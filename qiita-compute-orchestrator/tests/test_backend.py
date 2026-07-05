@@ -60,8 +60,6 @@ async def test_slurm_backend_constructor_accepts_config(tmp_path):
         client=client,
         partition="qiita",
         account="qiita-prod",
-        poll_interval_seconds=1,
-        job_timeout_seconds=60,
     )
     assert backend is not None
 

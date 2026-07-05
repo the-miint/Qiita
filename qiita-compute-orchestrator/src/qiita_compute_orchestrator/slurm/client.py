@@ -494,7 +494,12 @@ class SlurmrestdClient:
         # exit_code shape varies by SLURM version; v0.0.40+ wraps
         # return_code in the typed-numeric envelope (number/set/infinite).
         exit_code: int | None = None
-        rc = job.get("exit_code", {}).get("return_code")
+        # exit_code may be absent, JSON null (key present, value None), or the
+        # typed envelope dict. `.get("exit_code", {})` only defaults on absence,
+        # so a null value would make `.get("return_code")` raise AttributeError
+        # and escape the SlurmrestdError contract — guard the type explicitly.
+        exit_code_obj = job.get("exit_code")
+        rc = exit_code_obj.get("return_code") if isinstance(exit_code_obj, dict) else None
         if isinstance(rc, dict) and rc.get("set"):
             exit_code = rc.get("number")
         elif isinstance(rc, int):

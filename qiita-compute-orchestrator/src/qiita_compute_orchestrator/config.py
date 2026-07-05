@@ -73,19 +73,6 @@ CORRECT_COMPUTE_READINESS_INVOCATION = (
 BACKEND_LOCAL = "local"
 BACKEND_SLURM = "slurm"
 
-# SLURM polling defaults. The interval is the gap between
-# `GET /slurm/.../job/{id}` calls when waiting for a non-terminal
-# job; 10s is a reasonable trade-off between latency and slurmrestd
-# load. The total timeout caps a single step's wall time at 48h — it
-# must stay >= the largest step walltime any workflow declares (the
-# reference-add steps now run up to PT24H under a PT48H action_ceiling)
-# so SLURM's own --time kill fires before the CP poll loop gives up. A
-# step that exceeds this is either misconfigured (declare it longer in
-# YAML *and* raise this) or stuck (kill from outside). Override per-host
-# via SLURM_JOB_TIMEOUT_SECONDS.
-DEFAULT_SLURM_POLL_INTERVAL_SECONDS = 10
-DEFAULT_SLURM_JOB_TIMEOUT_SECONDS = 48 * 60 * 60
-
 
 @dataclass(frozen=True, slots=True)
 class SlurmSettings:
@@ -99,8 +86,6 @@ class SlurmSettings:
     partition: str  # SLURM partition (e.g. "qiita")
     account: str  # SLURM account for usage reporting
     api_version: str  # default v0.0.40
-    poll_interval_seconds: int
-    job_timeout_seconds: int
     # Python executable the native-step SBATCH script invokes via
     # `srun <native_python> -m qiita_compute_orchestrator.jobs ...`.
     # Default "python" assumes compute nodes already have a Python on
@@ -228,12 +213,6 @@ def _resolve_slurm_settings() -> SlurmSettings:
         partition=_required("SLURM_PARTITION"),
         account=_required("SLURM_ACCOUNT"),
         api_version=os.environ.get("SLURMRESTD_API_VERSION", DEFAULT_SLURMRESTD_API_VERSION),
-        poll_interval_seconds=int(
-            os.environ.get("SLURM_POLL_INTERVAL_SECONDS", str(DEFAULT_SLURM_POLL_INTERVAL_SECONDS))
-        ),
-        job_timeout_seconds=int(
-            os.environ.get("SLURM_JOB_TIMEOUT_SECONDS", str(DEFAULT_SLURM_JOB_TIMEOUT_SECONDS))
-        ),
         native_python=os.environ.get("SLURM_NATIVE_PYTHON", "python"),
         qos=os.environ.get("SLURM_QOS", ""),
     )

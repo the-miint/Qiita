@@ -15,6 +15,110 @@ the `no-changelog` label).
 
 ### Added
 
+- **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
+  the first piece of bulk-block read masking. The data plane materializes the
+  UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its
+  DuckLake `read` table into one per-ticket `reads.parquet`. The selector is
+  exact by construction (a per-member `prep_sample_idx = p AND sequence_idx
+  BETWEEN start AND stop` predicate — a split sample never leaks a sibling
+  block's rows) while a coarse `prep_sample_idx IN (...) AND sequence_idx BETWEEN
+  block_min AND block_max` pair drives DuckLake file-level pruning (measured
+  scale-invariant: a fixed block reads only its own files as the table grows 5×;
+  the coarse pair is load-bearing — the per-member `OR` alone would full-scan). New
+  `ExportReadBlockPayload`/`verify_export_read_block` (Rust) and
+  `_do_action_export_read_block` / `_resolve_staged_reads_block` (control plane);
+  `export_read` and `_do_action_export_read` refactored to share
+  `export_read_where_to_parquet` / `_do_action_export`. No caller yet (wired in a
+  later block-compute phase); no new env var, migration, scope, or operator
+  action. (#243)
+- **Block-compute schema — `block`, `block_member`, `mask_sample`, and a `block`
+  work-ticket scope.** The persistence layer for bulk-block read masking. A
+  `block` is the compute unit (a fixed ~10M-read slice from prep_samples sharing
+  one `mask_idx`, run as one work ticket); `block_member` is the block↔sample
+  cover-map (`[min_sequence_idx, max_sequence_idx]` per sample); `mask_sample`
+  is the per-`(mask_idx, prep_sample)` completion gate the masked-read export
+  path will consume (absence of a `read_mask` row must never read as "pass").
+  `qiita.work_ticket` gains a nullable `block_idx` scope arm, a `block`
+  `scope_target_kind` value (Python twin `ScopeTargetKind.BLOCK` +
+  `BlockScopeTarget`), and a `work_ticket_one_in_flight_per_block` partial unique
+  index. New `repositories/block.py` (`create_block`, `add_block_members`,
+  `set_block_state`, `set_block_work_ticket`, `create_mask_sample_pending`). The
+  planner and runner that drive these are in this same PR (below). (#243)
+- **Block planner + `submit-block-mask-pool` — plan a whole pool as fixed
+  ~10M-read blocks in one call.** The bulk-block analog of the per-sample
+  `submit-host-filter-pool` fan-out. A new server-side planner
+  (`block_planner.py`) resolves each sample's `mask_idx` at submit time (shared
+  `"read-mask"` identity, so a block-masked sample and a per-sample read-mask of
+  the same config collapse to one mask), partitions the pool by mask, tiles each
+  partition into ≤~10M-read blocks (pure arithmetic over `qiita.sequence_range`,
+  splitting a straddling sample on exact boundaries), then persists the
+  `block`/`block_member` cover-map + a PENDING `mask_sample` gate per sample,
+  creates one block work-ticket per block, and dispatches each. Exposed as
+  `POST /sequencing-run/{R}/sequenced-pool/{P}/block-mask-plan` (wet_lab_admin +
+  `prep_sample:write`, `BlockMaskPlan{Request,Response}` models) and the
+  `qiita submit-block-mask-pool` CLI, which reuses the same host-ref /
+  intent-mismatch preflight as `submit-host-filter-pool` (factored into a shared
+  helper) but makes a single call instead of N. The block runner path and
+  `read-mask-block` workflow that execute the dispatched tickets are in this same
+  PR (below); no new env var, migration, or scope. (#243)
+- **Block runner path — `read-mask-block/1.0.0` workflow + reconcile.** Wires the
+  block tickets the planner mints (previously they `RuntimeError`ed): the runner
+  gains a `block` scope arm that binds `reads` from the block's `block_member`
+  sub-ranges (via `export_read_block`) and `mask_idx` from the ticket (plan-time,
+  never re-minted). The new `workflows/read-mask-block/1.0.0.yaml` reuses the same
+  `qc` + `host_filter` native modules as `read-mask` (steps qc → host_filter →
+  register-files → reconcile-block). `host_filter` now stamps each `read_mask`
+  row's `prep_sample_idx` PER ROW from the reads parquet (was a per-run scalar) so
+  one multi-sample block records each read's true owner — a strict generalization
+  (a single-sample block is byte-identical to the per-sample path); `qc`/`host_filter`
+  `Inputs.prep_sample_idx` becomes optional (a block flows no such scope scalar).
+  New `reconcile-block` library primitive: in one transaction it marks the block
+  completed, then finalizes each covered sample once ALL its covering blocks are
+  done — a per-sample `mask_sample` `FOR UPDATE` lock serializes concurrent block
+  finalizers so exactly one wins, and the per-stage read counts are rolled onto
+  `sequenced_sample` from a new `mask_metrics` DoAction (the DuckLake aggregate
+  across the sample's blocks, replacing the per-sample path's local-parquet
+  rollup) with a fail-loud count assertion against `sequence_range`. No new env
+  var, migration, or scope; the `read-mask-block` workflow syncs via
+  `qiita-admin actions sync` at deploy. (#243)
+- **Masked-read export gate + block re-plan disallow-without-delete.** Two new
+  invariants that block masking requires (a sample's mask is now assembled by
+  several blocks, so real partial states exist). The masked-read export ticket
+  route (`POST /admin/masked-read-export/ticket`) now refuses (409) to mint a
+  DoGet ticket for a `(prep_sample, mask_idx)` whose `qiita.mask_sample` gate is
+  not `completed` — a partially-masked sample would silently truncate on pull.
+  A sample with NO gate row (the per-sample read-mask path, or an unmasked
+  sample) is unaffected, preserving that path's all-or-nothing guarantee. The
+  export manifest (`GET …/masked-read-export`) surfaces each sample's `mask_state`
+  (`MaskedReadExportSample.mask_state`) so the CLI reports skips before minting
+  tickets. The block planner (`plan_and_submit_blocks`) refuses (409, new
+  `BlockMaskResubmitError`) a fresh (`only_missing=False`) re-plan of a pool whose
+  samples already carry a `mask_sample` gate for the resolved mask — whether
+  COMPLETED (re-masking double-writes `read_mask`; DuckLake has no uniqueness) or
+  still PENDING (a prior plan's covering block is in-flight or failed, so minting
+  a fresh same-footprint block would wedge finalize forever); the operator DELETEs
+  the mask or passes `only_missing=true` (mirrors the sequenced_pool
+  resubmit rule). No new env var, migration, scope, or operator action. (#243)
+- **Idempotent block replace — `delete_read_mask_block` DoAction + `delete-block-mask`
+  workflow step.** Makes a block re-run self-cleaning so `read_mask` never
+  double-counts (DuckLake is append-only with no unique key). The new
+  `delete_read_mask_block` DoAction deletes exactly one block's footprint — the
+  `read_mask` rows for the ticket's `mask_idx` whose `(prep_sample_idx,
+  sequence_idx)` fall in the block's member sub-ranges, using the SAME
+  exact-by-construction selector as `export_read_block` (per-member `OR` residual,
+  so a split sample's sibling-block rows survive). The `read-mask-block/1.0.0`
+  workflow gains a `delete-block-mask` `action:` step immediately BEFORE
+  `register-files` (steps are now qc → host_filter → delete-block-mask →
+  register-files → reconcile-block): a fresh block deletes 0 rows, a re-run (retry,
+  or an operator resubmit covering the same footprint) deletes-then-re-registers so
+  exactly one copy lands and the reconcile count-assertion holds. New Rust
+  `DeleteReadMaskBlockPayload`/`verify_delete_read_mask_block` + `delete_read_mask_block`;
+  control-plane `delete_read_mask_block_data` DoAction wrapper + `delete_read_mask_block`
+  library primitive + runner block-scope dispatch arm; `LibraryPrimitive.DELETE_READ_MASK_BLOCK`.
+  End-to-end coverage in `tests/integration/test_read_mask_block_e2e.py` (split-sample
+  per-sample reconcile + export gate, and the delete-then-register no-duplicate
+  guarantee against a live data plane). No new env var, migration, or scope; the
+  updated `read-mask-block` workflow syncs via `qiita-admin actions sync` at deploy. (#243)
 - **Email notification on work-ticket terminal transitions.** When a work
   ticket reaches a terminal state (`completed` / `no_data` / `permanent`-failed),
   the control plane emails the originator. A new in-process asyncio sweeper
@@ -560,6 +664,10 @@ the `no-changelog` label).
   a newly-added action fails the build until it is consciously classified
   replay-safe. Documented in `docs/auth.md#ticket-replay` and the CLAUDE.md
   data-plane section. (#246)
+- Auth integer env-knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) are now validated at boot instead of parsed with a bare `int()` — a non-int or non-positive value fails loudly (leeway may be 0). (#241)
+- `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)
+- Flight-ticket and login-cookie signing now share `qiita_common.hashing.canonical_json` instead of three hand-rolled `json.dumps(sort_keys=…)` spellings, removing the risk of the HMAC'd wire serialization drifting. (#241)
+- Accepting an AuthRocket invitation redirects to the cookie-anchored `/auth/login` instead of minting a full-ceiling PAT from the un-anchored invitation JWT. (#241)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
@@ -1058,6 +1166,7 @@ the `no-changelog` label).
 
 ### Removed
 
+- Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag
   push, but production has only ever deployed manually via `deploy/local-deploy.sh`
@@ -1070,6 +1179,11 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
+- `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)
+- DB constraint/trigger violations (principal disable/retire, prep_sample publication lock) return stable client messages instead of leaking internal constraint/trigger names. (#241)
+- `verify_api_token` retains its fire-and-forget `record_token_use` task (was GC-droppable before the `last_used_at` write landed); `_parse_job` guards a null `exit_code` (was an untyped `AttributeError`); the SLURM payload rejects `gpu>0` at submit instead of silently dropping it. (#241)
+- Doc drift: architecture.md marks the unbuilt processing-results subsystem as *planned*; CLAUDE.md's data-plane test example names a real test; auth.md corrects the empty-`Bearer` behavior. (#241)
 - Integration-test harness: the `data_plane` fixture's gRPC-startup wait ceiling
   is raised from 10s to 30s (override via `QIITA_DP_START_TIMEOUT_S`), fixing an
   intermittent `test-integration` setup failure where the first module to use the

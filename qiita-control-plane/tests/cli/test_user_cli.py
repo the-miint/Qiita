@@ -3647,6 +3647,117 @@ def test_submit_host_filter_pool_mixed_pool_errors_then_force_proceeds(monkeypat
 
 
 # ---------------------------------------------------------------------------
+# submit-block-mask-pool
+# ---------------------------------------------------------------------------
+# Same client-side preflight as submit-host-filter-pool (host-ref coherence +
+# intent check + host-ref readiness), but the submission is ONE POST to the
+# block-mask-plan endpoint, not a per-sample fan-out. instrument_model + the
+# only-missing filter are server-side, so there is no GET /sequencing-run and no
+# client-side sample skipping.
+
+
+def _run_submit_block_mask_pool(
+    *, run=3, pool=5, rype=None, minimap2=None, force=False, only_missing=False
+):
+    from qiita_control_plane.cli.user import main
+
+    argv = [
+        "submit-block-mask-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+    ]
+    if rype is not None:
+        argv += ["--host-rype-reference-idx", str(rype)]
+    if minimap2 is not None:
+        argv += ["--host-minimap2-reference-idx", str(minimap2)]
+    if force:
+        argv += ["--force"]
+    if only_missing:
+        argv += ["--only-missing"]
+    return main(argv)
+
+
+def test_submit_block_mask_pool_single_plan_call_passthrough(monkeypatch, capsys):
+    """No host reference (a pass-through): after the roster GET, exactly ONE POST
+    to the block-mask-plan endpoint (no per-sample fan-out, no host-ref GETs, no
+    GET /sequencing-run), carrying only_missing + null host refs."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            # Pass-through intent (human_filtering=False) matches "no host ref".
+            (200, _pool_samples_body([(100, 1000, "10", False), (101, 1001, "11", False)])),
+            (202, {"blocks_created": 1, "samples_planned": 2, "partitions": [], "blocks": []}),
+        ],
+    )
+    rc = _run_submit_block_mask_pool()
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("/sequenced-pool/5/block-mask-plan")
+    assert posts[0]["json"] == {
+        "host_rype_reference_idx": None,
+        "host_minimap2_reference_idx": None,
+        "only_missing": False,
+    }
+    # No host-ref preflight GETs and no GET /sequencing-run for a pass-through.
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+def test_submit_block_mask_pool_host_filtered_preflights_and_posts(monkeypatch, capsys):
+    """With a rype reference: the reference is pre-flighted (GET /reference/{idx}
+    + its index list), then ONE plan POST carrying the host ref."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", True)])),
+            (200, _ref_active_body()),  # rype reference 7
+            (200, _both_indexes_body()),  # its index list (carries rype)
+            (202, {"blocks_created": 2, "samples_planned": 2, "partitions": [], "blocks": []}),
+        ],
+    )
+    rc = _run_submit_block_mask_pool(rype=7, only_missing=True)
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["json"] == {
+        "host_rype_reference_idx": 7,
+        "host_minimap2_reference_idx": None,
+        "only_missing": True,
+    }
+
+
+def test_submit_block_mask_pool_intent_mismatch_aborts_no_post(monkeypatch, capsys):
+    """The shared intent preflight fires for the block path too: a sample whose
+    intake intent disagrees with the pool-wide choice aborts before any POST
+    (no --force)."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        # Intake says human-filtered (True) but the submission applies no host ref.
+        responses=[(200, _pool_samples_body([(100, 1000, "10", True)]))],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_block_mask_pool()
+    assert exc_info.value.code == 1
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_block_mask_pool_minimap2_without_rype_errors(capsys):
+    """argparse-time coherence: minimap2 requires rype (exit 2), before any call."""
+    with pytest.raises(SystemExit):
+        _run_submit_block_mask_pool(minimap2=9)
+
+
+# ---------------------------------------------------------------------------
 # pool-completion (two-idx GET read command)
 # ---------------------------------------------------------------------------
 

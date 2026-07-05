@@ -491,6 +491,37 @@ async def sequenced_pool_action(postgres_pool):
 
 
 @pytest.fixture
+async def block_action(postgres_pool):
+    """An enabled, block-targeting action — the read-mask-block shape. Empty
+    scopes and any-object context, default audience ([system_admin]) matching
+    the admin_token fixture."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="block",
+        scopes=[],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def block_for_wt(postgres_pool):
+    """A bare qiita.block row with no back-filled work_ticket_idx yet — the
+    scope target a block-scoped submission aims at. Returns block_idx.
+
+    Teardown is FK-reverse: drop dependent work_tickets (work_ticket.block_idx
+    is a deferred NO ACTION, so the tickets must go first), then the block
+    (its block_member rows cascade)."""
+    block_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.block (state) VALUES ('pending') RETURNING block_idx"
+    )
+    yield block_idx
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE block_idx = $1", block_idx)
+    await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+
+
+@pytest.fixture
 async def prep_sample_with_study_link(postgres_pool, prep_sample_idx, admin_token):
     """The shared sequenced prep_sample plus a non-retired
     `prep_sample_to_study` link against a freshly-seeded study owned by
@@ -1364,6 +1395,150 @@ async def test_submit_sequenced_pool_unique_index_catches_select_race(
     assert "in flight" in second.json()["detail"]["reason"]
 
 
+# ---------------------------------------------------------------------------
+# block scope target (bulk-block read-mask)
+# ---------------------------------------------------------------------------
+
+
+def _block_body(action_id, version, block_idx, **overrides):
+    base = {
+        "action_id": action_id,
+        "action_version": version,
+        "scope_target": {"kind": "block", "block_idx": block_idx},
+        "action_context": {},
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_submit_block_scope_round_trips(
+    wt_client, postgres_pool, admin_token, block_action, block_for_wt
+):
+    """A block-scoped submission persists block_idx with every other scope arm
+    NULL (per work_ticket_scope_target_consistent), and a GET round-trips the
+    block scope_target."""
+    token, _ = admin_token
+    action_id, version = block_action
+    block_idx = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_block_body(action_id, version, block_idx),
+        headers=headers,
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT scope_target_kind, study_idx, prep_idx, reference_idx,"
+        "       prep_sample_idx, sequenced_pool_idx, block_idx, state"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    assert row["scope_target_kind"] == "block"
+    assert row["block_idx"] == block_idx
+    assert row["study_idx"] is None
+    assert row["prep_idx"] is None
+    assert row["reference_idx"] is None
+    assert row["prep_sample_idx"] is None
+    assert row["sequenced_pool_idx"] is None
+    assert row["state"] == WorkTicketState.PENDING.value
+
+    got = await wt_client.get(URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx), headers=headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["scope_target"] == {"kind": "block", "block_idx": block_idx}
+
+
+async def test_submit_block_disallow_without_delete(
+    wt_client, admin_token, block_action, block_for_wt
+):
+    """A second block submission against the same (action, block) while the
+    first is non-terminal must 409 via the SELECT-side disallow-without-delete
+    check, naming the blocking ticket idx."""
+    token, _ = admin_token
+    action_id, version = block_action
+    block_idx = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+    body = _block_body(action_id, version, block_idx)
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202, first.text
+    first_idx = first.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(first_idx)
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["blocking_work_ticket_idx"] == first_idx
+
+
+async def test_submit_block_distinct_blocks_allowed(
+    wt_client, postgres_pool, admin_token, block_action, block_for_wt
+):
+    """The in-flight gate is per-block: a second, distinct block submits
+    cleanly alongside a non-terminal ticket for the first block."""
+    token, _ = admin_token
+    action_id, version = block_action
+    first_block = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_block_body(action_id, version, first_block),
+        headers=headers,
+    )
+    assert first.status_code == 202, first.text
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    second_block = await postgres_pool.fetchval(
+        "INSERT INTO qiita.block (state) VALUES ('pending') RETURNING block_idx"
+    )
+    try:
+        second = await wt_client.post(
+            URL_WORK_TICKET_PREFIX,
+            json=_block_body(action_id, version, second_block),
+            headers=headers,
+        )
+        assert second.status_code == 202, second.text
+        wt_client._created_tickets.append(second.json()["work_ticket_idx"])
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE block_idx = $1", second_block
+        )
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", second_block)
+
+
+async def test_submit_block_unique_index_catches_select_race(
+    wt_client, admin_token, block_action, block_for_wt, monkeypatch
+):
+    """The atomic gate for a block double-submit is the partial unique index
+    work_ticket_one_in_flight_per_block. Short-circuit the SELECT-side check so
+    both submissions reach INSERT; the second must trip the constraint and
+    surface as the same 409 the SELECT path returns."""
+    token, _ = admin_token
+    action_id, version = block_action
+    block_idx = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+    body = _block_body(action_id, version, block_idx)
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202, first.text
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        _noop,
+    )
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409, second.text
+    assert "in flight" in second.json()["detail"]["reason"]
+
+
 async def test_submit_valid_context_against_schema(
     wt_client,
     postgres_pool,
@@ -2206,7 +2381,7 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/work-ticket  (list / summary, Phase 6)
+# GET /api/v1/work-ticket  (list / summary)
 # ---------------------------------------------------------------------------
 
 

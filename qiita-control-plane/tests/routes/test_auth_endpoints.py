@@ -1008,13 +1008,15 @@ async def test_handoff_cli_flow_redirects_to_loopback_with_ot_code(
         app.state.oidc_verifier = saved_verifier
 
 
-async def test_handoff_invitation_flow_no_cookie_mints_pat(
+async def test_handoff_invitation_flow_no_cookie_redirects_to_login(
     auth_client, postgres_pool, jwks_harness
 ):
     """Invitation acceptance lands here directly from AuthRocket's signup
-    redirect — the user never traversed /auth/login, so no cookie is
-    present. The route must accept the JWT alone, mint a PAT, and render
-    the same browser HTML the cookie-bearing browser-login flow does."""
+    redirect — the user never traversed /auth/login, so no cookie (and no
+    freshness anchor) is present. Rather than mint a full-ceiling 90-day PAT
+    from an un-anchored, replayable JWT, the route provisions the user and
+    redirects to /auth/login so the PAT is minted only through the cookie-
+    anchored path. A replayed invitation URL then yields just this redirect."""
     from qiita_control_plane.main import app
 
     saved_verifier = app.state.oidc_verifier
@@ -1027,16 +1029,12 @@ async def test_handoff_invitation_flow_no_cookie_mints_pat(
             f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.headers["content-type"].startswith("text/html")
-        # No Location header — invitation flow must never redirect to a
-        # CLI loopback (no cookie means we don't know any port to redirect
-        # to, and invitations are browser-only by definition).
-        assert "location" not in {k.lower() for k in resp.headers.keys()}
-        body = resp.text
-        assert "invite-accept@example.com" in body
-        assert "qk_" in body
+        assert resp.status_code == 302, resp.text
+        assert resp.headers["location"] == URL_AUTH_LOGIN
+        # No PAT is minted or rendered on the un-anchored path.
+        assert "qk_" not in resp.text
 
+        # The user IS provisioned (resolve_oidc upsert ran) but no token exists.
         pidx = await postgres_pool.fetchval(
             "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
             jwks_harness.issuer,
@@ -1044,16 +1042,19 @@ async def test_handoff_invitation_flow_no_cookie_mints_pat(
         )
         assert pidx is not None
         _track(auth_client, pidx)
+        token_count = await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1", pidx
+        )
+        assert token_count == 0
     finally:
         app.state.oidc_verifier = saved_verifier
 
 
-async def test_handoff_invitation_flow_records_audit_via_invitation(
-    auth_client, postgres_pool, jwks_harness
-):
-    """Audit detail.via must distinguish invitation acceptance from the
-    cookie-bearing browser and CLI flows so audit-log readers can tell
-    at a glance which entry point produced a given PAT."""
+async def test_handoff_invitation_flow_mints_no_token(auth_client, postgres_pool, jwks_harness):
+    """The invitation flow mints nothing — it redirects to the anchored login —
+    so it writes no token_mint audit event. (It previously minted a PAT with
+    via='invitation'; that un-anchored mint has been removed so a replayed
+    invitation JWT can't yield a credential.)"""
     from qiita_control_plane.main import app
 
     saved_verifier = app.state.oidc_verifier
@@ -1066,7 +1067,8 @@ async def test_handoff_invitation_flow_records_audit_via_invitation(
             f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 302
+        assert resp.headers["location"] == URL_AUTH_LOGIN
 
         pidx = await postgres_pool.fetchval(
             "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
@@ -1080,9 +1082,7 @@ async def test_handoff_invitation_flow_records_audit_via_invitation(
             " WHERE event_type = 'token_mint' AND principal_idx = $1",
             pidx,
         )
-        assert rows
-        detail = _detail(rows[-1])
-        assert detail["via"] == "invitation"
+        assert rows == []
     finally:
         app.state.oidc_verifier = saved_verifier
 
@@ -1144,7 +1144,9 @@ async def test_handoff_invitation_flow_does_not_write_cli_login_code(
             f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
-        assert resp.status_code == 200, resp.text
+        # Invitation now redirects to the anchored login and mints nothing.
+        assert resp.status_code == 302, resp.text
+        assert resp.headers["location"] == URL_AUTH_LOGIN
         after = await postgres_pool.fetchval("SELECT count(*) FROM qiita.cli_login_code")
         assert after == before
 
@@ -1286,6 +1288,17 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
         assert whoami.status_code == 200
         assert whoami.json()["email"] == "cli-exchange@example.com"
 
+        # The plaintext PAT must be scrubbed from the row the instant it's
+        # redeemed — cli_login_code is the only at-rest plaintext store, so a
+        # consumed row must never retain a usable token.
+        code_row = await postgres_pool.fetchrow(
+            "SELECT plaintext_pat, consumed_at FROM qiita.cli_login_code WHERE token_idx = $1",
+            body["token_idx"],
+        )
+        assert code_row is not None
+        assert code_row["consumed_at"] is not None
+        assert code_row["plaintext_pat"] is None
+
         # Second exchange: 404 (consumed).
         resp2 = await auth_client.post(
             URL_AUTH_CLI_EXCHANGE,
@@ -1312,6 +1325,68 @@ async def test_cli_exchange_unknown_code_returns_404(auth_client):
         json={"ot_code": "definitely-not-a-real-code-just-padding-bytes"},
     )
     assert resp.status_code == 404
+
+
+async def test_cli_login_code_sweeper_deletes_dead_rows(auth_client, postgres_pool):
+    """The sweeper deletes consumed and expired cli_login_code rows — reclaiming
+    any plaintext PAT left at rest — but leaves a live, unconsumed, unexpired
+    row so an in-flight CLI login can still redeem."""
+    from qiita_control_plane.auth.cli_login_code_sweeper import sweep_cli_login_codes_once
+    from qiita_control_plane.auth.token import mint_api_token
+
+    pidx = await _seed_user(postgres_pool, email="sweeper@example.com")
+    _track(auth_client, pidx)
+    _, token_idx = await mint_api_token(
+        postgres_pool, principal_idx=pidx, label="sweeper", scopes=[Scope.SELF_TOKEN]
+    )
+
+    now = datetime.now(UTC)
+
+    async def _insert_code(ot_code, *, created_at, expires_at, consumed_at):
+        # created_at is set explicitly so an already-expired row still satisfies
+        # the expires_at > created_at CHECK.
+        await postgres_pool.execute(
+            "INSERT INTO qiita.cli_login_code"
+            " (ot_code, principal_idx, token_idx, plaintext_pat,"
+            "  created_at, expires_at, consumed_at)"
+            " VALUES ($1, $2, $3, 'qk_secret', $4, $5, $6)",
+            ot_code,
+            pidx,
+            token_idx,
+            created_at,
+            expires_at,
+            consumed_at,
+        )
+
+    # Consumed (dead regardless of expiry).
+    await _insert_code(
+        b"\x01" * 32,
+        created_at=now - timedelta(seconds=60),
+        expires_at=now + timedelta(seconds=300),
+        consumed_at=now - timedelta(seconds=30),
+    )
+    # Expired, never consumed (dead: can never be redeemed, plaintext is liability).
+    await _insert_code(
+        b"\x02" * 32,
+        created_at=now - timedelta(seconds=60),
+        expires_at=now - timedelta(seconds=30),
+        consumed_at=None,
+    )
+    # Live: unconsumed and unexpired — must survive.
+    await _insert_code(
+        b"\x03" * 32,
+        created_at=now,
+        expires_at=now + timedelta(seconds=300),
+        consumed_at=None,
+    )
+
+    deleted = await sweep_cli_login_codes_once(postgres_pool)
+    assert deleted == 2
+
+    remaining = await postgres_pool.fetch(
+        "SELECT ot_code FROM qiita.cli_login_code WHERE token_idx = $1", token_idx
+    )
+    assert [bytes(r["ot_code"]) for r in remaining] == [b"\x03" * 32]
 
 
 # ---------------------------------------------------------------------------

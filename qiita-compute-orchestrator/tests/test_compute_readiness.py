@@ -52,8 +52,6 @@ def _make_slurm_settings(jwt_path: Path) -> SlurmSettings:
         partition="qiita",
         account="qiita-prod",
         api_version="v0.0.40",
-        poll_interval_seconds=0,
-        job_timeout_seconds=60,
         native_python="/opt/qiita/compute-orchestrator/.venv/bin/python",
         qos="",
     )

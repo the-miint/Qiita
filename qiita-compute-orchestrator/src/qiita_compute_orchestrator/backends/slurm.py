@@ -118,8 +118,6 @@ class SlurmBackend(ComputeBackend):
         client: SlurmrestdClient,
         partition: str,
         account: str,
-        poll_interval_seconds: int,
-        job_timeout_seconds: int,
         native_python: str = "python",
         co_to_cp_token: str = "",
         cp_url: str = "",
@@ -131,16 +129,6 @@ class SlurmBackend(ComputeBackend):
         self._client = client
         self._partition = partition
         self._account = account
-        # TODO(decouple-compute follow-up): remove these two fields + the
-        # SlurmSettings entries + the SLURM_POLL_INTERVAL_SECONDS /
-        # SLURM_JOB_TIMEOUT_SECONDS env vars in a dedicated config-cleanup PR.
-        # Retained-but-unread since the CP runner took over the poll loop (it
-        # drives status_step at its own interval and relies on SLURM's walltime
-        # to terminate a stuck job), so the orchestrator no longer polls or
-        # enforces a watch-timeout. Kept now only to keep this change off the
-        # deploy surface (the env vars still parse harmlessly).
-        self._poll_interval = poll_interval_seconds
-        self._job_timeout = job_timeout_seconds
         self._native_python = native_python
         # Shared-FS dir where built SIFs live (PATH_DERIVED/images). When
         # set, bare `container:` filenames in workflow YAML resolve as

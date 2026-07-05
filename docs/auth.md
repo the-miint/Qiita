@@ -104,7 +104,7 @@ class Anonymous(Principal):       # no Authorization header
 | Bearer shape | Path | Behavior |
 |---|---|---|
 | absent / non-Bearer | — | returns `Anonymous()` |
-| `Bearer ` (empty) | — | returns `Anonymous()` |
+| `Bearer ` (empty) | — | 401 `empty bearer credential` (an empty bearer is rejected, not treated as anonymous) |
 | `Bearer qk_...` | token | `verify_api_token` → load principal subtype → `HumanUser` or `ServiceAccount` |
 | `Bearer eyJ...x.y.z` | OIDC | `JwtVerifier.verify` → upsert / load → `HumanUser` |
 | anything else | malformed | 401 |

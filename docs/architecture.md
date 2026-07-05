@@ -211,10 +211,10 @@ The control plane gates all job submission on the current state of each `(prep_s
 
 This check applies at both the work ticket level (is there an active ticket for this prep + processing combination?) and the individual sample level (does any `prep_sample_idx` in the request already have a result in a non-terminal state?), preventing both whole-prep and partial duplicate submissions.
 
-The data plane asserts identifier integrity programmatically since DuckLake does not support explicit constraints (no unique constraints, no foreign keys at the DuckLake level):
+Since DuckLake does not support explicit constraints (no unique constraints, no foreign keys at the DuckLake level), the data plane is intended to assert identifier integrity programmatically. **These checks are planned, not yet built** — `processed_prep_sample_idx` and the processing-results tables it keys are part of the processing hierarchy that has not been implemented (`register_files` performs path-safety and existence checks only, and no startup scan runs today):
 
-- **At registration**: before `ducklake_add_data_files`, verifies the Parquet file's `processed_prep_sample_idx` values are a subset of the expected set provided by the control plane, and that no value from the file already exists in the catalog for this `(prep_sample_idx, processing_idx)` combination.
-- **At service startup**: scans the DuckLake catalog to verify no `processed_prep_sample_idx` appears in multiple active files for the same `(prep_sample_idx, processing_idx)`. Violations are logged as critical errors and the affected combinations are blocked from serving until reconciled.
+- **At registration** *(planned)*: before `ducklake_add_data_files`, verify the Parquet file's `processed_prep_sample_idx` values are a subset of the expected set provided by the control plane, and that no value from the file already exists in the catalog for this `(prep_sample_idx, processing_idx)` combination.
+- **At service startup** *(planned)*: scan the DuckLake catalog to verify no `processed_prep_sample_idx` appears in multiple active files for the same `(prep_sample_idx, processing_idx)`. Violations logged as critical errors; affected combinations blocked from serving until reconciled.
 
 ### Reference Database Design
 
@@ -311,8 +311,10 @@ All ID minting and membership management lives in the control plane (Postgres OL
 | Reference annotations | `(feature_idx, position)` | GFF-like: `(feature_idx, source, type, position, stop_position, score, strand, phase, attributes)` — gene models, CDS, regulatory regions |
 | Reference phylogeny | `(reference_idx, node_index)` | Per-reference tree: `(reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)` — Newick trees decomposed into node tables via `read_newick` |
 | Placements | `(reference_idx, fragment)` | jplace data stored as-is via `read_jplace`; reconciled against reference membership and phylogeny at query time |
-| Alignment detail | `(prep_sample_idx, …, feature_idx, position)` | Per-read alignment results sorted for genome locality: `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` |
-| Count / aggregation | `(prep_sample_idx, …, feature_idx)` | Sparse COO format: `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, value)` |
+| Alignment detail *(planned)* | `(prep_sample_idx, …, feature_idx, position)` | Per-read alignment results sorted for genome locality: `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` |
+| Count / aggregation *(planned)* | `(prep_sample_idx, …, feature_idx)` | Sparse COO format: `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, value)` |
+
+The **Alignment detail** and **Count / aggregation** rows describe the planned processing-results layout; those tables (and the `processed_prep_sample_idx` hierarchy they key) are not yet created by the data plane — `ensure_read_tables`/`ensure_reference_tables` create only the reference and read tables today.
 
 #### Taxonomy as a Reference
 

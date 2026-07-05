@@ -1,0 +1,149 @@
+action_id: read-mask-block
+version: 1.0.0
+target_kind: block
+# Block-scoped, NOT prep_sample-scoped: one ticket masks a fixed ~10M-read BLOCK
+# drawn from many prep_samples that share one filtering identity (mask_idx). The
+# block↔sample cover-map lives in qiita.block_member and the mask_idx rides on
+# the work_ticket. target_processing_kinds is intentionally absent — it is only
+# meaningful for target_kind: prep_sample (the loader + DB CHECK reject it here);
+# the samples a block covers are all `sequenced` by construction (the planner
+# enumerates a sequenced pool).
+
+description: >
+  Bulk-block variant of `read-mask`: mask a fixed ~10M-read BLOCK of reads drawn
+  from prep_samples that all resolve to one filtering identity (mask_idx),
+  instead of one ticket per sample. Decouples the COMPUTE unit (the block) from
+  the ACCOUNTING unit (per-sample completion): the block runs QC + host filtering
+  over its multi-sample reads in one job, then reconcile finalizes each covered
+  sample once ALL its covering blocks are done.
+
+  The reads are stored ONCE by the bcl-convert workflow's `ingest_reads` step
+  (DuckLake `read` table). This workflow never parses FASTQ or mints a
+  sequence_idx range. The runner binds `reads` from the block's `block_member`
+  sub-ranges via the `export_read_block` DoAction (the data plane materializes
+  the union of the members' `read` sub-ranges into a per-ticket `reads.parquet` —
+  the bulk read bytes never transit the control plane), and binds `mask_idx` from
+  the work_ticket (resolved at plan time as the partition key — never re-minted,
+  since a block has no single prep_sample the per-sample mint keys on).
+
+  The `qc` and `host_filter` steps are the SAME native modules as `read-mask`.
+  qc keys its partial mask on the globally-unique sequence_idx (never on the
+  owner), so a multi-sample block is handled unchanged. host_filter stamps each
+  read_mask row's prep_sample_idx PER ROW from the reads parquet (not a per-run
+  constant), so the multi-sample block records each read's true owner; the mask
+  identity `mask_idx` is the block-constant threaded via `params`. A single-sample
+  block yields output identical to a per-sample read-mask — the mask_idx collapses
+  with the per-sample path (both mint under the shared `read-mask` filter identity).
+
+  host_filter's host indexes are GATED exactly as in `read-mask`: when
+  action_context sets `host_filter_enabled: true`, `host_rype_reference_idx`
+  names an ACTIVE reference whose rype (.ryxdi) index is bound (required) and the
+  optional `host_minimap2_reference_idx` names a second ACTIVE reference whose
+  minimap2 (.mmi) index is bound. When disabled (or omitted) host_filter masks no
+  read as host and the mask is the QC mask unchanged.
+
+# reconcile-block writes the per-stage read counts onto each finalized sample's
+# sequenced_sample (a prep_sample subtype) row, so submitters must hold
+# prep_sample:write — the same scope the per-sample read-mask declares.
+scopes:
+  - prep_sample:write
+
+# Admin-only, same rationale as read-mask: masking makes the data plane
+# re-materialize RAW reads (human-containing) into the ticket workspace via the
+# `export_read_block` DoAction, so this is a privileged lab operation.
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: []
+  properties:
+    # Sequencing instrument model, folded into the mask identity (2-color →
+    # polyG). Pool-constant per plan; the planner reads it from the run and
+    # stamps it on every block ticket's action_context.
+    instrument_model:
+      type: string
+      minLength: 1
+    # Host-filter gate — identical shape to read-mask. Plain reference idxs, NOT
+    # `*_upload_idx` (the upload-handle walker leaves them alone).
+    host_filter_enabled:
+      type: boolean
+    host_rype_reference_idx:
+      type: integer
+      minimum: 1
+    host_minimap2_reference_idx:
+      type: integer
+      minimum: 1
+
+steps:
+  # Always-on QC over the block's stored reads. Emits a PARTIAL read mask
+  # (qc_mask: per read, reason + per-end trims) keyed by sequence_idx — order- and
+  # owner-independent, so a multi-sample block is fine. `reads` is runner-bound
+  # from the block's member sub-ranges (_resolve_staged_reads_block);
+  # `adapter_parquet` is materialized by the runner before the loop.
+  # `instrument_model` rides through `params:` to gate polyG.
+  - step: qc
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.qc
+    inputs: [reads, adapter_parquet]
+    params: {instrument_model: instrument_model}
+    outputs: [qc_mask]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 12
+      walltime: PT4H
+
+  # Merge host hits into the qc_mask and emit the final read_mask. Stamps each
+  # row's prep_sample_idx per-row from `reads` (multi-sample block). `mask_idx`
+  # is threaded via `params:` — its presence signals the runner to bind the mask
+  # before the loop (from work_ticket.mask_idx, resolved at plan time).
+  - step: host_filter
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.host_filter
+    inputs: [reads, qc_mask]
+    optional_inputs: [host_rype_path, host_minimap2_path]
+    params: {mask_idx: mask_idx}
+    outputs: [read_mask, read_mask_staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT4H
+
+  # Idempotent block replace: delete this block's exact read_mask footprint (its
+  # member sub-ranges under the ticket's mask_idx) from DuckLake BEFORE
+  # register-files re-writes it, so a block re-run (a retry, or an operator
+  # resubmit covering the same footprint) deletes-then-re-registers and never
+  # double-counts (the reconcile count-assertion would otherwise trip on 2× rows).
+  # On a fresh block it deletes 0 rows. Exact by construction (per-member OR), so a
+  # sample split across several blocks keeps its sibling blocks' rows — only THIS
+  # block's footprint goes. block_idx from the scope target, mask_idx from the
+  # ticket — no file inputs.
+  - action: delete-block-mask
+    inputs: []
+    outputs: []
+
+  # Load the block's final mask into the DuckLake `read_mask` table.
+  # read_mask_staging_dir holds read_mask.parquet. Unlike read-mask (where
+  # persist-read-metrics reads the LOCAL parquet and so runs BEFORE register-files),
+  # the block's per-sample rollup reads the PERSISTED DuckLake aggregate across all
+  # the sample's blocks, so register-files MUST run before reconcile-block.
+  - action: register-files
+    inputs: [read_mask_staging_dir]
+    outputs: []
+
+  # Terminal: mark this block completed, then finalize each covered sample whose
+  # LAST covering block just completed — roll the per-stage read counts onto its
+  # sequenced_sample (from the DuckLake `mask_metrics` aggregate, with the
+  # fail-loud count assertion) and flip its `mask_sample` gate to 'completed'. A
+  # sample split across several blocks finalizes only when all its blocks are done,
+  # serialized by a per-sample lock so exactly one block finalizes it. block_idx
+  # comes from the scope target and mask_idx from the ticket — no file inputs.
+  - action: reconcile-block
+    inputs: []
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 32
+  walltime: PT8H

@@ -83,8 +83,6 @@ def _make_backend(
         client=client,
         partition="qiita",
         account="qiita-prod",
-        poll_interval_seconds=0,  # 0 so tests don't sleep
-        job_timeout_seconds=60,
         co_to_cp_token=co_to_cp_token,
         cp_url=cp_url,
         path_scratch=path_scratch,

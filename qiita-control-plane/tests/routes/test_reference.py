@@ -180,6 +180,20 @@ async def test_list_references_returns_created(client):
     assert idxs <= listed
 
 
+async def test_list_references_respects_limit(client):
+    """The anonymous listing is bounded — ?limit=1 returns at most one row, and
+    an out-of-range limit is rejected by the query-param validator (422)."""
+    await _create_ref(client, "test-limit-a")
+    await _create_ref(client, "test-limit-b")
+
+    resp = await client.get(f"{URL_REFERENCE_PREFIX}?limit=1")
+    assert resp.status_code == 200
+    assert len(resp.json()) <= 1
+
+    too_big = await client.get(f"{URL_REFERENCE_PREFIX}?limit=1000000")
+    assert too_big.status_code == 422
+
+
 async def test_list_references_filters_is_host(client):
     """GET /reference?is_host=true returns only host references."""
     host = await client.post(

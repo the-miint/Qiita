@@ -106,6 +106,7 @@ _DISALLOW_WITHOUT_DELETE_INDEXES = frozenset(
         "work_ticket_one_in_flight_per_study_prep",
         "work_ticket_one_in_flight_per_prep_sample",
         "work_ticket_one_in_flight_per_sequenced_pool",
+        "work_ticket_one_in_flight_per_block",
     }
 )
 
@@ -209,25 +210,29 @@ def _check_scopes(principal: Principal, required_scopes: list[str]) -> None:
 
 def _scope_target_columns(
     scope_target: dict[str, Any],
-) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+) -> tuple[int | None, int | None, int | None, int | None, int | None, int | None]:
     """Map a ScopeTarget union member to the
-    (study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx)
-    tuple the work_ticket table expects.
+    (study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx,
+    block_idx) tuple the work_ticket table expects.
 
     The SEQUENCED_POOL arm carries both sequenced_pool_idx and
     sequencing_run_idx; the run idx is consumed by the orchestrator
     framework (SCOPE_SCALARS_BY_KIND) but is not a work_ticket column —
     it's derivable from the pool row's FK back to qiita.sequencing_run.
+    The BLOCK arm carries only block_idx (the filtering identity rides on
+    work_ticket.mask_idx, not the scope target).
     """
     kind = scope_target["kind"]
     if kind == ScopeTargetKind.REFERENCE.value:
-        return (None, None, scope_target["reference_idx"], None, None)
+        return (None, None, scope_target["reference_idx"], None, None, None)
     if kind == ScopeTargetKind.STUDY_PREP.value:
-        return (scope_target["study_idx"], scope_target["prep_idx"], None, None, None)
+        return (scope_target["study_idx"], scope_target["prep_idx"], None, None, None, None)
     if kind == ScopeTargetKind.PREP_SAMPLE.value:
-        return (None, None, None, scope_target["prep_sample_idx"], None)
+        return (None, None, None, scope_target["prep_sample_idx"], None, None)
     if kind == ScopeTargetKind.SEQUENCED_POOL.value:
-        return (None, None, None, None, scope_target["sequenced_pool_idx"])
+        return (None, None, None, None, scope_target["sequenced_pool_idx"], None)
+    if kind == ScopeTargetKind.BLOCK.value:
+        return (None, None, None, None, None, scope_target["block_idx"])
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"unknown scope_target.kind={kind!r}",
@@ -265,9 +270,14 @@ async def _check_disallow_without_delete(
     reaches COMPLETED, so a `WHERE state='completed'` unique index would be
     wrong. Two concurrent non-forced submits racing past it is the same
     accepted TOCTOU class as the rest of this check."""
-    study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx = _scope_target_columns(
-        scope_target
-    )
+    (
+        study_idx,
+        prep_idx,
+        reference_idx,
+        prep_sample_idx,
+        sequenced_pool_idx,
+        block_idx,
+    ) = _scope_target_columns(scope_target)
     if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
         existing = await pool.fetchval(
             "SELECT work_ticket_idx FROM qiita.work_ticket"
@@ -302,6 +312,22 @@ async def _check_disallow_without_delete(
             action_id,
             action_version,
             sequenced_pool_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
+        # Block scope: only the in-flight (non-terminal) gate applies here.
+        # A COMPLETED block does not block resubmission at the ticket level —
+        # the per-(prep_sample, mask_idx) COMPLETED gate on qiita.mask_sample
+        # is what a re-run must clear (DELETE-gated), not the block ticket.
+        existing = await pool.fetchval(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE action_id = $1 AND action_version = $2"
+            "   AND block_idx = $3"
+            "   AND state = ANY($4::qiita.work_ticket_state[])"
+            " LIMIT 1",
+            action_id,
+            action_version,
+            block_idx,
             list(NON_TERMINAL_WORK_TICKET_STATES),
         )
     else:
@@ -632,9 +658,14 @@ async def submit_work_ticket(
         pool, body.action_id, body.action_version, scope_target, force=body.force
     )
 
-    study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx = _scope_target_columns(
-        scope_target
-    )
+    (
+        study_idx,
+        prep_idx,
+        reference_idx,
+        prep_sample_idx,
+        sequenced_pool_idx,
+        block_idx,
+    ) = _scope_target_columns(scope_target)
     # INSERT and the failed→pending scope reset are ONE transaction so a fresh
     # submit never half-applies — mirrors the `/run` redrive path's single-
     # transaction guarantee. A reference this new ticket binds to may sit at
@@ -654,10 +685,10 @@ async def submit_work_ticket(
                 "INSERT INTO qiita.work_ticket ("
                 "  action_id, action_version, originator_principal_idx,"
                 "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-                "  prep_sample_idx, sequenced_pool_idx, action_context,"
+                "  prep_sample_idx, sequenced_pool_idx, block_idx, action_context,"
                 "  resource_override"
                 ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
-                "          $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
+                "          $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)"
                 " RETURNING work_ticket_idx",
                 body.action_id,
                 body.action_version,
@@ -668,6 +699,7 @@ async def submit_work_ticket(
                 reference_idx,
                 prep_sample_idx,
                 sequenced_pool_idx,
+                block_idx,
                 json.dumps(body.action_context),
                 json.dumps(body.resource_override.model_dump())
                 if body.resource_override is not None
@@ -718,7 +750,7 @@ async def submit_work_ticket(
 _WORK_TICKET_COLUMNS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx,"
     " wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx,"
-    " wt.prep_sample_idx, wt.sequenced_pool_idx,"
+    " wt.prep_sample_idx, wt.sequenced_pool_idx, wt.block_idx,"
     " sp.sequencing_run_idx,"
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
@@ -763,10 +795,11 @@ def _scope_target_from_columns(
     reference_idx: int | None,
     prep_sample_idx: int | None,
     sequenced_pool_idx: int | None,
+    block_idx: int | None,
     sequencing_run_idx: int | None,
 ) -> dict[str, Any]:
     """Rebuild the discriminated scope_target dict from the tagged-union
-    columns work_ticket stores (scope_target_kind + the five nullable idx
+    columns work_ticket stores (scope_target_kind + the six nullable idx
     columns; the SEQUENCED_POOL arm additionally needs the joined
     sequencing_run_idx). Shared by the single-ticket and list-summary row
     shapers so the union mapping lives in exactly one place."""
@@ -776,7 +809,9 @@ def _scope_target_from_columns(
         return {"kind": kind, "study_idx": study_idx, "prep_idx": prep_idx}
     if kind == ScopeTargetKind.PREP_SAMPLE.value:
         return {"kind": kind, "prep_sample_idx": prep_sample_idx}
-    # SEQUENCED_POOL — DB CHECK enforces one of the four valid kinds.
+    if kind == ScopeTargetKind.BLOCK.value:
+        return {"kind": kind, "block_idx": block_idx}
+    # SEQUENCED_POOL — DB CHECK enforces one of the five valid kinds.
     return {
         "kind": kind,
         "sequenced_pool_idx": sequenced_pool_idx,
@@ -798,6 +833,7 @@ def _shape_work_ticket_columns(data: dict[str, Any]) -> dict[str, Any]:
         reference_idx=data.pop("reference_idx"),
         prep_sample_idx=data.pop("prep_sample_idx"),
         sequenced_pool_idx=data.pop("sequenced_pool_idx"),
+        block_idx=data.pop("block_idx"),
         # Joined sequencing-run idx — only the SEQUENCED_POOL arm carries a
         # value (NULL otherwise) but the column is always selected, so pop
         # defensively with a default.

@@ -82,9 +82,9 @@ _PROBE_JOB_NAME = "qiita-compute-readiness-probe"
 _PROBE_CPU = 1
 _PROBE_MEM_MB = 256
 _PROBE_TIME_LIMIT_MINUTES = 5
-# The poll interval is intentionally tighter than the regular
-# SlurmBackend's `DEFAULT_SLURM_POLL_INTERVAL_SECONDS` (config.py).
-# Compute-readiness is an interactive operator command (someone is
+# The poll interval is intentionally tight (tighter than a background
+# poll loop would use). Compute-readiness is an interactive operator
+# command (someone is
 # watching the terminal); faster feedback beats slurmrestd-load
 # concerns, especially because the probe job's wall-time is capped at
 # 5 minutes so there are ~60 polls maximum.

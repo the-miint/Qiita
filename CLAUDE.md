@@ -52,7 +52,7 @@ cd qiita-control-plane && uv run pytest tests/test_smoke.py::test_health
 # Rust — DUCKDB_DOWNLOAD_LIB=1 dynamically links a prebuilt libduckdb from
 # target/duckdb-download instead of rebuilding the bundled DuckDB from source.
 # Without it, every invocation can spend many minutes compiling DuckDB.
-cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test config_defaults
+cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test config_with_valid_env
 ```
 
 **Linting a single component:**

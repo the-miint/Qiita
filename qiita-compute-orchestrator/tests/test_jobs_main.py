@@ -157,6 +157,24 @@ def test_flatten_params_merges_scalars_and_inputs():
     assert flat == {"fastq_path": "/data/in.fa", "reference_idx": 7, "work_ticket_idx": 99}
 
 
+def test_flatten_native_inputs_block_scope_injects_no_scalar():
+    """A `block`-scoped ticket flattens WITHOUT any scope scalar — a block
+    spans many prep_samples, so the native jobs read prep_sample_idx per-row
+    from the reads parquet rather than from an injected scalar. The block arm
+    exists in SCOPE_SCALARS_BY_KIND (as an empty set) purely so
+    `flatten_native_inputs` doesn't reject the ticket as an unknown kind; the
+    result carries only the step inputs and the always-on work_ticket_idx."""
+    from qiita_compute_orchestrator.jobs import flatten_native_inputs
+
+    flat = flatten_native_inputs(
+        {"reads": "/scratch/900/reads.parquet"},
+        step_name="qc",
+        scope_target={"kind": "block", "block_idx": 5},
+        work_ticket_idx=900,
+    )
+    assert flat == {"reads": "/scratch/900/reads.parquet", "work_ticket_idx": 900}
+
+
 @pytest.mark.parametrize("reserved_key", sorted(RESERVED_INPUT_KEYS))
 def test_flatten_params_rejects_reserved_key_collision(reserved_key):
     """If the workflow YAML's `inputs:` list happens to declare a name
