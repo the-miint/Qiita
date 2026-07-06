@@ -633,6 +633,13 @@ the `no-changelog` label).
   shared base DB unchanged, leaving the integration tier and single-test runs
   untouched. Local Docker harness: DB suite 96.6s → 29.8s (3.2×), 1979/1979 pass
   in both modes. (#253)
+- **CI/test Postgres runs with durability off** (`fsync`, `synchronous_commit`,
+  `full_page_writes` all `off`) in both harnesses — the Docker compose cluster
+  (`tests/_postgres/docker-compose.yml`) and the macOS host-postgres CI action.
+  The cluster is ephemeral and discarded after each run, so per-commit WAL fsync
+  buys nothing but latency; the write-heavy DB suite otherwise serializes on
+  disk sync across xdist workers (pronounced on the macOS runner's single brew
+  instance). (#253)
 - **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
   required and must be absolute (previously optional, falling back to
   `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /

@@ -50,6 +50,15 @@ runs:
         if [ "${{ inputs.ducklake }}" = "true" ]; then
           psql -d postgres -c "CREATE DATABASE qiita_ducklake OWNER qiita;"
         fi
+        # Durability off for this ephemeral CI cluster — mirrors the docker
+        # harness (tests/_postgres/docker-compose.yml). fsync / full_page_writes
+        # / synchronous_commit are all SIGHUP-reloadable, so ALTER SYSTEM +
+        # pg_reload_conf() applies them without a restart. The write-heavy DB
+        # suite otherwise serializes on WAL fsync across xdist workers.
+        psql -d postgres -c "ALTER SYSTEM SET fsync = off;"
+        psql -d postgres -c "ALTER SYSTEM SET synchronous_commit = off;"
+        psql -d postgres -c "ALTER SYSTEM SET full_page_writes = off;"
+        psql -d postgres -c "SELECT pg_reload_conf();"
 
     - name: Configure host-postgres env
       shell: bash
