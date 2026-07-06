@@ -640,6 +640,13 @@ the `no-changelog` label).
   buys nothing but latency; the write-heavy DB suite otherwise serializes on
   disk sync across xdist workers (pronounced on the macOS runner's single brew
   instance). (#253)
+- **JWKS / loopback test harnesses shut down promptly.** `HTTPServer.serve_forever`
+  defaults to a 0.5s shutdown-poll interval, so every auth/CLI test taking one of
+  these harnesses (the shared `testing/jwks.py`, `test_oidc.py`'s local harness,
+  and `test_cli_login.py`'s loopback fixture — ~120 tests) paid ~0.5s of pure
+  teardown wait. Dropped to 10ms. This was the single largest repeated cost in
+  `--durations`; the serial control-plane suite falls ~95s → ~34s and the
+  parallel run ~30s → ~9s locally. (#253)
 - **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
   required and must be absolute (previously optional, falling back to
   `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /
