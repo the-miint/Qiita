@@ -635,6 +635,25 @@ the `no-changelog` label).
   carried over verbatim and each module's public-name set is a superset of the
   original, so no consumer needed editing. No env var, migration, scope, route,
   or wire change. (#248)
+- **Control-plane test suite parallelized and de-latencied.** Several changes so
+  the ~1980 control-plane tests stop dominating CI wall-clock: (1) the
+  `test-control-plane-with-db` / `-without-db` targets run under `pytest-xdist`
+  (`-n auto --dist worksteal`) — the `postgres_url` fixture is now xdist-aware,
+  DROP+CREATEing and migrating a per-worker `qiita_test_<worker>` DB (from
+  `template0`, so concurrent creates don't race on a shared template), while
+  serial runs (no `PYTEST_XDIST_WORKER`) keep the shared base DB, leaving the
+  integration tier and single-test runs untouched; `worksteal` keeps an
+  end-of-run block of slow DB tests from stranding on one idle-surrounded worker.
+  (2) The JWKS / loopback test harnesses pass `poll_interval=0.01` to
+  `HTTPServer.serve_forever`, cutting a ~0.5s-per-test shutdown wait (the 0.5s
+  default) that ~120 auth/CLI tests each paid. Local Docker harness: serial
+  suite ~95s → ~34s, parallel run ~30s → ~9s; 1979/1979 pass in both modes. (#253)
+- **CI runs the macOS matrix leg only on `main`, not on PRs.** macOS runners are
+  ~6-15× slower than Ubuntu for the test suite and set the whole PR run's
+  wall-clock, while the deploy target is Linux. A `config` job now emits the
+  matrix OS list per event — Ubuntu-only for `pull_request`, Ubuntu + macOS for
+  `push` to `main` — so PR feedback is fast and macOS still gates every merge.
+  (#253)
 - **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
   required and must be absolute (previously optional, falling back to
   `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /
