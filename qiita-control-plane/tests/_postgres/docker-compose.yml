@@ -1,18 +1,6 @@
 services:
   postgres:
     image: postgres:17
-    # Durability off: this is an ephemeral CI/test cluster, so fsync and WAL
-    # full-page writes buy nothing but per-commit disk-sync latency — which
-    # serializes the write-heavy DB suite across xdist workers on one instance.
-    # Safe to lose on crash; the cluster is thrown away after the run.
-    command:
-      - postgres
-      - -c
-      - fsync=off
-      - -c
-      - synchronous_commit=off
-      - -c
-      - full_page_writes=off
     environment:
       POSTGRES_USER: qiita
       POSTGRES_PASSWORD: qiita
