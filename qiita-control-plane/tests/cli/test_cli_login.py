@@ -38,7 +38,10 @@ def loopback_server():
     result = LoopbackResult()
     server, port = bind_loopback()
     server.RequestHandlerClass = loopback_handler_factory(result)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    # poll_interval bounds how long shutdown() waits for the serve_forever loop
+    # to notice the stop flag; the 0.5s default added ~0.5s to each test's
+    # teardown here.
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
     thread.start()
     try:
         yield server, port, result

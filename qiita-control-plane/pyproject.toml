@@ -45,6 +45,7 @@ qiita = "qiita_control_plane.cli._bootstrap:qiita"
 dev = [
     "pytest>=9",
     "pytest-asyncio>=0.25",
+    "pytest-xdist>=3",
     "httpx>=0.28",
     "ruff>=0.15",
 ]

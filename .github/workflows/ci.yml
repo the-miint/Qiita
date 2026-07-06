@@ -12,11 +12,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which OSes the matrix jobs fan out over, decided per event. macOS runners
+  # are ~6-15× slower than Ubuntu for this suite and dominate PR wall-clock,
+  # while the deploy target is Linux — so PRs run Ubuntu-only for fast feedback
+  # and macOS coverage runs on every push to main (post-merge). Emitted as a
+  # JSON array string for `fromJSON` in each matrix below.
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.os.outputs.os }}
+    steps:
+      - id: os
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest", "macos-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   lint-python:
+    needs: config
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.config.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -30,10 +49,11 @@ jobs:
   # old test-rust -> lint-rust dependency). The one gating change: test-workflows
   # now waits on this whole job (lint + test) rather than the lint alone.
   rust:
+    needs: config
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.config.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -60,11 +80,11 @@ jobs:
       - run: make test-rust
 
   test-python:
-    needs: lint-python
+    needs: [config, lint-python]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.config.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -72,11 +92,11 @@ jobs:
       - run: make test-python
 
   test-control-plane-with-db:
-    needs: lint-python
+    needs: [config, lint-python]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.config.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -86,11 +106,11 @@ jobs:
       - run: make test-control-plane-with-db
 
   test-integration:
-    needs: [test-python, rust]
+    needs: [config, test-python, rust]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.config.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
