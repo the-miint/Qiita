@@ -34,6 +34,33 @@ def resolve_postgres_url() -> str:
     return os.environ.get("QIITA_TEST_POSTGRES_URL", POSTGRES_URL_DEFAULT)
 
 
+def _run_on_fresh_loop(coro) -> None:
+    """Run `coro` on its own short-lived event loop.
+
+    The provisioning fixtures below are sync but need asyncpg; use a private
+    loop so we never touch the session-scoped loop pytest-asyncio manages for
+    the async fixtures/tests.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _worker_db_urls(base_url: str, worker: str) -> tuple[str, str, str]:
+    """Derive (admin_url, worker_db_name, worker_url) from `base_url`.
+
+    The admin URL targets the always-present `postgres` maintenance DB; both
+    derived URLs keep host/port/user/password/query (sslmode) from the base.
+    """
+    parsed = urlparse(base_url)
+    worker_db = f"{parsed.path.lstrip('/')}_{worker}"
+    admin_url = urlunparse(parsed._replace(path="/postgres"))
+    worker_url = urlunparse(parsed._replace(path=f"/{worker_db}"))
+    return admin_url, worker_db, worker_url
+
+
 def _provision_worker_database(base_url: str, worker: str) -> str:
     """Return `base_url` with a per-xdist-worker database, created fresh.
 
@@ -51,30 +78,43 @@ def _provision_worker_database(base_url: str, worker: str) -> str:
     CREATEDB — the test `qiita` role is a superuser in both harnesses (docker
     `POSTGRES_USER` and the macOS host-postgres fixture's `WITH SUPERUSER`).
     """
-    parsed = urlparse(base_url)
-    base_db = parsed.path.lstrip("/")
-    worker_db = f"{base_db}_{worker}"
-    # Connect to the always-present `postgres` maintenance DB to (re)create the
-    # worker DB; keep host/port/user/password/query (sslmode) from the base URL.
-    admin_url = urlunparse(parsed._replace(path="/postgres"))
+    admin_url, worker_db, worker_url = _worker_db_urls(base_url, worker)
 
     async def _recreate() -> None:
         conn = await asyncpg.connect(admin_url)
         try:
             await conn.execute(f'DROP DATABASE IF EXISTS "{worker_db}" WITH (FORCE)')
-            await conn.execute(f'CREATE DATABASE "{worker_db}"')
+            # TEMPLATE template0, not the default template1: no one can connect
+            # to template0, so N workers running CREATE DATABASE concurrently
+            # can't fail with "source database template1 is being accessed by
+            # other users" (Postgres refuses to copy a template while another
+            # backend is attached to it).
+            await conn.execute(f'CREATE DATABASE "{worker_db}" TEMPLATE template0')
         finally:
             await conn.close()
 
-    # Own, short-lived loop so this sync fixture doesn't disturb the
-    # session-scoped loop pytest-asyncio manages for the async fixtures/tests.
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(_recreate())
-    finally:
-        loop.close()
+    _run_on_fresh_loop(_recreate())
+    return worker_url
 
-    return urlunparse(parsed._replace(path=f"/{worker_db}"))
+
+def _drop_worker_database(base_url: str, worker: str) -> None:
+    """Drop a per-worker database at session end.
+
+    Drop-at-start (in `_provision_worker_database`) already reclaims a same-named
+    DB from a crashed prior run; this end-of-session drop keeps a *persistent*
+    host Postgres (`QIITA_USE_HOST_POSTGRES=1`) from accumulating `qiita_test_gwN`
+    across clean runs at ever-larger worker counts.
+    """
+    admin_url, worker_db, _ = _worker_db_urls(base_url, worker)
+
+    async def _drop() -> None:
+        conn = await asyncpg.connect(admin_url)
+        try:
+            await conn.execute(f'DROP DATABASE IF EXISTS "{worker_db}" WITH (FORCE)')
+        finally:
+            await conn.close()
+
+    _run_on_fresh_loop(_drop())
 
 
 def run_migrations(postgres_url: str, migrations_dir: Path) -> None:
@@ -109,15 +149,19 @@ def run_migrations(postgres_url: str, migrations_dir: Path) -> None:
 
 
 @pytest.fixture(scope="session")
-def postgres_url() -> str:
+def postgres_url():
     base = resolve_postgres_url()
     # `pytest-xdist` sets PYTEST_XDIST_WORKER (gw0, gw1, …) in each worker
     # process; give each its own database so parallel workers never share
     # catalog state. Unset (serial run) → the shared base DB, unchanged.
     worker = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker:
-        return _provision_worker_database(base, worker)
-    return base
+    if not worker:
+        yield base
+        return
+    yield _provision_worker_database(base, worker)
+    # Session-end cleanup runs after `postgres_pool` has closed (reverse
+    # dependency order), so nothing is attached to the worker DB.
+    _drop_worker_database(base, worker)
 
 
 @pytest.fixture(scope="session")

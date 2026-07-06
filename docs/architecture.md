@@ -954,11 +954,11 @@ test-common: build-common
 	cd qiita-common && uv run pytest
 
 test-control-plane-without-db: build-control-plane
-	cd qiita-control-plane && uv run pytest -n auto -m 'not db'
+	cd qiita-control-plane && uv run pytest -n auto --dist worksteal -m 'not db'
 
 test-control-plane-with-db: build-control-plane $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
-	  ((cd qiita-control-plane && uv run pytest -n auto); PY_EC=$$?; \
+	  ((cd qiita-control-plane && uv run pytest -n auto --dist worksteal); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$PY_EC)
 

@@ -106,17 +106,19 @@ test-common: build-common
 # `pytestmark = pytest.mark.db`) and are excluded here; run them via
 # `make test-control-plane-with-db`.
 test-control-plane-without-db: build-control-plane
-	cd qiita-control-plane && uv run pytest -n auto -m 'not db'
+	cd qiita-control-plane && uv run pytest -n auto --dist worksteal -m 'not db'
 
 # Run the full control-plane suite, including DB-bound tests. Brings up
 # Postgres + applies dbmate migrations; tears down on exit. Set
 # QIITA_USE_HOST_POSTGRES=1 to skip Docker bring-up and use a host Postgres.
 # `-n auto` fans the suite across xdist workers; each worker provisions its own
 # `qiita_test_<worker>` database (see testing/postgres.py) so they don't share
-# catalog state.
+# catalog state. `--dist worksteal` lets an idle worker pull queued tests from a
+# busy one, avoiding an end-of-run straggler where the default `load` scheduler
+# strands a block of slow DB tests on a single worker.
 test-control-plane-with-db: build-control-plane $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
-	  ((cd qiita-control-plane && uv run pytest -n auto); PY_EC=$$?; \
+	  ((cd qiita-control-plane && uv run pytest -n auto --dist worksteal); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$PY_EC)
 

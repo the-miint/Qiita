@@ -50,8 +50,8 @@ class JwksHarness:
         self._server = HTTPServer((LOOPBACK_HOST, 0), self._make_handler())
         self.port = self._server.server_address[1]
         # poll_interval bounds how long shutdown() waits for the serve_forever
-        # loop to notice the stop flag; the 0.5s default added ~0.5s to every
-        # teardown, the dominant repeated cost across this file's ~29 tests.
+        # loop to notice the stop flag; the 0.5s default added ~0.5s of pure
+        # wall-clock wait to every teardown that takes this fixture.
         self._thread = threading.Thread(
             target=self._server.serve_forever, args=(0.01,), daemon=True
         )

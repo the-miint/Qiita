@@ -47,9 +47,9 @@ class JwksHarness:
         self.port = self._server.server_address[1]
         # poll_interval bounds how long shutdown() blocks waiting for the
         # serve_forever loop to observe the stop flag. The 0.5s default added
-        # ~0.5s to every teardown — with ~50 tests taking this fixture, the
-        # dominant repeated cost in --durations, and pure wall-clock wait that
-        # neither faster CPUs nor more xdist workers shrink. 10ms is plenty.
+        # ~0.5s of pure wall-clock wait to every teardown that takes this
+        # fixture — wait that neither faster CPUs nor more xdist workers shrink.
+        # 10ms is plenty.
         self._thread = threading.Thread(
             target=self._server.serve_forever, args=(0.01,), daemon=True
         )
