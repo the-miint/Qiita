@@ -9,10 +9,12 @@ filesystem from its own location, which works regardless of how this package
 is installed).
 """
 
+import asyncio
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 import pytest
@@ -30,6 +32,49 @@ POSTGRES_URL_DEFAULT = "postgresql://qiita:qiita@localhost:5433/qiita_test?sslmo
 def resolve_postgres_url() -> str:
     """Return the test database URL, honoring QIITA_TEST_POSTGRES_URL."""
     return os.environ.get("QIITA_TEST_POSTGRES_URL", POSTGRES_URL_DEFAULT)
+
+
+def _provision_worker_database(base_url: str, worker: str) -> str:
+    """Return `base_url` with a per-xdist-worker database, created fresh.
+
+    Under `pytest -n` each worker is a separate process that would otherwise
+    share the single `qiita_test` database — and the session-scoped fixtures
+    (fixed-name principals in sessions.py, the dbmate migration run below) are
+    idempotent across *sequential* sessions but race when N workers hit one DB
+    at once. So give each worker its own database (`qiita_test_gw0`, …): the
+    connection string is fully injectable, and `_run_db_migrations` /
+    `postgres_pool` already derive everything from this fixture's return value,
+    so the rest of the suite needs no per-worker awareness.
+
+    DROP+CREATE (FORCE, PG13+) guarantees a clean catalog per session so a
+    prior run's rows can't leak in. Requires the connecting role to have
+    CREATEDB — the test `qiita` role is a superuser in both harnesses (docker
+    `POSTGRES_USER` and the macOS host-postgres fixture's `WITH SUPERUSER`).
+    """
+    parsed = urlparse(base_url)
+    base_db = parsed.path.lstrip("/")
+    worker_db = f"{base_db}_{worker}"
+    # Connect to the always-present `postgres` maintenance DB to (re)create the
+    # worker DB; keep host/port/user/password/query (sslmode) from the base URL.
+    admin_url = urlunparse(parsed._replace(path="/postgres"))
+
+    async def _recreate() -> None:
+        conn = await asyncpg.connect(admin_url)
+        try:
+            await conn.execute(f'DROP DATABASE IF EXISTS "{worker_db}" WITH (FORCE)')
+            await conn.execute(f'CREATE DATABASE "{worker_db}"')
+        finally:
+            await conn.close()
+
+    # Own, short-lived loop so this sync fixture doesn't disturb the
+    # session-scoped loop pytest-asyncio manages for the async fixtures/tests.
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_recreate())
+    finally:
+        loop.close()
+
+    return urlunparse(parsed._replace(path=f"/{worker_db}"))
 
 
 def run_migrations(postgres_url: str, migrations_dir: Path) -> None:
@@ -65,7 +110,14 @@ def run_migrations(postgres_url: str, migrations_dir: Path) -> None:
 
 @pytest.fixture(scope="session")
 def postgres_url() -> str:
-    return resolve_postgres_url()
+    base = resolve_postgres_url()
+    # `pytest-xdist` sets PYTEST_XDIST_WORKER (gw0, gw1, …) in each worker
+    # process; give each its own database so parallel workers never share
+    # catalog state. Unset (serial run) → the shared base DB, unchanged.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker:
+        return _provision_worker_database(base, worker)
+    return base
 
 
 @pytest.fixture(scope="session")
