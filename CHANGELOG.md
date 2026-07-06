@@ -635,6 +635,48 @@ the `no-changelog` label).
   carried over verbatim and each module's public-name set is a superset of the
   original, so no consumer needed editing. No env var, migration, scope, route,
   or wire change. (#248)
+- **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
+  required and must be absolute (previously optional, falling back to
+  `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /
+  `DUCKLAKE_CATALOG_CONNSTR` / `PATH_SCRATCH`. A forgotten value used to silently
+  root durable DuckLake Parquet under `/tmp` (lost on reboot, never backed up);
+  the instance now refuses to start instead. `.env.data-plane.example` promotes
+  it to the required block. (#246)
+- **Data plane `register_files` is now catalog-atomic.** The per-file
+  `ducklake_add_data_files` registration loop is wrapped in a single DuckLake
+  transaction (BEGIN/COMMIT/ROLLBACK), matching the `delete_*` actions — a
+  mid-loop failure rolls back every prior registration rather than leaving a
+  reference half-registered in the catalog. Filesystem moves are intentionally
+  not rolled back (dest names are ticket-unique and `move_file` refuses to
+  overwrite, so a failure leaves only inert orphan Parquet). Adds end-to-end,
+  filename-traversal, and do_action dispatch-trust tests. (#246)
+- **Data plane offloads blocking DoAction work off the async runtime.** The
+  `register_files` / `delete_reference` / `delete_mask` / `delete_pool_reads`
+  arms ran their blocking DuckLake transactions inline on the tonic async
+  worker; each now runs on `tokio::task::spawn_blocking` (mirroring
+  `export_read` / `count_masked`), so a long registration or delete can't starve
+  the async runtime and stall concurrent requests. Each helper opens and drops
+  its own DuckDB connection, so nothing non-`Send` crosses the task boundary.
+  (#246)
+- **Data plane DoPut writes Parquet off the async runtime.** The DoPut handler
+  interleaved blocking Parquet write / `fsync` / `chmod` with awaiting the live
+  Flight stream, running file I/O inline on the tonic async worker. It now
+  bridges the two with a bounded mpsc channel: an async loop pulls decoded
+  batches off the stream and forwards them to a `spawn_blocking` writer task that
+  owns the file and does all blocking I/O. The bounded channel backpressures the
+  network when the writer falls behind, so peak memory stays bounded (same
+  posture as the DoGet streaming path). Behavior (durability fsync, `create_new`
+  concurrent-upload guard, partial-file cleanup on error, sha256/row-count
+  reporting) is unchanged. (#246)
+- **Data plane DoAction replay is a classified, tripwired accepted risk.** Flight
+  tickets have no single-use ledger, so a still-valid token can be replayed
+  within its lifetime; this is accepted because every DoAction is idempotent or
+  otherwise replay-safe. A new `REPLAY_SAFE_ACTIONS` registry now gates the
+  `do_action` dispatcher (an unlisted action is rejected), with a test pinning
+  the registry to the dispatcher's arms and an anchored `# replay:` comment — so
+  a newly-added action fails the build until it is consciously classified
+  replay-safe. Documented in `docs/auth.md#ticket-replay` and the CLAUDE.md
+  data-plane section. (#246)
 - A human PAT's effective scopes are now intersected with the principal's **current** role ceiling at token-resolve time, so a role downgrade (or a shrunk `ROLE_IMPLIED_SCOPES`) immediately narrows an already-minted token on scope-only-gated routes without revocation. Service-account tokens are unaffected (their ceiling is fixed, not role-derived). Note: this also narrows any human token that was minted *above* its role ceiling via low-level tooling that skips the mint-time ceiling check — such a token silently loses the out-of-ceiling scopes at the next resolve. (#242)
 - Auth integer env-knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) are now validated at boot instead of parsed with a bare `int()` — a non-int or non-positive value fails loudly (leeway may be 0). (#241)
 - `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)

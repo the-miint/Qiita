@@ -13,8 +13,10 @@ pub struct Settings {
     /// DuckLake catalog connection string (libpq format).
     /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
     pub ducklake_catalog_connstr: String,
-    /// Directory where DuckLake stores Parquet data files.
-    /// Derived as `PATH_PERSISTENT/ducklake`.
+    /// Directory where DuckLake stores Parquet data files (system-of-record
+    /// state). Derived as `PATH_PERSISTENT/ducklake`; `PATH_PERSISTENT` is a
+    /// required, absolute env var (no dev fallback — a missing one must fail
+    /// fast rather than silently rooting durable data under `/tmp`).
     pub path_persistent_ducklake: String,
     /// Root directory under which DoPut writes staged Parquet uploads.
     /// Derived as `PATH_SCRATCH/staging`; each upload lands at
@@ -50,14 +52,20 @@ impl Settings {
 
         let ducklake_catalog_connstr = std::env::var("DUCKLAKE_CATALOG_CONNSTR")
             .map_err(|_| "DUCKLAKE_CATALOG_CONNSTR is required but not set".to_string())?;
-        // DuckLake parquet lives at PATH_PERSISTENT/ducklake. PATH_PERSISTENT
-        // is optional in dev: it falls back to $TMPDIR/qiita (then /tmp/qiita),
-        // a tmp-rooted default and never a production-looking path.
-        let path_persistent = std::env::var("PATH_PERSISTENT").unwrap_or_else(|_| {
-            let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{base}/qiita")
-        });
-        let path_persistent_ducklake = format!("{path_persistent}/ducklake");
+        // DuckLake parquet lives at PATH_PERSISTENT/ducklake — this is the
+        // system-of-record store, so PATH_PERSISTENT is required + absolute
+        // (same fail-fast posture as HMAC_SECRET_KEY / DUCKLAKE_CATALOG_CONNSTR /
+        // PATH_SCRATCH). It previously fell back to $TMPDIR/qiita, which meant a
+        // forgotten env var in production silently landed durable lake data in
+        // /tmp — lost on reboot, never backed up. Fail loudly instead.
+        let path_persistent_raw = std::env::var("PATH_PERSISTENT")
+            .map_err(|_| "PATH_PERSISTENT is required but not set".to_string())?;
+        if !std::path::Path::new(&path_persistent_raw).is_absolute() {
+            return Err(format!(
+                "PATH_PERSISTENT must be an absolute path, got {path_persistent_raw:?}"
+            ));
+        }
+        let path_persistent_ducklake = format!("{path_persistent_raw}/ducklake");
 
         // DoPut uploads stage under PATH_SCRATCH/staging. PATH_SCRATCH is
         // required + absolute (same posture as the control plane); the
