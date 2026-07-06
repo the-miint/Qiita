@@ -622,6 +622,17 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Control-plane test suite runs in parallel via `pytest-xdist`.** The
+  `test-control-plane-with-db` and `test-control-plane-without-db` targets now
+  pass `-n auto`; the ~1980 control-plane tests previously ran serially, making
+  the macOS `test-control-plane-with-db` CI job (~800s) the whole run's
+  critical path. The DB tier shares one `qiita_test` database whose
+  session-scoped fixtures race under concurrency, so the `postgres_url` fixture
+  is now xdist-aware — each worker DROP+CREATEs and migrates its own
+  `qiita_test_<worker>` database; serial runs (no `PYTEST_XDIST_WORKER`) use the
+  shared base DB unchanged, leaving the integration tier and single-test runs
+  untouched. Local Docker harness: DB suite 96.6s → 29.8s (3.2×), 1979/1979 pass
+  in both modes. (#253)
 - **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
   required and must be absolute (previously optional, falling back to
   `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /
