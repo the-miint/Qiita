@@ -282,7 +282,8 @@ async def test_delete_reference_gcs_orphan_genome_keeps_shared(client, postgres_
 
     async def _genome(suffix):
         return await postgres_pool.fetchval(
-            "INSERT INTO qiita.genome (source, source_id) VALUES ('test', $1) RETURNING genome_idx",
+            "INSERT INTO qiita.genome (source, source_id)"
+            " VALUES ('genbank', $1) RETURNING genome_idx",
             f"{suffix}-{uuid.uuid4()}",
         )
 

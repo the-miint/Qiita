@@ -148,6 +148,28 @@ class ReadMaskReason(StrEnum):
     HOST_MINIMAP2 = "host_minimap2"
 
 
+class GenomeSource(StrEnum):
+    """Controlled vocabulary for a genome's provenance (`qiita.genome.source`).
+
+    `genbank` / `refseq` are the two NCBI assembly repositories; `qiita` marks a
+    genome derived from a qiita sample itself — those rows additionally carry
+    the originating `prep_sample_idx` on `qiita.genome` (enforced by the
+    `genome_qiita_origin_check` biconditional CHECK: prep_sample_idx set iff
+    source = 'qiita'). Extend deliberately (a new migration + a new value here);
+    ingest rejects anything outside the set.
+
+    Backs the `qiita.genome.source` column, which is plain `TEXT` + `CHECK`
+    (`genome_source_check`), NOT a Postgres `CREATE TYPE ... AS ENUM`. Per the
+    enum-parity carve-out in CLAUDE.md, it has no `ENUM_PAIRS` entry and is out
+    of scope for the parity test; the light `test_genome_schema` CHECK↔StrEnum
+    guard catches drift instead. Keep this set and the CHECK list in sync by hand.
+    """
+
+    GENBANK = "genbank"
+    REFSEQ = "refseq"
+    QIITA = "qiita"
+
+
 class TerminologyStatus(StrEnum):
     """Lifecycle states of a terminology row.
 
@@ -343,7 +365,7 @@ class ReferenceDeleteResponse(BaseModel):
 # genome data still gets the validator's protection.
 class FeatureHashEntry(BaseModel):
     sequence_hash: UUID
-    genome_source: str | None = None
+    genome_source: GenomeSource | None = None
     genome_source_id: str | None = None
 
     @model_validator(mode="after")

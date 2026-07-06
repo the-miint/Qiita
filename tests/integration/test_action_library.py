@@ -50,6 +50,23 @@ def _write_genome_map(path, entries: list[tuple[str, str | None, str | None]]) -
         conn.execute(f"COPY gm TO '{path}' (FORMAT PARQUET)")
 
 
+def _write_genome_map_with_prep(
+    path, entries: list[tuple[str, str | None, str | None, int | None]]
+) -> None:
+    """Write the qiita-origin genome-map variant, with the extra
+    (read_id, genome_source, genome_source_id, prep_sample_idx) column.
+    prep_sample_idx is NULL for external genomes and the originating sample
+    for source='qiita'."""
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE gm "
+            "(read_id VARCHAR, genome_source VARCHAR, genome_source_id VARCHAR, "
+            "prep_sample_idx BIGINT)"
+        )
+        conn.executemany("INSERT INTO gm VALUES (?, ?, ?, ?)", entries)
+        conn.execute(f"COPY gm TO '{path}' (FORMAT PARQUET)")
+
+
 def _read_feature_map(path) -> dict[str, int]:
     """Read a feature_map.parquet into a {sequence_hash → feature_idx} dict.
     Test assertions key on string-form UUIDs (`str(uuid.UUID(...))`), so the
@@ -169,7 +186,7 @@ async def test_library_mint_features_writes_genome_associations(
     manifest = tmp_path / "manifest.parquet"
     _write_manifest(manifest, hashes)
 
-    genome_source = f"src-{uuid.uuid4()}"
+    genome_source = "genbank"
     source_ids = [f"GENOME_{uuid.uuid4()}" for _ in range(2)]
     genome_map = tmp_path / "genome_map.parquet"
     _write_genome_map(
@@ -314,7 +331,7 @@ async def test_library_mint_features_genome_writes_are_idempotent(
     manifest = tmp_path / "manifest.parquet"
     _write_manifest(manifest, [h])
 
-    src = f"src-{uuid.uuid4()}"
+    src = "refseq"
     sid = f"GID-{uuid.uuid4()}"
     genome_map = tmp_path / "genome_map.parquet"
     _write_genome_map(genome_map, [("seq0", src, sid)])
@@ -407,9 +424,213 @@ async def test_library_mint_features_genome_map_with_null_source_id_fails(
     _write_manifest(manifest, [h])
 
     genome_map = tmp_path / "genome_map.parquet"
-    _write_genome_map(genome_map, [("seq0", "somesrc", None)])
+    # Valid vocabulary source so the NOT NULL on source_id is what bites (the
+    # vocab check would otherwise reject an unknown source first).
+    _write_genome_map(genome_map, [("seq0", "genbank", None)])
 
     with pytest.raises(asyncpg.NotNullViolationError):
         await LIBRARY[LibraryPrimitive.MINT_FEATURES](
             postgres_pool, manifest, tmp_path, genome_map
         )
+
+
+async def test_library_mint_features_rejects_unknown_genome_source(
+    postgres_pool, tmp_path
+):
+    """A genome_source outside the GenomeSource vocabulary is rejected up
+    front (fail-fast) — before any qiita.genome row is written."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+
+    h = _md5_uuid("BAD_SRC")
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [h])
+
+    sid = f"GID-{uuid.uuid4()}"
+    genome_map = tmp_path / "genome_map.parquet"
+    _write_genome_map(genome_map, [("seq0", "ncbi", sid)])
+
+    with pytest.raises(ValueError, match="vocabulary"):
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+            postgres_pool, manifest, tmp_path, genome_map
+        )
+
+    leaked = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.genome WHERE source_id = $1", sid
+    )
+    assert leaked == 0
+
+
+async def test_library_mint_features_qiita_source_records_prep_sample(
+    postgres_pool, tmp_path, human_admin_session
+):
+    """A qiita-derived genome (source='qiita') records the exact originating
+    prep_sample_idx on qiita.genome."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+    )
+
+    _, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=human_admin_session["principal_idx"]
+    )
+
+    h = _md5_uuid("QIITA_SRC")
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [h])
+
+    sid = f"QGENOME-{uuid.uuid4()}"
+    genome_map = tmp_path / "genome_map.parquet"
+    _write_genome_map_with_prep(genome_map, [("seq0", "qiita", sid, prep_sample_idx)])
+
+    await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path, genome_map
+    )
+
+    recorded = await postgres_pool.fetchval(
+        "SELECT prep_sample_idx FROM qiita.genome"
+        " WHERE source = 'qiita' AND source_id = $1",
+        sid,
+    )
+    assert recorded == prep_sample_idx
+
+
+async def test_library_mint_features_qiita_source_without_prep_sample_fails(
+    postgres_pool, tmp_path
+):
+    """source='qiita' with no prep_sample_idx violates the qiita-origin rule
+    (a 3-column map, prep_sample_idx tolerated as NULL) and is rejected."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+
+    h = _md5_uuid("QIITA_NOPREP")
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [h])
+
+    sid = f"QGENOME-{uuid.uuid4()}"
+    genome_map = tmp_path / "genome_map.parquet"
+    _write_genome_map(genome_map, [("seq0", "qiita", sid)])
+
+    with pytest.raises(ValueError, match="origin"):
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+            postgres_pool, manifest, tmp_path, genome_map
+        )
+
+    leaked = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.genome WHERE source_id = $1", sid
+    )
+    assert leaked == 0
+
+
+async def test_library_mint_features_non_qiita_with_prep_sample_fails(
+    postgres_pool, tmp_path, human_admin_session
+):
+    """A non-qiita source (genbank) that cites a prep_sample_idx violates the
+    qiita-origin rule — external genomes have no originating qiita sample."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+    )
+
+    _, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=human_admin_session["principal_idx"]
+    )
+
+    h = _md5_uuid("GENBANK_PREP")
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [h])
+
+    sid = f"GID-{uuid.uuid4()}"
+    genome_map = tmp_path / "genome_map.parquet"
+    _write_genome_map_with_prep(genome_map, [("seq0", "genbank", sid, prep_sample_idx)])
+
+    with pytest.raises(ValueError, match="origin"):
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+            postgres_pool, manifest, tmp_path, genome_map
+        )
+
+    leaked = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.genome WHERE source_id = $1", sid
+    )
+    assert leaked == 0
+
+
+async def test_library_mint_features_shared_genome_across_features(
+    postgres_pool, tmp_path
+):
+    """Many features of one assembly share a (source, source_id) in one batch;
+    the upsert must dedupe the conflict target rather than crash on it
+    (Postgres forbids one ON CONFLICT DO UPDATE touching a row twice)."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+
+    hashes = [_md5_uuid(f"SHARED_G{i}") for i in range(2)]
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, hashes)
+
+    sid = f"GCF-{uuid.uuid4()}"
+    genome_map = tmp_path / "genome_map.parquet"
+    _write_genome_map(genome_map, [("seq0", "genbank", sid), ("seq1", "genbank", sid)])
+
+    feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path, genome_map
+    )
+    mapping = _read_feature_map(feature_map_path)
+    expected = sorted(mapping[str(h)] for h in hashes)
+    rows = await postgres_pool.fetch(
+        "SELECT fg.feature_idx, g.genome_idx FROM qiita.feature_genome fg"
+        " JOIN qiita.genome g USING (genome_idx)"
+        " WHERE g.source = 'genbank' AND g.source_id = $1"
+        " ORDER BY fg.feature_idx",
+        sid,
+    )
+    assert [r["feature_idx"] for r in rows] == expected
+    assert len({r["genome_idx"] for r in rows}) == 1  # one shared genome row
+
+
+async def test_library_mint_features_qiita_reingest_updates_prep_sample(
+    postgres_pool, tmp_path, human_admin_session
+):
+    """Re-ingesting a qiita genome with a changed prep_sample_idx rewrites the
+    stored origin (the upsert's `DO UPDATE ... prep_sample_idx = EXCLUDED...`)."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+    )
+
+    owner = human_admin_session["principal_idx"]
+    _, prep1 = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=owner
+    )
+    _, prep2 = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=owner
+    )
+
+    h = _md5_uuid("QIITA_REINGEST")
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [h])
+    sid = f"QG-{uuid.uuid4()}"
+
+    async def _current_prep():
+        return await postgres_pool.fetchval(
+            "SELECT prep_sample_idx FROM qiita.genome"
+            " WHERE source = 'qiita' AND source_id = $1",
+            sid,
+        )
+
+    gm1 = tmp_path / "gm1.parquet"
+    _write_genome_map_with_prep(gm1, [("seq0", "qiita", sid, prep1)])
+    await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path / "o1", gm1
+    )
+    assert await _current_prep() == prep1
+
+    gm2 = tmp_path / "gm2.parquet"
+    _write_genome_map_with_prep(gm2, [("seq0", "qiita", sid, prep2)])
+    await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path / "o2", gm2
+    )
+    assert await _current_prep() == prep2

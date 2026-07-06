@@ -15,6 +15,13 @@ the `no-changelog` label).
 
 ### Added
 
+- **`genome_source` controlled vocabulary + qiita-origin sample link.** `qiita.genome.source`
+  is now a closed vocabulary (`genbank`, `refseq`, `qiita`), enforced both up front at ingest
+  (fail-fast in `_associate_genomes`, before any DB write) and by a `CHECK`, mirrored by the new
+  `GenomeSource` `StrEnum`. Qiita-derived genomes (`source='qiita'`) now record the exact
+  originating sample via a new nullable `qiita.genome.prep_sample_idx` (FK to `qiita.prep_sample`,
+  required iff the source is `qiita` — a biconditional `CHECK`); the genome-map Parquet gains an
+  optional `prep_sample_idx` column. (#reference-support)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its

@@ -29,7 +29,7 @@ import asyncpg
 import duckdb
 import pyarrow.flight as _flight
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.models import FeatureHashEntry
+from qiita_common.models import FeatureHashEntry, GenomeSource
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action
@@ -107,24 +107,44 @@ async def _write_genome_associations(
     feat_idxs: list[int],
     sources: list[str],
     source_ids: list[str],
+    prep_sample_idxs: list[int | None],
 ) -> None:
     """Batch upsert genomes and write feature_genome junction rows.
 
-    All three lists are positionally aligned: row i links
-    feat_idxs[i] to (sources[i], source_ids[i]). DO UPDATE on the genome
-    upsert guarantees RETURNING fires for every row even when the genome
-    already exists.
+    All four lists are positionally aligned: row i links feat_idxs[i] to
+    (sources[i], source_ids[i]) with originating prep_sample_idxs[i] (NULL for
+    external genomes; the qiita-origin sample for source='qiita'). DO UPDATE on
+    the genome upsert guarantees RETURNING fires for every row even when the
+    genome already exists, and keeps prep_sample_idx current on re-ingest.
     """
     if not feat_idxs:
         return
 
+    # Dedupe to one row per (source, source_id) before the upsert. A genome maps
+    # to many features (a multi-contig assembly; the qiita case: one sample →
+    # one assembly → many contigs, all sharing one source_id), so the same
+    # (source, source_id) recurs across the batch — and Postgres refuses to let
+    # one INSERT ... ON CONFLICT DO UPDATE touch the same conflict target twice
+    # ("cannot affect row a second time"). The dict keeps the last
+    # prep_sample_idx per key (consistent for valid input — a genome has one
+    # origin, already vetted by _validate_genome_map).
+    genome_prep = {
+        (s, sid): prep for s, sid, prep in zip(sources, source_ids, prep_sample_idxs, strict=True)
+    }
+    uniq_sources = [s for s, _ in genome_prep]
+    uniq_source_ids = [sid for _, sid in genome_prep]
+    uniq_preps = list(genome_prep.values())
+
     genome_rows = await conn.fetch(
-        "INSERT INTO qiita.genome (source, source_id)"
-        " SELECT unnest($1::text[]), unnest($2::text[])"
-        " ON CONFLICT (source, source_id) DO UPDATE SET source = EXCLUDED.source"
+        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
+        " SELECT unnest($1::text[]), unnest($2::text[]), unnest($3::bigint[])"
+        " ON CONFLICT (source, source_id)"
+        " DO UPDATE SET source = EXCLUDED.source,"
+        "               prep_sample_idx = EXCLUDED.prep_sample_idx"
         " RETURNING genome_idx, source, source_id",
-        sources,
-        source_ids,
+        uniq_sources,
+        uniq_source_ids,
+        uniq_preps,
     )
     genome_map = {(row["source"], row["source_id"]): row["genome_idx"] for row in genome_rows}
 
@@ -138,26 +158,74 @@ async def _write_genome_associations(
     )
 
 
+def _validate_genome_map(duck: duckdb.DuckDBPyConnection, genome_map_path: Path) -> bool:
+    """Fail-fast validation of the whole genome map before any DB write.
+
+    Returns whether the map carries a `prep_sample_idx` column — external-only
+    maps may omit it (treated as all-NULL). Raises ValueError if any
+    `genome_source` is outside the GenomeSource vocabulary, or if the
+    qiita-origin rule is violated (prep_sample_idx set iff genome_source='qiita').
+    One DISTINCT scan, so a genome-scale map is never materialised.
+    """
+    columns = {
+        c[0]
+        for c in duck.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [str(genome_map_path)]
+        ).description
+    }
+    missing = {"genome_source", "genome_source_id"} - columns
+    if missing:
+        raise ValueError(f"genome_map is missing required column(s): {sorted(missing)}")
+    has_prep = "prep_sample_idx" in columns
+    prep_expr = "prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT)"
+    combos = duck.execute(
+        f"SELECT DISTINCT genome_source, (({prep_expr}) IS NOT NULL) AS has_prep"
+        " FROM read_parquet(?)",
+        [str(genome_map_path)],
+    ).fetchall()
+
+    allowed = {s.value for s in GenomeSource}
+    bad_vocab = {src for src, _ in combos if src not in allowed}
+    if bad_vocab:
+        raise ValueError(
+            "genome_map has genome_source value(s) outside the allowed "
+            f"vocabulary {sorted(allowed)}: {sorted(str(s) for s in bad_vocab)}"
+        )
+    # Reached only when every source is valid (so no NULL sources here).
+    bad_origin = sorted({src for src, has in combos if (src == GenomeSource.QIITA.value) != has})
+    if bad_origin:
+        raise ValueError(
+            "genome_map violates the qiita-origin rule (prep_sample_idx is set "
+            f"iff genome_source='qiita'); offending source(s): {bad_origin}"
+        )
+    return has_prep
+
+
 async def _associate_genomes(
     pool: asyncpg.Pool,
     manifest_path: Path,
     genome_map_path: Path,
     feature_map_path: Path,
 ) -> None:
-    """Write qiita.feature_genome rows for the entries in `genome_map_path`.
+    """Write qiita.feature_genome (and qiita.genome) rows for `genome_map_path`.
 
     DuckDB JOINs the manifest (read_id → sequence_hash) against genome_map
-    (read_id → genome_source, genome_source_id) on read_id, and against the
-    already-written feature_map (sequence_hash → feature_idx) on
+    (read_id → genome_source, genome_source_id[, prep_sample_idx]) on read_id,
+    and against the already-written feature_map (sequence_hash → feature_idx) on
     sequence_hash — so feature_idx is resolved set-side in DuckDB rather than
     from an in-memory Python mapping. Rows whose read_id isn't in the manifest
     are dropped by the INNER JOIN — the genome map may legitimately cover only
     a subset of FASTA reads. Streamed in `_CHUNK_SIZE` batches so a
     genome-scale map never materialises in Python.
+
+    The whole map is validated up front (`_validate_genome_map`) — vocabulary
+    and the qiita-origin rule — so a bad map fails before any DB write.
     """
     with duckdb.connect(":memory:") as duck:
+        has_prep = _validate_genome_map(duck, genome_map_path)
+        prep_select = "g.prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT) AS prep_sample_idx"
         reader = duck.execute(
-            "SELECT fm.feature_idx, g.genome_source, g.genome_source_id"
+            f"SELECT fm.feature_idx, g.genome_source, g.genome_source_id, {prep_select}"
             " FROM read_parquet(?) AS m"
             " JOIN read_parquet(?) AS g USING (read_id)"
             " JOIN read_parquet(?) AS fm USING (sequence_hash)",
@@ -169,8 +237,11 @@ async def _associate_genomes(
                 continue
             sources = batch.column("genome_source").to_pylist()
             source_ids = batch.column("genome_source_id").to_pylist()
+            prep_sample_idxs = batch.column("prep_sample_idx").to_pylist()
             async with pool.acquire() as conn, conn.transaction():
-                await _write_genome_associations(conn, feat_idxs, sources, source_ids)
+                await _write_genome_associations(
+                    conn, feat_idxs, sources, source_ids, prep_sample_idxs
+                )
 
 
 async def _write_membership_rows(

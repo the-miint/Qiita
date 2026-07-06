@@ -270,6 +270,31 @@ def test_feature_hash_entry_rejects_id_without_source():
         )
 
 
+def test_feature_hash_entry_rejects_unknown_genome_source():
+    """genome_source is a GenomeSource controlled vocabulary — an arbitrary
+    string is rejected at the model boundary, not silently accepted."""
+    from qiita_common.models import FeatureHashEntry
+
+    with pytest.raises(ValidationError):
+        FeatureHashEntry(
+            sequence_hash=UUID("a0000000-0000-0000-0000-000000000001"),
+            genome_source="not-a-real-source",
+            genome_source_id="GCF_123",
+        )
+
+
+def test_feature_hash_entry_accepts_vocabulary_genome_source():
+    """A valid vocabulary value coerces to the GenomeSource enum."""
+    from qiita_common.models import FeatureHashEntry, GenomeSource
+
+    entry = FeatureHashEntry(
+        sequence_hash=UUID("a0000000-0000-0000-0000-000000000001"),
+        genome_source="genbank",
+        genome_source_id="GCF_123",
+    )
+    assert entry.genome_source is GenomeSource.GENBANK
+
+
 # --- StepSubmitRequest runtime-selection validator ---------------------------
 # Mirrors WorkflowStep's exactly-one(container, module) rule at the wire
 # boundary. Pydantic raises a 422 at FastAPI deserialization, before any

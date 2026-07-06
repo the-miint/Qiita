@@ -48,6 +48,16 @@ _None yet._
     applies it standalone).
   - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
     extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
+- **genome_source controlled vocabulary + qiita-origin sample.** `make migrate` applies
+  `20260706000000_genome_source_and_origin_sample.sql` (adds nullable `qiita.genome.prep_sample_idx`
+  FK to `qiita.prep_sample`, a `source` vocabulary CHECK, and a biconditional origin CHECK). Both
+  new CHECKs validate **existing** `qiita.genome` rows, so **before** migrating confirm none would
+  violate them: (#reference-support)
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.genome WHERE source NOT IN ('genbank','refseq')"
+  # expect: 0 — any out-of-vocab source must be fixed first, and any pre-existing source='qiita'
+  # row needs its prep_sample_idx backfilled (the new biconditional CHECK requires it).
+  ```
 
 ### 4. Deploy
 
