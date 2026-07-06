@@ -12,6 +12,10 @@ Qiita authenticates three kinds of principal against the control plane:
 
 The data plane does not perform user authentication. It verifies HMAC-signed Arrow Flight tickets issued by the control plane.
 
+### Ticket replay
+
+Flight tickets (DoGet/DoPut/DoAction) are HMAC-authenticated and time-bounded (`MAX_TICKET_LIFETIME`, ~1h) but carry **no single-use ledger** — the data plane holds no store of consumed tokens, so within its lifetime a captured, still-valid ticket can be replayed. This is a **deliberately accepted risk**: a nonce/consumed-token store would add cross-instance shared state to the intentionally-stateless, horizontally-scaled data plane, and it buys little because every DoAction the data plane dispatches is idempotent or otherwise replay-safe — `delete_*` re-delete zero rows, `register_files` fails closed on its ticket-unique dest (`move_file` refuses overwrite), `export_read` re-materializes identical bytes via atomic publish, `count_masked` is read-only, and DoPut's `create_new` rejects a second write to the same `upload_idx`. That property is enforced in code: the `REPLAY_SAFE_ACTIONS` registry gates the `do_action` dispatcher (`qiita-data-plane/src/flight_service.rs`), so a newly-added action is refused until it is consciously classified replay-safe or given replay protection, and a test pins the registry to the dispatcher's handled arms.
+
 ## Schema
 
 Auth extends the existing `qiita.principal` table (introduced by `20260423000000_principals.sql`) rather than creating a parallel users table. The driving invariant is **"every user is a principal, but not every principal is a user."**

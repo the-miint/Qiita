@@ -104,12 +104,26 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 /// contract the buffered path had. A connect/prepare/execute error surfaces as a
 /// single `Err` item, never a silently-truncated empty stream.
 ///
-/// Caveat (pre-existing, shared with the old `.collect()` path): the DuckDB
-/// Arrow iterator's `Item` is a bare `RecordBatch`, not a `Result`, so a failure
-/// that occurs *mid-iteration* (after at least one batch has been sent) cannot
-/// be surfaced — the iterator just terminates early and the consumer sees a
-/// clean EOF after partial data. Only connect/prepare/execute errors (before the
-/// first batch) become an `Err` item.
+/// Caveat — mid-stream truncation is indistinguishable from completion
+/// (pre-existing, shared with the old `.collect()` path, and bounded by the
+/// DuckDB API): the DuckDB Arrow iterator's `Item` is a bare `RecordBatch`, not
+/// a `Result`, so a failure that occurs *mid-iteration* (after at least one
+/// batch has been sent) cannot be surfaced as an error. The iterator simply
+/// terminates early, the channel closes, and the consumer sees a clean EOF —
+/// byte-for-byte identical to a successful, complete stream. A DoGet client
+/// therefore CANNOT tell a truncated result from a whole one on the wire; only
+/// connect/prepare/execute errors, which occur *before* the first batch, become
+/// an `Err` item the client can see.
+///
+/// We accept this rather than work around it: the fix would require the upstream
+/// `duckdb` crate to yield `Result<RecordBatch>` from its Arrow iterator (it does
+/// not today), and there is no in-crate seam to inject a trailing sentinel that
+/// survives the `FlightDataEncoder`. Mid-iteration failures are also rare in
+/// practice — the query is already prepared and executing, and the batches are
+/// read from local/attached storage. Callers that need end-to-end integrity
+/// verify it out-of-band (row counts, digests) rather than trusting stream
+/// termination. If the `duckdb` API ever exposes a fallible per-batch iterator,
+/// revisit this to surface mid-stream errors.
 fn stream_ducklake_batches(
     catalog_connstr: String,
     data_path: String,
@@ -132,6 +146,10 @@ fn stream_ducklake_batches(
             })?;
             let schema = arrow_result.get_schema();
             let mut produced = false;
+            // `arrow_result`'s Item is a bare `RecordBatch`, not a `Result` — a
+            // failure once iteration has begun cannot be observed here; the loop
+            // just ends and the consumer sees a clean EOF (see the fn-level
+            // caveat). Nothing to do about it until the duckdb API is fallible.
             for batch in arrow_result {
                 produced = true;
                 // Receiver dropped (client hung up) — stop early, don't error.
@@ -189,6 +207,42 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "node_index",
     "mask_idx",
     "prep_sample_idx",
+];
+
+/// DoAction variants that are safe to replay — the accepted-risk registry.
+///
+/// Flight action tokens are HMAC-authenticated but carry **no single-use
+/// ledger**: within a token's lifetime (bounded by `MAX_TICKET_LIFETIME`, ~1h)
+/// a captured, still-valid token can be replayed. We deliberately do NOT add a
+/// server-side nonce/consumed-token store — the operational cost of one is not
+/// justified because every action the data plane dispatches is idempotent or
+/// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
+///
+/// - `register_files` — dest names are ticket-unique and `move_file` refuses to
+///   overwrite, so a replay after success fails closed (AlreadyExists), never a
+///   double-registration.
+/// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
+///   `delete_read_mask_block` — logical DELETEs; re-running deletes zero rows.
+/// - `export_read` / `export_read_block` — re-materialize the same sample/block
+///   bytes to the same ticket path via atomic publish; a replay reproduces
+///   identical output.
+/// - `count_masked` / `mask_metrics` — read-only aggregates.
+///
+/// The `do_action` dispatcher rejects any action not in this set, so a **new**
+/// action is refused until it is added here — forcing whoever adds it to
+/// consciously classify it idempotent/replay-safe or give it replay protection
+/// first. `replay_safe_actions_matches_dispatcher` in the tests pins the set to
+/// the dispatcher's handled arms so the two can't drift.
+const REPLAY_SAFE_ACTIONS: &[&str] = &[
+    "register_files",
+    "delete_reference",
+    "delete_mask",
+    "delete_pool_reads",
+    "delete_read_mask_block",
+    "export_read",
+    "export_read_block",
+    "count_masked",
+    "mask_metrics",
 ];
 
 #[tonic::async_trait]
@@ -306,6 +360,23 @@ impl FlightService for QiitaFlightService {
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
 
+        // replay: Flight action tokens are HMAC-authenticated but have NO
+        // single-use ledger — a captured, still-valid token can be replayed
+        // within its lifetime. We accept that risk (see docs/auth.md and the
+        // REPLAY_SAFE_ACTIONS registry) because every arm below is idempotent or
+        // otherwise replay-safe. The registry is the gate: an action absent from
+        // it is rejected here, so a newly-added arm stays unreachable until it
+        // is consciously classified replay-safe (or given replay protection),
+        // and the match's `other =>` arm below is a defensive, unreachable
+        // fail-closed fallback. Keep this set and the match arms in lockstep —
+        // the test `replay_safe_actions_matches_dispatcher` fails otherwise.
+        if !REPLAY_SAFE_ACTIONS.contains(&action.r#type.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "unknown action type: {:?}",
+                action.r#type
+            )));
+        }
+
         match action.r#type.as_str() {
             "register_files" => {
                 let payload = auth::verify_action(&action.body, &self.hmac_secret)
@@ -318,7 +389,18 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let registered = register_files(&self.catalog_connstr, &self.data_path, &payload)?;
+                // register_files moves files and runs a blocking DuckLake
+                // transaction; run it on the blocking pool so it never starves a
+                // tonic async worker (mirrors export_read / count_masked). The
+                // closure opens and drops its own connection, so it is Send and
+                // crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let registered = tokio::task::spawn_blocking(move || {
+                    register_files(&catalog, &data_path, &payload)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "registered": registered,
@@ -342,11 +424,20 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let deleted = delete_reference(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    payload.reference_idx,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read / count_masked). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let reference_idx = payload.reference_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_reference(&catalog, &data_path, reference_idx)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_reference task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -368,8 +459,18 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let deleted =
-                    delete_mask(&self.catalog_connstr, &self.data_path, payload.mask_idx)?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read / count_masked). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let mask_idx = payload.mask_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_mask(&catalog, &data_path, mask_idx)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("delete_mask task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -391,11 +492,20 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let deleted = delete_pool_reads(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    &payload.prep_sample_idxs,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read / count_masked). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let prep_sample_idxs = payload.prep_sample_idxs;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_pool_reads(&catalog, &data_path, &prep_sample_idxs)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_pool_reads task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -765,9 +875,34 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+/// Bounded depth of the DoPut decoder→writer channel. The blocking writer task
+/// parks the async decoder on `send` when the channel is full, so peak memory is
+/// ~this many decoded payloads in flight rather than the whole upload. A payload
+/// is one client RecordBatch, which the chunked-upload path sizes up to ~1 GiB
+/// (see `FLIGHT_MAX_DECODING_BYTES` in main.rs), so this is deliberately small —
+/// enough to overlap decode and write without buffering many large batches.
+/// Mirrors `DOGET_BATCH_CHANNEL_DEPTH`.
+const DOPUT_WRITER_CHANNEL_DEPTH: usize = 4;
+
+/// One decoded payload forwarded from the async decoder to the blocking writer.
+enum DoPutWriterMsg {
+    Schema(arrow_schema::SchemaRef),
+    Batch(RecordBatch),
+}
+
 /// Drive the Flight stream through a Parquet writer; return
 /// `(sha256_hex, row_count, bytes_received)`. The caller owns staging-path
 /// cleanup on Err.
+///
+/// The Parquet write, `fsync`, and hashing are all blocking, but they must be
+/// interleaved with `decoder.next().await` on the live tonic stream — so this
+/// can't be a single `spawn_blocking`. Instead it bridges the two: an async loop
+/// pulls decoded payloads off the stream and forwards each to a `spawn_blocking`
+/// writer task over a bounded mpsc channel; the writer task owns the file and
+/// does all blocking I/O off the async runtime. The bounded channel
+/// backpressures the decoder (and thus the network) when the writer falls
+/// behind, so peak memory stays bounded (`DOPUT_WRITER_CHANNEL_DEPTH`) — the
+/// same posture as the DoGet streaming path.
 async fn write_doput_parquet<S>(
     staging_path: PathBuf,
     first: FlightData,
@@ -776,8 +911,127 @@ async fn write_doput_parquet<S>(
 where
     S: Stream<Item = Result<FlightData, Status>> + Send + Unpin + 'static,
 {
-    // Re-prepend the first message and map Status → FlightError so the
-    // arrow-flight decoder can consume it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DoPutWriterMsg>(DOPUT_WRITER_CHANNEL_DEPTH);
+
+    // Blocking writer task: owns the file + ArrowWriter, consumes payloads until
+    // the channel closes, then closes + fsyncs and returns the digest. All file
+    // I/O lives here, off the tonic async worker.
+    let writer_task = tokio::task::spawn_blocking(move || -> Result<(String, u64, u64), Status> {
+        // sync_handle is a dup of the same file ArrowWriter owns. After
+        // ArrowWriter::close() (which only flushes the writer's user-space
+        // buffer plus the OS write buffer), sync_all() on the dup forces a
+        // disk-level flush. Without it, a power loss / OOM kill between close
+        // and /done can leave the client thinking the upload succeeded while
+        // the bytes were never durable.
+        let mut writer: Option<ArrowWriter<HashingWriter<std::fs::File>>> = None;
+        let mut sync_handle: Option<std::fs::File> = None;
+        let mut row_count: u64 = 0;
+        // Outer half of the shared state. The HashingWriter held inside
+        // ArrowWriter holds a clone; on ArrowWriter::close() that clone is
+        // dropped and we can `try_unwrap` to extract the final digest and
+        // byte count without a second read of the file.
+        let hash_state: Arc<Mutex<(Sha256, u64)>> = Arc::new(Mutex::new((Sha256::new(), 0)));
+
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                DoPutWriterMsg::Schema(schema) => {
+                    if writer.is_some() {
+                        return Err(Status::invalid_argument(
+                            "DoPut stream carried multiple schemas",
+                        ));
+                    }
+                    // `create_new` fails atomically (EEXIST) if the file already
+                    // exists. Guards against two concurrent DoPuts with the same
+                    // upload_idx silently clobbering each other's bytes via
+                    // separate write() calls on the same path. The CP doesn't
+                    // reissue tickets for a given slot, so this is the
+                    // contract-violation surface.
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&staging_path)
+                        .map_err(|e| match e.kind() {
+                            std::io::ErrorKind::AlreadyExists => Status::already_exists(format!(
+                                "staging file already exists — concurrent DoPut?: {}",
+                                staging_path.display()
+                            )),
+                            _ => {
+                                Status::internal(format!("create {}: {e}", staging_path.display()))
+                            }
+                        })?;
+                    sync_handle = Some(
+                        file.try_clone()
+                            .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
+                    );
+                    // Parquet v2 + zstd. The orchestrator's miint.py defines
+                    // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
+                    // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
+                    // for transient files read once then deleted in the same
+                    // job). DoPut uploads are intermediate in the consumed-once
+                    // sense — but their disk-residency is "from /done to
+                    // (eventual) cleanup," not "until the next phase in the
+                    // same job." That can be minutes to indefinitely with the
+                    // current no-sweep follow-up open. The disk-footprint
+                    // tradeoff outweighs the snappy fast-decode win at GG2
+                    // scale: backbone FASTA blew up to ~3.5× the source on
+                    // disk under uncompressed v1 (DNA-chunk VARCHAR columns
+                    // don't dictionary-encode), and zstd-default level 3
+                    // gives ~4× compression at parquet-rs's default cost.
+                    let props = WriterProperties::builder()
+                        .set_writer_version(WriterVersion::PARQUET_2_0)
+                        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                        .build();
+                    let hashing_writer = HashingWriter {
+                        inner: file,
+                        state: hash_state.clone(),
+                    };
+                    writer = Some(
+                        ArrowWriter::try_new(hashing_writer, schema, Some(props))
+                            .map_err(|e| Status::internal(format!("parquet writer init: {e}")))?,
+                    );
+                }
+                DoPutWriterMsg::Batch(batch) => {
+                    let w = writer.as_mut().ok_or_else(|| {
+                        Status::invalid_argument("RecordBatch arrived before Schema")
+                    })?;
+                    row_count += batch.num_rows() as u64;
+                    w.write(&batch)
+                        .map_err(|e| Status::internal(format!("parquet write: {e}")))?;
+                }
+            }
+        }
+
+        let w = writer.ok_or_else(|| Status::invalid_argument("DoPut stream had no Schema"))?;
+        w.close()
+            .map_err(|e| Status::internal(format!("parquet close: {e}")))?;
+
+        // Force disk-level flush via the dup'd handle. Unwrap is safe —
+        // sync_handle is set in lockstep with `writer`, which we just confirmed
+        // resolved Some via the line above.
+        sync_handle
+            .expect("sync_handle set in lockstep with writer")
+            .sync_all()
+            .map_err(|e| Status::internal(format!("fsync: {e}")))?;
+
+        // ArrowWriter::close() above dropped the HashingWriter (and with it
+        // the inner Arc clone of hash_state); the outer Arc is now the sole
+        // owner, so try_unwrap succeeds.
+        let (hasher, bytes_received) = Arc::try_unwrap(hash_state)
+            .expect("HashingWriter dropped its Arc clone via ArrowWriter::close")
+            .into_inner()
+            .expect("hash_state mutex never poisoned");
+        let digest = hasher.finalize();
+        let mut sha256 = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            write!(&mut sha256, "{b:02x}").expect("write to String never fails");
+        }
+        Ok((sha256, row_count, bytes_received))
+    });
+
+    // Async side: re-prepend the first message and map Status → FlightError so
+    // the arrow-flight decoder can consume it, then forward each decoded payload
+    // to the writer task.
     let combined = stream::once(async move { Ok::<_, Status>(first) })
         .chain(stream)
         .map(|r| {
@@ -789,115 +1043,58 @@ where
         });
     let mut decoder = FlightDataDecoder::new(combined);
 
-    // sync_handle is a dup of the same file ArrowWriter owns. After
-    // ArrowWriter::close() (which only flushes the writer's user-space
-    // buffer plus the OS write buffer), sync_all() on the dup forces a
-    // disk-level flush. Without it, a power loss / OOM kill between close
-    // and /done can leave the client thinking the upload succeeded while
-    // the bytes were never durable.
-    let mut writer: Option<ArrowWriter<HashingWriter<std::fs::File>>> = None;
-    let mut sync_handle: Option<std::fs::File> = None;
-    let mut row_count: u64 = 0;
-    // Outer half of the shared state. The HashingWriter held inside
-    // ArrowWriter holds a clone; on ArrowWriter::close() that clone is
-    // dropped and we can `try_unwrap` to extract the final digest and
-    // byte count without a second read of the file.
-    let hash_state: Arc<Mutex<(Sha256, u64)>> = Arc::new(Mutex::new((Sha256::new(), 0)));
-
+    // A mid-stream decode error must win over whatever the writer task reports:
+    // once we drop `tx`, the task finishes "normally" on a partial file. Capture
+    // the decode error and return it after joining the task (the caller then
+    // cleans up the partial file).
+    let mut decode_err: Option<Status> = None;
     while let Some(item) = decoder.next().await {
-        let decoded = item.map_err(|e| Status::internal(format!("flight decode: {e}")))?;
-        match decoded.payload {
-            DecodedPayload::Schema(schema) => {
-                if writer.is_some() {
-                    return Err(Status::invalid_argument(
-                        "DoPut stream carried multiple schemas",
-                    ));
-                }
-                // `create_new` fails atomically (EEXIST) if the file already
-                // exists. Guards against two concurrent DoPuts with the same
-                // upload_idx silently clobbering each other's bytes via
-                // separate write() calls on the same path. The CP doesn't
-                // reissue tickets for a given slot, so this is the
-                // contract-violation surface.
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staging_path)
-                    .map_err(|e| match e.kind() {
-                        std::io::ErrorKind::AlreadyExists => Status::already_exists(format!(
-                            "staging file already exists — concurrent DoPut?: {}",
-                            staging_path.display()
-                        )),
-                        _ => Status::internal(format!("create {}: {e}", staging_path.display())),
-                    })?;
-                sync_handle = Some(
-                    file.try_clone()
-                        .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
-                );
-                // Parquet v2 + zstd. The orchestrator's miint.py defines
-                // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
-                // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
-                // for transient files read once then deleted in the same
-                // job). DoPut uploads are intermediate in the consumed-once
-                // sense — but their disk-residency is "from /done to
-                // (eventual) cleanup," not "until the next phase in the
-                // same job." That can be minutes to indefinitely with the
-                // current no-sweep follow-up open. The disk-footprint
-                // tradeoff outweighs the snappy fast-decode win at GG2
-                // scale: backbone FASTA blew up to ~3.5× the source on
-                // disk under uncompressed v1 (DNA-chunk VARCHAR columns
-                // don't dictionary-encode), and zstd-default level 3
-                // gives ~4× compression at parquet-rs's default cost.
-                let props = WriterProperties::builder()
-                    .set_writer_version(WriterVersion::PARQUET_2_0)
-                    .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                    .build();
-                let hashing_writer = HashingWriter {
-                    inner: file,
-                    state: hash_state.clone(),
-                };
-                writer = Some(
-                    ArrowWriter::try_new(hashing_writer, schema, Some(props))
-                        .map_err(|e| Status::internal(format!("parquet writer init: {e}")))?,
-                );
+        let decoded = match item {
+            Ok(d) => d,
+            Err(e) => {
+                decode_err = Some(Status::internal(format!("flight decode: {e}")));
+                break;
             }
-            DecodedPayload::RecordBatch(batch) => {
-                let w = writer
-                    .as_mut()
-                    .ok_or_else(|| Status::invalid_argument("RecordBatch arrived before Schema"))?;
-                row_count += batch.num_rows() as u64;
-                w.write(&batch)
-                    .map_err(|e| Status::internal(format!("parquet write: {e}")))?;
-            }
-            DecodedPayload::None => {}
+        };
+        let msg = match decoded.payload {
+            DecodedPayload::Schema(schema) => DoPutWriterMsg::Schema(schema),
+            DecodedPayload::RecordBatch(batch) => DoPutWriterMsg::Batch(batch),
+            DecodedPayload::None => continue,
+        };
+        // A send error means the writer task already returned (an internal
+        // error, e.g. AlreadyExists on create_new). Stop forwarding; the task's
+        // Result carries the real cause.
+        if tx.send(msg).await.is_err() {
+            break;
         }
     }
-    let w = writer.ok_or_else(|| Status::invalid_argument("DoPut stream had no Schema"))?;
-    w.close()
-        .map_err(|e| Status::internal(format!("parquet close: {e}")))?;
+    // Close the channel so the writer task can finish (drain buffered payloads,
+    // then close + fsync).
+    drop(tx);
 
-    // Force disk-level flush via the dup'd handle. Unwrap is safe —
-    // sync_handle is set in lockstep with `writer`, which we just confirmed
-    // resolved Some via the line above.
-    sync_handle
-        .expect("sync_handle set in lockstep with writer")
-        .sync_all()
-        .map_err(|e| Status::internal(format!("fsync: {e}")))?;
+    // Fold a task-panic join error into the same Result shape as the task body.
+    let task_result: Result<(String, u64, u64), Status> = writer_task.await.unwrap_or_else(|e| {
+        Err(Status::internal(format!(
+            "doput writer task join failed: {e}"
+        )))
+    });
 
-    // ArrowWriter::close() above dropped the HashingWriter (and with it
-    // the inner Arc clone of hash_state); the outer Arc is now the sole
-    // owner, so try_unwrap succeeds.
-    let (hasher, bytes_received) = Arc::try_unwrap(hash_state)
-        .expect("HashingWriter dropped its Arc clone via ArrowWriter::close")
-        .into_inner()
-        .expect("hash_state mutex never poisoned");
-    let digest = hasher.finalize();
-    let mut sha256 = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        write!(&mut sha256, "{b:02x}").expect("write to String never fails");
+    // Error precedence. An `AlreadyExists` from the writer (it lost the
+    // create_new race for this upload_idx) MUST win over a mid-stream decode
+    // error: do_put_inner skips its partial-file cleanup ONLY for AlreadyExists,
+    // and that staged file belongs to the concurrent, legitimate DoPut —
+    // surfacing the decode error instead would let the cleanup unlink their
+    // file. For every other outcome the decode error wins, because the writer
+    // may have "succeeded" on a truncated file that the caller must clean up.
+    if let Err(ref e) = task_result {
+        if e.code() == tonic::Code::AlreadyExists {
+            return task_result;
+        }
     }
-    Ok((sha256, row_count, bytes_received))
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
+    task_result
 }
 
 /// Canonical Parquet write options for an exported reads file — Parquet v2 +
@@ -1364,32 +1561,57 @@ fn register_files(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    let mut registered = Vec::new();
-    for (table, dest) in &moved {
-        let dest_str = dest
-            .to_str()
-            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
-        conn.execute(
-            "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
-            duckdb::params![table, dest_str],
-        )
-        .map_err(|e| {
-            // Log which files were already registered for recovery.
-            let already: Vec<_> = registered.iter().collect();
-            Status::internal(format!(
-                "ducklake_add_data_files failed for {table}/{}: {e}. \
-                 Already registered: {already:?}. \
-                 Already moved: {:?}. \
-                 Manual recovery may be needed.",
-                dest.display(),
-                moved
-                    .iter()
-                    .map(|(_, p)| p.display().to_string())
-                    .collect::<Vec<_>>()
-            ))
-        })?;
-        registered.push(dest_str.to_string());
-    }
+    // Register every moved file in ONE DuckLake transaction so the catalog
+    // update is all-or-nothing (mirrors delete_reference / delete_mask /
+    // delete_pool_reads). A failure part-way through the loop rolls back every
+    // prior ducklake_add_data_files call rather than leaving the reference
+    // half-registered in the catalog.
+    //
+    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
+    // already happened and are NOT rolled back. That is intentional and safe.
+    // Each dest name is ticket-unique (lake_dest_filename prefixes the work
+    // ticket) and move_file refuses to overwrite, so a rolled-back registration
+    // leaves at most an unreferenced orphan Parquet on disk — never a collision
+    // and never a double-registration. This matches how DuckLake already
+    // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
+    // either); a future maintenance pass sweeps them.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let registration = (|| -> Result<Vec<String>, Status> {
+        let mut registered = Vec::new();
+        for (table, dest) in &moved {
+            let dest_str = dest
+                .to_str()
+                .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
+            conn.execute(
+                "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+                duckdb::params![table, dest_str],
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "ducklake_add_data_files failed for {table}/{}: {e}",
+                    dest.display()
+                ))
+            })?;
+            registered.push(dest_str.to_string());
+        }
+        Ok(registered)
+    })();
+
+    let registered = match registration {
+        Ok(registered) => registered,
+        Err(e) => {
+            // Best-effort rollback; the catalog is left untouched so the control
+            // plane can retry from a clean slate. The moved files stay on disk
+            // as ticket-unique orphans (see above) — inert until a successful
+            // registration references them.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit registration transaction: {e}")))?;
 
     Ok(registered)
 }
@@ -2677,6 +2899,300 @@ mod tests {
         );
     }
 
+    // --- register_files filename validation (pure; no DuckDB) ---
+
+    /// `register_files` rejects any filename that could escape the staging dir
+    /// before it touches the filesystem or the catalog. `payload.files` is
+    /// HMAC-signed by the control plane, but this defense-in-depth check keeps
+    /// the data plane's filesystem contract independent of CP correctness. A
+    /// `..` (parent) or a rooted/absolute component must be refused; the check
+    /// runs first, so a bogus connstr/data_path is never reached.
+    #[test]
+    fn register_files_rejects_filename_traversal() {
+        for bad in [
+            "../escape.parquet",
+            "/etc/passwd",
+            "sub/../../escape.parquet",
+        ] {
+            let mut files = std::collections::HashMap::new();
+            files.insert(bad.to_string(), "reference_membership".to_string());
+            let payload = auth::ActionPayload {
+                action: "register_files".to_string(),
+                staging_dir: "/unused/staging".to_string(),
+                files,
+                work_ticket_idx: 1,
+            };
+            let err = register_files("unused-connstr", "unused-data-path", &payload)
+                .expect_err("a traversal filename must be rejected");
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "filename {bad:?} must be rejected as invalid, not reach the catalog"
+            );
+        }
+    }
+
+    // --- do_action dispatch trust checks (pure; no DuckDB) ---
+
+    /// An action whose `Action.type` header disagrees with the signed
+    /// `payload.action` is rejected. `verify_action` succeeds (HMAC + shape are
+    /// valid), then the handler's discriminator check catches the mismatch — the
+    /// two must agree so a token minted for one action can't be replayed under a
+    /// different action header.
+    #[tokio::test]
+    async fn do_action_rejects_type_payload_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+        // Validly-signed register_files-shaped payload, but its action field
+        // says delete_reference — sent under the register_files header.
+        let payload =
+            br#"{"action":"delete_reference","staging_dir":"/unused","files":{},"work_ticket_idx":1}"#;
+        let body = sign_raw(payload, b"dev-secret", future_expiry_secs(300));
+        let action = Action {
+            r#type: "register_files".to_string(),
+            body: body.into(),
+        };
+        // The success type (a boxed Stream) is not Debug, so `expect_err` won't
+        // compile — match instead.
+        let err = match service.do_action(Request::new(action)).await {
+            Ok(_) => panic!("action-type/payload mismatch must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("mismatch"),
+            "error should name the mismatch: {}",
+            err.message()
+        );
+    }
+
+    /// An unrecognized `Action.type` is rejected as invalid rather than silently
+    /// ignored or dispatched — the dispatcher only ever runs known handlers.
+    #[tokio::test]
+    async fn do_action_rejects_unknown_action_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+        let action = Action {
+            r#type: "definitely_not_a_real_action".to_string(),
+            body: Vec::<u8>::new().into(),
+        };
+        let err = match service.do_action(Request::new(action)).await {
+            Ok(_) => panic!("unknown action type must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// The replay-safe registry and the do_action dispatcher must stay in
+    /// lockstep. Every `REPLAY_SAFE_ACTIONS` entry reaches a real handler — it
+    /// then fails verifying the empty token body (`Unauthenticated`), NOT the
+    /// replay guard (`InvalidArgument`) — and an action outside the registry is
+    /// rejected by the guard. So a new match arm added without a registry entry
+    /// is unreachable and surfaces the moment it is exercised, forcing a
+    /// conscious replay classification (see the `# replay:` note in do_action).
+    #[tokio::test]
+    async fn replay_safe_actions_matches_dispatcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+
+        for name in REPLAY_SAFE_ACTIONS {
+            let action = Action {
+                r#type: name.to_string(),
+                body: Vec::<u8>::new().into(),
+            };
+            let err = match service.do_action(Request::new(action)).await {
+                Ok(_) => panic!("empty-body action {name:?} must fail"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.code(),
+                tonic::Code::Unauthenticated,
+                "classified action {name:?} must be dispatched to a handler \
+                 (fail on token verification), not rejected as unknown"
+            );
+        }
+
+        // An action absent from the registry is turned away by the replay guard.
+        let bogus = Action {
+            r#type: "definitely_not_a_real_action".to_string(),
+            body: Vec::<u8>::new().into(),
+        };
+        let err = match service.do_action(Request::new(bogus)).await {
+            Ok(_) => panic!("unclassified action must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// End-to-end `register_files`: seed a Parquet in a staging dir, register it
+    /// into DuckLake, and assert the file was moved to ticket-unique lake storage
+    /// and its rows are queryable through the catalog. Exercises the
+    /// move-then-register path and its wrapping transaction against a real
+    /// DuckLake catalog.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_moves_and_registers_end_to_end() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let ref_idx: i64 = 970_000;
+        let feat_a: i64 = 970_010;
+        let feat_b: i64 = 970_011;
+        // Ticket-unique dest names come from work_ticket_idx (lake_dest_filename).
+        // Derive it from the PID so a manual re-run against a persistent catalog
+        // mints a fresh file name instead of colliding with the prior run's
+        // still-registered lake file (move_file refuses to overwrite). CI resets
+        // the catalog each run, so this only matters for local re-runs.
+        let ticket: i64 = 970_000_000 + std::process::id() as i64;
+
+        // Ensure the target table exists, and tombstone any rows a prior local
+        // run left behind so the post-register count reflects only this run.
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+            ))
+            .unwrap();
+        }
+
+        // Seed a staging Parquet whose schema matches reference_membership
+        // (two BIGINT columns) — written by DuckDB so the types match exactly.
+        let staging = tempfile::tempdir().unwrap();
+        let src = staging.path().join("reference_membership.parquet");
+        let src_str = src.to_str().unwrap();
+        {
+            let writer = Connection::open_in_memory().unwrap();
+            writer
+                .execute_batch(&format!(
+                    "COPY (SELECT * FROM (VALUES \
+                         ({ref_idx}::BIGINT, {feat_a}::BIGINT), \
+                         ({ref_idx}::BIGINT, {feat_b}::BIGINT)) \
+                         t(reference_idx, feature_idx)) \
+                     TO '{src_str}' (FORMAT PARQUET)"
+                ))
+                .unwrap();
+        }
+        assert!(src.exists(), "staging parquet seeded");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "reference_membership.parquet".to_string(),
+            "reference_membership".to_string(),
+        );
+        let payload = auth::ActionPayload {
+            action: "register_files".to_string(),
+            staging_dir: staging.path().to_str().unwrap().to_string(),
+            files,
+            work_ticket_idx: ticket,
+        };
+
+        let registered =
+            register_files(&connstr, &data_path, &payload).expect("register_files failed");
+        assert_eq!(registered.len(), 1, "one file registered");
+        // The dest carries the ticket-unique minted name under the per-table dir.
+        let dest = std::path::Path::new(&registered[0]);
+        assert_eq!(
+            dest.file_name().and_then(|f| f.to_str()).unwrap(),
+            lake_dest_filename(ticket, "reference_membership.parquet")
+        );
+        assert!(dest.exists(), "registered lake file present on disk");
+        assert!(
+            !src.exists(),
+            "staging source was moved out, not left behind"
+        );
+
+        // The rows are queryable through the catalog via a fresh connection.
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let n: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_membership \
+                     WHERE reference_idx = {ref_idx}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "both seeded membership rows registered");
+
+        // Best-effort cleanup: tombstone the catalog rows only. Do NOT remove
+        // the physical lake file — it stays registered in the DuckLake catalog
+        // until compaction, and unlinking a still-registered data file breaks
+        // any later full-table scan of reference_membership (e.g. the
+        // delete_reference orphan subquery) with a missing-file IO error.
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+        ));
+    }
+
+    /// Pins the DuckLake-transaction semantics `register_files` relies on: a
+    /// `ducklake_add_data_files` performed inside a transaction that is then
+    /// ROLLBACK'd leaves ZERO rows registered — visible within the open
+    /// transaction, gone after the rollback. If DuckLake auto-committed catalog
+    /// mutations (ignoring the enclosing DuckDB transaction), `register_files`'
+    /// BEGIN/ROLLBACK wrap would be a no-op and a mid-loop failure would leak a
+    /// half-registered reference; this asserts it is not.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_ducklake_add_data_files_rolls_back_within_transaction() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let ref_idx: i64 = 972_000;
+        let feat: i64 = 972_010;
+
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+        ))
+        .unwrap();
+
+        // A valid reference_membership Parquet to register (types match exactly).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("m.parquet");
+        let src_str = src.to_str().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT {ref_idx}::BIGINT AS reference_idx, {feat}::BIGINT AS feature_idx) \
+             TO '{src_str}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+
+        let count = |c: &Connection| -> i64 {
+            c.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_membership \
+                     WHERE reference_idx = {ref_idx}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        conn.execute_batch("BEGIN TRANSACTION").unwrap();
+        conn.execute(
+            "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+            duckdb::params!["reference_membership", src_str],
+        )
+        .unwrap();
+        assert_eq!(count(&conn), 1, "registration is visible inside the txn");
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            count(&conn),
+            0,
+            "ROLLBACK must unwind the registration — the wrap in register_files \
+             is only atomic if DuckLake honors the enclosing transaction"
+        );
+    }
+
     /// `export_read_to_parquet` writes one sample's full reads from the DuckLake
     /// `read` table to a Parquet drop-in: the 7-col schema with `qual` as
     /// UTINYINT[], the seeded rows, mode 0o440. An unknown sample writes NO file
@@ -3355,6 +3871,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn do_put_alreadyexists_wins_over_mid_stream_decode_error() {
+        // Regression: with the async-decoder/blocking-writer bridge, a second
+        // DoPut to an occupied upload_idx whose stream ALSO errors mid-flight
+        // must still surface AlreadyExists — not the decode error. do_put_inner
+        // skips its partial-file cleanup only for AlreadyExists, and that staged
+        // file belongs to the first, legitimate upload; masking it as the decode
+        // error would unlink their file. Reproduces the writer-task error vs
+        // decode-error precedence.
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+
+        // First upload occupies upload_idx=88.
+        let t1 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
+        service
+            .do_put_inner(stream::iter(m1))
+            .await
+            .expect("first DoPut should succeed");
+        let staged = tmp.path().join("uploads/88/upload.parquet");
+        let bytes_before = std::fs::read(&staged).unwrap();
+
+        // Second DoPut to the same idx: keep only the schema frame, then inject a
+        // mid-stream error. The writer hits AlreadyExists on create_new while the
+        // decoder surfaces the error, exercising the precedence.
+        let t2 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let mut m2 = flight_stream_with_ticket(vec![sample_batch()], t2).await;
+        m2.truncate(1);
+        m2.push(Err(Status::internal("simulated mid-stream drop")));
+
+        let err = service
+            .do_put_inner(stream::iter(m2))
+            .await
+            .expect_err("second DoPut must fail");
+        assert_eq!(
+            err.code(),
+            tonic::Code::AlreadyExists,
+            "AlreadyExists must win over the decode error so the first file is preserved"
+        );
+
+        // The first upload's file is untouched — not unlinked by cleanup.
+        assert!(staged.exists(), "the first upload's file must survive");
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            bytes_before,
+            "first upload bytes unchanged"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o440
+        );
+    }
+
+    #[tokio::test]
     async fn do_put_concurrent_uploads_are_isolated() {
         // Two uploads to different upload_idx values land at different
         // staging paths and don't trample each other. Smoke test that the
@@ -3376,6 +3945,55 @@ mod tests {
 
         assert!(tmp.path().join("uploads/1/upload.parquet").exists());
         assert!(tmp.path().join("uploads/2/upload.parquet").exists());
+    }
+
+    #[tokio::test]
+    async fn do_put_writes_multi_batch_stream() {
+        // Exercise the async-decoder → blocking-writer channel bridge with more
+        // than one RecordBatch: every batch must flow through the mpsc channel,
+        // be written, and be counted. Three 3-row batches => 9 rows, and the
+        // PutResult sha256/bytes must match the file on disk byte-for-byte.
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+
+        let ticket = sign_doput_for_test(55, b"dev-secret", future_expiry_secs(300));
+        let batches = vec![sample_batch(), sample_batch(), sample_batch()];
+        let messages = flight_stream_with_ticket(batches, ticket).await;
+
+        let result = service
+            .do_put_inner(stream::iter(messages))
+            .await
+            .expect("multi-batch do_put should succeed");
+
+        let body: serde_json::Value = serde_json::from_slice(&result.app_metadata).unwrap();
+        assert_eq!(body["upload_idx"], 55);
+        assert_eq!(body["row_count"], 9, "three 3-row batches stream through");
+
+        let staged = tmp.path().join("uploads/55/upload.parquet");
+        let actual_bytes = std::fs::metadata(&staged).unwrap().len();
+        assert_eq!(body["bytes_received"].as_u64().unwrap(), actual_bytes);
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(&staged).unwrap());
+        let actual_sha: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(body["sha256"].as_str().unwrap(), actual_sha);
+
+        // Round-trips as a 9-row Parquet.
+        let reader = Connection::open_in_memory().unwrap();
+        let n: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{}')",
+                    staged.to_str().unwrap()
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 9);
     }
 
     #[test]
