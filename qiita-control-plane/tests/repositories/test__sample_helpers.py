@@ -40,7 +40,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueSameStudyError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
-    GlobalFieldRow,
+    FieldRow,
     GlobalMetadataRow,
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
@@ -57,6 +57,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     fetch_global_fields_by_display_names,
     fetch_global_metadata,
     fetch_missing_value_reason_idxs_by_names,
+    fetch_study_fields_by_display_names,
     fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
     link_entity_to_studies,
@@ -1816,11 +1817,19 @@ async def test_fetch_global_fields_by_display_names_returns_matching(
         )
 
     expected = {
-        name_a: GlobalFieldRow(
-            idx=idx_a, display_name=name_a, data_type=FieldDataType.TEXT, terminology_idx=None
+        name_a: FieldRow(
+            idx=idx_a,
+            display_name=name_a,
+            data_type=FieldDataType.TEXT,
+            terminology_idx=None,
+            global_field_idx=idx_a,
         ),
-        name_b: GlobalFieldRow(
-            idx=idx_b, display_name=name_b, data_type=FieldDataType.NUMERIC, terminology_idx=None
+        name_b: FieldRow(
+            idx=idx_b,
+            display_name=name_b,
+            data_type=FieldDataType.NUMERIC,
+            terminology_idx=None,
+            global_field_idx=idx_b,
         ),
     }
     assert result == expected
@@ -1857,11 +1866,132 @@ async def test_fetch_global_fields_by_display_names_omits_unknown(
 
     # Only the known name appears; unknown is silently absent.
     expected = {
-        known_name: GlobalFieldRow(
-            idx=idx, display_name=known_name, data_type=FieldDataType.TEXT, terminology_idx=None
+        known_name: FieldRow(
+            idx=idx,
+            display_name=known_name,
+            data_type=FieldDataType.TEXT,
+            terminology_idx=None,
+            global_field_idx=idx,
         ),
     }
     assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_study_fields_by_display_names (spec-parameterized over both entities)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx, spec):
+    """Tests the case where a study carries both a purely-local study field
+    and a globally-linked one: the fetch returns each as a FieldRow, with
+    global_field_idx None for the local field and the FK for the linked one,
+    the linked row's inherited data_type resolved via the global field, and
+    unknown names omitted.
+    """
+    study_idx = ctx["study_idx"]
+    created_by = ctx["principal_idx"]
+    study_field_key = f"{spec.entity_kind}_study_field"
+
+    # Purely-local field owns its own NUMERIC data_type; the globally-linked
+    # field is bound to a seeded DATE global field under a distinct label, so
+    # its data_type must come back inherited through the COALESCE join.
+    local_name = unique_field_name()
+    linked_name = unique_field_name()
+    global_field = await _seed_global_field_for_spec(ctx, spec, FieldDataType.DATE)
+
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            local_idx, _, _ = await _get_or_create_local_study_field(
+                conn,
+                spec=spec,
+                study_idx=study_idx,
+                display_name=local_name,
+                created_by_idx=created_by,
+                data_type=FieldDataType.NUMERIC,
+            )
+            linked_idx, _ = await _get_or_create_globally_linked_study_field(
+                conn,
+                spec=spec,
+                study_idx=study_idx,
+                global_field_idx=global_field.idx,
+                display_name=linked_name,
+                created_by_idx=created_by,
+            )
+    ctx["created"][study_field_key].extend([local_idx, linked_idx])
+
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_study_fields_by_display_names(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_names=[local_name, linked_name, unique_field_name()],
+        )
+
+    expected = {
+        local_name: FieldRow(
+            idx=local_idx,
+            display_name=local_name,
+            data_type=FieldDataType.NUMERIC,
+            terminology_idx=None,
+            global_field_idx=None,
+        ),
+        linked_name: FieldRow(
+            idx=linked_idx,
+            display_name=linked_name,
+            data_type=FieldDataType.DATE,
+            terminology_idx=None,
+            global_field_idx=global_field.idx,
+        ),
+    }
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_fields_by_display_names_scoped_to_study(ctx, spec):
+    """Tests the case where a matching display_name exists only in a different
+    study: the fetch is scoped to study_idx, so the field is absent from the
+    result. Empty input short-circuits to an empty dict.
+    """
+    study_field_key = f"{spec.entity_kind}_study_field"
+
+    # Seed a field in ctx's study, then query a freshly-seeded other study.
+    field_name = unique_field_name()
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            field_idx, _, _ = await _get_or_create_local_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                display_name=field_name,
+                created_by_idx=ctx["principal_idx"],
+            )
+    ctx["created"][study_field_key].append(field_idx)
+
+    other_study_idx = await _seed_study(
+        ctx["pool"], ctx["principal_idx"], f"other-{secrets.token_hex(4)}"
+    )
+    ctx["created"]["studies"].append(other_study_idx)
+
+    async with ctx["pool"].acquire() as conn:
+        scoped = await fetch_study_fields_by_display_names(
+            conn, spec=spec, study_idx=other_study_idx, display_names=[field_name]
+        )
+        empty = await fetch_study_fields_by_display_names(
+            conn, spec=spec, study_idx=ctx["study_idx"], display_names=[]
+        )
+
+    assert scoped == {}
+    assert empty == {}
 
 
 # ---------------------------------------------------------------------------
@@ -3280,7 +3410,7 @@ async def test_preflight_global_metadata_routes_terminology_term(ctx, spec):
     """Tests the case where a TERMINOLOGY-typed field's text value matches
     a qiita.terminology_term row in the field's terminology: preflight
     emits a TerminologyTermRef carrying idx, term_id, and label and the
-    field's data_type is reflected on the GlobalFieldRow.
+    field's data_type is reflected on the FieldRow.
     """
     term_row = await fetch_seeded_metagenome_term(ctx["pool"])
     terminology_idx = term_row["terminology_idx"]

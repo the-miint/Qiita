@@ -342,8 +342,8 @@ async def import_biosample_from_owner_biosample_id(
     validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
 
     # Pre-flight: pure-logic collision check between the owner-id field
-    # name and the metadata dict's keys. The owner-id row is purely-local;
-    # a globally-linked entry at the same display_name would violate that.
+    # name and the metadata dict's keys. The owner-id row is special and
+    # must not be overwritten/challenged by anything in the general metadata.
     if owner_biosample_id_field_name in metadata:
         raise BiosampleOwnerIdFieldCollisionError(owner_biosample_id_field_name)
 
@@ -409,6 +409,8 @@ async def import_biosample_from_owner_biosample_id(
         parsed_metadata=parsed_metadata,
     )
 
+    # TODO: somewhere in code below here, must extend to support multiple local fields.
+
     # tier_override pins the field above any study-level default so
     # the owner display value never surfaces to non-members (PII).
     (
@@ -437,6 +439,7 @@ async def import_biosample_from_owner_biosample_id(
             found_global_field_idx=resolved_global_field_idx,
         )
 
+    # TODO: must add additional call(s) to insert multiple local fields.
     await insert_owner_biosample_id_metadata(
         conn,
         biosample_idx=bs_idx,

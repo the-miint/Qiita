@@ -20,7 +20,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories._sample_helpers import (
-    GlobalFieldRow,
+    FieldRow,
     SampleEntityKind,
     _get_or_create_local_study_field,
     insert_entity_to_study,
@@ -418,7 +418,7 @@ async def _seed_global_field_for_spec(
     ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None
 ):
     """Seed one global field of the given data_type for spec.entity_kind
-    and track the row for cleanup. Returns a GlobalFieldRow shape so the
+    and track the row for cleanup. Returns a FieldRow shape so the
     caller can drive metadata writes against it directly. terminology_idx
     must be supplied when data_type=TERMINOLOGY (the *_global_field
     CHECK enforces the iff coupling) and omitted otherwise.
@@ -450,8 +450,12 @@ async def _seed_global_field_for_spec(
             terminology_idx=terminology_idx,
         )
         ctx["created"]["prep_sample_global_field"].append(gf_idx)
-    return GlobalFieldRow(
-        idx=gf_idx, display_name=display_name, data_type=data_type, terminology_idx=terminology_idx
+    return FieldRow(
+        idx=gf_idx,
+        display_name=display_name,
+        data_type=data_type,
+        terminology_idx=terminology_idx,
+        global_field_idx=gf_idx,
     )
 
 

@@ -41,28 +41,23 @@ class SampleEntityKind(StrEnum):
 type GlobalMetadataValue = str | Decimal | date | MissingReasonRef | TerminologyTermRef
 
 
-# ---------------------------------------------------------------------------
-# Shared *_global_field lookup row shape
-# ---------------------------------------------------------------------------
+class FieldRow(NamedTuple):
+    """Subset of field columns used by metadata pre-flight reads, for both a
+    *_global_field row and a study-local *_study_field row.
 
-
-class GlobalFieldRow(NamedTuple):
-    """Subset of *_global_field columns used by metadata pre-flight reads.
-
-    terminology_idx is non-None iff data_type is TERMINOLOGY (enforced by
-    the *_global_field CHECK), and identifies the terminology that scopes
-    any term-id lookup against the field.
+    data_type is the field's effective type (a globally-linked study-local row
+    inherits it from the global field). terminology_idx is non-None iff
+    data_type is TERMINOLOGY and scopes any term-id lookup. global_field_idx is
+    the global field this row represents or links to: its own idx for a
+    *_global_field row, the FK for a *_study_field row (None on a purely-local
+    field).
     """
 
     idx: int
     display_name: str
     data_type: FieldDataType
     terminology_idx: int | None
-
-
-# ---------------------------------------------------------------------------
-# Shared globally-linked metadata read shape and value-column dispatch
-# ---------------------------------------------------------------------------
+    global_field_idx: int | None
 
 
 class GlobalMetadataRow(NamedTuple):
@@ -298,14 +293,31 @@ class EntityMetadataSpec:
     link_entity_key_column: str
 
 
+def _field_rows_by_display_name(rows: list[asyncpg.Record]) -> dict[str, FieldRow]:
+    """Key field-lookup rows by display_name, wrapping each in FieldRow. Each
+    row must carry idx, display_name, data_type, terminology_idx, and
+    global_field_idx columns.
+    """
+    return {
+        r["display_name"]: FieldRow(
+            idx=r["idx"],
+            display_name=r["display_name"],
+            data_type=FieldDataType(r["data_type"]),
+            terminology_idx=r["terminology_idx"],
+            global_field_idx=r["global_field_idx"],
+        )
+        for r in rows
+    }
+
+
 async def fetch_global_fields_by_display_names(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     display_names: Iterable[str],
-) -> dict[str, GlobalFieldRow]:
-    """Return a dict of display_name -> GlobalFieldRow for the matching
-    rows in the *_global_field table named by spec.global_field_table.
+) -> dict[str, FieldRow]:
+    """Return a dict of display_name -> FieldRow for the matching rows in the
+    *_global_field table named by spec.global_field_table.
 
     Display names that have no matching row are absent from the returned
     dict; callers detect "unknown field" by checking dict membership for
@@ -316,25 +328,58 @@ async def fetch_global_fields_by_display_names(
     if not names:
         return {}
 
-    # f-string interpolation of the table identifier is safe: spec fields
-    # are frozen module-level constants, never reached by caller input.
+    # f-string interpolation of the table identifier is safe: spec fields are
+    # frozen module-level constants, never reached by caller input. A global
+    # field is its own reference, so idx doubles as global_field_idx.
     rows = await pool_or_conn.fetch(
-        f"SELECT idx, display_name, data_type, terminology_idx"
+        f"SELECT idx, display_name, data_type, terminology_idx,"
+        f" idx AS global_field_idx"
         f" FROM {spec.global_field_table}"
         f" WHERE display_name = ANY($1::text[])",
         names,
     )
+    return _field_rows_by_display_name(rows)
 
-    # Wrap each row in the typed tuple, keyed on display_name.
-    return {
-        r["display_name"]: GlobalFieldRow(
-            idx=r["idx"],
-            display_name=r["display_name"],
-            data_type=FieldDataType(r["data_type"]),
-            terminology_idx=r["terminology_idx"],
-        )
-        for r in rows
-    }
+
+async def fetch_study_fields_by_display_names(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_names: Iterable[str],
+) -> dict[str, FieldRow]:
+    """Return a dict of display_name -> FieldRow for the study's *_study_field
+    rows matching the given display_names.
+
+    Scoped to study_idx (the *_study_field unique key is
+    (study_idx, display_name)). data_type / terminology_idx are the effective
+    values: a globally-linked row stores them NULL and inherits from its global
+    field, so the query COALESCEs against *_global_field. global_field_idx is
+    the row's FK, None on a purely-local field. Names with no matching row are
+    absent from the returned dict; empty input short-circuits with no DB call.
+    """
+    # Materialize so emptiness is detectable and the param can be passed as ANY.
+    names = list(display_names)
+    if not names:
+        return {}
+
+    # f-string interpolation of the identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input. The LEFT JOIN
+    # resolves the inherited data_type / terminology_idx for globally-linked
+    # rows, which store those columns NULL.
+    fk_column = spec.study_field_global_fk_column
+    rows = await pool_or_conn.fetch(
+        f"SELECT sf.idx, sf.display_name,"
+        f" COALESCE(sf.data_type, gf.data_type) AS data_type,"
+        f" COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
+        f" sf.{fk_column} AS global_field_idx"
+        f" FROM {spec.study_field_table} sf"
+        f" LEFT JOIN {spec.global_field_table} gf ON gf.idx = sf.{fk_column}"
+        f" WHERE sf.study_idx = $1 AND sf.display_name = ANY($2::text[])",
+        study_idx,
+        names,
+    )
+    return _field_rows_by_display_name(rows)
 
 
 async def fetch_missing_value_reason_idxs_by_names(
@@ -817,11 +862,6 @@ def _make_collision_error(
     return ConflictingValueDifferentStudyError(**kwargs)
 
 
-# ---------------------------------------------------------------------------
-# Globally-linked study-field upsert (private)
-# ---------------------------------------------------------------------------
-
-
 async def _get_or_create_globally_linked_study_field(
     conn: asyncpg.Connection,
     *,
@@ -910,11 +950,6 @@ async def _get_or_create_globally_linked_study_field(
     return row["idx"], False
 
 
-# ---------------------------------------------------------------------------
-# Typed metadata insert (private)
-# ---------------------------------------------------------------------------
-
-
 async def _insert_metadata(
     conn: asyncpg.Connection,
     *,
@@ -967,9 +1002,83 @@ async def _insert_metadata(
     )
 
 
-# ---------------------------------------------------------------------------
-# write_global_metadata_or_diagnose (public)
-# ---------------------------------------------------------------------------
+async def _insert_metadata_or_diagnose(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    study_field_idx: int,
+    study_field_created: bool,
+    display_name: str,
+    data_type: FieldDataType,
+    value: GlobalMetadataValue,
+    caller_idx: int,
+    global_field_idx: int | None = None,
+) -> SampleMetadataWriteResult:
+    """Insert one metadata row inside a SAVEPOINT; on the collision-diagnostic
+    unique violation, read the slot occupant and raise the typed
+    SlotOccupiedError subclass. The nested transaction isolates the INSERT so
+    the caller's outer transaction survives to run the diagnostic SELECT.
+    global_field_idx discriminates the two write paths: non-None routes both
+    the diagnostic constraint and the slot lookup through the cross-study
+    partial index, None through the per-field constraint. Returns
+    SampleMetadataWriteResult on a clean insert.
+    """
+    # global_field_idx selects the path: the constraint that gates diagnosis
+    # and the slot lookup key both follow from it.
+    if global_field_idx is not None:
+        diagnostic_constraint_name = spec.global_field_unique_index_name
+        slot_kwargs: dict[str, int] = {"global_field_idx": global_field_idx}
+    else:
+        diagnostic_constraint_name = spec.local_unique_per_field_index_name
+        slot_kwargs = {"study_field_idx": study_field_idx}
+
+    # Typed INSERT inside a SAVEPOINT so a unique violation rolls back only the
+    # nested savepoint, leaving the caller's outer transaction alive to run the
+    # diagnostic SELECT below.
+    try:
+        async with conn.transaction():
+            metadata_idx = await _insert_metadata(
+                conn,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_field_idx=study_field_idx,
+                data_type=data_type,
+                value=value,
+                created_by_idx=caller_idx,
+            )
+        return SampleMetadataWriteResult(
+            metadata_idx=metadata_idx,
+            study_field_idx=study_field_idx,
+            study_field_created=study_field_created,
+        )
+    except asyncpg.UniqueViolationError as exc:
+        # Only the diagnostic constraint drives the diagnostic path; any other
+        # UniqueViolation is the caller's problem and propagates unchanged.
+        if exc.constraint_name != diagnostic_constraint_name:
+            raise
+
+    # Diagnose the slot occupant and raise the right subclass. Reached only via
+    # the controlled path above; the outer transaction is alive because the
+    # savepoint rolled back.
+    existing_row = await _fetch_slot_occupant(
+        conn,
+        spec=spec,
+        entity_idx=entity_idx,
+        **slot_kwargs,
+    )
+    raise _make_collision_error(
+        spec=spec,
+        entity_idx=entity_idx,
+        display_name=display_name,
+        study_field_idx=study_field_idx,
+        attempted_study_idx=study_idx,
+        attempted_value=value,
+        data_type=data_type,
+        existing_row=existing_row,
+        global_field_idx=global_field_idx,
+    )
 
 
 async def write_global_metadata_or_diagnose(
@@ -997,7 +1106,8 @@ async def write_global_metadata_or_diagnose(
     # rolls back any study_field row this function created before raising.
     require_transaction(conn)
 
-    # Step 1: resolve the caller's study_field bound to global_field_idx.
+    # Resolve the caller's study_field bound to global_field_idx (created here
+    # on first use), then insert-and-diagnose against the cross-study index.
     study_field_idx, study_field_created = await _get_or_create_globally_linked_study_field(
         conn,
         spec=spec,
@@ -1006,68 +1116,19 @@ async def write_global_metadata_or_diagnose(
         display_name=display_name,
         created_by_idx=caller_idx,
     )
-
-    # Step 2: typed INSERT inside a SAVEPOINT. Postgres aborts the whole
-    # transaction on any statement error, so without a savepoint the
-    # diagnostic SELECT below would fail. Nested conn.transaction() issues
-    # SAVEPOINT on enter and ROLLBACK TO SAVEPOINT on exception, leaving
-    # the outer transaction alive. Get-or-create above stays outside the
-    # savepoint so it rolls back with the caller's outer transaction.
-    try:
-        async with conn.transaction():
-            metadata_idx = await _insert_metadata(
-                conn,
-                spec=spec,
-                entity_idx=entity_idx,
-                study_field_idx=study_field_idx,
-                data_type=data_type,
-                value=value,
-                created_by_idx=caller_idx,
-            )
-        return SampleMetadataWriteResult(
-            metadata_idx=metadata_idx,
-            study_field_idx=study_field_idx,
-            study_field_created=study_field_created,
-        )
-    except asyncpg.UniqueViolationError as exc:
-        # Only the cross-study partial unique index drives the diagnostic
-        # path; any other UniqueViolation (e.g., unique_per_field) is the
-        # caller's problem and propagates unchanged.
-        if exc.constraint_name != spec.global_field_unique_index_name:
-            raise
-
-    # Step 3: diagnose the slot occupant and raise the right subclass.
-    # Reached only via the controlled path above (UniqueViolation on the
-    # partial unique index); the outer transaction is alive because the
-    # savepoint rolled back. The raise propagates up and the caller's
-    # transaction rolls back.
-    existing_row = await _fetch_slot_occupant(
+    return await _insert_metadata_or_diagnose(
         conn,
         spec=spec,
         entity_idx=entity_idx,
-        global_field_idx=global_field_idx,
-    )
-    raise _make_collision_error(
-        spec=spec,
-        entity_idx=entity_idx,
-        display_name=display_name,
+        study_idx=study_idx,
         study_field_idx=study_field_idx,
-        attempted_study_idx=study_idx,
-        attempted_value=value,
+        study_field_created=study_field_created,
+        display_name=display_name,
         data_type=data_type,
-        existing_row=existing_row,
+        value=value,
+        caller_idx=caller_idx,
         global_field_idx=global_field_idx,
     )
-
-
-# ---------------------------------------------------------------------------
-# Local-write strict-mode guard
-# ---------------------------------------------------------------------------
-#
-# LocalWriteOnGloballyLinkedFieldError fires pre-INSERT when the resolved
-# study_field turns out to be globally linked — strict-mode refuses to
-# write local-typed semantics through a global-typed field.
-# ---------------------------------------------------------------------------
 
 
 class LocalWriteOnGloballyLinkedFieldError(Exception):
@@ -1184,11 +1245,6 @@ async def _get_or_create_local_study_field(
     return row["idx"], False, row["found_global_field_idx"]
 
 
-# ---------------------------------------------------------------------------
-# write_local_metadata_or_diagnose (public)
-# ---------------------------------------------------------------------------
-
-
 async def write_local_metadata_or_diagnose(
     conn: asyncpg.Connection,
     *,
@@ -1218,10 +1274,10 @@ async def write_local_metadata_or_diagnose(
     # rolls back any study_field row this function created before raising.
     require_transaction(conn)
 
-    # Step 1: get-or-create the local study_field. The third tuple element
-    # is the resolved row's global_field_idx; non-None means the row is
-    # globally linked, which contradicts the caller's local-only intent
-    # and triggers the strict-mode guard.
+    # Get-or-create the local study_field. The third tuple element is the
+    # resolved row's global_field_idx; non-None means the row is globally
+    # linked, which contradicts the caller's local-only intent and triggers
+    # the strict-mode guard.
     (
         study_field_idx,
         study_field_created,
@@ -1249,54 +1305,19 @@ async def write_local_metadata_or_diagnose(
             found_global_field_idx=resolved_global_field_idx,
         )
 
-    # Step 2: typed INSERT inside a SAVEPOINT. Postgres aborts the whole
-    # transaction on any statement error, so without a savepoint the
-    # diagnostic SELECT below would fail. Nested conn.transaction()
-    # issues SAVEPOINT on enter and ROLLBACK TO SAVEPOINT on exception,
-    # leaving the outer transaction alive.
-    try:
-        async with conn.transaction():
-            metadata_idx = await _insert_metadata(
-                conn,
-                spec=spec,
-                entity_idx=entity_idx,
-                study_field_idx=study_field_idx,
-                data_type=data_type,
-                value=value,
-                created_by_idx=caller_idx,
-            )
-        return SampleMetadataWriteResult(
-            metadata_idx=metadata_idx,
-            study_field_idx=study_field_idx,
-            study_field_created=study_field_created,
-        )
-    except asyncpg.UniqueViolationError as exc:
-        # Only the unique-per-field constraint drives the diagnostic path;
-        # any other UniqueViolation propagates unchanged.
-        if exc.constraint_name != spec.local_unique_per_field_index_name:
-            raise
-
-    # Step 3: diagnose the slot occupant and raise the right subclass.
-    # Reached only via the controlled path above; the outer transaction
-    # is alive because the savepoint rolled back. The raise propagates
-    # up and the caller's transaction rolls back.
-    existing_row = await _fetch_slot_occupant(
+    # Insert-and-diagnose; the local path has no cross-study slot key, so
+    # global_field_idx stays None (which selects the per-field constraint).
+    return await _insert_metadata_or_diagnose(
         conn,
         spec=spec,
         entity_idx=entity_idx,
+        study_idx=study_idx,
         study_field_idx=study_field_idx,
-    )
-    # global_field_idx defaults to None: the local-path discriminator
-    # the shared dispatcher uses to skip the global-only message bits.
-    raise _make_collision_error(
-        spec=spec,
-        entity_idx=entity_idx,
+        study_field_created=study_field_created,
         display_name=display_name,
-        study_field_idx=study_field_idx,
-        attempted_study_idx=study_idx,
-        attempted_value=value,
         data_type=data_type,
-        existing_row=existing_row,
+        value=value,
+        caller_idx=caller_idx,
     )
 
 
@@ -1371,18 +1392,97 @@ async def assert_required_global_fields_supplied(
         raise MetadataMissingRequiredFieldsError(spec.entity_kind, missing)
 
 
+async def _resolve_and_parse_metadata_values(
+    conn: asyncpg.Connection,
+    *,
+    metadata: Mapping[str, str],
+    fields: Mapping[str, FieldRow],
+    reason_lookup: Mapping[str, int],
+) -> dict[str, GlobalMetadataValue]:
+    """Parse each metadata text value against its already-resolved field row,
+    returning display_name -> parsed value.
+
+    fields maps every display_name in metadata to its resolved field row
+    (data_type + terminology_idx). A value matching a reason_lookup key
+    (compared after outer-whitespace stripping) becomes a MissingReasonRef; a
+    TERMINOLOGY-typed field routes to a TerminologyTermRef on hit or raises
+    MetadataParseError on miss; any other value goes through the typed parser.
+    An empty reason_lookup disables marker recognition.
+    """
+    # Group terminology candidates by terminology_idx so the lookups batch per
+    # terminology. Missing-reason markers take precedence, so a text already
+    # matching a known reason name is excluded from the candidate set.
+    terminology_candidates: dict[int, set[str]] = {}
+    for display_name, text_value in metadata.items():
+        field_row = fields[display_name]
+        if field_row.data_type is not FieldDataType.TERMINOLOGY:
+            continue
+        stripped = text_value.strip()
+        if stripped in reason_lookup:
+            continue
+        # terminology_idx is non-None for TERMINOLOGY-typed rows by the
+        # *_global_field CHECK; assert rather than guard so a CHECK violation
+        # surfaces loudly instead of silently dropping the row.
+        assert field_row.terminology_idx is not None
+        terminology_candidates.setdefault(field_row.terminology_idx, set()).add(stripped)
+
+    # One round trip per distinct terminology_idx; the helper short-circuits
+    # on empty inputs so a no-terminology import pays nothing.
+    terminology_lookup: dict[tuple[int, str], tuple[int, str]] = {}
+    for terminology_idx, term_ids in terminology_candidates.items():
+        resolved = await fetch_terminology_term_idxs_by_term_ids(
+            conn, terminology_idx=terminology_idx, term_ids=term_ids
+        )
+        for term_id, idx_label in resolved.items():
+            terminology_lookup[(terminology_idx, term_id)] = idx_label
+
+    # Parse each text value: missing-reason markers route to MissingReasonRef
+    # first; TERMINOLOGY-typed fields then route to TerminologyTermRef on hit
+    # or raise MetadataParseError on miss; other values dispatch to the typed
+    # parser.
+    parsed: dict[str, GlobalMetadataValue] = {}
+    for display_name, text_value in metadata.items():
+        field_row = fields[display_name]
+        stripped = text_value.strip()
+        if stripped in reason_lookup:
+            parsed[display_name] = MissingReasonRef(idx=reason_lookup[stripped], name=stripped)
+            continue
+        if field_row.data_type is FieldDataType.TERMINOLOGY:
+            # terminology_idx is non-None for TERMINOLOGY-typed rows by the
+            # *_global_field CHECK; assert rather than guard so a CHECK violation
+            # surfaces loudly instead of silently dropping the row.
+            assert field_row.terminology_idx is not None
+            resolved_idx_label = terminology_lookup.get((field_row.terminology_idx, stripped))
+            if resolved_idx_label is None:
+                raise MetadataParseError(
+                    display_name=display_name,
+                    data_type=field_row.data_type,
+                    text_value=text_value,
+                    reason="no matching terminology term",
+                )
+            term_idx, term_label = resolved_idx_label
+            parsed[display_name] = TerminologyTermRef(
+                idx=term_idx, term_id=stripped, label=term_label
+            )
+            continue
+        parsed[display_name] = parse_text_for_data_type(
+            display_name, field_row.data_type, text_value
+        )
+    return parsed
+
+
 async def preflight_global_metadata(
     conn: asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     metadata: Mapping[str, str],
     known_missing_reasons: Mapping[str, int] | None = None,
-) -> list[tuple[GlobalFieldRow, GlobalMetadataValue]]:
+) -> list[tuple[FieldRow, GlobalMetadataValue]]:
     """Resolve every metadata display_name against spec.global_field_table
     and parse each text value into a typed Python value, a MissingReasonRef
     (if the text matches a known missing-reason name) or a TerminologyTermRef
     (if the text matches a qiita.terminology_term row scoped to the field's
-    terminology_idx). Returns (GlobalFieldRow, parsed_value) pairs in input
+    terminology_idx). Returns (FieldRow, parsed_value) pairs in input
     order.
 
     known_missing_reasons maps reason name -> idx; a text value matching a
@@ -1404,77 +1504,15 @@ async def preflight_global_metadata(
     if unknown:
         raise MetadataUnknownFieldsError(spec.entity_kind, unknown)
 
-    # Marker lookup is keyed on stripped text so it aligns with
-    # parse_text_for_data_type's whitespace handling; an empty mapping
-    # disables marker recognition.
-    reason_lookup: Mapping[str, int] = known_missing_reasons or {}
-
-    # Group terminology candidates by terminology_idx so we can batch the
-    # lookups per terminology, then resolve into a (terminology_idx,
-    # term_id) -> (idx, label) map. Missing-reason markers take precedence
-    # over the terminology lookup, so a text already matching a known
-    # missing-reason name is excluded from the candidate set.
-    terminology_candidates: dict[int, set[str]] = {}
-    for display_name, text_value in metadata.items():
-        global_row = global_field_rows[display_name]
-        if global_row.data_type is not FieldDataType.TERMINOLOGY:
-            continue
-        stripped = text_value.strip()
-        if stripped in reason_lookup:
-            continue
-        # terminology_idx is non-None for TERMINOLOGY-typed rows by the
-        # *_global_field CHECK; assert rather than guard so a CHECK violation
-        # surfaces loudly instead of silently dropping the row.
-        assert global_row.terminology_idx is not None
-        terminology_candidates.setdefault(global_row.terminology_idx, set()).add(stripped)
-
-    # One round trip per distinct terminology_idx; the helper short-circuits
-    # on empty inputs so a no-terminology import pays nothing.
-    terminology_lookup: dict[tuple[int, str], tuple[int, str]] = {}
-    for terminology_idx, term_ids in terminology_candidates.items():
-        resolved = await fetch_terminology_term_idxs_by_term_ids(
-            conn, terminology_idx=terminology_idx, term_ids=term_ids
-        )
-        for term_id, idx_label in resolved.items():
-            terminology_lookup[(terminology_idx, term_id)] = idx_label
-
-    # Parse each text value: missing-reason markers route to MissingReasonRef
-    # first; TERMINOLOGY-typed fields then route to TerminologyTermRef on hit
-    # or raise MetadataParseError on miss; other values dispatch to the
-    # typed parser.
-    parsed: list[tuple[GlobalFieldRow, GlobalMetadataValue]] = []
-    for display_name, text_value in metadata.items():
-        global_row = global_field_rows[display_name]
-        stripped = text_value.strip()
-        if stripped in reason_lookup:
-            parsed.append(
-                (global_row, MissingReasonRef(idx=reason_lookup[stripped], name=stripped))
-            )
-            continue
-        if global_row.data_type is FieldDataType.TERMINOLOGY:
-            # terminology_idx is non-None for TERMINOLOGY-typed rows by the
-            # *_global_field CHECK; assert rather than guard so a CHECK violation
-            # surfaces loudly instead of silently dropping the row.
-            assert global_row.terminology_idx is not None
-            resolved_idx_label = terminology_lookup.get((global_row.terminology_idx, stripped))
-            if resolved_idx_label is None:
-                raise MetadataParseError(
-                    display_name=display_name,
-                    data_type=global_row.data_type,
-                    text_value=text_value,
-                    reason="no matching terminology term",
-                )
-            term_idx, term_label = resolved_idx_label
-            parsed.append(
-                (
-                    global_row,
-                    TerminologyTermRef(idx=term_idx, term_id=stripped, label=term_label),
-                )
-            )
-            continue
-        parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
-        parsed.append((global_row, parsed_value))
-    return parsed
+    # Parse every value against its resolved field, then zip the results back
+    # into (field, value) pairs in input order.
+    parsed_values = await _resolve_and_parse_metadata_values(
+        conn,
+        metadata=metadata,
+        fields=global_field_rows,
+        reason_lookup=known_missing_reasons or {},
+    )
+    return [(global_field_rows[name], parsed_values[name]) for name in metadata]
 
 
 async def insert_entity_to_study(
@@ -1545,7 +1583,7 @@ async def write_global_metadata_entries(
     entity_idx: int,
     study_idx: int,
     caller_idx: int,
-    parsed_metadata: Sequence[tuple[GlobalFieldRow, GlobalMetadataValue]],
+    parsed_metadata: Sequence[tuple[FieldRow, GlobalMetadataValue]],
 ) -> None:
     """Drive write_global_metadata_or_diagnose over every preflight-parsed
     entry, writing each value against study_idx (the field-owning study).
