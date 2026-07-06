@@ -1479,6 +1479,13 @@ _None yet._
   per-sample reconcile + export gate, and the delete-then-register no-duplicate
   guarantee against a live data plane). No new env var, migration, or scope; the
   updated `read-mask-block` workflow syncs via `qiita-admin actions sync` at deploy. (#243)
+- **Documented the intended multi-alias field-linkage invariant.** Recorded, in
+  `docs/architecture.md` and as catalog comments on
+  `biosample_metadata_one_value_per_global_field` /
+  `prep_sample_metadata_one_value_per_global_field`, that one study may hold
+  several study-local fields linked to the same global field (keyed by
+  `display_name`), and that the per-`(entity, global field)` uniqueness must not
+  be tightened to per-study. Documentation and comments only; no behavior change.
 - **Email notification on work-ticket terminal transitions.** When a work
   ticket reaches a terminal state (`completed` / `no_data` / `permanent`-failed),
   the control plane emails the originator. A new in-process asyncio sweeper

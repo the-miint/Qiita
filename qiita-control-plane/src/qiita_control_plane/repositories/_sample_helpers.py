@@ -839,6 +839,12 @@ async def _get_or_create_globally_linked_study_field(
     column and leaves the inheritance columns NULL per the
     *_study_field_inheritance_consistent CHECK.
 
+    Resolution keys on (study_idx, display_name), not on global_field_idx: a
+    new display_name bound to an already-linked global field mints an
+    additional study-local field for that global rather than reusing the
+    existing one. This multi-field-per-global aliasing capability within
+    a single study is intentional; see docs/architecture.md.
+
     Raises StudyFieldConflictError when an existing row at
     (study_idx, display_name) is purely-local or bound to a different
     global field — silently reusing it would attach the value to the wrong
