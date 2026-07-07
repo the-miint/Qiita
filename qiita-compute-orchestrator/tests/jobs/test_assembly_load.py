@@ -102,6 +102,14 @@ def staging_inputs(tmp_path):
     }
 
 
+def _tsv(path: Path, header: list[str], rows: list[tuple]) -> None:
+    """Write a RAW tab-delimited tool table (the shape the containers now emit
+    verbatim) — assembly_load parses it with DuckDB read_csv, never Python csv."""
+    path.write_text(
+        "\t".join(header) + "\n" + "".join("\t".join(str(c) for c in r) + "\n" for r in rows)
+    )
+
+
 def _inputs(tmp_path, staging_inputs, *, checkm_rows=None, das_rows=None):
     from qiita_compute_orchestrator.jobs.assembly_load import Inputs
 
@@ -109,18 +117,29 @@ def _inputs(tmp_path, staging_inputs, *, checkm_rows=None, das_rows=None):
     refined_dir = tmp_path / "refined"
     checkm_dir.mkdir(exist_ok=True)
     refined_dir.mkdir(exist_ok=True)
+    # checkm_rows is a 7-tuple (bin_id, marker, completeness, contamination,
+    # strain, genome_size, n_contigs). It is split across CheckM's two RAW
+    # --tab_table outputs, exactly as the checkm.sh container now emits them:
+    # lineage.tsv (lineage_wf) carries the quality columns, qa.tsv (qa -o 2) the
+    # genome stats. Headers are CheckM 1.x's verbatim spaced/parenthesized names.
     if checkm_rows is not None:
-        header = (
-            "genome_local_id\tmarker_lineage\tcompleteness\tcontamination\t"
-            "strain_heterogeneity\tgenome_size\tn_contigs\n"
+        _tsv(
+            checkm_dir / "lineage.tsv",
+            ["Bin Id", "Marker lineage", "Completeness", "Contamination", "Strain heterogeneity"],
+            [(r[0], r[1], r[2], r[3], r[4]) for r in checkm_rows],
         )
-        (checkm_dir / "checkm_quality.tsv").write_text(
-            header + "".join("\t".join(str(c) for c in r) + "\n" for r in checkm_rows)
+        _tsv(
+            checkm_dir / "qa.tsv",
+            ["Bin Id", "Genome size (bp)", "# contigs"],
+            [(r[0], r[5], r[6]) for r in checkm_rows],
         )
+    # das_rows is a 3-tuple (bin, bin_score, bin_set) written as DAS_Tool's RAW
+    # summary columns (DAS_Tool 1.1.x names).
     if das_rows is not None:
-        (refined_dir / "das_tool_scores.tsv").write_text(
-            "genome_local_id\tdas_tool_score\tsource_binner\n"
-            + "".join("\t".join(str(c) for c in r) + "\n" for r in das_rows)
+        _tsv(
+            refined_dir / "das_tool_summary.tsv",
+            ["bin", "bin_score", "bin_set"],
+            list(das_rows),
         )
     return Inputs(
         checkm_dir=checkm_dir,

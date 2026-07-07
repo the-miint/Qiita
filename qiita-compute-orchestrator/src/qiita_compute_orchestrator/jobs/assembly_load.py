@@ -17,8 +17,11 @@ The first two come straight from reference_load's `write_feature_sequences` /
 Parquet is the DuckLake copy of the Postgres `qiita.assembly_membership` the
 `write-assembly-membership` action already wrote — joined here from `bin_map`
 (read_id -> kind, bin_id) x `id_map` (read_id -> feature_idx) plus the run scalars.
-`bin_quality` is read from the container's normalized TSVs with DuckDB's CSV reader
-(never a Python csv parser).
+`bin_quality` is built here by reading the container steps' RAW tool output with
+DuckDB's CSV reader and doing ALL the column-selection/join/rename in SQL — the
+containers emit CheckM's / DAS_Tool's tables verbatim (a plain `cp`, no awk/python
+normalization), so DuckDB is the ONE csv framework in this path (never a Python
+csv parser, never a shell transform on the tool tables).
 
 Empty/partial semantics mirror the old pacbio_ingest: an LCG-only sample (contigs
 but no MAG) is a SUCCESS — `bin_quality` is written empty (register-files still
@@ -52,9 +55,14 @@ YAML_STEP_NAME = "assembly_load"
 
 _KIND_MAG = "MAG"
 
-# Normalized-intermediate basenames the container entrypoints write.
-_CHECKM_TSV = "checkm_quality.tsv"
-_DAS_SCORES_TSV = "das_tool_scores.tsv"
+# RAW tool-output basenames the container entrypoints emit verbatim (no
+# normalization — DuckDB does the column-selection/join/rename below). checkm.sh
+# writes CheckM's two `--tab_table` outputs; bin_refine.sh copies DAS_Tool's
+# summary. Column names below are pinned to CheckM 1.x (`resultsParser.py`) and
+# DAS_Tool 1.1.x (`_DASTool_summary.tsv`); VALIDATE on the first Linux build.
+_CHECKM_LINEAGE_TSV = "lineage.tsv"  # `checkm lineage_wf --tab_table`
+_CHECKM_QA_TSV = "qa.tsv"  # `checkm qa -o 2 --tab_table`
+_DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
 
 # DuckDB resource caps. Off-SLURM fallback; under SLURM the limit tracks the real
 # cgroup via `resolve_duckdb_memory_gb()`. Sized to fit write_feature_sequence_chunks'
@@ -89,7 +97,8 @@ class Inputs(BaseModel):
 
     `manifest` / `feature_map` / `assembly_chunks` / `bin_map` are the upstream
     outputs (assembly_hash + mint-features). `checkm_dir` / `refined_bins_dir` are
-    container-step outputs holding the CheckM + DAS_Tool TSVs. `processing_idx` is
+    container-step outputs holding CheckM's raw `lineage.tsv` + `qa.tsv` and
+    DAS_Tool's raw `das_tool_summary.tsv`. `processing_idx` is
     threaded via the step's `params:` (so the runner mints the run identity before
     the loop); `prep_sample_idx` / `work_ticket_idx` are framework-injected scope
     scalars.
@@ -164,8 +173,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             _write_bin_quality(
                 conn,
-                checkm_tsv=inputs.checkm_dir / _CHECKM_TSV,
-                das_tsv=inputs.refined_bins_dir / _DAS_SCORES_TSV,
+                lineage_tsv=inputs.checkm_dir / _CHECKM_LINEAGE_TSV,
+                qa_tsv=inputs.checkm_dir / _CHECKM_QA_TSV,
+                das_tsv=inputs.refined_bins_dir / _DAS_SUMMARY_TSV,
                 prep_sample_idx=inputs.prep_sample_idx,
                 processing_idx=inputs.processing_idx,
                 out=bin_quality_out,
@@ -211,25 +221,37 @@ def _write_assembly_membership(
     )
 
 
+# DuckDB read_csv over a tab-delimited tool table with verbatim (spaced /
+# parenthesized / '#'-prefixed) headers. header=true keeps the raw column names so
+# they are addressed by name below; auto_detect infers types (the projection CASTs
+# regardless). No Python/awk ever touches these files — DuckDB is the sole parser.
+_READ_TSV = "read_csv(?, delim='\t', header=true, auto_detect=true)"
+
+
 def _write_bin_quality(
     conn: duckdb.DuckDBPyConnection,
     *,
-    checkm_tsv: Path,
+    lineage_tsv: Path,
+    qa_tsv: Path,
     das_tsv: Path,
     prep_sample_idx: int,
     processing_idx: int,
     out: str,
 ) -> None:
     """Per-MAG CheckM quality (+ optional DAS_Tool provenance) -> the DuckLake
-    `bin_quality` shape. Read with DuckDB's CSV reader (never a Python csv parser):
-    columns by NAME (header=true) so a producer can reorder them. `kind` is 'MAG';
-    `bin_id` is the CheckM `genome_local_id` (the MAG FASTA stem). DAS_Tool scores
-    are LEFT-joined on genome_local_id when the file is present, else NULL.
+    `bin_quality` shape, built entirely in DuckDB from the containers' RAW tool
+    output (never a Python csv parser). CheckM's two `--tab_table` tables are read
+    and joined on the verbatim `"Bin Id"` column: `lineage_wf` carries marker
+    lineage + completeness/contamination/strain heterogeneity, `qa -o 2` adds
+    genome size / # contigs. `kind` is 'MAG'; `bin_id` is CheckM's `"Bin Id"` (the
+    MAG FASTA stem). DAS_Tool's summary is LEFT-joined on its `bin` column (== the
+    same MAG stem) when present, pulling `bin_score` / `bin_set`, else NULL.
 
-    A sample with no CheckM table (LCG-only, or the CheckM DB was absent) writes a
+    A sample with no CheckM tables (LCG-only, or the CheckM DB was absent) writes a
     valid EMPTY Parquet with the right schema so register-files always finds the
-    table."""
-    if not checkm_tsv.is_file():
+    table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see the module
+    constants) — VALIDATE on the first Linux build."""
+    if not (lineage_tsv.is_file() and qa_tsv.is_file()):
         # Empty write — every placeholder NULL, no FROM, WHERE FALSE.
         projection = _BIN_QUALITY_SELECT.format(
             ps="NULL",
@@ -248,32 +270,28 @@ def _write_bin_quality(
         conn.execute(f"COPY (SELECT {projection} WHERE FALSE) TO '{out}' ({PARQUET_OPTS})")
         return
 
-    # Populated write. DAS_Tool scores are optional: LEFT JOIN them on
-    # genome_local_id when present, else the das columns are literal NULLs.
+    # Populated write. CheckM headers are verbatim (spaces / parens / '#'), so they
+    # are double-quoted. DAS_Tool provenance is optional: LEFT JOIN its summary on
+    # `bin` == CheckM "Bin Id" when present, else the das columns are literal NULLs.
     has_das = das_tsv.is_file()
     projection = _BIN_QUALITY_SELECT.format(
         ps=prep_sample_idx,
         proc=processing_idx,
         kind=f"'{_KIND_MAG}'",
-        bin_id="c.genome_local_id",
-        marker="c.marker_lineage",
-        completeness="c.completeness",
-        contamination="c.contamination",
-        strain="c.strain_heterogeneity",
-        genome_size="c.genome_size",
-        n_contigs="c.n_contigs",
-        das_score="d.das_tool_score" if has_das else "NULL",
-        das_binner="d.source_binner" if has_das else "NULL",
+        bin_id='lin."Bin Id"',
+        marker='lin."Marker lineage"',
+        completeness='lin."Completeness"',
+        contamination='lin."Contamination"',
+        strain='lin."Strain heterogeneity"',
+        genome_size='qa."Genome size (bp)"',
+        n_contigs='qa."# contigs"',
+        das_score='das."bin_score"' if has_das else "NULL",
+        das_binner='das."bin_set"' if has_das else "NULL",
     )
+    source = f'  FROM {_READ_TSV} lin  JOIN {_READ_TSV} qa ON lin."Bin Id" = qa."Bin Id"'
+    params = [str(lineage_tsv), str(qa_tsv)]
     if has_das:
-        source = (
-            "  FROM read_csv(?, delim='\t', header=true, auto_detect=true) c"
-            "  LEFT JOIN read_csv(?, delim='\t', header=true, auto_detect=true) d"
-            "    ON c.genome_local_id = d.genome_local_id"
-        )
-        params = [str(checkm_tsv), str(das_tsv)]
-    else:
-        source = "  FROM read_csv(?, delim='\t', header=true, auto_detect=true) c"
-        params = [str(checkm_tsv)]
+        source += f'  LEFT JOIN {_READ_TSV} das ON lin."Bin Id" = das."bin"'
+        params.append(str(das_tsv))
 
     conn.execute(f"COPY (SELECT {projection} {source}) TO '{out}' ({PARQUET_OPTS})", params)
