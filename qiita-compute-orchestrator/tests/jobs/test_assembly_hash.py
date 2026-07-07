@@ -1,0 +1,154 @@
+"""Isolated unit tests for `assembly_hash.execute` — the container-FASTA ->
+manifest / hash-keyed-chunks / bin_map head of the assembly-storage tail.
+
+Runs against the team-mirror miint build (conftest stages it): the job reads FASTA
+with miint `read_fastx` and chunks with `sequence_split`. Calls execute() directly.
+Covers: happy path (LCG + MAG, synthetic read_ids, hash-keyed chunks, dedup of
+identical contigs), synthetic-id disambiguation of a contig id reused across bins,
+and empty -> StepNoData.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from uuid import UUID
+
+import duckdb
+import pytest
+from qiita_common.backend_failure import StepNoData
+
+from qiita_compute_orchestrator.jobs.assembly_hash import Inputs, execute
+
+
+def _run(inputs: Inputs, workspace) -> dict:
+    return asyncio.run(execute(inputs, workspace))
+
+
+def _fasta(path, records: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f">{cid}\n{seq}\n" for cid, seq in records.items()))
+
+
+def _layout(tmp_path):
+    genomes = tmp_path / "genomes"
+    refined = tmp_path / "refined"
+    (genomes / "LCG").mkdir(parents=True)
+    refined.mkdir(parents=True)
+    return genomes, refined
+
+
+def _canonical(seq: str) -> str:
+    """Mirror the shared canonical form: LEAST(upper, revcomp(upper))."""
+    rc = seq.translate(str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN"))[::-1].upper()
+    return min(seq.upper(), rc)
+
+
+def _hash(seq: str) -> UUID:
+    return UUID(hashlib.md5(_canonical(seq).encode()).hexdigest())
+
+
+def _rows(parquet, cols: str, order: str):
+    with duckdb.connect(":memory:") as con:
+        return con.execute(
+            f"SELECT {cols} FROM read_parquet('{parquet}') ORDER BY {order}"
+        ).fetchall()
+
+
+def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
+    genomes, refined = _layout(tmp_path)
+    _fasta(genomes / "LCG" / "circ1.fna", {"c1": "AAAACCCCGGGGTTTT"})
+    _fasta(refined / "bin.1.fa", {"x1": "ACGTACGTACGTACGT", "x2": "TTTTGGGGCCCCAAAA"})
+
+    out = _run(
+        Inputs(
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=7
+        ),
+        tmp_path / "ws",
+    )
+
+    # manifest: synthetic read_id kind:bin_id:contig, canonical hash, length.
+    manifest = _rows(
+        out["manifest"],
+        "read_id, CAST(sequence_hash AS VARCHAR), sequence_length_bp",
+        "read_id",
+    )
+    assert manifest == sorted(
+        [
+            ("LCG:circ1:c1", str(_hash("AAAACCCCGGGGTTTT")), 16),
+            ("MAG:bin.1:x1", str(_hash("ACGTACGTACGTACGT")), 16),
+            ("MAG:bin.1:x2", str(_hash("TTTTGGGGCCCCAAAA")), 16),
+        ]
+    )
+
+    # bin_map: kind + bin_id per synthetic read_id.
+    bin_map = _rows(out["bin_map"], "read_id, kind, bin_id", "read_id")
+    assert bin_map == sorted(
+        [
+            ("LCG:circ1:c1", "LCG", "circ1"),
+            ("MAG:bin.1:x1", "MAG", "bin.1"),
+            ("MAG:bin.1:x2", "MAG", "bin.1"),
+        ]
+    )
+
+    # chunks: a directory of part_*.parquet keyed by sequence_hash; reassembled
+    # chunk_data equals the canonical bytes.
+    chunks_dir = out["assembly_chunks"]
+    assert chunks_dir.is_dir()
+    parts = sorted(chunks_dir.glob("part_*.parquet"))
+    assert parts
+    glob = str(chunks_dir / "part_*.parquet")
+    with duckdb.connect(":memory:") as con:
+        cols = {
+            c[0]: c[1]
+            for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [glob]).fetchall()
+        }
+        assert cols == {"sequence_hash": "UUID", "chunk_index": "INTEGER", "chunk_data": "VARCHAR"}
+        reassembled = dict(
+            con.execute(
+                "SELECT CAST(sequence_hash AS VARCHAR), "
+                "string_agg(chunk_data, '' ORDER BY chunk_index) "
+                "FROM read_parquet(?) GROUP BY sequence_hash",
+                [glob],
+            ).fetchall()
+        )
+    assert reassembled[str(_hash("AAAACCCCGGGGTTTT"))] == "AAAACCCCGGGGTTTT"
+    assert reassembled[str(_hash("ACGTACGTACGTACGT"))] == "ACGTACGTACGTACGT"
+
+
+def test_identical_contigs_dedup_to_one_chunk_set(tmp_path):
+    """Two contigs (different bins) with identical bytes collapse to ONE
+    sequence_hash in the chunks, but BOTH keep their manifest + bin_map rows (so
+    write-assembly-membership records both bins for the shared feature)."""
+    genomes, refined = _layout(tmp_path)
+    _fasta(refined / "bin.1.fa", {"ctg": "ACGTACGTACGTACGT"})
+    _fasta(refined / "bin.2.fa", {"ctg": "ACGTACGTACGTACGT"})
+
+    out = _run(
+        Inputs(genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=1, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+    # Same raw contig id "ctg" in two bins — synthetic read_ids disambiguate.
+    manifest = _rows(out["manifest"], "read_id", "read_id")
+    assert manifest == [("MAG:bin.1:ctg",), ("MAG:bin.2:ctg",)]
+
+    glob = str(out["assembly_chunks"] / "part_*.parquet")
+    with duckdb.connect(":memory:") as con:
+        distinct_hashes = con.execute(
+            f"SELECT count(DISTINCT sequence_hash) FROM read_parquet('{glob}')"
+        ).fetchone()[0]
+    assert distinct_hashes == 1
+
+
+def test_no_contigs_is_no_data(tmp_path):
+    genomes, refined = _layout(tmp_path)
+    with pytest.raises(StepNoData):
+        _run(
+            Inputs(
+                genomes_dir=genomes,
+                refined_bins_dir=refined,
+                prep_sample_idx=1,
+                work_ticket_idx=1,
+            ),
+            tmp_path / "ws",
+        )
