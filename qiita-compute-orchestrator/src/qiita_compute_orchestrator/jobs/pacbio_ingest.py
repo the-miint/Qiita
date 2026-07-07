@@ -56,6 +56,12 @@ from ..miint import (
 
 YAML_STEP_NAME = "pacbio_ingest"
 
+# The closed `kind` value set stored in assembled_genome / genome_quality. Kept as
+# module constants (not a cross-language enum — these are DuckLake-only VARCHAR
+# columns, no Postgres ENUM twin) so the producer stays honest about the two forms.
+_KIND_LCG = "LCG"  # a circular genome (large circular genome, >=512 kb)
+_KIND_MAG = "MAG"  # a refined metagenome-assembled bin
+
 # FASTA extensions accepted for genome files (both plain and gzip-compressed).
 _FASTA_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
 
@@ -189,7 +195,7 @@ def _collect_quality_rows(
         rows.append(
             (
                 prep_sample_idx,
-                "MAG",
+                _KIND_MAG,
                 local_id,
                 r.get("marker_lineage") or None,
                 _f(r.get("completeness")),
@@ -210,8 +216,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     assembler = inputs.assembler
 
     genome_rows = _collect_genome_rows(
-        inputs.genomes_dir / "LCG", "LCG", prep, assembler
-    ) + _collect_genome_rows(inputs.refined_bins_dir, "MAG", prep, assembler)
+        inputs.genomes_dir / "LCG", _KIND_LCG, prep, assembler
+    ) + _collect_genome_rows(inputs.refined_bins_dir, _KIND_MAG, prep, assembler)
 
     # A sample that assembled nothing binnable AND has no circular genome is a
     # terminal no-data outcome — no rows to store, not a failure.

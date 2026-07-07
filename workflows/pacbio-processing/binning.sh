@@ -25,7 +25,7 @@ if [[ ! -s "${NOLCG}" ]]; then
 fi
 
 # metaWRAP's --single-end wants a plain (uncompressed) .fastq path.
-READS_FQ="${WORK_FQ:-$(mktemp -d)/reads.fastq}"
+READS_FQ="$(mktemp -d)/reads.fastq"
 mkdir -p "$(dirname "${READS_FQ}")"
 if [[ "${READS_FASTQ}" == *.gz ]]; then
     pigz -dc "${READS_FASTQ}" > "${READS_FQ}"
@@ -37,8 +37,11 @@ fi
 # bin dirs exist. Only a hard metaWRAP crash should fail the step, so we let its
 # real exit code through except for the empty-result case metaWRAP signals with a
 # clean run and no bins.
+# -m 90 (not 100): the step's SLURM allocation is 100 GB (baseline_resources), so
+# cap metaWRAP below it to leave ~10 GB headroom for its Python/aligner runtime
+# (else it can OOM-kill at the cgroup boundary).
 micromamba run -n metawrap metawrap binning \
-    -a "${NOLCG}" -o "${OUT}" -t "${THREADS}" -m 100 -l 16000 \
+    -a "${NOLCG}" -o "${OUT}" -t "${THREADS}" -m 90 -l 16000 \
     --single-end --metabat2 --maxbin2 --concoct --universal "${READS_FQ}"
 
 qiita_finish bins_dir=bins

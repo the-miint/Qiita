@@ -29,6 +29,22 @@ if ! ls "${REFINED_DIR}"/*.fa >/dev/null 2>&1; then
 fi
 
 export CHECKM_DATA_PATH="${QIITA_CHECKM_DB:-/opt/checkm_data}"
+
+# The CheckM reference DB is bind-mounted at run time (deploy checklist bucket 2),
+# NOT baked into the SIF. If it is absent, DEGRADE gracefully rather than hard-fail
+# the whole ticket under `set -e`: emit the header-only table with a LOUD warning so
+# the sample's genomes still store — MAG quality is captured on the next run once
+# the DB (and its container bind) are present. This is the deploy-config gap the
+# checklist's "known follow-up" refers to; assemble/binning/bin_refine and the
+# genome sequences are unaffected, but MAG *quality* is uncaptured until then.
+if [[ ! -d "${CHECKM_DATA_PATH}" || -z "$(ls -A "${CHECKM_DATA_PATH}" 2>/dev/null)" ]]; then
+    echo "WARNING: CheckM reference data not found at CHECKM_DATA_PATH=${CHECKM_DATA_PATH};" >&2
+    echo "         emitting empty checkm_quality.tsv — MAG quality UNCAPTURED this run." >&2
+    _header > "${OUT}/checkm_quality.tsv"
+    qiita_finish checkm_dir=checkm
+    exit 0
+fi
+
 LINEAGE="${WORK}/lineage.tsv"
 QA="${WORK}/qa.tsv"
 
