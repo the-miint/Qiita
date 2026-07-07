@@ -20,9 +20,18 @@ if [[ ! -f "${PARAMS_JSON}" ]]; then
     exit 64
 fi
 
-# Thread count from the SLURM allocation (cpu in baseline_resources); 1 off-SLURM.
-# Exported so the tool subprocesses (and sourcing entrypoints) both see it.
-export THREADS="${SLURM_CPUS_PER_TASK:-1}"
+# Thread count from the SLURM allocation. SLURM_CPUS_PER_TASK is exactly the cpu
+# the resolved profile asked for (SlurmBackend sets cpus_per_task =
+# baseline_resources.cpu in slurm/payload.py), so a per-step cpu change in
+# 1.0.0.yaml needs no entrypoint change. Off SLURM (local apptainer runs) it is
+# unset — fall back to the box's real cpu count (nproc), then 1, never a bare
+# hardcoded 1. Mirrors workflows/bcl-convert/entrypoint.sh. Exported so the tool
+# subprocesses (and sourcing entrypoints) both see it.
+THREADS="${SLURM_CPUS_PER_TASK:-}"
+if [[ -z "${THREADS}" ]]; then
+    THREADS=$(nproc 2>/dev/null || echo 1)
+fi
+export THREADS
 
 # Read a required .inputs.<key> host path (or scalar) from params.json.
 qiita_input() { jq -er ".inputs.$1" "${PARAMS_JSON}"; }
