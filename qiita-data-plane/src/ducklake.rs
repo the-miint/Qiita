@@ -264,23 +264,28 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             chunk_data VARCHAR NOT NULL
         );
 
-        -- Which features a prep_sample's assembly contains, and in which bin.
-        -- kind is 'LCG' | 'MAG' (value set owned by the producer). The DuckLake
-        -- copy of qiita.assembly_membership for bulk joins with the sequences.
+        -- Which features a (prep_sample, processing) assembly run contains, and in
+        -- which bin. processing_idx disambiguates runs (bin_id reused across
+        -- samples AND runs); kind is 'LCG' | 'MAG' (value set owned by the
+        -- producer). The DuckLake copy of qiita.assembly_membership for bulk joins
+        -- with the sequences.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
             kind VARCHAR NOT NULL,
             bin_id VARCHAR NOT NULL,
             feature_idx BIGINT NOT NULL
         );
 
         -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on
-        -- (prep_sample_idx, kind, bin_id). completeness / contamination /
-        -- strain_heterogeneity + marker_lineage from `checkm lineage_wf
-        -- --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
-        -- das_tool_score / source_binner are DAS_Tool provenance.
+        -- (prep_sample_idx, processing_idx, kind, bin_id). completeness /
+        -- contamination / strain_heterogeneity + marker_lineage from `checkm
+        -- lineage_wf --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
+        -- das_tool_score / source_binner are DAS_Tool provenance. The assembler is
+        -- captured in qiita.processing (processing_idx), not repeated here.
         CREATE TABLE IF NOT EXISTS qiita_lake.bin_quality (
             prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
             kind VARCHAR NOT NULL,
             bin_id VARCHAR NOT NULL,
             marker_lineage VARCHAR,
@@ -290,8 +295,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             genome_size BIGINT,
             n_contigs BIGINT,
             das_tool_score DOUBLE,
-            source_binner VARCHAR,
-            assembler VARCHAR NOT NULL
+            source_binner VARCHAR
         );",
     )?;
     Ok(())
