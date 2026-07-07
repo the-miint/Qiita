@@ -44,12 +44,25 @@ context_schema:
       type: string
       minLength: 1
       pattern: "^/"
+    # Caller's alignment-state declaration. This loader supports only unaligned
+    # basecaller uBAMs (PacBio HiFi / ONT) — an aligned BAM would store
+    # reverse-strand reads mis-oriented. The submitting sequence-load step sets
+    # this True; the `bam` step then CONFIRMS the BAM is actually unaligned (a
+    # flags-only read_alignments pass) and 422s the ticket if not. Optional: the
+    # job defaults expect_unaligned=True, so a hand-submitted ticket that omits
+    # it is still verified. (Not a file path — the upload-handle walker only
+    # touches `*_upload_idx` keys, so it leaves this alone.)
+    expect_unaligned:
+      type: boolean
 
 steps:
   - step: bam
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.bam_to_parquet
     inputs: [bam_path]
+    # `expect_unaligned` rides through `params:` (scalar → Inputs field); absent
+    # from action_context, the job's default (True) applies.
+    params: {expect_unaligned: expect_unaligned}
     # `read_staging_dir` is the workspace holding read.parquet, which the
     # register-files step below loads into the DuckLake `read` table.
     outputs: [read_staging_dir]

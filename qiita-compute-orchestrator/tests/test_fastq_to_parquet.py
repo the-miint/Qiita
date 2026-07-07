@@ -364,7 +364,7 @@ def test_execute_recovery_skips_mint_and_uses_supplied_range(monkeypatch, tmp_pa
     no HTTP mint call is made (the patched mint would raise loudly), and
     the output Parquet's sequence_idx column starts at the supplied
     range's `sequence_idx_start`."""
-    from qiita_compute_orchestrator.jobs.fastq_to_parquet import PreMintedRange
+    from qiita_compute_orchestrator.sequence_range import PreMintedRange
 
     _assert_mint_not_called(monkeypatch)
 
@@ -392,7 +392,7 @@ def test_execute_recovery_rejects_count_mismatch(monkeypatch, tmp_path):
     from qiita_common.backend_failure import BackendFailure, FailureKind
     from qiita_common.models import WorkTicketFailureStage
 
-    from qiita_compute_orchestrator.jobs.fastq_to_parquet import PreMintedRange
+    from qiita_compute_orchestrator.sequence_range import PreMintedRange
 
     _assert_mint_not_called(monkeypatch)
 

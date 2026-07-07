@@ -9,9 +9,10 @@ Covers:
   - happy path: reads become read.parquet rows with sequence_idx from the minted
     range (read_sequences_sam's sequence_index + start - 1), qual decoded to
     UTINYINT[], sequence2/qual2 NULL;
-  - the one-record-per-read guard: a repeated QNAME (paired mate OR a
-    secondary/supplementary alignment — read_sequences_sam emits every record and
-    can't filter by flag) is rejected BAD_INPUT before the mint;
+  - the unaligned verify: an aligned (mapped) record → BAD_INPUT, and a caller
+    declaring expect_unaligned=False → BAD_INPUT;
+  - the one-record-per-read guard: a paired uBAM (unmapped mates sharing a QNAME,
+    which pass the verify) → BAD_INPUT before the mint;
   - header-only (no records) is terminal NO_DATA (StepNoData);
   - missing input raises FileNotFoundError;
   - pre_minted_range recovery (count match reuses the range).
@@ -34,13 +35,23 @@ from qiita_compute_orchestrator.jobs.bam_to_parquet import YAML_STEP_NAME, Input
 from qiita_compute_orchestrator.sequence_range import MintedSequenceRange, PreMintedRange
 
 # Minimal SAM columns: QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL.
-# Unmapped (FLAG 4) records model a long-read uBAM; RNAME='*' needs no @SQ header.
+# Unmapped (FLAG 4) records model a long-read uBAM. A mapped record (default
+# args overridden) models an aligned BAM the loader must reject.
 _UNMAPPED = 4
-_SUPPLEMENTARY = 2048
+_REVERSE = 16  # reverse-strand, MAPPED (no 0x4) — the mis-orientation case
 
 
-def _sam_record(qname: str, seq: str, qual: str, flag: int = _UNMAPPED) -> str:
-    return "\t".join([qname, str(flag), "*", "0", "0", "*", "*", "0", "0", seq, qual])
+def _sam_record(
+    qname: str,
+    seq: str,
+    qual: str,
+    flag: int = _UNMAPPED,
+    *,
+    rname: str = "*",
+    pos: int = 0,
+    cigar: str = "*",
+) -> str:
+    return "\t".join([qname, str(flag), rname, str(pos), "0", cigar, "*", "0", "0", seq, qual])
 
 
 def _write_sam(path, records: list[str]) -> None:
@@ -129,30 +140,48 @@ def test_header_only_sam_raises_stepnodata(fake_mint, tmp_path):
     assert not (tmp_path / "ws" / "read.parquet").exists()
 
 
-def test_supplementary_same_qname_rejected_as_bad_input(fake_mint, tmp_path):
-    """read_sequences_sam can't filter by flag, so a supplementary alignment
-    reaches the loader as a second record sharing the primary's QNAME. The
-    one-record-per-read guard rejects it BAD_INPUT (same path as paired input),
-    rather than minting an inflated range / assigning a stray sequence_idx."""
+def test_aligned_bam_rejected_as_bad_input(fake_mint, tmp_path):
+    """An aligned BAM (a mapped, reverse-strand record) is rejected BAD_INPUT by
+    the expect_unaligned verify pass — before the parse and before the mint — so
+    reverse-strand reads are never stored in reference orientation. r1 is a normal
+    unmapped read; r2 is mapped, which trips the guard."""
     sam = tmp_path / "in.sam"
     _write_sam(
         sam,
         [
-            _sam_record("r1", "ACGT", "IIII"),  # primary
-            _sam_record("r1", "GG", "II", flag=_SUPPLEMENTARY),  # same QNAME
+            _sam_record("r1", "ACGT", "IIII"),  # unmapped
+            _sam_record("r2", "TTTT", "IIII", flag=_REVERSE, rname="chr1", pos=30, cigar="4M"),
         ],
     )
 
     with pytest.raises(BackendFailure) as exc:
         _run(Inputs(bam_path=sam, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
     assert exc.value.kind == FailureKind.BAD_INPUT
+    assert exc.value.step_name == YAML_STEP_NAME
+    assert fake_mint == []
+    assert not (tmp_path / "ws" / "read.parquet").exists()
+
+
+def test_expect_unaligned_false_rejected_as_bad_input(fake_mint, tmp_path):
+    """A caller that declares expect_unaligned=False (an aligned BAM) is rejected
+    outright — aligned loading is not supported yet. Rejected before any parse."""
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(
+            Inputs(bam_path=sam, prep_sample_idx=1, work_ticket_idx=1, expect_unaligned=False),
+            tmp_path / "ws",
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
     assert fake_mint == []
 
 
 def test_duplicate_qname_rejected_as_bad_input(fake_mint, tmp_path):
-    """A paired-end BAM — two primary records sharing a QNAME (FLAG 0x1 paired) —
-    is rejected BAD_INPUT before the mint, not silently loaded as two reads with
-    distinct sequence_idx."""
+    """A paired uBAM — two UNMAPPED mates sharing a QNAME (FLAG 4|0x1) — passes the
+    unaligned verify (both unmapped) but is rejected BAD_INPUT by the
+    one-record-per-read guard, not silently loaded as two reads with distinct
+    sequence_idx."""
     sam = tmp_path / "in.sam"
     _write_sam(
         sam,

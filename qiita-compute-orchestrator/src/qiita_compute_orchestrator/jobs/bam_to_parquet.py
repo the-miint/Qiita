@@ -14,23 +14,26 @@ alignment information and every aux tag — base-modification (MM/ML methylation
 and kinetics (ipd/pw) included. If per-read methylation ever needs preserving,
 that is a separate reader and a separate table, not this job.
 
-**One record per read, enforced.** `read_sequences_sam` emits one row per SAM
-record and exposes no FLAG column, so it does NOT drop secondary/supplementary
-alignments — a read with any extra alignment record, or a paired mate, repeats
-its QNAME. Assigning each a distinct `sequence_idx` would give one molecular
-event two identifiers (the invariant `fastq_to_parquet` preserves by emitting one
-row per pair). So after the count we REJECT (BAD_INPUT) any input whose read_id
-is not unique — `count(DISTINCT read_id) != count(*)`. That one guard covers
-every multi-record case (paired-end, secondary, supplementary) without a FLAG
-column to filter on, and matches the target input: an unaligned basecaller uBAM,
-where every record is a distinct primary read. An aligned/split-read or paired
-BAM is out of scope and fails loudly rather than loading corrupt rows.
+**Unaligned uBAM, enforced.** The target input is a basecaller uBAM (PacBio HiFi
+/ ONT dorado), where every record is unaligned — `read_sequences_sam` returns
+`SEQ` verbatim, which for an unaligned read IS the sequenced orientation. An
+ALIGNED BAM (e.g. pbmm2/minimap2 output) carries reverse-strand records whose
+`SEQ` is reference-forward — reverse-complemented relative to the original read —
+which this loader would store mis-oriented, silently. `read_sequences_sam`
+exposes no FLAG column, so the caller DECLARES the expectation via
+`expect_unaligned` (the sequence-load step sets it True) and this job CONFIRMS it:
+a flags-only `read_alignments` pass rejects (BAD_INPUT) if any record is mapped,
+before the parse. `expect_unaligned=False` (a caller asserting an aligned BAM) is
+not supported yet and is rejected outright. This turns "unaligned only" from a
+silent assumption into a fail-loud contract.
 
-**Orientation.** `sequence1` is the BAM SEQ field verbatim (miint does not
-reverse-complement reverse-strand records back to sequenced orientation — probed
-against the mirror build). For an unaligned uBAM that IS the sequenced
-orientation; a strand-aware loader would need to handle reverse records, but this
-job ignores strand/modification semantics.
+**One record per read.** Even within an unaligned BAM, a paired uBAM flags both
+mates primary with the same QNAME, and `read_sequences_sam` emits one row per
+record — so the two mates would each get a distinct `sequence_idx`, two
+identifiers for one molecular event (the invariant `fastq_to_parquet` preserves
+by emitting one row per pair). So after the count we ALSO reject (BAD_INPUT) any
+input whose read_id is not unique (`count(DISTINCT read_id) != count(*)`). The
+single-end uBAM this targets has unique QNAMEs and passes.
 
 Input-immutability assumption, same as fastq_to_parquet: `bam_path` MUST NOT be
 modified between work_ticket submission and step execution — the retry-recovery
@@ -73,11 +76,15 @@ YAML_STEP_NAME = "bam"
 # DuckDB resource caps, mirroring fastq_to_parquet's rationale: the YAML
 # allocation (workflows/bam-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
 # SLURM cgroup; DuckDB's caps sit just below (`mem_gb - 1` leaves ~1 GB for
-# Python/miint/OS overhead). 7 GB is comfortably above the ~2.4 GB resident/thread
-# a long-read parse needs (2048 STANDARD_VECTOR_SIZE × 60 row_group_size × ~20 KB
-# avg long-read record incl. quality). The pipeline is a read_sequences_sam parse,
-# a footer count + `count(DISTINCT read_id)` aggregate, and a sorted COPY — all
-# spill to duckdb_tmp under the cap.
+# Python/miint/OS overhead). 7 GB matches fastq_to_parquet's cap, but note a BAM
+# record is heavier than a FASTQ read: a PacBio HiFi / ONT uBAM record carries
+# per-base modification (MM/ML) and kinetics (ipd/pw) aux tags that htslib
+# materializes with the whole record BEFORE read_sequences_sam projects them away
+# — so peak parse memory reflects the tagged record, not the ~20 KB seq+qual this
+# job keeps. The pipeline is the flags-only read_alignments verify pass, the
+# read_sequences_sam parse, a footer count + `count(DISTINCT read_id)` aggregate,
+# and a sorted COPY — all spill to duckdb_tmp under the cap. Revisit against a
+# real kinetics-laden uBAM MaxRSS if the parse dominates.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
@@ -86,14 +93,18 @@ class Inputs(BaseModel):
     """Typed input contract for bam_to_parquet.
 
     `bam_path` is the workflow-declared input (the action_context's bam_path
-    flows through here). `prep_sample_idx` and `work_ticket_idx` are
-    framework-injected scope scalars; `prep_sample_idx` is also the key the CP's
-    sequence-range allocator uses. `pre_minted_range` is the optional E-operator
-    recovery hook — set only on a retry where a prior attempt minted then failed
-    after the mint (see `PreMintedRange`).
+    flows through here). `expect_unaligned` is the caller's alignment-state
+    declaration (threaded from action_context via the step's `params:`; the
+    sequence-load step sets it True). Defaults True — a hand-submitted ticket that
+    omits it still gets the unaligned verification. `prep_sample_idx` and
+    `work_ticket_idx` are framework-injected scope scalars; `prep_sample_idx` is
+    also the key the CP's sequence-range allocator uses. `pre_minted_range` is the
+    optional E-operator recovery hook — set only on a retry where a prior attempt
+    minted then failed after the mint (see `PreMintedRange`).
     """
 
     bam_path: Path
+    expect_unaligned: bool = True
     prep_sample_idx: int
     work_ticket_idx: int
     pre_minted_range: PreMintedRange | None = None
@@ -103,6 +114,20 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """B-staged-Parquet pipeline. See module docstring for the full description."""
     if not inputs.bam_path.exists():
         raise FileNotFoundError(f"BAM file not found: {inputs.bam_path}")
+
+    # The caller must declare an unaligned BAM. An aligned BAM would store
+    # reverse-strand reads mis-oriented (see module docstring) — not supported yet.
+    if not inputs.expect_unaligned:
+        raise BackendFailure(
+            kind=FailureKind.BAD_INPUT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=YAML_STEP_NAME,
+            reason=(
+                "expect_unaligned=False: loading an aligned BAM is not supported "
+                "(reverse-strand reads would be stored in reference orientation); "
+                "this workflow expects an unaligned basecaller uBAM"
+            ),
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
@@ -123,6 +148,35 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=_DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
             )
+
+            # Confirm the declared `expect_unaligned`: read_sequences_sam exposes
+            # no FLAG column, so verify via a flags-only read_alignments pass and
+            # reject BAD_INPUT if ANY record is mapped. `LIMIT 1` + DuckDB's
+            # predicate pushdown into read_alignments (HTSlib-layer flag filter)
+            # short-circuit on the first aligned record, so an aligned BAM fails
+            # fast — before the seq/qual parse below. A uBAM (every record
+            # unmapped) scans flags only, then proceeds.
+            aligned = conn.execute(
+                "SELECT 1 FROM read_alignments(?) WHERE NOT alignment_is_unmapped(flags) LIMIT 1",
+                [str(inputs.bam_path)],
+            ).fetchone()
+            if aligned is not None:
+                raise BackendFailure(
+                    kind=FailureKind.BAD_INPUT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=YAML_STEP_NAME,
+                    reason=(
+                        f"expect_unaligned is set but the BAM contains aligned "
+                        f"records: {inputs.bam_path}. This loader stores SEQ verbatim "
+                        f"and would mis-orient reverse-strand reads — supply an "
+                        f"unaligned basecaller uBAM"
+                    ),
+                )
+
+            # BAM -> intermediate Parquet. read_sequences_sam yields the same
+            # read_fastx-compatible columns (incl. the per-record `sequence_index`
+            # ordinal used for the sequence_idx rewrite below), so this SELECT
+            # mirrors fastq_to_parquet's read_fastx SELECT. `comment` is dropped.
             conn.execute(
                 "COPY ( SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_sequences_sam(?) ) "
