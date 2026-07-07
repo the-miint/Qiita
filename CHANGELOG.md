@@ -629,6 +629,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Single-sourced the sequence-chunk reassembly SQL.** Added
+  `reassemble_chunks_expr` to `qiita_common.chunking` next to the existing
+  `sequence_split_expr`, so the `string_agg(chunk_data, '' ORDER BY chunk_index)`
+  reassembly (previously hand-written in `build_minimap2_index` and
+  `hash_sequences`) has one home for both directions of the chunk contract.
+  Pure refactor — both call sites emit byte-identical SQL. (#reference-support)
 - **`reference_taxonomy` is now 1-1 with a reference's features; taxonomy
   coverage gaps warn loudly instead of dropping silently.** `reference_load`'s
   `_write_taxonomy` used an INNER JOIN on `read_id`, which silently dropped both

@@ -42,6 +42,7 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.chunking import reassemble_chunks_expr
 from qiita_common.models import HOST_FILTER_INDEX_TYPE_MINIMAP2
 from qiita_common.parquet import validate_parquet_path
 
@@ -149,7 +150,7 @@ def _stage_subject(conn: duckdb.DuckDBPyConnection, read_target: Path) -> int:
     conn.execute(
         f"CREATE OR REPLACE TABLE {_SUBJECT_RELATION} AS "
         "SELECT feature_idx AS read_id, "
-        "string_agg(chunk_data, '' ORDER BY chunk_index) AS sequence1 "
+        f"{reassemble_chunks_expr()} AS sequence1 "
         f"FROM read_parquet('{target_sql}') GROUP BY feature_idx"
     )
     return conn.execute(f"SELECT count(*) FROM {_SUBJECT_RELATION}").fetchone()[0]
