@@ -1,0 +1,150 @@
+action_id: pacbio-processing
+version: 1.0.0
+target_kind: prep_sample
+# target_processing_kinds is intentionally omitted (empty = any kind): there is
+# no "masked" ProcessingKind, and the real input selector is `mask_idx` (which
+# host-filter/mask identity to assemble from), resolved by the runner into the
+# masked reads.parquet the pipeline consumes.
+
+description: >
+  Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
+  PacBio HiFi long reads (a port of qp-pacbio pipeline B). The runner materializes
+  the prep_sample's masked reads (the read_masked pass-set for `mask_idx`:
+  host/human/QC-failing reads excluded, recorded trims applied) into a per-ticket
+  reads.parquet; the native `pacbio_export_reads` step converts that to FASTQ and
+  records the chosen assembler. Four container steps then run the heavy tools —
+  `assemble` (hifiasm_meta → circular LCG genomes + noLCG contigs), `binning`
+  (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
+  and `checkm` (per-MAG completeness/contamination). The native `pacbio_ingest`
+  step parses the LCG + MAG sequences + CheckM metrics into two Parquets keyed by
+  prep_sample_idx, and register-files loads them into the `assembled_genome` and
+  `genome_quality` DuckLake tables.
+
+  Everything here is per-sample. Cross-sample dereplication / taxonomy / abundance
+  (galah/gtdbtk/GToTree/coverm) is a separate downstream stage that reads these
+  stored per-sample results across many preps.
+
+scopes: []
+
+audience:
+  # A processing workflow over a sample's already-stored masked reads. Available
+  # to end users and above; no service-account (LIMS) submission today.
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [mask_idx]
+  properties:
+    # The CP-minted filtering-config identity whose pass-set to assemble. The
+    # runner resolves it into the masked reads.parquet via the data-plane
+    # export_read_masked DoAction (mirrors how read-mask consumers thread
+    # mask_idx). Without it there is no way to select WHICH mask's reads to use.
+    mask_idx:
+      type: integer
+      minimum: 1
+    # Step-1 assembler. Threaded (as a scalar param) through the native
+    # pacbio_export_reads step into run_config.json, which the `assemble`
+    # container reads — a scalar can't ride a container step's inputs (the runner
+    # would treat it as a bind-mount path). hifiasm_meta is implemented today;
+    # myloasm is reserved for a future assemble-container branch.
+    assembler:
+      type: string
+      enum: [hifiasm_meta, myloasm]
+      default: hifiasm_meta
+
+steps:
+  # Convert the runner-materialized masked reads.parquet → reads.fastq.gz and
+  # record the assembler in run_config.json. `reads` is the magic staged-reads
+  # binding (masked variant, keyed off mask_idx). Native: a scalar param
+  # (assembler) is native-only, and parquet→fastq needs no container.
+  - step: pacbio_export_reads
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.pacbio_export_reads
+    inputs: [reads]
+    params: {assembler: assembler}
+    outputs: [reads_fastq, run_config]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT2H
+
+  # hifiasm_meta assembly + circular-genome extraction. Reads run_config.json to
+  # pick the assembler; emits genomes_dir/{LCG/*.fna, noLCG.fa}. 0 contigs is a
+  # terminal no-data outcome inside the container.
+  - step: assemble
+    step_type: singleton
+    container: pacbio-processing-1.0.0.sif
+    entrypoint: /opt/qiita/assemble.sh
+    inputs: [reads_fastq, run_config]
+    outputs: [genomes_dir]
+    baseline_resources:
+      cpu: 32
+      mem_gb: 192
+      walltime: PT16H
+
+  # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
+  # reads. 0 bins → empty bins_dir (exit 0); downstream steps skip cleanly.
+  - step: binning
+    step_type: singleton
+    container: pacbio-processing-1.0.0.sif
+    entrypoint: /opt/qiita/binning.sh
+    inputs: [genomes_dir, reads_fastq]
+    outputs: [bins_dir]
+    baseline_resources:
+      cpu: 16
+      mem_gb: 100
+      walltime: PT8H
+
+  # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
+  # → empty refined_bins_dir (exit 0), mirroring qp-pacbio's skip handler.
+  - step: bin_refine
+    step_type: singleton
+    container: pacbio-processing-1.0.0.sif
+    entrypoint: /opt/qiita/bin_refine.sh
+    inputs: [genomes_dir, bins_dir]
+    outputs: [refined_bins_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT4H
+
+  # CheckM lineage_wf + qa -o 2 over the refined MAGs → normalized
+  # checkm_quality.tsv. Empty input → empty checkm_dir (exit 0).
+  - step: checkm
+    step_type: singleton
+    container: pacbio-processing-1.0.0.sif
+    entrypoint: /opt/qiita/checkm.sh
+    inputs: [refined_bins_dir]
+    outputs: [checkm_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 40
+      walltime: PT4H
+
+  # Parse LCG + MAG FASTAs + CheckM metrics → assembled_genome.parquet +
+  # genome_quality.parquet keyed by prep_sample_idx. LCG-only is a success;
+  # zero genomes is StepNoData.
+  - step: pacbio_ingest
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.pacbio_ingest
+    inputs: [genomes_dir, refined_bins_dir, checkm_dir]
+    params: {assembler: assembler}
+    outputs: [genome_staging_dir]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
+  # Load assembled_genome.parquet → `assembled_genome` and
+  # genome_quality.parquet → `genome_quality` (top-level <stem>.parquet → table).
+  - action: register-files
+    inputs: [genome_staging_dir]
+    outputs: []
+
+# Per-step cap (the runner enforces resolved <= ceiling on every axis at
+# dispatch). Matches the heaviest step (assemble): 32 cpu / 192 GB / PT16H.
+action_ceiling:
+  cpu: 32
+  mem_gb: 192
+  walltime: PT16H
