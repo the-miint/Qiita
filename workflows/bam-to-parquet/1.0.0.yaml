@@ -8,7 +8,7 @@ target_processing_kinds: [sequenced]
 description: >
   Load a single sample's BAM (or SAM/CRAM) into the DuckLake `read` table — the
   BAM analogue of fastq-to-parquet. It reads the file with miint's
-  `read_alignments`, keeps only the read payload (read_id, sequence, quality),
+  `read_sequences_sam`, keeps only the read payload (read_id, sequence, quality),
   mints a contiguous sequence_idx range from the control plane
   (POST /api/v1/sequence-range), and writes read.parquet keyed by sequence_idx,
   which a register-files step loads into the `read` table.

@@ -1,44 +1,36 @@
 """Native job: convert a BAM/SAM/CRAM into a Parquet of reads, keyed by a
 CP-minted `sequence_idx` BIGINT.
 
-The BAM analogue of `fastq_to_parquet` — same B-staged-Parquet pipeline (parse →
-intermediate → count → mint range → rewrite with sequence_idx), with miint's
-`read_alignments` reader in place of `read_fastx`. It is a plain **read loader**:
-it takes only `read_id`, `sequence`, and `qual` from each record and DISCARDS
-everything else — alignment fields (reference/position/CIGAR) and every aux tag,
-including base-modification (MM/ML methylation) and kinetics (ipd/pw) tags. If
-per-read methylation ever needs preserving, that is a separate reader
-(`read_sequences_sam`) and a separate table, not this job.
+The BAM analogue of `fastq_to_parquet`, and structurally near-identical to it:
+miint's `read_sequences_sam` emits the SAME read_fastx-compatible schema
+(`sequence_index, read_id, sequence1, qual1, sequence2, qual2`) that `read_fastx`
+does, so this job is fastq_to_parquet with the reader swapped — same B-staged
+pipeline (parse → intermediate → count → mint range → rewrite with sequence_idx),
+same `sequence_index + start - 1` assignment (no hand-rolled ordinal), same
+column shape into the DuckLake `read` table.
 
-Scope assumptions, enforced or documented:
+It is a plain **read loader**: it takes only the read payload and DISCARDS all
+alignment information and every aux tag — base-modification (MM/ML methylation)
+and kinetics (ipd/pw) included. If per-read methylation ever needs preserving,
+that is a separate reader and a separate table, not this job.
 
-  - **Primary records only.** `read_alignments` emits one row per alignment
-    record, so a read with secondary (FLAG 0x100) or supplementary (0x800)
-    alignments would appear multiple times. We filter them out
-    (`alignment_is_secondary` / `alignment_is_supplementary`) so each read maps
-    to exactly one row — and one `sequence_idx`. For an unaligned uBAM (the
-    long-read basecaller case) every record is primary, so the filter is a
-    no-op.
-  - **Single-end, enforced.** Long-read BAMs are single-end; `sequence2`/`qual2`
-    are always NULL. A paired BAM (repeated QNAME across mates) is REJECTED
-    (BAD_INPUT) by a duplicate-QNAME guard after the count — the per-read
-    `sequence_idx` assignment below assigns one id per primary record, so two
-    primary mates sharing a QNAME would get two distinct sequence_idx for one
-    molecular event (the invariant `fastq_to_parquet` preserves by emitting one
-    row per pair). A comment isn't a guard; the check makes the assumption
-    load-bearing.
-  - **Orientation.** `sequence` is the BAM SEQ field verbatim. For an unaligned
-    read that IS the sequenced orientation; for a reverse-strand *aligned* read
-    it is reference-forward (reverse-complemented relative to the original read).
-    We store it as-is — acceptable because this job ignores strand/modification
-    semantics; a strand-aware loader would reverse-complement here.
+**One record per read, enforced.** `read_sequences_sam` emits one row per SAM
+record and exposes no FLAG column, so it does NOT drop secondary/supplementary
+alignments — a read with any extra alignment record, or a paired mate, repeats
+its QNAME. Assigning each a distinct `sequence_idx` would give one molecular
+event two identifiers (the invariant `fastq_to_parquet` preserves by emitting one
+row per pair). So after the count we REJECT (BAD_INPUT) any input whose read_id
+is not unique — `count(DISTINCT read_id) != count(*)`. That one guard covers
+every multi-record case (paired-end, secondary, supplementary) without a FLAG
+column to filter on, and matches the target input: an unaligned basecaller uBAM,
+where every record is a distinct primary read. An aligned/split-read or paired
+BAM is out of scope and fails loudly rather than loading corrupt rows.
 
-sequence_idx assignment. `read_alignments` (unlike `read_fastx`) exposes no
-per-record ordinal, so the intermediate mints one via
-`row_number() OVER (ORDER BY read_id)` — a deterministic total order once the
-unique-QNAME guard has passed. The final `sequence_idx` is `rec_index + start -
-1`; contiguous within the sample, a unique sorted join key (never a dense row
-counter — see the fastq job's gap note; the same applies).
+**Orientation.** `sequence1` is the BAM SEQ field verbatim (miint does not
+reverse-complement reverse-strand records back to sequenced orientation — probed
+against the mirror build). For an unaligned uBAM that IS the sequenced
+orientation; a strand-aware loader would need to handle reverse records, but this
+job ignores strand/modification semantics.
 
 Input-immutability assumption, same as fastq_to_parquet: `bam_path` MUST NOT be
 modified between work_ticket submission and step execution — the retry-recovery
@@ -78,17 +70,14 @@ from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
 # `- step: bam` YAML entry fails loudly.
 YAML_STEP_NAME = "bam"
 
-# DuckDB resource caps, mirroring fastq_to_parquet: the YAML allocation
-# (workflows/bam-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the SLURM cgroup;
-# DuckDB's cap sits just below (`mem_gb - 1` leaves ~1 GB for Python/miint/OS
-# overhead). 7 GB is sized against the same long-read budget fastq_to_parquet
-# documents (~2.4 GB resident/thread: 2048 STANDARD_VECTOR_SIZE × 60
-# row_group_size × ~20 KB avg long-read record incl. quality). This job ADDS a
-# full sort over the VARCHAR read_id (the `row_number()` ordinal below, and the
-# `count(DISTINCT read_id)` guard), which spills to duckdb_tmp under the cap
-# rather than growing it — so 7 GB stays the envelope; revisit against a real
-# long-read uBAM MaxRSS if the sort dominates. Literal (off-SLURM fallback and
-# on-SLURM cap alike).
+# DuckDB resource caps, mirroring fastq_to_parquet's rationale: the YAML
+# allocation (workflows/bam-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
+# SLURM cgroup; DuckDB's caps sit just below (`mem_gb - 1` leaves ~1 GB for
+# Python/miint/OS overhead). 7 GB is comfortably above the ~2.4 GB resident/thread
+# a long-read parse needs (2048 STANDARD_VECTOR_SIZE × 60 row_group_size × ~20 KB
+# avg long-read record incl. quality). The pipeline is a read_sequences_sam parse,
+# a footer count + `count(DISTINCT read_id)` aggregate, and a sorted COPY — all
+# spill to duckdb_tmp under the cap.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
@@ -123,11 +112,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     out = validate_parquet_path(out_path)
 
     try:
-        # BAM -> intermediate Parquet. `read_alignments(?, include_seq_qual:=true)`
-        # yields read_id/sequence/qual; we keep only primary records and mint a
-        # deterministic per-read ordinal (rec_index) so the sequence_idx rewrite
-        # below is `rec_index + start - 1`. `sequence IS NOT NULL` drops the rare
-        # SEQ='*' record (can't populate the NOT NULL sequence1 column).
+        # BAM -> intermediate Parquet. read_sequences_sam yields the same
+        # read_fastx-compatible columns (incl. the per-record `sequence_index`
+        # ordinal used for the sequence_idx rewrite below), so this SELECT mirrors
+        # fastq_to_parquet's read_fastx SELECT. `comment` is dropped (unused).
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
@@ -136,21 +124,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 threads=_DUCKDB_THREADS,
             )
             conn.execute(
-                "COPY ( SELECT "
-                "  row_number() OVER (ORDER BY read_id) AS rec_index,"
-                "  read_id,"
-                "  sequence AS sequence1,"
-                "  qual AS qual1 "
-                "FROM read_alignments(?, include_seq_qual := true) "
-                "WHERE NOT alignment_is_secondary(flags) "
-                "  AND NOT alignment_is_supplementary(flags) "
-                "  AND sequence IS NOT NULL ) "
+                "COPY ( SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "
+                "FROM read_sequences_sam(?) ) "
                 f"TO '{intermediate}' ({PARQUET_OPTS_INTERMEDIATE})",
                 [str(inputs.bam_path)],
             )
 
-        # Count via Parquet footer (no scan). Zero usable reads → terminal NO_DATA
-        # before any mint, mirroring fastq_to_parquet's empty-input handling.
+        # Count + distinct read_id in one scan: the total sizes the mint; the
+        # distinct count drives the one-record-per-read guard below.
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_conn() as conn:
             apply_duckdb_settings(
                 conn,
@@ -158,9 +139,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=_DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
             )
-            # count(DISTINCT read_id) alongside the total: the guard below needs
-            # both. This scans the intermediate's read_id column (the total alone
-            # would be a footer read), a bounded cost the correctness check earns.
             count, distinct_read_ids = conn.execute(
                 "SELECT count(*), count(DISTINCT read_id) FROM read_parquet(?)",
                 [str(intermediate)],
@@ -169,27 +147,26 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if count == 0:
             raise StepNoData(
                 step_name=YAML_STEP_NAME,
-                reason=f"BAM file contains no primary reads: {inputs.bam_path}",
+                reason=f"BAM file contains no reads: {inputs.bam_path}",
             )
 
-        # Enforce the one-primary-record-per-read invariant the sequence_idx
-        # assignment relies on. Duplicate QNAMEs (a paired-end BAM, whose mates
-        # share a QNAME and are both primary; or any duplicate) would each get a
-        # distinct sequence_idx — two identifiers for one molecular event,
-        # silently corrupting the `read` table. Fail fast before the mint rather
-        # than load bad rows. Runs after the empty check (an empty file trivially
-        # has distinct == count == 0).
+        # One-record-per-read guard. read_sequences_sam emits every SAM record and
+        # exposes no FLAG column, so a paired mate or a secondary/supplementary
+        # alignment repeats its QNAME — each would otherwise get a distinct
+        # sequence_idx (two identifiers for one molecular event, corrupting the
+        # `read` table). Reject before the mint rather than load bad rows. Runs
+        # after the empty check (an empty file trivially has distinct == count).
         if distinct_read_ids != count:
             raise BackendFailure(
                 kind=FailureKind.BAD_INPUT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=YAML_STEP_NAME,
                 reason=(
-                    f"BAM has {count} primary records but only {distinct_read_ids} "
-                    f"distinct read_id(s): duplicate QNAMEs are not supported — this "
-                    f"loader treats input as single-end and assigns one sequence_idx "
-                    f"per read (a paired-end BAM, whose mates share a QNAME, must be "
-                    f"loaded via a paired-aware workflow)"
+                    f"BAM has {count} records but only {distinct_read_ids} distinct "
+                    f"read_id(s): every read must appear exactly once. Duplicate "
+                    f"QNAMEs mean paired-end mates or secondary/supplementary "
+                    f"alignments, which this single-end read loader does not support "
+                    f"(it targets an unaligned basecaller uBAM)"
                 ),
             )
 
@@ -242,8 +219,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             sequence_idx_start = rng.sequence_idx_start
 
         # Rewrite intermediate -> final with sequence_idx assigned and physically
-        # sorted on disk. No miint here — a plain read_parquet carries the columns
-        # through. sequence2/qual2 are NULL (single-end); prep_sample_idx is a
+        # sorted on disk. sequence_idx = read_sequences_sam's per-file 1-based
+        # sequence_index + start - 1 (deterministic by construction — file order IS
+        # the assignment order, exactly like fastq_to_parquet). No miint here — a
+        # plain read_parquet carries the columns through. prep_sample_idx is a
         # per-run constant (the `read` table's scope/prune column).
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_conn() as conn:
             apply_duckdb_settings(
@@ -255,9 +234,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 "COPY ( SELECT "
                 "  ?::BIGINT AS prep_sample_idx,"
-                "  rec_index + ? - 1 AS sequence_idx,"
-                "  read_id, sequence1, qual1,"
-                "  NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 "
+                "  sequence_index + ? - 1 AS sequence_idx,"
+                "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
                 "ORDER BY sequence_idx ) "
                 f"TO '{out}' ({PARQUET_OPTS})",

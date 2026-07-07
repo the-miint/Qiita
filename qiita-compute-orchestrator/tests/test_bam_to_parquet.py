@@ -2,13 +2,16 @@
 
 Calls `execute()` directly (not through LocalBackend / run_native_job) so
 failures point at the read-loading logic, not framework wiring. Inputs are tiny
-hand-written SAM files — `read_alignments` reads SAM/BAM/CRAM, so a text SAM is a
-zero-dependency fixture (no pysam, no binary BAM to check in).
+hand-written SAM files — `read_sequences_sam` reads SAM/BAM/CRAM, so a text SAM is
+a zero-dependency fixture (no pysam, no binary BAM to check in).
 
 Covers:
-  - happy path: primary records become read.parquet rows with sequence_idx from
-    the minted range, qual decoded to UTINYINT[], sequence2/qual2 NULL;
-  - secondary/supplementary records are filtered out (one row per read);
+  - happy path: reads become read.parquet rows with sequence_idx from the minted
+    range (read_sequences_sam's sequence_index + start - 1), qual decoded to
+    UTINYINT[], sequence2/qual2 NULL;
+  - the one-record-per-read guard: a repeated QNAME (paired mate OR a
+    secondary/supplementary alignment — read_sequences_sam emits every record and
+    can't filter by flag) is rejected BAD_INPUT before the mint;
   - header-only (no records) is terminal NO_DATA (StepNoData);
   - missing input raises FileNotFoundError;
   - pre_minted_range recovery (count match reuses the range).
@@ -33,7 +36,6 @@ from qiita_compute_orchestrator.sequence_range import MintedSequenceRange, PreMi
 # Minimal SAM columns: QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL.
 # Unmapped (FLAG 4) records model a long-read uBAM; RNAME='*' needs no @SQ header.
 _UNMAPPED = 4
-_SECONDARY = 256
 _SUPPLEMENTARY = 2048
 
 
@@ -83,17 +85,16 @@ def _read_parquet(path) -> list[tuple]:
         ).fetchall()
 
 
-def test_execute_writes_read_parquet_and_filters_non_primary(fake_mint, tmp_path):
-    """Two primary reads round-trip; a supplementary record for a third read is
-    filtered out (so it never gets a sequence_idx). qual is phred-decoded to a
-    UTINYINT[]; sequence2/qual2 are NULL (single-end)."""
+def test_execute_writes_read_parquet(fake_mint, tmp_path):
+    """Two reads round-trip: sequence_idx assigned from read_sequences_sam's
+    per-file sequence_index (+ minted start), qual phred-decoded to a UTINYINT[],
+    sequence2/qual2 NULL (single-end)."""
     sam = tmp_path / "in.sam"
     _write_sam(
         sam,
         [
             _sam_record("r1", "ACGT", "IIII"),  # phred 40
             _sam_record("r2", "TTTT", "????"),  # phred 30
-            _sam_record("r3", "GGGG", "IIII", flag=_SUPPLEMENTARY),  # excluded
         ],
     )
 
@@ -107,7 +108,6 @@ def test_execute_writes_read_parquet_and_filters_non_primary(fake_mint, tmp_path
     # The intermediate must be gone before return (manifest walker cleanliness).
     assert not (tmp_path / "ws" / "_intermediate_reads.parquet").exists()
 
-    # mint called once with the primary-only count (2), not 3.
     assert fake_mint == [(42, 2)]
 
     rows = _read_parquet(read_pq)
@@ -129,14 +129,23 @@ def test_header_only_sam_raises_stepnodata(fake_mint, tmp_path):
     assert not (tmp_path / "ws" / "read.parquet").exists()
 
 
-def test_all_secondary_sam_raises_stepnodata(fake_mint, tmp_path):
-    """A SAM whose only records are secondary alignments has no primary reads →
-    the primary-only filter empties it → StepNoData."""
+def test_supplementary_same_qname_rejected_as_bad_input(fake_mint, tmp_path):
+    """read_sequences_sam can't filter by flag, so a supplementary alignment
+    reaches the loader as a second record sharing the primary's QNAME. The
+    one-record-per-read guard rejects it BAD_INPUT (same path as paired input),
+    rather than minting an inflated range / assigning a stray sequence_idx."""
     sam = tmp_path / "in.sam"
-    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII", flag=_SECONDARY)])
+    _write_sam(
+        sam,
+        [
+            _sam_record("r1", "ACGT", "IIII"),  # primary
+            _sam_record("r1", "GG", "II", flag=_SUPPLEMENTARY),  # same QNAME
+        ],
+    )
 
-    with pytest.raises(StepNoData):
+    with pytest.raises(BackendFailure) as exc:
         _run(Inputs(bam_path=sam, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
     assert fake_mint == []
 
 
