@@ -2,7 +2,7 @@
 the four DuckLake-shape staging Parquets register-files hands to the data plane.
 
 Tail of the long-read-assembly workflow, the assembly analogue of reference_load.
-It REUSES reference_load's now-generic re-key writers verbatim — the shared
+It REUSES the shared `_feature_load` re-key writers verbatim — the shared
 `qiita.feature` space means an assembled contig and a reference sequence with the
 same bytes carry the same feature_idx, so the sequence + chunk writers are
 identical. The four staging outputs (basename == DuckLake table name):
@@ -12,7 +12,7 @@ identical. The four staging outputs (basename == DuckLake table name):
   - `assembly_membership.parquet`       (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)
   - `bin_quality.parquet`               per-MAG CheckM (+ DAS_Tool provenance)
 
-The first two come straight from reference_load's `write_feature_sequences` /
+The first two come straight from the shared `_feature_load.write_feature_sequences` /
 `write_feature_sequence_chunks` (fed by `build_feature_id_map`). The membership
 Parquet is the DuckLake copy of the Postgres `qiita.assembly_membership` the
 `write-assembly-membership` action already wrote — joined here from `bin_map`
@@ -45,7 +45,8 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from .reference_load import (
+from ._feature_load import (
+    KIND_MAG,
     build_feature_id_map,
     write_feature_sequence_chunks,
     write_feature_sequences,
@@ -53,13 +54,11 @@ from .reference_load import (
 
 YAML_STEP_NAME = "assembly_load"
 
-_KIND_MAG = "MAG"
-
 # RAW tool-output basenames the container entrypoints emit verbatim (no
 # normalization — DuckDB does the column-selection/join/rename below). checkm.sh
 # writes CheckM's two `--tab_table` outputs; bin_refine.sh copies DAS_Tool's
 # summary. Column names below are pinned to CheckM 1.x (`resultsParser.py`) and
-# DAS_Tool 1.1.x (`_DASTool_summary.tsv`); VALIDATE on the first Linux build.
+# DAS_Tool 1.1.x (`_DASTool_summary.tsv`).
 _CHECKM_LINEAGE_TSV = "lineage.tsv"  # `checkm lineage_wf --tab_table`
 _CHECKM_QA_TSV = "qa.tsv"  # `checkm qa -o 2 --tab_table`
 _DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
@@ -150,15 +149,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # feature_map TEMP TABLE + id_map (read_id -> feature_idx via
-            # sequence_hash), exactly as reference_load.execute sets up — the reused
-            # writers and the membership join both read them.
+            # sequence_hash), exactly as reference_load.execute sets up — the shared
+            # _feature_load writers and the membership join both read them.
             conn.execute(
                 "CREATE TEMP TABLE feature_map AS SELECT * FROM read_parquet(?)",
                 [str(inputs.feature_map)],
             )
             build_feature_id_map(conn, inputs.manifest)
 
-            # Reused verbatim from reference_load — the shared feature space means
+            # Reused verbatim from _feature_load — the shared feature space means
             # the sequence + chunk writers are identical to the reference path.
             write_feature_sequences(conn, sequences_out)
             write_feature_sequence_chunks(conn, inputs.assembly_chunks, chunks_dir)
@@ -250,7 +249,7 @@ def _write_bin_quality(
     A sample with no CheckM tables (LCG-only, or the CheckM DB was absent) writes a
     valid EMPTY Parquet with the right schema so register-files always finds the
     table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see the module
-    constants) — VALIDATE on the first Linux build."""
+    constants)."""
     if not (lineage_tsv.is_file() and qa_tsv.is_file()):
         # Empty write — every placeholder NULL, no FROM, WHERE FALSE.
         projection = _BIN_QUALITY_SELECT.format(
@@ -277,7 +276,7 @@ def _write_bin_quality(
     projection = _BIN_QUALITY_SELECT.format(
         ps=prep_sample_idx,
         proc=processing_idx,
-        kind=f"'{_KIND_MAG}'",
+        kind=f"'{KIND_MAG}'",
         bin_id='lin."Bin Id"',
         marker='lin."Marker lineage"',
         completeness='lin."Completeness"',

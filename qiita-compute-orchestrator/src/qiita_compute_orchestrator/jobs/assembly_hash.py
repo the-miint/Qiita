@@ -56,14 +56,9 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._feature_load import KIND_LCG, KIND_MAG
 
 YAML_STEP_NAME = "assembly_hash"
-
-# The closed `kind` value set stored in the DuckLake/Postgres assembly tables.
-# Plain module constants (not a cross-language enum — `kind` is a TEXT column with
-# no Postgres ENUM twin), so the producer stays honest about the two forms.
-_KIND_LCG = "LCG"  # a circular genome (large circular genome)
-_KIND_MAG = "MAG"  # a refined metagenome-assembled bin
 
 # FASTA extensions accepted for contig files (both plain and gzip-compressed).
 _FASTA_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
@@ -122,7 +117,7 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
     dropped (`read_fastx` raises on a 0-record input, and one empty path aborts the
     whole `VARCHAR[]` scan)."""
     meta: list[tuple[str, str, str]] = []
-    for base, kind in ((genomes_dir / "LCG", _KIND_LCG), (refined_bins_dir, _KIND_MAG)):
+    for base, kind in ((genomes_dir / "LCG", KIND_LCG), (refined_bins_dir, KIND_MAG)):
         for path in _fasta_files(base):
             if is_empty_sequence_file(path):
                 continue
