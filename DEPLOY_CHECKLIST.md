@@ -43,14 +43,13 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
     && tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
   ```
-  KNOWN FOLLOW-UP: wiring the bind-mount + `CHECKM_DATA_PATH` into the container
-  step (the orchestrator binds only declared step inputs today) lands separately.
-  Until then the `checkm` step **degrades gracefully** — it detects the missing DB,
-  logs a loud warning, and leaves `checkm_dir` empty (assembly_load then writes
-  `bin_quality` empty) — so MAG-producing
-  samples still complete and their genome SEQUENCES store; only per-MAG **quality**
-  is uncaptured until the DB + bind are in place (re-running then backfills it).
-  assemble/binning/bin_refine are unaffected.
+  REQUIRED before the first `long-read-assembly` run: the `checkm` step now **fails
+  loud** (non-zero exit) when the DB is absent or misconfigured — it no longer
+  degrades to an empty `checkm_dir` — so a MAG-producing sample's ticket cannot
+  COMPLETE until the DB is staged AND the container can see it (bind-mount it to
+  `CHECKM_DATA_PATH`, or set `QIITA_CHECKM_DB` to its in-container path). Wiring the
+  bind into the container step is part of this setup (the orchestrator binds only
+  declared step inputs today). assemble/binning/bin_refine are unaffected.
 
 ### 3. Migrations
 

@@ -14,12 +14,16 @@
 # CheckM needs its ~1.4 GB reference data. It is bind-mounted at run time (NOT
 # baked into the image) and located via CHECKM_DATA_PATH; the operator provisions
 # it under PATH_DERIVED and the orchestrator binds it in. A plain bind is not
-# enough — CheckM reads CHECKM_DATA_PATH (set below).
+# enough — CheckM reads CHECKM_DATA_PATH (set below). Its ABSENCE is an operator
+# config error, not a data condition: with MAGs present but no DB to score them,
+# checkm.sh FAILS LOUD rather than silently emitting an empty checkm_dir (see the
+# DB check below). The genuinely-no-MAGs case above is a separate benign success.
 source /opt/qiita/_lib.sh
 
 REFINED_DIR="$(qiita_input refined_bins_dir)"
 OUT="${QIITA_OUTPUT_PATH}/checkm"
 WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 mkdir -p "${OUT}"
 
 # No MAGs to assess -> empty checkm_dir (assembly_load writes bin_quality empty).
@@ -31,17 +35,20 @@ fi
 export CHECKM_DATA_PATH="${QIITA_CHECKM_DB:-/opt/checkm_data}"
 
 # The CheckM reference DB is bind-mounted at run time (deploy checklist bucket 2),
-# NOT baked into the SIF. If it is absent, DEGRADE gracefully rather than hard-fail
-# the whole ticket under `set -e`: leave checkm_dir empty with a LOUD warning so
-# the sample's genomes still store — MAG quality is captured on the next run once
-# the DB (and its container bind) are present. This is the deploy-config gap the
-# checklist's "known follow-up" refers to; assemble/binning/bin_refine and the
-# genome sequences are unaffected, but MAG *quality* is uncaptured until then.
+# NOT baked into the SIF, and located via CHECKM_DATA_PATH (`checkm data setRoot`
+# reads the same var). Reaching here means there ARE MAGs to assess, so an
+# absent/empty DB is an OPERATOR CONFIG ERROR, not a data condition — silently
+# emitting an empty checkm_dir would let the ticket COMPLETE with MAG quality
+# permanently uncaptured. FAIL LOUD instead (mirrors bin_refine.sh's DAS_Tool
+# fail-loud): the operator must stage the DB + bind it in before the workflow can
+# run. This is distinct from the genuinely-no-MAGs benign empty success above.
 if [[ ! -d "${CHECKM_DATA_PATH}" || -z "$(ls -A "${CHECKM_DATA_PATH}" 2>/dev/null)" ]]; then
-    echo "WARNING: CheckM reference data not found at CHECKM_DATA_PATH=${CHECKM_DATA_PATH};" >&2
-    echo "         leaving checkm_dir empty — MAG quality UNCAPTURED this run." >&2
-    qiita_finish checkm_dir=checkm
-    exit 0
+    echo "ERROR: CheckM reference data not found at CHECKM_DATA_PATH=${CHECKM_DATA_PATH}." >&2
+    echo "       This is a deploy/config error: stage CheckM's ~1.4 GB reference DB" >&2
+    echo "       under PATH_DERIVED and bind it in (or set QIITA_CHECKM_DB to its" >&2
+    echo "       in-container path). Refusing to report MAG quality as empty when" >&2
+    echo "       MAGs are present — failing loud." >&2
+    exit 78
 fi
 
 # Emit CheckM's RAW --tab_table output straight into checkm_dir. lineage_wf carries
