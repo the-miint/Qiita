@@ -320,7 +320,7 @@ def test_compute_readiness_missing_venv_returns_2(monkeypatch, tmp_path, capsys)
     bogus = tmp_path / "no-such-venv"
     # subprocess.call should NOT be reached on this path.
     monkeypatch.setattr(
-        cli.subprocess,
+        cli.compute_readiness.subprocess,
         "call",
         lambda *a, **k: pytest.fail("subprocess.call should not run when python is missing"),
     )
@@ -349,7 +349,7 @@ def test_compute_readiness_invokes_orchestrator_module(monkeypatch, tmp_path):
         captured["cmd"] = list(cmd)
         return 0
 
-    monkeypatch.setattr(cli.subprocess, "call", fake_call)
+    monkeypatch.setattr(cli.compute_readiness.subprocess, "call", fake_call)
     rc = cli.main(["compute-readiness", "--orchestrator-venv", str(venv)])
     assert rc == 0
     assert captured["cmd"][0] == str(python)
@@ -382,7 +382,7 @@ def test_compute_readiness_propagates_flags(monkeypatch, tmp_path):
         captured["cmd"] = list(cmd)
         return 1
 
-    monkeypatch.setattr(cli.subprocess, "call", fake_call)
+    monkeypatch.setattr(cli.compute_readiness.subprocess, "call", fake_call)
     rc = cli.main(
         [
             "compute-readiness",
