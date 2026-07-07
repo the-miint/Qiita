@@ -30,7 +30,7 @@ the `no-changelog` label).
   scalar). Empty-branch semantics mirror qp-pacbio: LCG-only samples store
   successfully, zero-genome samples are a terminal NO_DATA. The cross-sample
   dereplication / taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a
-  separate follow-on that reads these per-sample results across many preps. (#TBD)
+  separate follow-on that reads these per-sample results across many preps. (#255)
 - **`export_read_masked` DoAction** — the masked sibling of `export_read`:
   materializes one prep_sample's `read_masked` pass-set (for a given `mask_idx`)
   to a per-ticket `reads.parquet`, so a consumer (pacbio assembly) gets
@@ -41,7 +41,7 @@ the `no-changelog` label).
   symlink-safe publish path. Added to `REPLAY_SAFE_ACTIONS`. The control-plane
   runner binds it to a workflow's `masked_reads` input via
   `_resolve_staged_masked_reads`, keyed off the action_context `mask_idx` (a
-  distinct binding from raw `reads`, which read-mask workflows consume). (#TBD)
+  distinct binding from raw `reads`, which read-mask workflows consume). (#255)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its

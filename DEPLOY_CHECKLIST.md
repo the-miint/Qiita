@@ -36,7 +36,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
   time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
   `/opt/checkm_data`), so the DB dir must be bind-mounted there (or
-  `QIITA_CHECKM_DB` set to its in-container path). (#TBD)
+  `QIITA_CHECKM_DB` set to its in-container path). (#255)
   ```bash
   sudo -u qiita-orch bash -c 'mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data" \
     && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
@@ -80,7 +80,7 @@ _None yet._
   ```
 
 - Confirm the `pacbio-processing/1.0.0` workflow synced into `qiita.action`
-  (synced by `qiita-admin actions sync` inside `activate.sh`): (#TBD)
+  (synced by `qiita-admin actions sync` inside `activate.sh`): (#255)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='pacbio-processing'"
@@ -109,7 +109,7 @@ _None yet._
   The `pacbio-processing-1.0.0.sif` is built automatically by `build-sifs.sh`
   during the deploy; the first build resolves several bioconda envs (metawrap /
   DAS_Tool / CheckM), so it is **slow** and needs apptainer + network on the build
-  host. Beyond the bucket-2 CheckM DB, no new env var, scope, or group. (#TBD)
+  host. Beyond the bucket-2 CheckM DB, no new env var, scope, or group. (#255)
 
 ---
 
