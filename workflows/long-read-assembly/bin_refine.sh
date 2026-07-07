@@ -16,6 +16,7 @@ BINS_DIR="$(qiita_input bins_dir)"
 NOLCG="${GENOMES_DIR}/noLCG.fa"
 OUT="${QIITA_OUTPUT_PATH}/refined_bins"
 WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 mkdir -p "${OUT}"
 
 # Per-binner contig->bin tables. metabat2's Fasta_to_Contig2Bin output needs the
@@ -68,11 +69,10 @@ set -e
 cat "${WORK}/dastool.log" >&2
 
 if [[ "${das_rc}" -ne 0 ]]; then
-    # DAS_Tool's benign "nothing passed the score threshold" message. NOTE: the
-    # exact wording must be confirmed against real DAS_Tool output on the first
-    # Linux build — the tool cannot run on the macOS dev box, so this regex is a
-    # best-effort match over the phrasings DAS_Tool uses. The default is to FAIL:
-    # only this specific pattern is accepted as an empty success.
+    # DAS_Tool's benign "nothing passed the score threshold" message. This regex is
+    # a best-effort match over the phrasings DAS_Tool uses for that outcome; the
+    # default on any non-zero exit is to FAIL — only this specific pattern is
+    # accepted as an empty success.
     if grep -qiE 'no bins.*(score|threshold|passed|found)|no high.?quality bins' "${WORK}/dastool.log"; then
         echo "bin_refine: DAS_Tool reported no bins above the score threshold — LCG-only success." >&2
         qiita_finish refined_bins_dir=refined_bins

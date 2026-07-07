@@ -16,6 +16,8 @@ GENOMES_DIR="$(qiita_input genomes_dir)"
 READS_FASTQ="$(qiita_input masked_reads_fastq)"
 NOLCG="${GENOMES_DIR}/noLCG.fa"
 OUT="${QIITA_OUTPUT_PATH}/bins"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 mkdir -p "${OUT}"
 
 # Nothing to bin (all-circular or empty assembly) -> empty bins_dir, exit 0.
@@ -25,8 +27,7 @@ if [[ ! -s "${NOLCG}" ]]; then
 fi
 
 # metaWRAP's --single-end wants a plain (uncompressed) .fastq path.
-READS_FQ="$(mktemp -d)/reads.fastq"
-mkdir -p "$(dirname "${READS_FQ}")"
+READS_FQ="${WORK}/reads.fastq"
 if [[ "${READS_FASTQ}" == *.gz ]]; then
     pigz -dc "${READS_FASTQ}" > "${READS_FQ}"
 else
