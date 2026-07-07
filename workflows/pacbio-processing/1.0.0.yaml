@@ -17,10 +17,14 @@ description: >
   tools —
   `assemble` (hifiasm_meta → circular LCG genomes + noLCG contigs), `binning`
   (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
-  and `checkm` (per-MAG completeness/contamination). The native `pacbio_ingest`
-  step parses the LCG + MAG sequences + CheckM metrics into two Parquets keyed by
-  prep_sample_idx, and register-files loads them into the `assembled_genome` and
-  `genome_quality` DuckLake tables.
+  and `checkm` (per-MAG completeness/contamination). The storage tail REUSES the
+  reference-add machinery: `assembly_hash` hashes the LCG + MAG contigs (shared
+  canonical sequence hash), `mint-features` mints the contig features against the
+  shared `qiita.feature`, `write-assembly-membership` links them to
+  `qiita.assembly_membership` (tagged by kind/bin_id, stamped with the run's
+  processing_idx), `assembly_load` re-keys them + reads the CheckM/DAS_Tool metrics
+  into the DuckLake-shape Parquets, and register-files loads the `assembled_sequence`,
+  `assembled_sequence_chunks`, `assembly_membership`, and `bin_quality` tables.
 
   Everything here is per-sample. Cross-sample dereplication / taxonomy / abundance
   (galah/gtdbtk/GToTree/coverm) is a separate downstream stage that reads these
@@ -126,24 +130,54 @@ steps:
       mem_gb: 40
       walltime: PT4H
 
-  # Parse LCG + MAG FASTAs + CheckM metrics → assembled_genome.parquet +
-  # genome_quality.parquet keyed by prep_sample_idx. LCG-only is a success;
-  # zero genomes is StepNoData.
-  - step: pacbio_ingest
+  # Hash the LCG + MAG contigs into the reference-load shape: manifest
+  # (synthetic globally-unique read_id, SHARED canonical sequence_hash),
+  # hash-keyed assembly_chunks/, and bin_map (read_id → kind, bin_id). Zero
+  # contigs (no LCG, no MAG) is StepNoData. Sequences are run-agnostic, so this
+  # step carries no processing_idx.
+  - step: assembly_hash
     step_type: singleton
-    module: qiita_compute_orchestrator.jobs.pacbio_ingest
-    inputs: [genomes_dir, refined_bins_dir, checkm_dir]
-    params: {assembler: assembler}
-    outputs: [genome_staging_dir]
+    module: qiita_compute_orchestrator.jobs.assembly_hash
+    inputs: [genomes_dir, refined_bins_dir]
+    outputs: [manifest, assembly_chunks, bin_map]
     baseline_resources:
       cpu: 2
       mem_gb: 8
       walltime: PT1H
 
-  # Load assembled_genome.parquet → `assembled_genome` and
-  # genome_quality.parquet → `genome_quality` (top-level <stem>.parquet → table).
+  # Mint feature_idx for every contig hash against the SHARED qiita.feature (same
+  # primitive reference-add uses) — identical bytes collapse to one feature_idx.
+  - action: mint-features
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  # Link this run's contigs to qiita.assembly_membership, tagged by (kind, bin_id)
+  # and stamped with the run's processing_idx (minted before the loop because
+  # assembly_load threads it via params). Idempotent (ON CONFLICT DO NOTHING).
+  - action: write-assembly-membership
+    inputs: [bin_map, manifest, feature_map]
+    outputs: []
+
+  # Re-key the contigs to feature_idx (REUSED reference_load writers) and read the
+  # CheckM/DAS_Tool metrics → the four DuckLake-shape staging Parquets. Threads
+  # processing_idx via params: (signals the runner to mint the run identity before
+  # the step loop). LCG-only samples write bin_quality empty (a success).
+  - step: assembly_load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_load
+    inputs: [manifest, feature_map, assembly_chunks, bin_map, checkm_dir, refined_bins_dir]
+    params: {processing_idx: processing_idx}
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT2H
+
+  # Load the staging Parquets → the `assembled_sequence`, `assembled_sequence_chunks`,
+  # `assembly_membership`, and `bin_quality` DuckLake tables (top-level
+  # <stem>.parquet → table; a subdir of parts → the table named after the dir).
   - action: register-files
-    inputs: [genome_staging_dir]
+    inputs: [staging_dir]
     outputs: []
 
 # Per-step cap (the runner enforces resolved <= ceiling on every axis at

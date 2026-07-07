@@ -185,12 +185,15 @@ def test_load_actions_loads_on_disk_pacbio_processing_yaml():
       * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
         for the masked read_masked pass-set to assemble);
       * the step chain is pacbio_export_reads (module) → assemble → binning →
-        bin_refine → checkm (four container steps) → pacbio_ingest (module) →
-        register-files, in that order;
+        bin_refine → checkm (four container steps) → assembly_hash (module) →
+        mint-features → write-assembly-membership → assembly_load (module) →
+        register-files, in that order — the storage tail reuses the reference-add
+        primitives;
       * all four heavy tools share ONE SIF with per-step entrypoints — the
         packaging the one-SIF-per-workflow-dir build tooling supports;
-      * both native steps thread the `assembler` scalar via params (a container
-        step can't take a scalar param — the runner treats it as a bind path).
+      * pacbio_export_reads threads the `assembler` scalar and assembly_load
+        threads `processing_idx` via params (a container step can't take a scalar
+        param — the runner treats it as a bind path).
     """
     from pathlib import Path
 
@@ -214,16 +217,23 @@ def test_load_actions_loads_on_disk_pacbio_processing_yaml():
         "binning",
         "bin_refine",
         "checkm",
-        "pacbio_ingest",
+        "assembly_hash",
+        "mint-features",
+        "write-assembly-membership",
+        "assembly_load",
         "register-files",
     ]
 
     export_step = next(s for s in pacbio.steps if s.name == "pacbio_export_reads")
     assert export_step.module == "qiita_compute_orchestrator.jobs.pacbio_export_reads"
     assert export_step.params == {"assembler": "assembler"}
-    ingest_step = next(s for s in pacbio.steps if s.name == "pacbio_ingest")
-    assert ingest_step.module == "qiita_compute_orchestrator.jobs.pacbio_ingest"
-    assert ingest_step.params == {"assembler": "assembler"}
+    hash_step = next(s for s in pacbio.steps if s.name == "assembly_hash")
+    assert hash_step.module == "qiita_compute_orchestrator.jobs.assembly_hash"
+    load_step = next(s for s in pacbio.steps if s.name == "assembly_load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.assembly_load"
+    # assembly_load threads processing_idx via params so the runner mints the run
+    # identity before the step loop; write-assembly-membership then reads it.
+    assert load_step.params == {"processing_idx": "processing_idx"}
 
     # One image, per-step entrypoints — the single-SIF packaging.
     container_steps = [s for s in pacbio.steps if getattr(s, "container", None)]
