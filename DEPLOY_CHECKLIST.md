@@ -58,6 +58,10 @@ _None yet._
   # expect: 0 — any out-of-vocab source must be fixed first, and any pre-existing source='qiita'
   # row needs its prep_sample_idx backfilled (the new biconditional CHECK requires it).
   ```
+- **Per-shard `reference_index.shard_id`.** `make migrate` applies
+  `20260707000000_reference_index_shard_id.sql` (adds a nullable
+  `qiita.reference_index.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
+  no backfill or out-of-band steps. (#reference-support)
 
 ### 4. Deploy
 

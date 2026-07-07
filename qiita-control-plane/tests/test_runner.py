@@ -1657,6 +1657,70 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
     )
 
 
+async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference_idx, tmp_path):
+    """A sharded analysis index's meta JSON carries `shard_id`; the arm threads
+    it (via `meta.get`) into register_index so the row records it. A host meta
+    JSON that omits the key registers `shard_id IS NULL` (backward-compatible)."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    async def _dispatch(meta: dict, binding: str) -> None:
+        meta_path = tmp_path / f"{binding}.json"
+        meta_path.write_text(json.dumps(meta))
+        entry = WorkflowAction(kind="action", name="register-index", inputs=[binding], outputs=[])
+        out = await _run_action_primitive(
+            postgres_pool,
+            entry,
+            {binding: str(meta_path)},
+            tmp_path,
+            {"kind": "reference", "reference_idx": reference_idx},
+            work_ticket_idx=1,
+            hmac_secret=b"unused",
+            data_plane_url="grpc://unused:50051",
+        )
+        assert out == {}
+
+    try:
+        await _dispatch(
+            {
+                "index_type": "rype",
+                "fs_path": f"/srv/qiita/references/{reference_idx}/shards/1/index.ryxdi",
+                "params": {"k": 64},
+                "shard_id": 1,
+            },
+            "shard_index_meta",
+        )
+        await _dispatch(
+            {
+                "index_type": "rype",
+                "fs_path": f"/srv/qiita/references/{reference_idx}/rype/index.ryxdi",
+                "params": {"k": 64},
+            },
+            "rype_index_meta",
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT shard_id FROM qiita.reference_index"
+                " WHERE reference_idx = $1 AND fs_path LIKE '%/shards/1/%'",
+                reference_idx,
+            )
+            == 1
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT shard_id FROM qiita.reference_index"
+                " WHERE reference_idx = $1 AND fs_path LIKE '%/rype/index.ryxdi'",
+                reference_idx,
+            )
+            is None
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
 # =============================================================================
 # Block-scope wiring (bulk-block read-mask): scope target + reconcile-block arm
 # =============================================================================
@@ -1890,7 +1954,7 @@ def register_index_spy(monkeypatch):
 
     calls: list[tuple[str, dict]] = []
 
-    async def register_index(pool, *, reference_idx, index_type, fs_path, params):
+    async def register_index(pool, *, reference_idx, index_type, fs_path, params, shard_id=None):
         calls.append((index_type, params))
 
     monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_INDEX, register_index)
@@ -1998,14 +2062,17 @@ async def test_when_gate_runs_both_when_flags_absent(
 # populates.
 
 
-async def _insert_reference_index(pool, reference_idx, fs_path, *, index_type="rype"):
+async def _insert_reference_index(
+    pool, reference_idx, fs_path, *, index_type="rype", shard_id=None
+):
     return await pool.fetchval(
-        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
-        " VALUES ($1, $2, $3, $4::jsonb) RETURNING reference_index_idx",
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING reference_index_idx",
         reference_idx,
         index_type,
         fs_path,
         json.dumps({"k": 64, "w": 25}),
+        shard_id,
     )
 
 
@@ -2025,6 +2092,31 @@ async def test_resolve_reference_index_path_returns_latest(postgres_pool, refere
     try:
         resolved = await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
         assert resolved == newest
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_reference_index_path_ignores_shard_rows(postgres_pool, reference_idx):
+    """The whole-reference (unsharded) resolver must never return a shard row's
+    path, even when a shard row sorts first (newer / higher idx). It selects the
+    newest row with `shard_id IS NULL`."""
+    from qiita_control_plane.runner import _resolve_reference_index_path
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    unsharded = "/srv/qiita/whole.ryxdi"
+    await _insert_reference_index(postgres_pool, reference_idx, unsharded)
+    # Inserted last (higher reference_index_idx) so it would win newest-wins if
+    # the resolver didn't filter shard rows out.
+    await _insert_reference_index(
+        postgres_pool, reference_idx, "/srv/qiita/shards/0/index.ryxdi", shard_id=0
+    )
+    try:
+        resolved = await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+        assert resolved == unsharded
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx

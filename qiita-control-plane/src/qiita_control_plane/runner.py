@@ -1517,6 +1517,12 @@ async def _resolve_reference_index_path(
     ordered by created_at then reference_index_idx, both descending, so a
     same-timestamp tie still resolves deterministically to the latest row.
 
+    This is the *whole-reference* (unsharded) lookup: it filters to
+    `shard_id IS NULL` so a per-shard analysis-index row can never be served
+    here. All rows are NULL today, so this is a no-op now and forward-safe once
+    shard rows exist. Shard-aware resolution (routing a read to its shard) is a
+    later milestone and is deliberately NOT built here.
+
     Raises:
       * ReferenceNotFound — the reference row doesn't exist.
       * ValueError — the reference exists but isn't `active` (an index built
@@ -1538,7 +1544,7 @@ async def _resolve_reference_index_path(
         )
     fs_path = await pool.fetchval(
         "SELECT fs_path FROM qiita.reference_index"
-        " WHERE reference_idx = $1 AND index_type = $2"
+        " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NULL"
         " ORDER BY created_at DESC, reference_index_idx DESC"
         " LIMIT 1",
         reference_idx,
@@ -3802,7 +3808,9 @@ async def _run_action_primitive(
         # the step's single declared input, NOT hardcoded: a host reference runs
         # two register-index steps (rype + minimap2), each pointing at its own
         # meta. Read it for index_type / fs_path / params (index_type comes from
-        # the builder, not hardcoded here).
+        # the builder, not hardcoded here). `shard_id` is optional: a host meta
+        # JSON omits it (`.get` -> None -> unsharded row); a sharded analysis
+        # index builder emits one meta per shard carrying its shard_id.
         if len(entry.inputs) != 1:
             raise RuntimeError(
                 f"register-index expects exactly one input (the index meta); got {entry.inputs!r}"
@@ -3815,6 +3823,7 @@ async def _run_action_primitive(
             index_type=meta["index_type"],
             fs_path=meta["fs_path"],
             params=meta["params"],
+            shard_id=meta.get("shard_id"),
         )
         return {}
 

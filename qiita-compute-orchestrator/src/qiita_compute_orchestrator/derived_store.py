@@ -44,6 +44,7 @@ from pathlib import Path
 __all__ = [
     "minimap2_index_path",
     "reference_derived_dir",
+    "reference_shard_dir",
     "rype_index_path",
 ]
 
@@ -57,6 +58,19 @@ def reference_derived_dir(derived_root: Path | str, reference_idx: int) -> Path:
     ``Path`` too so callers that already hold one don't round-trip through str.
     """
     return Path(derived_root) / "references" / str(reference_idx)
+
+
+def reference_shard_dir(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
+    """``{PATH_DERIVED}/references/{reference_idx}/shards/{shard_id}`` — the
+    per-shard directory of a sharded *analysis* index (one ``shard_id`` per
+    shard, 0..N-1). Composed off ``reference_derived_dir`` so it sits inside the
+    per-reference subtree the ``DELETE /reference-artifact/{idx}`` rmtree purges
+    — no separate cleanup path.
+
+    B1 lays down only the directory *layout*; what a shard directory contains
+    (a ``.mmi`` vs vendored FASTA vs a ``.ryxdi``) is decided by the later
+    sharded-index build milestone."""
+    return reference_derived_dir(derived_root, reference_idx) / "shards" / str(shard_id)
 
 
 def rype_index_path(derived_root: Path | str, reference_idx: int) -> Path:

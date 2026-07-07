@@ -316,7 +316,12 @@ class ReferenceIndex(BaseModel):
     the authoritative manifest (buckets, minimizer params, etc.) lives inside
     the index artifact itself. Mirrors the `qiita.reference_index` row. There
     may be more than one index per reference (different `index_type`, or — once
-    references can grow — newer generations of the same type)."""
+    references can grow — newer generations of the same type).
+
+    A sharded *analysis* index writes one row per shard (`shard_id` 0..N-1); an
+    unsharded whole-reference index (a host `rype`/`minimap2`) has `shard_id`
+    None. Like `index_type`, `shard_id` carries no allow-list here — the DB
+    CHECK (`shard_id IS NULL OR shard_id >= 0`) is authoritative."""
 
     reference_index_idx: Annotated[int, Field(gt=0)]
     reference_idx: Annotated[int, Field(gt=0)]
@@ -324,6 +329,7 @@ class ReferenceIndex(BaseModel):
     fs_path: str
     params: dict[str, Any]
     created_at: AwareDatetime
+    shard_id: int | None = None
 
 
 class ReferenceArtifactPurgeResponse(BaseModel):

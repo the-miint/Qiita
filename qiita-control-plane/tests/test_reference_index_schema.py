@@ -127,6 +127,72 @@ async def test_reference_index_rejects_unknown_type(postgres_pool):
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
+async def test_reference_index_accepts_shard_id(postgres_pool):
+    """A sharded analysis index writes one row per shard, carrying its
+    `shard_id` (0..N-1). The column round-trips the integer verbatim."""
+    idx = await _make_reference(postgres_pool, "schema-refindex-shard")
+    try:
+        rii = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference_index"
+            " (reference_idx, index_type, fs_path, params, shard_id)"
+            " VALUES ($1, 'rype', '/srv/x/shards/3/index.ryxdi', '{}'::jsonb, 3)"
+            " RETURNING reference_index_idx",
+            idx,
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT shard_id FROM qiita.reference_index WHERE reference_index_idx = $1", rii
+            )
+            == 3
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
+async def test_reference_index_shard_id_defaults_null(postgres_pool):
+    """The pre-existing 4-column INSERT (no shard_id) leaves it NULL — the
+    unsharded whole-reference (host) index shape is unchanged by the migration."""
+    idx = await _make_reference(postgres_pool, "schema-refindex-unsharded", is_host=True)
+    try:
+        rii = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+            " VALUES ($1, 'rype', '/srv/x.ryxdi', '{}'::jsonb) RETURNING reference_index_idx",
+            idx,
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT shard_id FROM qiita.reference_index WHERE reference_index_idx = $1", rii
+            )
+            is None
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
+async def test_reference_index_rejects_negative_shard_id(postgres_pool):
+    """The `reference_index_shard_id_nonneg` CHECK rejects a negative shard_id."""
+    idx = await _make_reference(postgres_pool, "schema-refindex-badshard")
+    try:
+        with pytest.raises(Exception):  # asyncpg.CheckViolationError
+            await postgres_pool.execute(
+                "INSERT INTO qiita.reference_index"
+                " (reference_idx, index_type, fs_path, params, shard_id)"
+                " VALUES ($1, 'rype', '/srv/x/shards/-1/index.ryxdi', '{}'::jsonb, -1)",
+                idx,
+            )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
 async def test_reference_index_restricts_reference_delete(postgres_pool):
     """RESTRICT FK (schema-wide convention): a reference with an index row
     cannot be deleted until the index row is removed first."""

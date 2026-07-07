@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Added
 
+- **Per-shard `reference_index.shard_id` + register/GET/derived-store plumbing.**
+  The foundation for per-shard *analysis* reference indexes: `qiita.reference_index`
+  gains a nullable `shard_id INTEGER` (+ a `>= 0` CHECK) so a sharded index writes
+  one row per shard (`shard_id` 0..N-1) while the existing unsharded host index
+  keeps `shard_id` NULL. Additive and backward-compatible — no `shard_count`
+  (it's `COUNT(*)` per `(reference_idx, index_type)`), no new UNIQUE (the
+  `(reference_idx, index_type, fs_path)` idempotency key already dedups
+  path-distinct shard rows). `register_index` and `GET /reference/{idx}/index`
+  thread `shard_id`; the runner's register-index arm reads it from the meta JSON
+  (`meta.get` → NULL for host metas); the whole-reference resolver
+  (`_resolve_reference_index_path`) filters `shard_id IS NULL` so a shard row is
+  never served as the unsharded index; and `derived_store.reference_shard_dir`
+  lays down the `references/{idx}/shards/{shard_id}/` layout (under the existing
+  purge subtree). No shard builds, planner, or routing yet — those are later
+  milestones. (#reference-support)
 - **`genome_source` controlled vocabulary + qiita-origin sample link.** `qiita.genome.source`
   is now a closed vocabulary (`genbank`, `refseq`, `qiita`), enforced both up front at ingest
   (fail-fast in `_associate_genomes`, before any DB write) and by a `CHECK`, mirrored by the new

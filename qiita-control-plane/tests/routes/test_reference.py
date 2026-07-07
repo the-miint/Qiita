@@ -267,6 +267,32 @@ async def test_get_reference_index_returns_rows(client, postgres_pool):
     assert body[0]["reference_idx"] == idx
 
 
+async def test_get_reference_index_returns_shard_id(client, postgres_pool):
+    """A sharded analysis index surfaces one flat row per shard, each carrying
+    its `shard_id`; an unsharded row carries `shard_id: null`. Grouping into
+    "one logical index with N shards" is a later concern."""
+    r = await _create_ref(client, "test-index-shards")
+    idx = r.json()["reference_idx"]
+    await postgres_pool.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " VALUES"
+        "   ($1, 'rype', '/srv/x/whole.ryxdi', '{}'::jsonb, NULL),"
+        "   ($1, 'rype', '/srv/x/shards/0/index.ryxdi', '{}'::jsonb, 0),"
+        "   ($1, 'rype', '/srv/x/shards/1/index.ryxdi', '{}'::jsonb, 1)",
+        idx,
+    )
+    resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=idx))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 3
+    shard_by_path = {row["fs_path"]: row["shard_id"] for row in body}
+    assert shard_by_path == {
+        "/srv/x/whole.ryxdi": None,
+        "/srv/x/shards/0/index.ryxdi": 0,
+        "/srv/x/shards/1/index.ryxdi": 1,
+    }
+
+
 async def test_get_reference_index_404_when_reference_absent(client, postgres_pool):
     """GET index for a non-existent reference is 404 (distinct from empty list)."""
     max_idx = await postgres_pool.fetchval(

@@ -163,6 +163,10 @@ async def get_reference_index(
     newest first. 404 when the reference itself doesn't exist; an empty list
     when it exists but has no index built yet — the two are distinct.
 
+    A sharded analysis index surfaces as one flat row per shard (each carrying
+    its `shard_id`); grouping shards into "one logical index" is a later
+    concern. An unsharded whole-reference index has `shard_id` null.
+
     `fs_path` is the on-disk index location a future host-filter compute job
     consumes (the runner injects it directly; this endpoint is for general
     visibility / admin). Scoped to reference:read — unlike the anonymous-OK
@@ -174,7 +178,8 @@ async def get_reference_index(
     if exists is None:
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     rows = await pool.fetch(
-        "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at"
+        "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
+        " shard_id"
         " FROM qiita.reference_index WHERE reference_idx = $1"
         " ORDER BY created_at DESC, reference_index_idx DESC",
         reference_idx,
