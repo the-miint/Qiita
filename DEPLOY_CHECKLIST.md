@@ -66,6 +66,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     applies it standalone).
   - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
     extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
+- **Assembly-processing schema for `pacbio-processing`.** `make migrate` applies
+  `20260707000000_assembly.sql`: creates `qiita.processing` (+ the idempotent
+  `qiita.mint_processing` mint function) and `qiita.assembly_membership`. Plain
+  `make migrate`, no backfill or out-of-band setup. (The four DuckLake assembly
+  tables are auto-created at data-plane startup — see the note below.) (#255)
 
 ### 4. Deploy
 
@@ -107,9 +112,11 @@ _None yet._
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
   read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
-- **`pacbio-processing/1.0.0` is inert until an operator runs it.** The two new
-  DuckLake tables (`assembled_genome`, `genome_quality`) are created automatically
-  at data-plane startup by `ensure_genome_tables` — **no migration, no action**.
+- **`pacbio-processing/1.0.0` is inert until an operator runs it.** The four new
+  DuckLake tables (`assembled_sequence`, `assembled_sequence_chunks`,
+  `assembly_membership`, `bin_quality`) are created automatically at data-plane
+  startup by `ensure_assembly_tables` — **no data-plane action** (the Postgres
+  `qiita.processing` / `qiita.assembly_membership` side is the bucket-3 migration).
   The `pacbio-processing-1.0.0.sif` is built automatically by `build-sifs.sh`
   during the deploy; the first build resolves several bioconda envs (metawrap /
   DAS_Tool / CheckM), so it is **slow** and needs apptainer + network on the build

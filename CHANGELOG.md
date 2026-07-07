@@ -19,19 +19,28 @@ the `no-changelog` label).
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
   reads (selected by a required `mask_idx`): the runner STREAMS the masked reads
   to a gzip FASTQ (miint `COPY … FORMAT FASTQ`, no intermediate Parquet) and a
-  native step records the assembler; four
-  container steps run hifiasm_meta → metawrap binning → DAS_Tool → CheckM (all
-  sharing one `pacbio-processing-1.0.0.sif` via per-step entrypoints, one
-  micromamba env per tool); and a native `pacbio_ingest` step + register-files
-  load the results into two new `prep_sample_idx`-keyed DuckLake tables —
-  `assembled_genome` (LCG circular-genome + MAG contig sequences) and
-  `genome_quality` (CheckM completeness/contamination + DAS_Tool provenance). The
-  step-1 assembler is a parameter (`hifiasm_meta` default; `myloasm` reserved),
-  threaded through the native steps' `params:` (a container step can't take a
-  scalar). Empty-branch semantics mirror qp-pacbio: LCG-only samples store
-  successfully, zero-genome samples are a terminal NO_DATA. The cross-sample
-  dereplication / taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a
-  separate follow-on that reads these per-sample results across many preps. (#255)
+  native step records the assembler; four container steps run hifiasm_meta →
+  metawrap binning → DAS_Tool → CheckM (all sharing one
+  `pacbio-processing-1.0.0.sif` via per-step entrypoints, one micromamba env per
+  tool). The storage tail REUSES the reference-add pipeline rather than a bespoke
+  parser: `assembly_hash` reads the LCG + MAG contigs with miint `read_fastx` and
+  emits the manifest + hash-keyed chunks + bin_map shape, `mint-features` mints the
+  contig features against the SHARED `qiita.feature` (identical bytes collapse to
+  one feature_idx — an assembled contig and a reference sequence share identity),
+  `write-assembly-membership` links them to `qiita.assembly_membership`, and
+  `assembly_load` (reusing reference_load's re-key writers) + register-files load
+  four DuckLake tables — `assembled_sequence` / `assembled_sequence_chunks`
+  (feature-keyed contig sequences), `assembly_membership` (which features each
+  (prep_sample, run, bin) contains), and `bin_quality` (per-MAG CheckM + DAS_Tool
+  provenance, read with DuckDB's CSV reader). Each run has a `processing_idx`
+  identity (deduped on the canonical params hash — workflow/version/assembler) so a
+  re-run with different params never collides a prior run's bins. The step-1
+  assembler is a parameter (`hifiasm_meta` default; `myloasm` reserved), threaded
+  through the native steps' `params:` (a container step can't take a scalar).
+  Empty-branch semantics mirror qp-pacbio: LCG-only samples store successfully,
+  zero-contig samples are a terminal NO_DATA. The cross-sample dereplication /
+  taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a separate follow-on
+  that reads these per-sample results across many preps. (#255)
 - **Masked-reads streaming binding (`masked_reads_fastq`)** — an assembly
   workflow that consumes ready-for-consumption reads declares `masked_reads_fastq`;
   the runner's `_resolve_staged_masked_reads` STREAMS the prep_sample's
