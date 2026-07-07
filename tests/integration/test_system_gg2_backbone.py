@@ -285,7 +285,7 @@ async def test_gg2_backbone_full_pipeline(
         "SELECT count(*) FROM qiita.feature_genome fg"
         " JOIN qiita.genome g USING (genome_idx)"
         " JOIN qiita.reference_membership m ON m.feature_idx = fg.feature_idx"
-        " WHERE m.reference_idx = $1 AND g.source = 'gg2'",
+        " WHERE m.reference_idx = $1 AND g.source = 'genbank'",
         gg2_reference,
     )
     assert actual_genome_count == _EXPECTED_GENOME_ASSOCIATIONS
