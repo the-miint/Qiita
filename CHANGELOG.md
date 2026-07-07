@@ -24,7 +24,7 @@ the `no-changelog` label).
   aux tag (methylation MM/ML, kinetics), and treats input as single-end. No new
   table, migration, container, or env var. The `PreMintedRange` retry-recovery
   model moved from `jobs/fastq_to_parquet.py` to `sequence_range.py` so both
-  read-ingest jobs share it. (#bam-to-parquet)
+  read-ingest jobs share it. (#254)
 
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the

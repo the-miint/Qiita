@@ -68,7 +68,7 @@ _None yet._
 - Confirm the `bam-to-parquet/1.0.0` workflow synced into `qiita.action` (new
   BAM read-loader — synced by `qiita-admin actions sync` inside `activate.sh`,
   covered by `make verify-deploy`'s `qiita.action` list; this asserts the specific
-  new action): (#bam-to-parquet)
+  new action): (#254)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='bam-to-parquet'"
