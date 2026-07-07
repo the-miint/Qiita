@@ -15,6 +15,31 @@ the `no-changelog` label).
 
 ### Added
 
+- **`pacbio-processing` workflow — per-sample PacBio HiFi assembly → MAG
+  recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
+  reads (selected by a required `mask_idx`): a native `pacbio_export_reads` step
+  converts the masked `reads.parquet` to FASTQ + records the assembler; four
+  container steps run hifiasm_meta → metawrap binning → DAS_Tool → CheckM (all
+  sharing one `pacbio-processing-1.0.0.sif` via per-step entrypoints, one
+  micromamba env per tool); and a native `pacbio_ingest` step + register-files
+  load the results into two new `prep_sample_idx`-keyed DuckLake tables —
+  `assembled_genome` (LCG circular-genome + MAG contig sequences) and
+  `genome_quality` (CheckM completeness/contamination + DAS_Tool provenance). The
+  step-1 assembler is a parameter (`hifiasm_meta` default; `myloasm` reserved),
+  threaded through the native steps' `params:` (a container step can't take a
+  scalar). Empty-branch semantics mirror qp-pacbio: LCG-only samples store
+  successfully, zero-genome samples are a terminal NO_DATA. The cross-sample
+  dereplication / taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a
+  separate follow-on that reads these per-sample results across many preps. (#TBD)
+- **`export_read_masked` DoAction** — the masked sibling of `export_read`:
+  materializes one prep_sample's `read_masked` pass-set (for a given `mask_idx`)
+  to a per-ticket `reads.parquet`, so a consumer (pacbio assembly) gets
+  host/human/QC-filtered, trimmed reads — which `export_read` / `export_read_block`
+  do not (they read the raw `read` table). The shared writer
+  `export_read_where_to_parquet` was renamed to `export_read_select_to_parquet`
+  and now takes the full inner SELECT, so all three read exports share one atomic,
+  symlink-safe publish path. Added to `REPLAY_SAFE_ACTIONS`. The control-plane
+  runner glue that calls it is a follow-up. (#TBD)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its

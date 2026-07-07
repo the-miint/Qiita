@@ -31,7 +31,21 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-_None yet._
+- **CheckM reference database for `pacbio-processing`.** The workflow's `checkm`
+  step needs CheckM's ~1.4 GB reference data, which is deliberately NOT baked into
+  the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
+  time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
+  `/opt/checkm_data`), so the DB dir must be bind-mounted there (or
+  `QIITA_CHECKM_DB` set to its in-container path). (#TBD)
+  ```bash
+  sudo -u qiita-orch bash -c 'mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data" \
+    && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
+    && tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
+  ```
+  KNOWN FOLLOW-UP: wiring the bind-mount + `CHECKM_DATA_PATH` into the container
+  step (the orchestrator binds only declared step inputs today) lands separately;
+  until then the `checkm` step cannot find the DB, though assemble/binning/
+  bin_refine are unaffected.
 
 ### 3. Migrations
 
@@ -65,6 +79,14 @@ _None yet._
   # expect: read-mask-block|1.0.0|block
   ```
 
+- Confirm the `pacbio-processing/1.0.0` workflow synced into `qiita.action`
+  (synced by `qiita-admin actions sync` inside `activate.sh`): (#TBD)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='pacbio-processing'"
+  # expect: pacbio-processing|1.0.0|prep_sample
+  ```
+
 ### Notes (no host action)
 
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
@@ -81,6 +103,13 @@ _None yet._
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
   read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
+- **`pacbio-processing/1.0.0` is inert until an operator runs it.** The two new
+  DuckLake tables (`assembled_genome`, `genome_quality`) are created automatically
+  at data-plane startup by `ensure_genome_tables` — **no migration, no action**.
+  The `pacbio-processing-1.0.0.sif` is built automatically by `build-sifs.sh`
+  during the deploy; the first build resolves several bioconda envs (metawrap /
+  DAS_Tool / CheckM), so it is **slow** and needs apptainer + network on the build
+  host. Beyond the bucket-2 CheckM DB, no new env var, scope, or group. (#TBD)
 
 ---
 
