@@ -14,11 +14,14 @@ description: >
   which a register-files step loads into the `read` table.
 
   This is a PLAIN read loader: it discards all alignment fields and every aux tag
-  (base-modification / methylation MM/ML, kinetics ipd/pw, etc.). Only primary
-  records are kept (one row per read → one sequence_idx); the input is treated as
-  single-end (sequence2/qual2 NULL), which holds for the long-read BAMs this
-  targets. Full reads are stored ONCE, independent of any mask — the read-mask
-  workflow masks them later, exactly as for FASTQ-ingested reads.
+  (base-modification / methylation MM/ML, kinetics ipd/pw, etc.). It expects an
+  unaligned basecaller uBAM (PacBio HiFi / ONT), which the caller declares via
+  `expect_unaligned` (an aligned BAM is rejected — its reverse-strand reads would
+  be stored mis-oriented). Each read must appear exactly once: a duplicate QNAME
+  (a paired mate, or a secondary/supplementary alignment) is rejected, so one read
+  maps to one sequence_idx. Single-end (sequence2/qual2 NULL). Full reads are
+  stored ONCE, independent of any mask — the read-mask workflow masks them later,
+  exactly as for FASTQ-ingested reads.
 
   Per-sample scope (target_kind: prep_sample); the route's submit-time check
   rejects tickets pointing at non-sequenced preps. The orchestrator authenticates
