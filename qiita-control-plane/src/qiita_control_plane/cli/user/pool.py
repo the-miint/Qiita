@@ -628,7 +628,7 @@ def _handle_submit_host_filter_pool(
 
     The pool's reads were stored once by the bcl-convert workflow's ingest_reads
     step; this gesture does NOT parse FASTQ or re-store reads. It submits one
-    read-mask/1.0.0 ticket per sample (always-on QC + host filtering), each
+    read-mask ticket per sample (always-on QC + host filtering), each
     recorded as a read_mask over the stored reads.
 
     Host filtering is a property of the filtering config, not of the sample:
@@ -656,7 +656,7 @@ def _handle_submit_host_filter_pool(
          tickets instead of one actionable error. (No host refs given skips this.)
       4. Read the run's instrument_model once (GET /sequencing-run) to forward
          per sample so QC's polyG step is gated correctly (nullable).
-      5. POST one read-mask/1.0.0 ticket per sample (always-on QC; host filtering
+      5. POST one read-mask ticket per sample (always-on QC; host filtering
          enabled with the given reference(s), or a pass-through when none is
          given), scoped to the sample's prep_sample_idx. The runner binds each
          sample's stored reads (failing the ticket if it was never ingested).
@@ -779,7 +779,7 @@ def _handle_submit_host_filter_pool(
         )
         instrument_model = run.get("instrument_model")
 
-        # Step 5: one read-mask/1.0.0 ticket per sample — always-on QC + the host
+        # Step 5: one read-mask ticket per sample — always-on QC + the host
         # filtering chosen on this submission, uniform across the pool. A given
         # rype reference filters every sample against it (plus the optional
         # minimap2 reference); with none given each ticket sets

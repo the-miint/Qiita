@@ -17,79 +17,9 @@ reaches the system and whether the auth model can gate it:
 `token revoke-all` is HTTP+PAT and by the rule could live in `qiita`; it
 stays here for operator discoverability, not because the split forces it.
 
-Subcommands:
-  set-system-role  — direct DB UPDATE of qiita.principal.system_role.
-                     Used for the bootstrap path (first system_admin) and
-                     when the operator has DB access but no PAT yet. Refuses
-                     to operate on the system principal (idx=1).
-  whoami           — calls GET /api/v1/auth/whoami via the configured PAT.
-  token revoke-all — calls POST /api/v1/admin/principal/{idx}/revoke-all-tokens.
-  login            — drives the AuthRocket LoginRocket Web flow end-to-end.
-                     Spawns a localhost loopback HTTP server, opens a
-                     browser to /api/v1/auth/login?cli=1&port=N, waits for
-                     the handoff to redirect back with a one-time code,
-                     exchanges the code at /api/v1/auth/cli-exchange for
-                     a PAT, and writes the PAT to ~/.qiita/token (0600).
-  actions sync     — read every action YAML under --workflows-dir and upsert
-                     YAML-authoritative columns into qiita.action. Direct DB
-                     write; reads DATABASE_URL from env. Idempotent: re-runs
-                     converge to the YAML state without touching operational
-                     columns (enabled / first_seen_at / disabled_*).
-  ticket force-fail — direct-DB transition of a non-terminal work_ticket
-                     to state=failed with a captured failure_type /
-                     stage / step_name / reason. Replaces the previous
-                     "operator writes UPDATE qiita.work_ticket by hand"
-                     recovery pattern with a single command that
-                     respects the schema's CHECK constraints. Refuses
-                     to operate on already-terminal tickets.
-  owner-biosample-id — HTTP+PAT export of the owner-submitted original
-                     sample names for a study, written as a TSV to
-                     --output (0600, never stdout). Maps biosample_idx +
-                     biosample_accession back to the PII-pinned owner name
-                     that is otherwise masked everywhere. With
-                     --sequenced-pool-idx, restricts to that pool's samples
-                     in the study and adds prep_sample_idx + ENA
-                     experiment/run accessions. Server-gated by system_admin
-                     + the admin:biosample_owner_id_read scope.
-  work-ticket backfill-mask-idx — one-time idempotent backfill of
-                     work_ticket.mask_idx for existing read-mask /
-                     fastq-to-parquet tickets, by re-deriving each
-                     ticket's mask params hash and LOOKING IT UP in
-                     qiita.mask_definition (never minting). Dry-run by
-                     default; --apply writes. Scoped to mask_idx IS NULL
-                     so re-runs are no-ops.
-  compute-readiness — exercise the path qiita-job needs end-to-end and
-                     report per-check status (JWT, CP /healthz,
-                     SLURM_NATIVE_PYTHON on host, plus an optional
-                     SLURM probe-job that verifies the same env from
-                     a compute node). Subprocess-execs into the
-                     orchestrator's venv since the diagnostic uses the
-                     orchestrator's Settings.from_env() and
-                     SlurmrestdClient surfaces.
-  mask delete      — calls DELETE /api/v1/mask-definition/{mask_idx} as
-                     the configured PAT (system_admin via the
-                     mask_definition:delete scope). The route does the
-                     lake-first teardown (DuckLake read_mask rows then
-                     the Postgres mask_definition row) and detaches any
-                     referencing work_ticket via ON DELETE SET NULL.
-                     Prints the rows_deleted count.
-  mask purge-failed — bulk recovery for the read_mask move-then-read
-                     bug: failed read-mask / fastq-to-parquet tickets
-                     whose failure_reason carries "read_mask parquet not
-                     found" (the mask IS registered in DuckLake; only the
-                     metrics step failed). For each candidate it captures
-                     the resubmit params, deletes the now-stale mask (so
-                     the re-run won't duplicate read_mask rows), optionally
-                     deletes the FAILED ticket (--with-tickets), then
-                     RESUBMITS a fresh work_ticket against the fixed
-                     workflow. Guards: a mask referenced by ANY non-failed
-                     work_ticket is NEVER deleted (skipped + reported).
-                     Dry-run by default; --execute required to mutate.
-                     --limit caps, --rate throttles SLURM resubmits,
-                     --wait polls each resubmit to a terminal state.
-                     Mixes direct-DB reads (selector + shared-mask guard +
-                     ticket delete) with PAT'd REST calls (mask delete +
-                     resubmit), so it needs BOTH DATABASE_URL and a PAT.
+For the subcommand list and per-flag details, run `qiita-admin --help` (or
+`qiita-admin <subcommand> --help`) — the argparse help is the ground truth, so
+it can't drift from the actual commands the way a hand-maintained list would.
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected). Loopback login flow, token I/O,
@@ -98,41 +28,14 @@ and the generic HTTP runner live in `cli._common`.
 
 import argparse
 import asyncio
-import base64
-import contextlib
-import csv
-import itertools
 import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import asyncpg
 import httpx
-from pydantic import ValidationError
-from qiita_common.api_paths import (
-    PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
-    PATH_ADMIN_PREFIX,
-    PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
-    PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
-    PATH_MASK_DEFINITION_PREFIX,
-    PATH_WORK_TICKET_PREFIX,
-    PATH_WORK_TICKET_ROOT,
-)
-from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
-from qiita_common.parquet import ROW_GROUP_SIZE_BYTES
-
-from qiita_control_plane.actions import (
-    DuplicateActionError,
-    load_actions,
-    sync_actions,
-)
-from qiita_control_plane.miint import connect_with_miint
-from qiita_control_plane.runner import backfill_work_ticket_mask_idx
 
 from .. import _common
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
@@ -461,7 +364,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the orchestrator's venv; the wrapper invokes"
             f" `<venv>/bin/python -m qiita_compute_orchestrator.cli.compute_readiness`."
-            f" Default: {_DEFAULT_ORCHESTRATOR_VENV}"
+            f" Default: {_DEFAULT_ORCHESTRATOR_VENV} (set $QIITA_ORCHESTRATOR_VENV to"
+            " change the default without this flag)"
         ),
     )
     p_readiness.add_argument(
@@ -803,17 +707,26 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
                 f" new={r['new_work_ticket_idx']} state={r['state']}{tail}"
             )
         if report["failures"]:
-            print(f"  FAILURES (isolated; batch continued): {len(report['failures'])}")
+            # This branch exits nonzero, so its operator-actionable failure
+            # lines go to stderr (distinct from the run report on stdout).
+            print(
+                f"  FAILURES (isolated; batch continued): {len(report['failures'])}",
+                file=sys.stderr,
+            )
             for f in report["failures"]:
                 print(
                     f"    FAIL work_ticket_idx={f['work_ticket_idx']}"
                     f" mask_idx={f['mask_idx']}"
                     f" (mask_deleted={f['mask_deleted']} ticket_deleted={f['ticket_deleted']}):"
-                    f" {f['error']}"
+                    f" {f['error']}",
+                    file=sys.stderr,
                 )
                 # Replay hint: with the mask already deleted, a plain re-POST of
                 # this body is safe (no duplicate read_mask rows).
-                print(f"      replay POST /work-ticket: {json.dumps(f['resubmit_body'])}")
+                print(
+                    f"      replay POST /work-ticket: {json.dumps(f['resubmit_body'])}",
+                    file=sys.stderr,
+                )
             # A non-empty failures list is an operator-actionable signal.
             return 1
     else:
@@ -841,19 +754,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "DuplicateActionError",
-    "PATH_ADMIN_MASKED_READ_EXPORT_TICKET",
-    "PATH_ADMIN_PREFIX",
-    "PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT",
-    "PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID",
-    "PATH_MASK_DEFINITION_PREFIX",
-    "PATH_WORK_TICKET_PREFIX",
-    "PATH_WORK_TICKET_ROOT",
-    "Path",
-    "ROW_GROUP_SIZE_BYTES",
-    "SYSTEM_PRINCIPAL_IDX",
-    "SystemRole",
-    "ValidationError",
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
     "_FAILURE_STAGES_REJECTING_STEP_NAME",
@@ -875,7 +775,6 @@ __all__ = [
     "_build_parser",
     "_build_resubmit_body",
     "_commit_partials",
-    "_common",
     "_count_masked",
     "_count_non_failed_missing_mask_idx",
     "_decode_hmac_secret",
@@ -909,24 +808,5 @@ __all__ = [
     "_validate_force_fail_args",
     "_write_masked_sample",
     "_write_owner_biosample_id_tsv",
-    "argparse",
-    "asyncio",
-    "asyncpg",
-    "backfill_work_ticket_mask_idx",
-    "base64",
-    "connect_with_miint",
-    "contextlib",
-    "csv",
-    "httpx",
-    "itertools",
-    "json",
-    "load_actions",
     "main",
-    "os",
-    "re",
-    "subprocess",
-    "sync_actions",
-    "sys",
-    "tempfile",
-    "time",
 ]

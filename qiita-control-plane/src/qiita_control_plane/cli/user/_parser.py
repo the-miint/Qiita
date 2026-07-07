@@ -957,7 +957,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         description=(
             "For every active sequenced_sample in --sequenced-pool-idx, submit a"
-            " read-mask/1.0.0 work-ticket: always-on QC (fastp-equivalent"
+            " read-mask work-ticket: always-on QC (fastp-equivalent"
             " adapter/polyG/length trimming) followed by host filtering, recorded"
             " as a read_mask over the reads bcl-convert already stored — this"
             " command does NOT parse FASTQ or re-store reads. The host reference"

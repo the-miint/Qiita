@@ -4,17 +4,21 @@ Split out of the former single-file ``cli.admin`` module; behavior unchanged.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-# Production install location for the orchestrator's venv. Same path
-# the deploy script writes to and the systemd unit launches from —
-# this constant is a default for the operator-side wrapper, not the
-# source of truth; --orchestrator-venv overrides for dev hosts or
-# unusual layouts. The wrapper subprocess-execs `<venv>/bin/python -m
+# Default install location for the orchestrator's venv — the path the deploy
+# script writes to and the systemd unit launches from. This is only a default
+# for the operator-side wrapper, not a source of truth: a host with a different
+# layout sets QIITA_ORCHESTRATOR_VENV in its environment (so the path lives in
+# config, not hard-coded here), and --orchestrator-venv overrides per-invocation.
+# The wrapper subprocess-execs `<venv>/bin/python -m
 # qiita_compute_orchestrator.cli.compute_readiness`.
-_DEFAULT_ORCHESTRATOR_VENV = Path("/opt/qiita/compute-orchestrator/.venv")
+_DEFAULT_ORCHESTRATOR_VENV = Path(
+    os.environ.get("QIITA_ORCHESTRATOR_VENV", "/opt/qiita/compute-orchestrator/.venv")
+)
 
 
 def _handle_compute_readiness(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

@@ -26,72 +26,6 @@ Authentication: HTTP subcommands read the PAT from QIITA_TOKEN env or
 from ~/.qiita/token (mode 0600).
 """
 
-import argparse
-import asyncio
-import base64
-import json
-import sqlite3
-from collections.abc import Callable
-from pathlib import Path
-from typing import Any, NamedTuple
-
-import httpx
-from pydantic import BaseModel, ValidationError
-from qiita_common.actions import READ_MASK_ACTION_ID
-from qiita_common.api_paths import (
-    PATH_BIOSAMPLE_BY_IDX,
-    PATH_BIOSAMPLE_LIST_BY_STUDY,
-    PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
-    PATH_BIOSAMPLE_PREFIX,
-    PATH_PREP_PROTOCOL_PREFIX,
-    PATH_PREP_SAMPLE_PREFIX,
-    PATH_PREP_SAMPLE_RETIRED,
-    PATH_PREP_SAMPLE_STUDY_LIST,
-    PATH_REFERENCE_BY_IDX,
-    PATH_REFERENCE_INDEX,
-    PATH_REFERENCE_PREFIX,
-    PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
-    PATH_SEQUENCED_POOL_BY_IDX,
-    PATH_SEQUENCED_POOL_COMPLETION,
-    PATH_SEQUENCED_SAMPLE_BY_IDX,
-    PATH_SEQUENCED_SAMPLE_FROM_RUN,
-    PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
-    PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
-    PATH_SEQUENCED_SAMPLE_PREFIX,
-    PATH_SEQUENCING_RUN_BY_IDX,
-    PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
-    PATH_SEQUENCING_RUN_PREFIX,
-    PATH_SEQUENCING_RUN_SEQUENCED_POOL,
-    PATH_STUDY_BY_IDX,
-    PATH_STUDY_LOOKUP_BY_ACCESSION,
-    PATH_STUDY_PREFIX,
-    PATH_WORK_TICKET_PREFIX,
-)
-from qiita_common.illumina import read_instrument_run_info
-from qiita_common.models import (
-    HOST_FILTER_INDEX_TYPE_MINIMAP2,
-    HOST_FILTER_INDEX_TYPE_RYPE,
-    BiosampleImportRequest,
-    BiosampleLookupByAccessionRequest,
-    BiosamplePatchRequest,
-    BlockMaskPlanRequest,
-    Platform,
-    ReferenceStatus,
-    ScopeTargetKind,
-    SequencedPoolCreateRequest,
-    SequencedPoolPreflightUpdateLaneRequest,
-    SequencedSampleCreateRequest,
-    SequencedSamplePatchRequest,
-    SequencingRunCreateRequest,
-    StudyCreate,
-    StudyLookupByAccessionRequest,
-    StudyPatchRequest,
-    Tier,
-    UserUpdate,
-    WorkTicketCreateRequest,
-    WorkTicketState,
-)
-
 from .. import _common
 from ._helpers import _build_body, _handle_patch, _handle_read, _lane_arg
 from ._parser import _build_parser
@@ -157,61 +91,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "Any",
-    "BaseModel",
-    "BiosampleImportRequest",
-    "BiosampleLookupByAccessionRequest",
-    "BiosamplePatchRequest",
-    "BlockMaskPlanRequest",
-    "Callable",
-    "HOST_FILTER_INDEX_TYPE_MINIMAP2",
-    "HOST_FILTER_INDEX_TYPE_RYPE",
-    "NamedTuple",
-    "PATH_BIOSAMPLE_BY_IDX",
-    "PATH_BIOSAMPLE_LIST_BY_STUDY",
-    "PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION",
-    "PATH_BIOSAMPLE_PREFIX",
-    "PATH_PREP_PROTOCOL_PREFIX",
-    "PATH_PREP_SAMPLE_PREFIX",
-    "PATH_PREP_SAMPLE_RETIRED",
-    "PATH_PREP_SAMPLE_STUDY_LIST",
-    "PATH_REFERENCE_BY_IDX",
-    "PATH_REFERENCE_INDEX",
-    "PATH_REFERENCE_PREFIX",
-    "PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN",
-    "PATH_SEQUENCED_POOL_BY_IDX",
-    "PATH_SEQUENCED_POOL_COMPLETION",
-    "PATH_SEQUENCED_SAMPLE_BY_IDX",
-    "PATH_SEQUENCED_SAMPLE_FROM_RUN",
-    "PATH_SEQUENCED_SAMPLE_LIST_BY_POOL",
-    "PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL",
-    "PATH_SEQUENCED_SAMPLE_PREFIX",
-    "PATH_SEQUENCING_RUN_BY_IDX",
-    "PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID",
-    "PATH_SEQUENCING_RUN_PREFIX",
-    "PATH_SEQUENCING_RUN_SEQUENCED_POOL",
-    "PATH_STUDY_BY_IDX",
-    "PATH_STUDY_LOOKUP_BY_ACCESSION",
-    "PATH_STUDY_PREFIX",
-    "PATH_WORK_TICKET_PREFIX",
-    "Path",
-    "Platform",
-    "READ_MASK_ACTION_ID",
-    "ReferenceStatus",
-    "ScopeTargetKind",
-    "SequencedPoolCreateRequest",
-    "SequencedPoolPreflightUpdateLaneRequest",
-    "SequencedSampleCreateRequest",
-    "SequencedSamplePatchRequest",
-    "SequencingRunCreateRequest",
-    "StudyCreate",
-    "StudyLookupByAccessionRequest",
-    "StudyPatchRequest",
-    "Tier",
-    "UserUpdate",
-    "ValidationError",
-    "WorkTicketCreateRequest",
-    "WorkTicketState",
     "_BCL_CONVERT_ACTION_ID",
     "_BCL_CONVERT_ACTION_VERSION",
     "_PreflightRow",
@@ -220,7 +99,6 @@ __all__ = [
     "_assert_pool_intent_matches",
     "_build_body",
     "_build_missing_section",
-    "_common",
     "_get_work_ticket",
     "_get_work_ticket_step_logs",
     "_handle_biosample_create",
@@ -266,12 +144,5 @@ __all__ = [
     "_run_reference_load",
     "_run_work_ticket",
     "_serializable",
-    "argparse",
-    "asyncio",
-    "base64",
-    "httpx",
-    "json",
     "main",
-    "read_instrument_run_info",
-    "sqlite3",
 ]
