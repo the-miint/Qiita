@@ -1,7 +1,7 @@
 """Native job: re-key assembly_hash's hash-keyed outputs to feature_idx and write
 the four DuckLake-shape staging Parquets register-files hands to the data plane.
 
-Tail of the pacbio-processing workflow, the assembly analogue of reference_load.
+Tail of the long-read-assembly workflow, the assembly analogue of reference_load.
 It REUSES reference_load's now-generic re-key writers verbatim — the shared
 `qiita.feature` space means an assembled contig and a reference sequence with the
 same bytes carry the same feature_idx, so the sequence + chunk writers are
@@ -23,7 +23,7 @@ containers emit CheckM's / DAS_Tool's tables verbatim (a plain `cp`, no awk/pyth
 normalization), so DuckDB is the ONE csv framework in this path (never a Python
 csv parser, never a shell transform on the tool tables).
 
-Empty/partial semantics mirror the old pacbio_ingest: an LCG-only sample (contigs
+Empty/partial semantics mirror qp-pacbio: an LCG-only sample (contigs
 but no MAG) is a SUCCESS — `bin_quality` is written empty (register-files still
 finds all four tables with the right schema). Zero contigs never reaches here
 (assembly_hash raised StepNoData upstream).

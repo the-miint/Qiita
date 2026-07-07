@@ -1,4 +1,4 @@
-"""Isolated unit tests for `pacbio_export_reads.execute` — now just emits the
+"""Isolated unit tests for `assembly_run_config.execute` — now just emits the
 assembly run-config (the masked reads are streamed to FASTQ by the CP runner)."""
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from qiita_compute_orchestrator.jobs.pacbio_export_reads import Inputs, execute
+from qiita_compute_orchestrator.jobs.assembly_run_config import Inputs, execute
 
 
 def _run(inputs: Inputs, workspace) -> dict:

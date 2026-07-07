@@ -1,20 +1,23 @@
 Bootstrap: docker
 From: mambaorg/micromamba:1.5.8
 
-# Per-tool image for the pacbio-processing `bin_refine` step (DAS_Tool + diamond).
-# One of four single-tool images the workflow ships; see assemble.def for the
-# split rationale. Invoked as `apptainer exec <sif> /opt/qiita/bin_refine.sh`
+# Per-tool image for the long-read-assembly `checkm` step (CheckM + pplacer/hmmer/
+# prodigal). One of four single-tool images the workflow ships; see assemble.def
+# for the split rationale. Invoked as `apptainer exec <sif> /opt/qiita/checkm.sh`
 # (per-step entrypoint), so the %runscript is unused.
 #
+# CheckM reference data (~1.4 GB) is NOT baked in — it is bind-mounted at run time
+# from PATH_DERIVED and pointed at via CHECKM_DATA_PATH in checkm.sh.
+#
 # BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
-# bioconda pins and the DAS_Tool summary columns `bin`/`bin_score`/`bin_set`
-# (consumed downstream by assembly_load with DuckDB) must be verified on the first
-# Linux build (`make test-workflows` / build-sifs.sh); pinned against DAS_Tool
-# 1.1.x source, re-confirm against real output.
+# bioconda pins and the CheckM `--tab_table` headers `"Bin Id"`/`"Genome size
+# (bp)"`/`"# contigs"` (consumed downstream by assembly_load with DuckDB) must be
+# verified on the first Linux build (`make test-workflows` / build-sifs.sh);
+# pinned against CheckM 1.x source, re-confirm against real output.
 
 %labels
-    workflow pacbio-processing
-    tool bin_refine
+    workflow long-read-assembly
+    tool checkm
     version 1.0.0
 
 %files
@@ -24,7 +27,7 @@ From: mambaorg/micromamba:1.5.8
     # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
     _lib.sh /opt/qiita/_lib.sh
     # This image's per-step entrypoint.
-    bin_refine.sh /opt/qiita/bin_refine.sh
+    checkm.sh /opt/qiita/checkm.sh
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -39,25 +42,25 @@ From: mambaorg/micromamba:1.5.8
 
     # One env for this tool. Channels bioconda + conda-forge; versions pinned
     # loosely here and tightened after the first Linux build resolves the solve.
-    #  - bin_refine: DAS_Tool + diamond (DAS_Tool bundles its SCG db).
-    micromamba create -y -n dastool -c bioconda -c conda-forge das_tool diamond
+    #  - checkm: CheckM + its external binaries (pplacer, hmmer, prodigal).
+    micromamba create -y -n checkm -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
 
-    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/bin_refine.sh
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/checkm.sh
     chmod 0644 /opt/qiita/manifest_writer.py
 
     micromamba clean -a -y
 
 %test
     set -e
-    micromamba env list | grep -q dastool
-    micromamba run -n dastool DAS_Tool --version
+    micromamba env list | grep -q checkm
+    micromamba run -n checkm checkm -h >/dev/null
     # Base utilities + the shipped manifest writer.
     jq --version
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
     # Guard the entrypoint stays wired to its env.
-    grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
+    grep -q 'micromamba run -n checkm checkm' /opt/qiita/checkm.sh
 
 %runscript
-    echo "pacbio-dastool image: invoke the step entrypoint, e.g." >&2
-    echo "  apptainer exec <sif> /opt/qiita/bin_refine.sh" >&2
+    echo "long-read-assembly-checkm image: invoke the step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/checkm.sh" >&2
     exit 64

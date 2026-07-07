@@ -1,7 +1,7 @@
 Bootstrap: docker
 From: mambaorg/micromamba:1.5.8
 
-# Per-tool image for the pacbio-processing `assemble` step (hifiasm_meta). One of
+# Per-tool image for the long-read-assembly `assemble` step (hifiasm_meta). One of
 # four single-tool images the workflow ships (assemble / binning / bin_refine /
 # checkm), each built from its own def + sif-build.d/ spec so a change to one
 # tool's solve rebuilds ONLY that image — the tools are mutually
@@ -18,7 +18,7 @@ From: mambaorg/micromamba:1.5.8
 # (pinned against hifiasm-meta source; re-confirm against real output).
 
 %labels
-    workflow pacbio-processing
+    workflow long-read-assembly
     tool assemble
     version 1.0.0
 
@@ -64,6 +64,6 @@ From: mambaorg/micromamba:1.5.8
     grep -q 'micromamba run -n assemble hifiasm_meta' /opt/qiita/assemble.sh
 
 %runscript
-    echo "pacbio-assemble image: invoke the step entrypoint, e.g." >&2
+    echo "long-read-assembly-assemble image: invoke the step entrypoint, e.g." >&2
     echo "  apptainer exec <sif> /opt/qiita/assemble.sh" >&2
     exit 64

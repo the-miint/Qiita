@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared helpers for the pacbio-processing per-step entrypoints. Each step
+# Shared helpers for the long-read-assembly per-step entrypoints. Each step
 # sources this, reads its inputs from params.json, runs its tool writing under
 # $QIITA_OUTPUT_PATH, then calls qiita_finish to emit the manifest and apply the
 # 0440 (files) / 0550 (dirs) mode contract the data-plane verifier requires.

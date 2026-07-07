@@ -1,4 +1,4 @@
-"""Native job: hash the pacbio-processing container's assembled contigs into the
+"""Native job: hash the long-read-assembly container's assembled contigs into the
 same manifest + hash-keyed-chunks shape `hash_sequences` produces, plus a bin_map.
 
 Head of the assembly-storage tail. The heavy tools ran in containers; this native
@@ -33,7 +33,7 @@ from the globbed paths) JOINs the scan back to each contig's kind + bin without
 fragile filename regex.
 
 0 contigs (no LCG, no MAG under either dir) is a terminal no-data outcome
-(`StepNoData`), mirroring the old pacbio_ingest skip-on-empty branch — not a
+(`StepNoData`), mirroring qp-pacbio's skip-on-empty branch — not a
 failure.
 """
 

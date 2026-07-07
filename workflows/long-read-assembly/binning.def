@@ -1,7 +1,7 @@
 Bootstrap: docker
 From: mambaorg/micromamba:1.5.8
 
-# Per-tool image for the pacbio-processing `binning` step (metawrap: metabat2 +
+# Per-tool image for the long-read-assembly `binning` step (metawrap: metabat2 +
 # maxbin2 + concoct). One of four single-tool images the workflow ships; see
 # assemble.def for the split rationale. Invoked as
 # `apptainer exec <sif> /opt/qiita/binning.sh` (per-step entrypoint), so the
@@ -12,7 +12,7 @@ From: mambaorg/micromamba:1.5.8
 # verified on the first Linux build (`make test-workflows` / build-sifs.sh).
 
 %labels
-    workflow pacbio-processing
+    workflow long-read-assembly
     tool binning
     version 1.0.0
 
@@ -58,6 +58,6 @@ From: mambaorg/micromamba:1.5.8
     grep -q 'micromamba run -n metawrap metawrap' /opt/qiita/binning.sh
 
 %runscript
-    echo "pacbio-binning image: invoke the step entrypoint, e.g." >&2
+    echo "long-read-assembly-binning image: invoke the step entrypoint, e.g." >&2
     echo "  apptainer exec <sif> /opt/qiita/binning.sh" >&2
     exit 64

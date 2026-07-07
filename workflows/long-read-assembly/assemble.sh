@@ -7,7 +7,7 @@
 #                      predicate on the stored length, not a filter applied here)
 #   noLCG.fa           the non-circular contigs (input to binning + bin_refine)
 # Zero contigs is left as an empty genomes_dir; downstream steps skip cleanly and
-# pacbio_ingest turns the all-empty result into StepNoData.
+# assembly_hash turns the all-empty result into StepNoData.
 source /opt/qiita/_lib.sh
 
 READS_FASTQ="$(qiita_input masked_reads_fastq)"

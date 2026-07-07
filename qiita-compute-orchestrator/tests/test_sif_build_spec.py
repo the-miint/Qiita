@@ -101,7 +101,7 @@ def _def_path(spec_path: Path, spec: dict[str, str]) -> Path:
 
 def _spec_id(spec_path: Path) -> str:
     """Distinct pytest id per spec — `<wf>` for a legacy spec, `<wf>:<image>`
-    for a multi spec (so the four pacbio images don't collide on `sif-build.d`)."""
+    for a multi spec (so the four per-tool images don't collide on `sif-build.d`)."""
     if spec_path.name == "sif-build.env":
         return spec_path.parent.name
     return f"{spec_path.parent.parent.name}:{spec_path.stem}"

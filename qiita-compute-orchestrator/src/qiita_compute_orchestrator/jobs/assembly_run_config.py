@@ -8,9 +8,6 @@ is no intermediate Parquet and no hand-rolled FASTQ. Its only job is to write
 step's inputs (the runner treats a container input as a bind-mount path), so it
 flows through this native step into a small file the `assemble` container reads
 with `jq`.
-
-(Naming is deliberately left as-is for now; the pacbio-specific module/step names
-are generalized in a follow-up review theme.)
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 # YAML step name this module implements.
-YAML_STEP_NAME = "pacbio_export_reads"
+YAML_STEP_NAME = "assembly_run_config"
 
 # Output basename the `assemble` container reads via params.json `.inputs.run_config`.
 _RUN_CONFIG_NAME = "run_config.json"
