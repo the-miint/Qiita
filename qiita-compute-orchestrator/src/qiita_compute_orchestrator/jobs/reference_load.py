@@ -70,7 +70,7 @@ YAML_STEP_NAME = "load"
 _DUCKDB_MEMORY_GB = 31
 _DUCKDB_THREADS = 8
 
-# Per-batch chunk budget for `_write_reference_sequence_chunks`. Same
+# Per-batch chunk budget for `write_feature_sequence_chunks`. Same
 # rationale as hash_sequences: each batch's in-memory sort is bounded
 # by `_CHUNK_BUDGET_PER_BATCH × chunk_size` (~3.2 GB at 64 KB chunks).
 # Bin-packing by chunk-count (not feature-count) is load-bearing on
@@ -158,7 +158,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Pull feature_map into a TEMP TABLE once — every downstream
             # write JOINs against it (sequences, chunks, membership) and
-            # _build_id_map needs it too. Without this each helper would
+            # build_feature_id_map needs it too. Without this each helper would
             # re-scan the file.
             conn.execute(
                 "CREATE TEMP TABLE feature_map AS SELECT * FROM read_parquet(?)",
@@ -169,12 +169,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # taxonomy / phylogeny / placements writes all key off
             # read_id, so this single JOIN is the bridge to feature_idx.
             # Counts also drive the unmapped-hash check below.
-            _build_id_map(conn, inputs.manifest)
+            build_feature_id_map(conn, inputs.manifest)
 
-            _write_reference_sequences(conn, sequences_out)
+            write_feature_sequences(conn, sequences_out)
             written.append(sequences_path)
 
-            _write_reference_sequence_chunks(
+            write_feature_sequence_chunks(
                 conn,
                 inputs.reference_sequence_chunks,
                 chunks_dir,
@@ -233,7 +233,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # top-level subdirs of `part_*.parquet` (multi-file tables).
     #
     # `reference_sequence_chunks` re-exposes the feature-keyed chunks dir
-    # (written by `_write_reference_sequence_chunks` above) as its own binding.
+    # (written by `write_feature_sequence_chunks` above) as its own binding.
     # The hash_sequences step's same-named binding is sequence_hash-keyed
     # (pre-minting); this is the feature_idx-keyed re-key, which is what rype
     # needs. host-reference-add's build_rype_index step consumes it — and must
@@ -275,7 +275,7 @@ def _unwrap_chunks_to_temp_file(
     return out_path
 
 
-def _build_id_map(
+def build_feature_id_map(
     conn: duckdb.DuckDBPyConnection,
     manifest_path: Path,
 ) -> None:
@@ -313,7 +313,7 @@ def _build_id_map(
         raise ValueError(f"{n_unmapped} unmapped sequence hash(es) in feature_map: {hashes}")
 
 
-def _write_reference_sequences(
+def write_feature_sequences(
     conn: duckdb.DuckDBPyConnection,
     out: str,
 ) -> None:
@@ -333,7 +333,7 @@ def _write_reference_sequences(
     )
 
 
-def _write_reference_sequence_chunks(
+def write_feature_sequence_chunks(
     conn: duckdb.DuckDBPyConnection,
     reference_sequence_chunks_path: Path,
     out_dir: Path,
@@ -388,7 +388,7 @@ def _write_reference_sequence_chunks(
     # columnar storage makes the count(*) cheap (~1-2 sec) even though
     # the input is ~30 GB total. JOIN with the small feature_map TEMP
     # TABLE attaches feature_idx; defensive against any hash without a
-    # mint (every input hash should have one via _build_id_map's gap
+    # mint (every input hash should have one via build_feature_id_map's gap
     # check, but this keeps the count semantically correct).
     rows = conn.execute(
         "SELECT fm.feature_idx, rc.sequence_hash, count(*) AS n_chunks "
