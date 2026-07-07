@@ -17,8 +17,9 @@ the `no-changelog` label).
 
 - **`pacbio-processing` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
-  reads (selected by a required `mask_idx`): a native `pacbio_export_reads` step
-  converts the masked `reads.parquet` to FASTQ + records the assembler; four
+  reads (selected by a required `mask_idx`): the runner STREAMS the masked reads
+  to a gzip FASTQ (miint `COPY … FORMAT FASTQ`, no intermediate Parquet) and a
+  native step records the assembler; four
   container steps run hifiasm_meta → metawrap binning → DAS_Tool → CheckM (all
   sharing one `pacbio-processing-1.0.0.sif` via per-step entrypoints, one
   micromamba env per tool); and a native `pacbio_ingest` step + register-files
@@ -31,21 +32,19 @@ the `no-changelog` label).
   successfully, zero-genome samples are a terminal NO_DATA. The cross-sample
   dereplication / taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a
   separate follow-on that reads these per-sample results across many preps. (#255)
-- **`export_read_masked` DoAction** — the masked sibling of `export_read`:
-  materializes one prep_sample's `read_masked` pass-set (for a given `mask_idx`)
-  to a per-ticket `reads.parquet`, so a consumer (pacbio assembly) gets
-  host/human/QC-filtered, trimmed reads — which `export_read` / `export_read_block`
-  do not (they read the raw `read` table). The shared writer
-  `export_read_where_to_parquet` was renamed to `export_read_select_to_parquet`
-  and now takes the full inner SELECT, so all three read exports share one atomic,
-  symlink-safe publish path. Added to `REPLAY_SAFE_ACTIONS`. The control-plane
-  runner binds it to a workflow's `masked_reads` input via
-  `_resolve_staged_masked_reads`, keyed off the action_context `mask_idx` (a
-  distinct binding from raw `reads`, which read-mask workflows consume). The
-  resolver enforces the `mask_sample` completion gate — a partially-masked
-  block sample is rejected rather than assembled from a partial pass-set — and
-  treats a fully-masked-out sample (0 passing reads, a common outcome) as a
-  terminal NO_DATA, not a failure. (#255)
+- **Masked-reads streaming binding (`masked_reads_fastq`)** — an assembly
+  workflow that consumes ready-for-consumption reads declares `masked_reads_fastq`;
+  the runner's `_resolve_staged_masked_reads` STREAMS the prep_sample's
+  `read_masked` pass-set from the data plane (the existing `read_masked` DoGet
+  ticket — **no bespoke DoAction or payload**) and writes it to a gzip FASTQ with
+  miint's native `COPY … (FORMAT FASTQ)` — the same capability the admin
+  masked-read export uses, so no intermediate Parquet, no hand-rolled FASTQ, and
+  the data plane never writes a file (it streams). A distinct binding from raw
+  `reads` (which read-mask workflows consume). The resolver enforces the
+  `mask_sample` completion gate — a partially-masked block sample is rejected
+  rather than assembled from a partial pass-set — and treats a fully-masked-out
+  sample (0 passing reads, a common outcome) as a terminal NO_DATA, not a
+  failure. (#255)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its

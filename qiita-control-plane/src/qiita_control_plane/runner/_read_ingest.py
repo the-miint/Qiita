@@ -16,7 +16,8 @@ from qiita_common.backend_failure import StepNoData
 
 import qiita_control_plane.runner as _runner_pkg
 
-from ..auth.tickets import sign_action
+from ..auth.tickets import sign_action, sign_ticket
+from ..miint import connect_with_miint
 from ..repositories.block import fetch_mask_sample_state
 from ._upload import _submission_bad_input
 
@@ -40,12 +41,13 @@ _log = logging.getLogger(__name__)
 
 SAMPLE_MAP_BINDING = "sample_map"
 STAGED_READS_BINDING = "reads"
-# The MASKED sibling of `reads`: a workflow that consumes ready-for-consumption
-# reads (pacbio assembly) declares `masked_reads`, which the runner materializes
-# from the `read_masked` view's pass-set for a mask_idx. A DISTINCT name from
-# `reads` (raw) so the two never collide — read-mask workflows consume raw `reads`
-# to CREATE a mask; assembly workflows consume `masked_reads`.
-STAGED_MASKED_READS_BINDING = "masked_reads"
+# A workflow that consumes ready-for-consumption reads (assembly) declares
+# `masked_reads_fastq`; the runner STREAMS the `read_masked` pass-set for a
+# mask_idx from the data plane and writes it as gzip FASTQ (via miint's native
+# COPY FORMAT FASTQ). A DISTINCT name from raw `reads` so the two never collide —
+# read-mask workflows consume raw `reads` to CREATE a mask; assembly workflows
+# consume `masked_reads_fastq`.
+STAGED_MASKED_READS_BINDING = "masked_reads_fastq"
 READS_STAGING_ROOT_BINDING = "reads_staging_root"
 
 
@@ -165,12 +167,40 @@ def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str,
     return _do_action_export("export_read_block", data_plane_url, token)
 
 
-def _do_action_export_read_masked(data_plane_url: str, token: bytes) -> dict[str, Any]:
-    """`export_read_masked` DoAction: the data plane materializes ONE prep_sample's
-    `read_masked` pass-set (for a given mask_idx) into a per-ticket Parquet.
-    Isolated (thin wrapper over `_do_action_export`) so unit tests stub the real
-    call by name."""
-    return _do_action_export("export_read_masked", data_plane_url, token)
+def _sql_str_path(path: Path) -> str:
+    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
+    return str(path).replace("'", "''")
+
+
+def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest: Path) -> int:
+    """Stream one prep_sample's `read_masked` pass-set from the data plane and write
+    it as gzip FASTQ with miint's native `COPY … (FORMAT FASTQ)` — the EXACT
+    capability the admin masked-read export uses. The data plane STREAMS the rows
+    over a DoGet; it never writes a file, there is no intermediate Parquet, and no
+    hand-rolled FASTQ writer. Returns the FASTQ record count (0 ⇒ the mask filtered
+    everything out; the caller turns that into a terminal NO_DATA). Module-level so
+    unit tests stub it by name.
+
+    Single-pass over the stream: the DoGet reader is registered as `masked`, the
+    COPY consumes it, and `COPY … TO` returns the rows it wrote. Realigning the
+    incoming Flight buffers (DataTypeSpecific) mirrors the admin export — Acero
+    warns per-batch on the zero-copy gRPC buffers otherwise (apache/arrow#37195)."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+    import pyarrow.ipc as ipc  # noqa: PLC0415
+
+    read_opts = flight.FlightCallOptions(
+        read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
+    )
+    with flight.FlightClient(data_plane_url) as client, connect_with_miint() as con:
+        reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
+        con.register("masked", reader)
+        # Single-end long reads: sequence2/qual2 are NULL, so FORMAT FASTQ writes a
+        # single-end fastq. Column order is the one the miint writer requires.
+        (count,) = con.execute(
+            "COPY (SELECT read_id, sequence1, qual1, sequence2, qual2 FROM masked) "
+            f"TO '{_sql_str_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+        ).fetchone()
+    return int(count)
 
 
 async def _resolve_staged_reads(
@@ -255,24 +285,22 @@ async def _resolve_staged_masked_reads(
     hmac_secret: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
-    """Bind `masked_reads` to a prep_sample's MASKED read pass-set for a mask_idx —
-    the analog of `_resolve_staged_reads` for a workflow that consumes
-    ready-for-consumption reads (pacbio assembly) rather than raw reads.
+    """Bind `masked_reads_fastq` to a gzip FASTQ of a prep_sample's MASKED read
+    pass-set for a mask_idx — the reads a downstream assembler consumes.
 
-    Unlike `_resolve_staged_reads` there is NO durable fast-path copy: masking is
-    downstream state layered over the raw `read` table, so we always ask the data
-    plane to materialize the `read_masked` view's pass-set (host/human/QC-failing
-    rows excluded, recorded trims applied) for (mask_idx, prep_sample_idx) into a
-    per-ticket `masked_reads.parquet` via the `export_read_masked` DoAction (the
-    bulk read bytes never transit the control plane).
+    Reuses the EXISTING streaming masked-read capability (the admin masked-read
+    export): sign a `read_masked` DoGet ticket, STREAM the pass-set from the data
+    plane, and write FASTQ with miint's native `COPY … (FORMAT FASTQ)`. No bespoke
+    DoAction/payload, no intermediate Parquet, no hand-rolled FASTQ writer, and the
+    data plane never writes a file — it streams (`_stream_masked_reads_to_fastq`).
 
     First enforces the `mask_sample` completion gate: a block-masked sample whose
     covering block is still in flight would expose a PARTIAL pass-set, so it is
-    rejected (SUBMISSION/BAD_INPUT) rather than assembled — the same fail-closed
-    gate the admin masked-read export enforces. A fully-masked-out sample (0
-    passing reads) is a COMMON, expected outcome, NOT an error: it is a terminal
-    NO_DATA (logged; the outer handler transitions the ticket to NO_DATA). A data
-    plane that is unreachable / wrote no file is SUBMISSION/BAD_INPUT."""
+    rejected (SUBMISSION/BAD_INPUT) — the same fail-closed gate the admin export
+    enforces. A fully-masked-out sample (0 passing reads) is a COMMON, expected
+    outcome, not an error: it is a terminal NO_DATA (logged; the outer handler
+    transitions the ticket to NO_DATA). An unreachable data plane / no file written
+    is SUBMISSION/BAD_INPUT."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     # Completion gate: a non-completed `mask_sample` row means a covering block is
@@ -289,38 +317,38 @@ async def _resolve_staged_masked_reads(
             "Resubmit once reconcile marks the mask completed."
         )
 
-    workspace.mkdir(parents=True, exist_ok=True)
-    dest = workspace / "masked_reads.parquet"
-    token = sign_action(
-        action="export_read_masked",
-        payload={
-            "mask_idx": mask_idx,
-            "prep_sample_idx": prep_sample_idx,
-            "dest": str(dest),
-        },
+    # The SAME read_masked DoGet ticket the admin masked-read export mints — a
+    # generic ticket scoped to exactly (prep_sample_idx, mask_idx), no bespoke
+    # action or payload type.
+    ticket = sign_ticket(
+        table="read_masked",
+        filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
         secret=hmac_secret,
     )
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "masked_reads.fastq.gz"
     # Flight failure -> SUBMISSION BAD_INPUT like the other pre-loop resolvers
     # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
-    # stranding it in PROCESSING.
+    # stranding it in PROCESSING. The blocking stream+COPY runs off the event loop.
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._do_action_export_read_masked, data_plane_url, token
+        count = await asyncio.get_running_loop().run_in_executor(
+            None, _runner_pkg._stream_masked_reads_to_fastq, data_plane_url, ticket, dest
         )
     except Exception as exc:
         raise _submission_bad_input(
-            f"could not materialize masked reads for prep_sample {prep_sample_idx} "
+            f"could not stream masked reads for prep_sample {prep_sample_idx} "
             f"(mask_idx {mask_idx}) from the data plane: {type(exc).__name__}: {exc}"
         ) from exc
 
-    if result.get("count", 0) == 0:
-        # No reads pass this mask for this sample (the data plane writes no file for
-        # an empty result). This is COMMON — aggressive host/human filtering can
-        # legitimately remove everything — so it is a terminal NO_DATA outcome, not
-        # a failure. Logged here for operator visibility; the outer StepNoData
-        # handler transitions the ticket PROCESSING → NO_DATA.
+    if count == 0:
+        # No reads pass this mask for this sample. COMMON — aggressive host/human
+        # filtering can legitimately remove everything — so it is a terminal
+        # NO_DATA, not a failure. Remove the empty fastq the COPY may have created;
+        # log for operator visibility (the outer StepNoData handler moves the
+        # ticket PROCESSING → NO_DATA).
+        dest.unlink(missing_ok=True)
         _log.info(
-            "pacbio: no reads pass mask_idx %s for prep_sample %s — no data to assemble",
+            "assembly: no reads pass mask_idx %s for prep_sample %s — no data to assemble",
             mask_idx,
             prep_sample_idx,
         )
@@ -332,8 +360,8 @@ async def _resolve_staged_masked_reads(
         )
     if not dest.exists():
         raise _submission_bad_input(
-            f"the data plane reported masked reads for prep_sample {prep_sample_idx} "
-            f"(mask_idx {mask_idx}) but wrote no file at {dest}"
+            f"streamed {count} masked reads for prep_sample {prep_sample_idx} "
+            f"(mask_idx {mask_idx}) but no fastq landed at {dest}"
         )
     return {STAGED_MASKED_READS_BINDING: dest}
 

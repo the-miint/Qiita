@@ -13,7 +13,7 @@
 source /opt/qiita/_lib.sh
 
 GENOMES_DIR="$(qiita_input genomes_dir)"
-READS_FASTQ="$(qiita_input reads_fastq)"
+READS_FASTQ="$(qiita_input masked_reads_fastq)"
 NOLCG="${GENOMES_DIR}/noLCG.fa"
 OUT="${QIITA_OUTPUT_PATH}/bins"
 mkdir -p "${OUT}"

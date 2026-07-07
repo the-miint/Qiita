@@ -8,7 +8,7 @@
 # pacbio_ingest turns the all-empty result into StepNoData.
 source /opt/qiita/_lib.sh
 
-READS_FASTQ="$(qiita_input reads_fastq)"
+READS_FASTQ="$(qiita_input masked_reads_fastq)"
 RUN_CONFIG="$(qiita_input run_config)"
 ASSEMBLER="$(jq -er '.assembler' "${RUN_CONFIG}")"
 

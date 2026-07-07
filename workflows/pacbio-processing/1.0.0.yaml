@@ -8,11 +8,13 @@ target_kind: prep_sample
 
 description: >
   Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
-  PacBio HiFi long reads (a port of qp-pacbio pipeline B). The runner materializes
-  the prep_sample's masked reads (the read_masked pass-set for `mask_idx`:
-  host/human/QC-failing reads excluded, recorded trims applied) into a per-ticket
-  reads.parquet; the native `pacbio_export_reads` step converts that to FASTQ and
-  records the chosen assembler. Four container steps then run the heavy tools —
+  PacBio HiFi long reads (a port of qp-pacbio pipeline B). The runner STREAMS the
+  prep_sample's masked reads (the read_masked pass-set for `mask_idx`:
+  host/human/QC-failing reads excluded, recorded trims applied) from the data
+  plane straight to a gzip FASTQ (`masked_reads_fastq`) via miint's native
+  COPY FORMAT FASTQ — no intermediate Parquet; the native `pacbio_export_reads`
+  step only records the chosen assembler. Four container steps then run the heavy
+  tools —
   `assemble` (hifiasm_meta → circular LCG genomes + noLCG contigs), `binning`
   (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
   and `checkm` (per-MAG completeness/contamination). The native `pacbio_ingest`
@@ -37,9 +39,10 @@ context_schema:
   required: [mask_idx]
   properties:
     # The CP-minted filtering-config identity whose pass-set to assemble. The
-    # runner resolves it into the masked reads.parquet via the data-plane
-    # export_read_masked DoAction (mirrors how read-mask consumers thread
-    # mask_idx). Without it there is no way to select WHICH mask's reads to use.
+    # runner signs a read_masked DoGet ticket scoped to (prep_sample_idx, mask_idx)
+    # and STREAMS that pass-set into a FASTQ (the same capability the admin
+    # masked-read export uses). Without it there is no way to select WHICH mask's
+    # reads to use.
     mask_idx:
       type: integer
       minimum: 1
@@ -55,20 +58,20 @@ context_schema:
 
 steps:
   # Convert the runner-materialized masked reads.parquet → reads.fastq.gz and
-  # record the assembler in run_config.json. `masked_reads` is the staged-reads
-  # binding's masked variant: the runner resolves it from the read_masked
-  # pass-set for the action_context `mask_idx` via export_read_masked. Native: a
-  # scalar param (assembler) is native-only, and parquet→fastq needs no container.
+  # Emit run_config.json (the chosen assembler). The masked reads are STREAMED to
+  # `masked_reads_fastq` by the runner (the read_masked DoGet + miint COPY FORMAT
+  # FASTQ, keyed off the action_context `mask_idx`) — a runner-produced binding, so
+  # no step reads them here. This native step only carries the `assembler` scalar
+  # (native-only) into a file the assemble container reads with jq.
   - step: pacbio_export_reads
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.pacbio_export_reads
-    inputs: [masked_reads]
     params: {assembler: assembler}
-    outputs: [reads_fastq, run_config]
+    outputs: [run_config]
     baseline_resources:
-      cpu: 2
-      mem_gb: 8
-      walltime: PT2H
+      cpu: 1
+      mem_gb: 2
+      walltime: PT10M
 
   # hifiasm_meta assembly + circular-genome extraction. Reads run_config.json to
   # pick the assembler; emits genomes_dir/{LCG/*.fna, noLCG.fa}. 0 contigs is a
@@ -77,7 +80,7 @@ steps:
     step_type: singleton
     container: pacbio-processing-1.0.0.sif
     entrypoint: /opt/qiita/assemble.sh
-    inputs: [reads_fastq, run_config]
+    inputs: [masked_reads_fastq, run_config]
     outputs: [genomes_dir]
     baseline_resources:
       cpu: 32
@@ -90,7 +93,7 @@ steps:
     step_type: singleton
     container: pacbio-processing-1.0.0.sif
     entrypoint: /opt/qiita/binning.sh
-    inputs: [genomes_dir, reads_fastq]
+    inputs: [genomes_dir, masked_reads_fastq]
     outputs: [bins_dir]
     baseline_resources:
       cpu: 16

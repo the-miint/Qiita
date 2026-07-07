@@ -223,9 +223,9 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 ///   double-registration.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` — logical DELETEs; re-running deletes zero rows.
-/// - `export_read` / `export_read_block` / `export_read_masked` —
-///   re-materialize the same sample/block/mask bytes to the same ticket path via
-///   atomic publish; a replay reproduces identical output.
+/// - `export_read` / `export_read_block` — re-materialize the same sample/block
+///   bytes to the same ticket path via atomic publish; a replay reproduces
+///   identical output.
 /// - `count_masked` / `mask_metrics` — read-only aggregates.
 ///
 /// The `do_action` dispatcher rejects any action not in this set, so a **new**
@@ -241,7 +241,6 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_read_mask_block",
     "export_read",
     "export_read_block",
-    "export_read_masked",
     "count_masked",
     "mask_metrics",
 ];
@@ -634,58 +633,6 @@ impl FlightService for QiitaFlightService {
                 .await
                 .map_err(|e| {
                     Status::internal(format!("export_read_block task join failed: {e}"))
-                })??;
-
-                let result_body = serde_json::to_vec(&serde_json::json!({
-                    "count": count,
-                    "dest": payload.dest,
-                }))
-                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-                let result = arrow_flight::Result {
-                    body: result_body.into(),
-                };
-                let output = stream::once(futures::future::ready(Ok(result)));
-                Ok(Response::new(Box::pin(output)))
-            }
-            "export_read_masked" => {
-                let payload = auth::verify_export_read_masked(&action.body, &self.hmac_secret)
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-                if payload.action != "export_read_masked" {
-                    return Err(Status::invalid_argument(format!(
-                        "action type mismatch: header says 'export_read_masked', payload says {:?}",
-                        payload.action
-                    )));
-                }
-
-                // Defense in depth on the HMAC-trusted destination before it is
-                // inlined into a DuckDB `COPY ... TO` literal and written to.
-                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
-
-                // `COPY` is synchronous and, for a whole sample's pass-set,
-                // long-lived — run it on the blocking pool so it never starves a
-                // tonic async worker. The closure opens and drops its own
-                // connection, so it is Send and crosses no await (mirrors
-                // `export_read`).
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
-                let scratch_root = self.scratch_root.clone();
-                let mask = payload.mask_idx;
-                let prep = payload.prep_sample_idx;
-                let count = tokio::task::spawn_blocking(move || {
-                    export_read_masked_to_parquet(
-                        &catalog,
-                        &data_path,
-                        mask,
-                        prep,
-                        &dest,
-                        &scratch_root,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("export_read_masked task join failed: {e}"))
                 })??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
@@ -1197,22 +1144,13 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// `dest`, filtered by the caller-supplied `where_clause` (an already-safe SQL
 /// predicate — HMAC-verified inlined integers only). Returns the row count.
 ///
-/// The projection every read export writes, in `read`-table column order, so the
-/// file is a drop-in for the durable staging copy. `export_read_masked` selects
-/// the SAME columns from the `read_masked` view (which exposes exactly these plus
-/// `mask_idx`), so all three exports produce an identical output schema.
-const READ_EXPORT_COLUMNS: &str =
-    "prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2";
-
 /// Shared machinery for the read-export DoActions: `export_read` (one whole
-/// sample), `export_read_block` (the union of a block's `(prep_sample,
-/// sub-range)` members), and `export_read_masked` (one sample's mask pass-set).
-/// The caller passes the full inner `SELECT ... FROM ... WHERE ...`; this handles
-/// the atomic, symlink-safe publish. An empty selection writes NO file and
-/// returns 0 — the control plane turns that into a clean submission failure. The
-/// `COPY` streams row groups to disk, so memory stays bounded regardless of
-/// selection size. Opens and drops its own connection so the caller can run it on
-/// the blocking pool (mirrors `register_files`).
+/// sample) and `export_read_block` (the union of a block's `(prep_sample,
+/// sub-range)` members). An empty selection writes NO file and returns 0 — the
+/// control plane turns that into a clean submission failure. The `COPY` streams
+/// row groups to disk, so memory stays bounded regardless of selection size.
+/// Opens and drops its own connection so the caller can run it on the blocking
+/// pool (mirrors `register_files`).
 ///
 /// `dest` arrives already lexically validated (`validate_export_dest`), but this
 /// is human-read data, so we ALSO resolve symlinks: another job on the shared
@@ -1224,10 +1162,10 @@ const READ_EXPORT_COLUMNS: &str =
 /// `reads.parquet` a retry could read. The row count is read back from the
 /// written file, so it always matches the bytes on disk (no separate catalog
 /// scan that could race the `COPY`).
-fn export_read_select_to_parquet(
+fn export_read_where_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
-    select_sql: &str,
+    where_clause: &str,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
@@ -1271,11 +1209,10 @@ fn export_read_select_to_parquet(
 
     // Write to a sibling temp, then publish atomically. `dest` is validated
     // (absolute, under the scratch root, no `..`, no single quote) and the
-    // `.partial` suffix preserves all of that; `select_sql` carries only
-    // HMAC-verified inlined integers over the fixed READ_EXPORT_COLUMNS
-    // projection — all safe to inline. That projection is the full `read` schema
-    // in table order, so the file is a drop-in for the durable staging copy
-    // (modulo row order, which does not matter).
+    // `.partial` suffix preserves all of that; the `where_clause` carries only
+    // HMAC-verified inlined integers — all safe to inline. The column list is
+    // the full `read` schema in table order, so the file is a drop-in for the
+    // durable staging copy (modulo row order, which does not matter).
     let tmp = {
         let mut s = dest.as_os_str().to_os_string();
         s.push(".partial");
@@ -1284,7 +1221,11 @@ fn export_read_select_to_parquet(
     let tmp_sql = tmp
         .to_str()
         .ok_or_else(|| Status::internal(format!("non-UTF-8 dest path: {}", tmp.display())))?;
-    let copy_sql = format!("COPY ({select_sql}) TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})");
+    let copy_sql = format!(
+        "COPY (SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2 \
+         FROM qiita_lake.read WHERE {where_clause}) \
+         TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})"
+    );
 
     // The fallible sequence is isolated so the temp file is cleaned up on the
     // empty path (count 0) and on any error; on success it is renamed away.
@@ -1328,7 +1269,7 @@ fn export_read_select_to_parquet(
 /// Re-materialize one prep_sample's reads into a per-ticket `reads.parquet` a
 /// read-mask job consumes (the per-sample export). A sample with no stored reads
 /// writes NO file and returns 0. `prep_sample_idx` is an HMAC-verified i64, safe
-/// to inline. See `export_read_select_to_parquet` for the shared write/publish.
+/// to inline. See `export_read_where_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
@@ -1336,40 +1277,10 @@ fn export_read_to_parquet(
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
-    export_read_select_to_parquet(
+    export_read_where_to_parquet(
         catalog_connstr,
         data_path,
-        &format!(
-            "SELECT {READ_EXPORT_COLUMNS} FROM qiita_lake.read \
-             WHERE prep_sample_idx = {prep_sample_idx}"
-        ),
-        dest,
-        scratch_root,
-    )
-}
-
-/// Re-materialize one prep_sample's MASKED reads — the `read_masked` view's
-/// pass-set for a given `mask_idx` (host/human/QC-failing rows excluded, recorded
-/// trims applied) — into a per-ticket `reads.parquet` the pacbio-processing
-/// assembly step consumes. A sample with no passing reads under that mask writes
-/// NO file and returns 0. `mask_idx`/`prep_sample_idx` are HMAC-verified i64s,
-/// safe to inline. Output schema matches `export_read` (READ_EXPORT_COLUMNS), so
-/// it is a drop-in for every read consumer.
-fn export_read_masked_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
-    mask_idx: i64,
-    prep_sample_idx: i64,
-    dest: &Path,
-    scratch_root: &Path,
-) -> Result<i64, Status> {
-    export_read_select_to_parquet(
-        catalog_connstr,
-        data_path,
-        &format!(
-            "SELECT {READ_EXPORT_COLUMNS} FROM qiita_lake.read_masked \
-             WHERE mask_idx = {mask_idx} AND prep_sample_idx = {prep_sample_idx}"
-        ),
+        &format!("prep_sample_idx = {prep_sample_idx}"),
         dest,
         scratch_root,
     )
@@ -1403,10 +1314,10 @@ fn export_read_block_to_parquet(
         return Ok(0);
     }
     let where_clause = block_read_where_clause(members);
-    export_read_select_to_parquet(
+    export_read_where_to_parquet(
         catalog_connstr,
         data_path,
-        &format!("SELECT {READ_EXPORT_COLUMNS} FROM qiita_lake.read WHERE {where_clause}"),
+        &where_clause,
         dest,
         scratch_root,
     )

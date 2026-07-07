@@ -193,7 +193,7 @@ def test_workflow_needs_staged_reads_gate():
 
 # --- masked-read resolver (_resolve_staged_masked_reads) -------------------
 
-_EXPORT_READ_MASKED = "qiita_control_plane.runner._do_action_export_read_masked"
+_STREAM_MASKED = "qiita_control_plane.runner._stream_masked_reads_to_fastq"
 
 
 class _FakePool:
@@ -207,10 +207,23 @@ class _FakePool:
         return self._gate_state
 
 
+def _run_masked(pool, prep_sample_idx, workspace, mask_idx=77):
+    return asyncio.run(
+        _resolve_staged_masked_reads(
+            pool,
+            {"prep_sample_idx": prep_sample_idx},
+            mask_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=workspace,
+        )
+    )
+
+
 def test_workflow_needs_staged_masked_reads_gate():
-    """`masked_reads` consumed but not produced → needs the masked staged binding
-    (pacbio-processing). The raw-`reads` gate must NOT fire on it, and vice-versa."""
-    pacbio = [_step(inputs=["masked_reads"], outputs=["reads_fastq"])]
+    """`masked_reads_fastq` consumed but not produced → needs the masked staged
+    binding (assembly). The raw-`reads` gate must NOT fire on it, and vice-versa."""
+    pacbio = [_step(inputs=["masked_reads_fastq"], outputs=["genomes_dir"])]
     assert _workflow_needs_staged_masked_reads(pacbio) is True
     assert _workflow_needs_staged_reads(pacbio) is False
 
@@ -218,88 +231,61 @@ def test_workflow_needs_staged_masked_reads_gate():
     assert _workflow_needs_staged_masked_reads(raw) is False
 
 
-def test_resolve_staged_masked_reads_binds_workspace_parquet_and_signs(tmp_path, monkeypatch):
-    """No gate row + count>0: the data-plane `export_read_masked` action writes the
-    per-ticket masked_reads.parquet, which `masked_reads` binds to."""
+def test_resolve_staged_masked_reads_streams_fastq_and_binds(tmp_path, monkeypatch):
+    """No gate row + count>0: the runner streams read_masked to a gzip FASTQ (miint
+    COPY FORMAT FASTQ), which `masked_reads_fastq` binds to. No parquet, no
+    DoAction."""
     workspace = tmp_path / "ticket" / "804"
-    dest = workspace / "masked_reads.parquet"
+    dest = workspace / "masked_reads.fastq.gz"
 
-    def _fake_export(_url, _token):
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text("parquet-bytes")
-        return {"count": 9, "dest": str(dest)}
+    def _fake_stream(_url, _ticket, out):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("fastq-bytes")
+        return 9
 
-    monkeypatch.setattr(_EXPORT_READ_MASKED, _fake_export)
+    monkeypatch.setattr(_STREAM_MASKED, _fake_stream)
 
-    bound = asyncio.run(
-        _resolve_staged_masked_reads(
-            _FakePool(),
-            {"prep_sample_idx": 42},
-            77,
-            data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
-            workspace=workspace,
-        )
-    )
+    bound = _run_masked(_FakePool(), 42, workspace)
     assert bound[STAGED_MASKED_READS_BINDING] == dest
     assert dest.exists()
 
 
 def test_resolve_staged_masked_reads_incomplete_mask_is_bad_input(tmp_path, monkeypatch):
     """A mask_sample gate row that is not 'completed' (a covering block still
-    masking) → BAD_INPUT before any export — never assemble a partial pass-set."""
-    monkeypatch.setattr(_EXPORT_READ_MASKED, lambda _u, _t: pytest.fail("must not export"))
+    masking) → BAD_INPUT before any stream — never assemble a partial pass-set."""
+    monkeypatch.setattr(_STREAM_MASKED, lambda _u, _t, _d: pytest.fail("must not stream"))
     with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_masked_reads(
-                _FakePool("processing"),
-                {"prep_sample_idx": 7},
-                77,
-                data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
-                workspace=tmp_path / "ws",
-            )
-        )
+        _run_masked(_FakePool("processing"), 7, tmp_path / "ws")
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "not completed" in exc.value.reason
 
 
-def test_resolve_staged_masked_reads_empty_export_is_no_data(tmp_path, monkeypatch):
+def test_resolve_staged_masked_reads_empty_stream_is_no_data(tmp_path, monkeypatch):
     """0 passing reads under the mask is a COMMON outcome (heavy filtering removed
-    everything) → terminal StepNoData, NOT a failure."""
-    monkeypatch.setattr(_EXPORT_READ_MASKED, lambda _u, _t: {"count": 0, "dest": "x"})
+    everything) → terminal StepNoData, NOT a failure; the empty fastq is removed."""
+    workspace = tmp_path / "ws"
+
+    def _fake_stream(_url, _ticket, out):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("")  # COPY may create an empty file
+        return 0
+
+    monkeypatch.setattr(_STREAM_MASKED, _fake_stream)
     with pytest.raises(StepNoData) as exc:
-        asyncio.run(
-            _resolve_staged_masked_reads(
-                _FakePool(),
-                {"prep_sample_idx": 7},
-                77,
-                data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
-                workspace=tmp_path / "ws",
-            )
-        )
+        _run_masked(_FakePool(), 7, workspace)
     assert "nothing to assemble" in exc.value.reason
+    assert not (workspace / "masked_reads.fastq.gz").exists()
 
 
-def test_resolve_staged_masked_reads_export_failure_is_bad_input(tmp_path, monkeypatch):
-    """A Flight failure is wrapped as BAD_INPUT (never an untyped exception)."""
+def test_resolve_staged_masked_reads_stream_failure_is_bad_input(tmp_path, monkeypatch):
+    """A Flight/stream failure is wrapped as BAD_INPUT (never an untyped exception)."""
 
-    def _boom(_url, _token):
+    def _boom(_url, _ticket, _dest):
         raise RuntimeError("Flight: connection refused")
 
-    monkeypatch.setattr(_EXPORT_READ_MASKED, _boom)
+    monkeypatch.setattr(_STREAM_MASKED, _boom)
     with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_masked_reads(
-                _FakePool(),
-                {"prep_sample_idx": 7},
-                77,
-                data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
-                workspace=tmp_path / "ws",
-            )
-        )
+        _run_masked(_FakePool(), 7, tmp_path / "ws")
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "data plane" in exc.value.reason
 
