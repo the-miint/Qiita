@@ -272,7 +272,7 @@ def test_bin_quality_without_das_scores_is_null(tmp_path, staging_inputs):
         tmp_path,
         staging_inputs,
         checkm_rows=[("bin.1", "k__Bacteria", 95.5, 1.2, 0.0, 10000, 2)],
-        das_rows=None,  # no das_tool_scores.tsv
+        das_rows=None,  # no das_tool_summary.tsv
     )
     out = _run(inputs, tmp_path / "ws")
     pq = out["staging_dir"] / "bin_quality.parquet"

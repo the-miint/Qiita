@@ -46,7 +46,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   KNOWN FOLLOW-UP: wiring the bind-mount + `CHECKM_DATA_PATH` into the container
   step (the orchestrator binds only declared step inputs today) lands separately.
   Until then the `checkm` step **degrades gracefully** — it detects the missing DB,
-  logs a loud warning, and emits an empty `checkm_quality.tsv` — so MAG-producing
+  logs a loud warning, and leaves `checkm_dir` empty (assembly_load then writes
+  `bin_quality` empty) — so MAG-producing
   samples still complete and their genome SEQUENCES store; only per-MAG **quality**
   is uncaptured until the DB + bind are in place (re-running then backfills it).
   assemble/binning/bin_refine are unaffected.

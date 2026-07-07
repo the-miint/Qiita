@@ -117,8 +117,8 @@ steps:
       mem_gb: 32
       walltime: PT4H
 
-  # CheckM lineage_wf + qa -o 2 over the refined MAGs → normalized
-  # checkm_quality.tsv. Empty input → empty checkm_dir (exit 0).
+  # CheckM lineage_wf + qa -o 2 over the refined MAGs → raw lineage.tsv + qa.tsv
+  # (assembly_load joins them in DuckDB). Empty input → empty checkm_dir (exit 0).
   - step: checkm
     step_type: singleton
     container: pacbio-processing-1.0.0.sif

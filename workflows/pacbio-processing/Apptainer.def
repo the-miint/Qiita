@@ -12,10 +12,14 @@ From: mambaorg/micromamba:1.5.8
 # native install to trim the image.
 #
 # BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
-# bioconda package pins and a few tool-output field names (hifiasm-meta's GFA
-# circular-contig marker, the DAS_Tool summary / CheckM qa column headers the
-# entrypoints normalize) must be verified on the first Linux build
-# (`make test-workflows` / the deploy's build-sifs.sh).
+# bioconda package pins and a few tool-output field names must be verified on the
+# first Linux build (`make test-workflows` / the deploy's build-sifs.sh). The
+# entrypoints now emit the tools' RAW tables verbatim (no column normalization);
+# the field names are consumed downstream by `assembly_load` with DuckDB — the
+# hifiasm-meta GFA circular-contig `[lc]` name suffix (assemble.sh), the DAS_Tool
+# summary columns `bin`/`bin_score`/`bin_set`, and the CheckM `--tab_table` headers
+# `"Bin Id"`/`"Genome size (bp)"`/`"# contigs"` (assembly_load) — pinned against
+# hifiasm-meta / DAS_Tool 1.1.x / CheckM 1.x source; re-confirm against real output.
 
 %labels
     workflow pacbio-processing
