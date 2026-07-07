@@ -223,50 +223,66 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// Create the assembled_genome + genome_quality tables in DuckLake.
+/// Create the assembly-result tables in DuckLake — the assembly analogue of the
+/// reference-sequence tables, following the SAME chunked + content-hashed model.
 ///
-/// These hold per-sample metagenome-assembly results from the pacbio-processing
-/// workflow: assembled genome sequences (circular LCG genomes + refined MAG
-/// bins) and their CheckM quality metrics. Keyed by the CP-minted
-/// `prep_sample_idx` — the key a later cross-sample merge selects on to gather
-/// many samples' genomes (across preps/studies) into one dereplicated set.
+/// A contig is stored ONCE, deduped by content hash and keyed by the CP-minted
+/// `feature_idx` (the shared `qiita.feature` space, minted via `mint-features`),
+/// exactly like a reference sequence. The bytes are 64 KB chunks (reassemble via
+/// `string_agg(chunk_data, '' ORDER BY chunk_index)`), never a bulk VARCHAR cell.
+/// `assembly_membership` records which features a prep_sample's assembly contains
+/// and in which bin (a circular LCG genome or a refined MAG) — the DuckLake copy
+/// of `qiita.assembly_membership`, for bulk joins against the sequences.
+/// `bin_quality` is per-MAG CheckM, joined to its contigs via assembly_membership
+/// on (prep_sample_idx, kind, bin_id).
 ///
-/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK.
-/// A "genome" (one circular LCG genome or one MAG bin) is the group of contig
-/// rows sharing (prep_sample_idx, kind, genome_local_id); `genome_local_id` is
-/// unique within a sample, so a merge can namespace it globally as
-/// `<prep_sample_idx>_<genome_local_id>`.
+/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
+/// (integrity is enforced upstream — the CP mints feature_idx/dedups on
+/// sequence_hash, the orchestrator verifies before load).
 ///
 /// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
 /// register_files loads them and they are SQL-queryable in the catalog; external
 /// Flight read-back is added when the cross-sample merge stage lands.
-pub fn ensure_genome_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
-        "-- One row per assembled contig. A genome (a circular LCG genome or a
-        -- refined MAG bin) is the set of rows sharing
-        -- (prep_sample_idx, kind, genome_local_id). kind is 'LCG' | 'MAG'.
-        -- `sequence` holds the whole contig; length_bp is a convenience/prune
-        -- column. `assembler` records which step-1 tool produced it (provenance).
-        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_genome (
-            prep_sample_idx BIGINT NOT NULL,
-            kind VARCHAR NOT NULL,
-            genome_local_id VARCHAR NOT NULL,
-            contig_id VARCHAR NOT NULL,
-            sequence VARCHAR NOT NULL,
-            length_bp BIGINT NOT NULL,
-            assembler VARCHAR NOT NULL
+        "-- One row per UNIQUE contig (content-hash deduped), keyed by the minted
+        -- feature_idx. Mirrors reference_sequences: sequence_length_bp lives here
+        -- (kept for coverage), the bytes live in the chunks table.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_sequence (
+            feature_idx BIGINT NOT NULL,
+            sequence_hash UUID NOT NULL,
+            sequence_length_bp BIGINT NOT NULL
         );
 
-        -- One row per MAG (CheckM quality). LCG quality is (re)computed later in
-        -- the cross-sample merge, so `kind` is 'MAG' here. completeness /
-        -- contamination / strain_heterogeneity + marker_lineage come from
-        -- `checkm lineage_wf --tab_table`; genome_size / n_contigs from
-        -- `checkm qa -o 2` (NOT emitted by --tab_table); das_tool_score /
-        -- source_binner are provenance carried over from DAS_Tool.
-        CREATE TABLE IF NOT EXISTS qiita_lake.genome_quality (
+        -- The contig bytes in 64 KB chunks (reassemble with
+        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
+        -- reference_sequence_chunks; loaded multi-file (a <table>/ subdir of parts)
+        -- so a large assembly never OOMs a single-file sort+write.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_sequence_chunks (
+            feature_idx BIGINT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_data VARCHAR NOT NULL
+        );
+
+        -- Which features a prep_sample's assembly contains, and in which bin.
+        -- kind is 'LCG' | 'MAG' (value set owned by the producer). The DuckLake
+        -- copy of qiita.assembly_membership for bulk joins with the sequences.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             kind VARCHAR NOT NULL,
-            genome_local_id VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            feature_idx BIGINT NOT NULL
+        );
+
+        -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on
+        -- (prep_sample_idx, kind, bin_id). completeness / contamination /
+        -- strain_heterogeneity + marker_lineage from `checkm lineage_wf
+        -- --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
+        -- das_tool_score / source_binner are DAS_Tool provenance.
+        CREATE TABLE IF NOT EXISTS qiita_lake.bin_quality (
+            prep_sample_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
             marker_lineage VARCHAR,
             completeness DOUBLE,
             contamination DOUBLE,
@@ -496,14 +512,19 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
-    fn ensure_genome_tables_is_idempotent() {
+    fn ensure_assembly_tables_is_idempotent() {
         // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
-        // EXISTS), and both tables must exist and be queryable afterwards.
+        // EXISTS), and every table must exist and be queryable afterwards.
         let conn = setup_conn();
-        ensure_genome_tables(&conn).expect("first ensure_genome_tables");
-        ensure_genome_tables(&conn).expect("second ensure_genome_tables (idempotent)");
+        ensure_assembly_tables(&conn).expect("first ensure_assembly_tables");
+        ensure_assembly_tables(&conn).expect("second ensure_assembly_tables (idempotent)");
 
-        for table in ["assembled_genome", "genome_quality"] {
+        for table in [
+            "assembled_sequence",
+            "assembled_sequence_chunks",
+            "assembly_membership",
+            "bin_quality",
+        ] {
             // table is a &'static str literal, so the format! is injection-safe
             // (test-only pattern; see Cleanup above).
             let sql = format!(
