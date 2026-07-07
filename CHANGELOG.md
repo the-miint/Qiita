@@ -1203,6 +1203,21 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **Reference-load's sequence-chunk re-key no longer sorts `chunk_data` (fixes a
+  GG2-scale OOM).** `_write_reference_sequence_chunks` re-keyed hash → feature_idx
+  by materializing each batch and sorting it `ORDER BY feature_idx, chunk_index` —
+  putting the 64 KB `chunk_data` rows through a sort, the exact anti-pattern
+  `hash_sequences` was built to avoid when writing the same table shape upstream.
+  The parallel sort's working set ballooned far past the batched input and OOM'd
+  DuckDB at genome scale (a sort can't spill rows that fat). It now writes each part
+  with a SINGLE streaming COPY — the narrow per-batch `feature_map` subset is the
+  hash-join build side and `chunk_data` rides the probe straight to the writer,
+  never buffered into a build or a sort (peak ~1 GB/thread, constant in file size).
+  File-level DuckLake pruning is preserved by bin-packing features into disjoint,
+  contiguous feature_idx ranges (one per part); the within-part sort is dropped
+  (on-disk order isn't load-bearing — reassembly sorts `chunk_index` in memory and
+  DoGet filters by feature_idx), and `_CHUNK_BUDGET_PER_BATCH` drops 50k→10k to keep
+  the per-part ranges narrow for pruning. (#reference-support)
 - The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)
