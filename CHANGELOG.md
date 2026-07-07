@@ -41,7 +41,11 @@ the `no-changelog` label).
   symlink-safe publish path. Added to `REPLAY_SAFE_ACTIONS`. The control-plane
   runner binds it to a workflow's `masked_reads` input via
   `_resolve_staged_masked_reads`, keyed off the action_context `mask_idx` (a
-  distinct binding from raw `reads`, which read-mask workflows consume). (#255)
+  distinct binding from raw `reads`, which read-mask workflows consume). The
+  resolver enforces the `mask_sample` completion gate — a partially-masked
+  block sample is rejected rather than assembled from a partial pass-set — and
+  treats a fully-masked-out sample (0 passing reads, a common outcome) as a
+  terminal NO_DATA, not a failure. (#255)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its

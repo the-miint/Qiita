@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import duckdb
 import pytest
 from qiita_common.api_paths import compute_reads_staging_path
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
@@ -196,6 +196,17 @@ def test_workflow_needs_staged_reads_gate():
 _EXPORT_READ_MASKED = "qiita_control_plane.runner._do_action_export_read_masked"
 
 
+class _FakePool:
+    """Minimal asyncpg.Pool stand-in: `fetchval` returns a fixed mask_sample
+    gate state (None = no gate row = allowed)."""
+
+    def __init__(self, gate_state: str | None = None):
+        self._gate_state = gate_state
+
+    async def fetchval(self, *_args, **_kwargs):
+        return self._gate_state
+
+
 def test_workflow_needs_staged_masked_reads_gate():
     """`masked_reads` consumed but not produced → needs the masked staged binding
     (pacbio-processing). The raw-`reads` gate must NOT fire on it, and vice-versa."""
@@ -208,8 +219,8 @@ def test_workflow_needs_staged_masked_reads_gate():
 
 
 def test_resolve_staged_masked_reads_binds_workspace_parquet_and_signs(tmp_path, monkeypatch):
-    """The data-plane `export_read_masked` action writes the per-ticket
-    masked_reads.parquet, which `masked_reads` binds to. No durable fast-path."""
+    """No gate row + count>0: the data-plane `export_read_masked` action writes the
+    per-ticket masked_reads.parquet, which `masked_reads` binds to."""
     workspace = tmp_path / "ticket" / "804"
     dest = workspace / "masked_reads.parquet"
 
@@ -222,6 +233,7 @@ def test_resolve_staged_masked_reads_binds_workspace_parquet_and_signs(tmp_path,
 
     bound = asyncio.run(
         _resolve_staged_masked_reads(
+            _FakePool(),
             {"prep_sample_idx": 42},
             77,
             data_plane_url="grpc://unused",
@@ -233,12 +245,14 @@ def test_resolve_staged_masked_reads_binds_workspace_parquet_and_signs(tmp_path,
     assert dest.exists()
 
 
-def test_resolve_staged_masked_reads_empty_export_fails_nothing_to_assemble(tmp_path, monkeypatch):
-    """0 passing reads under the mask → BAD_INPUT 'nothing to assemble'."""
-    monkeypatch.setattr(_EXPORT_READ_MASKED, lambda _u, _t: {"count": 0, "dest": "x"})
+def test_resolve_staged_masked_reads_incomplete_mask_is_bad_input(tmp_path, monkeypatch):
+    """A mask_sample gate row that is not 'completed' (a covering block still
+    masking) → BAD_INPUT before any export — never assemble a partial pass-set."""
+    monkeypatch.setattr(_EXPORT_READ_MASKED, lambda _u, _t: pytest.fail("must not export"))
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_masked_reads(
+                _FakePool("processing"),
                 {"prep_sample_idx": 7},
                 77,
                 data_plane_url="grpc://unused",
@@ -247,6 +261,24 @@ def test_resolve_staged_masked_reads_empty_export_fails_nothing_to_assemble(tmp_
             )
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "not completed" in exc.value.reason
+
+
+def test_resolve_staged_masked_reads_empty_export_is_no_data(tmp_path, monkeypatch):
+    """0 passing reads under the mask is a COMMON outcome (heavy filtering removed
+    everything) → terminal StepNoData, NOT a failure."""
+    monkeypatch.setattr(_EXPORT_READ_MASKED, lambda _u, _t: {"count": 0, "dest": "x"})
+    with pytest.raises(StepNoData) as exc:
+        asyncio.run(
+            _resolve_staged_masked_reads(
+                _FakePool(),
+                {"prep_sample_idx": 7},
+                77,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
     assert "nothing to assemble" in exc.value.reason
 
 
@@ -260,6 +292,7 @@ def test_resolve_staged_masked_reads_export_failure_is_bad_input(tmp_path, monke
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_masked_reads(
+                _FakePool(),
                 {"prep_sample_idx": 7},
                 77,
                 data_plane_url="grpc://unused",

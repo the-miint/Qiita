@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
+from qiita_common.backend_failure import StepNoData
 
 import qiita_control_plane.runner as _runner_pkg
 
 from ..auth.tickets import sign_action
+from ..repositories.block import fetch_mask_sample_state
 from ._upload import _submission_bad_input
+
+_log = logging.getLogger(__name__)
 
 # =============================================================================
 # Read ingest + staged-read bindings
@@ -241,6 +247,7 @@ async def _resolve_staged_reads(
 
 
 async def _resolve_staged_masked_reads(
+    pool: asyncpg.Pool,
     scope_target: dict[str, Any],
     mask_idx: int,
     *,
@@ -259,9 +266,28 @@ async def _resolve_staged_masked_reads(
     per-ticket `masked_reads.parquet` via the `export_read_masked` DoAction (the
     bulk read bytes never transit the control plane).
 
-    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if no reads pass the
-    mask — nothing to assemble — or the data plane is unreachable."""
+    First enforces the `mask_sample` completion gate: a block-masked sample whose
+    covering block is still in flight would expose a PARTIAL pass-set, so it is
+    rejected (SUBMISSION/BAD_INPUT) rather than assembled — the same fail-closed
+    gate the admin masked-read export enforces. A fully-masked-out sample (0
+    passing reads) is a COMMON, expected outcome, NOT an error: it is a terminal
+    NO_DATA (logged; the outer handler transitions the ticket to NO_DATA). A data
+    plane that is unreachable / wrote no file is SUBMISSION/BAD_INPUT."""
     prep_sample_idx = scope_target["prep_sample_idx"]
+
+    # Completion gate: a non-completed `mask_sample` row means a covering block is
+    # still masking this sample, so read_masked would expose only a partial
+    # pass-set. Reject rather than assemble partial reads. No gate row (the
+    # per-sample read-mask path) ⇒ allowed. Mirrors routes/admin masked-export.
+    gate_state = await fetch_mask_sample_state(
+        pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
+    )
+    if gate_state is not None and gate_state != "completed":
+        raise _submission_bad_input(
+            f"mask_idx {mask_idx} is not completed for prep_sample {prep_sample_idx} "
+            f"(mask_sample.state={gate_state!r}); a covering block is still masking. "
+            "Resubmit once reconcile marks the mask completed."
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.parquet"
@@ -288,11 +314,21 @@ async def _resolve_staged_masked_reads(
         ) from exc
 
     if result.get("count", 0) == 0:
-        # No reads pass this mask for this sample (data plane writes no file for an
-        # empty result) — there is nothing to assemble.
-        raise _submission_bad_input(
-            f"no reads pass mask_idx {mask_idx} for prep_sample {prep_sample_idx}; "
-            "there is nothing to assemble (is the sample masked under this mask?)"
+        # No reads pass this mask for this sample (the data plane writes no file for
+        # an empty result). This is COMMON — aggressive host/human filtering can
+        # legitimately remove everything — so it is a terminal NO_DATA outcome, not
+        # a failure. Logged here for operator visibility; the outer StepNoData
+        # handler transitions the ticket PROCESSING → NO_DATA.
+        _log.info(
+            "pacbio: no reads pass mask_idx %s for prep_sample %s — no data to assemble",
+            mask_idx,
+            prep_sample_idx,
+        )
+        raise StepNoData(
+            reason=(
+                f"no reads pass mask_idx {mask_idx} for prep_sample "
+                f"{prep_sample_idx} — nothing to assemble"
+            ),
         )
     if not dest.exists():
         raise _submission_bad_input(

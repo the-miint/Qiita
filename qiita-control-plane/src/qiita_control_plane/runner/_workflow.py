@@ -315,6 +315,7 @@ async def run_workflow(
                 )
             bound.update(
                 await _resolve_staged_masked_reads(
+                    pool,
                     scope_target,
                     int(mask_idx),
                     data_plane_url=data_plane_url,

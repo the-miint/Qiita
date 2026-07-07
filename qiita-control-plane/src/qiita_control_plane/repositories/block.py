@@ -183,6 +183,29 @@ async def lock_mask_sample(
     )
 
 
+async def fetch_mask_sample_state(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> str | None:
+    """Read-only companion to `lock_mask_sample`: return the `(mask_idx,
+    prep_sample_idx)` gate row's state, or None when no row exists.
+
+    None means "no block-mask gate for this sample" — the per-sample read-mask
+    path (or an unmasked sample), which consumers treat as allowed. A non-None
+    state other than 'completed' means a covering block is still in flight, so a
+    consumer that must not read a PARTIAL pass-set (the masked-read export, the
+    pacbio assembly input) rejects it. Point-in-time read: no FOR UPDATE / no
+    transaction requirement — it gates a read, it does not finalize. Mirrors the
+    fail-closed gate the admin masked-read export enforces inline (routes/admin)."""
+    return await conn.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
 async def finalize_mask_sample(
     conn: asyncpg.Connection,
     *,
