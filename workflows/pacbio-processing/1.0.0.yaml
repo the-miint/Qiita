@@ -55,13 +55,14 @@ context_schema:
 
 steps:
   # Convert the runner-materialized masked reads.parquet → reads.fastq.gz and
-  # record the assembler in run_config.json. `reads` is the magic staged-reads
-  # binding (masked variant, keyed off mask_idx). Native: a scalar param
-  # (assembler) is native-only, and parquet→fastq needs no container.
+  # record the assembler in run_config.json. `masked_reads` is the staged-reads
+  # binding's masked variant: the runner resolves it from the read_masked
+  # pass-set for the action_context `mask_idx` via export_read_masked. Native: a
+  # scalar param (assembler) is native-only, and parquet→fastq needs no container.
   - step: pacbio_export_reads
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.pacbio_export_reads
-    inputs: [reads]
+    inputs: [masked_reads]
     params: {assembler: assembler}
     outputs: [reads_fastq, run_config]
     baseline_resources:

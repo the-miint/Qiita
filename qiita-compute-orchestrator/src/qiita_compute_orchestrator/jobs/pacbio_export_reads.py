@@ -63,12 +63,13 @@ _DUCKDB_THREADS = 2
 class Inputs(BaseModel):
     """Typed input contract for pacbio_export_reads.
 
-    `reads` is the per-ticket masked `reads.parquet` (binding name `reads`).
+    `masked_reads` is the per-ticket masked `reads.parquet` (binding name
+    `masked_reads`, materialized by the runner via export_read_masked).
     `assembler` selects the step-1 tool and is stamped into run_config.json.
     `prep_sample_idx`/`work_ticket_idx` are framework-injected scope scalars.
     """
 
-    reads: Path
+    masked_reads: Path
     assembler: Literal["hifiasm_meta", "myloasm"] = "hifiasm_meta"
     prep_sample_idx: int
     work_ticket_idx: int
@@ -81,7 +82,7 @@ def _phred_to_ascii(qual: list[int]) -> str:
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    reads = inputs.reads
+    reads = inputs.masked_reads
     if not reads.exists():
         raise FileNotFoundError(
             f"masked reads Parquet not found: {reads} "

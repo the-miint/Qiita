@@ -34,6 +34,12 @@ from ._upload import _submission_bad_input
 
 SAMPLE_MAP_BINDING = "sample_map"
 STAGED_READS_BINDING = "reads"
+# The MASKED sibling of `reads`: a workflow that consumes ready-for-consumption
+# reads (pacbio assembly) declares `masked_reads`, which the runner materializes
+# from the `read_masked` view's pass-set for a mask_idx. A DISTINCT name from
+# `reads` (raw) so the two never collide — read-mask workflows consume raw `reads`
+# to CREATE a mask; assembly workflows consume `masked_reads`.
+STAGED_MASKED_READS_BINDING = "masked_reads"
 READS_STAGING_ROOT_BINDING = "reads_staging_root"
 
 
@@ -57,6 +63,18 @@ def _workflow_needs_staged_reads(steps: list[Any]) -> bool:
         return False
     for entry in steps:
         if STAGED_READS_BINDING in (getattr(entry, "outputs", []) or []):
+            return False
+    return True
+
+
+def _workflow_needs_staged_masked_reads(steps: list[Any]) -> bool:
+    """True iff `masked_reads` is consumed by some step but produced by none — so
+    it must be bound externally from the sample's `read_masked` pass-set (the
+    pacbio-processing assembly workflow)."""
+    if not _workflow_declares_input(steps, STAGED_MASKED_READS_BINDING):
+        return False
+    for entry in steps:
+        if STAGED_MASKED_READS_BINDING in (getattr(entry, "outputs", []) or []):
             return False
     return True
 
@@ -141,6 +159,14 @@ def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str,
     return _do_action_export("export_read_block", data_plane_url, token)
 
 
+def _do_action_export_read_masked(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """`export_read_masked` DoAction: the data plane materializes ONE prep_sample's
+    `read_masked` pass-set (for a given mask_idx) into a per-ticket Parquet.
+    Isolated (thin wrapper over `_do_action_export`) so unit tests stub the real
+    call by name."""
+    return _do_action_export("export_read_masked", data_plane_url, token)
+
+
 async def _resolve_staged_reads(
     scope_target: dict[str, Any],
     staging_root: Path,
@@ -212,6 +238,68 @@ async def _resolve_staged_reads(
             f"wrote no file at {dest}"
         )
     return {STAGED_READS_BINDING: dest}
+
+
+async def _resolve_staged_masked_reads(
+    scope_target: dict[str, Any],
+    mask_idx: int,
+    *,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Bind `masked_reads` to a prep_sample's MASKED read pass-set for a mask_idx —
+    the analog of `_resolve_staged_reads` for a workflow that consumes
+    ready-for-consumption reads (pacbio assembly) rather than raw reads.
+
+    Unlike `_resolve_staged_reads` there is NO durable fast-path copy: masking is
+    downstream state layered over the raw `read` table, so we always ask the data
+    plane to materialize the `read_masked` view's pass-set (host/human/QC-failing
+    rows excluded, recorded trims applied) for (mask_idx, prep_sample_idx) into a
+    per-ticket `masked_reads.parquet` via the `export_read_masked` DoAction (the
+    bulk read bytes never transit the control plane).
+
+    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if no reads pass the
+    mask — nothing to assemble — or the data plane is unreachable."""
+    prep_sample_idx = scope_target["prep_sample_idx"]
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "masked_reads.parquet"
+    token = sign_action(
+        action="export_read_masked",
+        payload={
+            "mask_idx": mask_idx,
+            "prep_sample_idx": prep_sample_idx,
+            "dest": str(dest),
+        },
+        secret=hmac_secret,
+    )
+    # Flight failure -> SUBMISSION BAD_INPUT like the other pre-loop resolvers
+    # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
+    # stranding it in PROCESSING.
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _runner_pkg._do_action_export_read_masked, data_plane_url, token
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize masked reads for prep_sample {prep_sample_idx} "
+            f"(mask_idx {mask_idx}) from the data plane: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if result.get("count", 0) == 0:
+        # No reads pass this mask for this sample (data plane writes no file for an
+        # empty result) — there is nothing to assemble.
+        raise _submission_bad_input(
+            f"no reads pass mask_idx {mask_idx} for prep_sample {prep_sample_idx}; "
+            "there is nothing to assemble (is the sample masked under this mask?)"
+        )
+    if not dest.exists():
+        raise _submission_bad_input(
+            f"the data plane reported masked reads for prep_sample {prep_sample_idx} "
+            f"(mask_idx {mask_idx}) but wrote no file at {dest}"
+        )
+    return {STAGED_MASKED_READS_BINDING: dest}
 
 
 async def _resolve_staged_reads_block(

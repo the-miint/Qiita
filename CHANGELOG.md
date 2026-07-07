@@ -39,7 +39,9 @@ the `no-changelog` label).
   `export_read_where_to_parquet` was renamed to `export_read_select_to_parquet`
   and now takes the full inner SELECT, so all three read exports share one atomic,
   symlink-safe publish path. Added to `REPLAY_SAFE_ACTIONS`. The control-plane
-  runner glue that calls it is a follow-up. (#TBD)
+  runner binds it to a workflow's `masked_reads` input via
+  `_resolve_staged_masked_reads`, keyed off the action_context `mask_idx` (a
+  distinct binding from raw `reads`, which read-mask workflows consume). (#TBD)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its

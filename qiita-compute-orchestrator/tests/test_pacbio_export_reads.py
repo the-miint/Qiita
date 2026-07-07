@@ -47,7 +47,7 @@ def test_happy_path_writes_fastq_and_run_config(tmp_path):
     )
     ws = tmp_path / "ws"
     out = _run(
-        Inputs(reads=reads, assembler="hifiasm_meta", prep_sample_idx=5, work_ticket_idx=9),
+        Inputs(masked_reads=reads, assembler="hifiasm_meta", prep_sample_idx=5, work_ticket_idx=9),
         ws,
     )
 
@@ -67,17 +67,17 @@ def test_empty_reads_is_no_data(tmp_path):
     reads = tmp_path / "reads.parquet"
     _write_reads_parquet(reads, [])
     with pytest.raises(StepNoData):
-        _run(Inputs(reads=reads, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
+        _run(Inputs(masked_reads=reads, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
 
 
 def test_missing_quality_is_bad_input(tmp_path):
     reads = tmp_path / "reads.parquet"
     _write_reads_parquet(reads, [("noqual", "ACGT", None, 1)])
     with pytest.raises(BackendFailure) as ei:
-        _run(Inputs(reads=reads, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
+        _run(Inputs(masked_reads=reads, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
     assert ei.value.kind is FailureKind.BAD_INPUT
 
 
 def test_unknown_assembler_rejected():
     with pytest.raises(ValueError):
-        Inputs(reads="x", assembler="spades", prep_sample_idx=1, work_ticket_idx=1)
+        Inputs(masked_reads="x", assembler="spades", prep_sample_idx=1, work_ticket_idx=1)

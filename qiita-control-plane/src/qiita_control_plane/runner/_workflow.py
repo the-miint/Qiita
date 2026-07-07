@@ -64,9 +64,11 @@ from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
+    _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
     _workflow_declares_input,
+    _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
 from ._reconstruct import (
@@ -294,6 +296,32 @@ async def run_workflow(
                     "a workflow that masks stored reads must be prep_sample- or "
                     f"block-scoped; got {scope_target['kind']!r}"
                 )
+
+        # Staged MASKED-read binding (assembly workflows): `masked_reads` is a
+        # sample's `read_masked` pass-set for the action_context `mask_idx`,
+        # materialized via the `export_read_masked` DoAction. Distinct from `reads`
+        # (raw) above — read-mask workflows consume raw reads to CREATE a mask;
+        # pacbio-processing consumes an EXISTING mask's pass-set to assemble.
+        if _workflow_needs_staged_masked_reads(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that assembles masked reads must be prep_sample-"
+                    f"scoped; got {scope_target['kind']!r}"
+                )
+            mask_idx = bound.get(MASK_IDX_BINDING)
+            if mask_idx is None:
+                raise _submission_bad_input(
+                    "a masked-reads workflow requires `mask_idx` in action_context"
+                )
+            bound.update(
+                await _resolve_staged_masked_reads(
+                    scope_target,
+                    int(mask_idx),
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
 
         # Read-mask identity: when a step threads `mask_idx` through its params
         # (the host_filter step), bind the mask_idx before the loop. Same

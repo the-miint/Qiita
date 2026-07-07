@@ -21,11 +21,14 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 
 from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
+    STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
     _resolve_sample_map,
+    _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
     _workflow_declares_input,
+    _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
 
@@ -186,6 +189,86 @@ def test_workflow_needs_staged_reads_gate():
 
     no_reads = [_step(inputs=["bcl_input_dir"], outputs=["convert_dir"])]
     assert _workflow_needs_staged_reads(no_reads) is False
+
+
+# --- masked-read resolver (_resolve_staged_masked_reads) -------------------
+
+_EXPORT_READ_MASKED = "qiita_control_plane.runner._do_action_export_read_masked"
+
+
+def test_workflow_needs_staged_masked_reads_gate():
+    """`masked_reads` consumed but not produced → needs the masked staged binding
+    (pacbio-processing). The raw-`reads` gate must NOT fire on it, and vice-versa."""
+    pacbio = [_step(inputs=["masked_reads"], outputs=["reads_fastq"])]
+    assert _workflow_needs_staged_masked_reads(pacbio) is True
+    assert _workflow_needs_staged_reads(pacbio) is False
+
+    raw = [_step(inputs=["reads", "qc_mask"], outputs=["read_mask"])]
+    assert _workflow_needs_staged_masked_reads(raw) is False
+
+
+def test_resolve_staged_masked_reads_binds_workspace_parquet_and_signs(tmp_path, monkeypatch):
+    """The data-plane `export_read_masked` action writes the per-ticket
+    masked_reads.parquet, which `masked_reads` binds to. No durable fast-path."""
+    workspace = tmp_path / "ticket" / "804"
+    dest = workspace / "masked_reads.parquet"
+
+    def _fake_export(_url, _token):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("parquet-bytes")
+        return {"count": 9, "dest": str(dest)}
+
+    monkeypatch.setattr(_EXPORT_READ_MASKED, _fake_export)
+
+    bound = asyncio.run(
+        _resolve_staged_masked_reads(
+            {"prep_sample_idx": 42},
+            77,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=workspace,
+        )
+    )
+    assert bound[STAGED_MASKED_READS_BINDING] == dest
+    assert dest.exists()
+
+
+def test_resolve_staged_masked_reads_empty_export_fails_nothing_to_assemble(tmp_path, monkeypatch):
+    """0 passing reads under the mask → BAD_INPUT 'nothing to assemble'."""
+    monkeypatch.setattr(_EXPORT_READ_MASKED, lambda _u, _t: {"count": 0, "dest": "x"})
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_masked_reads(
+                {"prep_sample_idx": 7},
+                77,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "nothing to assemble" in exc.value.reason
+
+
+def test_resolve_staged_masked_reads_export_failure_is_bad_input(tmp_path, monkeypatch):
+    """A Flight failure is wrapped as BAD_INPUT (never an untyped exception)."""
+
+    def _boom(_url, _token):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(_EXPORT_READ_MASKED, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_masked_reads(
+                {"prep_sample_idx": 7},
+                77,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "data plane" in exc.value.reason
 
 
 def test_workflow_declares_input_checks_optional_too():
