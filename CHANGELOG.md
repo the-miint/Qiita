@@ -629,6 +629,22 @@ the `no-changelog` label).
 
 ### Changed
 
+- **`reference_taxonomy` is now 1-1 with a reference's features; taxonomy
+  coverage gaps warn loudly instead of dropping silently.** `reference_load`'s
+  `_write_taxonomy` used an INNER JOIN on `read_id`, which silently dropped both
+  features with no supplied taxonomy row and taxonomy rows keyed to an unknown
+  `feature_id` (the same ID-namespace-mismatch class that already bit the genome
+  map). It now writes exactly one row per reference feature: a feature with no
+  supplied taxonomy is recorded at rest as an all-NULL-rank ("unclassified")
+  row rather than dropped. Coverage anomalies — missing taxonomy, stray/unmatched
+  `feature_id`s, and duplicate supplied rows (collapsed to one per feature) — are
+  logged as loud `WARNING`s (landing in the SLURM job log) rather than failing
+  the ingest, because real corpora are not strictly 1-1 (GG2's 2024.09 backbone
+  has ~29 features with no taxonomy). The supplied-content format checks (≤8
+  ranks, no blank fields, prefix order) stay hard `ValueError`s. No schema change
+  (the rank columns are already nullable) and no migration; already-ingested
+  references are not backfilled — only new ingests get the 1-1-at-rest shape.
+  (#reference-support)
 - **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
   required and must be absolute (previously optional, falling back to
   `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /

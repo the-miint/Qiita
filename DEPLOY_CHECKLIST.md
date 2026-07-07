@@ -91,6 +91,15 @@ _None yet._
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
   read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
+- **`reference_taxonomy` row semantics changed (reference ingest).** After this
+  deploys, a newly-ingested reference gets one `reference_taxonomy` row per feature —
+  a feature with no supplied taxonomy is stored as an all-NULL-rank ("unclassified")
+  row instead of being dropped, so the table is 1-1 with the reference's features and
+  its row count equals the feature count. Coverage gaps / stray `feature_id`s / duplicate
+  supplied rows now log loud `WARNING`s in the SLURM job log rather than failing. No host
+  action, no migration; **already-ingested references are NOT backfilled** — only new
+  ingests get the 1-1-at-rest shape, so analysts querying `reference_taxonomy` across a
+  mix of old and new references will see both shapes. (#reference-support)
 
 ---
 
