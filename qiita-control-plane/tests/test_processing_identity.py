@@ -33,16 +33,16 @@ def test_workflow_needs_processing_gate():
 def test_build_processing_params_shape_and_assembler_default():
     """The canonical params carry workflow+version+assembler; an omitted assembler
     collapses to the workflow default (so omitted == explicit-default)."""
-    explicit = _build_processing_params("pacbio-processing", "1.0.0", {"assembler": "myloasm"})
+    explicit = _build_processing_params("long-read-assembly", "1.0.0", {"assembler": "myloasm"})
     assert explicit == {
-        "workflow": "pacbio-processing",
+        "workflow": "long-read-assembly",
         "version": "1.0.0",
         "assembler": "myloasm",
     }
 
-    omitted = _build_processing_params("pacbio-processing", "1.0.0", {})
+    omitted = _build_processing_params("long-read-assembly", "1.0.0", {})
     assert omitted["assembler"] == "hifiasm_meta"
     # Omitted and explicit-default hash-collapse (same dict -> same processing_idx).
     assert omitted == _build_processing_params(
-        "pacbio-processing", "1.0.0", {"assembler": "hifiasm_meta"}
+        "long-read-assembly", "1.0.0", {"assembler": "hifiasm_meta"}
     )

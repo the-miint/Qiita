@@ -223,9 +223,9 @@ def _run_masked(pool, prep_sample_idx, workspace, mask_idx=77):
 def test_workflow_needs_staged_masked_reads_gate():
     """`masked_reads_fastq` consumed but not produced → needs the masked staged
     binding (assembly). The raw-`reads` gate must NOT fire on it, and vice-versa."""
-    pacbio = [_step(inputs=["masked_reads_fastq"], outputs=["genomes_dir"])]
-    assert _workflow_needs_staged_masked_reads(pacbio) is True
-    assert _workflow_needs_staged_reads(pacbio) is False
+    assembly = [_step(inputs=["masked_reads_fastq"], outputs=["genomes_dir"])]
+    assert _workflow_needs_staged_masked_reads(assembly) is True
+    assert _workflow_needs_staged_reads(assembly) is False
 
     raw = [_step(inputs=["reads", "qc_mask"], outputs=["read_mask"])]
     assert _workflow_needs_staged_masked_reads(raw) is False

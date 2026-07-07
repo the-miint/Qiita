@@ -305,7 +305,7 @@ async def run_workflow(
         # sample's `read_masked` pass-set for the action_context `mask_idx`,
         # materialized via the `export_read_masked` DoAction. Distinct from `reads`
         # (raw) above — read-mask workflows consume raw reads to CREATE a mask;
-        # pacbio-processing consumes an EXISTING mask's pass-set to assemble.
+        # long-read-assembly consumes an EXISTING mask's pass-set to assemble.
         if _workflow_needs_staged_masked_reads(action.steps):
             if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
                 raise _submission_bad_input(
