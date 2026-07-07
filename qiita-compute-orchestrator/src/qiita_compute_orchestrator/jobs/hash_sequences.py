@@ -43,6 +43,7 @@ import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
+from qiita_common.chunking import canonical_sequence_hash_expr
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -214,10 +215,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     ") "
                     "SELECT "
                     "  read_id, "
-                    "  LEAST("
-                    "    md5(upper(sequence))::uuid,"
-                    "    md5(sequence_dna_reverse_complement(upper(sequence)))::uuid"
-                    "  ) AS sequence_hash, "
+                    # Canonical hash single-sourced in qiita_common.chunking so
+                    # assembly ingest derives the identical feature_idx for
+                    # identical bytes (shared qiita.feature).
+                    f"  {canonical_sequence_hash_expr('sequence')} AS sequence_hash, "
                     "  CAST(length(sequence) AS BIGINT) AS sequence_length_bp "
                     "FROM per_read",
                     [str(inputs.fasta_path), batch],
