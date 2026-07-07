@@ -15,6 +15,7 @@ RUN_CONFIG="$(qiita_input run_config)"
 ASSEMBLER="$(jq -er '.assembler' "${RUN_CONFIG}")"
 
 WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 OUT="${QIITA_OUTPUT_PATH}/genomes"
 mkdir -p "${OUT}/LCG"
 
@@ -41,14 +42,13 @@ esac
 # matches (a bare `c$` would also catch any non-canonical name ending in 'c'); a
 # name that doesn't match the circular shape falls through to noLCG (binned),
 # which is the safe default. Circular -> LCG candidates; the rest -> noLCG.fa (fed
-# to binning). Still worth re-confirming on the first Linux build against a real
-# hifiasm-meta GFA (the S-line byte layout was not directly inspected).
+# to binning).
 #
-# G:43 (reviewer "a linear chromosome is a single contig too?"): yes, and that is
-# intended — LCG means a large *circular* genome. A complete but LINEAR chromosome
-# is not circular, so it flows to noLCG and is recovered through binning (as a
-# single-contig MAG if it bins alone). Only closed circular molecules shortcut
-# past binning as LCG. This matches qp-pacbio's split.
+# A linear chromosome is a single contig too, but LCG means a large *circular*
+# genome. A complete but LINEAR chromosome is not circular, so it flows to noLCG
+# and is recovered through binning (as a single-contig MAG if it bins alone). Only
+# closed circular molecules shortcut past binning as LCG. This matches qp-pacbio's
+# split.
 if [[ -s "${GFA}" ]]; then
     awk '$1=="S" && $2 ~ /tg[0-9]+c$/  {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${WORK}/circular.fa"
     awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
@@ -66,10 +66,20 @@ fi
 # Everything here is ingested under kind='LCG'; a consumer that wants only
 # chromosome-scale genomes filters on length.
 if [[ -s "${WORK}/circular.fa" ]]; then
-    awk -v d="${OUT}/LCG" '
-        /^>/ { id=substr($1,2); f=d"/"id".fna" }
-        { print > f }
-    ' "${WORK}/circular.fa"
+    # Split the multi-FASTA of circular contigs into one file per sequence with
+    # seqkit (a proper FASTA tool, not a hand-rolled awk parser). seqkit names its
+    # split outputs by its own convention, so normalise each to LCG/<contig_id>.fna:
+    # assembly_hash derives each LCG's bin_id from the FILENAME stem (it scans with
+    # read_fastx include_filepath), so the file name must be exactly the contig id.
+    SPLIT_DIR="${WORK}/lcg_split"
+    micromamba run -n assemble seqkit split -i -O "${SPLIT_DIR}" "${WORK}/circular.fa" >/dev/null
+    for f in "${SPLIT_DIR}"/*; do
+        [[ -f "${f}" ]] || continue
+        # The contig id is the file's single record's first header token — the same
+        # id seqkit split keyed on and the id read_fastx will report downstream.
+        id="$(micromamba run -n assemble seqkit seq -n -i "${f}")"
+        mv "${f}" "${OUT}/LCG/${id}.fna"
+    done
 fi
 
 qiita_finish genomes_dir=genomes
