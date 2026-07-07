@@ -15,7 +15,7 @@ CREATE TABLE qiita.processing (
     -- qiita.mint_processing. The dedup key: same params -> same hash -> same id.
     params_hash    BYTEA   NOT NULL UNIQUE,
 
-    workflow       TEXT    NOT NULL,   -- action_id, e.g. 'pacbio-processing'
+    workflow       TEXT    NOT NULL,   -- action_id, e.g. 'long-read-assembly'
     version        TEXT    NOT NULL,   -- e.g. '1.0.0'
 
     -- Full canonical params blob (workflow, version, assembler, ...), kept beside

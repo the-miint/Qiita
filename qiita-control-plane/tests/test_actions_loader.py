@@ -189,8 +189,8 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
         mint-features → write-assembly-membership → assembly_load (module) →
         register-files, in that order — the storage tail reuses the reference-add
         primitives;
-      * all four heavy tools share ONE SIF with per-step entrypoints — the
-        packaging the one-SIF-per-workflow-dir build tooling supports;
+      * each of the four heavy tools has its OWN per-tool SIF + entrypoint — the
+        packaging the multi-SIF-per-workflow-dir build tooling supports;
       * assembly_run_config threads the `assembler` scalar and assembly_load
         threads `processing_idx` via params (a container step can't take a scalar
         param — the runner treats it as a bind path).

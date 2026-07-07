@@ -196,7 +196,7 @@ async def fetch_mask_sample_state(
     path (or an unmasked sample), which consumers treat as allowed. A non-None
     state other than 'completed' means a covering block is still in flight, so a
     consumer that must not read a PARTIAL pass-set (the masked-read export, the
-    pacbio assembly input) rejects it. Point-in-time read: no FOR UPDATE / no
+    long-read-assembly input) rejects it. Point-in-time read: no FOR UPDATE / no
     transaction requirement — it gates a read, it does not finalize. Mirrors the
     fail-closed gate the admin masked-read export enforces inline (routes/admin)."""
     return await conn.fetchval(

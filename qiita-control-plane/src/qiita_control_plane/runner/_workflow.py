@@ -61,6 +61,7 @@ from ._mask import (
     _workflow_needs_mask,
 )
 from ._processing import (
+    ASSEMBLER_BINDING,
     _mint_processing_idx,
     _workflow_needs_processing,
 )
@@ -303,9 +304,11 @@ async def run_workflow(
 
         # Staged MASKED-read binding (assembly workflows): `masked_reads` is a
         # sample's `read_masked` pass-set for the action_context `mask_idx`,
-        # materialized via the `export_read_masked` DoAction. Distinct from `reads`
-        # (raw) above — read-mask workflows consume raw reads to CREATE a mask;
-        # long-read-assembly consumes an EXISTING mask's pass-set to assemble.
+        # STREAMED from the data plane over a `read_masked` DoGet straight to gzip
+        # FASTQ (miint's native COPY FORMAT FASTQ) — no bespoke DoAction, no
+        # intermediate Parquet. Distinct from `reads` (raw) above — read-mask
+        # workflows consume raw reads to CREATE a mask; long-read-assembly consumes
+        # an EXISTING mask's pass-set to assemble.
         if _workflow_needs_staged_masked_reads(action.steps):
             if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
                 raise _submission_bad_input(
@@ -384,12 +387,21 @@ async def run_workflow(
         # the FAILED handler. Idempotent: a re-mint on resume re-resolves the same
         # id via the params-hash upsert.
         if _workflow_needs_processing(action.steps):
+            # Single-source the assembler default from the action's context_schema
+            # (the one result-affecting knob today) — the same default the hash and
+            # the container use, so neither can drift from a re-declared literal.
+            assembler_default = (
+                action.context_schema.get("properties", {})
+                .get(ASSEMBLER_BINDING, {})
+                .get("default")
+            )
             bound.update(
                 await _mint_processing_idx(
                     pool,
                     action_id=action.action_id,
                     action_version=action.version,
                     bound=bound,
+                    assembler_default=assembler_default,
                 )
             )
 

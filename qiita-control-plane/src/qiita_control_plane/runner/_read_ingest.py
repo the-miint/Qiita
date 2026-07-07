@@ -13,6 +13,7 @@ from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
 from qiita_common.backend_failure import StepNoData
+from qiita_common.parquet import validate_parquet_path
 
 import qiita_control_plane.runner as _runner_pkg
 
@@ -167,11 +168,6 @@ def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str,
     return _do_action_export("export_read_block", data_plane_url, token)
 
 
-def _sql_str_path(path: Path) -> str:
-    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
-    return str(path).replace("'", "''")
-
-
 def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest: Path) -> int:
     """Stream one prep_sample's `read_masked` pass-set from the data plane and write
     it as gzip FASTQ with miint's native `COPY … (FORMAT FASTQ)` — the EXACT
@@ -198,7 +194,7 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
         # single-end fastq. Column order is the one the miint writer requires.
         (count,) = con.execute(
             "COPY (SELECT read_id, sequence1, qual1, sequence2, qual2 FROM masked) "
-            f"TO '{_sql_str_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+            f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
         ).fetchone()
     return int(count)
 

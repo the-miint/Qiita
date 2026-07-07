@@ -31,18 +31,44 @@ def test_workflow_needs_processing_gate():
 
 
 def test_build_processing_params_shape_and_assembler_default():
-    """The canonical params carry workflow+version+assembler; an omitted assembler
-    collapses to the workflow default (so omitted == explicit-default)."""
-    explicit = _build_processing_params("long-read-assembly", "1.0.0", {"assembler": "myloasm"})
+    """The canonical params carry workflow+version+mask_idx+assembler; an omitted
+    assembler collapses to the passed context_schema default (so omitted ==
+    explicit-default)."""
+    explicit = _build_processing_params(
+        "long-read-assembly",
+        "1.0.0",
+        {"mask_idx": 7, "assembler": "myloasm"},
+        assembler_default="hifiasm_meta",
+    )
     assert explicit == {
         "workflow": "long-read-assembly",
         "version": "1.0.0",
+        "mask_idx": 7,
         "assembler": "myloasm",
     }
 
-    omitted = _build_processing_params("long-read-assembly", "1.0.0", {})
+    omitted = _build_processing_params(
+        "long-read-assembly", "1.0.0", {"mask_idx": 7}, assembler_default="hifiasm_meta"
+    )
     assert omitted["assembler"] == "hifiasm_meta"
     # Omitted and explicit-default hash-collapse (same dict -> same processing_idx).
     assert omitted == _build_processing_params(
-        "long-read-assembly", "1.0.0", {"assembler": "hifiasm_meta"}
+        "long-read-assembly",
+        "1.0.0",
+        {"mask_idx": 7, "assembler": "hifiasm_meta"},
+        assembler_default="hifiasm_meta",
     )
+
+
+def test_mask_idx_is_part_of_the_identity():
+    """mask_idx is the gating input predicate: the same sample+assembler assembled
+    from two different masks must yield DISTINCT params (distinct processing_idx),
+    never a false duplicate that disallow-without-delete would block."""
+    mask_a = _build_processing_params(
+        "long-read-assembly", "1.0.0", {"mask_idx": 1}, assembler_default="hifiasm_meta"
+    )
+    mask_b = _build_processing_params(
+        "long-read-assembly", "1.0.0", {"mask_idx": 2}, assembler_default="hifiasm_meta"
+    )
+    assert mask_a != mask_b
+    assert mask_a["mask_idx"] == 1 and mask_b["mask_idx"] == 2

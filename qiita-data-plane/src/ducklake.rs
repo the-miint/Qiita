@@ -241,8 +241,8 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// sequence_hash, the orchestrator verifies before load).
 ///
 /// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
-/// register_files loads them and they are SQL-queryable in the catalog; external
-/// Flight read-back is added when the cross-sample merge stage lands.
+/// register_files loads them and they are SQL-queryable in the catalog; they are
+/// intentionally not on the external Flight read-back path (`ALLOWED_TABLES`).
 pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- One row per UNIQUE contig (content-hash deduped), keyed by the minted

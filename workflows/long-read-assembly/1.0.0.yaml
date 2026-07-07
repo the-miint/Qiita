@@ -3,8 +3,8 @@ version: 1.0.0
 target_kind: prep_sample
 # target_processing_kinds is intentionally omitted (empty = any kind): there is
 # no "masked" ProcessingKind, and the real input selector is `mask_idx` (which
-# host-filter/mask identity to assemble from), resolved by the runner into the
-# masked reads.parquet the pipeline consumes.
+# host-filter/mask identity to assemble from), which the runner STREAMS into the
+# masked-reads FASTQ the pipeline consumes (no intermediate Parquet).
 
 description: >
   Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
@@ -61,7 +61,6 @@ context_schema:
       default: hifiasm_meta
 
 steps:
-  # Convert the runner-materialized masked reads.parquet → reads.fastq.gz and
   # Emit run_config.json (the chosen assembler). The masked reads are STREAMED to
   # `masked_reads_fastq` by the runner (the read_masked DoGet + miint COPY FORMAT
   # FASTQ, keyed off the action_context `mask_idx`) — a runner-produced binding, so
