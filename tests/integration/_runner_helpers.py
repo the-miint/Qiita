@@ -10,44 +10,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from qiita_compute_orchestrator.backend import StepHandle, StepStatusInfo
-from qiita_compute_orchestrator.backends.local import LocalBackend
-
 from qiita_common.models import StepHandleWire, StepStatusWire
 
-
-def _handle_to_wire(handle: StepHandle) -> StepHandleWire:
-    """Convert the orchestrator-internal StepHandle (Path-typed) into the
-    StepHandleWire the runner threads around (string-typed)."""
-    return StepHandleWire(
-        compute_target=handle.compute_target,
-        step_name=handle.step_name,
-        slurm_job_id=handle.slurm_job_id,
-        job_name=handle.job_name,
-        output_path=str(handle.output_path) if handle.output_path is not None else None,
-        logs_path=str(handle.logs_path) if handle.logs_path is not None else None,
-        terminal_outputs=(
-            {k: str(v) for k, v in handle.terminal_outputs.items()}
-            if handle.terminal_outputs is not None
-            else None
-        ),
-    )
-
-
-def _handle_from_wire(handle: StepHandleWire) -> StepHandle:
-    return StepHandle(
-        compute_target=handle.compute_target,
-        step_name=handle.step_name,
-        slurm_job_id=handle.slurm_job_id,
-        job_name=handle.job_name,
-        output_path=Path(handle.output_path) if handle.output_path is not None else None,
-        logs_path=Path(handle.logs_path) if handle.logs_path is not None else None,
-        terminal_outputs=(
-            {k: Path(v) for k, v in handle.terminal_outputs.items()}
-            if handle.terminal_outputs is not None
-            else None
-        ),
-    )
+# _handle_from_wire / _handle_to_wire are reused from the orchestrator rather
+# than duplicated here: they dispatch on the typed LocalStepHandle /
+# SlurmStepHandle subtypes, so this in-process bridge stays correct if that
+# mapping changes.
+from qiita_compute_orchestrator.backend import StepStatusInfo
+from qiita_compute_orchestrator.backends.local import LocalBackend
+from qiita_compute_orchestrator.step import _handle_from_wire, _handle_to_wire
 
 
 class LocalComputeBackendClient:
@@ -94,7 +65,9 @@ class LocalComputeBackendClient:
         return _handle_to_wire(handle)
 
     async def status_step(self, handle: StepHandleWire) -> StepStatusWire:
-        info: StepStatusInfo = await self._backend.status_step(_handle_from_wire(handle))
+        info: StepStatusInfo = await self._backend.status_step(
+            _handle_from_wire(handle)
+        )
         return StepStatusWire(
             status=info.status,
             raw_state=info.raw_state,
@@ -102,7 +75,9 @@ class LocalComputeBackendClient:
             reason=info.reason,
         )
 
-    async def result_step(self, handle: StepHandleWire, status: StepStatusWire) -> dict[str, Path]:
+    async def result_step(
+        self, handle: StepHandleWire, status: StepStatusWire
+    ) -> dict[str, Path]:
         return await self._backend.result_step(
             _handle_from_wire(handle),
             StepStatusInfo(

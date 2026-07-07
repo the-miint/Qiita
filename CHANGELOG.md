@@ -633,6 +633,19 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Internal decomposition — no behavior change.** Consolidated the six
+  near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
+  helper; split the orchestrator's all-nullable `StepHandle` into typed
+  `LocalStepHandle` / `SlurmStepHandle` (the `StepHandleWire` wire form is
+  byte-for-byte unchanged, so no migration and no CP↔CO contract change); and
+  broke four monoliths into cohesive packages that re-export every name at the
+  same import path — `qiita_common.models` (→ health / reference / step /
+  upload / user / biosample / study / auth / work_ticket / sequencing + a
+  shared `_base`), the `qiita_control_plane.cli.user` and `.cli.admin` CLIs, and
+  `qiita_control_plane.runner`. Pure moves: every top-level definition is
+  carried over verbatim and each module's public-name set is a superset of the
+  original, so no consumer needed editing. No env var, migration, scope, route,
+  or wire change. (#248)
 - **Control-plane test suite parallelized and de-latencied.** Several changes so
   the ~1980 control-plane tests stop dominating CI wall-clock: (1) the
   `test-control-plane-with-db` / `-without-db` targets run under `pytest-xdist`

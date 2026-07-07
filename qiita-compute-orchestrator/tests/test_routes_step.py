@@ -13,12 +13,13 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from qiita_common.models import ComputeTarget, StepStatus
+from qiita_common.models import StepStatus
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 
 from qiita_compute_orchestrator.backend import (
     ComputeBackend,
     FoundJob,
+    LocalStepHandle,
     StepHandle,
     StepStatusInfo,
 )
@@ -80,8 +81,7 @@ class _RecordingBackend(ComputeBackend):
                 baseline_resources=baseline_resources,
             )
         )
-        return StepHandle(
-            compute_target=ComputeTarget.LOCAL,
+        return LocalStepHandle(
             step_name=name,
             terminal_outputs={"manifest": workspace / "manifest.parquet"},
         )
@@ -291,7 +291,13 @@ def test_step_result_serializes_backend_failure(http_client, cp_to_co_token):
         URL_STEP_RESULT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
-            "handle": {"compute_target": "slurm", "step_name": "hash", "slurm_job_id": 1},
+            "handle": {
+                "compute_target": "slurm",
+                "step_name": "hash",
+                "slurm_job_id": 1,
+                "output_path": "/scratch/ws/output",
+                "logs_path": "/scratch/ws/logs",
+            },
             "status": {"status": "completed", "raw_state": "COMPLETED", "exit_code": 0},
         },
     )
@@ -358,7 +364,13 @@ def test_step_result_serializes_step_no_data(http_client, cp_to_co_token):
         URL_STEP_RESULT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
-            "handle": {"compute_target": "slurm", "step_name": "fastq", "slurm_job_id": 1},
+            "handle": {
+                "compute_target": "slurm",
+                "step_name": "fastq",
+                "slurm_job_id": 1,
+                "output_path": "/scratch/ws/output",
+                "logs_path": "/scratch/ws/logs",
+            },
             "status": {"status": "failed", "raw_state": "FAILED", "exit_code": 1},
         },
     )

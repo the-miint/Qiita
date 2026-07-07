@@ -792,7 +792,7 @@ qiita/
 │   └── src/
 │       └── qiita_common/
 │           ├── __init__.py
-│           ├── models.py                   # work-ticket / API schemas, principal + action types
+│           ├── models/                     # work-ticket / API schemas, principal + action types (domain submodules re-exported via models/__init__.py)
 │           ├── api_paths.py                # canonical REST path constants (shared CP↔CO)
 │           ├── auth_constants.py           # scope names, token prefixes
 │           ├── config.py                   # env-var loading helpers
@@ -815,7 +815,7 @@ qiita/
 │   │       ├── db.py               # asyncpg connection pool setup
 │   │       ├── deps.py             # FastAPI dependency-injection helpers (sessions, scopes)
 │   │       ├── dispatch.py         # dispatch + reconcile_inflight_tickets (restart re-attach)
-│   │       ├── runner.py           # per-ticket workflow runner (walks action steps; drives submit→poll→result)
+│   │       ├── runner/             # per-ticket workflow runner package (walks action steps; drives submit→poll→result)
 │   │       ├── step_progress.py    # qiita.work_ticket_step writers/readers (restart-recovery spine)
 │   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
 │   │       ├── actions/            # action library + sync from workflows/

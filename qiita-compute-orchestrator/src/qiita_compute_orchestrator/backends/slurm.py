@@ -30,7 +30,6 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
 from qiita_common.models import (
-    ComputeTarget,
     StepBaselineResources,
     StepStatus,
     WorkTicketFailureStage,
@@ -39,6 +38,7 @@ from qiita_common.models import (
 from ..backend import (
     ComputeBackend,
     FoundJob,
+    SlurmStepHandle,
     StepHandle,
     StepStatusInfo,
     assert_container_scope_supported,
@@ -426,8 +426,7 @@ class SlurmBackend(ComputeBackend):
         except SlurmrestdError as exc:
             raise self._classify_submit_error(exc, name) from exc
 
-        return StepHandle(
-            compute_target=ComputeTarget.SLURM,
+        return SlurmStepHandle(
             step_name=name,
             slurm_job_id=job_id,
             job_name=payload["job"]["name"],
@@ -584,9 +583,11 @@ class SlurmBackend(ComputeBackend):
         """Guard: status_step / result_step operate only on a SLURM handle
         (one carrying a job id and the workspace paths). A handle from a
         different backend reaching here is a caller bug — fail loudly with
-        a typed BackendFailure rather than dereferencing a None path into
-        an opaque AttributeError."""
-        if handle.slurm_job_id is None or handle.output_path is None or handle.logs_path is None:
+        a typed BackendFailure rather than dereferencing a missing field into
+        an opaque AttributeError. `SlurmStepHandle`'s required job-id / paths
+        make the fields non-None once this passes, so the callers below can
+        dereference them directly."""
+        if not isinstance(handle, SlurmStepHandle):
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,

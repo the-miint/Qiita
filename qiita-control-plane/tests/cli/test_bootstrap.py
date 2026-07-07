@@ -130,6 +130,29 @@ def test_qiita_admin_entrypoint_delegates_to_real_main(monkeypatch) -> None:
     assert _bootstrap.qiita_admin() is sentinel
 
 
+# --- `python -m` module invocation resolves each CLI package's __main__ ------
+
+
+@pytest.mark.parametrize(
+    "module", ["qiita_control_plane.cli.user", "qiita_control_plane.cli.admin"]
+)
+def test_module_invocation_runs(module: str) -> None:
+    """`python -m qiita_control_plane.cli.{user,admin} --help` must exit 0.
+
+    The CLIs are packages, so `-m` runs their `__main__.py` (never `__init__`);
+    a missing `__main__.py` makes this raise "cannot be directly executed". Run
+    in a subprocess because that is the only way to exercise the real `-m`
+    launcher. Covers the operator/smoke path that shells out via `-m`.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", module, "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"python -m {module} --help failed:\n{result.stderr}"
+    assert "usage:" in result.stdout
+
+
 # --- import-cleanliness invariant (the whole point of the shim) -------------
 
 

@@ -16,9 +16,9 @@ fabricating a job id it doesn't have.
 from pathlib import Path
 
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import ComputeTarget, StepStatus, WorkTicketFailureStage
+from qiita_common.models import StepStatus, WorkTicketFailureStage
 
-from ..backend import ComputeBackend, FoundJob, StepHandle, StepStatusInfo
+from ..backend import ComputeBackend, FoundJob, LocalStepHandle, StepHandle, StepStatusInfo
 from ..jobs import flatten_native_inputs, run_native_job
 
 
@@ -91,11 +91,7 @@ class LocalBackend(ComputeBackend):
             work_ticket_idx=work_ticket_idx,
         )
         outputs = await run_native_job(module, raw_inputs, workspace, step_name=name)
-        return StepHandle(
-            compute_target=ComputeTarget.LOCAL,
-            step_name=name,
-            terminal_outputs=outputs,
-        )
+        return LocalStepHandle(step_name=name, terminal_outputs=outputs)
 
     async def status_step(self, handle: StepHandle) -> StepStatusInfo:
         """Local steps run to completion at submit time, so status is
@@ -118,7 +114,7 @@ class LocalBackend(ComputeBackend):
                 reason=f"LocalBackend.result_step called with non-COMPLETED status "
                 f"{status.status.value!r}",
             )
-        return handle.terminal_outputs or {}
+        return handle.terminal_outputs
 
     async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:
         """LocalBackend runs steps in-process and never submits to SLURM, so
