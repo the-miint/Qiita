@@ -15,13 +15,14 @@ the `no-changelog` label).
 
 ### Added
 
-- **`pacbio-processing` workflow — per-sample PacBio HiFi assembly → MAG
+- **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
   reads (selected by a required `mask_idx`): the runner STREAMS the masked reads
   to a gzip FASTQ (miint `COPY … FORMAT FASTQ`, no intermediate Parquet) and a
   native step records the assembler; four container steps run hifiasm_meta →
   metawrap binning → DAS_Tool → CheckM, each in its OWN per-tool image
-  (`pacbio-assemble` / `pacbio-binning` / `pacbio-dastool` / `pacbio-checkm`,
+  (`long-read-assembly-assemble` / `long-read-assembly-binning` /
+  `long-read-assembly-dastool` / `long-read-assembly-checkm`,
   one micromamba env each) so a change to one tool's solve rebuilds only that
   image and each tool is reusable on its own. The storage tail REUSES the
   reference-add pipeline rather than a bespoke
@@ -663,6 +664,15 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Renamed the `pacbio-processing` workflow → `long-read-assembly`** to
+  generalize its name ahead of future long-read inputs (ONT via myloasm), before
+  it ships. The rename covers the workflow dir + `action_id`, the native step /
+  module `pacbio_export_reads` → `assembly_run_config`, and the four per-tool SIFs
+  (`pacbio-{assemble,binning,dastool,checkm}-1.0.0.sif` →
+  `long-read-assembly-{assemble,binning,dastool,checkm}-1.0.0.sif`). The workflow
+  still runs on PacBio HiFi reads via hifiasm_meta today (ONT is a later branch);
+  its `Inputs`/`execute` contract, params, and DuckLake outputs are unchanged.
+  (#255)
 - **SIF build tooling supports N per-tool images per workflow.** A container
   workflow may now ship several single-tool images under
   `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE`
@@ -671,7 +681,7 @@ the `no-changelog` label).
   `build-sif.sh` takes an optional `<image>` selector, `deploy/build-sifs.sh`
   discovers both layouts, and a new `qiita_sif_build_inputs_hash_scoped` keys
   the two-gate idempotency hash to each image's own inputs so one tool's change
-  rebuilds only its image. `pacbio-processing` is the first consumer, split from
+  rebuilds only its image. `long-read-assembly` is the first consumer, split from
   one four-env image into four per-tool images. (#255)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`

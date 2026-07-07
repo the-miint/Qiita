@@ -31,7 +31,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-- **CheckM reference database for `pacbio-processing`.** The workflow's `checkm`
+- **CheckM reference database for `long-read-assembly`.** The workflow's `checkm`
   step needs CheckM's ~1.4 GB reference data, which is deliberately NOT baked into
   the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
   time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
@@ -67,7 +67,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     applies it standalone).
   - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
     extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
-- **Assembly-processing schema for `pacbio-processing`.** `make migrate` applies
+- **Assembly-processing schema for `long-read-assembly`.** `make migrate` applies
   `20260707000000_assembly.sql`: creates `qiita.processing` (+ the idempotent
   `qiita.mint_processing` mint function) and `qiita.assembly_membership`. Plain
   `make migrate`, no backfill or out-of-band setup. (The four DuckLake assembly
@@ -89,12 +89,12 @@ _None yet._
   # expect: read-mask-block|1.0.0|block
   ```
 
-- Confirm the `pacbio-processing/1.0.0` workflow synced into `qiita.action`
+- Confirm the `long-read-assembly/1.0.0` workflow synced into `qiita.action`
   (synced by `qiita-admin actions sync` inside `activate.sh`): (#255)
 
   ```bash
-  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='pacbio-processing'"
-  # expect: pacbio-processing|1.0.0|prep_sample
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='long-read-assembly'"
+  # expect: long-read-assembly|1.0.0|prep_sample
   ```
 
 ### Notes (no host action)
@@ -113,14 +113,14 @@ _None yet._
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
   read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
-- **`pacbio-processing/1.0.0` is inert until an operator runs it.** The four new
+- **`long-read-assembly/1.0.0` is inert until an operator runs it.** The four new
   DuckLake tables (`assembled_sequence`, `assembled_sequence_chunks`,
   `assembly_membership`, `bin_quality`) are created automatically at data-plane
   startup by `ensure_assembly_tables` — **no data-plane action** (the Postgres
   `qiita.processing` / `qiita.assembly_membership` side is the bucket-3 migration).
-  The workflow's FOUR per-tool images (`pacbio-assemble-1.0.0.sif`,
-  `pacbio-binning-1.0.0.sif`, `pacbio-dastool-1.0.0.sif`,
-  `pacbio-checkm-1.0.0.sif`) are built automatically by `build-sifs.sh` during
+  The workflow's FOUR per-tool images (`long-read-assembly-assemble-1.0.0.sif`,
+  `long-read-assembly-binning-1.0.0.sif`, `long-read-assembly-dastool-1.0.0.sif`,
+  `long-read-assembly-checkm-1.0.0.sif`) are built automatically by `build-sifs.sh` during
   the deploy — it now iterates `workflows/*/sif-build.d/*.env` in addition to the
   legacy `sif-build.env`, so no new manual build step. The first build resolves
   several bioconda envs (metawrap / DAS_Tool / CheckM), so it is **slow** and

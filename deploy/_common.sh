@@ -190,7 +190,7 @@ qiita_sif_build_inputs_hash() {
 # def/entrypoint rebuild EVERY image), this hashes only the EXPLICIT files an
 # image declares (its own def + entrypoint(s), via the spec's HASH_INPUTS) plus
 # _shared/. That is what lets, e.g., an edit to the checkm image's def rebuild
-# only pacbio-checkm and leave pacbio-assemble alone — the granularity the
+# only long-read-assembly-checkm and leave long-read-assembly-assemble alone — the granularity the
 # per-tool split exists to deliver. Same digest shape as the whole-dir hash
 # (repo-relative path + sha256 per file, sorted, re-hashed) so a legacy single
 # image and a scoped image are computed identically; only the input SET differs.
