@@ -2,7 +2,9 @@
 # Step 1 (qp-pacbio steps 1+2): assemble masked HiFi reads, then split circular
 # genomes (LCG) from the linear contigs (noLCG). Output `genomes_dir` =
 # $QIITA_OUTPUT_PATH/genomes:
-#   LCG/<contig>.fna   one circular genome >=512 kb per file (ingested as LCG)
+#   LCG/<contig>.fna   one circular contig per file, ANY size (ingested as LCG;
+#                      the >=512 kb "large complete genome" cut is a query-time
+#                      predicate on the stored length, not a filter applied here)
 #   noLCG.fa           the non-circular contigs (input to binning + bin_refine)
 # Zero contigs is left as an empty genomes_dir; downstream steps skip cleanly and
 # pacbio_ingest turns the all-empty result into StepNoData.
@@ -52,33 +54,22 @@ if [[ -s "${GFA}" ]]; then
     awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
 fi
 
-# One file per circular contig (a circular genome is single-contig), then keep
-# only those >=512 kb as LCG (qp-pacbio's `find -size -512k` filter, inverted).
-#
-# REVIEW (G:44 — needs a human/bioinformatics call; NOT changed here): a circular
-# contig <512 kb is very often a REAL biological molecule — a plasmid (or a phage /
-# small replicon) — not an assembly artifact. Deleting it here silently DISCARDS
-# that sequence with no recovery: it is circular so it never reaches noLCG/binning
-# either, so a sample's plasmids are lost entirely. A better outcome is to KEEP
-# these and store them under a distinct `kind` (e.g. 'plasmid' or 'small_circular')
-# — the storage schema's `kind` column is plain TEXT specifically to allow new
-# kinds, so this is additive. But it changes the closed kind value set that flows
-# end-to-end (assembly_hash `_KIND_*`, assembly_load, the DuckLake
-# assembly_membership/bin_quality `kind` column), and the exact size cutoff /
-# whether to bin-quality-assess plasmids is a biology decision. Left as-is (bare
-# deletion) pending that confirmation; when confirmed, thread a new kind through
-# `_file_meta` in assembly_hash rather than rm'ing here.
+# One file per circular contig (a circular genome is single-contig). We keep
+# EVERY circular contig regardless of size — the >=512 kb "large complete genome"
+# (LCG) distinction is applied ON THE FLY at query time against the stored
+# sequence_length_bp (WHERE sequence_length_bp >= 524288), NOT by deleting here.
+# A circular contig <512 kb is very often a REAL biological molecule — a plasmid,
+# phage, or other small replicon — and (being circular) it never reaches
+# noLCG/binning, so a `find -size -512k` delete (qp-pacbio's original) would
+# discard that sequence with no recovery path. Storing all circulars keeps them
+# queryable; the size cut is a predicate downstream, not a destructive filter.
+# Everything here is ingested under kind='LCG'; a consumer that wants only
+# chromosome-scale genomes filters on length.
 if [[ -s "${WORK}/circular.fa" ]]; then
     awk -v d="${OUT}/LCG" '
         /^>/ { id=substr($1,2); f=d"/"id".fna" }
         { print > f }
     ' "${WORK}/circular.fa"
-    for f in "${OUT}/LCG"/*.fna; do
-        [[ -e "$f" ]] || continue
-        if [[ "$(stat -c%s "$f")" -lt 524288 ]]; then
-            rm -f "$f"
-        fi
-    done
 fi
 
 qiita_finish genomes_dir=genomes

@@ -50,24 +50,40 @@ fi
 bins_csv="$(IFS=,; echo "${das_bins[*]}")"
 labels_csv="$(IFS=,; echo "${das_labels[*]}")"
 
-# DAS_Tool exits non-zero when no bin clears its score threshold — a normal
-# "no MAGs" outcome, not a failure. Treat a missing bins dir as empty.
+# DAS_Tool exits non-zero for TWO very different reasons: (a) a legitimate
+# "no bin clears the score threshold" outcome (a low-biomass sample — a valid
+# LCG-only success), and (b) a real crash (OOM, missing diamond, corrupt input).
+# We must NOT swallow (b). Capture the exit code + full log, and treat a non-zero
+# exit as the benign empty case ONLY when the log carries DAS_Tool's specific
+# no-bins message; anything else fails the step loudly (the repo's fail-fast
+# ethos). The default on a non-zero exit is to FAIL.
 set +e
 micromamba run -n dastool DAS_Tool \
     --bins="${bins_csv}" --contigs="${NOLCG}" \
     --outputbasename="${WORK}/dastool" --labels="${labels_csv}" \
-    --threads="${THREADS}" --search_engine=diamond --write_bins 1
+    --threads="${THREADS}" --search_engine=diamond --write_bins 1 \
+    > "${WORK}/dastool.log" 2>&1
+das_rc=$?
 set -e
+cat "${WORK}/dastool.log" >&2
 
-# REVIEW (assembly correctness): DAS_Tool exits non-zero both when no bin clears
-# its score threshold (a legitimate "no MAGs" outcome for a low-biomass sample)
-# AND when it genuinely crashes (OOM, missing diamond, corrupt input). The `set
-# +e` above + this "no output bins => success, exit 0" check cannot tell the two
-# apart, so a real DAS_Tool failure is silently reported as an LCG-only success.
-# This matches qp-pacbio's tolerance, but trades the repo's fail-loud ethos for
-# it. DAS_Tool (an R script) exposes no distinct exit code to disambiguate.
-# Needs a human/bioinformatics call on whether to tighten (e.g. grep DAS_Tool's
-# log for its "no bins" message before treating a non-zero exit as success).
+if [[ "${das_rc}" -ne 0 ]]; then
+    # DAS_Tool's benign "nothing passed the score threshold" message. NOTE: the
+    # exact wording must be confirmed against real DAS_Tool output on the first
+    # Linux build — the tool cannot run on the macOS dev box, so this regex is a
+    # best-effort match over the phrasings DAS_Tool uses. The default is to FAIL:
+    # only this specific pattern is accepted as an empty success.
+    if grep -qiE 'no bins.*(score|threshold|passed|found)|no high.?quality bins' "${WORK}/dastool.log"; then
+        echo "bin_refine: DAS_Tool reported no bins above the score threshold — LCG-only success." >&2
+        qiita_finish refined_bins_dir=refined_bins
+        exit 0
+    fi
+    echo "bin_refine: DAS_Tool failed (exit ${das_rc}); log does not match the benign no-bins message — failing the step." >&2
+    exit "${das_rc}"
+fi
+
+# Exit 0 but no bins written (edge case): treat an empty output dir as the benign
+# empty outcome.
 DAS_BINS_DIR="${WORK}/dastool_DASTool_bins"
 if ! ls "${DAS_BINS_DIR}"/*.fa >/dev/null 2>&1; then
     qiita_finish refined_bins_dir=refined_bins
