@@ -150,6 +150,11 @@ from ._mask import (
     _workflow_needs_mask,
     backfill_work_ticket_mask_idx,
 )
+from ._processing import (
+    PROCESSING_IDX_BINDING,
+    _mint_processing_idx,
+    _workflow_needs_processing,
+)
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
     SAMPLE_MAP_BINDING,
@@ -217,6 +222,7 @@ __all__: list[str] = [
     "IllegalStatusTransition",
     "LIBRARY",
     "LibraryPrimitive",
+    "PROCESSING_IDX_BINDING",
     "MASK_IDX_BINDING",
     "MINT_FEATURES_OUTPUT_BASENAME",
     "Path",
@@ -299,6 +305,7 @@ __all__: list[str] = [
     "_log",
     "_materialize_backfill_adapter_set_hash",
     "_mint_read_mask",
+    "_mint_processing_idx",
     "_note_transient_retry",
     "_patch_resource_status",
     "_persist_mask_idx",
@@ -330,6 +337,7 @@ __all__: list[str] = [
     "_workflow_declares_input",
     "_workflow_needs_adapters",
     "_workflow_needs_mask",
+    "_workflow_needs_processing",
     "_workflow_needs_staged_masked_reads",
     "_workflow_needs_staged_reads",
     "_write_adapter_parquet",

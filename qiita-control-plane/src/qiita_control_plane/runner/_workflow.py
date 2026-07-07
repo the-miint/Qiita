@@ -60,6 +60,10 @@ from ._mask import (
     _persist_mask_idx,
     _workflow_needs_mask,
 )
+from ._processing import (
+    _mint_processing_idx,
+    _workflow_needs_processing,
+)
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
     SAMPLE_MAP_BINDING,
@@ -372,6 +376,22 @@ async def run_workflow(
                     "a workflow that masks reads (threads mask_idx) must be "
                     f"prep_sample- or block-scoped; got {scope_target['kind']!r}"
                 )
+
+        # Processing identity: when a step threads `processing_idx` (the assembly
+        # membership + load steps), mint the run's processing_idx before the loop —
+        # the canonical-params hash of {workflow, version, result-affecting knobs
+        # like the assembler}. Same inside-try placement so a mint failure lands in
+        # the FAILED handler. Idempotent: a re-mint on resume re-resolves the same
+        # id via the params-hash upsert.
+        if _workflow_needs_processing(action.steps):
+            bound.update(
+                await _mint_processing_idx(
+                    pool,
+                    action_id=action.action_id,
+                    action_version=action.version,
+                    bound=bound,
+                )
+            )
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
