@@ -1,0 +1,89 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# ONE image shared by all four pacbio-processing container steps (assemble /
+# binning / bin_refine / checkm); each step is invoked as
+# `apptainer exec <sif> /opt/qiita/<step>.sh` (per-step entrypoint), so the
+# %runscript is unused. The tools are mutually dependency-incompatible
+# (metawrap is a py2.7-era orchestrator; CheckM is py3; DAS_Tool drags in R), so
+# each lives in its OWN micromamba env and the entrypoints call
+# `micromamba run -n <env> <tool>`. This is the isolation the plan calls for; a
+# build-time refinement can swap any single-binary tool (seqkit, diamond) to a
+# native install to trim the image.
+#
+# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
+# bioconda package pins and a few tool-output field names (hifiasm-meta's GFA
+# circular-contig marker, the DAS_Tool summary / CheckM qa column headers the
+# entrypoints normalize) must be verified on the first Linux build
+# (`make test-workflows` / the deploy's build-sifs.sh).
+
+%labels
+    workflow pacbio-processing
+    version 1.0.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    _lib.sh /opt/qiita/_lib.sh
+    # Per-step entrypoints (one per container step in 1.0.0.yaml).
+    assemble.sh /opt/qiita/assemble.sh
+    binning.sh /opt/qiita/binning.sh
+    bin_refine.sh /opt/qiita/bin_refine.sh
+    checkm.sh /opt/qiita/checkm.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json), gawk, pigz (fast (de)compress), procps, findutils — the
+    # base utilities the entrypoints rely on outside the tool envs.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+
+    # One env per tool. Channels bioconda + conda-forge; versions pinned loosely
+    # here and tightened after the first Linux build resolves the solve.
+    #  - assemble: hifiasm-meta (+ nothing else; awk does the GFA split)
+    micromamba create -y -n assemble  -c bioconda -c conda-forge hifiasm_meta seqkit
+    #  - binning: metawrap bundles metabat2 + maxbin2 + concoct + its aligners
+    micromamba create -y -n metawrap  -c bioconda -c conda-forge metawrap-mg
+    #  - bin_refine: DAS_Tool + diamond (DAS_Tool bundles its SCG db)
+    micromamba create -y -n dastool   -c bioconda -c conda-forge das_tool diamond
+    #  - checkm: CheckM + its external binaries (pplacer, hmmer, prodigal)
+    micromamba create -y -n checkm    -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
+
+    # CheckM reference data (~1.4 GB) is NOT baked in — it is bind-mounted at run
+    # time from PATH_DERIVED and pointed at via CHECKM_DATA_PATH in checkm.sh.
+
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh /opt/qiita/binning.sh \
+               /opt/qiita/bin_refine.sh /opt/qiita/checkm.sh
+    chmod 0644 /opt/qiita/manifest_writer.py
+
+    micromamba clean -a -y
+
+%test
+    set -e
+    # Every env the entrypoints call must exist and expose its primary tool.
+    micromamba env list | grep -q assemble
+    micromamba env list | grep -q metawrap
+    micromamba env list | grep -q dastool
+    micromamba env list | grep -q checkm
+    micromamba run -n assemble hifiasm_meta --version
+    micromamba run -n dastool DAS_Tool --version
+    micromamba run -n checkm checkm -h >/dev/null
+    # Base utilities + the shipped manifest writer.
+    jq --version
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Guard the per-step entrypoints stay wired to their envs.
+    grep -q 'micromamba run -n assemble hifiasm_meta' /opt/qiita/assemble.sh
+    grep -q 'micromamba run -n metawrap metawrap' /opt/qiita/binning.sh
+    grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
+    grep -q 'micromamba run -n checkm checkm' /opt/qiita/checkm.sh
+
+%runscript
+    echo "pacbio-processing image: invoke a per-step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/assemble.sh" >&2
+    exit 64
