@@ -16,6 +16,7 @@ from qiita_compute_orchestrator.derived_store import (
     reference_derived_dir,
     reference_shard_dir,
     rype_index_path,
+    shard_rype_index_path,
 )
 
 
@@ -62,3 +63,22 @@ def test_reference_shard_dir_lives_under_the_reference_dir():
 
 def test_reference_shard_dir_accepts_str_or_path_root():
     assert reference_shard_dir("/derived", 1, 2) == reference_shard_dir(Path("/derived"), 1, 2)
+
+
+def test_shard_rype_index_path_layout():
+    """The per-shard rype `.ryxdi` routing index sits at
+    `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/index.ryxdi`."""
+    assert shard_rype_index_path("/derived", 7, 0) == Path(
+        "/derived/references/7/shards/0/index.ryxdi"
+    )
+
+
+def test_shard_rype_index_path_under_reference_dir():
+    """The shard `.ryxdi` must sit inside the per-reference subtree, so the purge
+    endpoint's single `reference_derived_dir` rmtree removes it too."""
+    root = Path("/derived")
+    assert shard_rype_index_path(root, 42, 3).is_relative_to(reference_derived_dir(root, 42))
+
+
+def test_shard_rype_index_path_accepts_str_or_path_root():
+    assert shard_rype_index_path("/derived", 1, 2) == shard_rype_index_path(Path("/derived"), 1, 2)

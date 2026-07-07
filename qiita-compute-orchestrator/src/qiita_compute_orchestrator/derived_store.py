@@ -46,6 +46,7 @@ __all__ = [
     "reference_derived_dir",
     "reference_shard_dir",
     "rype_index_path",
+    "shard_rype_index_path",
 ]
 
 
@@ -77,6 +78,17 @@ def rype_index_path(derived_root: Path | str, reference_idx: int) -> Path:
     """The rype ``.ryxdi`` index directory for a reference (a DIRECTORY:
     ``manifest.toml`` + Parquet shards), written by ``build_rype_index``."""
     return reference_derived_dir(derived_root, reference_idx) / "rype" / "index.ryxdi"
+
+
+def shard_rype_index_path(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
+    """The per-shard rype ``.ryxdi`` ROUTING index directory of a sharded
+    *analysis* reference:
+    ``{PATH_DERIVED}/references/{reference_idx}/shards/{shard_id}/index.ryxdi``.
+    Composed off ``reference_shard_dir`` so it sits inside the per-reference
+    subtree the ``DELETE /reference-artifact/{idx}`` rmtree purges. Written by
+    ``build_rype_index`` in shard mode (one ``.ryxdi`` per shard, over just that
+    shard's features)."""
+    return reference_shard_dir(derived_root, reference_idx, shard_id) / "index.ryxdi"
 
 
 def minimap2_index_path(derived_root: Path | str, reference_idx: int) -> Path:

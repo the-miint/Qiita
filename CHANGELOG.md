@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Added
 
+- **Per-shard rype `.ryxdi` build (parameterized `build_rype_index` + `plan()`).**
+  The `build_rype_index` native job gains an optional **shard mode**: given a
+  `shard_id` and a runner-staged feature roster (`shard_features`, a Parquet of
+  `(feature_idx, sequence_length_bp)`), it builds one shard's rype `.ryxdi` routing
+  index over just that shard's features and writes it to
+  `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/index.ryxdi`
+  (`derived_store.shard_rype_index_path`), recording `shard_id` in the meta JSON
+  (the register-index arm already threads it, B1). Both shard fields unset =
+  today's whole-reference host build, byte-identical. Adds a `plan()` that sizes
+  the shard build's `mem_gb` down from the whole-reference baseline (floored at the
+  runtime-consistent rype+DuckDB+headroom minimum, scaled by the shard's total bp),
+  so a fleet of small shards doesn't each grab the 64 GB whole-reference slot.
+  Re-verified `rype_index_create` against upstream miint (`docs/duckdb-miint.md`
+  refreshed). No shard fan-out / workflow wiring yet — that's a later milestone;
+  16S/no-genome sharding deferred. (#reference-support)
 - **Lineage-sorted shard planner + `reference_membership.shard_id` persistence.**
   The deterministic partition of an analysis reference's features into shards. A
   pure tiler `qiita_control_plane.shard_planner.tile_by_lineage(items, num_shards)`

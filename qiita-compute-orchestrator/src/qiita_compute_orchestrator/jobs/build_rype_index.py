@@ -39,16 +39,17 @@ create them as plain VIEW/TABLE (see docs/duckdb-miint.md).
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from pathlib import Path
 
 import duckdb
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from qiita_common.models import HOST_FILTER_INDEX_TYPE_RYPE
 from qiita_common.parquet import validate_parquet_path
 
 from ..config import get_settings
-from ..derived_store import rype_index_path
+from ..derived_store import rype_index_path, shard_rype_index_path
 from ..miint import (
     apply_duckdb_settings,
     duckdb_headroom_gb,
@@ -57,6 +58,7 @@ from ..miint import (
     resolve_duckdb_memory_gb,
     slurm_alloc_gb,
 )
+from . import JobPlan, JobResourcePlan
 
 YAML_STEP_NAME = "build_rype_index"
 
@@ -104,6 +106,21 @@ _DUCKDB_THREADS = 8
 # grows elastically as an OOM retry escalates the allocation.
 _RYPE_MAX_MEMORY_GB = 30
 
+# plan() memory sizing for SHARD mode (advisory, down-only). A shard is ~1/1000
+# of the reference, so it needn't request the whole-reference 64 GB YAML baseline;
+# plan() sizes mem_gb from the shard's total bp and lets the CP's down-only
+# composition lower the SLURM allocation. The FLOOR is the smallest allocation the
+# runtime DuckDB/rype split stays consistent at: rype's max_memory is floored at
+# `_RYPE_MAX_MEMORY_GB`, so the cgroup must hold rype's floor + DuckDB's cap + the
+# shared headroom, else the split would hand rype more than the cgroup has. Above
+# the floor, add a gentle per-bp term (the rype build is memory-bounded/windowed,
+# so this over-provisions safely rather than tracking a hard requirement). Tune
+# against a real shard build; an under-estimate is still caught by OOM escalation.
+_SHARD_PLAN_FLOOR_GB = (
+    _RYPE_MAX_MEMORY_GB + _DUCKDB_MEMORY_CAP_GB + duckdb_headroom_gb(_DUCKDB_THREADS)
+)
+_SHARD_PLAN_BP_PER_GB = 1_000_000_000
+
 # rype build defaults. w=20 is passed explicitly (the function default is 50).
 # Override per-build with the `rype_w` action_context key (host-reference-add).
 _DEFAULT_K = 64
@@ -126,6 +143,14 @@ class Inputs(BaseModel):
     `reference_idx` and `work_ticket_idx` are framework-injected scope scalars.
     `k` / `w` are the rype build parameters (host-filter defaults); `bucket_name`
     overrides the default single-bucket name.
+
+    SHARD mode (both `shard_id` and `shard_features` set) builds one shard's
+    routing `.ryxdi` over just that shard's features: `shard_features` is a
+    runner-staged Parquet roster `(feature_idx BIGINT, sequence_length_bp BIGINT)`
+    (the shard's members, from `reference_membership.shard_id`), and the build is
+    restricted to those features and written to the per-shard path. Left unset
+    (both None) is HOST/unsharded mode — today's whole-reference behavior,
+    byte-identical.
     """
 
     reference_sequence_chunks: Path
@@ -134,6 +159,17 @@ class Inputs(BaseModel):
     k: int = _DEFAULT_K
     w: int = _DEFAULT_W
     bucket_name: str | None = None
+    shard_id: int | None = None
+    shard_features: Path | None = None
+
+    @model_validator(mode="after")
+    def _shard_fields_both_or_neither(self) -> Inputs:
+        if (self.shard_id is None) != (self.shard_features is None):
+            raise ValueError(
+                "shard_id and shard_features must be supplied together (both for a"
+                " sharded build, or neither for a whole-reference/host build)"
+            )
+        return self
 
 
 def _run_rype_index_create(
@@ -178,15 +214,30 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # single file too (tests / future producers).
     read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
 
-    bucket = inputs.bucket_name or f"reference_{inputs.reference_idx}"
+    # SHARD mode when shard_id/shard_features are set (the validator guarantees
+    # both-or-neither). A sharded build indexes only the shard's features and
+    # writes a per-shard `.ryxdi`; host/unsharded mode is byte-identical to before.
+    sharded = inputs.shard_id is not None
+    if inputs.bucket_name is not None:
+        bucket = inputs.bucket_name
+    elif sharded:
+        bucket = f"reference_{inputs.reference_idx}_shard_{inputs.shard_id}"
+    else:
+        bucket = f"reference_{inputs.reference_idx}"
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value
     # here instead of the $TMPDIR/qiita/derived default. The layout is owned by
     # `derived_store` (the orchestrator's derived-storage convention, shared with
-    # build_minimap2_index and the reference-artifact purge endpoint).
-    index_dir = rype_index_path(get_settings().path_derived, inputs.reference_idx)
+    # build_minimap2_index and the reference-artifact purge endpoint). A sharded
+    # build lands at `.../shards/{shard_id}/index.ryxdi` (one `.ryxdi` per shard).
+    path_derived = get_settings().path_derived
+    index_dir = (
+        shard_rype_index_path(path_derived, inputs.reference_idx, inputs.shard_id)
+        if sharded
+        else rype_index_path(path_derived, inputs.reference_idx)
+    )
     index_dir.parent.mkdir(parents=True, exist_ok=True)
     # On a workflow retry the build re-runs against the same persistent path;
     # clear any prior (possibly partial) `.ryxdi` so the rebuild is
@@ -222,9 +273,19 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # CREATE VIEW, so the path is inlined; validate_parquet_path rejects
         # quote/backslash/control chars (the repo's fail-fast escaping contract).
         read_target_sql = validate_parquet_path(read_target)
+        # In shard mode restrict the feed to the shard's features (the roster);
+        # the roster path is inlined like the chunk path, so validate it too. The
+        # DISTINCT mapping below then covers exactly the shard's features.
+        subset_sql = ""
+        if sharded:
+            roster_sql = validate_parquet_path(inputs.shard_features)
+            subset_sql = (
+                f" WHERE feature_idx IN (SELECT feature_idx FROM read_parquet('{roster_sql}'))"
+            )
         conn.execute(
             f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
             f"SELECT feature_idx, chunk_index, chunk_data FROM read_parquet('{read_target_sql}')"
+            f"{subset_sql}"
         )
         # Single-bucket mapping over every distinct feature. bucket is a
         # controlled string; escape quotes for the inlined literal.
@@ -251,14 +312,45 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     params = {"k": inputs.k, "w": inputs.w, "bucket_name": bucket}
     meta_path = workspace / "rype_index_meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {"index_type": HOST_FILTER_INDEX_TYPE_RYPE, "fs_path": str(index_dir), "params": params}
-        )
-    )
+    # Only a sharded build adds `shard_id` to the meta JSON; host mode omits it
+    # (keeping the host meta byte-identical). The runner's register-index arm
+    # reads it via `meta.get("shard_id")` — absent → None → a whole-reference row.
+    meta: dict = {
+        "index_type": HOST_FILTER_INDEX_TYPE_RYPE,
+        "fs_path": str(index_dir),
+        "params": params,
+    }
+    if sharded:
+        meta["shard_id"] = inputs.shard_id
+    meta_path.write_text(json.dumps(meta))
     # Only the in-tree meta JSON is a step output. The `.ryxdi` itself lives
     # under PATH_DERIVED (outside the per-attempt workspace) on purpose — it
     # outlives the work ticket — so it CANNOT be a declared output: the launcher
     # manifest write and the verifier both require every output to resolve under
     # $QIITA_OUTPUT_PATH. register-index reads its location from meta `fs_path`.
     return {"rype_index_meta": meta_path}
+
+
+def plan(inputs: Inputs) -> JobPlan:
+    """Size a SHARD build's memory down from the whole-reference baseline.
+
+    Host/unsharded mode → no opinion (empty `JobPlan` → keep the step's YAML
+    baseline; the whole-reference build still gets its 64 GB). Shard mode → size
+    `mem_gb` from the shard's total bp: the runtime-consistent floor
+    (`_SHARD_PLAN_FLOOR_GB` — rype's `max_memory` floor + DuckDB's cap + shared
+    headroom) plus a gentle per-bp term. The control plane applies this ONLY when
+    it is below the step's baseline (down-only composition), so a small shard runs
+    in a smaller SLURM slot (1000 shards don't each grab 64 GB) while an
+    over-estimate harmlessly stays at baseline. Advisory — an under-estimate is
+    still caught by the existing OOM-retry escalation. `plan()` runs at submit
+    time in the orchestrator process and reads only the small roster (bp sum), not
+    the chunk data."""
+    if inputs.shard_id is None or inputs.shard_features is None:
+        return JobPlan()
+    with duckdb.connect(":memory:") as conn:
+        total_bp = conn.execute(
+            "SELECT COALESCE(sum(sequence_length_bp), 0) FROM read_parquet(?)",
+            [str(inputs.shard_features)],
+        ).fetchone()[0]
+    mem_gb = _SHARD_PLAN_FLOOR_GB + math.ceil(total_bp / _SHARD_PLAN_BP_PER_GB)
+    return JobPlan(resources=JobResourcePlan(mem_gb=mem_gb))
