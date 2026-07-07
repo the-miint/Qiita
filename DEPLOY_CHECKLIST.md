@@ -118,10 +118,15 @@ _None yet._
   `assembly_membership`, `bin_quality`) are created automatically at data-plane
   startup by `ensure_assembly_tables` — **no data-plane action** (the Postgres
   `qiita.processing` / `qiita.assembly_membership` side is the bucket-3 migration).
-  The `pacbio-processing-1.0.0.sif` is built automatically by `build-sifs.sh`
-  during the deploy; the first build resolves several bioconda envs (metawrap /
-  DAS_Tool / CheckM), so it is **slow** and needs apptainer + network on the build
-  host. Beyond the bucket-2 CheckM DB, no new env var, scope, or group. (#255)
+  The workflow's FOUR per-tool images (`pacbio-assemble-1.0.0.sif`,
+  `pacbio-binning-1.0.0.sif`, `pacbio-dastool-1.0.0.sif`,
+  `pacbio-checkm-1.0.0.sif`) are built automatically by `build-sifs.sh` during
+  the deploy — it now iterates `workflows/*/sif-build.d/*.env` in addition to the
+  legacy `sif-build.env`, so no new manual build step. The first build resolves
+  several bioconda envs (metawrap / DAS_Tool / CheckM), so it is **slow** and
+  needs apptainer + network on the build host; the two-gate idempotency is now
+  per-image, so a later change to one tool rebuilds only its SIF. Beyond the
+  bucket-2 CheckM DB, no new env var, scope, or group. (#255)
 
 ---
 

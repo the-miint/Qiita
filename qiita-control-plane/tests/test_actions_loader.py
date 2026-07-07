@@ -235,10 +235,16 @@ def test_load_actions_loads_on_disk_pacbio_processing_yaml():
     # identity before the step loop; write-assembly-membership then reads it.
     assert load_step.params == {"processing_idx": "processing_idx"}
 
-    # One image, per-step entrypoints — the single-SIF packaging.
+    # One per-tool image per container step (assemble / binning / bin_refine /
+    # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
     container_steps = [s for s in pacbio.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
-    assert {s.container for s in container_steps} == {"pacbio-processing-1.0.0.sif"}
+    assert {s.container for s in container_steps} == {
+        "pacbio-assemble-1.0.0.sif",
+        "pacbio-binning-1.0.0.sif",
+        "pacbio-dastool-1.0.0.sif",
+        "pacbio-checkm-1.0.0.sif",
+    }
     assert len({s.entrypoint for s in container_steps}) == 4
 
 

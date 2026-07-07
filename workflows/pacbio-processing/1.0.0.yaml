@@ -82,7 +82,7 @@ steps:
   # terminal no-data outcome inside the container.
   - step: assemble
     step_type: singleton
-    container: pacbio-processing-1.0.0.sif
+    container: pacbio-assemble-1.0.0.sif
     entrypoint: /opt/qiita/assemble.sh
     inputs: [masked_reads_fastq, run_config]
     outputs: [genomes_dir]
@@ -95,7 +95,7 @@ steps:
   # reads. 0 bins → empty bins_dir (exit 0); downstream steps skip cleanly.
   - step: binning
     step_type: singleton
-    container: pacbio-processing-1.0.0.sif
+    container: pacbio-binning-1.0.0.sif
     entrypoint: /opt/qiita/binning.sh
     inputs: [genomes_dir, masked_reads_fastq]
     outputs: [bins_dir]
@@ -108,7 +108,7 @@ steps:
   # → empty refined_bins_dir (exit 0), mirroring qp-pacbio's skip handler.
   - step: bin_refine
     step_type: singleton
-    container: pacbio-processing-1.0.0.sif
+    container: pacbio-dastool-1.0.0.sif
     entrypoint: /opt/qiita/bin_refine.sh
     inputs: [genomes_dir, bins_dir]
     outputs: [refined_bins_dir]
@@ -121,7 +121,7 @@ steps:
   # (assembly_load joins them in DuckDB). Empty input → empty checkm_dir (exit 0).
   - step: checkm
     step_type: singleton
-    container: pacbio-processing-1.0.0.sif
+    container: pacbio-checkm-1.0.0.sif
     entrypoint: /opt/qiita/checkm.sh
     inputs: [refined_bins_dir]
     outputs: [checkm_dir]

@@ -1,0 +1,66 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# Per-tool image for the pacbio-processing `checkm` step (CheckM + pplacer/hmmer/
+# prodigal). One of four single-tool images the workflow ships; see assemble.def
+# for the split rationale. Invoked as `apptainer exec <sif> /opt/qiita/checkm.sh`
+# (per-step entrypoint), so the %runscript is unused.
+#
+# CheckM reference data (~1.4 GB) is NOT baked in — it is bind-mounted at run time
+# from PATH_DERIVED and pointed at via CHECKM_DATA_PATH in checkm.sh.
+#
+# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
+# bioconda pins and the CheckM `--tab_table` headers `"Bin Id"`/`"Genome size
+# (bp)"`/`"# contigs"` (consumed downstream by assembly_load with DuckDB) must be
+# verified on the first Linux build (`make test-workflows` / build-sifs.sh);
+# pinned against CheckM 1.x source, re-confirm against real output.
+
+%labels
+    workflow pacbio-processing
+    tool checkm
+    version 1.0.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    _lib.sh /opt/qiita/_lib.sh
+    # This image's per-step entrypoint.
+    checkm.sh /opt/qiita/checkm.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json), gawk, pigz (fast (de)compress), procps, findutils — the
+    # base utilities the entrypoint relies on outside the tool env.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+
+    # One env for this tool. Channels bioconda + conda-forge; versions pinned
+    # loosely here and tightened after the first Linux build resolves the solve.
+    #  - checkm: CheckM + its external binaries (pplacer, hmmer, prodigal).
+    micromamba create -y -n checkm -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
+
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/checkm.sh
+    chmod 0644 /opt/qiita/manifest_writer.py
+
+    micromamba clean -a -y
+
+%test
+    set -e
+    micromamba env list | grep -q checkm
+    micromamba run -n checkm checkm -h >/dev/null
+    # Base utilities + the shipped manifest writer.
+    jq --version
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Guard the entrypoint stays wired to its env.
+    grep -q 'micromamba run -n checkm checkm' /opt/qiita/checkm.sh
+
+%runscript
+    echo "pacbio-checkm image: invoke the step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/checkm.sh" >&2
+    exit 64

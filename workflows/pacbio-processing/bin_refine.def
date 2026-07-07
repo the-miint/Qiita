@@ -1,0 +1,63 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# Per-tool image for the pacbio-processing `bin_refine` step (DAS_Tool + diamond).
+# One of four single-tool images the workflow ships; see assemble.def for the
+# split rationale. Invoked as `apptainer exec <sif> /opt/qiita/bin_refine.sh`
+# (per-step entrypoint), so the %runscript is unused.
+#
+# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
+# bioconda pins and the DAS_Tool summary columns `bin`/`bin_score`/`bin_set`
+# (consumed downstream by assembly_load with DuckDB) must be verified on the first
+# Linux build (`make test-workflows` / build-sifs.sh); pinned against DAS_Tool
+# 1.1.x source, re-confirm against real output.
+
+%labels
+    workflow pacbio-processing
+    tool bin_refine
+    version 1.0.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    _lib.sh /opt/qiita/_lib.sh
+    # This image's per-step entrypoint.
+    bin_refine.sh /opt/qiita/bin_refine.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json), gawk, pigz (fast (de)compress), procps, findutils — the
+    # base utilities the entrypoint relies on outside the tool env.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+
+    # One env for this tool. Channels bioconda + conda-forge; versions pinned
+    # loosely here and tightened after the first Linux build resolves the solve.
+    #  - bin_refine: DAS_Tool + diamond (DAS_Tool bundles its SCG db).
+    micromamba create -y -n dastool -c bioconda -c conda-forge das_tool diamond
+
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/bin_refine.sh
+    chmod 0644 /opt/qiita/manifest_writer.py
+
+    micromamba clean -a -y
+
+%test
+    set -e
+    micromamba env list | grep -q dastool
+    micromamba run -n dastool DAS_Tool --version
+    # Base utilities + the shipped manifest writer.
+    jq --version
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Guard the entrypoint stays wired to its env.
+    grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
+
+%runscript
+    echo "pacbio-dastool image: invoke the step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/bin_refine.sh" >&2
+    exit 64

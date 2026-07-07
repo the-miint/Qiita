@@ -20,9 +20,11 @@ the `no-changelog` label).
   reads (selected by a required `mask_idx`): the runner STREAMS the masked reads
   to a gzip FASTQ (miint `COPY … FORMAT FASTQ`, no intermediate Parquet) and a
   native step records the assembler; four container steps run hifiasm_meta →
-  metawrap binning → DAS_Tool → CheckM (all sharing one
-  `pacbio-processing-1.0.0.sif` via per-step entrypoints, one micromamba env per
-  tool). The storage tail REUSES the reference-add pipeline rather than a bespoke
+  metawrap binning → DAS_Tool → CheckM, each in its OWN per-tool image
+  (`pacbio-assemble` / `pacbio-binning` / `pacbio-dastool` / `pacbio-checkm`,
+  one micromamba env each) so a change to one tool's solve rebuilds only that
+  image and each tool is reusable on its own. The storage tail REUSES the
+  reference-add pipeline rather than a bespoke
   parser: `assembly_hash` reads the LCG + MAG contigs with miint `read_fastx` and
   emits the manifest + hash-keyed chunks + bin_map shape, `mint-features` mints the
   contig features against the SHARED `qiita.feature` (identical bytes collapse to
@@ -661,6 +663,16 @@ the `no-changelog` label).
 
 ### Changed
 
+- **SIF build tooling supports N per-tool images per workflow.** A container
+  workflow may now ship several single-tool images under
+  `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE`
+  and `HASH_INPUTS`) alongside — and fully backward-compatible with — the legacy
+  single `sif-build.env` + `Apptainer.def` form (bcl-convert untouched).
+  `build-sif.sh` takes an optional `<image>` selector, `deploy/build-sifs.sh`
+  discovers both layouts, and a new `qiita_sif_build_inputs_hash_scoped` keys
+  the two-gate idempotency hash to each image's own inputs so one tool's change
+  rebuilds only its image. `pacbio-processing` is the first consumer, split from
+  one four-env image into four per-tool images. (#255)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
   helper; split the orchestrator's all-nullable `StepHandle` into typed
