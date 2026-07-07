@@ -205,6 +205,91 @@ async def test_reference_membership_rejects_duplicate(postgres_pool):
         await postgres_pool.release(conn)
 
 
+async def _make_membership_row(conn, feature_hash):
+    """Insert a reference + feature + their membership row; return
+    (reference_idx, feature_idx). Caller runs inside a rolled-back transaction."""
+    ref_idx = await conn.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', $2) RETURNING reference_idx",
+        f"shard-membership-{feature_hash[:8]}",
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    feat_idx = await conn.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx",
+        feature_hash,
+    )
+    await conn.execute(
+        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx) VALUES ($1, $2)",
+        ref_idx,
+        feat_idx,
+    )
+    return ref_idx, feat_idx
+
+
+async def test_reference_membership_shard_id_defaults_null(postgres_pool):
+    """The pre-existing 2-column membership INSERT leaves shard_id NULL — a
+    feature not yet assigned to a shard (unsharded reference)."""
+    conn = await postgres_pool.acquire()
+    try:
+        tr = conn.transaction()
+        await tr.start()
+        ref_idx, feat_idx = await _make_membership_row(conn, "e0000000-0000-0000-0000-000000000001")
+        shard_id = await conn.fetchval(
+            "SELECT shard_id FROM qiita.reference_membership"
+            " WHERE reference_idx = $1 AND feature_idx = $2",
+            ref_idx,
+            feat_idx,
+        )
+        assert shard_id is None
+        await tr.rollback()
+    finally:
+        await postgres_pool.release(conn)
+
+
+async def test_reference_membership_shard_id_round_trips(postgres_pool):
+    """A shard assignment records the lineage-sorted shard index verbatim."""
+    conn = await postgres_pool.acquire()
+    try:
+        tr = conn.transaction()
+        await tr.start()
+        ref_idx, feat_idx = await _make_membership_row(conn, "e0000000-0000-0000-0000-000000000002")
+        await conn.execute(
+            "UPDATE qiita.reference_membership SET shard_id = 5"
+            " WHERE reference_idx = $1 AND feature_idx = $2",
+            ref_idx,
+            feat_idx,
+        )
+        shard_id = await conn.fetchval(
+            "SELECT shard_id FROM qiita.reference_membership"
+            " WHERE reference_idx = $1 AND feature_idx = $2",
+            ref_idx,
+            feat_idx,
+        )
+        assert shard_id == 5
+        await tr.rollback()
+    finally:
+        await postgres_pool.release(conn)
+
+
+async def test_reference_membership_rejects_negative_shard_id(postgres_pool):
+    """The reference_membership_shard_id_nonneg CHECK rejects a negative shard_id."""
+    conn = await postgres_pool.acquire()
+    try:
+        tr = conn.transaction()
+        await tr.start()
+        ref_idx, feat_idx = await _make_membership_row(conn, "e0000000-0000-0000-0000-000000000003")
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE qiita.reference_membership SET shard_id = -1"
+                " WHERE reference_idx = $1 AND feature_idx = $2",
+                ref_idx,
+                feat_idx,
+            )
+        await tr.rollback()
+    finally:
+        await postgres_pool.release(conn)
+
+
 async def test_feature_genome_fk_on_feature(postgres_pool):
     """feature_genome must reject non-existent feature_idx."""
     conn = await postgres_pool.acquire()

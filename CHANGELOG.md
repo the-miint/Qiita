@@ -15,6 +15,20 @@ the `no-changelog` label).
 
 ### Added
 
+- **Lineage-sorted shard planner + `reference_membership.shard_id` persistence.**
+  The deterministic partition of an analysis reference's features into shards. A
+  pure tiler `qiita_control_plane.shard_planner.tile_by_lineage(items, num_shards)`
+  sorts the sharding units lexicographically by taxonomy lineage string and cuts
+  the sorted list into a fixed `_SHARD_COUNT = 1000` approximately-even shards
+  (fixed count / variable size — the mirror image of the read-block planner). The
+  tiler is generic over units (the caller chooses `item_id = genome_idx` for a
+  genome reference so shards balance by genome count and a genome's contigs stay
+  together); it is deterministic and re-derivable (internal `(lineage, item_id)`
+  sort). A new nullable `qiita.reference_membership.shard_id INTEGER` (+ a `>= 0`
+  CHECK) records the assignment (NULL = unassigned/unsharded), written by
+  `write_shard_assignment` (idempotent, replay-safe, reference-scoped). No shard
+  builds, fan-out, routing, or workflow wiring yet — those are later milestones;
+  16S / no-genome sharding is deferred. (#reference-support)
 - **Per-shard `reference_index.shard_id` + register/GET/derived-store plumbing.**
   The foundation for per-shard *analysis* reference indexes: `qiita.reference_index`
   gains a nullable `shard_id INTEGER` (+ a `>= 0` CHECK) so a sharded index writes

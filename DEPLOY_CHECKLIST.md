@@ -62,6 +62,10 @@ _None yet._
   `20260707000000_reference_index_shard_id.sql` (adds a nullable
   `qiita.reference_index.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
   no backfill or out-of-band steps. (#reference-support)
+- **Shard planner `reference_membership.shard_id`.** `make migrate` applies
+  `20260708000000_reference_membership_shard_id.sql` (adds a nullable
+  `qiita.reference_membership.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
+  no backfill or out-of-band steps. (#reference-support)
 
 ### 4. Deploy
 

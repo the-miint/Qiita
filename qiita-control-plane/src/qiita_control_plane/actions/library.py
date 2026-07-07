@@ -20,7 +20,7 @@ it differently.
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -465,6 +465,45 @@ async def write_membership(
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
     return total_linked, total_seen - total_linked
+
+
+async def write_shard_assignment(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    shards: Sequence[Sequence[int]],
+) -> int:
+    """Record a shard planner's output onto qiita.reference_membership.shard_id.
+
+    `shards[i]` is the list of feature_idx assigned to shard `i`; each listed
+    feature's membership row for this reference is stamped with that shard index.
+    A feature present in no shard list keeps `shard_id NULL` (e.g. a deferred
+    16S / no-genome feature the current sharding pass does not cover).
+
+    Idempotent and replay-safe: it is a straight UPDATE, so re-running the same
+    assignment sets the same values without error. Scoped to `reference_idx`, so
+    a feature shared across references (same feature_idx) is stamped only for
+    this reference's membership row. Batched in `_CHUNK_SIZE` slices so a
+    GG2-scale reference doesn't send one giant array. Returns the total number of
+    membership rows updated (feature_idx values not in this reference's
+    membership match nothing and are not counted).
+    """
+    total_updated = 0
+    async with pool.acquire() as conn, conn.transaction():
+        for shard_id, feature_idxs in enumerate(shards):
+            for start in range(0, len(feature_idxs), _CHUNK_SIZE):
+                batch = list(feature_idxs[start : start + _CHUNK_SIZE])
+                if not batch:
+                    continue
+                rows = await conn.fetch(
+                    "UPDATE qiita.reference_membership SET shard_id = $1"
+                    " WHERE reference_idx = $2 AND feature_idx = ANY($3::bigint[])"
+                    " RETURNING feature_idx",
+                    shard_id,
+                    reference_idx,
+                    batch,
+                )
+                total_updated += len(rows)
+    return total_updated
 
 
 async def register_index(
