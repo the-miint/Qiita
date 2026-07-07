@@ -36,12 +36,16 @@ the `no-changelog` label).
   (feature-keyed contig sequences), `assembly_membership` (which features each
   (prep_sample, run, bin) contains), and `bin_quality` (per-MAG CheckM + DAS_Tool
   provenance, read with DuckDB's CSV reader). Each run has a `processing_idx`
-  identity (deduped on the canonical params hash — workflow/version/assembler) so a
-  re-run with different params never collides a prior run's bins. The step-1
+  identity (deduped on the canonical params hash — workflow/version/mask_idx/
+  assembler, so assembling a different mask's pass-set is a distinct run and never
+  collides a prior run's bins). The step-1
   assembler is a parameter (`hifiasm_meta` default; `myloasm` reserved), threaded
   through the native steps' `params:` (a container step can't take a scalar).
   Empty-branch semantics mirror qp-pacbio: LCG-only samples store successfully,
-  zero-contig samples are a terminal NO_DATA. The cross-sample dereplication /
+  zero-contig samples are a terminal NO_DATA; sub-512 kb circular contigs
+  (plasmids / small replicons) are kept as LCG and separated from chromosome-scale
+  genomes by length at query time rather than deleted. CheckM requires its
+  reference DB (the step fails loud without it — a required deploy step). The cross-sample dereplication /
   taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a separate follow-on
   that reads these per-sample results across many preps. (#255)
 - **Masked-reads streaming binding (`masked_reads_fastq`)** — an assembly
@@ -664,6 +668,18 @@ the `no-changelog` label).
 
 ### Changed
 
+- **`long-read-assembly` review hardening** (before it ships, from human review):
+  the processing identity now includes `mask_idx` — the pass-set selector — so two
+  masks on one sample are distinct runs, not a false disallow-without-delete
+  collision; the assembler default is single-sourced from the action's
+  `context_schema` and the resolved assembler is bound so the container assembles
+  exactly what the identity hashed. CheckM now hard-fails (EX_CONFIG) when its
+  reference DB is absent instead of silently storing empty quality; DAS_Tool
+  distinguishes a benign no-bins result from a real crash (fails loud on the
+  latter). The per-contig split uses `seqkit` (not a hand-rolled awk parser), the
+  masked-reads `COPY` target goes through the fail-fast path validator, and the
+  shared feature-sequence writers moved to a neutral `_feature_load` helper (no
+  job module reaches into another's). (#255)
 - **Renamed the `pacbio-processing` workflow → `long-read-assembly`** to
   generalize its name ahead of future long-read inputs (ONT via myloasm), before
   it ships. The rename covers the workflow dir + `action_id`, the native step /
