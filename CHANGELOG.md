@@ -24,11 +24,11 @@ the `no-changelog` label).
   `read.parquet` that a `register-files` step loads into the existing DuckLake
   `read` table. A plain read loader — it discards all alignment fields and every
   aux tag (methylation MM/ML, kinetics). It targets an unaligned basecaller uBAM:
-  the caller declares `expect_unaligned` (default true) and the job CONFIRMS it
-  via a flags-only `read_alignments` pass, rejecting an aligned BAM BAD_INPUT
-  (whose reverse-strand reads would otherwise be stored mis-oriented); a
-  duplicate-QNAME guard additionally rejects a paired uBAM so one read never gets
-  two `sequence_idx`. No new table, migration, container, or env var. The
+  the caller declares `expect_unaligned` (default true), which the job trusts
+  (an `expect_unaligned=false` ticket is rejected — aligned loading is
+  unsupported; verifying the FLAGs can be layered on later); a duplicate-QNAME
+  guard rejects a paired uBAM so one read never gets two `sequence_idx`. No new
+  table, migration, container, or env var. The
   `PreMintedRange` retry-recovery model moved from `jobs/fastq_to_parquet.py` to
   `sequence_range.py` so both read-ingest jobs share it. (#254)
 

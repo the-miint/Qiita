@@ -20,11 +20,6 @@ the facts the job's SQL depends on that a stubbed unit test can't see:
     this pin fails and the job's guard/comment must be revisited.
   * A header-only SAM (no records) yields ZERO ROWS, not a throw — the job's
     NO_DATA path depends on this (unlike `read_fastx`, which throws on empty).
-  * Because read_sequences_sam has no FLAG column, the job's `expect_unaligned`
-    verify uses `read_alignments` + `alignment_is_unmapped(flags)`
-    (`USMALLINT → BOOLEAN`): true for an unmapped record (FLAG 4), false for a
-    mapped one (secondary/supplementary/aligned). Pinned here so the verify SQL
-    can't silently drift.
 
 Runs against the team-mirror build staged by the session-autouse fixture in
 tests/conftest.py (`open_miint_conn` is LOAD-only).
@@ -105,22 +100,3 @@ def test_read_sequences_sam_empty_yields_zero_rows(tmp_path):
     with open_miint_conn() as conn:
         n = conn.execute("SELECT count(*) FROM read_sequences_sam(?)", [str(path)]).fetchone()[0]
     assert n == 0
-
-
-def test_alignment_is_unmapped_predicate(tmp_path):
-    """The job's expect_unaligned verify: read_alignments exposes `flags`
-    USMALLINT and `alignment_is_unmapped(flags)` → BOOLEAN — true for the unmapped
-    r1 (FLAG 4), false for the mapped r2/r3 (secondary/supplementary)."""
-    sam = _write_sam(tmp_path)
-    with open_miint_conn() as conn:
-        rows = conn.execute(
-            "SELECT read_id, typeof(alignment_is_unmapped(flags)), "
-            "  alignment_is_unmapped(flags) "
-            "FROM read_alignments(?) ORDER BY read_id",
-            [sam],
-        ).fetchall()
-    by_id = {r[0]: r for r in rows}
-    assert by_id["r1"][1] == "BOOLEAN"
-    assert by_id["r1"][2] is True
-    assert by_id["r2"][2] is False
-    assert by_id["r3"][2] is False

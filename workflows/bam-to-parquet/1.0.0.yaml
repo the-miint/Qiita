@@ -47,11 +47,12 @@ context_schema:
     # Caller's alignment-state declaration. This loader supports only unaligned
     # basecaller uBAMs (PacBio HiFi / ONT) — an aligned BAM would store
     # reverse-strand reads mis-oriented. The submitting sequence-load step sets
-    # this True; the `bam` step then CONFIRMS the BAM is actually unaligned (a
-    # flags-only read_alignments pass) and 422s the ticket if not. Optional: the
-    # job defaults expect_unaligned=True, so a hand-submitted ticket that omits
-    # it is still verified. (Not a file path — the upload-handle walker only
-    # touches `*_upload_idx` keys, so it leaves this alone.)
+    # this True; the `bam` step TRUSTS the declaration (it does not yet verify the
+    # BAM's FLAGs — that restriction can be added later). expect_unaligned=False
+    # (an aligned BAM) is rejected outright. Optional: the job defaults True, so a
+    # hand-submitted ticket that omits it is treated as unaligned. (Not a file
+    # path — the upload-handle walker only touches `*_upload_idx` keys, so it
+    # leaves this alone.)
     expect_unaligned:
       type: boolean
 
