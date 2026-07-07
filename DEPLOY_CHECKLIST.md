@@ -19,7 +19,17 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- **PRE-CHECK before the bucket-3 `20260707000000` migration.** That migration adds `UNIQUE(display_name)` to `biosample_global_field` and `prep_sample_global_field`; the `ALTER TABLE ... ADD CONSTRAINT UNIQUE` **fails** if either table already holds duplicate display_names. Find and resolve any before `make migrate`: (#feat_biosample_metadata_import)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "
+    SELECT 'biosample_global_field' AS table_name, display_name, count(*) AS n
+      FROM qiita.biosample_global_field GROUP BY display_name HAVING count(*) > 1
+    UNION ALL
+    SELECT 'prep_sample_global_field' AS table_name, display_name, count(*) AS n
+      FROM qiita.prep_sample_global_field GROUP BY display_name HAVING count(*) > 1"
+  # expect: zero rows. Any row → resolve the duplicate display_name(s) first.
+  ```
 
 ### 3. Migrations
 

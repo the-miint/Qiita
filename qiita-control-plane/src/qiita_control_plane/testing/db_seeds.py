@@ -1,10 +1,12 @@
 """Pytest seed and state-change helpers for DB-row fixtures.
 
 Plain async functions (not pytest fixtures) so callers can pass test-local
-arguments. Helpers fall into three groups: seeders that insert rows and
+arguments. Helpers fall into four groups: seeders that insert rows and
 return the new idx, state-changers that update existing rows (disabling,
-retiring, etc.), and lookup helpers for migration-seeded reference data
-that every test DB carries. Cleanup is the caller's responsibility
+retiring, etc.), lookup helpers for migration-seeded reference data that
+every test DB carries, and a cleanup-tracking helper that records
+import-created rows in a test's `created` dict. Cleanup is the caller's
+responsibility
 (route tests do FK-reverse cleanup against a per-test `created` tracker;
 integration tests may rely on a session-scoped truncate). Helpers are
 pool-based and commit their writes — for repository-layer trigger tests
@@ -25,6 +27,11 @@ from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
+from ..repositories._sample_helpers import (
+    EntityMetadataSpec,
+    _get_or_create_globally_linked_study_field,
+    _get_or_create_local_study_field,
+)
 
 # Seeded NCBI Taxonomy fixture data — must match the seed migration at
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
@@ -399,6 +406,102 @@ async def seed_prep_sample_global_field(
         terminology_idx,
         created_by_idx,
     )
+
+
+async def seed_local_study_field(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    data_type: FieldDataType = FieldDataType.TEXT,
+    required: bool = False,
+) -> int:
+    """Create a purely-local study field for spec's entity and return its idx.
+
+    Delegates to the repository get-or-create so the study-field INSERT and
+    inheritance rules stay single-sourced; the caller supplies display_name and
+    tracks the returned idx for cleanup. Runs inside an acquired transaction
+    because the underlying upsert requires one.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=display_name,
+            created_by_idx=created_by_idx,
+            data_type=data_type,
+            required=required,
+        )
+    return idx
+
+
+async def seed_globally_linked_study_field(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    global_field_idx: int,
+    display_name: str,
+    created_by_idx: int,
+) -> int:
+    """Create a study field linked to global_field_idx for spec's entity and
+    return its idx.
+
+    Delegates to the repository get-or-create so the study-field INSERT and
+    inheritance rules stay single-sourced; the caller supplies display_name and
+    tracks the returned idx for cleanup. Runs inside an acquired transaction
+    because the underlying upsert requires one.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            global_field_idx=global_field_idx,
+            display_name=display_name,
+            created_by_idx=created_by_idx,
+        )
+    return idx
+
+
+async def track_biosample_metadata_outputs(
+    pool: asyncpg.Pool,
+    created: dict,
+    biosample_idx: int,
+    study_idx: int,
+    global_field_idxs: list[int],
+) -> None:
+    """Record, in a test's `created` tracker, the study-field and metadata rows a
+    biosample import produced, so FK-reverse cleanup sweeps them.
+
+    Appends every globally-linked biosample_study_field at study_idx tied to one
+    of global_field_idxs, plus every non-owner-id biosample_metadata row for
+    biosample_idx. An idx already present is not re-appended.
+    """
+    # Pick up every globally-linked study field row at this study tied to
+    # one of the supplied global fields.
+    field_rows = await pool.fetch(
+        "SELECT idx FROM qiita.biosample_study_field"
+        " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
+        study_idx,
+        list(global_field_idxs),
+    )
+    for r in field_rows:
+        if r["idx"] not in created["biosample_study_field"]:
+            created["biosample_study_field"].append(r["idx"])
+
+    # Pick up every non-owner-id metadata row for this biosample.
+    meta_rows = await pool.fetch(
+        "SELECT idx FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        biosample_idx,
+    )
+    for r in meta_rows:
+        if r["idx"] not in created["biosample_metadata"]:
+            created["biosample_metadata"].append(r["idx"])
 
 
 async def seed_biosample_to_study_link(

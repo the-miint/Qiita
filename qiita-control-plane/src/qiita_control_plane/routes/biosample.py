@@ -62,6 +62,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories._sample_helpers import (
+    DuplicateGlobalFieldTargetError,
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
     MetadataParseError,
@@ -226,11 +227,24 @@ async def import_biosample(
                 ),
             )
         except StudyFieldConflictError as exc:
+            # found_global_field_idx None means the shadowing study field is
+            # purely-local; otherwise it is bound to a different global field.
+            if exc.found_global_field_idx is None:
+                conflict = "a purely-local field of that name"
+            else:
+                conflict = "a field of that name bound to a different global field"
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"study has an existing field at display_name {exc.display_name!r}"
-                    " bound to a different global field"
+                    f"metadata field {exc.display_name!r} conflicts with"
+                    f" {conflict} already on this study"
+                ),
+            )
+        except DuplicateGlobalFieldTargetError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"metadata fields {exc.display_names!r} all resolve to the same global field"
                 ),
             )
         except SlotOccupiedError as exc:

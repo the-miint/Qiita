@@ -30,7 +30,7 @@ from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
-    preflight_global_metadata,
+    preflight_sample_metadata,
     validate_primary_secondary_studies,
     write_global_metadata_entries,
 )
@@ -312,9 +312,10 @@ async def import_sequenced_prep_sample(
     # Pre-flight: type-resolve every metadata entry against
     # prep_sample_global_field; unknown-name, parse-failure, and
     # unresolved-terminology cases raise before any DB write.
-    parsed_metadata = await preflight_global_metadata(
+    parsed_metadata, _ = await preflight_sample_metadata(
         conn,
         spec=PREP_SAMPLE_METADATA_SPEC,
+        study_idx=primary_study_idx,
         metadata=metadata,
         known_missing_reasons=known_missing_reasons,
     )

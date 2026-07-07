@@ -35,10 +35,15 @@ class SampleEntityKind(StrEnum):
     PREP_SAMPLE = "prep_sample"
 
 
-# One globally-linked metadata value as it travels through this module:
-# a parsed scalar, an intentionally-missing marker, or a terminology term.
-# Mirrors the wire-side qiita_common.models.GlobalMetadataEntry.value union.
-type GlobalMetadataValue = str | Decimal | date | MissingReasonRef | TerminologyTermRef
+# One parsed metadata value as it travels through this module: a scalar, an
+# intentionally-missing marker, or a terminology term. The same shape holds for
+# globally-linked and purely-local values; mirrors the wire-side
+# qiita_common.models.GlobalMetadataEntry.value union.
+type SampleMetadataValue = str | Decimal | date | MissingReasonRef | TerminologyTermRef
+
+# One resolved metadata column: its field row paired with the parsed value to
+# write into it. The unit the preflight emits and the write helpers consume.
+type FieldValuePair = tuple[FieldRow, SampleMetadataValue]
 
 
 class FieldRow(NamedTuple):
@@ -73,7 +78,7 @@ class GlobalMetadataRow(NamedTuple):
     display_name: str
     description: str | None
     data_type: FieldDataType
-    value: GlobalMetadataValue
+    value: SampleMetadataValue
 
 
 # Closed set of data_types currently decoded. BOOLEAN is intentionally
@@ -152,6 +157,28 @@ class StudyFieldConflictError(Exception):
             f"{entity_kind}_study_field at study_idx={study_idx},"
             f" display_name={display_name!r} is bound to global"
             f" {found_global_field_idx!r}, expected {expected_global_field_idx!r}"
+        )
+
+
+class DuplicateGlobalFieldTargetError(Exception):
+    """Raised when two or more input metadata columns resolve to the same
+    global field — directly, or through a study-local alias. One entity's
+    value for a single global field cannot come from multiple columns. Carries
+    the shared global_field_idx and the colliding display_names.
+    """
+
+    def __init__(
+        self,
+        entity_kind: SampleEntityKind,
+        global_field_idx: int,
+        display_names: list[str],
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.global_field_idx = global_field_idx
+        self.display_names = display_names
+        super().__init__(
+            f"multiple {entity_kind} columns target global field"
+            f" {global_field_idx}: {display_names!r}"
         )
 
 
@@ -516,7 +543,7 @@ async def fetch_global_metadata(
         data_type = FieldDataType(r["data_type"])
         missing_reason_idx = r[MISSING_REASON_VALUE_COLUMN]
         terminology_term_idx = r[TERMINOLOGY_TERM_VALUE_COLUMN]
-        value: GlobalMetadataValue
+        value: SampleMetadataValue
         if missing_reason_idx is not None:
             value = MissingReasonRef(idx=missing_reason_idx, name=r["missing_reason_name"])
         elif terminology_term_idx is not None:
@@ -576,7 +603,7 @@ class SlotOccupiedError(Exception):
         study_field_idx: int,
         attempted_study_idx: int,
         contributing_study_idx: int,
-        attempted_value: GlobalMetadataValue,
+        attempted_value: SampleMetadataValue,
         data_type: FieldDataType,
         existing_metadata_idx: int,
         # int arm is the terminology_term.idx FK (read from the typed value
@@ -674,7 +701,7 @@ def _resolve_typed_value_column(data_type: FieldDataType) -> str:
 def _compare_slot_occupant(
     value_column: str,
     existing_row: Mapping[str, object],
-    attempted_value: GlobalMetadataValue,
+    attempted_value: SampleMetadataValue,
 ) -> Literal["same", "different", "occupied_by_missing", "occupied_by_typed"]:
     """Classify the existing slot occupant vs the attempted write.
 
@@ -780,7 +807,7 @@ async def _fetch_slot_occupant(
 def _diagnose_slot_occupant(
     data_type: FieldDataType,
     existing_row: Mapping[str, object],
-    attempted_value: GlobalMetadataValue,
+    attempted_value: SampleMetadataValue,
 ) -> tuple[
     Literal["same", "different", "occupied_by_missing", "occupied_by_typed"],
     str | Decimal | date | int | None,
@@ -811,7 +838,7 @@ def _make_collision_error(
     display_name: str,
     study_field_idx: int,
     attempted_study_idx: int,
-    attempted_value: GlobalMetadataValue,
+    attempted_value: SampleMetadataValue,
     data_type: FieldDataType,
     existing_row: Mapping[str, object],
     global_field_idx: int | None = None,
@@ -957,7 +984,7 @@ async def _insert_metadata(
     entity_idx: int,
     study_field_idx: int,
     data_type: FieldDataType,
-    value: GlobalMetadataValue,
+    value: SampleMetadataValue,
     created_by_idx: int,
 ) -> int:
     """Insert one metadata row into spec.metadata_table and return its idx.
@@ -1012,7 +1039,7 @@ async def _insert_metadata_or_diagnose(
     study_field_created: bool,
     display_name: str,
     data_type: FieldDataType,
-    value: GlobalMetadataValue,
+    value: SampleMetadataValue,
     caller_idx: int,
     global_field_idx: int | None = None,
 ) -> SampleMetadataWriteResult:
@@ -1090,7 +1117,7 @@ async def write_global_metadata_or_diagnose(
     global_field_idx: int,
     display_name: str,
     data_type: FieldDataType,
-    value: GlobalMetadataValue,
+    value: SampleMetadataValue,
     caller_idx: int,
 ) -> SampleMetadataWriteResult:
     """Write one globally-linked metadata row; on cross-study slot collision,
@@ -1253,7 +1280,7 @@ async def write_local_metadata_or_diagnose(
     study_idx: int,
     display_name: str,
     data_type: FieldDataType,
-    value: GlobalMetadataValue,
+    value: SampleMetadataValue,
     caller_idx: int,
     required: bool = False,
     terminology_idx: int | None = None,
@@ -1398,7 +1425,7 @@ async def _resolve_and_parse_metadata_values(
     metadata: Mapping[str, str],
     fields: Mapping[str, FieldRow],
     reason_lookup: Mapping[str, int],
-) -> dict[str, GlobalMetadataValue]:
+) -> dict[str, SampleMetadataValue]:
     """Parse each metadata text value against its already-resolved field row,
     returning display_name -> parsed value.
 
@@ -1440,7 +1467,7 @@ async def _resolve_and_parse_metadata_values(
     # first; TERMINOLOGY-typed fields then route to TerminologyTermRef on hit
     # or raise MetadataParseError on miss; other values dispatch to the typed
     # parser.
-    parsed: dict[str, GlobalMetadataValue] = {}
+    parsed: dict[str, SampleMetadataValue] = {}
     for display_name, text_value in metadata.items():
         field_row = fields[display_name]
         stripped = text_value.strip()
@@ -1471,48 +1498,110 @@ async def _resolve_and_parse_metadata_values(
     return parsed
 
 
-async def preflight_global_metadata(
+async def preflight_sample_metadata(
     conn: asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
+    study_idx: int,
     metadata: Mapping[str, str],
     known_missing_reasons: Mapping[str, int] | None = None,
-) -> list[tuple[FieldRow, GlobalMetadataValue]]:
-    """Resolve every metadata display_name against spec.global_field_table
-    and parse each text value into a typed Python value, a MissingReasonRef
-    (if the text matches a known missing-reason name) or a TerminologyTermRef
-    (if the text matches a qiita.terminology_term row scoped to the field's
-    terminology_idx). Returns (FieldRow, parsed_value) pairs in input
-    order.
+    allow_local: bool = False,
+) -> tuple[list[FieldValuePair], list[FieldValuePair]]:
+    """Resolve and parse metadata into (global_pairs, local_pairs), each a list
+    of (FieldRow, parsed_value) in input order.
 
-    known_missing_reasons maps reason name -> idx; a text value matching a
-    key (after outer-whitespace stripping) is emitted as MissingReasonRef
-    and skips typed parsing. None or empty disables marker recognition.
-    Raises MetadataUnknownFieldsError (carrying every unknown name) before
-    parsing, then MetadataParseError on the first typed-parse failure or
-    unresolved terminology term.
+    With allow_local False only global fields are accepted; with allow_local
+    True a name may also resolve to an existing study-local field on study_idx
+    (never created here). known_missing_reasons maps reason name -> idx; None or
+    empty disables marker recognition. Raises MetadataUnknownFieldsError (name
+    matches no field), StudyFieldConflictError (name is a global field but also
+    a study-local field bound elsewhere), DuplicateGlobalFieldTargetError (two
+    columns target one global field), or MetadataParseError (value will not
+    coerce to its field's data_type).
     """
-    # Resolve all requested display_names in one round trip; the helper
-    # short-circuits on empty input so this is free for metadata-less callers.
+    # Resolve names against global fields first.
     global_field_rows = await fetch_global_fields_by_display_names(
         conn, spec=spec, display_names=metadata.keys()
     )
+    non_global_names = [name for name in metadata if name not in global_field_rows]
 
-    # Collect every unknown name (not first-only) so the caller can surface
-    # them all in one 422.
-    unknown = [name for name in metadata if name not in global_field_rows]
+    # Strict mode (no local writes): reject any non-global names up front,
+    # collecting every name into one error.
+    if not allow_local and non_global_names:
+        raise MetadataUnknownFieldsError(spec.entity_kind, non_global_names)
+
+    # Local write mode: resolve names against the study's *existing* study-local fields.
+    study_field_rows = await fetch_study_fields_by_display_names(
+        conn, spec=spec, study_idx=study_idx, display_names=metadata.keys()
+    )
+
+    # Partition each name into the global-write, local-write, or unknown group,
+    # rejecting one that is both a global field and a differently-bound study field.
+    global_write_rows: dict[str, FieldRow] = {}
+    local_write_rows: dict[str, FieldRow] = {}
+    unknown: list[str] = []
+    for curr_name in metadata:
+        curr_global_field = global_field_rows.get(curr_name)
+        curr_study_field = study_field_rows.get(curr_name)
+        if curr_global_field is not None:
+            if (
+                curr_study_field is not None
+                and curr_study_field.global_field_idx != curr_global_field.global_field_idx
+            ):
+                raise StudyFieldConflictError(
+                    entity_kind=spec.entity_kind,
+                    study_idx=study_idx,
+                    display_name=curr_name,
+                    expected_global_field_idx=curr_global_field.global_field_idx,
+                    found_global_field_idx=curr_study_field.global_field_idx,
+                )
+
+            # Route via the global field (a study-local field here is a
+            # same-global alias; the mismatch case already raised).
+            global_write_rows[curr_name] = curr_global_field
+        elif curr_study_field is not None:
+            if curr_study_field.global_field_idx is not None:
+                # A study-local global alias: write its value through the global field.
+                global_write_rows[curr_name] = curr_study_field
+            else:
+                local_write_rows[curr_name] = curr_study_field
+        else:
+            unknown.append(curr_name)
+
     if unknown:
         raise MetadataUnknownFieldsError(spec.entity_kind, unknown)
 
-    # Parse every value against its resolved field, then zip the results back
-    # into (field, value) pairs in input order.
+    # No two input columns may target the same global field: one entity's value
+    # for a global field cannot come from multiple columns.
+    global_field_sources: dict[int, list[str]] = {}
+    for name, field_row in global_write_rows.items():
+        global_field_sources.setdefault(field_row.global_field_idx, []).append(name)
+    for target_global_field_idx, source_names in global_field_sources.items():
+        if len(source_names) > 1:
+            raise DuplicateGlobalFieldTargetError(
+                entity_kind=spec.entity_kind,
+                global_field_idx=target_global_field_idx,
+                display_names=source_names,
+            )
+
+    all_fields = {**global_write_rows, **local_write_rows}
     parsed_values = await _resolve_and_parse_metadata_values(
         conn,
         metadata=metadata,
-        fields=global_field_rows,
+        fields=all_fields,
         reason_lookup=known_missing_reasons or {},
     )
-    return [(global_field_rows[name], parsed_values[name]) for name in metadata]
+
+    global_and_local_pairs: list[list[FieldValuePair]] = []
+    for curr_rows in global_write_rows, local_write_rows:
+        curr_pairs = [
+            (curr_rows[name], parsed_values[name]) for name in metadata if name in curr_rows
+        ]
+        global_and_local_pairs.append(curr_pairs)
+    # Unpack into named bindings so the return is a statically-fixed 2-tuple
+    # (a bare tuple(list) widens to variadic) and the arity is asserted here.
+    global_pairs, local_pairs = global_and_local_pairs
+    return global_pairs, local_pairs
 
 
 async def insert_entity_to_study(
@@ -1583,14 +1672,17 @@ async def write_global_metadata_entries(
     entity_idx: int,
     study_idx: int,
     caller_idx: int,
-    parsed_metadata: Sequence[tuple[FieldRow, GlobalMetadataValue]],
+    parsed_metadata: Sequence[FieldValuePair],
 ) -> None:
     """Drive write_global_metadata_or_diagnose over every preflight-parsed
     entry, writing each value against study_idx (the field-owning study).
 
-    The first collision or rollback signal write_global_metadata_or_diagnose
-    raises propagates; subsequent entries are not attempted because the
-    caller's outer transaction is the right place to roll partial state back.
+    Each row's global_field_idx names the target global field, so a study-local
+    alias row (whose own idx is the alias study_field, not the global) writes
+    through to the global field it links to. The first collision or rollback
+    signal write_global_metadata_or_diagnose raises propagates; subsequent
+    entries are not attempted because the caller's outer transaction is the
+    right place to roll partial state back.
     """
     # One write per entry, sequentially; the outer transaction is the
     # atomicity boundary.
@@ -1600,9 +1692,46 @@ async def write_global_metadata_entries(
             spec=spec,
             entity_idx=entity_idx,
             study_idx=study_idx,
-            global_field_idx=global_row.idx,
+            global_field_idx=global_row.global_field_idx,
             display_name=global_row.display_name,
             data_type=global_row.data_type,
+            value=parsed_value,
+            caller_idx=caller_idx,
+        )
+
+
+async def write_local_metadata_entries(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    caller_idx: int,
+    resolved_metadata: Sequence[FieldValuePair],
+) -> None:
+    """Write each entry against the study_field its FieldRow names, via
+    _insert_metadata_or_diagnose keyed on the per-field slot.
+
+    Each FieldRow's idx is used directly as the study_field_idx — no
+    get-or-create — so the study_field must already exist. The value is
+    inserted against exactly that study_field and the metadata trigger
+    denormalizes global_field_idx from it. The first collision or rollback
+    signal propagates; subsequent entries are not attempted because the
+    caller's outer transaction rolls partial state back.
+    """
+    # One write per entry, sequentially; the outer transaction is the
+    # atomicity boundary. global_field_idx is omitted, selecting the per-field
+    # local slot and constraint.
+    for field_row, parsed_value in resolved_metadata:
+        await _insert_metadata_or_diagnose(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=study_idx,
+            study_field_idx=field_row.idx,
+            study_field_created=False,
+            display_name=field_row.display_name,
+            data_type=field_row.data_type,
             value=parsed_value,
             caller_idx=caller_idx,
         )

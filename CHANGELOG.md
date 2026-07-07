@@ -2227,6 +2227,17 @@ _None yet._
 - `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)
 - Flight-ticket and login-cookie signing now share `qiita_common.hashing.canonical_json` instead of three hand-rolled `json.dumps(sort_keys=…)` spellings, removing the risk of the HMAC'd wire serialization drifting. (#241)
 - Accepting an AuthRocket invitation redirects to the cookie-anchored `/auth/login` instead of minting a full-ceiling PAT from the un-anchored invitation JWT. (#241)
+- **Biosample import can now populate existing study-local metadata fields.** A
+  `POST /study/{idx}/biosample` metadata column that is not a global field is
+  resolved against the study's existing study-local fields: a purely-local field
+  is written locally, and a study-local alias of a global field writes through to
+  that global field's slot. No new purely-local field is ever minted for a
+  metadata column (the owner-biosample-id field remains the sole create-on-import
+  exception). A column matching nothing is rejected (`422`, unknown field); a
+  column naming a global field shadowed by a conflicting study-local field is
+  rejected (`422`); and two columns resolving to the same global field are
+  rejected (`422`). Enabled by a migration adding `UNIQUE(display_name)` to both
+  `biosample_global_field` and `prep_sample_global_field`.
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only

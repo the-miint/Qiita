@@ -22,7 +22,6 @@ from qiita_common.models import FieldDataType
 from qiita_control_plane.repositories._sample_helpers import (
     FieldRow,
     SampleEntityKind,
-    _get_or_create_local_study_field,
     insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import insert_biosample
@@ -30,6 +29,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_global_field,
+    seed_local_study_field,
     seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
 )
@@ -303,16 +303,14 @@ async def _create_biosample_with_link(ctx):
 async def _create_local_field(ctx, suffix=""):
     """Helper: create a purely-local biosample_study_field, track for cleanup."""
     field_name = f"{unique_field_name()}_{suffix}"
-    async with ctx["pool"].acquire() as conn:
-        async with conn.transaction():
-            idx, _, _ = await _get_or_create_local_study_field(
-                conn,
-                spec=BIOSAMPLE_METADATA_SPEC,
-                study_idx=ctx["study_idx"],
-                display_name=field_name,
-                created_by_idx=ctx["principal_idx"],
-                required=True,
-            )
+    idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        display_name=field_name,
+        created_by_idx=ctx["principal_idx"],
+        required=True,
+    )
     ctx["created"]["biosample_study_field"].append(idx)
     return idx
 

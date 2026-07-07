@@ -24,9 +24,10 @@ from ._sample_helpers import (
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
-    preflight_global_metadata,
+    preflight_sample_metadata,
     validate_primary_secondary_studies,
     write_global_metadata_entries,
+    write_local_metadata_entries,
 )
 from .biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
@@ -279,16 +280,22 @@ async def import_biosample_from_owner_biosample_id(
     ena_sample_accession: str | None = None,
     matrix_tube_id: str | None = None,
 ) -> BiosampleImportResult:
-    """Import one biosample with its owner-id and any globally-linked metadata.
+    """Import one biosample with its owner-id and any supplied metadata.
 
     Creates the biosample, links it to primary_study_idx plus every
-    entry in secondary_study_idxs, writes any supplied metadata
-    against globally-linked biosample_study_field rows on
-    primary_study_idx (auto-creating each linked field on first use),
-    and writes the owner-biosample-id value against a purely-local
-    biosample_study_field on primary_study_idx flagged
-    is_owner_biosample_id=True. Returns a BiosampleImportResult
-    naming the new biosample plus the owner-biosample-id field row.
+    entry in secondary_study_idxs, writes any supplied metadata on
+    primary_study_idx, and writes the owner-biosample-id value against
+    a purely-local biosample_study_field on primary_study_idx flagged
+    is_owner_biosample_id=True. Returns a BiosampleImportResult naming
+    the new biosample plus the owner-biosample-id field row.
+
+    Each metadata key resolves against primary_study_idx: a global
+    field's display_name writes globally (auto-creating the linked
+    study field on first use); an existing purely-local study field
+    writes locally; an existing study-local alias of a global field
+    writes through to that global field. No new purely-local field is
+    ever created for a metadata key — only the owner-biosample-id field
+    is created on import.
 
     primary_study_idx owns the globally-linked field rows and the
     owner-biosample-id local field row; secondary studies share the
@@ -320,13 +327,20 @@ async def import_biosample_from_owner_biosample_id(
           entry whose key equals owner_biosample_id_field_name.
         - BiosampleOwnerIdMissingValueError when
           owner_biosample_id_value matches a missing_value_reason name.
-        - MetadataUnknownFieldsError when any metadata key has no
-          matching biosample_global_field row; all unknown names are
+        - MetadataUnknownFieldsError when a metadata key matches
+          neither a biosample_global_field row nor an existing
+          study-local field on primary_study_idx; all unknown names are
           collected in one error.
+        - StudyFieldConflictError when a metadata key names a global
+          field but primary_study_idx already has a study-local field
+          at that display_name bound to a different global (or none).
+        - DuplicateGlobalFieldTargetError when two or more metadata
+          keys resolve to the same global field (direct + alias, or
+          two aliases).
         - MetadataParseError on first failure to coerce a non-marker
-          text value into the type its global field declares, or on
-          first TERMINOLOGY-typed text that does not resolve to a term
-          in the field's terminology.
+          text value into the type its field declares, or on first
+          TERMINOLOGY-typed text that does not resolve to a term in the
+          field's terminology.
         - LocalWriteOnGloballyLinkedFieldError when
           owner_biosample_id_field_name resolves to a field on
           primary_study_idx that is already globally linked.
@@ -371,14 +385,15 @@ async def import_biosample_from_owner_biosample_id(
         conn, spec=BIOSAMPLE_METADATA_SPEC, metadata=metadata
     )
 
-    # Pre-flight: type-resolve every metadata entry against
-    # biosample_global_field; unknown-name, parse-failure, and
-    # unresolved-terminology cases raise before any DB write.
-    parsed_metadata = await preflight_global_metadata(
+    # Pre-flight: resolve each metadata entry against the study's global and
+    # existing study-local fields; any unresolvable/conflicting case raises pre-write.
+    global_pairs, local_pairs = await preflight_sample_metadata(
         conn,
         spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=primary_study_idx,
         metadata=metadata,
         known_missing_reasons=known_missing_reasons,
+        allow_local=True,
     )
 
     bs_idx = await insert_biosample(
@@ -406,10 +421,19 @@ async def import_biosample_from_owner_biosample_id(
         entity_idx=bs_idx,
         study_idx=primary_study_idx,
         caller_idx=caller_idx,
-        parsed_metadata=parsed_metadata,
+        parsed_metadata=global_pairs,
     )
 
-    # TODO: somewhere in code below here, must extend to support multiple local fields.
+    # Write each metadata entry that resolved to an *existing* purely-local
+    # study field against that field directly (no field is created here).
+    await write_local_metadata_entries(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=primary_study_idx,
+        caller_idx=caller_idx,
+        resolved_metadata=local_pairs,
+    )
 
     # tier_override pins the field above any study-level default so
     # the owner display value never surfaces to non-members (PII).
@@ -439,7 +463,6 @@ async def import_biosample_from_owner_biosample_id(
             found_global_field_idx=resolved_global_field_idx,
         )
 
-    # TODO: must add additional call(s) to insert multiple local fields.
     await insert_owner_biosample_id_metadata(
         conn,
         biosample_idx=bs_idx,

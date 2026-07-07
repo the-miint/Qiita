@@ -29,6 +29,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import BiosampleAccessionField, FieldDataType
 
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
     fetch_seeded_metagenome_term,
     retire_biosample,
@@ -36,7 +37,10 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample,
     seed_biosample_global_field,
     seed_biosample_to_study_link,
+    seed_globally_linked_study_field,
+    seed_local_study_field,
     seed_user_principal,
+    track_biosample_metadata_outputs,
 )
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
@@ -182,7 +186,7 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
     Looks up the owner-biosample-id metadata row by natural key after a
     successful create — the route returns the field idx and the biosample
     idx but not the metadata idx. Tests that supply a non-empty `metadata`
-    dict must additionally call `_track_global_metadata_outputs` to pick up
+    dict must additionally call `track_biosample_metadata_outputs` to pick up
     the globally-linked field rows and per-key metadata rows the route
     auto-creates; this helper only tracks the owner-id surface.
 
@@ -219,38 +223,6 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
             )
             await _track_global_metadata_outputs(ctx, rj["biosample_idx"], study_idx, [host_gf_idx])
     return resp
-
-
-async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
-    """Track globally-linked study fields (by global field idx) and every
-    non-owner-id metadata row written for this biosample. Use after
-    `_post_biosample` in tests that exercised the metadata dict path so
-    the FK-reverse cleanup picks the new rows up. Mirrors the sibling
-    helper in tests/repositories/test_biosample.py so the two layers stay
-    parallel.
-    """
-    # Pick up every globally-linked study field row at this study tied to
-    # one of the supplied global fields.
-    rows = await ctx["pool"].fetch(
-        "SELECT idx FROM qiita.biosample_study_field"
-        " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
-        study_idx,
-        list(global_idxs),
-    )
-    for r in rows:
-        if r["idx"] not in ctx["created"]["biosample_study_field"]:
-            ctx["created"]["biosample_study_field"].append(r["idx"])
-
-    # Pick up every non-owner-id metadata row for this biosample. The
-    # owner-id row is already tracked by _post_biosample.
-    meta_rows = await ctx["pool"].fetch(
-        "SELECT idx FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
-        bs_idx,
-    )
-    for r in meta_rows:
-        if r["idx"] not in ctx["created"]["biosample_metadata"]:
-            ctx["created"]["biosample_metadata"].append(r["idx"])
 
 
 # ===========================================================================
@@ -840,7 +812,9 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
     )
     assert resp.status_code == 201, resp.text
     bs_idx = resp.json()["biosample_idx"]
-    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [date_global, num_global])
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [date_global, num_global]
+    )
 
     # Verify the metadata rows landed with the correct typed values. Scoped to the
     # two fields under test — _post_biosample injects the required host_taxon_id,
@@ -904,8 +878,8 @@ async def test_post_biosample_globally_linked_owner_field_409(ctx):
         metadata={linked_name: "seed-value"},
     )
     assert seed_resp.status_code == 201, seed_resp.text
-    await _track_global_metadata_outputs(
-        ctx, seed_resp.json()["biosample_idx"], study_idx, [global_idx]
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], seed_resp.json()["biosample_idx"], study_idx, [global_idx]
     )
 
     resp = await _post_biosample(
@@ -918,6 +892,188 @@ async def test_post_biosample_globally_linked_owner_field_409(ctx):
     )
     assert resp.status_code == 409, resp.text
     assert linked_name in resp.json()["detail"]
+
+
+async def test_post_biosample_writes_existing_local_field_201(ctx):
+    """Tests the case where a metadata key names an existing purely-local study
+    field: the route writes the value locally (global_field_idx NULL) and 201s.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="local"
+    )
+    local_name = unique_field_name("local")
+    local_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=local_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(local_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name("owner"),
+        owner_biosample_id_value="LOCAL-201",
+        metadata={local_name: "local-value"},
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+
+    rows = await ctx["pool"].fetch(
+        "SELECT biosample_study_field_idx, global_field_idx, value_text"
+        " FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        bs_idx,
+    )
+    assert [dict(r) for r in rows] == [
+        {
+            "biosample_study_field_idx": local_idx,
+            "global_field_idx": None,
+            "value_text": "local-value",
+        }
+    ]
+
+
+async def test_post_biosample_writes_alias_through_to_global_201(ctx):
+    """Tests the case where a metadata key names a study-local alias of a
+    global field: the route writes through to the global slot and 201s.
+    """
+    suffix = secrets.token_hex(4)
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"r_alias_{suffix}",
+        display_name=f"Global Label {suffix}",
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="alias"
+    )
+    alias_name = f"Alias Label {suffix}"
+    alias_idx = await seed_globally_linked_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        global_field_idx=global_idx,
+        display_name=alias_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(alias_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name("owner"),
+        owner_biosample_id_value="ALIAS-201",
+        metadata={alias_name: "alias-value"},
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
+
+    rows = await ctx["pool"].fetch(
+        "SELECT biosample_study_field_idx, global_field_idx, value_text"
+        " FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        bs_idx,
+    )
+    assert [dict(r) for r in rows] == [
+        {
+            "biosample_study_field_idx": alias_idx,
+            "global_field_idx": global_idx,
+            "value_text": "alias-value",
+        }
+    ]
+
+
+async def test_post_biosample_cross_field_conflict_422(ctx):
+    """Tests the case where a metadata key names a global field shadowed by a
+    purely-local study field of the same name: the route returns 422.
+    """
+    suffix = secrets.token_hex(4)
+    shared_name = f"Shared Label {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"r_conflict_{suffix}",
+        display_name=shared_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="conflict"
+    )
+    shadow_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=shared_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(shadow_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name("owner"),
+        owner_biosample_id_value="CONFLICT-422",
+        metadata={shared_name: "x"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert shared_name in resp.json()["detail"]
+
+
+async def test_post_biosample_duplicate_global_target_422(ctx):
+    """Tests the case where a global field's own label and a study-local alias
+    of it both appear in the metadata: the route returns 422 naming both.
+    """
+    suffix = secrets.token_hex(4)
+    global_label = f"Global Label {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"r_dup_{suffix}",
+        display_name=global_label,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="dup")
+    alias_name = f"Alias Label {suffix}"
+    alias_idx = await seed_globally_linked_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        global_field_idx=global_idx,
+        display_name=alias_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(alias_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name("owner"),
+        owner_biosample_id_value="DUP-422",
+        metadata={global_label: "a", alias_name: "b"},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert global_label in detail
+    assert alias_name in detail
 
 
 async def test_post_biosample_metadata_unknown_field_422(ctx):
@@ -1116,7 +1272,9 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # biosample_global_field rows are intentionally NOT tracked here so the
     # cross-study seed survives this test.
     bs_idx = resp.json()["biosample_idx"]
-    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, list(display_to_idx.values()))
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, list(display_to_idx.values())
+    )
 
     # Verify every metadata row landed in the correct typed value_* column:
     # typed scalars in value_text/value_numeric/value_date, ENVO terms in
@@ -1618,7 +1776,9 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
     )
     assert resp.status_code == 201, resp.text
     bs_idx = resp.json()["biosample_idx"]
-    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
 
     resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
@@ -1697,7 +1857,9 @@ async def test_get_biosample_carries_terminology_term(ctx):
     )
     assert resp.status_code == 201, resp.text
     bs_idx = resp.json()["biosample_idx"]
-    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
 
     resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
@@ -1846,7 +2008,9 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
     )
     assert post_resp.status_code == 201, post_resp.text
     bs_idx = post_resp.json()["biosample_idx"]
-    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
 
     resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
