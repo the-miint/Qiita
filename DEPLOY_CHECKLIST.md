@@ -65,6 +65,16 @@ _None yet._
   # expect: read-mask-block|1.0.0|block
   ```
 
+- Confirm the `bam-to-parquet/1.0.0` workflow synced into `qiita.action` (new
+  BAM read-loader — synced by `qiita-admin actions sync` inside `activate.sh`,
+  covered by `make verify-deploy`'s `qiita.action` list; this asserts the specific
+  new action): (#bam-to-parquet)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='bam-to-parquet'"
+  # expect: bam-to-parquet|1.0.0|prep_sample
+  ```
+
 ### Notes (no host action)
 
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)

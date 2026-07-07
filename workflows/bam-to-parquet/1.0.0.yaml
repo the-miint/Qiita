@@ -1,0 +1,70 @@
+action_id: bam-to-parquet
+version: 1.0.0
+target_kind: prep_sample
+# Sequenced-only by definition: a BAM is a sequencing artifact. The submit route
+# reads the prep_sample's processing_kind and 422s if it's not in this list.
+target_processing_kinds: [sequenced]
+
+description: >
+  Load a single sample's BAM (or SAM/CRAM) into the DuckLake `read` table — the
+  BAM analogue of fastq-to-parquet. It reads the file with miint's
+  `read_alignments`, keeps only the read payload (read_id, sequence, quality),
+  mints a contiguous sequence_idx range from the control plane
+  (POST /api/v1/sequence-range), and writes read.parquet keyed by sequence_idx,
+  which a register-files step loads into the `read` table.
+
+  This is a PLAIN read loader: it discards all alignment fields and every aux tag
+  (base-modification / methylation MM/ML, kinetics ipd/pw, etc.). Only primary
+  records are kept (one row per read → one sequence_idx); the input is treated as
+  single-end (sequence2/qual2 NULL), which holds for the long-read BAMs this
+  targets. Full reads are stored ONCE, independent of any mask — the read-mask
+  workflow masks them later, exactly as for FASTQ-ingested reads.
+
+  Per-sample scope (target_kind: prep_sample); the route's submit-time check
+  rejects tickets pointing at non-sequenced preps. The orchestrator authenticates
+  the sequence-range mint with the compute service-account PAT, so the submitter
+  does not need sequence_range:mint on their own token.
+
+scopes: []
+
+audience:
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [bam_path]
+  properties:
+    # Absolute path on the shared filesystem the orchestrator can read.
+    # minLength rejects an empty string; the "^/" pattern rejects relative paths
+    # (which would resolve against whatever CWD the launcher starts in). The
+    # orchestrator's _resolve_input_binds binds the file's parent dir into the
+    # step so the path is visible at the same absolute location.
+    bam_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+
+steps:
+  - step: bam
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.bam_to_parquet
+    inputs: [bam_path]
+    # `read_staging_dir` is the workspace holding read.parquet, which the
+    # register-files step below loads into the DuckLake `read` table.
+    outputs: [read_staging_dir]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
+  # Load the full reads into the DuckLake `read` table (register-files maps the
+  # top-level read.parquet to table = file stem).
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 4
+  mem_gb: 16
+  walltime: PT2H

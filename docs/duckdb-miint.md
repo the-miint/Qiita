@@ -72,7 +72,7 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 
 ### Table functions (`SELECT * FROM …`) — `docs/table-functions.md`
 **Sequence/alignment readers:**
-- `read_alignments(filename, [reference_lengths='table_name'], [include_filepath=false], [include_seq_qual=false])` — SAM/BAM/CRAM
+- `read_alignments(filename, [reference_lengths='table_name'], [include_filepath=false], [include_seq_qual=false])` — SAM/BAM/CRAM. **qiita-verified 2026-07-07** (`bam_to_parquet` job + `tests/jobs/test_bam_to_parquet_miint_contract.py`): with `include_seq_qual := true` it emits `read_id VARCHAR`, `sequence VARCHAR`, `qual UTINYINT[]` (phred-**decoded**, not ASCII — drops straight into the `read` table's `qual1`), and `flags USMALLINT`; one row per alignment record (so secondary/supplementary alignments repeat a read — filter with `alignment_is_secondary(flags)` / `alignment_is_supplementary(flags)`, both `USMALLINT → BOOLEAN`). A headerless SAM (no `@SQ`) is rejected by htslib. **Undocumented upstream + unverified by us:** SEQ orientation for reverse-strand reads (assumed reference-forward per SAM), and output row ordering (`bam_to_parquet` mints its own `row_number()` ordinal rather than trust file order).
 - `alignment_slice(table_name, start, stop, [include_deletions=false])` — pileup-style projection
 - `read_fastx(filename, [sequence2=filename], [include_filepath=false], [qual_offset=33])` — FASTQ/FASTA, paired
 - `read_sequences_sff(filename, [include_filepath=false], [trim=true])`

@@ -104,7 +104,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.models import WorkTicketFailureStage
@@ -121,6 +121,7 @@ from ..miint import (
 )
 from ..read_count import write_read_count
 from ..sequence_range import (
+    PreMintedRange,
     PrepSampleNotEligibleForSequenceRange,
     SequenceRangeAlreadyExists,
     mint_sequence_range,
@@ -146,29 +147,6 @@ YAML_STEP_NAME = "fastq"
 # incl. quality); 7 GB is comfortably above that.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
-
-
-class PreMintedRange(BaseModel):
-    """Operator-supplied recovery range for a retried fastq_to_parquet
-    work_ticket.
-
-    Set only when phase 4 failed transiently on a prior attempt AFTER
-    phase 3 had already minted a sequence-range — the prep_sample's
-    `qiita.sequence_range` row exists and a fresh mint would 409. The
-    operator (or the runner-side automation) reads the existing range,
-    resubmits the work_ticket with this field populated, and the
-    orchestrator skips the mint call.
-
-    The two indices are inclusive on both ends and must match the
-    FASTQ's read count exactly: `sequence_idx_stop - sequence_idx_start
-    + 1 == count_of_reads`. Mismatch → BAD_INPUT.
-
-    See docs/runbooks/fastq-to-parquet-retry-recovery.md for the full
-    operator workflow.
-    """
-
-    sequence_idx_start: int = Field(gt=0)
-    sequence_idx_stop: int = Field(gt=0)
 
 
 class Inputs(BaseModel):

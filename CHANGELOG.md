@@ -15,6 +15,17 @@ the `no-changelog` label).
 
 ### Added
 
+- **`bam-to-parquet` workflow — load a sample's BAM into the `read` table.** The
+  BAM analogue of `fastq-to-parquet`: a single native `bam` step reads the file
+  with miint's `read_alignments`, keeps only the read payload (read_id, sequence,
+  quality) from primary records, mints a `sequence_idx` range, and writes
+  `read.parquet` that a `register-files` step loads into the existing DuckLake
+  `read` table. A plain read loader — it discards all alignment fields and every
+  aux tag (methylation MM/ML, kinetics), and treats input as single-end. No new
+  table, migration, container, or env var. The `PreMintedRange` retry-recovery
+  model moved from `jobs/fastq_to_parquet.py` to `sequence_range.py` so both
+  read-ingest jobs share it. (#bam-to-parquet)
+
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its
