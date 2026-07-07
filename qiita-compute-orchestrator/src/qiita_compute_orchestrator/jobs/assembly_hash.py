@@ -33,8 +33,7 @@ from the globbed paths) JOINs the scan back to each contig's kind + bin without
 fragile filename regex.
 
 0 contigs (no LCG, no MAG under either dir) is a terminal no-data outcome
-(`StepNoData`), mirroring qp-pacbio's skip-on-empty branch — not a
-failure.
+(`StepNoData`), not a failure.
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._feature_load import KIND_LCG, KIND_MAG
+from ._assembly import KIND_LCG, KIND_MAG
 
 YAML_STEP_NAME = "assembly_hash"
 

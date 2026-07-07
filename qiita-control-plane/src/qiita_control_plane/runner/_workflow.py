@@ -302,8 +302,8 @@ async def run_workflow(
                     f"block-scoped; got {scope_target['kind']!r}"
                 )
 
-        # Staged MASKED-read binding (assembly workflows): `masked_reads` is a
-        # sample's `read_masked` pass-set for the action_context `mask_idx`,
+        # Staged MASKED-read binding (assembly workflows): `masked_reads_fastq` is
+        # a sample's `read_masked` pass-set for the action_context `mask_idx`,
         # STREAMED from the data plane over a `read_masked` DoGet straight to gzip
         # FASTQ (miint's native COPY FORMAT FASTQ) — no bespoke DoAction, no
         # intermediate Parquet. Distinct from `reads` (raw) above — read-mask

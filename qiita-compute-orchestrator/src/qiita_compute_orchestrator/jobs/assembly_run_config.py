@@ -1,13 +1,13 @@
 """Native job: emit the assembly run-config (the chosen assembler).
 
-The masked reads are now STREAMED to FASTQ by the control-plane runner (the
-`read_masked` DoGet + miint's native `COPY … FORMAT FASTQ`; see the runner's
-`_resolve_staged_masked_reads`), so this step no longer touches read data — there
-is no intermediate Parquet and no hand-rolled FASTQ. Its only job is to write
-`run_config.json` carrying the `assembler` choice: a scalar can't ride a container
-step's inputs (the runner treats a container input as a bind-mount path), so it
-flows through this native step into a small file the `assemble` container reads
-with `jq`.
+This step's only job is to write `run_config.json` carrying the `assembler`
+choice. It does not touch read data: the masked reads are streamed to FASTQ
+separately by the control-plane runner (the `read_masked` DoGet + miint's native
+`COPY … FORMAT FASTQ`; see the runner's `_resolve_staged_masked_reads`), with no
+intermediate Parquet and no hand-rolled FASTQ. The assembler rides through this
+native step because a scalar can't ride a container step's inputs (the runner
+treats a container input as a bind-mount path), so it flows into a small file the
+`assemble` container reads with `jq`.
 """
 
 from __future__ import annotations

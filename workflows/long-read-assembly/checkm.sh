@@ -1,5 +1,5 @@
 #!/bin/bash
-# Step 4 (qp-pacbio step 7): CheckM quality assessment of the refined MAGs.
+# CheckM quality assessment of the refined MAGs.
 # Output `checkm_dir` = $QIITA_OUTPUT_PATH/checkm holding CheckM's RAW --tab_table
 # output verbatim (the container does NO column normalization — one CSV framework,
 # DuckDB, owns all parsing in assembly_load):

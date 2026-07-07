@@ -1,4 +1,4 @@
-"""Shared feature-sequence writers + assembly `kind` literals.
+"""Shared feature-sequence writers.
 
 Neutral helper for the two job modules that re-key hash-keyed sequence
 outputs to `feature_idx` and emit the DuckLake-shape staging Parquets:
@@ -22,18 +22,6 @@ import duckdb
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS, PARQUET_OPTS_CHUNKED
-
-# The closed `kind` value set stored in the DuckLake/Postgres assembly tables,
-# single-sourced here so `assembly_hash` (producer of `bin_map.kind`) and
-# `assembly_load` (writer of `assembly_membership.kind` / `bin_quality.kind`)
-# stay in lockstep — `bin_quality` joins `assembly_membership` on `kind`, so a
-# drift between the two would silently break that join. Plain module constants,
-# not a cross-language enum: `kind` is a TEXT column with no Postgres ENUM twin
-# (deliberately extensible — a future 'plasmid'/'small_circular' kind is
-# intended), so the shared Python constant is the fail-fast guard, not a DB
-# CHECK.
-KIND_LCG = "LCG"  # a circular genome (large circular genome)
-KIND_MAG = "MAG"  # a refined metagenome-assembled bin
 
 # Per-batch chunk budget for `write_feature_sequence_chunks`. Same
 # rationale as hash_sequences: each batch's in-memory sort is bounded

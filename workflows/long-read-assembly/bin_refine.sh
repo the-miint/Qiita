@@ -1,6 +1,6 @@
 #!/bin/bash
-# Step 3 (qp-pacbio steps 5+6): DAS_Tool consensus refinement over the three
-# binners' output, then expose the winning bins + DAS_Tool's RAW summary table.
+# DAS_Tool consensus refinement over the three binners' output, then expose the
+# winning bins + DAS_Tool's RAW summary table.
 # Output `refined_bins_dir` = $QIITA_OUTPUT_PATH/refined_bins:
 #   <bin>.fa                 one refined MAG per file (ingested as MAG)
 #   das_tool_summary.tsv     DAS_Tool's RAW *_DASTool_summary.tsv, verbatim (no

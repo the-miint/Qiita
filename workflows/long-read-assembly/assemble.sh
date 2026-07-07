@@ -1,6 +1,6 @@
 #!/bin/bash
-# Step 1 (qp-pacbio steps 1+2): assemble masked HiFi reads, then split circular
-# genomes (LCG) from the linear contigs (noLCG). Output `genomes_dir` =
+# Assemble masked HiFi reads, then split circular genomes (LCG) from the linear
+# contigs (noLCG). Output `genomes_dir` =
 # $QIITA_OUTPUT_PATH/genomes:
 #   LCG/<contig>.fna   one circular contig per file, ANY size (ingested as LCG;
 #                      the >=512 kb "large complete genome" cut is a query-time
@@ -47,8 +47,7 @@ esac
 # A linear chromosome is a single contig too, but LCG means a large *circular*
 # genome. A complete but LINEAR chromosome is not circular, so it flows to noLCG
 # and is recovered through binning (as a single-contig MAG if it bins alone). Only
-# closed circular molecules shortcut past binning as LCG. This matches qp-pacbio's
-# split.
+# closed circular molecules shortcut past binning as LCG.
 if [[ -s "${GFA}" ]]; then
     awk '$1=="S" && $2 ~ /tg[0-9]+c$/  {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${WORK}/circular.fa"
     awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"

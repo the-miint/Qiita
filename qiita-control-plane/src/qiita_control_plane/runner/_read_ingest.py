@@ -77,9 +77,9 @@ def _workflow_needs_staged_reads(steps: list[Any]) -> bool:
 
 
 def _workflow_needs_staged_masked_reads(steps: list[Any]) -> bool:
-    """True iff `masked_reads` is consumed by some step but produced by none — so
-    it must be bound externally from the sample's `read_masked` pass-set (the
-    long-read-assembly workflow)."""
+    """True iff `masked_reads_fastq` is consumed by some step but produced by
+    none — so it must be bound externally from the sample's `read_masked` pass-set
+    (the long-read-assembly workflow)."""
     if not _workflow_declares_input(steps, STAGED_MASKED_READS_BINDING):
         return False
     for entry in steps:

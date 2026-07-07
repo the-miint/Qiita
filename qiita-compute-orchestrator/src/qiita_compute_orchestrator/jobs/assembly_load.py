@@ -23,9 +23,9 @@ containers emit CheckM's / DAS_Tool's tables verbatim (a plain `cp`, no awk/pyth
 normalization), so DuckDB is the ONE csv framework in this path (never a Python
 csv parser, never a shell transform on the tool tables).
 
-Empty/partial semantics mirror qp-pacbio: an LCG-only sample (contigs
-but no MAG) is a SUCCESS — `bin_quality` is written empty (register-files still
-finds all four tables with the right schema). Zero contigs never reaches here
+Empty/partial semantics: an LCG-only sample (contigs but no MAG) is a SUCCESS —
+`bin_quality` is written empty (register-files still finds all four tables with
+the right schema). Zero contigs never reaches here
 (assembly_hash raised StepNoData upstream).
 """
 
@@ -45,8 +45,8 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._assembly import KIND_MAG
 from ._feature_load import (
-    KIND_MAG,
     build_feature_id_map,
     write_feature_sequence_chunks,
     write_feature_sequences,

@@ -28,6 +28,18 @@ CREATE TABLE qiita.processing (
     CONSTRAINT processing_params_hash_len CHECK (octet_length(params_hash) = 32)
 );
 
+COMMENT ON TABLE qiita.processing IS
+    'CP-minted processing-run identity. One row per distinct assembly run — the '
+    'workflow + version + result-affecting params (mask_idx, assembler); '
+    'deduplicated on params_hash (SHA-256 of the canonical params JSON) so the '
+    'same params resolve to the same processing_idx fleet-wide. Mint via '
+    'qiita.mint_processing (idempotent upsert on params_hash); the canonical '
+    'params are built CP-side in the runner _build_processing_params.';
+
+COMMENT ON COLUMN qiita.processing.params_hash IS
+    'SHA-256 (32 bytes) of the canonical params JSON (sorted keys, no '
+    'whitespace), computed in qiita-common / the runner. The UNIQUE dedup key.';
+
 -- Idempotent mint, mirroring qiita.mint_mask_definition: return the existing row
 -- for a params_hash, else insert and return it (concurrent-insert safe).
 CREATE OR REPLACE FUNCTION qiita.mint_processing(
@@ -94,6 +106,14 @@ CREATE TABLE qiita.assembly_membership (
 -- Feature-first lookup (which samples/runs/bins contain a given contig),
 -- mirroring the reference_membership (feature_idx) index.
 CREATE INDEX ON qiita.assembly_membership (feature_idx);
+
+COMMENT ON TABLE qiita.assembly_membership IS
+    'Junction: which deduped contig features a prep_sample''s assembly RUN '
+    '(processing_idx) produced, and in which bin. One row per (prep_sample_idx, '
+    'processing_idx, kind, bin_id, feature_idx) — the assembly analogue of '
+    'qiita.reference_membership. processing_idx disambiguates re-runs so a reused '
+    'bin_id never collides; kind is a producer-owned TEXT set (''LCG'' = circular '
+    'genome, ''MAG'' = refined bin).';
 
 -- migrate:down
 

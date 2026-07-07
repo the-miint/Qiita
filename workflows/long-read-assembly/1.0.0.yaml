@@ -8,7 +8,7 @@ target_kind: prep_sample
 
 description: >
   Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
-  PacBio HiFi long reads (a port of qp-pacbio pipeline B). The runner STREAMS the
+  PacBio HiFi long reads. The runner STREAMS the
   prep_sample's masked reads (the read_masked pass-set for `mask_idx`:
   host/human/QC-failing reads excluded, recorded trims applied) from the data
   plane straight to a gzip FASTQ (`masked_reads_fastq`) via miint's native
@@ -54,7 +54,7 @@ context_schema:
     # assembly_run_config step into run_config.json, which the `assemble`
     # container reads — a scalar can't ride a container step's inputs (the runner
     # would treat it as a bind-mount path). hifiasm_meta is implemented today;
-    # myloasm is reserved for a future assemble-container branch.
+    # myloasm is a valid enum value that is not implemented yet.
     assembler:
       type: string
       enum: [hifiasm_meta, myloasm]
@@ -104,7 +104,7 @@ steps:
       walltime: PT8H
 
   # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
-  # → empty refined_bins_dir (exit 0), mirroring qp-pacbio's skip handler.
+  # → empty refined_bins_dir (exit 0); a real DAS_Tool crash fails the step.
   - step: bin_refine
     step_type: singleton
     container: long-read-assembly-dastool-1.0.0.sif

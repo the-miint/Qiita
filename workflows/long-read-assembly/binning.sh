@@ -1,15 +1,13 @@
 #!/bin/bash
-# Step 2 (qp-pacbio step 4): metaWRAP binning of the noLCG contigs with three
-# binners (metabat2 + maxbin2 + concoct). Output `bins_dir` =
+# metaWRAP binning of the noLCG contigs with three binners (metabat2 + maxbin2 +
+# concoct). Output `bins_dir` =
 # $QIITA_OUTPUT_PATH/bins/{metabat2_bins,maxbin2_bins,concoct_bins}/ (whichever
 # binners produced anything). No contigs, or no bins at all, leaves an empty
 # bins_dir — bin_refine handles that.
 #
 # NOTE: metaWRAP aligns reads with bwa (a short-read aligner) internally to
-# compute coverage; on HiFi reads that is a known suboptimality inherited from
-# qp-pacbio (a minimap2-hifi depth path is a future improvement). qp-pacbio's
-# separate minimap2 pre-map produced a BAM metaWRAP never consumed, so it is
-# dropped here.
+# compute coverage; on HiFi reads that is a known suboptimality. metaWRAP
+# self-aligns, so no separate minimap2 pre-map is run here.
 source /opt/qiita/_lib.sh
 
 GENOMES_DIR="$(qiita_input genomes_dir)"
