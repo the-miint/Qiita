@@ -223,6 +223,64 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Create the assembled_genome + genome_quality tables in DuckLake.
+///
+/// These hold per-sample metagenome-assembly results from the pacbio-processing
+/// workflow: assembled genome sequences (circular LCG genomes + refined MAG
+/// bins) and their CheckM quality metrics. Keyed by the CP-minted
+/// `prep_sample_idx` — the key a later cross-sample merge selects on to gather
+/// many samples' genomes (across preps/studies) into one dereplicated set.
+///
+/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK.
+/// A "genome" (one circular LCG genome or one MAG bin) is the group of contig
+/// rows sharing (prep_sample_idx, kind, genome_local_id); `genome_local_id` is
+/// unique within a sample, so a merge can namespace it globally as
+/// `<prep_sample_idx>_<genome_local_id>`.
+///
+/// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
+/// register_files loads them and they are SQL-queryable in the catalog; external
+/// Flight read-back is added when the cross-sample merge stage lands.
+pub fn ensure_genome_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- One row per assembled contig. A genome (a circular LCG genome or a
+        -- refined MAG bin) is the set of rows sharing
+        -- (prep_sample_idx, kind, genome_local_id). kind is 'LCG' | 'MAG'.
+        -- `sequence` holds the whole contig; length_bp is a convenience/prune
+        -- column. `assembler` records which step-1 tool produced it (provenance).
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_genome (
+            prep_sample_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            genome_local_id VARCHAR NOT NULL,
+            contig_id VARCHAR NOT NULL,
+            sequence VARCHAR NOT NULL,
+            length_bp BIGINT NOT NULL,
+            assembler VARCHAR NOT NULL
+        );
+
+        -- One row per MAG (CheckM quality). LCG quality is (re)computed later in
+        -- the cross-sample merge, so `kind` is 'MAG' here. completeness /
+        -- contamination / strain_heterogeneity + marker_lineage come from
+        -- `checkm lineage_wf --tab_table`; genome_size / n_contigs from
+        -- `checkm qa -o 2` (NOT emitted by --tab_table); das_tool_score /
+        -- source_binner are provenance carried over from DAS_Tool.
+        CREATE TABLE IF NOT EXISTS qiita_lake.genome_quality (
+            prep_sample_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            genome_local_id VARCHAR NOT NULL,
+            marker_lineage VARCHAR,
+            completeness DOUBLE,
+            contamination DOUBLE,
+            strain_heterogeneity DOUBLE,
+            genome_size BIGINT,
+            n_contigs BIGINT,
+            das_tool_score DOUBLE,
+            source_binner VARCHAR,
+            assembler VARCHAR NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +491,28 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "read_masked view should exist exactly once");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_genome_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
+        // EXISTS), and both tables must exist and be queryable afterwards.
+        let conn = setup_conn();
+        ensure_genome_tables(&conn).expect("first ensure_genome_tables");
+        ensure_genome_tables(&conn).expect("second ensure_genome_tables (idempotent)");
+
+        for table in ["assembled_genome", "genome_quality"] {
+            // table is a &'static str literal, so the format! is injection-safe
+            // (test-only pattern; see Cleanup above).
+            let sql = format!(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = '{table}'"
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(n, 1, "{table} table should exist exactly once");
+        }
     }
 
     /// read_masked applies the recorded trims (substr on the sequence, list
