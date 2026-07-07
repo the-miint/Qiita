@@ -10,12 +10,10 @@ From: mambaorg/micromamba:1.5.8
 # invoked as `apptainer exec <sif> /opt/qiita/assemble.sh` (per-step entrypoint),
 # so the %runscript is unused.
 #
-# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
-# bioconda package pins and a few tool-output field names must be verified on the
-# first Linux build (`make test-workflows` / the deploy's build-sifs.sh). The
-# entrypoint emits the tool's RAW tables verbatim (no column normalization);
-# assemble.sh depends on the hifiasm-meta GFA circular-contig `[lc]` name suffix
-# (pinned against hifiasm-meta source; re-confirm against real output).
+# Pinned invariant: assemble.sh depends on hifiasm-meta encoding a contig's
+# circularity in the trailing `[lc]` letter of its GFA segment name (`…tg……c` =
+# circular, `…l` = linear). The entrypoint emits the tool's RAW output verbatim
+# (no column normalization); downstream parsing is DuckDB's.
 
 %labels
     workflow long-read-assembly

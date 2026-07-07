@@ -9,11 +9,9 @@ From: mambaorg/micromamba:1.5.8
 # CheckM reference data (~1.4 GB) is NOT baked in — it is bind-mounted at run time
 # from PATH_DERIVED and pointed at via CHECKM_DATA_PATH in checkm.sh.
 #
-# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
-# bioconda pins and the CheckM `--tab_table` headers `"Bin Id"`/`"Genome size
-# (bp)"`/`"# contigs"` (consumed downstream by assembly_load with DuckDB) must be
-# verified on the first Linux build (`make test-workflows` / build-sifs.sh);
-# pinned against CheckM 1.x source, re-confirm against real output.
+# Pinned invariant: checkm.sh + assembly_load depend on CheckM 1.x's `--tab_table`
+# / `qa -o 2` column names — `"Bin Id"`, `"Genome size (bp)"`, `"# contigs"`,
+# completeness/contamination — consumed downstream by assembly_load with DuckDB.
 
 %labels
     workflow long-read-assembly

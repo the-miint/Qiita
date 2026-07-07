@@ -6,11 +6,9 @@ From: mambaorg/micromamba:1.5.8
 # split rationale. Invoked as `apptainer exec <sif> /opt/qiita/bin_refine.sh`
 # (per-step entrypoint), so the %runscript is unused.
 #
-# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. The exact
-# bioconda pins and the DAS_Tool summary columns `bin`/`bin_score`/`bin_set`
-# (consumed downstream by assembly_load with DuckDB) must be verified on the first
-# Linux build (`make test-workflows` / build-sifs.sh); pinned against DAS_Tool
-# 1.1.x source, re-confirm against real output.
+# Pinned invariant: bin_refine.sh + assembly_load depend on DAS_Tool 1.1.x's
+# `*_DASTool_summary.tsv` summary columns — `bin`, `bin_score`, `bin_set` —
+# consumed downstream by assembly_load with DuckDB.
 
 %labels
     workflow long-read-assembly

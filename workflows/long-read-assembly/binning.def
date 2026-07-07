@@ -7,9 +7,8 @@ From: mambaorg/micromamba:1.5.8
 # `apptainer exec <sif> /opt/qiita/binning.sh` (per-step entrypoint), so the
 # %runscript is unused.
 #
-# BUILD-VALIDATION NOTE: authored on macOS where apptainer can't run. metawrap-mg
-# is the heaviest bioconda solve of the four images; its exact pins must be
-# verified on the first Linux build (`make test-workflows` / build-sifs.sh).
+# metawrap-mg is the heaviest bioconda solve of the four images (metabat2 + maxbin2
+# + concoct + its aligners in one env), so this SIF is the slowest to build.
 
 %labels
     workflow long-read-assembly
