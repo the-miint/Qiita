@@ -38,6 +38,7 @@ def test_library_re_exports_match_module_callables():
 
     assert LIBRARY[LibraryPrimitive.MINT_FEATURES] is lib.mint_features
     assert LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP] is lib.write_membership
+    assert LIBRARY[LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP] is lib.write_assembly_membership
     assert LIBRARY[LibraryPrimitive.REGISTER_FILES] is lib.register_files
     assert LIBRARY[LibraryPrimitive.REGISTER_INDEX] is lib.register_index
     assert LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS] is lib.persist_read_metrics
@@ -71,6 +72,60 @@ async def test_delete_read_mask_block_data_empty_members_short_circuits():
         data_plane_url="grpc://unreachable:1",
     )
     assert rows == 0
+
+
+def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path):
+    """The DuckDB join behind write-assembly-membership resolves each contig's
+    synthetic read_id through bin_map (kind, bin_id) and manifest -> feature_map
+    (sequence_hash -> feature_idx) to one (kind, bin_id, feature_idx) row per
+    contig. Two contigs that collapse to the same feature_idx (identical bytes)
+    stay distinct rows because their bin/kind differ."""
+    import uuid
+
+    import duckdb
+
+    from qiita_control_plane.actions.library import ASSEMBLY_MEMBERSHIP_JOIN_SQL
+
+    h1 = uuid.UUID(int=1)
+    h2 = uuid.UUID(int=2)
+
+    def _write(path, schema, rows):
+        with duckdb.connect(":memory:") as c:
+            c.execute(f"CREATE TEMP TABLE t ({schema})")
+            c.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in rows[0])})", rows)
+            c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+
+    bin_map = tmp_path / "bin_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    feature_map = tmp_path / "feature_map.parquet"
+    _write(
+        bin_map,
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR",
+        [
+            ("LCG:circ1:c1", "LCG", "circ1"),
+            ("MAG:bin.1:x1", "MAG", "bin.1"),
+            ("MAG:bin.2:y1", "MAG", "bin.2"),
+        ],
+    )
+    _write(
+        manifest,
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [
+            ("LCG:circ1:c1", str(h1), 10),
+            ("MAG:bin.1:x1", str(h2), 20),
+            # bin.2 shares bytes with bin.1 -> same hash -> same feature_idx.
+            ("MAG:bin.2:y1", str(h2), 20),
+        ],
+    )
+    _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(str(h1), 100), (str(h2), 200)])
+
+    with duckdb.connect(":memory:") as c:
+        rows = c.execute(
+            ASSEMBLY_MEMBERSHIP_JOIN_SQL, [str(bin_map), str(manifest), str(feature_map)]
+        ).fetchall()
+    assert sorted(rows) == sorted(
+        [("LCG", "circ1", 100), ("MAG", "bin.1", 200), ("MAG", "bin.2", 200)]
+    )
 
 
 def test_reap_staged_reads_none_root_is_noop():
