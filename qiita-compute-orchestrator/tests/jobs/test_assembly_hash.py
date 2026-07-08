@@ -146,6 +146,21 @@ def test_identical_contigs_dedup_to_one_chunk_set(tmp_path):
     assert distinct_hashes == 1
 
 
+def test_lcg_only_no_mag(tmp_path):
+    """LCG-only: a circular genome but NO refined MAGs (empty refined_bins_dir)
+    stores successfully — the single-file circular.fa LCG path + COALESCE bin_id
+    run without any MAG row alongside them (bin_id resolves to the contig id)."""
+    genomes, refined = _layout(tmp_path)
+    _fasta(genomes / "circular.fa", {"c1": "AAAACCCCGGGGTTTT"})
+
+    out = _run(
+        Inputs(genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=5, work_ticket_idx=9),
+        tmp_path / "ws",
+    )
+    bin_map = _rows(out["bin_map"], "read_id, kind, bin_id", "read_id")
+    assert bin_map == [("LCG:c1:c1", "LCG", "c1")]
+
+
 def test_no_contigs_is_no_data(tmp_path):
     genomes, refined = _layout(tmp_path)
     with pytest.raises(StepNoData):

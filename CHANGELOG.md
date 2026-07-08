@@ -664,7 +664,8 @@ the `no-changelog` label).
 - **SIF build tooling supports N per-tool images per workflow.** A container
   workflow may now ship several single-tool images under
   `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE` and a
-  `HASH_INPUTS` listing that image's def + entrypoint(s)) alongside — and fully
+  `HASH_INPUTS` of the entrypoint(s) + shared helper it %files-copies; the def is
+  auto-included in the scoped hash) alongside — and fully
   backward-compatible with — the legacy single `sif-build.env` + `Apptainer.def`
   form (bcl-convert untouched). `build-sif.sh` takes an optional `<image>`
   selector, `deploy/build-sifs.sh` discovers both layouts, and a new
