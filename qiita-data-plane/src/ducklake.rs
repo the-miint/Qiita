@@ -27,6 +27,13 @@ fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parquet row-group size (rows) DuckLake should use when it rewrites the chunked
+/// sequence tables. Must equal `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`: the
+/// orchestrator writes those chunk Parquets at this row count
+/// (`PARQUET_OPTS_CHUNKED` `ROW_GROUP_SIZE`), and the per-table `set_option` calls
+/// below pin DuckLake's own rewrites to the same layout.
+const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
+
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
 /// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session.
@@ -131,13 +138,12 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             pendant_length DOUBLE
         );",
     )?;
-    // The chunked table is written with a 16384-row group (PARQUET_OPTS_CHUNKED
-    // ROW_GROUP_SIZE); pin DuckLake's own rewrites of it to the same layout. Keep
-    // in sync with qiita_common.chunking.CHUNK_ROW_GROUP_SIZE.
-    conn.execute_batch(
-        "CALL qiita_lake.set_option('parquet_row_group_size', 16384, \
-         table_name => 'reference_sequence_chunks');",
-    )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'reference_sequence_chunks');"
+    ))?;
     Ok(())
 }
 
@@ -316,13 +322,12 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             source_binner VARCHAR
         );",
     )?;
-    // Match the 16384-row group the chunk writer uses (PARQUET_OPTS_CHUNKED) so
-    // DuckLake's own rewrites of assembled_sequence_chunks keep the same layout.
-    // Keep in sync with qiita_common.chunking.CHUNK_ROW_GROUP_SIZE.
-    conn.execute_batch(
-        "CALL qiita_lake.set_option('parquet_row_group_size', 16384, \
-         table_name => 'assembled_sequence_chunks');",
-    )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'assembled_sequence_chunks');"
+    ))?;
     Ok(())
 }
 
