@@ -219,10 +219,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # Pass 2 — hash-keyed chunks. Re-scan every FASTA, dedup by canonical
-            # sequence_hash (identical contigs collapse to one — the lex-smaller
-            # contig id wins deterministically), and stream 64 KB `sequence_split`
-            # chunks straight to Parquet. Bytes are chunked exactly as read; the
-            # canonical identity lives in the hash. Mirrors hash_sequences' relabel.
+            # sequence_hash, and stream 64 KB `sequence_split` chunks straight to
+            # Parquet. The dedup is `DISTINCT ON (sequence_hash)` with an explicit
+            # `ORDER BY sequence_hash, contig_id`. contig_id is NOT projected — it is
+            # the tie-break that fixes WHICH row survives per hash group: the
+            # canonical hash folds a sequence and its reverse-complement into ONE
+            # hash, so rows sharing a sequence_hash can carry DIFFERENT raw bytes
+            # (fwd vs revcomp). Without the tie-break DuckDB could keep either row,
+            # so the chunk bytes would vary run-to-run; ordering by contig_id pins
+            # the representative to the lex-smaller contig id, so re-runs write
+            # byte-identical chunks (this tail is replay-safe). Bytes are chunked
+            # exactly as read; the canonical identity lives in the hash. Mirrors
+            # hash_sequences' relabel.
             conn.execute(
                 "COPY ("
                 "  WITH per_contig AS ("
