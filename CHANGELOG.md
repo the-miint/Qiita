@@ -17,50 +17,43 @@ the `no-changelog` label).
 
 - **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
-  reads (selected by a required `mask_idx`): the runner STREAMS the masked reads
-  to a gzip FASTQ (miint `COPY … FORMAT FASTQ`, no intermediate Parquet) and a
-  native step records the assembler; four container steps run hifiasm_meta →
-  metawrap binning → DAS_Tool → CheckM, each in its OWN per-tool image
-  (`long-read-assembly-assemble` / `long-read-assembly-binning` /
-  `long-read-assembly-dastool` / `long-read-assembly-checkm`,
-  one micromamba env each) so a change to one tool's solve rebuilds only that
-  image and each tool is reusable on its own. The storage tail REUSES the
-  reference-add pipeline rather than a bespoke
-  parser: `assembly_hash` reads the LCG + MAG contigs with miint `read_fastx` and
-  emits the manifest + hash-keyed chunks + bin_map shape, `mint-features` mints the
-  contig features against the SHARED `qiita.feature` (identical bytes collapse to
-  one feature_idx — an assembled contig and a reference sequence share identity),
-  `write-assembly-membership` links them to `qiita.assembly_membership`, and
-  `assembly_load` (reusing reference_load's re-key writers) + register-files load
-  four DuckLake tables — `assembled_sequence` / `assembled_sequence_chunks`
+  reads, selected by a required `mask_idx`: the runner's
+  `_resolve_staged_masked_reads` STREAMS the `read_masked` pass-set from the data
+  plane (the existing `read_masked` DoGet — **no bespoke DoAction or payload**) to
+  a gzip FASTQ via miint's native `COPY … FORMAT FASTQ` (the `masked_reads_fastq`
+  binding, the same capability the admin masked-read export uses), so no
+  intermediate Parquet and the data plane never writes a file. It enforces the
+  `mask_sample` completion gate (a partially-masked sample is rejected, not
+  assembled from a partial pass-set) and treats a fully-masked-out sample as a
+  terminal NO_DATA. A native step records the assembler; four container steps run
+  hifiasm_meta → metawrap binning → DAS_Tool → CheckM, each in its OWN per-tool
+  image (`long-read-assembly-{assemble,binning,dastool,checkm}`, one micromamba env
+  each) so a change to one tool's solve rebuilds only that image. CheckM requires
+  its reference DB — the `checkm` step fails loud without it (a required deploy
+  step) — and DAS_Tool fails loud on a real crash while treating a genuine no-bins
+  result as a benign empty. The storage tail REUSES the reference-add pipeline
+  rather than a bespoke parser: `assembly_hash` reads the LCG + MAG contigs with
+  miint `read_fastx` (circular contigs arrive as one multi-FASTA, no per-contig
+  split) and emits the manifest + hash-keyed chunks + bin_map, `mint-features`
+  mints the contig features against the SHARED `qiita.feature` (identical bytes
+  collapse to one feature_idx — an assembled contig and a reference sequence share
+  identity), `write-assembly-membership` links them to `qiita.assembly_membership`,
+  and `assembly_load` (reusing reference_load's re-key writers) + register-files
+  load four DuckLake tables — `assembled_sequence` / `assembled_sequence_chunks`
   (feature-keyed contig sequences), `assembly_membership` (which features each
   (prep_sample, run, bin) contains), and `bin_quality` (per-MAG CheckM + DAS_Tool
   provenance, read with DuckDB's CSV reader). Each run has a `processing_idx`
   identity (deduped on the canonical params hash — workflow/version/mask_idx/
-  assembler, so assembling a different mask's pass-set is a distinct run and never
-  collides a prior run's bins). The step-1
-  assembler is a parameter (`hifiasm_meta` default; `myloasm` reserved), threaded
-  through the native steps' `params:` (a container step can't take a scalar).
-  Empty-branch semantics mirror qp-pacbio: LCG-only samples store successfully,
-  zero-contig samples are a terminal NO_DATA; sub-512 kb circular contigs
-  (plasmids / small replicons) are kept as LCG and separated from chromosome-scale
-  genomes by length at query time rather than deleted. CheckM requires its
-  reference DB (the step fails loud without it — a required deploy step). The cross-sample dereplication /
-  taxonomy / abundance stage (galah/gtdbtk/GToTree/coverm) is a separate follow-on
-  that reads these per-sample results across many preps. (#255)
-- **Masked-reads streaming binding (`masked_reads_fastq`)** — an assembly
-  workflow that consumes ready-for-consumption reads declares `masked_reads_fastq`;
-  the runner's `_resolve_staged_masked_reads` STREAMS the prep_sample's
-  `read_masked` pass-set from the data plane (the existing `read_masked` DoGet
-  ticket — **no bespoke DoAction or payload**) and writes it to a gzip FASTQ with
-  miint's native `COPY … (FORMAT FASTQ)` — the same capability the admin
-  masked-read export uses, so no intermediate Parquet, no hand-rolled FASTQ, and
-  the data plane never writes a file (it streams). A distinct binding from raw
-  `reads` (which read-mask workflows consume). The resolver enforces the
-  `mask_sample` completion gate — a partially-masked block sample is rejected
-  rather than assembled from a partial pass-set — and treats a fully-masked-out
-  sample (0 passing reads, a common outcome) as a terminal NO_DATA, not a
-  failure. (#255)
+  assembler, so a different mask's pass-set is a distinct run that never collides a
+  prior run's bins). The step-1 assembler is a parameter (`hifiasm_meta` default;
+  `myloasm` reserved), threaded through the native steps' `params:` (a container
+  step can't take a scalar). Empty-branch semantics: LCG-only samples store
+  successfully, zero-contig samples are a terminal NO_DATA; sub-512 kb circular
+  contigs (plasmids / small replicons) are kept as LCG and separated from
+  chromosome-scale genomes by length at query time rather than deleted. The
+  cross-sample dereplication / taxonomy / abundance stage
+  (galah/gtdbtk/GToTree/coverm) is a separate follow-on that reads these per-sample
+  results across many preps. (#255)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its
@@ -668,45 +661,17 @@ the `no-changelog` label).
 
 ### Changed
 
-- **`long-read-assembly` — parquet-native LCG handling.** The `assemble` container
-  now emits circular contigs as a single `circular.fa` multi-FASTA (dropping the
-  per-contig `seqkit split` step and `seqkit` from the image); the native
-  `assembly_hash` step reads it with miint `read_fastx`, deriving each LCG's
-  `bin_id` from the record id — one less tool and no per-contig filesystem split,
-  moving the parse to the miint-having native job. Also fixed the per-tool SIF
-  specs to list their `.def` in `HASH_INPUTS`, so a def-only change retriggers the
-  scoped rebuild hash. (#255)
-- **`long-read-assembly` review hardening** (before it ships, from human review):
-  the processing identity now includes `mask_idx` — the pass-set selector — so two
-  masks on one sample are distinct runs, not a false disallow-without-delete
-  collision; the assembler default is single-sourced from the action's
-  `context_schema` and the resolved assembler is bound so the container assembles
-  exactly what the identity hashed. CheckM now hard-fails (EX_CONFIG) when its
-  reference DB is absent instead of silently storing empty quality; DAS_Tool
-  distinguishes a benign no-bins result from a real crash (fails loud on the
-  latter). The per-contig split uses `seqkit` (not a hand-rolled awk parser), the
-  masked-reads `COPY` target goes through the fail-fast path validator, and the
-  shared feature-sequence writers moved to a neutral `_feature_load` helper (no
-  job module reaches into another's). (#255)
-- **Renamed the `pacbio-processing` workflow → `long-read-assembly`** to
-  generalize its name ahead of future long-read inputs (ONT via myloasm), before
-  it ships. The rename covers the workflow dir + `action_id`, the native step /
-  module `pacbio_export_reads` → `assembly_run_config`, and the four per-tool SIFs
-  (`pacbio-{assemble,binning,dastool,checkm}-1.0.0.sif` →
-  `long-read-assembly-{assemble,binning,dastool,checkm}-1.0.0.sif`). The workflow
-  still runs on PacBio HiFi reads via hifiasm_meta today (ONT is a later branch);
-  its `Inputs`/`execute` contract, params, and DuckLake outputs are unchanged.
-  (#255)
 - **SIF build tooling supports N per-tool images per workflow.** A container
   workflow may now ship several single-tool images under
-  `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE`
-  and `HASH_INPUTS`) alongside — and fully backward-compatible with — the legacy
-  single `sif-build.env` + `Apptainer.def` form (bcl-convert untouched).
-  `build-sif.sh` takes an optional `<image>` selector, `deploy/build-sifs.sh`
-  discovers both layouts, and a new `qiita_sif_build_inputs_hash_scoped` keys
-  the two-gate idempotency hash to each image's own inputs so one tool's change
-  rebuilds only its image. `long-read-assembly` is the first consumer, split from
-  one four-env image into four per-tool images. (#255)
+  `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE` and a
+  `HASH_INPUTS` listing that image's def + entrypoint(s)) alongside — and fully
+  backward-compatible with — the legacy single `sif-build.env` + `Apptainer.def`
+  form (bcl-convert untouched). `build-sif.sh` takes an optional `<image>`
+  selector, `deploy/build-sifs.sh` discovers both layouts, and a new
+  `qiita_sif_build_inputs_hash_scoped` keys the two-gate idempotency hash to each
+  image's own inputs so a change to one tool's def or entrypoint rebuilds only its
+  image. `long-read-assembly` is the first consumer, shipping four per-tool images
+  (assemble / binning / dastool / checkm). (#255)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
   helper; split the orchestrator's all-nullable `StepHandle` into typed
