@@ -107,7 +107,7 @@ _None yet._
 
 - Confirm the deploy re-rendered nginx with the hardened Flight edge
   (`activate.sh` re-installs `qiita.conf` + `nginx -t` + `systemctl reload nginx`,
-  so no manual step — this just asserts the reload carried the new directives): (#harden/data-plane-public-edge)
+  so no manual step — this just asserts the reload carried the new directives): (#261)
 
   ```bash
   sudo nginx -T 2>/dev/null | grep -A8 'location /arrow.flight.protocol.FlightService/' \
@@ -158,7 +158,7 @@ _None yet._
   `read_masked` DoGet (defense-in-depth; via the binary restart), and the CLI
   `--data-plane-url` help now points at the public `grpc+tls://<host>:443` form
   (the `grpc://<host>:50051` example is the firewalled on-host port). No new env
-  var, host dir, scope, migration, or SIF. (#harden/data-plane-public-edge)
+  var, host dir, scope, migration, or SIF. (#261)
 
 ---
 

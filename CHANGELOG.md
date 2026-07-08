@@ -690,7 +690,7 @@ the `no-changelog` label).
   studies) as defense-in-depth; the reference_* tables still allow an unfiltered
   read by design. CLI `--data-plane-url` help now shows the public
   `grpc+tls://<host>:443` form — the old `grpc://<host>:50051` example is the
-  on-host/direct port and is not reachable off the deploy host. (#harden/data-plane-public-edge)
+  on-host/direct port and is not reachable off the deploy host. (#261)
 
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
