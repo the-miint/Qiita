@@ -42,10 +42,13 @@ from __future__ import annotations
 from pathlib import Path
 
 __all__ = [
+    "bowtie2_index_path",
     "minimap2_index_path",
     "reference_derived_dir",
     "reference_shard_dir",
     "rype_index_path",
+    "shard_bowtie2_index_prefix",
+    "shard_minimap2_index_path",
     "shard_rype_index_path",
 ]
 
@@ -93,5 +96,35 @@ def shard_rype_index_path(derived_root: Path | str, reference_idx: int, shard_id
 
 def minimap2_index_path(derived_root: Path | str, reference_idx: int) -> Path:
     """The minimap2 ``.mmi`` index file for a reference (a single FILE),
-    written by ``build_minimap2_index``."""
+    written by ``build_minimap2_index`` in host/whole-reference mode."""
     return reference_derived_dir(derived_root, reference_idx) / "minimap2" / "index.mmi"
+
+
+def shard_minimap2_index_path(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
+    """The per-shard minimap2 ``.mmi`` index file of a sharded *analysis*
+    reference:
+    ``{PATH_DERIVED}/references/{reference_idx}/shards/{shard_id}/minimap2/index.mmi``.
+    Composed off ``reference_shard_dir`` so it sits inside the per-reference
+    subtree the ``DELETE /reference-artifact/{idx}`` rmtree purges. Written by
+    ``build_minimap2_index`` in shard mode (one ``.mmi`` per shard, over just that
+    shard's features)."""
+    return reference_shard_dir(derived_root, reference_idx, shard_id) / "minimap2" / "index.mmi"
+
+
+def bowtie2_index_path(derived_root: Path | str, reference_idx: int) -> Path:
+    """The bowtie2 index PREFIX for a reference (host/whole-reference mode):
+    ``{PATH_DERIVED}/references/{reference_idx}/bowtie2/index``. bowtie2 writes
+    MULTIPLE files under this shared prefix (``index.1.bt2`` … ``index.rev.2.bt2``),
+    so this is a prefix, not a single file — ``reference_index.fs_path`` for a
+    bowtie2 row is this prefix. Written by ``build_bowtie2_index``."""
+    return reference_derived_dir(derived_root, reference_idx) / "bowtie2" / "index"
+
+
+def shard_bowtie2_index_prefix(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
+    """The per-shard bowtie2 index PREFIX of a sharded *analysis* reference:
+    ``{PATH_DERIVED}/references/{reference_idx}/shards/{shard_id}/bowtie2/index``.
+    Like ``bowtie2_index_path`` this is a PREFIX (bowtie2 writes multiple ``.bt2``
+    files under it), composed off ``reference_shard_dir`` so it sits inside the
+    per-reference subtree the purge endpoint removes. Written by
+    ``build_bowtie2_index`` in shard mode."""
+    return reference_shard_dir(derived_root, reference_idx, shard_id) / "bowtie2" / "index"

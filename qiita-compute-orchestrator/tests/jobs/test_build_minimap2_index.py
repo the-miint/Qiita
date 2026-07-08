@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import duckdb
@@ -290,3 +292,204 @@ def test_build_minimap2_index_real_smoke(tmp_path, monkeypatch):
     assert mmi.stat().st_size > 0, "minimap2 index is empty (failed/partial build)"
     assert meta["params"]["preset"] == "sr"
     assert meta["params"]["num_subjects"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Shard mode (streaming via B6s) + plan()
+# ---------------------------------------------------------------------------
+
+
+def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
+    """Write a shard feature roster Parquet `(feature_idx BIGINT,
+    sequence_length_bp BIGINT)` — the per-shard subset B5 will stage from
+    reference_membership.shard_id joined with the sequence lengths."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(":memory:") as conn:
+        if not rows:
+            # 0-row but correctly-typed Parquet (an empty shard roster).
+            conn.execute(
+                "COPY (SELECT CAST(NULL AS BIGINT) AS feature_idx, "
+                "CAST(NULL AS BIGINT) AS sequence_length_bp WHERE false) "
+                f"TO '{path}' (FORMAT PARQUET)"
+            )
+            return path
+        values_sql = ", ".join("(CAST(? AS BIGINT), CAST(? AS BIGINT))" for _ in rows)
+        params: list = []
+        for fidx, bp in rows:
+            params.extend([fidx, bp])
+        conn.execute(
+            f"COPY (SELECT * FROM (VALUES {values_sql}) AS t(feature_idx, sequence_length_bp)) "
+            f"TO '{path}' (FORMAT PARQUET)",
+            params,
+        )
+    return path
+
+
+def _fake_stream_from_parquet(parquet: Path, captured: dict):
+    """Build a fake `open_reference_chunk_stream` that registers a local chunk
+    Parquet as the streamed relation (simulating the B6s DoGet), capturing the
+    ticket scope args."""
+
+    @asynccontextmanager
+    async def fake_stream(conn, *, reference_idx, feature_idx, relation="reference_chunks"):
+        captured["reference_idx"] = reference_idx
+        captured["feature_idx"] = feature_idx
+        conn.execute(
+            f"CREATE OR REPLACE VIEW {relation} AS SELECT * FROM read_parquet('{parquet}')"
+        )
+        try:
+            yield relation
+        finally:
+            conn.execute(f"DROP VIEW IF EXISTS {relation}")
+
+    return fake_stream
+
+
+def test_build_minimap2_index_shard_mode(tmp_path, monkeypatch):
+    """Shard mode streams the roster's chunks (via open_reference_chunk_stream),
+    reassembles the subject, writes to `.../shards/{shard_id}/minimap2/index.mmi`,
+    and records `shard_id` + a stream-source params block in the meta."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    shared_root = tmp_path / "shared"
+    monkeypatch.setenv("PATH_DERIVED", str(shared_root))
+
+    reference_idx = 7
+    shard_id = 3
+    # The streamed (roster-scoped) chunks: feature 100 across two out-of-order
+    # chunks, feature 300 single-chunk.
+    stream_parquet = _write_chunks_parquet(
+        tmp_path / "stream.parquet",
+        [(100, 1, "GGGG"), (100, 0, "ACGT"), (300, 0, "TTTT")],
+    )
+    roster = _write_roster(tmp_path / "roster.parquet", [(100, 8), (300, 4)])
+
+    stream_capture: dict = {}
+    monkeypatch.setattr(
+        build_minimap2_index,
+        "open_reference_chunk_stream",
+        _fake_stream_from_parquet(stream_parquet, stream_capture),
+    )
+    save_capture = _stub_capture_save(build_minimap2_index, monkeypatch)
+
+    inputs = build_minimap2_index.Inputs(
+        reference_idx=reference_idx,
+        work_ticket_idx=42,
+        shard_id=shard_id,
+        shard_features=roster,
+    )
+    out = asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
+
+    # Ticket scoped to the roster's feature_idx list.
+    assert stream_capture["reference_idx"] == reference_idx
+    assert sorted(stream_capture["feature_idx"]) == [100, 300]
+    # Subject reassembled from the stream; feature 100 in chunk_index order.
+    assert save_capture["cols"] == ["read_id", "sequence1"]
+    assert save_capture["rows"] == [(100, "ACGTGGGG"), (300, "TTTT")]
+
+    expected = (
+        shared_root
+        / "references"
+        / str(reference_idx)
+        / "shards"
+        / str(shard_id)
+        / "minimap2"
+        / "index.mmi"
+    )
+    assert save_capture["output_path"] == str(expected)
+    assert expected.is_file()
+
+    meta = json.loads(Path(out["minimap2_index_meta"]).read_text())
+    assert meta["index_type"] == "minimap2"
+    assert meta["fs_path"] == str(expected)
+    assert meta["shard_id"] == shard_id
+    assert meta["params"] == {
+        "preset": "sr",
+        "source": "stream",
+        "feature_count": 2,
+        "num_subjects": 2,
+    }
+
+
+def test_build_minimap2_index_shard_empty_roster_raises(tmp_path, monkeypatch):
+    """An empty shard roster is a fail-fast before any stream is opened."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    roster = _write_roster(tmp_path / "roster.parquet", [])
+
+    def _boom(*a, **k):  # open_reference_chunk_stream must never be reached
+        raise AssertionError("stream opened for an empty roster")
+
+    monkeypatch.setattr(build_minimap2_index, "open_reference_chunk_stream", _boom)
+
+    inputs = build_minimap2_index.Inputs(
+        reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+    )
+    with pytest.raises(ValueError, match="roster"):
+        asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
+
+
+def test_build_minimap2_index_shard_inputs_both_or_neither(tmp_path):
+    """shard_id and shard_features must be supplied together."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    with pytest.raises(ValueError):
+        build_minimap2_index.Inputs(
+            reference_idx=1, work_ticket_idx=1, shard_id=0
+        )  # missing shard_features
+    with pytest.raises(ValueError):
+        build_minimap2_index.Inputs(
+            reference_idx=1, work_ticket_idx=1, shard_features=tmp_path / "r.parquet"
+        )  # missing shard_id
+
+
+def test_build_minimap2_index_host_mode_requires_chunks():
+    """Host/whole-reference mode (no shard) requires reference_sequence_chunks."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    with pytest.raises(ValueError, match="reference_sequence_chunks"):
+        build_minimap2_index.Inputs(reference_idx=1, work_ticket_idx=1)
+
+
+def test_build_minimap2_index_plan_host_mode_no_opinion(tmp_path):
+    """Host mode → empty JobPlan (no resource opinion)."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    inputs = build_minimap2_index.Inputs(
+        reference_sequence_chunks=tmp_path / "c", reference_idx=1, work_ticket_idx=1
+    )
+    assert build_minimap2_index.plan(inputs).resources is None
+
+
+def test_build_minimap2_index_plan_shard_mode_sizes_mem(tmp_path):
+    """Shard mode sizes mem_gb from the shard's total bp, floored at the
+    runtime-consistent minimum (DuckDB fallback + minimap2 reserve + headroom)."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    roster = _write_roster(tmp_path / "roster.parquet", [(100, 500_000_000), (300, 500_000_000)])
+    inputs = build_minimap2_index.Inputs(
+        reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+    )
+    plan = build_minimap2_index.plan(inputs)
+    total_bp = 1_000_000_000
+    expected = build_minimap2_index._SHARD_PLAN_FLOOR_GB + math.ceil(
+        total_bp / build_minimap2_index._SHARD_PLAN_BP_PER_GB
+    )
+    assert plan.resources is not None
+    assert plan.resources.mem_gb == expected
+
+
+def test_build_minimap2_index_plan_shard_mem_scales_with_bp(tmp_path):
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    small = _write_roster(tmp_path / "small.parquet", [(1, 100_000_000)])
+    big = _write_roster(tmp_path / "big.parquet", [(1, 40_000_000_000)])
+
+    def _mem(roster):
+        inputs = build_minimap2_index.Inputs(
+            reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+        )
+        return build_minimap2_index.plan(inputs).resources.mem_gb
+
+    assert _mem(big) > _mem(small)

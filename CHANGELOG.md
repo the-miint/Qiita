@@ -15,6 +15,22 @@ the `no-changelog` label).
 
 ### Added
 
+- **Per-shard aligner-subject builders (B4): minimap2 `.mmi` + bowtie2 `.bt2`,
+  streaming via B6s.** `build_minimap2_index` gains a shard mode and a new
+  `build_bowtie2_index` native job lands alongside it. Given a `shard_id` + a
+  runner-staged feature roster, each builds one shard's analysis subject index over
+  just that shard's features, pulling the chunk bytes from the data plane over Arrow
+  Flight (the B6s stream) instead of staging Parquet, and writing to
+  `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/{minimap2,bowtie2}/index*`
+  (new `derived_store` helpers). Host/whole-reference mode is unchanged
+  (byte-identical staging read). The chunk reassembly is single-sourced in a new
+  `subject.stage_subject`; the ticket-fetch+stream composition is a new
+  `data_plane_client.open_reference_chunk_stream`. Both builders expose a `plan()`
+  that sizes shard memory down from the whole-reference baseline. bowtie2's index is
+  preset-independent (`save_bowtie2_index` takes no preset, unlike minimap2) and
+  needs no GPL boundary — both verified against the team-mirror miint build by the
+  host-mode real-miint smokes. The builders are unwired (jobs only); shard
+  assignment, roster staging, fan-out, and workflow wiring are B5. (#reference-support)
 - **`reference_index.index_type` admits `'bowtie2'` (B4 precursor).** A one-line
   additive CHECK migration extends the `reference_index_index_type_check` allow-list
   to `rype`/`minimap2`/`bowtie2`; a matching `INDEX_TYPE_BOWTIE2` constant lands in

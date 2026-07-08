@@ -23,11 +23,14 @@ module import path for jobs that never stream).
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 from qiita_common.api_paths import URL_REFERENCE_DOGET
+
+from .config import get_settings
+from .cp_client import make_cp_client
 
 if TYPE_CHECKING:
     import duckdb
@@ -100,3 +103,46 @@ def stream_reference_chunks(
             conn.unregister(relation)
     finally:
         client.close()
+
+
+@asynccontextmanager
+async def open_reference_chunk_stream(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    reference_idx: int,
+    feature_idx: list[int] | None,
+    relation: str = "reference_chunks",
+) -> AsyncIterator[str]:
+    """Compose the two B6s seams into one: mint a `feature_idx`-scoped DoGet
+    ticket (CO→CP) and stream that roster's `reference_sequence_chunks` rows
+    (CO→DP Flight) into `conn` as `relation`, yielding the registered relation
+    name for the caller to reassemble from inside the `async with` body.
+
+    This is the seam a shard builder imports and monkeypatches in tests. The two
+    underlying seams (`fetch_reference_doget_ticket`, `stream_reference_chunks`)
+    stay separate so the integration test can bypass the CP hop and sign a ticket
+    directly against the fixture data plane's HMAC secret.
+
+    The CP client is closed as soon as the ticket is minted — it is NOT held open
+    for the body (nothing in the body calls the CP). Only the Flight client/stream
+    stays open for the body's duration (the stream is pulled lazily by DuckDB as
+    the reassembly query scans `relation`); it is torn down and the relation
+    unregistered on exit. `feature_idx` scopes the ticket to a shard's roster; pass
+    None only for a whole-reference stream (never `[]` — the CP rejects it).
+    `data_plane_url` resolves from `get_settings()` (the lifespan-installed value on
+    the service, the propagated `DATA_PLANE_URL` on a compute node).
+    """
+    async with make_cp_client() as http:
+        ticket = await fetch_reference_doget_ticket(
+            http=http,
+            reference_idx=reference_idx,
+            table="reference_sequence_chunks",
+            feature_idx=feature_idx,
+        )
+    with stream_reference_chunks(
+        conn,
+        data_plane_url=get_settings().data_plane_url,
+        ticket_bytes=ticket,
+        relation=relation,
+    ) as rel:
+        yield rel
