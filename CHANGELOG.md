@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- **`work_ticket.shard_id` fan-out discriminant (B5 schema).** A nullable
+  `INTEGER` column (CHECK: only legal on `reference` scope, `>= 0`) lets N
+  concurrent same-action build tickets fan out over one reference without
+  colliding. The existing `work_ticket_one_in_flight_per_reference` partial
+  UNIQUE is re-partitioned with `AND shard_id IS NULL` (preserving the exact
+  one-per-reference guarantee for every non-sharded action and the ingest
+  ticket), and a new `work_ticket_one_in_flight_per_shard` gates at most one
+  non-terminal ticket per `(action, reference, shard)`. The `WorkTicket` model
+  and the runner/route read paths carry `shard_id`; a racing INSERT maps to 409
+  like every other scope. Dormant — nothing sets `shard_id` yet. (#reference-support)
 - **Per-shard aligner-subject builders (B4): minimap2 `.mmi` + bowtie2 `.bt2`,
   streaming via B6s.** `build_minimap2_index` gains a shard mode and a new
   `build_bowtie2_index` native job lands alongside it. Given a `shard_id` + a

@@ -1881,6 +1881,12 @@ class WorkTicket(BaseModel):
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     originator_principal_idx: Annotated[int, Field(gt=0)]
     scope_target: ScopeTarget
+    # Analysis-index shard ordinal (0..N-1) for a sharded reference build
+    # ticket; None for every non-sharded ticket. Mirrors qiita.work_ticket.
+    # shard_id, whose CHECK ties a non-NULL value to reference scope. Lets N
+    # concurrent same-action build tickets fan out over one reference without
+    # colliding on work_ticket_one_in_flight_per_reference.
+    shard_id: int | None = None
     action_context: dict[str, Any] = Field(default_factory=dict)
     state: WorkTicketState
     # Retry accounting. retry_count starts at 0 and increments on each
