@@ -29,8 +29,13 @@ miint's `read_fastx` (native parser; `.gz` transparent; `read_id` is the header'
 first token) and split into 64 KB chunks with miint's native `sequence_split`
 (`UNNEST`ed) — never a hand-rolled parser. `read_fastx` returns `filepath` exactly
 as passed, so a small in-memory `file_meta(filepath, kind, bin_id)` table (built
-from the globbed paths) JOINs the scan back to each contig's kind + bin without
-fragile filename regex.
+from the input paths) JOINs the scan back to each contig's kind + bin without
+fragile filename regex. A MAG's bin_id is its file (one FASTA per bin groups many
+contigs); the LCG contigs arrive as a single `circular.fa` multi-FASTA and each is
+its own genome, so an LCG's bin_id is the contig id itself — carried as a NULL
+`file_meta.bin_id` and COALESCE'd from the read_fastx record in the scan. (That
+also means the container needs no per-contig FASTA split: `read_fastx` reads the
+whole multi-FASTA and the id column IS the bin_id.)
 
 0 contigs (no LCG, no MAG under either dir) is a terminal no-data outcome
 (`StepNoData`), not a failure.
@@ -62,6 +67,11 @@ YAML_STEP_NAME = "assembly_hash"
 # FASTA extensions accepted for contig files (both plain and gzip-compressed).
 _FASTA_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
 
+# The `assemble` container emits every circular contig into a single multi-FASTA
+# under genomes_dir (not one file per contig — no split step needed): each record
+# is one circular genome whose bin_id is the contig id itself.
+_LCG_FILE = "circular.fa"
+
 # DuckDB resource caps. `_DUCKDB_MEMORY_GB` is the OFF-SLURM fallback (local
 # backend / tests); under SLURM the limit tracks the real cgroup via
 # `resolve_duckdb_memory_gb()`. DuckDB owns the whole box here (no in-process
@@ -77,7 +87,7 @@ _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
-    `genomes_dir` (holds `LCG/`) and `refined_bins_dir` (MAG bins) are the upstream
+    `genomes_dir` (holds `circular.fa`) and `refined_bins_dir` (MAG bins) are the upstream
     container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
     framework-injected scope scalars (declared for an explicit contract even though
     this step doesn't read them — sequences are run-agnostic, so no processing_idx
@@ -110,17 +120,26 @@ def _fasta_files(base: Path) -> list[Path]:
     return sorted(set(found))
 
 
-def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str, str]]:
-    """Build the `(filepath, kind, bin_id)` rows for every non-empty contig FASTA:
-    LCG under `<genomes_dir>/LCG`, MAG under `<refined_bins_dir>`. Empty files are
-    dropped (`read_fastx` raises on a 0-record input, and one empty path aborts the
-    whole `VARCHAR[]` scan)."""
-    meta: list[tuple[str, str, str]] = []
-    for base, kind in ((genomes_dir / "LCG", KIND_LCG), (refined_bins_dir, KIND_MAG)):
-        for path in _fasta_files(base):
-            if is_empty_sequence_file(path):
-                continue
-            meta.append((str(path), kind, _local_id(path)))
+def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str, str | None]]:
+    """Build the `(filepath, kind, bin_id)` rows for every non-empty contig FASTA.
+
+    - LCG: the single `<genomes_dir>/circular.fa` multi-FASTA of circular contigs.
+      `bin_id` is NULL — an LCG contig is its own genome, so its bin_id is the
+      contig id itself (the read_fastx record id), COALESCE'd in the scan rather
+      than carried here.
+    - MAG: each refined-bin FASTA under `<refined_bins_dir>`; `bin_id` = the
+      filename stem (a bin groups many contigs under one file).
+
+    Empty files are dropped (`read_fastx` raises on a 0-record input, and one empty
+    path aborts the whole `VARCHAR[]` scan)."""
+    meta: list[tuple[str, str, str | None]] = []
+    lcg = genomes_dir / _LCG_FILE
+    if lcg.is_file() and not is_empty_sequence_file(lcg):
+        meta.append((str(lcg), KIND_LCG, None))
+    for path in _fasta_files(refined_bins_dir):
+        if is_empty_sequence_file(path):
+            continue
+        meta.append((str(path), KIND_MAG, _local_id(path)))
     return meta
 
 
@@ -134,7 +153,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             step_name=YAML_STEP_NAME,
             reason=(
                 f"no contigs to hash for prep_sample_idx={inputs.prep_sample_idx} "
-                f"(no LCG under {inputs.genomes_dir}/LCG, no MAG under "
+                f"(no LCG at {inputs.genomes_dir}/{_LCG_FILE}, no MAG under "
                 f"{inputs.refined_bins_dir})"
             ),
         )
@@ -179,8 +198,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "CREATE TEMP TABLE contig AS "
                 "SELECT "
                 "  fm.kind AS kind, "
-                "  fm.bin_id AS bin_id, "
-                "  fm.kind || ':' || fm.bin_id || ':' || rf.read_id AS read_id, "
+                "  COALESCE(fm.bin_id, rf.read_id) AS bin_id, "
+                "  fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) "
+                "|| ':' || rf.read_id AS read_id, "
                 f"  {canonical_sequence_hash_expr('rf.sequence1')} AS sequence_hash, "
                 "  CAST(length(rf.sequence1) AS BIGINT) AS sequence_length_bp "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "

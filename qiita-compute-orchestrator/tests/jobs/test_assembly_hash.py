@@ -33,7 +33,7 @@ def _fasta(path, records: dict[str, str]) -> None:
 def _layout(tmp_path):
     genomes = tmp_path / "genomes"
     refined = tmp_path / "refined"
-    (genomes / "LCG").mkdir(parents=True)
+    genomes.mkdir(parents=True)
     refined.mkdir(parents=True)
     return genomes, refined
 
@@ -57,7 +57,10 @@ def _rows(parquet, cols: str, order: str):
 
 def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
     genomes, refined = _layout(tmp_path)
-    _fasta(genomes / "LCG" / "circ1.fna", {"c1": "AAAACCCCGGGGTTTT"})
+    # circular.fa is a single multi-FASTA of circular contigs; each record is its
+    # OWN LCG genome, so its bin_id IS the contig id (from the read, not a filename)
+    # — no per-contig split step.
+    _fasta(genomes / "circular.fa", {"c1": "AAAACCCCGGGGTTTT", "c2": "GGGGAAAATTTTCCCC"})
     _fasta(refined / "bin.1.fa", {"x1": "ACGTACGTACGTACGT", "x2": "TTTTGGGGCCCCAAAA"})
 
     out = _run(
@@ -75,17 +78,20 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
     )
     assert manifest == sorted(
         [
-            ("LCG:circ1:c1", str(_hash("AAAACCCCGGGGTTTT")), 16),
+            ("LCG:c1:c1", str(_hash("AAAACCCCGGGGTTTT")), 16),
+            ("LCG:c2:c2", str(_hash("GGGGAAAATTTTCCCC")), 16),
             ("MAG:bin.1:x1", str(_hash("ACGTACGTACGTACGT")), 16),
             ("MAG:bin.1:x2", str(_hash("TTTTGGGGCCCCAAAA")), 16),
         ]
     )
 
-    # bin_map: kind + bin_id per synthetic read_id.
+    # bin_map: kind + bin_id per synthetic read_id. Each LCG contig is its own bin
+    # (bin_id == contig id); the MAG's contigs share the file's bin_id.
     bin_map = _rows(out["bin_map"], "read_id, kind, bin_id", "read_id")
     assert bin_map == sorted(
         [
-            ("LCG:circ1:c1", "LCG", "circ1"),
+            ("LCG:c1:c1", "LCG", "c1"),
+            ("LCG:c2:c2", "LCG", "c2"),
             ("MAG:bin.1:x1", "MAG", "bin.1"),
             ("MAG:bin.1:x2", "MAG", "bin.1"),
         ]

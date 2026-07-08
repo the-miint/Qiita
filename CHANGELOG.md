@@ -668,6 +668,14 @@ the `no-changelog` label).
 
 ### Changed
 
+- **`long-read-assembly` — parquet-native LCG handling.** The `assemble` container
+  now emits circular contigs as a single `circular.fa` multi-FASTA (dropping the
+  per-contig `seqkit split` step and `seqkit` from the image); the native
+  `assembly_hash` step reads it with miint `read_fastx`, deriving each LCG's
+  `bin_id` from the record id — one less tool and no per-contig filesystem split,
+  moving the parse to the miint-having native job. Also fixed the per-tool SIF
+  specs to list their `.def` in `HASH_INPUTS`, so a def-only change retriggers the
+  scoped rebuild hash. (#255)
 - **`long-read-assembly` review hardening** (before it ships, from human review):
   the processing identity now includes `mask_idx` — the pass-set selector — so two
   masks on one sample are distinct runs, not a false disallow-without-delete

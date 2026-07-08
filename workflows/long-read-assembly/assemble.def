@@ -42,9 +42,10 @@ From: mambaorg/micromamba:1.5.8
 
     # One env for this tool. Channels bioconda + conda-forge; versions pinned
     # loosely here and tightened after the first Linux build resolves the solve.
-    #  - assemble: hifiasm-meta (awk does the GFA split; seqkit is a general
-    #    long-read utility kept from the combined image's env).
-    micromamba create -y -n assemble -c bioconda -c conda-forge hifiasm_meta seqkit
+    #  - assemble: hifiasm-meta (the assembler). The GFA split is plain awk and the
+    #    circular contigs are emitted as a single multi-FASTA (no per-contig split
+    #    tool), so the native assembly_hash step reads them with miint read_fastx.
+    micromamba create -y -n assemble -c bioconda -c conda-forge hifiasm_meta
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh
     chmod 0644 /opt/qiita/manifest_writer.py

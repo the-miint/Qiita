@@ -77,7 +77,7 @@ steps:
       walltime: PT10M
 
   # hifiasm_meta assembly + circular-genome extraction. Reads run_config.json to
-  # pick the assembler; emits genomes_dir/{LCG/*.fna, noLCG.fa}. 0 contigs is a
+  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
   # terminal no-data outcome inside the container.
   - step: assemble
     step_type: singleton
