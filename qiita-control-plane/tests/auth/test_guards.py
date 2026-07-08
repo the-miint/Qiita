@@ -230,6 +230,66 @@ def test_require_any_scope_401_on_anonymous():
 
 
 # ---------------------------------------------------------------------------
+# stale-token hint: a scope-403 whose real cause is a PAT minted before the
+# scope was added to the caller's role ceiling should tell them to re-login.
+# ---------------------------------------------------------------------------
+
+
+def test_require_scope_403_stale_token_hints_relogin():
+    """Role grants the scope (it's in the live ceiling) but the token predates
+    the grant — the 403 detail carries an actionable re-login hint."""
+    from qiita_control_plane.auth.guards import require_scope
+    from qiita_control_plane.auth.scopes import role_ceiling
+
+    granted = next(iter(role_ceiling(SystemRole.SYSTEM_ADMIN)))
+    dep = require_scope(granted)
+    # admin role, but the token itself carries none of its ceiling scopes.
+    h = _human(role=SystemRole.SYSTEM_ADMIN, scopes=frozenset())
+    with pytest.raises(HTTPException) as exc:
+        dep(h)
+    assert exc.value.status_code == 403
+    assert "qiita login" in exc.value.detail
+
+
+def test_require_scope_403_no_hint_when_scope_outside_ceiling():
+    """A genuinely-unentitled caller (scope not in their role ceiling) gets the
+    plain 403 with no re-login hint — re-minting wouldn't help them."""
+    from qiita_control_plane.auth.guards import require_scope
+    from qiita_control_plane.auth.scopes import role_ceiling
+
+    assert Scope.ADMIN_USER not in role_ceiling(SystemRole.USER)
+    dep = require_scope(Scope.ADMIN_USER)
+    with pytest.raises(HTTPException) as exc:
+        dep(_human(role=SystemRole.USER, scopes=frozenset({Scope.SELF_PROFILE})))
+    assert exc.value.status_code == 403
+    assert "qiita login" not in exc.value.detail
+
+
+def test_require_scope_403_no_hint_for_service_account():
+    """Service accounts don't use the role ceiling, so no re-login hint."""
+    from qiita_control_plane.auth.guards import require_scope
+
+    dep = require_scope(Scope.FEATURE_MINT)
+    with pytest.raises(HTTPException) as exc:
+        dep(_service(scopes=frozenset()))
+    assert exc.value.status_code == 403
+    assert "qiita login" not in exc.value.detail
+
+
+def test_require_any_scope_403_stale_token_hints_relogin():
+    from qiita_control_plane.auth.guards import require_any_scope
+    from qiita_control_plane.auth.scopes import role_ceiling
+
+    granted = next(iter(role_ceiling(SystemRole.SYSTEM_ADMIN)))
+    dep = require_any_scope(granted, Scope.ADMIN_USER)
+    h = _human(role=SystemRole.SYSTEM_ADMIN, scopes=frozenset())
+    with pytest.raises(HTTPException) as exc:
+        dep(h)
+    assert exc.value.status_code == 403
+    assert "qiita login" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
 # require_human_with_role — composes require_human + role check
 # ---------------------------------------------------------------------------
 # These tests exercise the role-check body of the helper directly.

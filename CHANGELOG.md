@@ -54,6 +54,22 @@ the `no-changelog` label).
   cross-sample dereplication / taxonomy / abundance stage
   (galah/gtdbtk/GToTree/coverm) is a separate follow-on that reads these per-sample
   results across many preps. (#255)
+- **`bam-to-parquet` workflow — load a sample's BAM into the `read` table.** The
+  BAM analogue of `fastq-to-parquet`, structurally near-identical: a single native
+  `bam` step reads the file with miint's `read_sequences_sam` (which emits a
+  `read_fastx`-compatible schema, so `sequence_idx` comes from its per-file
+  `sequence_index` just like the FASTQ path), keeps only the read payload
+  (read_id, sequence, quality), mints a `sequence_idx` range, and writes
+  `read.parquet` that a `register-files` step loads into the existing DuckLake
+  `read` table. A plain read loader — it discards all alignment fields and every
+  aux tag (methylation MM/ML, kinetics). It targets an unaligned basecaller uBAM:
+  the caller declares `expect_unaligned` (default true), which the job trusts
+  (an `expect_unaligned=false` ticket is rejected — aligned loading is
+  unsupported; verifying the FLAGs can be layered on later); a duplicate-QNAME
+  guard rejects a paired uBAM so one read never gets two `sequence_idx`. No new
+  table, migration, container, or env var. The
+  `PreMintedRange` retry-recovery model moved from `jobs/fastq_to_parquet.py` to
+  `sequence_range.py` so both read-ingest jobs share it. (#254)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its
@@ -696,6 +712,17 @@ the `no-changelog` label).
   carried over verbatim and each module's public-name set is a superset of the
   original, so no consumer needed editing. No env var, migration, scope, route,
   or wire change. (#248)
+
+- **Scope-403s now flag when your token lacks a scope your role grants, and
+  point at re-login.** A human's PAT scopes are fixed at mint time, so a scope
+  that's in the caller's live `role_ceiling` but absent from the token yields a
+  confusing `missing required scope 'X'` 403 even though the role grants X —
+  whether the scope was added to the ceiling after mint, or the PAT was minted
+  below the ceiling. `require_scope` / `require_any_scope` now append an
+  actionable "run `qiita login` to mint a fresh token with your full role scopes"
+  hint in that case. Genuinely-unentitled callers and service accounts get the
+  plain 403 unchanged — no security-model change (nothing is granted, only the
+  message improves). (#161)
 - **Control-plane test suite parallelized and de-latencied.** Several changes so
   the ~1980 control-plane tests stop dominating CI wall-clock: (1) the
   `test-control-plane-with-db` / `-without-db` targets run under `pytest-xdist`

@@ -44,6 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import httpx
+from pydantic import BaseModel, Field
 from qiita_common.api_paths import (
     URL_SEQUENCE_RANGE_BY_PREP_SAMPLE,
     URL_SEQUENCE_RANGE_PREFIX,
@@ -102,6 +103,30 @@ class PrepSampleNotEligibleForSequenceRange(Exception):
             "step execution, or non-sequenced processing_kind)."
         )
         self.prep_sample_idx = prep_sample_idx
+
+
+class PreMintedRange(BaseModel):
+    """Operator-supplied recovery range for a retried read-ingest work_ticket
+    (the `fastq_to_parquet` and `bam_to_parquet` native jobs both accept it).
+
+    Set only when a prior attempt failed transiently AFTER it had already minted
+    a sequence-range — the prep_sample's `qiita.sequence_range` row exists and a
+    fresh mint would 409. The operator (or runner-side automation) reads the
+    existing range, resubmits the work_ticket with this field populated, and the
+    job skips the mint call.
+
+    The two indices are inclusive on both ends and must match the input's read
+    count exactly: `sequence_idx_stop - sequence_idx_start + 1 == count_of_reads`.
+    Mismatch → BAD_INPUT.
+
+    Lives here (not in a job module) because it is the recovery twin of
+    `MintedSequenceRange` and both read-ingest jobs consume it — neither should
+    import it out of the other. See
+    docs/runbooks/fastq-to-parquet-retry-recovery.md for the full operator flow.
+    """
+
+    sequence_idx_start: int = Field(gt=0)
+    sequence_idx_stop: int = Field(gt=0)
 
 
 async def mint_sequence_range(

@@ -73,6 +73,7 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 ### Table functions (`SELECT * FROM …`) — `docs/table-functions.md`
 **Sequence/alignment readers:**
 - `read_alignments(filename, [reference_lengths='table_name'], [include_filepath=false], [include_seq_qual=false])` — SAM/BAM/CRAM
+- `read_sequences_sam(filename)` — SAM/BAM/CRAM as reads (not alignments), emitting a `read_fastx`-compatible schema (`sequence_index, read_id, comment, sequence1/2, qual1/2`; `qual*` phred-decoded `UTINYINT[]`). **Undocumented upstream**; one row per SAM record (no FLAG column, no secondary/supplementary filter; empty input → 0 rows, not a throw). Contract pinned in `qiita-compute-orchestrator/tests/jobs/test_bam_to_parquet_miint_contract.py`; consumed by `bam_to_parquet`.
 - `alignment_slice(table_name, start, stop, [include_deletions=false])` — pileup-style projection
 - `read_fastx(filename, [sequence2=filename], [include_filepath=false], [qual_offset=33])` — FASTQ/FASTA, paired
 - `read_sequences_sff(filename, [include_filepath=false], [trim=true])`
