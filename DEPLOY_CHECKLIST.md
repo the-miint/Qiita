@@ -159,6 +159,14 @@ _None yet._
   action, no migration; **already-ingested references are NOT backfilled** — only new
   ingests get the 1-1-at-rest shape, so analysts querying `reference_taxonomy` across a
   mix of old and new references will see both shapes. (#reference-support)
+- **New sharded-index observability endpoint (control-plane).**
+  `GET /api/v1/reference/{idx}/shard-index-status` returns a sharded reference's
+  `expected_shards` (N), per-`index_type` `registered_shards`, and `failed_shard_tickets`
+  — the diagnostic for a reference wedged in `indexing` on a permanently-failed shard
+  (remediation: an operator redrives the FAILED build-shard-index ticket; its
+  finalize-shard re-counts and, as the last observer, flips `active`). Scoped to
+  `reference:read` (universal), additive, no new env var / migration / scope / sync.
+  Reads all-zero / empty for an unsharded reference. (#reference-support)
 
 ---
 

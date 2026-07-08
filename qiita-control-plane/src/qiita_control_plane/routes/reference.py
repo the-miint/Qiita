@@ -28,6 +28,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
+    PATH_REFERENCE_SHARD_INDEX_STATUS,
     PATH_REFERENCE_STATUS,
 )
 from qiita_common.auth_constants import Scope
@@ -39,8 +40,10 @@ from qiita_common.models import (
     ReferenceIndex,
     ReferenceKind,
     ReferenceResponse,
+    ReferenceShardIndexStatus,
     ReferenceStatus,
     ReferenceStatusUpdate,
+    WorkTicketState,
 )
 
 from ..actions.library import delete_reference_data
@@ -69,6 +72,10 @@ from ..deps import (
     get_db_pool,
     get_hmac_secret,
     get_tx_conn_factory,
+)
+from ..shard_orchestration import (
+    BUILD_SHARD_INDEX_ACTION_ID,
+    expected_shard_index_types,
 )
 
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
@@ -192,6 +199,87 @@ async def get_reference_index(
             d["params"] = json.loads(d["params"])
         out.append(ReferenceIndex(**d))
     return out
+
+
+@router.get(PATH_REFERENCE_SHARD_INDEX_STATUS)
+async def get_reference_shard_index_status(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> ReferenceShardIndexStatus:
+    """Progress of a sharded analysis reference's fan-out index build.
+
+    Surfaces the count-based, fail-closed completion `finalize_shard` gates on,
+    so a reference wedged in `indexing` on a permanently-failed shard is
+    diagnosable: `expected_shards` is N (the planner's shard count), and
+    `registered_shards` maps each expected `index_type` to how many of the N
+    shards have registered a `reference_index` row — a type below N is
+    incomplete, a type at N is done. `failed_shard_tickets` counts this
+    reference's build-shard-index work tickets in `failed`; the operator
+    redrives those to unwedge the build (each redriven ticket's finalize_shard
+    re-counts and, as the last observer, flips `active`).
+
+    404 when the reference itself doesn't exist. An unsharded reference — or one
+    whose sharding fanned out zero shards — reads all-zero / empty (a valid
+    "nothing sharded here" answer, not an error). Scoped to reference:read like
+    the /index listing: it exposes build progress, not payload."""
+    exists = await pool.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+
+    # N = the shards the planner assigned (COUNT(DISTINCT shard_id) over the
+    # non-NULL membership rows — the same derivation finalize_shard uses; there
+    # is no shard_count column). 0 for an unsharded reference.
+    expected_shards = await pool.fetchval(
+        "SELECT count(DISTINCT shard_id) FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND shard_id IS NOT NULL",
+        reference_idx,
+    )
+
+    # Registered shard rows per index_type — the observed ground truth.
+    rows = await pool.fetch(
+        "SELECT index_type, count(DISTINCT shard_id) AS n FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND shard_id IS NOT NULL GROUP BY index_type",
+        reference_idx,
+    )
+    registered_shards: dict[str, int] = {r["index_type"]: r["n"] for r in rows}
+
+    # Seed every expected index_type (read from any one build-shard-index
+    # ticket's copied context) at 0, so a type whose shards ALL failed to
+    # register shows as `type: 0` rather than being silently absent. This is the
+    # same expected set finalize_shard checks against N.
+    ctx = await pool.fetchval(
+        "SELECT action_context FROM qiita.work_ticket"
+        " WHERE reference_idx = $1 AND action_id = $2"
+        " ORDER BY work_ticket_idx DESC LIMIT 1",
+        reference_idx,
+        BUILD_SHARD_INDEX_ACTION_ID,
+    )
+    ctx_dict = json.loads(ctx) if isinstance(ctx, str) else ctx
+    # A well-formed fan-out ticket always carries an object; guard the shape so a
+    # malformed / JSON-`null` context degrades this diagnostic to observed-only
+    # rather than 500ing (asyncpg hands JSON null back as the string "null", so
+    # it survives the fetch and json.loads to Python None — caught here too).
+    if isinstance(ctx_dict, dict):
+        for index_type in expected_shard_index_types(ctx_dict):
+            registered_shards.setdefault(index_type, 0)
+
+    failed_shard_tickets = await pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket"
+        " WHERE reference_idx = $1 AND action_id = $2 AND state = $3",
+        reference_idx,
+        BUILD_SHARD_INDEX_ACTION_ID,
+        WorkTicketState.FAILED.value,
+    )
+
+    return ReferenceShardIndexStatus(
+        reference_idx=reference_idx,
+        expected_shards=expected_shards,
+        registered_shards=registered_shards,
+        failed_shard_tickets=failed_shard_tickets,
+    )
 
 
 @router.get(PATH_REFERENCE_BY_IDX)

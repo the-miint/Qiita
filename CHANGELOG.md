@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded-index status endpoint (B5, observability).** New
+  `GET /api/v1/reference/{idx}/shard-index-status` (model `ReferenceShardIndexStatus`)
+  surfaces a sharded reference's fan-out build progress: `expected_shards` (N, derived
+  from `reference_membership.shard_id` — the same count `finalize-shard` gates on),
+  per-`index_type` `registered_shards` (each expected type seeded to 0 so a wholly-unbuilt
+  type is visible rather than absent), and `failed_shard_tickets` (build-shard-index
+  tickets in `failed`). Makes a reference wedged in `indexing` on a permanently-failed
+  shard diagnosable; remediation is an operator redrive of the FAILED ticket. Scoped to
+  `reference:read` like the `/index` listing; an unsharded reference reads all-zero /
+  empty. (#reference-support)
 - **Sharded reference-add wiring + build-shard-index workflow + CLI (B5,
   live end-to-end).** `reference-add` / `local-reference-add` gain an opt-in
   `shard_index` context flag (+ `build_rype`/`build_minimap2`/`build_bowtie2`

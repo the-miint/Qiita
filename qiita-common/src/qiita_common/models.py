@@ -339,6 +339,36 @@ class ReferenceIndex(BaseModel):
     shard_id: int | None = None
 
 
+class ReferenceShardIndexStatus(BaseModel):
+    """Returned by GET /api/v1/reference/{idx}/shard-index-status.
+
+    Observability for a sharded analysis reference's fan-out build (the
+    `plan-shards` -> N x `build-shard-index` -> `finalize-shard` pipeline).
+    Makes a reference wedged in `indexing` on a permanently-failed shard
+    visible so an operator can redrive the offending ticket.
+
+    `expected_shards` is N, the shard count the planner assigned (COUNT(DISTINCT
+    shard_id) over `reference_membership`). `registered_shards` maps each
+    expected `index_type` to how many of the N shards have a registered
+    `reference_index` row: a type whose shards all completed reads `N`, a wedged
+    type reads `< N`, and a wholly-failed type reads `0` (still keyed, so it is
+    visible rather than silently absent). The reference reaches `active` only
+    once every expected type reaches N — the same count `finalize_shard` gates
+    on. `failed_shard_tickets` counts this reference's build-shard-index work
+    tickets in `failed`; those are what an operator redrives to unwedge the
+    build (its `finalize_shard` re-counts and, as the last observer, flips
+    `active`).
+
+    An unsharded reference — or one whose sharding fanned out zero shards (no
+    genome-bearing features) — reads `expected_shards=0`, empty
+    `registered_shards`, and zero `failed_shard_tickets`."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    expected_shards: Annotated[int, Field(ge=0)]
+    registered_shards: dict[str, Annotated[int, Field(ge=0)]]
+    failed_shard_tickets: Annotated[int, Field(ge=0)]
+
+
 class ReferenceArtifactPurgeResponse(BaseModel):
     """Result of the orchestrator's on-disk reference-artifact cleanup.
 

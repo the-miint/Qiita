@@ -12,6 +12,7 @@ from qiita_common.api_paths import (
     URL_REFERENCE_DOGET,
     URL_REFERENCE_INDEX,
     URL_REFERENCE_PREFIX,
+    URL_REFERENCE_SHARD_INDEX_STATUS,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
@@ -307,6 +308,178 @@ async def test_get_reference_index_404_when_reference_absent(client, postgres_po
     )
     resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=max_idx + 1))
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /reference/{idx}/shard-index-status — sharded-build progress (B5)
+# ---------------------------------------------------------------------------
+
+_BUILD_SHARD_INDEX_ACTION_ID = "build-shard-index"
+_BUILD_SHARD_INDEX_VERSION = "1.0.0"
+
+
+async def _seed_build_shard_action(pool):
+    """Idempotently seed the build-shard-index action FK target (shared id,
+    never torn down — mirrors test_shard_fanout._scaffold)."""
+    await pool.execute(
+        "INSERT INTO qiita.action"
+        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
+        " VALUES ($1, $2, 'reference', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
+        "         1, 1, '1 minute', NULL, 'failed')"
+        " ON CONFLICT (action_id, version) DO NOTHING",
+        _BUILD_SHARD_INDEX_ACTION_ID,
+        _BUILD_SHARD_INDEX_VERSION,
+        '{"service": false, "human_roles": ["system_admin"]}',
+    )
+
+
+async def test_shard_index_status_404_when_reference_absent(client, postgres_pool):
+    """Status of a non-existent reference is 404, like the other reference GETs."""
+    max_idx = await postgres_pool.fetchval(
+        "SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.reference"
+    )
+    resp = await client.get(URL_REFERENCE_SHARD_INDEX_STATUS.format(reference_idx=max_idx + 1))
+    assert resp.status_code == 404
+
+
+async def test_shard_index_status_unsharded_reads_empty(client):
+    """A reference that was never sharded reads all-zero / empty — a valid
+    "nothing sharded here" answer, not an error."""
+    r = await _create_ref(client, "test-shard-status-unsharded")
+    idx = r.json()["reference_idx"]
+    resp = await client.get(URL_REFERENCE_SHARD_INDEX_STATUS.format(reference_idx=idx))
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "reference_idx": idx,
+        "expected_shards": 0,
+        "registered_shards": {},
+        "failed_shard_tickets": 0,
+    }
+
+
+async def test_shard_index_status_reports_progress(client, postgres_pool):
+    """A sharded reference reports N (from membership), per-expected-type
+    registered counts (a wholly-unbuilt expected type shows 0, not absent), and
+    the count of failed build-shard-index tickets — the wedge diagnostic that
+    makes a reference stuck in `indexing` visible."""
+    r = await _create_ref(client, "test-shard-status-progress")
+    idx = r.json()["reference_idx"]
+
+    # N = 3 shards (membership rows shard_id 0..2, one distinct feature each).
+    for shard_id in range(3):
+        feat = await postgres_pool.fetchval(
+            "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid())"
+            " RETURNING feature_idx"
+        )
+        await postgres_pool.execute(
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx, shard_id)"
+            " VALUES ($1, $2, $3)",
+            idx,
+            feat,
+            shard_id,
+        )
+
+    # rype registered for all 3 shards; minimap2 for 2 of 3; bowtie2 for none.
+    for shard_id in range(3):
+        await postgres_pool.execute(
+            "INSERT INTO qiita.reference_index"
+            " (reference_idx, index_type, fs_path, params, shard_id)"
+            " VALUES ($1, 'rype', $2, '{}'::jsonb, $3)",
+            idx,
+            f"/derived/{idx}/shards/{shard_id}/rype",
+            shard_id,
+        )
+    for shard_id in range(2):
+        await postgres_pool.execute(
+            "INSERT INTO qiita.reference_index"
+            " (reference_idx, index_type, fs_path, params, shard_id)"
+            " VALUES ($1, 'minimap2', $2, '{}'::jsonb, $3)",
+            idx,
+            f"/derived/{idx}/shards/{shard_id}/minimap2",
+            shard_id,
+        )
+
+    # build-shard-index tickets: all three build_* flags on (so bowtie2 is an
+    # expected type despite zero registered rows); shard 0 completed, 1 & 2 failed.
+    await _seed_build_shard_action(postgres_pool)
+    principal_idx = await postgres_pool.fetchval("SELECT MIN(idx) FROM qiita.principal")
+    for shard_id, state in ((0, "completed"), (1, "failed"), (2, "failed")):
+        failed = state == "failed"
+        await postgres_pool.execute(
+            "INSERT INTO qiita.work_ticket"
+            " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+            "  reference_idx, shard_id, state, action_context,"
+            "  failure_type, failure_stage, failure_reason)"
+            " VALUES ($1, $2, $3, 'reference', $4, $5, $6, $7::jsonb,"
+            "         $8::qiita.failure_type, $9::qiita.work_ticket_failure_stage, $10)",
+            _BUILD_SHARD_INDEX_ACTION_ID,
+            _BUILD_SHARD_INDEX_VERSION,
+            principal_idx,
+            idx,
+            shard_id,
+            state,
+            '{"build_rype": true, "build_minimap2": true, "build_bowtie2": true}',
+            # Failed tickets must carry failure metadata (work_ticket_failure_consistent);
+            # `finalize` stage needs no failure_step_name (…_step_name_consistent).
+            "permanent" if failed else None,
+            "finalize" if failed else None,
+            "shard build failed" if failed else None,
+        )
+
+    resp = await client.get(URL_REFERENCE_SHARD_INDEX_STATUS.format(reference_idx=idx))
+    body = resp.json()
+
+    # Tear down the work tickets we inserted before asserting, so the client
+    # fixture's reference cleanup (which doesn't touch work_ticket) can't
+    # RESTRICT-fail on a leaked FK even if an assertion below trips.
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
+
+    assert resp.status_code == 200
+    assert body["expected_shards"] == 3
+    assert body["registered_shards"] == {"rype": 3, "minimap2": 2, "bowtie2": 0}
+    assert body["failed_shard_tickets"] == 2
+
+
+async def test_shard_index_status_tolerates_non_object_context(client, postgres_pool):
+    """A malformed / JSON-`null` ticket `action_context` must not 500 this
+    diagnostic endpoint — it degrades to observed-only (no expected-type seeding)
+    rather than raising when the copied context isn't a JSON object."""
+    r = await _create_ref(client, "test-shard-status-badctx")
+    idx = r.json()["reference_idx"]
+
+    feat = await postgres_pool.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid()) RETURNING feature_idx"
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx, shard_id)"
+        " VALUES ($1, $2, 0)",
+        idx,
+        feat,
+    )
+    await _seed_build_shard_action(postgres_pool)
+    principal_idx = await postgres_pool.fetchval("SELECT MIN(idx) FROM qiita.principal")
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  reference_idx, shard_id, state, action_context)"
+        " VALUES ($1, $2, $3, 'reference', $4, 0, 'completed', 'null'::jsonb)",
+        _BUILD_SHARD_INDEX_ACTION_ID,
+        _BUILD_SHARD_INDEX_VERSION,
+        principal_idx,
+        idx,
+    )
+
+    resp = await client.get(URL_REFERENCE_SHARD_INDEX_STATUS.format(reference_idx=idx))
+    body = resp.json()
+
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
+
+    assert resp.status_code == 200
+    assert body["expected_shards"] == 1
+    # No expected-type seeding (context isn't an object) and no registered rows.
+    assert body["registered_shards"] == {}
+    assert body["failed_shard_tickets"] == 0
 
 
 # ---------------------------------------------------------------------------
