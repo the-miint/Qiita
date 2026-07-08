@@ -523,6 +523,27 @@ async def run_workflow(
                     f"block-scoped; got {scope_target['kind']!r}"
                 )
 
+        # Sharded-index build roster (build-shard-index workflow): a
+        # reference-scoped ticket carrying a non-NULL shard_id builds ONE shard.
+        # Stage its feature roster (`shard_features`) + `shard_id` before the loop
+        # so the build steps' Inputs resolve. Inside-try, so a Flight failure /
+        # empty shard FAILs the ticket cleanly. Keyed off the ticket's shard_id
+        # (not a step-input scan) — the whole ticket is a single-shard build.
+        if (
+            scope_target["kind"] == ScopeTargetKind.REFERENCE.value
+            and work_ticket.get("shard_id") is not None
+        ):
+            bound.update(
+                await _stage_shard_roster(
+                    pool,
+                    scope_target["reference_idx"],
+                    work_ticket["shard_id"],
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
+
         # Read-mask identity: when a step threads `mask_idx` through its params
         # (the host_filter step), bind the mask_idx before the loop. Same
         # inside-try placement as the resolvers above so a failure lands in the
@@ -1928,6 +1949,91 @@ async def _resolve_qc_adapters(
 SAMPLE_MAP_BINDING = "sample_map"
 STAGED_READS_BINDING = "reads"
 READS_STAGING_ROOT_BINDING = "reads_staging_root"
+
+# Bindings a sharded build ticket's build steps consume: the per-shard feature
+# roster Parquet (`shard_features`) and the shard ordinal (`shard_id`). The
+# runner stages both BEFORE the step loop (see `_stage_shard_roster`), from the
+# ticket's `shard_id` + `reference_membership.shard_id`; the shard build jobs
+# (build_rype/minimap2/bowtie2_index) resolve them as their `Inputs`.
+SHARD_FEATURES_BINDING = "shard_features"
+SHARD_ID_BINDING = "shard_id"
+_REFERENCE_SEQUENCES_TABLE = "reference_sequences"
+
+
+def _do_get_reference_sequences_roster(
+    data_plane_url: str, ticket_bytes: bytes, out_path: Path
+) -> int:
+    """Synchronous Flight DoGet of a feature-scoped `reference_sequences` slice,
+    written to a `(feature_idx BIGINT, sequence_length_bp BIGINT)` roster Parquet
+    at `out_path`. Runs in a thread executor (pyarrow.flight is sync); isolated
+    so `_stage_shard_roster`'s unit test stubs the whole seam. Returns the row
+    count (the shard's feature count that has a sequence)."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        table = client.do_get(flight.Ticket(ticket_bytes)).read_all()
+    # Project to exactly the roster columns the build jobs expect (drop
+    # sequence_hash) — the shard build reads `feature_idx` to scope its own chunk
+    # stream and `sequence_length_bp` for plan() sizing.
+    roster = table.select(["feature_idx", "sequence_length_bp"])
+    pq.write_table(roster, str(out_path), compression="snappy")
+    return roster.num_rows
+
+
+async def _stage_shard_roster(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    shard_id: int,
+    *,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Any]:
+    """Stage this shard's feature roster before the build step loop and bind it.
+
+    The shard's features are the cover-map (`reference_membership.shard_id`);
+    their `sequence_length_bp` lives in DuckLake `reference_sequences`, reachable
+    only over Flight. So we read the shard's feature_idx set from Postgres, sign
+    a `feature_idx`-scoped `reference_sequences` DoGet (the B6 subset ticket — so
+    each shard transfers only its own slice, not the whole reference N times),
+    and write `<workspace>/shard_roster.parquet`. Binds `shard_features` (the
+    roster path) and `shard_id` so the build steps' `Inputs` resolve.
+
+    Like the other pre-loop resolvers, a Flight failure is wrapped as a
+    SUBMISSION-attributed BAD_INPUT so it lands in the outer FAILED handler
+    instead of escaping as an untyped exception (which would violate the
+    step-name CHECK). An empty membership shard is a misconfiguration — fail
+    loud rather than build an empty index."""
+    rows = await pool.fetch(
+        "SELECT feature_idx FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND shard_id = $2",
+        reference_idx,
+        shard_id,
+    )
+    feature_idxs = [r["feature_idx"] for r in rows]
+    if not feature_idxs:
+        raise _submission_bad_input(
+            f"shard {shard_id} of reference {reference_idx} has no member features "
+            "(reference_membership.shard_id) — nothing to build"
+        )
+    ticket = sign_ticket(
+        table=_REFERENCE_SEQUENCES_TABLE,
+        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+        secret=hmac_secret,
+    )
+    workspace.mkdir(parents=True, exist_ok=True)
+    roster_path = workspace / "shard_roster.parquet"
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, _do_get_reference_sequences_roster, data_plane_url, ticket, roster_path
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not fetch reference_sequences for reference {reference_idx} "
+            f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}"
+        ) from exc
+    return {SHARD_FEATURES_BINDING: roster_path, SHARD_ID_BINDING: shard_id}
 
 
 def _workflow_declares_input(steps: list[Any], name: str) -> bool:

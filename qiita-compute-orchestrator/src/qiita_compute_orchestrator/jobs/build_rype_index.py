@@ -49,6 +49,7 @@ from qiita_common.models import HOST_FILTER_INDEX_TYPE_RYPE
 from qiita_common.parquet import validate_parquet_path
 
 from ..config import get_settings
+from ..data_plane_client import open_reference_chunk_stream
 from ..derived_store import rype_index_path, shard_rype_index_path
 from ..miint import (
     apply_duckdb_settings,
@@ -138,22 +139,26 @@ _MAPPING_TABLE = "rype_bucket_map"
 class Inputs(BaseModel):
     """Typed input contract for build_rype_index.
 
-    `reference_sequence_chunks` is the feature-keyed chunk output of the
-    `load` step (a DIRECTORY of `part_*.parquet`, or a single Parquet file).
-    `reference_idx` and `work_ticket_idx` are framework-injected scope scalars.
-    `k` / `w` are the rype build parameters (host-filter defaults); `bucket_name`
-    overrides the default single-bucket name.
+    `reference_sequence_chunks` is the feature-keyed chunk output of the `load`
+    step (a DIRECTORY of `part_*.parquet`, or a single Parquet file). It is
+    REQUIRED in host mode and unused in shard mode (the shard streams its chunks
+    from the data plane), hence `Path | None`. `reference_idx` and
+    `work_ticket_idx` are framework-injected scope scalars. `k` / `w` are the
+    rype build parameters (host-filter defaults); `bucket_name` overrides the
+    default single-bucket name.
 
     SHARD mode (both `shard_id` and `shard_features` set) builds one shard's
     routing `.ryxdi` over just that shard's features: `shard_features` is a
     runner-staged Parquet roster `(feature_idx BIGINT, sequence_length_bp BIGINT)`
-    (the shard's members, from `reference_membership.shard_id`), and the build is
-    restricted to those features and written to the per-shard path. Left unset
-    (both None) is HOST/unsharded mode — today's whole-reference behavior,
-    byte-identical.
+    (the shard's members, from `reference_membership.shard_id`) whose
+    `feature_idx` list scopes a B6s DoGet ticket, and the chunk bytes STREAM from
+    the data plane over Arrow Flight — a shard build runs AFTER the ingest
+    ticket's register-files has moved the staging chunks into DuckLake, so there
+    is no staging Parquet to read. Left unset (both None) is HOST/unsharded
+    mode — today's whole-reference behavior, byte-identical (staging read).
     """
 
-    reference_sequence_chunks: Path
+    reference_sequence_chunks: Path | None = None
     reference_idx: int
     work_ticket_idx: int
     k: int = _DEFAULT_K
@@ -168,6 +173,13 @@ class Inputs(BaseModel):
             raise ValueError(
                 "shard_id and shard_features must be supplied together (both for a"
                 " sharded build, or neither for a whole-reference/host build)"
+            )
+        # Host mode reads staging Parquet, so it needs the chunk binding; shard
+        # mode streams and ignores it.
+        if self.shard_id is None and self.reference_sequence_chunks is None:
+            raise ValueError(
+                "reference_sequence_chunks is required in host/whole-reference mode"
+                " (supply shard_id + shard_features for a sharded streaming build)"
             )
         return self
 
@@ -207,17 +219,20 @@ def _run_rype_index_create(
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    chunks = inputs.reference_sequence_chunks
-    if not chunks.exists():
-        raise FileNotFoundError(f"reference_sequence_chunks not found: {chunks}")
-    # reference_load emits chunks as a directory of part_*.parquet; accept a
-    # single file too (tests / future producers).
-    read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
-
     # SHARD mode when shard_id/shard_features are set (the validator guarantees
-    # both-or-neither). A sharded build indexes only the shard's features and
-    # writes a per-shard `.ryxdi`; host/unsharded mode is byte-identical to before.
+    # both-or-neither, and that host mode carries `reference_sequence_chunks`).
+    # A sharded build streams only the shard's features and writes a per-shard
+    # `.ryxdi`; host/unsharded mode reads staging Parquet, byte-identical to before.
     sharded = inputs.shard_id is not None
+
+    read_target: Path | None = None
+    if not sharded:
+        chunks = inputs.reference_sequence_chunks
+        if not chunks.exists():
+            raise FileNotFoundError(f"reference_sequence_chunks not found: {chunks}")
+        # reference_load emits chunks as a directory of part_*.parquet; accept a
+        # single file too (tests / future producers).
+        read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
     if inputs.bucket_name is not None:
         bucket = inputs.bucket_name
     elif sharded:
@@ -268,25 +283,46 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
-        # Non-temp view/table so rype's separate bind/execute connection can
-        # resolve them by name. DuckDB rejects prepared parameters inside
-        # CREATE VIEW, so the path is inlined; validate_parquet_path rejects
-        # quote/backslash/control chars (the repo's fail-fast escaping contract).
-        read_target_sql = validate_parquet_path(read_target)
-        # In shard mode restrict the feed to the shard's features (the roster);
-        # the roster path is inlined like the chunk path, so validate it too. The
-        # DISTINCT mapping below then covers exactly the shard's features.
-        subset_sql = ""
+        # Non-temp view/table (`_CHUNK_VIEW`) so rype's separate bind/execute
+        # connection can resolve it by name. Host mode reads the staging Parquet
+        # lazily (a VIEW rype windows over); shard mode streams the roster's
+        # chunks from the data plane and MATERIALIZES them into a table inside the
+        # stream `with` (draining the Flight stream so the client closes before
+        # the long rype build — a shard is ~1/1000 of the reference, so the
+        # materialized set is small).
         if sharded:
+            # Read the shard's feature roster (small — one row per feature) to
+            # scope the DoGet ticket, then stream that roster's chunks. Mirrors
+            # build_minimap2_index's shard path.
             roster_sql = validate_parquet_path(inputs.shard_features)
-            subset_sql = (
-                f" WHERE feature_idx IN (SELECT feature_idx FROM read_parquet('{roster_sql}'))"
+            feature_ids = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT feature_idx FROM read_parquet('{roster_sql}')"
+                ).fetchall()
+            ]
+            if not feature_ids:
+                raise ValueError(
+                    f"shard {inputs.shard_id} roster ({inputs.shard_features}) is empty:"
+                    " nothing to build a rype index from"
+                )
+            async with open_reference_chunk_stream(
+                conn, reference_idx=inputs.reference_idx, feature_idx=feature_ids
+            ) as rel:
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {_CHUNK_VIEW} AS "
+                    f"SELECT feature_idx, chunk_index, chunk_data FROM {rel}"
+                )
+        else:
+            # DuckDB rejects prepared parameters inside CREATE VIEW, so the path
+            # is inlined; validate_parquet_path rejects quote/backslash/control
+            # chars (the repo's fail-fast escaping contract).
+            read_target_sql = validate_parquet_path(read_target)
+            conn.execute(
+                f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
+                "SELECT feature_idx, chunk_index, chunk_data "
+                f"FROM read_parquet('{read_target_sql}')"
             )
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
-            f"SELECT feature_idx, chunk_index, chunk_data FROM read_parquet('{read_target_sql}')"
-            f"{subset_sql}"
-        )
         # Single-bucket mapping over every distinct feature. bucket is a
         # controlled string; escape quotes for the inlined literal.
         bucket_sql = bucket.replace("'", "''")

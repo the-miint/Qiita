@@ -22,10 +22,51 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import duckdb
 import pytest
+
+
+def _write_chunks_parquet(path: Path, rows: list[tuple[int, int, str]]) -> Path:
+    """Write a single feature-keyed chunk Parquet `(feature_idx BIGINT,
+    chunk_index INTEGER, chunk_data VARCHAR)` — the shape the B6s stream carries."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(":memory:") as conn:
+        values_sql = ", ".join(
+            "(CAST(? AS BIGINT), CAST(? AS INTEGER), CAST(? AS VARCHAR))" for _ in rows
+        )
+        params: list = []
+        for fidx, cidx, data in rows:
+            params.extend([fidx, cidx, data])
+        conn.execute(
+            f"COPY (SELECT * FROM (VALUES {values_sql}) "
+            "AS t(feature_idx, chunk_index, chunk_data)) "
+            f"TO '{path}' (FORMAT PARQUET)",
+            params,
+        )
+    return path
+
+
+def _fake_stream_from_parquet(parquet: Path, captured: dict):
+    """A fake `open_reference_chunk_stream` that registers a local chunk Parquet
+    as the streamed relation (simulating the B6s DoGet), capturing the ticket
+    scope args — mirrors the build_minimap2_index shard-mode test stub."""
+
+    @asynccontextmanager
+    async def fake_stream(conn, *, reference_idx, feature_idx, relation="reference_chunks"):
+        captured["reference_idx"] = reference_idx
+        captured["feature_idx"] = feature_idx
+        conn.execute(
+            f"CREATE OR REPLACE VIEW {relation} AS SELECT * FROM read_parquet('{parquet}')"
+        )
+        try:
+            yield relation
+        finally:
+            conn.execute(f"DROP VIEW IF EXISTS {relation}")
+
+    return fake_stream
 
 
 def _write_chunks_dir(chunks_dir: Path, rows: list[tuple[int, int, str]]) -> Path:
@@ -309,6 +350,14 @@ def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
     reference_membership.shard_id joined with the sequence lengths."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(":memory:") as conn:
+        if not rows:
+            # 0-row but correctly-typed Parquet (an empty shard roster).
+            conn.execute(
+                "COPY (SELECT CAST(NULL AS BIGINT) AS feature_idx, "
+                "CAST(NULL AS BIGINT) AS sequence_length_bp WHERE false) "
+                f"TO '{path}' (FORMAT PARQUET)"
+            )
+            return path
         values_sql = ", ".join("(CAST(? AS BIGINT), CAST(? AS BIGINT))" for _ in rows)
         params: list = []
         for fidx, bp in rows:
@@ -322,9 +371,11 @@ def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
 
 
 def test_build_rype_index_shard_mode(tmp_path, monkeypatch):
-    """In shard mode the build indexes ONLY the shard's features (the roster
-    subset), writes to `.../shards/{shard_id}/index.ryxdi`, uses a shard-qualified
-    bucket, and records `shard_id` in the meta JSON."""
+    """In shard mode the build STREAMS the shard's chunks from the data plane
+    (open_reference_chunk_stream, scoped to the roster's feature_idx list — the
+    staging Parquet is gone after register-files), writes to
+    `.../shards/{shard_id}/index.ryxdi`, uses a shard-qualified bucket, and
+    records `shard_id` in the meta JSON."""
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     shared_root = tmp_path / "shared"
@@ -332,12 +383,20 @@ def test_build_rype_index_shard_mode(tmp_path, monkeypatch):
 
     reference_idx = 7
     shard_id = 3
-    # Chunks carry three features; the shard roster covers only two of them.
-    chunks_dir = _write_chunks_dir(
-        tmp_path / "reference_sequence_chunks",
-        [(100, 0, "ACGT"), (200, 0, "GGGG"), (300, 0, "TTTT")],
+    # The streamed (roster-scoped) chunks: feature 100 multi-chunk, feature 300
+    # single-chunk. The stream carries exactly the shard's features.
+    stream_parquet = _write_chunks_parquet(
+        tmp_path / "stream.parquet",
+        [(100, 1, "GGGG"), (100, 0, "ACGT"), (300, 0, "TTTT")],
     )
-    roster = _write_roster(tmp_path / "roster.parquet", [(100, 4), (300, 4)])
+    roster = _write_roster(tmp_path / "roster.parquet", [(100, 8), (300, 4)])
+
+    stream_capture: dict = {}
+    monkeypatch.setattr(
+        build_rype_index,
+        "open_reference_chunk_stream",
+        _fake_stream_from_parquet(stream_parquet, stream_capture),
+    )
 
     captured: dict = {}
 
@@ -358,7 +417,6 @@ def test_build_rype_index_shard_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(build_rype_index, "_run_rype_index_create", fake_build)
 
     inputs = build_rype_index.Inputs(
-        reference_sequence_chunks=chunks_dir,
         reference_idx=reference_idx,
         work_ticket_idx=42,
         shard_id=shard_id,
@@ -366,7 +424,10 @@ def test_build_rype_index_shard_mode(tmp_path, monkeypatch):
     )
     out = asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
 
-    # Feature 200 is excluded — only the roster's {100, 300} are indexed.
+    # The DoGet ticket was scoped to the roster's feature_idx list.
+    assert stream_capture["reference_idx"] == reference_idx
+    assert sorted(stream_capture["feature_idx"]) == [100, 300]
+    # The mapping covers exactly the streamed shard's features.
     assert captured["features"] == [100, 300]
     assert captured["bucket"] == f"reference_{reference_idx}_shard_{shard_id}"
 
@@ -380,6 +441,25 @@ def test_build_rype_index_shard_mode(tmp_path, monkeypatch):
     assert meta["index_type"] == "rype"
     assert meta["fs_path"] == str(expected_dir)
     assert meta["shard_id"] == shard_id
+
+
+def test_build_rype_index_shard_empty_roster_raises(tmp_path, monkeypatch):
+    """An empty shard roster is a fail-fast before any stream is opened."""
+    from qiita_compute_orchestrator.jobs import build_rype_index
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    roster = _write_roster(tmp_path / "roster.parquet", [])
+
+    def _boom(*a, **k):  # open_reference_chunk_stream must never be reached
+        raise AssertionError("stream opened for an empty roster")
+
+    monkeypatch.setattr(build_rype_index, "open_reference_chunk_stream", _boom)
+
+    inputs = build_rype_index.Inputs(
+        reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+    )
+    with pytest.raises(ValueError, match="roster"):
+        asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
 
 
 def test_build_rype_index_host_meta_shard_id_none(tmp_path, monkeypatch):
@@ -483,10 +563,11 @@ def test_build_rype_index_plan_shard_mem_scales_with_bp(tmp_path):
 
 
 def test_build_rype_index_real_rype_shard_smoke(tmp_path, monkeypatch):
-    """Smoke the REAL `rype_index_create` over a SHARD SUBSET (seam not stubbed):
-    a roster covering two of three features builds a populated `.ryxdi` at the
-    shard path, and the meta records shard_id. This is the authoritative miint
-    re-verification for the per-shard build."""
+    """Smoke the REAL `rype_index_create` over a STREAMED SHARD SUBSET (build seam
+    not stubbed, stream seam stubbed with a local Parquet): a roster covering two
+    of three features builds a populated `.ryxdi` at the shard path, and the meta
+    records shard_id. This is the authoritative miint re-verification for the
+    per-shard STREAMING build."""
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     shared_root = tmp_path / "shared"
@@ -494,16 +575,23 @@ def test_build_rype_index_real_rype_shard_smoke(tmp_path, monkeypatch):
 
     reference_idx = 4243
     shard_id = 2
-    rows = [(fidx, 0, seq) for fidx, seq in _SMOKE_FEATURES.items()]
-    chunks_dir = _write_chunks_dir(tmp_path / "reference_sequence_chunks", rows)
-    # Shard roster: two of the three smoke features (lengths are ~640 bp each).
+    # The B6s stream carries only the roster's features (100, 300) — the DoGet is
+    # feature-scoped. Feature 200 is not in the stream (nor the shard).
+    stream_parquet = _write_chunks_parquet(
+        tmp_path / "stream.parquet",
+        [(100, 0, _SMOKE_FEATURES[100]), (300, 0, _SMOKE_FEATURES[300])],
+    )
     roster = _write_roster(
         tmp_path / "roster.parquet",
         [(100, len(_SMOKE_FEATURES[100])), (300, len(_SMOKE_FEATURES[300]))],
     )
+    monkeypatch.setattr(
+        build_rype_index,
+        "open_reference_chunk_stream",
+        _fake_stream_from_parquet(stream_parquet, {}),
+    )
 
     inputs = build_rype_index.Inputs(
-        reference_sequence_chunks=chunks_dir,
         reference_idx=reference_idx,
         work_ticket_idx=1,
         shard_id=shard_id,

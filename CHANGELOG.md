@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Added
 
+- **Runner shard-roster staging + rype shard build streams (B5).** For a
+  reference-scoped ticket carrying a non-NULL `shard_id`, the runner now stages
+  the shard's feature roster before the step loop (`_stage_shard_roster`): it
+  reads the shard's members from `reference_membership.shard_id`, signs a
+  `feature_idx`-scoped `reference_sequences` DoGet (so each shard transfers only
+  its own slice, not the whole reference N times), and writes
+  `shard_roster.parquet`, binding `shard_features` + `shard_id` for the build
+  steps' `Inputs`. `build_rype_index` shard mode now STREAMS its chunks from the
+  data plane (`open_reference_chunk_stream`, scoped to the roster) instead of
+  reading a staging Parquet — a shard build runs after the ingest ticket's
+  register-files has moved the staging chunks into DuckLake, so there is no
+  staging Parquet to read (matching how B4's minimap2/bowtie2 shard modes already
+  stream). Host/whole-reference rype mode is byte-identical (staging read).
+  A Flight failure / empty shard is wrapped as a SUBMISSION BAD_INPUT.
+  (#reference-support)
 - **Sharded-index fan-out + count-based completion (B5).** A new
   `shard_orchestration.plan_and_submit_shards` turns a `plan_shards` assignment
   into N build tickets: it transitions the reference `loading → indexing` and,

@@ -23,7 +23,11 @@ from contextlib import asynccontextmanager
 from qiita_common.api_paths import LOOPBACK_HOST
 
 from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
-from qiita_compute_orchestrator.jobs import build_bowtie2_index, build_minimap2_index
+from qiita_compute_orchestrator.jobs import (
+    build_bowtie2_index,
+    build_minimap2_index,
+    build_rype_index,
+)
 
 from conftest import ducklake_connect
 
@@ -160,3 +164,56 @@ def test_shard_build_streams_and_writes_artifact(
     else:
         bt2 = list(expected_dir.glob(f"{fs_path.name}*.bt2"))  # multi-file .bt2 set
         assert bt2 and all(f.stat().st_size > 0 for f in bt2)
+
+
+def test_rype_shard_build_streams_and_writes_artifact(
+    data_plane, tmp_path, monkeypatch
+):
+    """The rype shard build (build_rype_index in shard mode) streams the roster's
+    chunks from the live DP — a shard build runs after register-files has moved
+    the staging chunks into DuckLake, so there is no staging Parquet — and the
+    real miint `rype_index_create` writes the per-shard `.ryxdi` at
+    `.../references/{ref}/shards/{shard}/index.ryxdi`, with the meta carrying
+    shard_id. Separate from the minimap2/bowtie2 parametrize because rype's layout
+    (a `.ryxdi` DIRECTORY, no `num_subjects` in params) differs."""
+    import json
+    from pathlib import Path
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "derived"))
+    monkeypatch.setattr(
+        build_rype_index, "open_reference_chunk_stream", _fake_open_stream(data_plane)
+    )
+
+    shard_id = 5
+    roster = _write_roster(
+        tmp_path / "roster.parquet",
+        [(f, len(_CONTIGS[f])) for f in _SUBSET],
+    )
+
+    inputs = build_rype_index.Inputs(
+        reference_idx=_REF_IDX,
+        work_ticket_idx=1,
+        shard_id=shard_id,
+        shard_features=roster,
+    )
+    out = asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
+
+    meta = json.loads(Path(out["rype_index_meta"]).read_text())
+    assert meta["index_type"] == "rype"
+    assert meta["shard_id"] == shard_id
+    # Shard-qualified bucket over exactly the roster's features.
+    assert meta["params"]["bucket_name"] == f"reference_{_REF_IDX}_shard_{shard_id}"
+
+    index_dir = Path(meta["fs_path"])
+    assert (
+        index_dir
+        == Path(tmp_path / "derived")
+        / "references"
+        / str(_REF_IDX)
+        / "shards"
+        / str(shard_id)
+        / "index.ryxdi"
+    )
+    assert index_dir.is_dir(), "rype did not create the shard .ryxdi directory"
+    assert (index_dir / "manifest.toml").is_file(), "no manifest.toml in shard .ryxdi"
+    assert list(index_dir.rglob("*.parquet")), "shard rype index has no Parquet content"

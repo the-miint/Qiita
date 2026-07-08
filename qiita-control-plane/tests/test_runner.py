@@ -2790,6 +2790,149 @@ async def test_workflow_needs_adapters_detects_adapter_input():
 
 
 # =============================================================================
+# _stage_shard_roster (sharded-index build roster pre-step)
+# =============================================================================
+
+
+async def _add_shard_members(pool, reference_idx, members):
+    """Mint features + reference_membership rows carrying shard_id. `members` is
+    a list of (shard_id | None) — one feature per entry. Returns the feature_idxs."""
+    feats = []
+    for shard_id in members:
+        f = await pool.fetchval(
+            "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid())"
+            " RETURNING feature_idx"
+        )
+        await pool.execute(
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx, shard_id)"
+            " VALUES ($1, $2, $3)",
+            reference_idx,
+            f,
+            shard_id,
+        )
+        feats.append(f)
+    return feats
+
+
+async def test_stage_shard_roster_scopes_ticket_to_shard(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """The roster DoGet is scoped to EXACTLY this shard's member features
+    (reference_membership.shard_id), and the returned bindings carry the roster
+    path + shard_id for the build steps' Inputs."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane import runner
+
+    # shard 0 -> {fA, fB}; shard 1 -> {fC}; one unassigned (shard_id NULL).
+    fA, fB, fC, _f_null = await _add_shard_members(postgres_pool, reference_idx, [0, 0, 1, None])
+
+    captured: dict = {}
+
+    def fake_sign(*, table, filter, secret):
+        captured["table"] = table
+        captured["filter"] = filter
+        return b"ticket-bytes"
+
+    def fake_doget(_url, _ticket, out_path):
+        fids = captured["filter"]["feature_idx"]
+        pq.write_table(
+            pa.table(
+                {
+                    "feature_idx": pa.array(fids, pa.int64()),
+                    "sequence_length_bp": pa.array([100] * len(fids), pa.int64()),
+                }
+            ),
+            str(out_path),
+        )
+        return len(fids)
+
+    monkeypatch.setattr(runner, "sign_ticket", fake_sign)
+    monkeypatch.setattr(runner, "_do_get_reference_sequences_roster", fake_doget)
+
+    try:
+        out = await runner._stage_shard_roster(
+            postgres_pool,
+            reference_idx,
+            0,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+        assert captured["table"] == "reference_sequences"
+        assert captured["filter"]["reference_idx"] == [reference_idx]
+        # Exactly shard 0's features — not shard 1's, not the NULL-shard one.
+        assert sorted(captured["filter"]["feature_idx"]) == sorted([fA, fB])
+        assert out == {
+            "shard_features": tmp_path / "shard_roster.parquet",
+            "shard_id": 0,
+        }
+        assert (tmp_path / "shard_roster.parquet").exists()
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", [fA, fB, fC, _f_null]
+        )
+
+
+async def test_stage_shard_roster_empty_shard_fails(postgres_pool, reference_idx, tmp_path):
+    """A shard with no member features (nothing assigned to it) is a
+    misconfiguration — SUBMISSION BAD_INPUT, not an empty build."""
+    from qiita_control_plane import runner
+
+    with pytest.raises(BackendFailure) as ei:
+        await runner._stage_shard_roster(
+            postgres_pool,
+            reference_idx,
+            99,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+
+
+async def test_stage_shard_roster_dataplane_failure_is_submission(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """A Flight DoGet failure while staging the roster is wrapped as a SUBMISSION
+    BackendFailure (never an untyped escape — same contract as the other
+    pre-loop resolvers)."""
+    from qiita_control_plane import runner
+
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0])
+
+    def _boom(_url, _ticket, _out):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(runner, "_do_get_reference_sequences_roster", _boom)
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await runner._stage_shard_roster(
+                postgres_pool,
+                reference_idx,
+                0,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path,
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        assert ei.value.step_name is None
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+# =============================================================================
 # fastq-to-parquet/1.2.0 step wiring (fastq -> qc -> host_filter)
 # =============================================================================
 #
