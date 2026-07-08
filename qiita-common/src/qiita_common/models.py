@@ -308,6 +308,13 @@ HOST_FILTER_REQUIRED_INDEX_TYPES = frozenset(
     {HOST_FILTER_INDEX_TYPE_RYPE, HOST_FILTER_INDEX_TYPE_MINIMAP2}
 )
 
+# The bowtie2 subject index (`.bt2` set), an ANALYSIS-alignment index the eventual
+# sharded aligner consumes. Unlike rype/minimap2 (dual-purpose: host-filter AND
+# analysis), bowtie2 is analysis-only, so it is deliberately NOT in
+# HOST_FILTER_REQUIRED_INDEX_TYPES. Mirrors the `reference_index.index_type` CHECK
+# allow-list (plain TEXT+CHECK, no Postgres ENUM twin — see CLAUDE.md "Enum parity").
+INDEX_TYPE_BOWTIE2 = "bowtie2"
+
 
 class ReferenceIndex(BaseModel):
     """A built search index for a reference (e.g. a rype `.ryxdi` directory).

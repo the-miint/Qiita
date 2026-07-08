@@ -92,6 +92,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `20260708000000_reference_membership_shard_id.sql` (adds a nullable
   `qiita.reference_membership.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
   no backfill or out-of-band steps. (#reference-support)
+- **bowtie2 `reference_index.index_type`.** `make migrate` applies
+  `20260709000000_reference_index_bowtie2_type.sql` (extends the
+  `reference_index_index_type_check` allow-list to `rype`/`minimap2`/`bowtie2`).
+  Additive CHECK; no `'bowtie2'` rows exist yet (the shard builders are unwired), no
+  out-of-band steps. (#reference-support)
 
 ### 4. Deploy
 

@@ -15,6 +15,13 @@ the `no-changelog` label).
 
 ### Added
 
+- **`reference_index.index_type` admits `'bowtie2'` (B4 precursor).** A one-line
+  additive CHECK migration extends the `reference_index_index_type_check` allow-list
+  to `rype`/`minimap2`/`bowtie2`; a matching `INDEX_TYPE_BOWTIE2` constant lands in
+  `qiita-common`. bowtie2 is an analysis-only subject index, so it is deliberately
+  absent from `HOST_FILTER_REQUIRED_INDEX_TYPES` (unlike the dual-purpose
+  rype/minimap2). No Postgres ENUM twin (TEXT+CHECK), no `register_index`/runner
+  change (already generic over `index_type`). (#reference-support)
 - **Compute-side reference-chunk streaming (B6s).** The orchestrator can now pull a
   reference's sequence chunks from the data plane over Arrow Flight instead of
   reading staging Parquet — the streaming foundation the B4 shard builders sit on.

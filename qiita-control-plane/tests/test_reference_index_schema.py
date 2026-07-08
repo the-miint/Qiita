@@ -114,6 +114,32 @@ async def test_reference_index_accepts_minimap2_type(postgres_pool):
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
+async def test_reference_index_accepts_bowtie2_type(postgres_pool):
+    """The CHECK allow-list includes 'bowtie2' (the analysis-alignment subject
+    index) alongside 'rype' and 'minimap2'. `fs_path` is a PREFIX (bowtie2 writes
+    multiple `.bt2` files under it), not a single-file path."""
+    idx = await _make_reference(postgres_pool, "schema-refindex-bowtie2")
+    try:
+        rii = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+            " VALUES ($1, 'bowtie2', '/srv/x/shards/0/bowtie2/index', $2::jsonb)"
+            " RETURNING reference_index_idx",
+            idx,
+            '{"preset": "sensitive", "source": "stream", "feature_count": 2}',
+        )
+        row = await postgres_pool.fetchrow(
+            "SELECT index_type, fs_path FROM qiita.reference_index WHERE reference_index_idx = $1",
+            rii,
+        )
+        assert row["index_type"] == "bowtie2"
+        assert row["fs_path"] == "/srv/x/shards/0/bowtie2/index"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
 async def test_reference_index_rejects_unknown_type(postgres_pool):
     idx = await _make_reference(postgres_pool, "schema-refindex-badtype")
     try:
