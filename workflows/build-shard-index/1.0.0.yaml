@@ -1,0 +1,140 @@
+action_id: build-shard-index
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Build ONE analysis-index shard of a sharded reference. Fanned out by the
+  `plan-shards` action (one build-shard-index ticket per shard, each carrying a
+  distinct `work_ticket.shard_id` + the index-selection context copied from the
+  parent reference-add) — it is never submitted directly. Before the step loop
+  the runner stages this shard's feature roster (`reference_membership.shard_id`
+  joined to `reference_sequences`) and binds `shard_features` + `shard_id`; each
+  build step then STREAMS just that shard's chunks from the data plane (the
+  staging Parquet is gone — a shard build runs after the ingest ticket's
+  register-files moved the chunks into DuckLake) and writes a per-shard index
+  under `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/...`, recorded in
+  qiita.reference_index (shard_id set). The terminal `finalize-shard` counts
+  registered shards per expected index_type against N and, when every expected
+  type is complete for all N shards, does the guarded `indexing → active`.
+
+  Index selection mirrors host-reference-add: by default all of rype / minimap2 /
+  bowtie2 are built, and `build_*: false` in action_context skips a builder (and
+  its register-index). The reference is already `indexing` when this runs (the
+  parent's plan-shards transitioned it), so the build steps carry no
+  target_status and the action carries NO success_status — finalize-shard owns
+  the transition to `active`.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  # No fasta / upload inputs — the sequences already live in DuckLake and stream
+  # per-shard. The build gates + params are copied verbatim from the parent
+  # reference-add ticket by the fan-out (shard_orchestration.SHARD_BUILD_CONTEXT_KEYS).
+  properties:
+    # Which per-shard indexes to build (default-ON via the steps' `when:`;
+    # finalize-shard expects exactly the ON set). An omitted key builds that index.
+    build_rype: {type: boolean}
+    build_minimap2: {type: boolean}
+    build_bowtie2: {type: boolean}
+    # Build params: rype_w -> build_rype_index.w, minimap2_preset ->
+    # build_minimap2_index.preset (bowtie2 is preset-independent).
+    rype_w: {type: integer, minimum: 1}
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+  # At least one index type must be built (mirrors the parent's backstop). Fires
+  # only when all three build_* are explicitly false.
+  not:
+    required: [build_rype, build_minimap2, build_bowtie2]
+    properties:
+      build_rype: {const: false}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
+
+# NO success_status — finalize-shard (the terminal step) owns indexing → active.
+# NO failure_status either — a single shard build failing must NOT flip the whole
+# reference to `failed` (the FSM's only exit from `failed` is → pending, forcing a
+# full-ingest restart — wrong blast radius). Fail-closed: the failed shard ticket
+# stays FAILED, the reference stays honestly in `indexing`, and an operator
+# redrives the shard ticket (its finalize-shard re-counts and flips active).
+
+steps:
+  # Each build step consumes the runner-staged `shard_features` roster (the
+  # shard's feature_idx list + bp) and its `shard_id` (bound before the loop by
+  # _stage_shard_roster), streams that shard's chunks from the data plane, and
+  # writes a per-shard index. No `reference_sequence_chunks` input (shard mode
+  # streams) and no target_status (the reference is already `indexing`). Each
+  # `register-index` sibling carries the same `when:` gate, and the runner's
+  # register-index arm reads meta.shard_id → a per-shard reference_index row.
+  - step: build_rype_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_rype_index
+    inputs: [shard_features]
+    # rype_w (action_context) -> Inputs.w; shard_id (runner-bound) -> Inputs.shard_id.
+    params: {rype_w: w, shard_id: shard_id}
+    when: build_rype
+    outputs: [rype_index_meta]
+    # Whole-reference host baseline; build_rype_index.plan() sizes a small shard
+    # DOWN from here (down-only), so 1000 shards don't each grab 64 GB.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 64
+      walltime: PT2H
+
+  - action: register-index
+    inputs: [rype_index_meta]
+    when: build_rype
+    outputs: []
+
+  - step: build_minimap2_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_minimap2_index
+    inputs: [shard_features]
+    params: {minimap2_preset: preset, shard_id: shard_id}
+    when: build_minimap2
+    outputs: [minimap2_index_meta]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-index
+    inputs: [minimap2_index_meta]
+    when: build_minimap2
+    outputs: []
+
+  - step: build_bowtie2_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_bowtie2_index
+    inputs: [shard_features]
+    # bowtie2 is preset-independent — only shard_id rides params.
+    params: {shard_id: shard_id}
+    when: build_bowtie2
+    outputs: [bowtie2_index_meta]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-index
+    inputs: [bowtie2_index_meta]
+    when: build_bowtie2
+    outputs: []
+
+  # Terminal: count-based completion. No inputs/outputs (reference_idx is the
+  # scope target; the expected index_types come from this ticket's build gates).
+  # Runs unconditionally — the last shard to complete flips the reference active.
+  - action: finalize-shard
+    inputs: []
+    outputs: []
+
+action_ceiling:
+  cpu: 16
+  mem_gb: 128
+  walltime: PT4H

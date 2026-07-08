@@ -97,6 +97,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `reference_index_index_type_check` allow-list to `rype`/`minimap2`/`bowtie2`).
   Additive CHECK; no `'bowtie2'` rows exist yet (the shard builders are unwired), no
   out-of-band steps. (#reference-support)
+- **`work_ticket.shard_id` sharded-fan-out discriminant.** `make migrate` applies
+  `20260710000000_work_ticket_shard_id.sql` (adds a nullable `qiita.work_ticket.shard_id
+  INTEGER` + a reference-scope-only CHECK, re-partitions
+  `work_ticket_one_in_flight_per_reference` with `AND shard_id IS NULL`, and adds
+  `work_ticket_one_in_flight_per_shard`). Additive; existing tickets read NULL and are
+  unaffected, no backfill or out-of-band steps. (#reference-support)
 
 ### 4. Deploy
 
@@ -112,6 +118,20 @@ _None yet._
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='read-mask-block'"
   # expect: read-mask-block|1.0.0|block
+  ```
+
+- Confirm the new `build-shard-index/1.0.0` workflow synced into `qiita.action` (the
+  sharded-index fan-out target — one build-shard-index ticket per shard; synced by
+  `qiita-admin actions sync` inside `activate.sh`). The extended `reference-add` /
+  `local-reference-add` context (the opt-in `shard_index` flag) re-syncs in place with
+  no separate check. No new env var, host directory, scope, group, or SIF (the shard
+  builders reuse the existing native rype/minimap2/bowtie2 job modules — no container;
+  the `compute` SA's `ticket:doget` grant above already covers the per-shard streaming).
+  Inert until a submitter opts in with `--shard-index`. (#reference-support)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='build-shard-index'"
+  # expect: build-shard-index|1.0.0|reference
   ```
 
 ### Notes (no host action)

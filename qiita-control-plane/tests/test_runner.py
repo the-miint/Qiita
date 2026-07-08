@@ -2777,6 +2777,37 @@ async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
     assert "data plane" in ei.value.reason
 
 
+async def test_shard_fanout_owns_finalize_matrix(postgres_pool, reference_idx):
+    """The conditional-finalize predicate: the parent reference-add finalize skips
+    its success_status patch iff a sharded fan-out is in progress — shard_index
+    set AND the reference currently `indexing` (N>0 fanned out). Every other case
+    (no shard_index, sharded-but-still-loading = N=0, non-reference scope) returns
+    False → the parent patches `active` inline."""
+    from qiita_control_plane import runner
+
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+
+    async def owns(bound, *, status):
+        await postgres_pool.execute(
+            "UPDATE qiita.reference SET status = $1 WHERE reference_idx = $2", status, reference_idx
+        )
+        async with postgres_pool.acquire() as conn:
+            return await runner._shard_fanout_owns_finalize(conn, ref_scope, bound)
+
+    # shard_index + indexing (fan-out happened, N>0) → skip the parent patch.
+    assert await owns({"shard_index": True}, status="indexing") is True
+    # shard_index + still loading (N=0, no fan-out) → parent patches active.
+    assert await owns({"shard_index": True}, status="loading") is False
+    # No shard_index (unsharded ref-add) → parent patches active, even if indexing.
+    assert await owns({}, status="indexing") is False
+    assert await owns({"shard_index": False}, status="indexing") is False
+    # Non-reference scope → never owned by a shard fan-out.
+    block_scope = {"kind": "block", "block_idx": 1}
+    async with postgres_pool.acquire() as conn:
+        owned = await runner._shard_fanout_owns_finalize(conn, block_scope, {"shard_index": True})
+    assert owned is False
+
+
 async def test_workflow_needs_adapters_detects_adapter_input():
     """The gate fires only when an entry declares adapter_parquet as an input."""
     from types import SimpleNamespace

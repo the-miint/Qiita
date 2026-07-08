@@ -701,7 +701,14 @@ async def run_workflow(
         try:
             async with pool.acquire() as conn, conn.transaction():
                 await _consume_upload_handles(conn, upload_idxs=uploads_to_consume)
-                if action.success_status:
+                # Skip the success_status patch when a sharded fan-out is in
+                # progress — finalize-shard owns `indexing → active` once every
+                # shard registers (see `_shard_fanout_owns_finalize`). Every
+                # other case (unsharded ref-add, sharded-but-N=0, host-ref-add)
+                # patches inline as before.
+                if action.success_status and not await _shard_fanout_owns_finalize(
+                    conn, scope_target, bound
+                ):
                     await _patch_resource_status(conn, scope_target, action.success_status)
                 await _atomic_transition(
                     conn,
@@ -2686,6 +2693,34 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
             "block_idx": work_ticket["block_idx"],
         }
     raise RuntimeError(f"unknown scope_target_kind: {kind!r}")
+
+
+async def _shard_fanout_owns_finalize(
+    conn: asyncpg.Connection,
+    scope_target: dict[str, Any],
+    bound: dict[str, Any],
+) -> bool:
+    """True when this ticket kicked off a sharded fan-out now in progress, so the
+    parent action's finalize must NOT apply its success_status — the terminal
+    `finalize-shard` owns `indexing → active` once every shard registers.
+
+    Fires only for a reference-scoped ticket whose action_context set
+    `shard_index` AND whose reference is currently `indexing` (plan-shards
+    transitioned it because N > 0). A sharded reference with no genomes stays
+    `loading` (N = 0, no fan-out) → this returns False → the parent patches
+    `active` inline (nothing to shard). An unsharded reference-add (no
+    `shard_index`) also returns False → patches `active` unchanged. `bound`
+    carries the action_context (resume-safe: reseeded from the persisted ticket
+    context), so this is correct across a CP restart."""
+    if not bound.get("shard_index"):
+        return False
+    if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+        return False
+    status = await conn.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+        scope_target["reference_idx"],
+    )
+    return status == ReferenceStatus.INDEXING.value
 
 
 async def _patch_resource_status(

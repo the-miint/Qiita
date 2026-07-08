@@ -40,6 +40,38 @@ context_schema:
     tree_upload_idx: {type: integer, minimum: 1}
     jplace_upload_idx: {type: integer, minimum: 1}
     genome_map_upload_idx: {type: integer, minimum: 1}
+    # Analysis sharding (opt-in, default OFF). When true, after register-files the
+    # `plan-shards` action assigns this reference's genome-bearing features to N
+    # lineage-sorted shards (reference_membership.shard_id) and fans out one
+    # build-shard-index ticket per shard; the reference goes loading → indexing →
+    # (all shards registered) → active, so `active` guarantees complete sharded
+    # indexes. Sharding is an indexing choice ON the same reference data — not a
+    # separate action. Taxonomy SHOULD be supplied (sharding sorts by lineage);
+    # an all-unclassified reference still shards (lineage=''). Default OFF →
+    # today's loading → active, no build, byte-identical.
+    shard_index: {type: boolean}
+    # Which per-shard analysis indexes to build (default-ON via the
+    # build-shard-index steps' `when:`; only meaningful when shard_index is true).
+    build_rype: {type: boolean}
+    build_minimap2: {type: boolean}
+    build_bowtie2: {type: boolean}
+    # Build params forwarded to the shard builders (rype_w -> build_rype_index.w,
+    # minimap2_preset -> build_minimap2_index.preset).
+    rype_w: {type: integer, minimum: 1}
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+  # A sharded reference must build at least one index type — reject sharding with
+  # every builder disabled. Fires only when shard_index is true AND all three
+  # build_* are explicitly false (an omitted build_* defaults ON via `when:`, so
+  # the common sharded path is unaffected).
+  not:
+    required: [shard_index, build_rype, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_rype: {const: false}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
 
 success_status: active
 failure_status: failed
@@ -79,6 +111,21 @@ steps:
 
   - action: register-files
     inputs: [staging_dir]
+    outputs: []
+
+  # Sharded-index fan-out (opt-in). Runs ONLY when action_context sets
+  # shard_index: true. MUST follow register-files — a shard build streams its
+  # chunks from DuckLake, and register-files is what MOVES the staging chunks in.
+  # plan-shards assigns reference_membership.shard_id, transitions
+  # loading → indexing, and fans out one build-shard-index ticket per shard
+  # (N = 0 for a reference with no genomes is a no-op). The action keeps
+  # success_status: active for the unsharded path; the runner's finalize skips
+  # that patch while a sharded fan-out is in progress (the reference is
+  # `indexing`), leaving `indexing → active` to each shard's terminal
+  # finalize-shard. No inputs/outputs: reference_idx is the scope target.
+  - action: plan-shards
+    when: shard_index
+    inputs: []
     outputs: []
 
 action_ceiling:

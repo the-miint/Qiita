@@ -1001,6 +1001,17 @@ def _build_parser() -> argparse.ArgumentParser:
             " which builds the rype + minimap2 host-filter indexes. Requires --taxonomy."
         ),
     )
+    p_reference_load.add_argument(
+        "--shard-index",
+        action="store_true",
+        dest="shard_index",
+        help=(
+            "Build per-shard ANALYSIS indexes (rype + minimap2 + bowtie2) on a plain"
+            " reference: after ingest, plan-shards fans out one build per lineage-sorted"
+            " shard (loading -> indexing -> active). Requires --taxonomy; mutually"
+            " exclusive with --host."
+        ),
+    )
     # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local
     # by-path). Neither is argparse-required because exactly which one applies
     # depends on --local; the entry point enforces the XOR and the
@@ -1032,35 +1043,44 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument("--tree", type=Path)
     p_reference_load.add_argument("--jplace", type=Path)
     p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
-    # Host index selection + build params (apply only with --host). Default
-    # builds both indexes; the opt-out flags skip one (not both — the entry
-    # point rejects building neither). --rype-w / --minimap2-preset tune the
-    # builders; omitted, they use the builders' defaults (w=20, preset=sr).
+    # Index selection + build params (apply with --host OR --shard-index). Default
+    # builds every index; the opt-out flags skip one (the entry point rejects
+    # building none). --rype-w / --minimap2-preset tune the builders; omitted,
+    # they use the builders' defaults (w=20, preset=sr).
     p_reference_load.add_argument(
         "--no-rype-index",
         action="store_true",
         help=(
-            "With --host: skip the rype index (build minimap2 only). Cannot be"
-            " combined with --no-minimap2-index."
+            "With --host/--shard-index: skip the rype index. Cannot be combined with"
+            " the other --no-*-index flags such that none is built."
         ),
     )
     p_reference_load.add_argument(
         "--no-minimap2-index",
         action="store_true",
         help=(
-            "With --host: skip the minimap2 index (build rype only). Cannot be"
-            " combined with --no-rype-index."
+            "With --host/--shard-index: skip the minimap2 index. Cannot be combined"
+            " with the other --no-*-index flags such that none is built."
+        ),
+    )
+    p_reference_load.add_argument(
+        "--no-bowtie2-index",
+        action="store_true",
+        dest="no_bowtie2_index",
+        help=(
+            "With --shard-index: skip the bowtie2 per-shard analysis index (bowtie2 is"
+            " analysis-only, so this does not apply to --host)."
         ),
     )
     p_reference_load.add_argument(
         "--rype-w",
         type=int,
-        help="With --host: rype minimizer window `w` for the rype index build (default 20).",
+        help="With --host/--shard-index: rype minimizer window `w` (default 20).",
     )
     p_reference_load.add_argument(
         "--minimap2-preset",
         choices=("sr", "map-ont", "map-pb", "map-hifi", "asm5", "asm10", "asm20"),
-        help="With --host: minimap2 preset baked into the .mmi index (default sr).",
+        help="With --host/--shard-index: minimap2 preset baked into the .mmi index (default sr).",
     )
     p_reference_load.add_argument(
         "--data-plane-url",
@@ -1830,6 +1850,7 @@ async def _run_reference_load(
         version=args.version,
         kind=args.kind,
         host=args.host,
+        shard_index=args.shard_index,
         reference_idx=args.reference_idx,
         taxonomy_path=args.taxonomy,
         tree_path=args.tree,
@@ -1837,6 +1858,7 @@ async def _run_reference_load(
         genome_map_path=args.genome_map,
         build_rype=not args.no_rype_index,
         build_minimap2=not args.no_minimap2_index,
+        build_bowtie2=not args.no_bowtie2_index,
         rype_w=args.rype_w,
         minimap2_preset=args.minimap2_preset,
         watch=not args.no_watch,

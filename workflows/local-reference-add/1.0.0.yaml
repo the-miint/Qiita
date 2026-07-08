@@ -41,6 +41,33 @@ context_schema:
     tree_path: {type: string, pattern: "^/"}
     jplace_path: {type: string, pattern: "^/"}
     genome_map_path: {type: string, pattern: "^/"}
+    # Analysis sharding (opt-in, default OFF) — identical semantics to
+    # reference-add's shard_index: after register-files, `plan-shards` assigns
+    # reference_membership.shard_id and fans out one build-shard-index ticket per
+    # shard (loading → indexing → active). Sharding is an indexing choice on the
+    # same reference data. Default OFF → today's loading → active, byte-identical.
+    shard_index: {type: boolean}
+    # Which per-shard analysis indexes to build (default-ON; only meaningful when
+    # shard_index is true).
+    build_rype: {type: boolean}
+    build_minimap2: {type: boolean}
+    build_bowtie2: {type: boolean}
+    # Build params forwarded to the shard builders (rype_w -> build_rype_index.w,
+    # minimap2_preset -> build_minimap2_index.preset).
+    rype_w: {type: integer, minimum: 1}
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+  # A sharded reference must build at least one index type (same backstop as
+  # reference-add). Fires only when shard_index is true AND all three build_*
+  # are explicitly false.
+  not:
+    required: [shard_index, build_rype, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_rype: {const: false}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
 
 success_status: active
 failure_status: failed
@@ -98,6 +125,15 @@ steps:
 
   - action: register-files
     inputs: [staging_dir]
+    outputs: []
+
+  # Sharded-index fan-out (opt-in) — identical to reference-add's plan-shards
+  # tail. Runs only when shard_index: true; MUST follow register-files (shard
+  # builds stream chunks from DuckLake). See reference-add/1.0.0.yaml for the
+  # full rationale (loading → indexing → active, conditional finalize).
+  - action: plan-shards
+    when: shard_index
+    inputs: []
     outputs: []
 
 action_ceiling:

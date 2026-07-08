@@ -15,6 +15,22 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded reference-add wiring + build-shard-index workflow + CLI (B5,
+  live end-to-end).** `reference-add` / `local-reference-add` gain an opt-in
+  `shard_index` context flag (+ `build_rype`/`build_minimap2`/`build_bowtie2`
+  gates, `rype_w`/`minimap2_preset` knobs, and a both/all-off backstop); when set,
+  a `plan-shards` action runs after register-files to assign shards and fan out
+  the build. A new `build-shard-index/1.0.0` workflow (target_kind reference, NO
+  success_status) builds one shard's rype/minimap2/bowtie2 indexes (each gated,
+  each with a register-index sibling) and ends with `finalize-shard`. The runner's
+  finalize now skips the parent's success_status patch while a sharded fan-out is
+  in progress (`_shard_fanout_owns_finalize`) so `indexing → active` is owned by
+  the terminal finalize-shard — unsharded / sharded-but-N=0 / host paths patch
+  `active` inline unchanged. The CLI's `qiita reference load` gains `--shard-index`
+  (mutually exclusive with `--host`, requires `--taxonomy`) and `--no-bowtie2-index`,
+  and the existing index knobs (`--no-rype-index`/`--no-minimap2-index`/`--rype-w`/
+  `--minimap2-preset`) now apply to `--shard-index` as well as `--host`. Default
+  (no `shard_index`) is byte-identical to today's `loading → active`. (#reference-support)
 - **Runner shard-roster staging + rype shard build streams (B5).** For a
   reference-scoped ticket carrying a non-NULL `shard_id`, the runner now stages
   the shard's feature roster before the step loop (`_stage_shard_roster`): it
