@@ -31,6 +31,13 @@ from ._helpers import _build_body, _handle_patch, _handle_read, _lane_arg
 from ._parser import _build_parser
 from .auth import _handle_login, _handle_profile_set, _handle_whoami, _patch_user_me
 from .biosample import _handle_biosample_create, _post_biosample
+from .pacbio import (
+    _handle_submit_pacbio_ingest,
+    _index_run_bams,
+    _PacbioPreflightRow,
+    _read_pacbio_preflight_rows,
+    _resolve_sample_bams,
+)
 from .pool import (
     _BCL_CONVERT_ACTION_ID,
     _BCL_CONVERT_ACTION_VERSION,
@@ -93,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "_BCL_CONVERT_ACTION_ID",
     "_BCL_CONVERT_ACTION_VERSION",
+    "_PacbioPreflightRow",
     "_PreflightRow",
     "_READ_MASK_ACTION_VERSION",
     "_assert_host_reference_ready",
@@ -121,12 +129,14 @@ __all__ = [
     "_handle_submit_bcl_convert",
     "_handle_submit_block_mask_pool",
     "_handle_submit_host_filter_pool",
+    "_handle_submit_pacbio_ingest",
     "_handle_ticket_list",
     "_handle_ticket_logs",
     "_handle_ticket_run",
     "_handle_ticket_status",
     "_handle_ticket_submit",
     "_handle_whoami",
+    "_index_run_bams",
     "_lane_arg",
     "_list_work_tickets",
     "_lookup_accessions",
@@ -139,8 +149,10 @@ __all__ = [
     "_post_study",
     "_post_work_ticket",
     "_print_missing_accession_error",
+    "_read_pacbio_preflight_rows",
     "_read_preflight_rows",
     "_render_ticket_logs",
+    "_resolve_sample_bams",
     "_run_reference_load",
     "_run_work_ticket",
     "_serializable",

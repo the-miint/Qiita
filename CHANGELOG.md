@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Added
 
+- **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
+  analogue of `submit-bcl-convert`: it reads a kl-run-preflight blob, stands up
+  the `sequencing_run` (platform `pacbio_smrt`) / `sequenced_pool` (blob attached)
+  / `sequenced_sample` roster, and — because PacBio arrives already demultiplexed
+  (one uBAM per barcode) — FANS OUT one existing `bam-to-parquet` ticket per
+  sample rather than a single pool-scoped demux ticket (no new job or workflow).
+  Each sample's BAM is located under `{run_folder}/{smrt_cell}/hifi_reads/` by its
+  barcode; a barcode reused across SMRT cells within a run fails loud (it cannot
+  be disambiguated until the preflight carries a SMRT-cell column) rather than
+  silently binding the wrong cell's reads. The PacBio preflight reader is a
+  PROVISIONAL in-CLI seam (`_read_pacbio_preflight_rows`) reading the
+  `pacbio_sample` table directly — `kl-run-preflight` ships no
+  `get_pacbio_sample_info` yet — isolated so it swaps to the upstream accessor
+  (which will also supply the SMRT cell) in one place. Verified against
+  kl-run-preflight's own `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
 - **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
   reads, selected by a required `mask_idx`: the runner's
