@@ -37,6 +37,7 @@ from .principal import (
     ServiceAccount,
     get_current_principal,
 )
+from .scopes import role_ceiling
 
 _MSG_AUTH_REQUIRED = "authentication required"
 
@@ -142,12 +143,46 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
     return _dep
 
 
+_STALE_TOKEN_HINT = (
+    " (your role grants this scope, but your current token doesn't include it — "
+    "run `qiita login` to mint a fresh token with your full role scopes)"
+)
+
+
+def _stale_token_hint(p: Principal, scopes: tuple[str, ...]) -> str:
+    """Actionable suffix for a scope 403 when the caller's role grants the scope
+    but their token doesn't carry it.
+
+    A human's PAT scopes are fixed at mint time, so a scope that's in the
+    caller's live `role_ceiling` but absent from the token yields a confusing
+    "missing required scope" 403 even though the role grants it. Two states land
+    here — a scope added to the ceiling *after* the token was minted (the token
+    predates the grant), or a PAT deliberately minted below the ceiling — and the
+    condition can't tell them apart, so the hint describes the state and points
+    at re-login rather than asserting a cause. When any of the checked `scopes`
+    is in the caller's live ceiling but absent from the token, return the hint;
+    otherwise ''. Non-human principals (service accounts, anonymous) don't use
+    the role ceiling, so they never get the hint.
+    """
+    if not isinstance(p, HumanUser):
+        return ""
+    try:
+        ceiling = role_ceiling(p.system_role)
+    except ValueError:
+        return ""
+    if any(s in ceiling and not p.has_scope(s) for s in scopes):
+        return _STALE_TOKEN_HINT
+    return ""
+
+
 def require_scope(scope: str) -> Callable[..., Principal]:
     """Factory: returns a dep that 401s on Anonymous, 403s if the principal's
     token scope set does not include `scope`.
 
     Accepts a Scope member or bare string; normalised so the 403 detail
-    renders `'self:token'` not `<Scope.SELF_TOKEN: 'self:token'>`.
+    renders `'self:token'` not `<Scope.SELF_TOKEN: 'self:token'>`. When the
+    caller's live role grants the scope but their token doesn't carry it, the
+    detail carries an actionable re-login hint (see `_stale_token_hint`).
     """
     scope_str = str(scope)
 
@@ -157,7 +192,7 @@ def require_scope(scope: str) -> Callable[..., Principal]:
         if not p.has_scope(scope_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"missing required scope {scope_str!r}",
+                detail=f"missing required scope {scope_str!r}" + _stale_token_hint(p, (scope_str,)),
             )
         return p
 
@@ -184,7 +219,8 @@ def require_any_scope(*scopes: str) -> Callable[..., Principal]:
         if not any(p.has_scope(s) for s in scope_strs):
             raise HTTPException(
                 status_code=403,
-                detail=f"missing one of required scopes {list(scope_strs)!r}",
+                detail=f"missing one of required scopes {list(scope_strs)!r}"
+                + _stale_token_hint(p, scope_strs),
             )
         return p
 
