@@ -15,6 +15,26 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded-index fan-out + count-based completion (B5).** A new
+  `shard_orchestration.plan_and_submit_shards` turns a `plan_shards` assignment
+  into N build tickets: it transitions the reference `loading → indexing` and,
+  in one transaction, INSERTs one PENDING `build-shard-index` `work_ticket` per
+  shard (scope `reference`, carrying `shard_id=k` + the index-selection context
+  copied from the parent), then dispatches each fresh ticket. N = 0 (no genomes)
+  is a no-op. Idempotent on redrive (`ON CONFLICT DO NOTHING` on the per-shard
+  index; the `loading → indexing` transition tolerates an already-`indexing`
+  reference). The runner threads a `dispatch_cb` (`schedule_dispatch`) from the
+  dispatch layer down through `run_workflow` → `_run_action_primitive` so the
+  fan-out fires child dispatches; a crash between INSERT and dispatch leaves the
+  tickets PENDING for the next startup reconcile. A new `finalize-shard`
+  primitive (`actions.library.finalize_shard`, registered in `LIBRARY`) is each
+  build ticket's terminal step: it counts registered shards per expected
+  `index_type` against N (derived from `reference_membership`) and does the
+  guarded `indexing → active` only when every type is complete — fail-closed
+  (a missing shard leaves `indexing`; it never flips to `failed`), and
+  last-observer-race-safe (the guarded UPDATE lets exactly one racer win;
+  a finalize that finds the reference already `active` is idempotent success).
+  Dormant — no workflow YAML references these actions yet. (#reference-support)
 - **`plan-shards` assignment core (B5).** A new CP-side `action:` primitive
   (`plan_shards`, registered in `LIBRARY`) turns the B2 tiler + persistence into
   an end-to-end shard assignment for one reference: it streams

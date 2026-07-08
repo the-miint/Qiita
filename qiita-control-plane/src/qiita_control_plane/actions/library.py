@@ -31,7 +31,7 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.models import FeatureHashEntry, GenomeSource
+from qiita_common.models import FeatureHashEntry, GenomeSource, ReferenceStatus
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action, sign_ticket
@@ -43,6 +43,7 @@ from ..repositories.block import (
     set_block_state,
 )
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
+from .reference import IllegalStatusTransition, transition_reference_status
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535
 # scalar parameter limit, but large arrays increase memory pressure and
@@ -746,6 +747,78 @@ async def register_index(
     )
 
 
+async def finalize_shard(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    expected_index_types: Sequence[str],
+) -> dict[str, Any]:
+    """Terminal step of each shard's build ticket: count-based, fail-closed
+    completion of a sharded reference.
+
+    Derives N = the number of shards from `reference_membership` (COUNT(DISTINCT
+    shard_id) over the non-NULL rows — no `shard_count` column to keep in sync),
+    then, for each expected `index_type` (the build_* subset this reference was
+    sharded for), counts registered shard rows in `reference_index`. Iff every
+    expected type has a registered row for all N shards, it does the guarded
+    `indexing -> active` transition so `active` guarantees complete sharded
+    indexes (the C1 consumer needs no coverage check). A single still-missing
+    shard leaves the reference honestly in `indexing` (fail-closed) — this
+    primitive NEVER transitions to `failed` (the FSM's only exit from `failed`
+    is `-> pending`, a full-ingest restart — wrong blast radius; an operator
+    redrives the failed shard ticket instead).
+
+    Race-safe: register_index rows are dedup'd on (reference_idx, index_type,
+    fs_path) and committed before each ticket's own finalize_shard, so the last
+    finalize in wall-clock time observes every sibling's rows; the guarded
+    UPDATE (transition_reference_status) lets exactly one racer flip `active`,
+    and a finalize that finds the reference already `active` treats the
+    IllegalStatusTransition as idempotent success.
+
+    Returns a JSON-able summary: `activated` (whether the reference is now
+    active), the derived `expected_shards` N, and per-type `registered_shards`.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        n = await conn.fetchval(
+            "SELECT count(DISTINCT shard_id) FROM qiita.reference_membership"
+            " WHERE reference_idx = $1 AND shard_id IS NOT NULL",
+            reference_idx,
+        )
+        registered: dict[str, int] = {}
+        for index_type in expected_index_types:
+            registered[index_type] = await conn.fetchval(
+                "SELECT count(DISTINCT shard_id) FROM qiita.reference_index"
+                " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NOT NULL",
+                reference_idx,
+                index_type,
+            )
+        # Fail-closed: require at least one expected type AND at least one shard,
+        # so a degenerate call (no expected types → registered={} → all([]) is
+        # vacuously True) can NEVER flip `active` with zero indexes. `active`
+        # must always mean "every expected index is built for all N shards".
+        complete = n > 0 and bool(registered) and all(count >= n for count in registered.values())
+        activated = False
+        if complete:
+            try:
+                await transition_reference_status(conn, reference_idx, ReferenceStatus.ACTIVE)
+                activated = True
+            except IllegalStatusTransition:
+                # A sibling finalize already flipped `active` (or the reference
+                # is otherwise past `indexing`) — idempotent success, not a fault.
+                current = await conn.fetchval(
+                    "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+                    reference_idx,
+                )
+                activated = current == ReferenceStatus.ACTIVE.value
+                if not activated:
+                    raise
+    return {
+        "reference_idx": reference_idx,
+        "expected_shards": n,
+        "registered_shards": registered,
+        "activated": activated,
+    }
+
+
 def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int]:
     """Derive the three per-stage both-mates (`*_r1r2`) read counts from a
     read_mask Parquet, returning (raw, biological, quality_filtered).
@@ -1275,6 +1348,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PLAN_SHARDS: plan_shards,
+    LibraryPrimitive.FINALIZE_SHARD: finalize_shard,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,

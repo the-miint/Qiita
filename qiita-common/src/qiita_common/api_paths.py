@@ -100,6 +100,11 @@ class LibraryPrimitive(StrEnum):
     # Postgres/DuckLake, and it writes shard_id back), not a native compute job.
     # See qiita_control_plane.actions.library.plan_shards.
     PLAN_SHARDS = "plan-shards"
+    # Reference sharding: the terminal step of each shard's build ticket.
+    # Count-based, fail-closed completion — when every expected index_type has a
+    # registered row for all N shards, does the guarded `indexing -> active`.
+    # See qiita_control_plane.actions.library.finalize_shard.
+    FINALIZE_SHARD = "finalize-shard"
     PERSIST_READ_METRICS = "persist-read-metrics"
     PERSIST_QC_REPORT = "persist-qc-report"
     # Block-compute: idempotent block replace. Runs immediately BEFORE

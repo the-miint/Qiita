@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,13 @@ from .actions.reference import (
 from .auth.tickets import sign_action, sign_ticket
 from .repositories.block import fetch_block_members
 from .repositories.mask_definition import lookup_mask_idx_by_params, mint_mask_definition
+from .shard_orchestration import (
+    BUILD_SHARD_INDEX_ACTION_ID,
+    BUILD_SHARD_INDEX_ACTION_VERSION,
+    SHARD_BUILD_CONTEXT_KEYS,
+    expected_shard_index_types,
+    plan_and_submit_shards,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -319,6 +327,7 @@ async def run_workflow(
     default_adapter_reference_idx: int | None = None,
     poll_interval_seconds: float = _STEP_POLL_INTERVAL_SECONDS,
     resume: bool = False,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> None:
     """Execute (or resume) the workflow attached to one work ticket.
 
@@ -644,6 +653,7 @@ async def run_workflow(
                 poll_interval_seconds=poll_interval_seconds,
                 prior_progress=progress,
                 resume=resume,
+                dispatch_cb=dispatch_cb,
             )
             bound.update(outputs)
 
@@ -807,6 +817,7 @@ async def _run_entry_with_retry(
     poll_interval_seconds: float,
     prior_progress: list[step_progress.StepProgressRow],
     resume: bool = False,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
     `BackendFailure`. Returns the entry's output map on success; raises
@@ -935,6 +946,7 @@ async def _run_entry_with_retry(
                     attempt=attempt,
                     hmac_secret=hmac_secret,
                     data_plane_url=data_plane_url,
+                    dispatch_cb=dispatch_cb,
                 )
             # WorkflowEntry is a closed union; the discriminator on
             # ActionDefinition guarantees one of the two arms above.
@@ -3662,6 +3674,7 @@ async def _dispatch_action(
     attempt: int,
     hmac_secret: bytes,
     data_plane_url: str,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Run one in-process `action:` entry and record its progress.
 
@@ -3695,6 +3708,7 @@ async def _dispatch_action(
             work_ticket_idx=work_ticket_idx,
             hmac_secret=hmac_secret,
             data_plane_url=data_plane_url,
+            dispatch_cb=dispatch_cb,
         )
     except BackendFailure as exc:
         await _best_effort_record_failed(
@@ -3735,6 +3749,7 @@ async def _run_action_primitive(
     work_ticket_idx: int,
     hmac_secret: bytes,
     data_plane_url: str,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Translate a workflow `action:` entry into the matching LIBRARY call.
     Per-primitive logic lives here because each primitive has its own
@@ -3829,20 +3844,52 @@ async def _run_action_primitive(
 
     if entry.name == LibraryPrimitive.PLAN_SHARDS:
         # Assign this reference's genome-bearing features to N lineage-sorted
-        # shards (reference_membership.shard_id). No file inputs: reference_idx
-        # from the scope target; the taxonomy DoGet + PG export are internal.
-        # This commit lands assignment only — the N-ticket fan-out over the
-        # assigned shards is wired in on top of this arm in a later commit.
+        # shards (reference_membership.shard_id) and fan out one build-shard-index
+        # ticket per shard. No file inputs: reference_idx from the scope target;
+        # the taxonomy DoGet + PG export are internal. The build gates/knobs the
+        # shard tickets carry are copied from THIS ticket's action_context
+        # (present in `bound`); the originator is inherited from this ticket.
         if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
             raise RuntimeError(
                 f"plan-shards requires a reference-scoped ticket; got {scope_target['kind']!r}"
             )
-        await LIBRARY[LibraryPrimitive.PLAN_SHARDS](
+        if dispatch_cb is None:
+            # Fanning out without a dispatch mechanism would silently strand the
+            # shard tickets in PENDING until the next startup reconcile — fail
+            # loud instead (dispatch always threads a callback in production).
+            raise RuntimeError("plan-shards requires a dispatch_cb to fan out shard tickets")
+        originator_principal_idx = await pool.fetchval(
+            "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        shard_context = {k: bound[k] for k in SHARD_BUILD_CONTEXT_KEYS if k in bound}
+        await plan_and_submit_shards(
             pool,
             scope_target["reference_idx"],
             hmac_secret=hmac_secret,
             data_plane_url=data_plane_url,
             workspace=workspace,
+            originator_principal_idx=originator_principal_idx,
+            build_action_id=BUILD_SHARD_INDEX_ACTION_ID,
+            build_action_version=BUILD_SHARD_INDEX_ACTION_VERSION,
+            action_context=shard_context,
+            dispatch_cb=dispatch_cb,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.FINALIZE_SHARD:
+        # Terminal step of a build-shard-index ticket: count-based, fail-closed
+        # completion. The expected index_types are derived from THIS ticket's
+        # build gates (in `bound`), so finalize counts exactly what was built.
+        # No file inputs; reference_idx from the scope target.
+        if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+            raise RuntimeError(
+                f"finalize-shard requires a reference-scoped ticket; got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.FINALIZE_SHARD](
+            pool,
+            scope_target["reference_idx"],
+            expected_shard_index_types(bound),
         )
         return {}
 
