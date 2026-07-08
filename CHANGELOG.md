@@ -677,6 +677,21 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Data-plane public-edge hardening.** The Arrow Flight service is reachable
+  from the internet through nginx on 443 (by design — clients connect directly
+  through nginx). Tightened that edge: the nginx Flight `location` now sets
+  `client_max_body_size 1088m` (matching the data plane's ~1 GiB DoPut decode
+  ceiling — nginx's 1 MB default would 413 reference-load uploads), bumps
+  `grpc_read_timeout`/`grpc_send_timeout` to 3600s (the 60s default cut off large
+  DoGet exports before the first batch materialized), and caps concurrent Flight
+  connections per client (`limit_conn qiita_flight_conn 64`) to blunt connection
+  floods. The data plane's `build_query` now refuses an empty filter on the
+  `read_masked` view (which would `SELECT *` every sample's pass-reads across all
+  studies) as defense-in-depth; the reference_* tables still allow an unfiltered
+  read by design. CLI `--data-plane-url` help now shows the public
+  `grpc+tls://<host>:443` form — the old `grpc://<host>:50051` example is the
+  on-host/direct port and is not reachable off the deploy host. (#harden/data-plane-public-edge)
+
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
   options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`

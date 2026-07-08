@@ -2016,6 +2016,19 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     let full_table = format!("qiita_lake.{table}");
 
     if filter.is_empty() {
+        // Defense-in-depth against a full-table read leak. `read_masked` exposes
+        // per-sample human read data and is always scoped by an explicit
+        // (prep_sample_idx, mask_idx) filter the control plane sets before
+        // signing; an empty filter here would `SELECT *` every sample's
+        // pass-reads across all studies if the CP ever mis-signed. Refuse it.
+        // The reference_* tables are broadly readable by design (this mirrors
+        // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
+        // legitimate there — reject empty filters only for the read surface.
+        if table == "read_masked" {
+            return Err(Status::invalid_argument(
+                "read_masked requires a non-empty filter (refusing full-table read)",
+            ));
+        }
         return Ok((format!("SELECT * FROM {full_table}"), full_table));
     }
 
@@ -3599,6 +3612,30 @@ mod tests {
             result.is_err(),
             "sequence_idx is not an allowed filter column"
         );
+    }
+
+    #[test]
+    fn build_query_read_masked_rejects_empty_filter() {
+        // An empty filter on the human-read surface would SELECT * every
+        // sample's pass-reads across all studies — refuse it (the CP always
+        // scopes read_masked tickets, this is defense-in-depth).
+        let empty = auth::TicketFilter::new();
+        let result = build_query("read_masked", &empty);
+        assert!(
+            result.is_err(),
+            "empty filter on read_masked must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_reference_table_allows_empty_filter() {
+        // Reference tables are broadly readable by design (mirrors the
+        // anonymous REST reference GET), so an unfiltered SELECT is legitimate.
+        let empty = auth::TicketFilter::new();
+        let (sql, table) = build_query("reference_sequences", &empty)
+            .expect("empty filter on a reference table is allowed");
+        assert_eq!(table, "qiita_lake.reference_sequences");
+        assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
     }
 
     // ------------------------------------------------------------------

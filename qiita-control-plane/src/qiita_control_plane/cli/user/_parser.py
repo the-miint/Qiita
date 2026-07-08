@@ -781,8 +781,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument(
         "--data-plane-url",
         help=(
-            "gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051)."
-            " Required for remote ingest; ignored (and optional) under --local."
+            "gRPC URL of the data plane. From off the deploy host use the public "
+            "TLS edge (e.g. grpc+tls://qiita.example.com:443); grpc://<host>:50051 "
+            "is the direct/on-host form. Required for remote ingest; ignored (and "
+            "optional) under --local."
         ),
     )
     p_reference_load.add_argument(
