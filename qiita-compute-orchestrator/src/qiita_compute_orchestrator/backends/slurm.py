@@ -125,6 +125,7 @@ class SlurmBackend(ComputeBackend):
         path_derived_images: Path | None = None,
         path_scratch: str = "",
         path_derived: str = "",
+        data_plane_url: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
@@ -170,6 +171,13 @@ class SlurmBackend(ComputeBackend):
         # the launcher's get_settings() on the compute node needs the real
         # value, not the $TMPDIR/qiita/derived dev fallback.
         self._path_derived = path_derived
+        # Data-plane gRPC origin, propagated for the same reason as PATH_DERIVED:
+        # a native job that streams reference chunks (Flight DoGet) resolves it
+        # via the launcher's get_settings() on the compute node, so it needs the
+        # real nginx-fronted origin, not the localhost dev fallback. Empty in unit
+        # tests that don't exercise streaming; production wires it in
+        # main._build_backend().
+        self._data_plane_url = data_plane_url
         # Optional SLURM QOS to set on submit; empty string means "let
         # SLURM apply the submitting user's default QOS" (the orchestrator
         # doesn't override).
@@ -386,6 +394,8 @@ class SlurmBackend(ComputeBackend):
             extra_env["PATH_SCRATCH"] = self._path_scratch
         if self._path_derived:
             extra_env["PATH_DERIVED"] = self._path_derived
+        if self._data_plane_url:
+            extra_env["DATA_PLANE_URL"] = self._data_plane_url
         # Native jobs LOAD miint from the deploy-staged MIINT_EXTENSION_DIRECTORY
         # (open_miint_conn); the compute node sees it only if we propagate it.
         # Single-sourced with the compute-readiness probe via miint_job_env() so

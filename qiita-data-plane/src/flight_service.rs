@@ -2061,6 +2061,13 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         if needs_membership_join && col == "reference_idx" {
             // Applied as a WHERE on the joined membership table alias.
             where_clauses.push(format!("m.reference_idx IN ({csv})"));
+        } else if needs_membership_join {
+            // Under the membership JOIN, feature_idx exists on BOTH the base
+            // table (t) and the membership table (m), so an unqualified
+            // reference is ambiguous — a combined {reference_idx, feature_idx}
+            // filter (what the CP's feature_idx-scoped DoGet ticket mints)
+            // would otherwise fail to bind. Qualify with the base alias.
+            where_clauses.push(format!("t.{col} IN ({csv})"));
         } else {
             where_clauses.push(format!("{col} IN ({csv})"));
         }
@@ -3544,6 +3551,41 @@ mod tests {
         );
         assert!(sql.contains("m.reference_idx IN (42)"));
         assert!(sql.starts_with("SELECT t.* FROM"));
+    }
+
+    #[test]
+    fn build_query_chunks_reference_and_feature_idx_qualifies_columns() {
+        // The shape the CP's feature_idx-scoped DoGet ticket mints: BOTH
+        // reference_idx (→ membership JOIN) and feature_idx. Under the JOIN,
+        // feature_idx lives on both t and m, so it MUST be qualified `t.` or the
+        // query fails to bind ("Ambiguous reference to column name feature_idx").
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(5)],
+        );
+        filter.insert(
+            "feature_idx".to_string(),
+            vec![
+                serde_json::Value::from(800001),
+                serde_json::Value::from(800002),
+            ],
+        );
+        let (sql, _) = build_query("reference_sequence_chunks", &filter).unwrap();
+        assert!(
+            sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
+            "expected membership JOIN, got: {sql}"
+        );
+        assert!(sql.contains("m.reference_idx IN (5)"), "got: {sql}");
+        assert!(
+            sql.contains("t.feature_idx IN (800001,800002)"),
+            "feature_idx must be qualified with the base alias under the JOIN, got: {sql}"
+        );
+        // No unqualified `feature_idx IN` clause (the ambiguous form).
+        assert!(
+            !sql.contains(" feature_idx IN ("),
+            "unqualified feature_idx clause is ambiguous under the JOIN, got: {sql}"
+        );
     }
 
     #[test]

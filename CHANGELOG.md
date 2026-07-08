@@ -15,6 +15,30 @@ the `no-changelog` label).
 
 ### Added
 
+- **Compute-side reference-chunk streaming (B6s).** The orchestrator can now pull a
+  reference's sequence chunks from the data plane over Arrow Flight instead of
+  reading staging Parquet — the streaming foundation the B4 shard builders sit on.
+  A new orchestrator `DATA_PLANE_URL` setting (default `grpc://localhost:50051`, not
+  fail-fast) is propagated into the SLURM job env like `PATH_DERIVED` so the native
+  launcher resolves the real data-plane origin on the compute node. A new
+  `data_plane_client` module carries the two-step retrieval path: an async
+  `fetch_reference_doget_ticket` (CO→CP, compute SA PAT) that obtains a
+  `feature_idx`-scoped ticket at job runtime, and a streaming `stream_reference_chunks`
+  context manager (CO→DP Flight DoGet) that registers the `(feature_idx, chunk_index,
+  chunk_data)` stream into DuckDB for lazy, unbuffered reassembly. The live `compute`
+  service account needs the `ticket:doget` scope (already within
+  `SERVICE_ACCOUNT_SCOPE_CEILING`) to mint the ticket. (#reference-support)
+
+### Fixed
+
+- **Data plane: ambiguous `feature_idx` under the reference-membership JOIN.**
+  `build_query` qualified only `reference_idx` (with the membership alias `m.`)
+  when a `reference_sequences` / `reference_sequence_chunks` filter triggered the
+  membership JOIN, leaving any other column unqualified. A combined
+  `{reference_idx, feature_idx}` filter — exactly what the B6 `feature_idx`-scoped
+  DoGet ticket mints — then failed to bind with "Ambiguous reference to column name
+  feature_idx" (`feature_idx` exists on both joined tables). The non-reference_idx
+  columns are now qualified with the base-table alias `t.`. (#reference-support)
 - **`feature_idx`-scoped DoGet ticket (B6).** `POST /reference/{idx}/ticket/doget`
   gains an optional `feature_idx` subset on its request body: omitted ⇒ today's
   whole-reference ticket (`filter={"reference_idx":[idx]}`), byte-identical;

@@ -13,7 +13,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
-### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast — a missing one keeps the unit down; entries that instead fall back to a default when unset are flagged inline)
 
 - **Email notification (control-plane).** To turn on work-ticket terminal-digest emails, set `SMTP_*` in `/etc/qiita/control-plane.env` before the restart; leaving `SMTP_HOST` unset keeps the no-op transport (no mail). None are secrets (relay is no-auth, IP-allowlisted, validated end-to-end). Optional `NOTIFY_*` knobs keep their defaults if unset. (#238)
   ```bash
@@ -28,10 +28,36 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   grep -q '^PATH_PERSISTENT=' /etc/qiita/data-plane.env || echo 'MISSING: set PATH_PERSISTENT in /etc/qiita/data-plane.env'
   ```
+- **`DATA_PLANE_URL` for the compute orchestrator.** Native reference-index build
+  jobs stream reference sequence chunks from the data plane over Arrow Flight; the
+  orchestrator propagates `DATA_PLANE_URL` into the SLURM job env so the compute
+  node DoGets against the right gRPC origin. **Not** `from_env()` fail-fast — a
+  missing value falls back to `grpc://localhost:50051` (the unit still boots), but
+  a compute node cannot reach a localhost data plane, so set it to the
+  nginx-fronted gRPC origin (same host the data plane's own `DATA_PLANE_URL`
+  names) before the restart. (#reference-support)
+  ```bash
+  sudo bash -c 'echo "DATA_PLANE_URL=grpc://qiita-miint.ucsd.edu:50051" >> /etc/qiita/compute-orchestrator.env'
+  ```
 
 ### 2. One-time host setup
 
-_None yet._
+- **Grant `ticket:doget` to the `compute` service account.** The orchestrator's
+  reference-chunk streaming makes a CO→CP call to mint a `feature_idx`-scoped DoGet
+  ticket, which needs the `ticket:doget` scope (within `SERVICE_ACCOUNT_SCOPE_CEILING`;
+  the `compute` SA currently holds only `sequence_range:mint`). Scopes ride the PAT,
+  so re-mint the `compute` SA token with the expanded set `["sequence_range:mint",
+  "ticket:doget"]` and swap the token file — the "mint new, swap file, revoke old"
+  flow in [`docs/runbooks/orchestrator-token-rotation.md`](docs/runbooks/orchestrator-token-rotation.md),
+  with the expanded scope list from
+  [`docs/runbooks/compute-service-account-provisioning.md`](docs/runbooks/compute-service-account-provisioning.md#scope-grant).
+  **Least-privilege alternative:** if you prefer to keep `sequence_range:mint` (a
+  `sequence_idx`-domain mint) isolated from the reference read scope, provision a
+  separate service account holding only `ticket:doget` and point the reference
+  build path at its token instead — see the provisioning runbook's "Why a separate
+  principal". Extending `compute` is simplest; `ticket:doget` is a read scope (it
+  signs a ticket to read reference chunks), not cross-domain minting authority.
+  (#reference-support)
 
 ### 3. Migrations
 

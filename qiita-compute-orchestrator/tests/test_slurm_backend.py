@@ -68,6 +68,7 @@ def _make_backend(
     cp_url: str = "",
     path_scratch: str = "",
     path_derived: str = "",
+    data_plane_url: str = "",
 ) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
@@ -87,6 +88,7 @@ def _make_backend(
         cp_url=cp_url,
         path_scratch=path_scratch,
         path_derived=path_derived,
+        data_plane_url=data_plane_url,
     )
 
 
@@ -410,9 +412,11 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
     assert "CO_TO_CP_TOKEN" not in env
     assert "QIITA_ALLOW_TOKEN_ENV" not in env
     assert "QIITA_CP_URL" not in env
-    # Likewise PATH_SCRATCH / PATH_DERIVED — only propagated when wired (below).
+    # Likewise PATH_SCRATCH / PATH_DERIVED / DATA_PLANE_URL — only propagated
+    # when wired (below).
     assert "PATH_SCRATCH" not in env
     assert "PATH_DERIVED" not in env
+    assert "DATA_PLANE_URL" not in env
 
 
 @pytest.mark.asyncio
@@ -496,6 +500,46 @@ async def test_run_step_propagates_path_derived_into_job_env(jwt_path, baseline,
     )
     env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
     assert env["PATH_DERIVED"] == "/scratch/persistent"
+
+
+@pytest.mark.asyncio
+async def test_run_step_propagates_data_plane_url_into_job_env(jwt_path, baseline, tmp_path):
+    """A native job that streams reference chunks (Flight DoGet) resolves the
+    data-plane origin via the launcher's get_settings() on the compute node.
+    Like PATH_DERIVED, /etc/qiita is invisible from compute nodes, so the backend
+    must propagate the resolved DATA_PLANE_URL into the SLURM job env or the
+    launcher falls back to the grpc://localhost:50051 DEFAULT and DoGets against
+    the wrong origin."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(
+        httpx.MockTransport(handler),
+        jwt_path,
+        data_plane_url="grpc://qiita-miint.ucsd.edu:50051",
+    )
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert env["DATA_PLANE_URL"] == "grpc://qiita-miint.ucsd.edu:50051"
 
 
 @pytest.mark.asyncio
