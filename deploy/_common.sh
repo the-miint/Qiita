@@ -184,6 +184,36 @@ qiita_sif_build_inputs_hash() {
     )
 }
 
+# Scoped variant of the hash above for a MULTI-IMAGE workflow (one that ships
+# several per-tool images from a `sif-build.d/` — see build-sif.sh). Instead of
+# hashing the whole workflow dir (which would make a change to ANY tool's
+# def/entrypoint rebuild EVERY image), this hashes only the EXPLICIT files an
+# image declares (its own def + entrypoint(s), via the spec's HASH_INPUTS) plus
+# _shared/. That is what lets, e.g., an edit to the checkm image's def rebuild
+# only long-read-assembly-checkm and leave long-read-assembly-assemble alone — the granularity the
+# per-tool split exists to deliver. Same digest shape as the whole-dir hash
+# (repo-relative path + sha256 per file, sorted, re-hashed) so a legacy single
+# image and a scoped image are computed identically; only the input SET differs.
+#
+# $1 = repo root, $2 = shared dir, then N absolute file paths (the image's
+# declared build inputs, each already validated to exist by the caller). Echoes
+# the hex digest. The same cd-to-/ safety note as qiita_sif_build_inputs_hash
+# applies (find restoring an unreadable cwd), so the work runs in a subshell.
+qiita_sif_build_inputs_hash_scoped() {
+    local repo_root="$1" shared_dir="$2"
+    shift 2
+    (
+        cd / || exit 1
+        {
+            printf '%s\n' "$@"
+            find "$shared_dir" -type f ! -path '*/__pycache__/*'
+        } | LC_ALL=C sort | while IFS= read -r f; do
+            printf '%s ' "${f#"$repo_root"/}"   # repo-relative path → location-independent
+            _qiita_sha256 < "$f"
+        done | _qiita_sha256
+    )
+}
+
 # Which of a workflow's vendored SOURCES are NOT staged under the images/sources
 # dir? build-sifs.sh uses this to SKIP (not fail) an image whose licensed artifact
 # the operator hasn't placed out of band. $1 = sources dir, $2 = space-separated

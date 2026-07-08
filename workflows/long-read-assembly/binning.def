@@ -1,0 +1,62 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# Per-tool image for the long-read-assembly `binning` step (metawrap: metabat2 +
+# maxbin2 + concoct). One of four single-tool images the workflow ships; see
+# assemble.def for the split rationale. Invoked as
+# `apptainer exec <sif> /opt/qiita/binning.sh` (per-step entrypoint), so the
+# %runscript is unused.
+#
+# metawrap-mg is the heaviest bioconda solve of the four images (metabat2 + maxbin2
+# + concoct + its aligners in one env), so this SIF is the slowest to build.
+
+%labels
+    workflow long-read-assembly
+    tool binning
+    version 1.0.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    _lib.sh /opt/qiita/_lib.sh
+    # This image's per-step entrypoint.
+    binning.sh /opt/qiita/binning.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json), gawk, pigz (binning.sh decompresses reads), procps,
+    # findutils — the base utilities the entrypoint relies on outside the tool env.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+
+    # One env for this tool. Channels bioconda + conda-forge; versions pinned
+    # loosely here and tightened after the first Linux build resolves the solve.
+    #  - binning: metawrap bundles metabat2 + maxbin2 + concoct + its aligners.
+    micromamba create -y -n metawrap -c bioconda -c conda-forge metawrap-mg
+
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh
+    chmod 0644 /opt/qiita/manifest_writer.py
+
+    micromamba clean -a -y
+
+%test
+    set -e
+    micromamba env list | grep -q metawrap
+    micromamba run -n metawrap metawrap --version >/dev/null 2>&1 || micromamba run -n metawrap metawrap -h >/dev/null
+    # Base utilities + the shipped manifest writer.
+    jq --version
+    pigz --version
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Guard the entrypoint stays wired to its env.
+    grep -q 'micromamba run -n metawrap metawrap' /opt/qiita/binning.sh
+
+%runscript
+    echo "long-read-assembly-binning image: invoke the step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/binning.sh" >&2
+    exit 64

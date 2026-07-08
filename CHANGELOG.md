@@ -15,6 +15,45 @@ the `no-changelog` label).
 
 ### Added
 
+- **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
+  recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
+  reads, selected by a required `mask_idx`: the runner's
+  `_resolve_staged_masked_reads` STREAMS the `read_masked` pass-set from the data
+  plane (the existing `read_masked` DoGet — **no bespoke DoAction or payload**) to
+  a gzip FASTQ via miint's native `COPY … FORMAT FASTQ` (the `masked_reads_fastq`
+  binding, the same capability the admin masked-read export uses), so no
+  intermediate Parquet and the data plane never writes a file. It enforces the
+  `mask_sample` completion gate (a partially-masked sample is rejected, not
+  assembled from a partial pass-set) and treats a fully-masked-out sample as a
+  terminal NO_DATA. A native step records the assembler; four container steps run
+  hifiasm_meta → metawrap binning → DAS_Tool → CheckM, each in its OWN per-tool
+  image (`long-read-assembly-{assemble,binning,dastool,checkm}`, one micromamba env
+  each) so a change to one tool's solve rebuilds only that image. CheckM requires
+  its reference DB — the `checkm` step fails loud without it (a required deploy
+  step) — and DAS_Tool fails loud on a real crash while treating a genuine no-bins
+  result as a benign empty. The storage tail REUSES the reference-add pipeline
+  rather than a bespoke parser: `assembly_hash` reads the LCG + MAG contigs with
+  miint `read_fastx` (circular contigs arrive as one multi-FASTA, no per-contig
+  split) and emits the manifest + hash-keyed chunks + bin_map, `mint-features`
+  mints the contig features against the SHARED `qiita.feature` (identical bytes
+  collapse to one feature_idx — an assembled contig and a reference sequence share
+  identity), `write-assembly-membership` links them to `qiita.assembly_membership`,
+  and `assembly_load` (reusing reference_load's re-key writers) + register-files
+  load four DuckLake tables — `assembled_sequence` / `assembled_sequence_chunks`
+  (feature-keyed contig sequences), `assembly_membership` (which features each
+  (prep_sample, run, bin) contains), and `bin_quality` (per-MAG CheckM + DAS_Tool
+  provenance, read with DuckDB's CSV reader). Each run has a `processing_idx`
+  identity (deduped on the canonical params hash — workflow/version/mask_idx/
+  assembler, so a different mask's pass-set is a distinct run that never collides a
+  prior run's bins). The step-1 assembler is a parameter (`hifiasm_meta` default;
+  `myloasm` reserved), threaded through the native steps' `params:` (a container
+  step can't take a scalar). Empty-branch semantics: LCG-only samples store
+  successfully, zero-contig samples are a terminal NO_DATA; sub-512 kb circular
+  contigs (plasmids / small replicons) are kept as LCG and separated from
+  chromosome-scale genomes by length at query time rather than deleted. The
+  cross-sample dereplication / taxonomy / abundance stage
+  (galah/gtdbtk/GToTree/coverm) is a separate follow-on that reads these per-sample
+  results across many preps. (#255)
 - **`bam-to-parquet` workflow — load a sample's BAM into the `read` table.** The
   BAM analogue of `fastq-to-parquet`, structurally near-identical: a single native
   `bam` step reads the file with miint's `read_sequences_sam` (which emits a
@@ -31,7 +70,6 @@ the `no-changelog` label).
   table, migration, container, or env var. The
   `PreMintedRange` retry-recovery model moved from `jobs/fastq_to_parquet.py` to
   `sequence_range.py` so both read-ingest jobs share it. (#254)
-
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its
@@ -639,6 +677,28 @@ the `no-changelog` label).
 
 ### Changed
 
+- **DuckLake catalog parquet write-options aligned with our register-time format.**
+  Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
+  options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`
+  per-table on the chunk tables (`reference_sequence_chunks`,
+  `assembled_sequence_chunks`), matching `qiita_common.parquet.PARQUET_OPTS` /
+  `CHUNK_ROW_GROUP_SIZE` — so DuckLake's OWN rewrites (compaction, merge, any future
+  direct insert) stay consistent with the format `register_files` writes rather than
+  drifting to DuckLake's defaults. Set idempotently at data-plane boot
+  (`connect_ducklake` + the `ensure_*_tables`), persisted in `ducklake_metadata`.
+  (#255)
+- **SIF build tooling supports N per-tool images per workflow.** A container
+  workflow may now ship several single-tool images under
+  `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE` and a
+  `HASH_INPUTS` of the entrypoint(s) + shared helper it %files-copies; the def is
+  auto-included in the scoped hash) alongside — and fully
+  backward-compatible with — the legacy single `sif-build.env` + `Apptainer.def`
+  form (bcl-convert untouched). `build-sif.sh` takes an optional `<image>`
+  selector, `deploy/build-sifs.sh` discovers both layouts, and a new
+  `qiita_sif_build_inputs_hash_scoped` keys the two-gate idempotency hash to each
+  image's own inputs so a change to one tool's def or entrypoint rebuilds only its
+  image. `long-read-assembly` is the first consumer, shipping four per-tool images
+  (assemble / binning / dastool / checkm). (#255)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
   helper; split the orchestrator's all-nullable `StepHandle` into typed

@@ -5,14 +5,22 @@ A container workflow opts into the single generic builder by adding a
 into a temp root it owns and only ever READS the checkout, so a locked-down
 service account can build without write access to the qiita-owned tree.
 
+A workflow may ship its image spec in either of two layouts, both guarded here:
+
+* SINGLE (legacy): `workflows/<wf>/sif-build.env` builds
+  `workflows/<wf>/Apptainer.def` into one SIF.
+* MULTI (per-tool): `workflows/<wf>/sif-build.d/<image>.env` each builds its
+  own def (the spec's `DEF_FILE`, relative to the workflow dir) into its own
+  SIF, so one workflow can ship N single-tool images.
+
 These pure-unit tests (no infrastructure; run under `make test`) keep that
 contract from rotting:
 
 * no hand-rolled per-workflow `scripts/build-*-sif.sh` can reappear and
   reintroduce the checkout-write bug — the generic `build-sif.sh` is the
   only allowed builder;
-* every `sif-build.env` carries the keys build-sif.sh requires and has the
-  Apptainer.def it builds; and
+* every spec (either layout) carries the keys build-sif.sh requires, the def
+  it names exists, and any HASH_INPUTS it declares point at real files; and
 * SIF_FILENAME matches the workflow YAML's `container:` value, so the built
   artifact name can't drift from what the orchestrator resolves at run time.
 """
@@ -72,7 +80,31 @@ def _files_directives(def_text: str) -> list[str]:
 
 
 def _sif_build_specs() -> list[Path]:
-    return sorted(_WORKFLOWS.glob("*/sif-build.env"))
+    """Every image spec, both layouts: the legacy single form at the workflow
+    root and the per-tool multi form under sif-build.d/."""
+    return sorted([*_WORKFLOWS.glob("*/sif-build.env"), *_WORKFLOWS.glob("*/sif-build.d/*.env")])
+
+
+def _workflow_dir(spec_path: Path) -> Path:
+    """The workflow directory a spec belongs to. A legacy spec sits directly in
+    it; a multi spec sits one level down in sif-build.d/."""
+    if spec_path.name == "sif-build.env":
+        return spec_path.parent
+    return spec_path.parent.parent
+
+
+def _def_path(spec_path: Path, spec: dict[str, str]) -> Path:
+    """The Apptainer def this spec builds — DEF_FILE (workflow-relative) if the
+    spec names one, else the legacy Apptainer.def."""
+    return _workflow_dir(spec_path) / spec.get("DEF_FILE", "Apptainer.def")
+
+
+def _spec_id(spec_path: Path) -> str:
+    """Distinct pytest id per spec — `<wf>` for a legacy spec, `<wf>:<image>`
+    for a multi spec (so the four per-tool images don't collide on `sif-build.d`)."""
+    if spec_path.name == "sif-build.env":
+        return spec_path.parent.name
+    return f"{spec_path.parent.parent.name}:{spec_path.stem}"
 
 
 def test_generic_build_script_is_the_only_sif_builder() -> None:
@@ -95,10 +127,9 @@ def test_at_least_one_workflow_uses_the_generic_flow() -> None:
     assert _sif_build_specs(), "expected at least one workflows/*/sif-build.env"
 
 
-@pytest.mark.parametrize("spec_path", _sif_build_specs(), ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("spec_path", _sif_build_specs(), ids=_spec_id)
 def test_sif_build_spec_is_complete(spec_path: Path) -> None:
     spec = _parse_env(spec_path)
-    workflow_dir = spec_path.parent
 
     missing = [k for k in _REQUIRED_KEYS if not spec.get(k)]
     assert not missing, f"{spec_path} is missing required key(s): {missing}"
@@ -113,12 +144,24 @@ def test_sif_build_spec_is_complete(spec_path: Path) -> None:
             f"(`$`/backtick) — specs must be literal KEY=value data"
         )
 
-    assert (workflow_dir / "Apptainer.def").is_file(), (
-        f"{workflow_dir.name} declares a sif-build.env but has no Apptainer.def"
+    def_path = _def_path(spec_path, spec)
+    assert def_path.is_file(), (
+        f"{_spec_id(spec_path)} declares a build spec but its def "
+        f"{def_path.relative_to(_WORKFLOWS)} does not exist"
     )
 
+    # A multi-image spec scopes its idempotency hash to HASH_INPUTS — those must
+    # be real workflow-relative files, or a typo silently drops a build input
+    # from the hash (an edit to it would then never trigger a rebuild).
+    workflow_dir = _workflow_dir(spec_path)
+    for rel in spec.get("HASH_INPUTS", "").split():
+        assert (workflow_dir / rel).is_file(), (
+            f"{_spec_id(spec_path)}: HASH_INPUTS entry '{rel}' does not exist "
+            f"under {workflow_dir.name}/"
+        )
 
-@pytest.mark.parametrize("spec_path", _sif_build_specs(), ids=lambda p: p.parent.name)
+
+@pytest.mark.parametrize("spec_path", _sif_build_specs(), ids=_spec_id)
 def test_sources_are_referenced_in_def(spec_path: Path) -> None:
     """Each staged SOURCES artifact must actually be consumed by the def's
     %files (by bare filename); a source listed but never copied in is dead
@@ -127,23 +170,23 @@ def test_sources_are_referenced_in_def(spec_path: Path) -> None:
     sources = spec.get("SOURCES", "").split()
     if not sources:
         return
-    def_text = (spec_path.parent / "Apptainer.def").read_text()
+    def_text = _def_path(spec_path, spec).read_text()
     files_block = "\n".join(_files_directives(def_text))
     for src in sources:
         assert src in files_block, (
-            f"{spec_path.parent.name}: sif-build.env lists SOURCES entry "
-            f"'{src}' but no Apptainer.def %files directive references it"
+            f"{_spec_id(spec_path)}: spec lists SOURCES entry "
+            f"'{src}' but no def %files directive references it"
         )
 
 
-@pytest.mark.parametrize("spec_path", _sif_build_specs(), ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("spec_path", _sif_build_specs(), ids=_spec_id)
 def test_sif_filename_matches_workflow_container(spec_path: Path) -> None:
     """SIF_FILENAME must equal the `container:` the workflow YAML declares,
     so the built artifact name matches what the orchestrator resolves at run
     time. Regex-scan the YAML(s) rather than depend on a parser."""
     spec = _parse_env(spec_path)
     sif = spec["SIF_FILENAME"]
-    workflow_dir = spec_path.parent
+    workflow_dir = _workflow_dir(spec_path)
 
     # `_`-prefixed dirs are sentinel/helper workflows (e.g. _sif-build-smoke,
     # alongside _shared); they intentionally ship no workflow YAML — the

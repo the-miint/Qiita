@@ -31,7 +31,25 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-_None yet._
+- **CheckM reference database for `long-read-assembly`.** The workflow's `checkm`
+  step needs CheckM's ~1.4 GB reference data, which is deliberately NOT baked into
+  the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
+  time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
+  `/opt/checkm_data`), so the DB dir must be bind-mounted there (or
+  `QIITA_CHECKM_DB` set to its in-container path). (#255)
+  ```bash
+  # verify the tarball against CheckM's published checksum before extracting.
+  sudo -u qiita-orch bash -c 'mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data" \
+    && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
+    && tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
+  ```
+  REQUIRED before the first `long-read-assembly` run: the `checkm` step now **fails
+  loud** (non-zero exit) when the DB is absent or misconfigured — it no longer
+  degrades to an empty `checkm_dir` — so a MAG-producing sample's ticket cannot
+  COMPLETE until the DB is staged AND the container can see it (bind-mount it to
+  `CHECKM_DATA_PATH`, or set `QIITA_CHECKM_DB` to its in-container path). Wiring the
+  bind into the container step is part of this setup (the orchestrator binds only
+  declared step inputs today). assemble/binning/bin_refine are unaffected.
 
 ### 3. Migrations
 
@@ -48,6 +66,11 @@ _None yet._
     applies it standalone).
   - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
     extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
+- **Assembly-processing schema for `long-read-assembly`.** `make migrate` applies
+  `20260707000000_assembly.sql`: creates `qiita.processing` (+ the idempotent
+  `qiita.mint_processing` mint function) and `qiita.assembly_membership`. Plain
+  `make migrate`, no backfill or out-of-band setup. (The four DuckLake assembly
+  tables are auto-created at data-plane startup — see the note below.) (#255)
 
 ### 4. Deploy
 
@@ -65,6 +88,13 @@ _None yet._
   # expect: read-mask-block|1.0.0|block
   ```
 
+- Confirm the `long-read-assembly/1.0.0` workflow synced into `qiita.action`
+  (synced by `qiita-admin actions sync` inside `activate.sh`): (#255)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='long-read-assembly'"
+  # expect: long-read-assembly|1.0.0|prep_sample
+  ```
 - Confirm the `bam-to-parquet/1.0.0` workflow synced into `qiita.action` (new
   BAM read-loader — synced by `qiita-admin actions sync` inside `activate.sh`,
   covered by `make verify-deploy`'s `qiita.action` list; this asserts the specific
@@ -91,6 +121,20 @@ _None yet._
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
   read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
+- **`long-read-assembly/1.0.0` is inert until an operator runs it.** The four new
+  DuckLake tables (`assembled_sequence`, `assembled_sequence_chunks`,
+  `assembly_membership`, `bin_quality`) are created automatically at data-plane
+  startup by `ensure_assembly_tables` — **no data-plane action** (the Postgres
+  `qiita.processing` / `qiita.assembly_membership` side is the bucket-3 migration).
+  The workflow's FOUR per-tool images (`long-read-assembly-assemble-1.0.0.sif`,
+  `long-read-assembly-binning-1.0.0.sif`, `long-read-assembly-dastool-1.0.0.sif`,
+  `long-read-assembly-checkm-1.0.0.sif`) are built automatically by `build-sifs.sh` during
+  the deploy — it now iterates `workflows/*/sif-build.d/*.env` in addition to the
+  legacy `sif-build.env`, so no new manual build step. The first build resolves
+  several bioconda envs (metawrap / DAS_Tool / CheckM), so it is **slow** and
+  needs apptainer + network on the build host; the two-gate idempotency is now
+  per-image, so a later change to one tool rebuilds only its SIF. Beyond the
+  bucket-2 CheckM DB, no new env var, scope, or group. (#255)
 
 ---
 

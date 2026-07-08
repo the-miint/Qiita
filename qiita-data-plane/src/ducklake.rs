@@ -27,6 +27,13 @@ fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parquet row-group size (rows) DuckLake should use when it rewrites the chunked
+/// sequence tables. Must equal `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`: the
+/// orchestrator writes those chunk Parquets at this row count
+/// (`PARQUET_OPTS_CHUNKED` `ROW_GROUP_SIZE`), and the per-table `set_option` calls
+/// below pin DuckLake's own rewrites to the same layout.
+const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
+
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
 /// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session.
@@ -43,6 +50,17 @@ pub fn connect_ducklake(
     conn.execute_batch(&format!(
         "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake (DATA_PATH '{data_path}');"
     ))?;
+    // Align DuckLake's OWN parquet writes (compaction, merge, any future direct
+    // insert) with how register_files writes our files. DuckLake's defaults are
+    // snappy + Parquet v1; qiita_common.parquet.PARQUET_OPTS writes zstd + v2, so
+    // without this DuckLake's maintenance rewrites would drift from the
+    // register-time format. Persisted in ducklake_metadata (a catalog-global
+    // default; the per-chunks-table row-group override is set alongside each table).
+    // Idempotent — re-set on every boot. Keep the values in sync with PARQUET_OPTS.
+    conn.execute_batch(
+        "CALL qiita_lake.set_option('parquet_compression', 'zstd');
+         CALL qiita_lake.set_option('parquet_version', 2);",
+    )?;
     Ok(())
 }
 
@@ -120,6 +138,12 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             pendant_length DOUBLE
         );",
     )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'reference_sequence_chunks');"
+    ))?;
     Ok(())
 }
 
@@ -220,6 +244,90 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
          AND r.sequence_idx = m.sequence_idx
         WHERE m.reason = 'pass';",
     )?;
+    Ok(())
+}
+
+/// Create the assembly-result tables in DuckLake — the assembly analogue of the
+/// reference-sequence tables, following the SAME chunked + content-hashed model.
+///
+/// A contig is stored ONCE, deduped by content hash and keyed by the CP-minted
+/// `feature_idx` (the shared `qiita.feature` space, minted via `mint-features`),
+/// exactly like a reference sequence. The bytes are 64 KB chunks (reassemble via
+/// `string_agg(chunk_data, '' ORDER BY chunk_index)`), never a bulk VARCHAR cell.
+/// `assembly_membership` records which features a prep_sample's assembly contains
+/// and in which bin (a circular LCG genome or a refined MAG) — the DuckLake copy
+/// of `qiita.assembly_membership`, for bulk joins against the sequences.
+/// `bin_quality` is per-MAG CheckM, joined to its contigs via assembly_membership
+/// on (prep_sample_idx, kind, bin_id).
+///
+/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
+/// (integrity is enforced upstream — the CP mints feature_idx/dedups on
+/// sequence_hash, the orchestrator verifies before load).
+///
+/// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
+/// register_files loads them and they are SQL-queryable in the catalog; they are
+/// intentionally not on the external Flight read-back path (`ALLOWED_TABLES`).
+pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- One row per UNIQUE contig (content-hash deduped), keyed by the minted
+        -- feature_idx. Mirrors reference_sequences: sequence_length_bp lives here
+        -- (kept for coverage), the bytes live in the chunks table.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_sequence (
+            feature_idx BIGINT NOT NULL,
+            sequence_hash UUID NOT NULL,
+            sequence_length_bp BIGINT NOT NULL
+        );
+
+        -- The contig bytes in 64 KB chunks (reassemble with
+        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
+        -- reference_sequence_chunks; loaded multi-file (a <table>/ subdir of parts)
+        -- so a large assembly never OOMs a single-file sort+write.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_sequence_chunks (
+            feature_idx BIGINT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_data VARCHAR NOT NULL
+        );
+
+        -- Which features a (prep_sample, processing) assembly run contains, and in
+        -- which bin. processing_idx disambiguates runs (bin_id reused across
+        -- samples AND runs); kind is 'LCG' | 'MAG' (value set owned by the
+        -- producer). The DuckLake copy of qiita.assembly_membership for bulk joins
+        -- with the sequences.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            feature_idx BIGINT NOT NULL
+        );
+
+        -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on
+        -- (prep_sample_idx, processing_idx, kind, bin_id). completeness /
+        -- contamination / strain_heterogeneity + marker_lineage from `checkm
+        -- lineage_wf --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
+        -- das_tool_score / source_binner are DAS_Tool provenance. The assembler is
+        -- captured in qiita.processing (processing_idx), not repeated here.
+        CREATE TABLE IF NOT EXISTS qiita_lake.bin_quality (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            marker_lineage VARCHAR,
+            completeness DOUBLE,
+            contamination DOUBLE,
+            strain_heterogeneity DOUBLE,
+            genome_size BIGINT,
+            n_contigs BIGINT,
+            das_tool_score DOUBLE,
+            source_binner VARCHAR
+        );",
+    )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'assembled_sequence_chunks');"
+    ))?;
     Ok(())
 }
 
@@ -433,6 +541,33 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "read_masked view should exist exactly once");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_assembly_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
+        // EXISTS), and every table must exist and be queryable afterwards.
+        let conn = setup_conn();
+        ensure_assembly_tables(&conn).expect("first ensure_assembly_tables");
+        ensure_assembly_tables(&conn).expect("second ensure_assembly_tables (idempotent)");
+
+        for table in [
+            "assembled_sequence",
+            "assembled_sequence_chunks",
+            "assembly_membership",
+            "bin_quality",
+        ] {
+            // table is a &'static str literal, so the format! is injection-safe
+            // (test-only pattern; see Cleanup above).
+            let sql = format!(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = '{table}'"
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(n, 1, "{table} table should exist exactly once");
+        }
     }
 
     /// read_masked applies the recorded trims (substr on the sequence, list

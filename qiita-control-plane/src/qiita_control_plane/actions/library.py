@@ -33,6 +33,7 @@ from qiita_common.models import FeatureHashEntry
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action
+from ..repositories.assembly import insert_assembly_membership_rows
 from ..repositories.block import (
     fetch_block_members,
     finalize_mask_sample,
@@ -367,6 +368,82 @@ async def write_membership(
                 async with conn.transaction():
                     chunk_linked = await _write_membership_rows(conn, reference_idx, feature_idxs)
                 total_linked += chunk_linked
+                total_seen += len(feature_idxs)
+    return total_linked, total_seen - total_linked
+
+
+# DuckDB JOIN that resolves each assembly contig to its bin + feature_idx.
+# bin_map (read_id -> kind, bin_id) x manifest (read_id -> sequence_hash) x
+# feature_map (sequence_hash -> feature_idx). The read_id is assembly_hash's
+# synthetic globally-unique id (kind:bin_id:contig_id), so the join is 1:1 per
+# contig. INNER JOINs by construction: every bin_map read_id is a manifest read_id
+# (both from the same assembly_hash scan) and every manifest hash was minted by
+# mint-features, so no contig is dropped. Exposed as a module constant so the join
+# is unit-testable against Parquet fixtures without a Postgres pool.
+ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
+    "SELECT bm.kind, bm.bin_id, fm.feature_idx"
+    " FROM read_parquet(?) AS bm"
+    " JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
+    " JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+)
+
+
+async def write_assembly_membership(
+    pool: asyncpg.Pool,
+    prep_sample_idx: int,
+    processing_idx: int,
+    bin_map_path: Path,
+    manifest_path: Path,
+    feature_map_path: Path,
+) -> tuple[int, int]:
+    """Link a prep_sample's assembly-run contigs to qiita.assembly_membership.
+
+    The assembly analogue of `write_membership`. DuckDB JOINs `bin_map`
+    (read_id -> kind, bin_id) against `manifest` (read_id -> sequence_hash) and
+    the already-minted `feature_map` (sequence_hash -> feature_idx), resolving
+    each contig set-side to `(kind, bin_id, feature_idx)`; the stream is read in
+    `_CHUNK_SIZE` batches and bulk-inserted into qiita.assembly_membership with
+    `(prep_sample_idx, processing_idx)` stamped from this run. Never materialises
+    the whole mapping in Python — same streaming contract mint_features /
+    write_membership follow.
+
+    Returns `(linked, already_linked)`. Idempotent (ON CONFLICT DO NOTHING on the
+    natural PK): a workflow retried from the start re-links nothing new. Raises
+    ValueError (FK violation surfaced structured) if any feature_idx is missing
+    from qiita.feature.
+    """
+    for label, path in [
+        ("bin_map", bin_map_path),
+        ("manifest", manifest_path),
+        ("feature_map", feature_map_path),
+    ]:
+        if not path.exists():
+            raise FileNotFoundError(f"{label} not found: {path}")
+
+    total_linked = 0
+    total_seen = 0
+    async with pool.acquire() as conn:
+        with duckdb.connect(":memory:") as duck:
+            reader = duck.execute(
+                ASSEMBLY_MEMBERSHIP_JOIN_SQL,
+                [str(bin_map_path), str(manifest_path), str(feature_map_path)],
+            ).to_arrow_reader(_CHUNK_SIZE)
+            for batch in reader:
+                kinds = batch.column("kind").to_pylist()
+                if not kinds:
+                    continue
+                bin_ids = batch.column("bin_id").to_pylist()
+                feature_idxs = batch.column("feature_idx").to_pylist()
+                async with conn.transaction():
+                    linked = await insert_assembly_membership_rows(
+                        conn,
+                        prep_sample_idx=prep_sample_idx,
+                        processing_idx=processing_idx,
+                        kinds=kinds,
+                        bin_ids=bin_ids,
+                        feature_idxs=feature_idxs,
+                    )
+                total_linked += linked
                 total_seen += len(feature_idxs)
     return total_linked, total_seen - total_linked
 
@@ -941,6 +1018,7 @@ async def reconcile_block(
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
+    LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,

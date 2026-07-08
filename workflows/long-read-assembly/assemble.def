@@ -1,0 +1,68 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# Per-tool image for the long-read-assembly `assemble` step (hifiasm_meta). One of
+# four single-tool images the workflow ships (assemble / binning / bin_refine /
+# checkm), each built from its own def + sif-build.d/ spec so a change to one
+# tool's solve rebuilds ONLY that image — the tools are mutually
+# dependency-incompatible (metawrap is py2.7-era; CheckM is py3; DAS_Tool drags in
+# R), and a single-tool image also makes each reusable on its own. The step is
+# invoked as `apptainer exec <sif> /opt/qiita/assemble.sh` (per-step entrypoint),
+# so the %runscript is unused.
+#
+# Pinned invariant: assemble.sh depends on hifiasm-meta encoding a contig's
+# circularity in the trailing `[lc]` letter of its GFA segment name (`…tg……c` =
+# circular, `…l` = linear). The entrypoint emits the tool's RAW output verbatim
+# (no column normalization); downstream parsing is DuckDB's.
+
+%labels
+    workflow long-read-assembly
+    tool assemble
+    version 1.0.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    _lib.sh /opt/qiita/_lib.sh
+    # This image's per-step entrypoint.
+    assemble.sh /opt/qiita/assemble.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json), gawk, pigz (fast (de)compress), procps, findutils — the
+    # base utilities the entrypoint relies on outside the tool env.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+
+    # One env for this tool. Channels bioconda + conda-forge; versions pinned
+    # loosely here and tightened after the first Linux build resolves the solve.
+    #  - assemble: hifiasm-meta (the assembler). The GFA split is plain awk and the
+    #    circular contigs are emitted as a single multi-FASTA (no per-contig split
+    #    tool), so the native assembly_hash step reads them with miint read_fastx.
+    micromamba create -y -n assemble -c bioconda -c conda-forge hifiasm_meta
+
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh
+    chmod 0644 /opt/qiita/manifest_writer.py
+
+    micromamba clean -a -y
+
+%test
+    set -e
+    micromamba env list | grep -q assemble
+    micromamba run -n assemble hifiasm_meta --version
+    # Base utilities + the shipped manifest writer.
+    jq --version
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Guard the entrypoint stays wired to its env.
+    grep -q 'micromamba run -n assemble hifiasm_meta' /opt/qiita/assemble.sh
+
+%runscript
+    echo "long-read-assembly-assemble image: invoke the step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/assemble.sh" >&2
+    exit 64

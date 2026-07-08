@@ -1,0 +1,187 @@
+action_id: long-read-assembly
+version: 1.0.0
+target_kind: prep_sample
+# target_processing_kinds is intentionally omitted (empty = any kind): there is
+# no "masked" ProcessingKind, and the real input selector is `mask_idx` (which
+# host-filter/mask identity to assemble from), which the runner STREAMS into the
+# masked-reads FASTQ the pipeline consumes (no intermediate Parquet).
+
+description: >
+  Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
+  PacBio HiFi long reads. The runner STREAMS the
+  prep_sample's masked reads (the read_masked pass-set for `mask_idx`:
+  host/human/QC-failing reads excluded, recorded trims applied) from the data
+  plane straight to a gzip FASTQ (`masked_reads_fastq`) via miint's native
+  COPY FORMAT FASTQ — no intermediate Parquet; the native `assembly_run_config`
+  step only records the chosen assembler. Four container steps then run the heavy
+  tools —
+  `assemble` (hifiasm_meta → circular LCG genomes + noLCG contigs), `binning`
+  (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
+  and `checkm` (per-MAG completeness/contamination). The storage tail REUSES the
+  reference-add machinery: `assembly_hash` hashes the LCG + MAG contigs (shared
+  canonical sequence hash), `mint-features` mints the contig features against the
+  shared `qiita.feature`, `write-assembly-membership` links them to
+  `qiita.assembly_membership` (tagged by kind/bin_id, stamped with the run's
+  processing_idx), `assembly_load` re-keys them + reads the CheckM/DAS_Tool metrics
+  into the DuckLake-shape Parquets, and register-files loads the `assembled_sequence`,
+  `assembled_sequence_chunks`, `assembly_membership`, and `bin_quality` tables.
+
+  Everything here is per-sample. Cross-sample dereplication / taxonomy / abundance
+  (galah/gtdbtk/GToTree/coverm) is a separate downstream stage that reads these
+  stored per-sample results across many preps.
+
+scopes: []
+
+audience:
+  # A processing workflow over a sample's already-stored masked reads. Available
+  # to end users and above; no service-account (LIMS) submission today.
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [mask_idx]
+  properties:
+    # The CP-minted filtering-config identity whose pass-set to assemble. The
+    # runner signs a read_masked DoGet ticket scoped to (prep_sample_idx, mask_idx)
+    # and STREAMS that pass-set into a FASTQ (the same capability the admin
+    # masked-read export uses). Without it there is no way to select WHICH mask's
+    # reads to use.
+    mask_idx:
+      type: integer
+      minimum: 1
+    # Step-1 assembler. Threaded (as a scalar param) through the native
+    # assembly_run_config step into run_config.json, which the `assemble`
+    # container reads — a scalar can't ride a container step's inputs (the runner
+    # would treat it as a bind-mount path). hifiasm_meta is implemented today;
+    # myloasm is a valid enum value that is not implemented yet.
+    assembler:
+      type: string
+      enum: [hifiasm_meta, myloasm]
+      default: hifiasm_meta
+
+steps:
+  # Emit run_config.json (the chosen assembler). The masked reads are STREAMED to
+  # `masked_reads_fastq` by the runner (the read_masked DoGet + miint COPY FORMAT
+  # FASTQ, keyed off the action_context `mask_idx`) — a runner-produced binding, so
+  # no step reads them here. This native step only carries the `assembler` scalar
+  # (native-only) into a file the assemble container reads with jq.
+  - step: assembly_run_config
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_run_config
+    params: {assembler: assembler}
+    outputs: [run_config]
+    baseline_resources:
+      cpu: 1
+      mem_gb: 2
+      walltime: PT10M
+
+  # hifiasm_meta assembly + circular-genome extraction. Reads run_config.json to
+  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
+  # terminal no-data outcome inside the container.
+  - step: assemble
+    step_type: singleton
+    container: long-read-assembly-assemble-1.0.0.sif
+    entrypoint: /opt/qiita/assemble.sh
+    inputs: [masked_reads_fastq, run_config]
+    outputs: [genomes_dir]
+    baseline_resources:
+      cpu: 32
+      mem_gb: 192
+      walltime: PT16H
+
+  # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
+  # reads. 0 bins → empty bins_dir (exit 0); downstream steps skip cleanly.
+  - step: binning
+    step_type: singleton
+    container: long-read-assembly-binning-1.0.0.sif
+    entrypoint: /opt/qiita/binning.sh
+    inputs: [genomes_dir, masked_reads_fastq]
+    outputs: [bins_dir]
+    baseline_resources:
+      cpu: 16
+      mem_gb: 100
+      walltime: PT8H
+
+  # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
+  # → empty refined_bins_dir (exit 0); a real DAS_Tool crash fails the step.
+  - step: bin_refine
+    step_type: singleton
+    container: long-read-assembly-dastool-1.0.0.sif
+    entrypoint: /opt/qiita/bin_refine.sh
+    inputs: [genomes_dir, bins_dir]
+    outputs: [refined_bins_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT4H
+
+  # CheckM lineage_wf + qa -o 2 over the refined MAGs → raw lineage.tsv + qa.tsv
+  # (assembly_load joins them in DuckDB). Empty input → empty checkm_dir (exit 0).
+  - step: checkm
+    step_type: singleton
+    container: long-read-assembly-checkm-1.0.0.sif
+    entrypoint: /opt/qiita/checkm.sh
+    inputs: [refined_bins_dir]
+    outputs: [checkm_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 40
+      walltime: PT4H
+
+  # Hash the LCG + MAG contigs into the reference-load shape: manifest
+  # (synthetic globally-unique read_id, SHARED canonical sequence_hash),
+  # hash-keyed assembly_chunks/, and bin_map (read_id → kind, bin_id). Zero
+  # contigs (no LCG, no MAG) is StepNoData. Sequences are run-agnostic, so this
+  # step carries no processing_idx.
+  - step: assembly_hash
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_hash
+    inputs: [genomes_dir, refined_bins_dir]
+    outputs: [manifest, assembly_chunks, bin_map]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
+  # Mint feature_idx for every contig hash against the SHARED qiita.feature (same
+  # primitive reference-add uses) — identical bytes collapse to one feature_idx.
+  - action: mint-features
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  # Link this run's contigs to qiita.assembly_membership, tagged by (kind, bin_id)
+  # and stamped with the run's processing_idx (minted before the loop because
+  # assembly_load threads it via params). Idempotent (ON CONFLICT DO NOTHING).
+  - action: write-assembly-membership
+    inputs: [bin_map, manifest, feature_map]
+    outputs: []
+
+  # Re-key the contigs to feature_idx (REUSED reference_load writers) and read the
+  # CheckM/DAS_Tool metrics → the four DuckLake-shape staging Parquets. Threads
+  # processing_idx via params: (signals the runner to mint the run identity before
+  # the step loop). LCG-only samples write bin_quality empty (a success).
+  - step: assembly_load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_load
+    inputs: [manifest, feature_map, assembly_chunks, bin_map, checkm_dir, refined_bins_dir]
+    params: {processing_idx: processing_idx}
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT2H
+
+  # Load the staging Parquets → the `assembled_sequence`, `assembled_sequence_chunks`,
+  # `assembly_membership`, and `bin_quality` DuckLake tables (top-level
+  # <stem>.parquet → table; a subdir of parts → the table named after the dir).
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+# Per-step cap (the runner enforces resolved <= ceiling on every axis at
+# dispatch). Matches the heaviest step (assemble): 32 cpu / 192 GB / PT16H.
+action_ceiling:
+  cpu: 32
+  mem_gb: 192
+  walltime: PT16H

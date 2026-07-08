@@ -60,13 +60,20 @@ from ._mask import (
     _persist_mask_idx,
     _workflow_needs_mask,
 )
+from ._processing import (
+    ASSEMBLER_BINDING,
+    _mint_processing_idx,
+    _workflow_needs_processing,
+)
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
+    _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
     _workflow_declares_input,
+    _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
 from ._reconstruct import (
@@ -295,6 +302,35 @@ async def run_workflow(
                     f"block-scoped; got {scope_target['kind']!r}"
                 )
 
+        # Staged MASKED-read binding (assembly workflows): `masked_reads_fastq` is
+        # a sample's `read_masked` pass-set for the action_context `mask_idx`,
+        # STREAMED from the data plane over a `read_masked` DoGet straight to gzip
+        # FASTQ (miint's native COPY FORMAT FASTQ) — no bespoke DoAction, no
+        # intermediate Parquet. Distinct from `reads` (raw) above — read-mask
+        # workflows consume raw reads to CREATE a mask; long-read-assembly consumes
+        # an EXISTING mask's pass-set to assemble.
+        if _workflow_needs_staged_masked_reads(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that assembles masked reads must be prep_sample-"
+                    f"scoped; got {scope_target['kind']!r}"
+                )
+            mask_idx = bound.get(MASK_IDX_BINDING)
+            if mask_idx is None:
+                raise _submission_bad_input(
+                    "a masked-reads workflow requires `mask_idx` in action_context"
+                )
+            bound.update(
+                await _resolve_staged_masked_reads(
+                    pool,
+                    scope_target,
+                    int(mask_idx),
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
+
         # Read-mask identity: when a step threads `mask_idx` through its params
         # (the host_filter step), bind the mask_idx before the loop. Same
         # inside-try placement as the resolvers above so a failure lands in the
@@ -343,6 +379,31 @@ async def run_workflow(
                     "a workflow that masks reads (threads mask_idx) must be "
                     f"prep_sample- or block-scoped; got {scope_target['kind']!r}"
                 )
+
+        # Processing identity: when a step threads `processing_idx` (the assembly
+        # membership + load steps), mint the run's processing_idx before the loop —
+        # the canonical-params hash of {workflow, version, result-affecting knobs
+        # like the assembler}. Same inside-try placement so a mint failure lands in
+        # the FAILED handler. Idempotent: a re-mint on resume re-resolves the same
+        # id via the params-hash upsert.
+        if _workflow_needs_processing(action.steps):
+            # Single-source the assembler default from the action's context_schema
+            # (the one result-affecting knob today) — the same default the hash and
+            # the container use, so neither can drift from a re-declared literal.
+            assembler_default = (
+                action.context_schema.get("properties", {})
+                .get(ASSEMBLER_BINDING, {})
+                .get("default")
+            )
+            bound.update(
+                await _mint_processing_idx(
+                    pool,
+                    action_id=action.action_id,
+                    action_version=action.version,
+                    bound=bound,
+                    assembler_default=assembler_default,
+                )
+            )
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
