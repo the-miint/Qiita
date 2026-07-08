@@ -516,6 +516,25 @@ def test_submit_pacbio_ingest_retry_reuses_existing_roster(monkeypatch, tmp_path
     ]
 
 
+def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(monkeypatch, tmp_path):
+    """A re-run cannot silently change an existing sample's identity: if the roster
+    row's biosample_idx differs from what this submission resolves, fail loud
+    (exit 1) instead of reusing it and pretending the correction landed."""
+    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    # bc3011 resolves to biosample_idx 11 (BIO_sample.1) in the stub, but the
+    # roster claims it maps to a different biosample — a divergent re-run.
+    existing = [{"sequenced_pool_item_id": "bc3011", "prep_sample_idx": 300, "biosample_idx": 999}]
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured, existing_samples=existing)
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(run, db))
+    assert ei.value.code == 1
+
+
 def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(monkeypatch, tmp_path):
     """A real re-submit: the samples exist AND their ingest tickets already
     COMPLETED (or are in-flight), so the work-ticket POSTs 409. Those are the

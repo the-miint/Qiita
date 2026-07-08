@@ -424,6 +424,25 @@ def _provision_run_pool_roster(
         secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
         existing = existing_by_item_id.get(item_id)
         if existing is not None:
+            # Reuse is convergent, NOT a silent overwrite: a re-run cannot change an
+            # existing sample's identity. Guard the one identity field the roster
+            # exposes — biosample_idx — so a re-run pointing an item_id at a
+            # different biosample fails loud instead of pretending the correction
+            # landed. (The roster does not carry primary/secondary study_idx or
+            # prep_protocol_idx, so those cannot be reconciled here; reuse trusts
+            # the existing row for them — correcting them needs a pool-sample delete
+            # + re-create, not a re-run.)
+            existing_biosample_idx = existing.get("biosample_idx")
+            if existing_biosample_idx is not None and existing_biosample_idx != biosample_idx:
+                print(
+                    f"error: pool item {item_id!r} already exists in sequenced_pool"
+                    f" {sequenced_pool_idx} with biosample_idx={existing_biosample_idx}, but this"
+                    f" submission resolves it to biosample_idx={biosample_idx}. A re-run cannot"
+                    " change an existing sample's biosample — delete the pool sample (or fix the"
+                    " preflight) and re-run.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
             prep_sample_idx = existing["prep_sample_idx"]
             sequenced_sample_idx = existing.get("sequenced_sample_idx")
             reused = True
@@ -436,13 +455,29 @@ def _provision_run_pool_roster(
                 primary_study_idx=primary_study_idx,
                 secondary_study_idxs=secondary_study_idxs,
             ).model_dump(exclude_unset=True, mode="json")
-            sample_resp = _common.call(
-                "POST",
-                base_url,
-                token,
-                f"{PATH_SEQUENCING_RUN_PREFIX}{sample_path}",
-                json=sample_body,
-            )
+            try:
+                sample_resp = _common.call(
+                    "POST",
+                    base_url,
+                    token,
+                    f"{PATH_SEQUENCING_RUN_PREFIX}{sample_path}",
+                    json=sample_body,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    # The item_id is absent from the roster (which filters retired
+                    # rows) yet the composer's (pool, item_id) uniqueness — which
+                    # counts retired rows — rejects it. A create-missing re-run
+                    # can't resolve a retired-slot collision; surface it actionably
+                    # instead of letting a raw 409 abort the gesture opaquely.
+                    print(
+                        f"error: pool item {item_id!r} conflicts with an existing (possibly"
+                        f" retired) sample in sequenced_pool {sequenced_pool_idx}; resolve it"
+                        " before re-running.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1) from exc
+                raise
             prep_sample_idx = sample_resp["prep_sample_idx"]
             sequenced_sample_idx = sample_resp["sequenced_sample_idx"]
             reused = False

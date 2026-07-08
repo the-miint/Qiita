@@ -2786,6 +2786,73 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
     assert summary["sequenced_pool"]["status"] == "reused"
 
 
+def test_submit_bcl_convert_reuses_existing_roster_samples(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """Convergent re-run: when the pool roster already holds a sample, bcl-convert
+    creates NO sequenced-sample (create-missing) and reuses its prep_sample_idx in
+    the work-ticket sample_map. Pins the CHANGELOG 'convergent re-run' claim."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", [])])
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),
+            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
+            (200, {"resolved": {"PRJ001": 7}, "missing": []}),
+            (200, {"sequencing_run_idx": 12}),
+            (200, {"sequenced_pool_idx": 34}),
+            # roster already has item "1" (biosample_idx matches the resolved 41).
+            (
+                200,
+                {
+                    "samples": [
+                        {
+                            "sequenced_pool_item_id": "1",
+                            "prep_sample_idx": 81,
+                            "sequenced_sample_idx": 71,
+                            "biosample_idx": 41,
+                        }
+                    ]
+                },
+            ),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    # No sequenced-sample was CREATED (POST) — the existing one is reused.
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/sequenced-sample")
+    ]
+    # The work-ticket sample_map carries the reused prep_sample_idx.
+    ticket = next(r for r in captured["requests"] if r["url"].endswith("/work-ticket"))
+    assert ticket["json"]["action_context"]["sample_map"] == [
+        {"prep_sample_idx": 81, "pool_item_id": "1"}
+    ]
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequenced_samples"][0]["prep_sample_idx"] == 81
+
+
 def test_submit_bcl_convert_rejects_relative_bcl_input_dir(capsys, preflight_stub):
     """A relative --bcl-input-dir cannot be passed through to the
     orchestrator's container bind logic safely; fail at argparse time

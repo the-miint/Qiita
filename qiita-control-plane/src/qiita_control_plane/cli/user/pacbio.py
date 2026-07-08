@@ -68,6 +68,10 @@ _SHEET_TYPE_METAG = "pacbio_metag"
 # Per-cell reads PacBio's demux could not assign to a barcode; never a sample.
 _UNASSIGNED_BAM_SUFFIX = ".unassigned.bam"
 
+# Per-SMRT-cell subdirectory holding demultiplexed HiFi BAMs, and the filename
+# field that names it: `{run}/{well}/hifi_reads/{movie}.hifi_reads.{barcode}.bam`.
+_HIFI_READS_DIR = "hifi_reads"
+
 
 class _PacbioPreflightRow(NamedTuple):
     """One PacBio sample pulled from the kl-run-preflight SQLite.
@@ -321,14 +325,14 @@ def _index_run_bams(run_folder: Path) -> tuple[dict[str, Path], set[str]]:
     """
     index: dict[str, Path] = {}
     duplicated: set[str] = set()
-    for bam in sorted(run_folder.glob("*/hifi_reads/*.bam")):
+    for bam in sorted(run_folder.glob(f"*/{_HIFI_READS_DIR}/*.bam")):
         if bam.name.endswith(_UNASSIGNED_BAM_SUFFIX):
             continue
         parts = bam.name.split(".")
         # Require the exact demux shape "<movie>.hifi_reads.<barcode>.bam" so a
         # non-demuxed combined BAM ("<movie>.hifi_reads.bam") isn't indexed under a
         # spurious barcode ("hifi_reads"). ["m84_s1", "hifi_reads", "bc2073", "bam"].
-        if len(parts) < 4 or parts[-3] != "hifi_reads":
+        if len(parts) < 4 or parts[-3] != _HIFI_READS_DIR:
             continue
         barcode = parts[-2]
         if barcode in index or barcode in duplicated:
@@ -394,12 +398,11 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     3. POST /sequencing-run (platform PACBIO_SMRT; instrument_run_id +
        instrument_model from args, since PacBio has no RunInfo.xml) and
        /sequencing-run/{run}/sequenced-pool (attaching the preflight blob). The
-       blob is attached per the store-once design so a FUTURE read-mask submission
+       blob is attached per the store-once design so a later read-mask submission
        can re-read the protocol columns (human_filtering, twist_adaptor_id,
-       syndna_is_twisted) server-side and derive the case's mask chain — the same
-       way submit-host-filter-pool reads human_filtering from the stored Illumina
-       blob today. That PacBio server-side re-read parser is NOT built yet (it
-       lands with the case-5 mask PR); until then human_filtering is echoed in this
+       syndna_is_twisted) server-side and derive the mask chain, as
+       submit-host-filter-pool already does for the Illumina blob. No PacBio
+       server-side re-read parser exists yet: human_filtering is echoed in this
        command's summary for operator reference only and is not forwarded onward.
     4. GET the pool roster and create only the MISSING sequenced-samples
        (`sequenced_pool_item_id = barcode`, the PacBio demux identifier — the
