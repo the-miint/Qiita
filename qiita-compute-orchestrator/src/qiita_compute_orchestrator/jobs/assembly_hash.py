@@ -218,34 +218,42 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{bin_map_out}' ({PARQUET_OPTS})"
             )
 
-            # Pass 2 — hash-keyed chunks. Re-scan every FASTA, dedup by canonical
-            # sequence_hash, and stream 64 KB `sequence_split` chunks straight to
-            # Parquet. The dedup is `DISTINCT ON (sequence_hash)` with an explicit
-            # `ORDER BY sequence_hash, contig_id`. contig_id is NOT projected — it is
-            # the tie-break that fixes WHICH row survives per hash group: the
-            # canonical hash folds a sequence and its reverse-complement into ONE
-            # hash, so rows sharing a sequence_hash can carry DIFFERENT raw bytes
-            # (fwd vs revcomp). Without the tie-break DuckDB could keep either row,
-            # so the chunk bytes would vary run-to-run; ordering by contig_id pins
-            # the representative to the lex-smaller contig id, so re-runs write
-            # byte-identical chunks (this tail is replay-safe). Bytes are chunked
-            # exactly as read; the canonical identity lives in the hash. Mirrors
-            # hash_sequences' relabel.
+            # winner — the ONE surviving contig per canonical sequence_hash, chosen
+            # as a NARROW `DISTINCT ON (sequence_hash)` over the in-memory `contig`
+            # table (synthetic read_id + hash only, NO sequence bytes), tie-broken by
+            # the synthetic read_id so re-runs pick the same representative
+            # deterministically. The canonical hash folds a sequence and its
+            # reverse-complement into one hash, so distinct raw bytes can share a
+            # hash; keeping the lex-smaller synthetic read_id makes the stored bytes
+            # reproducible (this tail is replay-safe). This narrow sort is the crux
+            # of bounding memory: the multi-MB sequence payload NEVER rides it.
+            conn.execute(
+                "CREATE TEMP TABLE winner AS "
+                "SELECT DISTINCT ON (sequence_hash) read_id, sequence_hash "
+                "FROM contig ORDER BY sequence_hash, read_id"
+            )
+
+            # Pass 2 — hash-keyed chunks, STREAMING. Re-scan the FASTA, re-derive
+            # each contig's synthetic read_id (same file_meta join as pass 1), keep
+            # ONLY the winners (a tiny build side), and UNNEST 64 KB `sequence_split`
+            # chunks straight to Parquet keyed by the winner's canonical hash. The
+            # join filters to winners BEFORE the UNNEST, so `sequence_split` runs only
+            # on surviving rows and each winner's chunks stream to the writer — the
+            # full sequence set is never sorted or materialized at once. Peak memory
+            # is ~constant in total contig size (bounded by the read_fastx batch +
+            # in-flight chunk lists), not O(total bytes) — the same shape that keeps
+            # hash_sequences bounded on multi-GB genome inputs. Bytes are chunked
+            # exactly as read; the canonical identity lives in the hash.
             conn.execute(
                 "COPY ("
-                "  WITH per_contig AS ("
-                "    SELECT rf.read_id AS contig_id, "
-                f"      {canonical_sequence_hash_expr('rf.sequence1')} AS sequence_hash, "
-                "      rf.sequence1 AS sequence "
-                f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}') rf"
-                "  ), "
-                "  dedup AS ("
-                "    SELECT DISTINCT ON (sequence_hash) sequence_hash, sequence "
-                "    FROM per_contig ORDER BY sequence_hash, contig_id"
-                "  ) "
                 "  SELECT sequence_hash, c.chunk_index, c.chunk_data FROM ("
-                f"    SELECT sequence_hash, UNNEST({sequence_split_expr('sequence')}) AS c "
-                "    FROM dedup"
+                "    SELECT w.sequence_hash AS sequence_hash, "
+                f"      UNNEST({sequence_split_expr('rf.sequence1')}) AS c "
+                f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
+                "      include_filepath:=true) rf "
+                "    JOIN file_meta fm ON rf.filepath = fm.filepath "
+                "    JOIN winner w ON w.read_id = "
+                "      (fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' || rf.read_id)"
                 "  )"
                 f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED})",
                 [paths],

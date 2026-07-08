@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from uuid import UUID
 
 import duckdb
@@ -159,6 +160,47 @@ def test_lcg_only_no_mag(tmp_path):
     )
     bin_map = _rows(out["bin_map"], "read_id, kind, bin_id", "read_id")
     assert bin_map == [("LCG:c1:c1", "LCG", "c1")]
+
+
+@pytest.mark.skipif(
+    os.environ.get("QIITA_ASSEMBLY_STRESS") != "1",
+    reason="heavy (~800 MB fixture); opt in with QIITA_ASSEMBLY_STRESS=1",
+)
+def test_pass2_stays_bounded_at_scale(tmp_path, monkeypatch):
+    """Regression for the pass-2 memory blow-up: the dedup must NOT carry the
+    sequence payload through a sort. The old `DISTINCT ON (sequence_hash) …,
+    sequence ORDER BY …` sorted every row's full contig bytes (~6x amplification)
+    and OOM'd at ~1 GB of assembled input under a few-GB cap; the narrow-dedup +
+    streaming-chunk rewrite completes with ~constant memory regardless of input.
+
+    Here: ~800 MB of distinct random contigs under a 3 GB DuckDB cap — the old
+    query OOMs (0.8 GB x ~6 > 3 GB), the new one stays ~1.8 GB. Opt-in because the
+    fixture is large (the orchestrator suite has no slow tier to exclude it from).
+    """
+    import qiita_compute_orchestrator.jobs.assembly_hash as ahmod
+
+    genomes, refined = _layout(tmp_path)
+    # 400 x 2 MB distinct random contigs (random bytes → no accidental dedup).
+    lut = bytes(b"ACGT"[i & 3] for i in range(256))
+    with open(genomes / "circular.fa", "wb") as f:
+        for i in range(400):
+            f.write(b">ctg%06d\n" % i)
+            f.write(os.urandom(2_000_000).translate(lut))
+            f.write(b"\n")
+
+    # Constrain DuckDB to a cap the old payload-carrying sort would exceed.
+    monkeypatch.setattr(ahmod, "_DUCKDB_MEMORY_GB", 3)
+
+    out = _run(
+        Inputs(genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=1, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+    # Completed under the cap; every contig is distinct → 400 hashes, none deduped.
+    n_contigs = _rows(out["manifest"], "count(*)", "1")[0][0]
+    chunks_glob = str(out["assembly_chunks"] / "part_*.parquet")
+    n_hashes = _rows(chunks_glob, "count(DISTINCT sequence_hash)", "1")[0][0]
+    assert n_contigs == 400
+    assert n_hashes == 400
 
 
 def test_no_contigs_is_no_data(tmp_path):
