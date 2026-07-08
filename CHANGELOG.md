@@ -692,6 +692,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- **`submit-bcl-convert` re-run is now convergent (create-missing roster).** The
+  run → pool → sequenced-sample provisioning is unified with `submit-pacbio-ingest`
+  in one shared `_provision_run_pool_roster` (was duplicated between the two). As a
+  result bcl-convert now GETs the pool roster and creates only the missing samples,
+  so a re-run after a partial failure reuses existing rows instead of 409ing on the
+  first already-created sample. (#260)
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
   options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`

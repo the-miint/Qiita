@@ -40,29 +40,18 @@ from typing import NamedTuple
 
 import httpx
 from qiita_common.api_paths import (
-    PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
-    PATH_BIOSAMPLE_PREFIX,
-    PATH_SEQUENCED_SAMPLE_FROM_RUN,
-    PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
-    PATH_SEQUENCING_RUN_PREFIX,
-    PATH_SEQUENCING_RUN_SEQUENCED_POOL,
-    PATH_STUDY_LOOKUP_BY_ACCESSION,
-    PATH_STUDY_PREFIX,
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.models import (
-    BiosampleLookupByAccessionRequest,
     Platform,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
-    SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
-    StudyLookupByAccessionRequest,
     WorkTicketCreateRequest,
 )
 
 from .. import _common
-from .pool import _dedup_accessions, _lookup_accessions, _print_missing_accession_error
+from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
 # Pinned here so the CLI does not drift from the workflow YAML the operator's
@@ -449,8 +438,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     # operator-actionable and must not create a half-populated pool.
     bam_by_barcode = _resolve_sample_bams(preflight_rows, args.run_folder, parser)
 
-    unique_biosamples, unique_studies = _dedup_accessions(preflight_rows)
-
     run_body = SequencingRunCreateRequest(
         instrument_run_id=args.instrument_run_id,
         platform=Platform.PACBIO_SMRT,
@@ -462,110 +449,36 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict:
-        owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
-
-        resolved_biosamples, missing_biosamples = _lookup_accessions(
+        # Shared run → pool → roster provisioning (create-missing; fails fast on an
+        # unresolved accession). PacBio keys the pool-item-id on the barcode (unique
+        # within a pool by the same no-barcode-reuse rule the BAM index enforces).
+        provision = _provision_run_pool_roster(
             args.base_url,
             token,
-            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
-            unique_biosamples,
-            BiosampleLookupByAccessionRequest,
+            preflight_rows=preflight_rows,
+            run_body=run_body,
+            pool_body=pool_body,
+            prep_protocol_idx=args.prep_protocol_idx,
+            pool_item_id=lambda row: row.barcode,
+            row_label=lambda row: f"sample {row.sample_name}",
+            row_noun="sample",
         )
-        resolved_studies, missing_studies = _lookup_accessions(
-            args.base_url,
-            token,
-            f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
-            unique_studies,
-            StudyLookupByAccessionRequest,
-        )
-        if missing_biosamples or missing_studies:
-            _print_missing_accession_error(
-                preflight_rows,
-                missing_biosamples,
-                missing_studies,
-                row_label=lambda row: f"sample {row.sample_name}",
-                row_noun="sample",
-            )
-            sys.exit(1)
-
-        run_resp, run_status = _common.call_with_status(
-            "POST", args.base_url, token, PATH_SEQUENCING_RUN_PREFIX, json=run_body
-        )
-        sequencing_run_idx = run_resp["sequencing_run_idx"]
-
-        pool_resp, pool_status = _common.call_with_status(
-            "POST",
-            args.base_url,
-            token,
-            f"{PATH_SEQUENCING_RUN_PREFIX}"
-            f"{PATH_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx)}",
-            json=pool_body,
-        )
-        sequenced_pool_idx = pool_resp["sequenced_pool_idx"]
-
-        # One sequenced-sample per row; sequenced_pool_item_id = barcode (unique
-        # within the pool by the same no-barcode-reuse rule the BAM index enforces).
-        #
-        # Create-missing, not blind-create: the composer 409s on a duplicate
-        # (pool, item_id), so a plain POST loop would abort a retry on the FIRST
-        # already-created sample — defeating the resilient fan-out below (the whole
-        # point of which is "re-run to retry a failed ticket"). So GET the pool's
-        # existing roster first and reuse those rows, POSTing only the samples not
-        # yet present. This makes the whole gesture convergent (mirrors
-        # submit-host-filter-pool's roster-GET pattern), which is what the docstring
-        # promises. On a fresh pool the roster is empty and every sample is created.
-        roster_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
-            sequencing_run_idx=sequencing_run_idx,
-            sequenced_pool_idx=sequenced_pool_idx,
-        )
-        roster = _common.call(
-            "GET", args.base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{roster_path}"
-        )
-        existing_by_item_id = {s["sequenced_pool_item_id"]: s for s in roster.get("samples", [])}
-        sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
-            sequencing_run_idx=sequencing_run_idx,
-            sequenced_pool_idx=sequenced_pool_idx,
-        )
-        per_sample: list[dict] = []
-        for row in preflight_rows:
-            existing = existing_by_item_id.get(row.barcode)
-            if existing is not None:
-                prep_sample_idx = existing["prep_sample_idx"]
-                sequenced_sample_idx = existing.get("sequenced_sample_idx")
-            else:
-                secondary_study_idxs = [
-                    resolved_studies[a] for a in row.secondary_project_accessions
-                ]
-                sample_body = SequencedSampleCreateRequest(
-                    biosample_idx=resolved_biosamples[row.biosample_accession],
-                    owner_idx=owner_idx,
-                    prep_protocol_idx=args.prep_protocol_idx,
-                    sequenced_pool_item_id=row.barcode,
-                    primary_study_idx=resolved_studies[row.primary_project_accession],
-                    secondary_study_idxs=secondary_study_idxs,
-                ).model_dump(exclude_unset=True, mode="json")
-                sample_resp = _common.call(
-                    "POST",
-                    args.base_url,
-                    token,
-                    f"{PATH_SEQUENCING_RUN_PREFIX}{sample_path}",
-                    json=sample_body,
-                )
-                prep_sample_idx = sample_resp["prep_sample_idx"]
-                sequenced_sample_idx = sample_resp["sequenced_sample_idx"]
-            per_sample.append(
-                {
-                    "sample_name": row.sample_name,
-                    "barcode": row.barcode,
-                    "bam_path": str(bam_by_barcode[row.barcode]),
-                    "biosample_idx": resolved_biosamples[row.biosample_accession],
-                    "primary_study_idx": resolved_studies[row.primary_project_accession],
-                    "human_filtering": row.human_filtering,
-                    "prep_sample_idx": prep_sample_idx,
-                    "sequenced_sample_idx": sequenced_sample_idx,
-                    "reused": existing is not None,
-                }
-            )
+        sequencing_run_idx = provision.sequencing_run_idx
+        sequenced_pool_idx = provision.sequenced_pool_idx
+        per_sample = [
+            {
+                "sample_name": s.row.sample_name,
+                "barcode": s.row.barcode,
+                "bam_path": str(bam_by_barcode[s.row.barcode]),
+                "biosample_idx": s.biosample_idx,
+                "primary_study_idx": s.primary_study_idx,
+                "human_filtering": s.row.human_filtering,
+                "prep_sample_idx": s.prep_sample_idx,
+                "sequenced_sample_idx": s.sequenced_sample_idx,
+                "reused": s.reused,
+            }
+            for s in provision.samples
+        ]
 
         # Fan out one bam-to-parquet ingest ticket per sample. Per-sample
         # resilient: a single ticket's failure is recorded and the loop CONTINUES,
@@ -636,11 +549,11 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         summary = {
             "sequencing_run": {
                 "sequencing_run_idx": sequencing_run_idx,
-                "status": "created" if run_status == 201 else "reused",
+                "status": "created" if provision.run_status == 201 else "reused",
             },
             "sequenced_pool": {
                 "sequenced_pool_idx": sequenced_pool_idx,
-                "status": "created" if pool_status == 201 else "reused",
+                "status": "created" if provision.pool_status == 201 else "reused",
             },
             "samples_submitted": len(per_sample) - len(failures) - len(skipped),
             "samples_skipped": len(skipped),
