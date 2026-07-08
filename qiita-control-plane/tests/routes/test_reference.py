@@ -1,12 +1,19 @@
 """Integration tests for reference routes — exercises POST/GET against real Postgres."""
 
+import base64
+import json
+import struct
+import uuid
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_REFERENCE_BY_IDX,
+    URL_REFERENCE_DOGET,
     URL_REFERENCE_INDEX,
     URL_REFERENCE_PREFIX,
 )
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
 pytestmark = pytest.mark.db
 
@@ -300,3 +307,161 @@ async def test_get_reference_index_404_when_reference_absent(client, postgres_po
     )
     resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=max_idx + 1))
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /reference/{idx}/ticket/doget — feature_idx-scoped ticket (B6)
+# ---------------------------------------------------------------------------
+# The doget route is scope-gated on tickets:doget, which SYSTEM_ADMIN does NOT
+# hold (only the service-account ceiling does), so these tests drive it with the
+# compute SA client rather than the module's admin `client`. The app's HMAC
+# secret is pinned to a known value so the test decodes the signed ticket
+# payload (not the MAC) and asserts the exact filter shape.
+
+# Any 32-byte value works — the test parses the payload, never verifies the MAC.
+_DOGET_HMAC_SECRET = b"\x00" * 32
+
+
+def _decode_ticket_payload(ticket_b64: str) -> dict:
+    """Parse the JSON payload out of a base64 signed Flight ticket.
+
+    Wire format: <1B version><4B payload_len><payload><32B HMAC><8B expiry>.
+    """
+    raw = base64.b64decode(ticket_b64)
+    payload_len = struct.unpack(">I", raw[1:5])[0]
+    return json.loads(raw[5 : 5 + payload_len])
+
+
+@pytest.fixture
+async def doget_ctx(postgres_pool, compute_worker_service_account):
+    """SA client (holds tickets:doget) + a reference-seeding helper, with the
+    app HMAC secret pinned so the test can decode the signed ticket payload.
+
+    `seed_reference(status)` inserts a reference directly at an arbitrary
+    status (the public create route only mints `pending`) and tracks it for
+    FK-reverse cleanup at teardown.
+    """
+    from qiita_control_plane.config import Settings
+    from qiita_control_plane.main import app
+
+    app.state.pool = postgres_pool
+    app.state.settings = Settings(
+        database_url="unused",
+        hmac_secret_key=_DOGET_HMAC_SECRET,
+        data_plane_url="unused",
+    )
+
+    created: list[int] = []
+
+    async def _seed_reference(status: str) -> int:
+        idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+            " VALUES ($1, '1.0', 'sequence_reference', $2, $3) RETURNING reference_idx",
+            f"b6-{uuid.uuid4()}",
+            status,
+            SYSTEM_PRINCIPAL_IDX,
+        )
+        created.append(idx)
+        return idx
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
+    ) as sa:
+        yield {"sa": sa, "seed_reference": _seed_reference}
+
+    if created:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
+            created,
+        )
+
+
+async def test_doget_feature_idx_subset_signs_scoped_filter(doget_ctx):
+    """feature_idx present ⇒ the ticket scopes to reference_idx AND feature_idx."""
+    ref = await doget_ctx["seed_reference"]("active")
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref),
+        json={"table": "reference_sequence_chunks", "feature_idx": [11, 22, 33]},
+    )
+    assert resp.status_code == 201, resp.text
+    payload = _decode_ticket_payload(resp.json()["ticket"])
+    assert payload["table"] == "reference_sequence_chunks"
+    assert payload["filter"] == {"reference_idx": [ref], "feature_idx": [11, 22, 33]}
+
+
+async def test_doget_feature_idx_omitted_signs_whole_reference(doget_ctx):
+    """feature_idx omitted ⇒ the historical whole-reference filter, unchanged."""
+    ref = await doget_ctx["seed_reference"]("active")
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref),
+        json={"table": "reference_sequence_chunks"},
+    )
+    assert resp.status_code == 201, resp.text
+    payload = _decode_ticket_payload(resp.json()["ticket"])
+    assert payload["filter"] == {"reference_idx": [ref]}
+
+
+async def test_doget_indexing_reference_yields_ticket(doget_ctx):
+    """A shard build streams mid-ingest: status 'indexing' now signs (was 409)."""
+    ref = await doget_ctx["seed_reference"]("indexing")
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref),
+        json={"table": "reference_sequence_chunks", "feature_idx": [7]},
+    )
+    assert resp.status_code == 201, resp.text
+    payload = _decode_ticket_payload(resp.json()["ticket"])
+    assert payload["filter"] == {"reference_idx": [ref], "feature_idx": [7]}
+
+
+@pytest.mark.parametrize("status", ["pending", "loading"])
+async def test_doget_pre_ducklake_status_409(doget_ctx, status):
+    """pending/loading are pre-DuckLake (no chunk data to stream yet) → 409."""
+    ref = await doget_ctx["seed_reference"](status)
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref),
+        json={"table": "reference_sequence_chunks"},
+    )
+    assert resp.status_code == 409, resp.text
+
+
+async def test_doget_missing_reference_404(doget_ctx, postgres_pool):
+    """A reference_idx with no row is 404, distinct from the 409 status gate."""
+    max_idx = await postgres_pool.fetchval(
+        "SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.reference"
+    )
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=max_idx + 1),
+        json={"table": "reference_sequence_chunks"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_doget_feature_idx_over_bound_422(doget_ctx):
+    """The _MAX_DOGET_FEATURE_IDX bound rejects an over-long subset at the
+    request layer (422), before any reference lookup."""
+    from qiita_common.models import _MAX_DOGET_FEATURE_IDX
+
+    ref = await doget_ctx["seed_reference"]("active")
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref),
+        json={
+            "table": "reference_sequence_chunks",
+            "feature_idx": list(range(1, _MAX_DOGET_FEATURE_IDX + 2)),
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_doget_feature_idx_empty_list_422(doget_ctx):
+    """An explicit empty feature_idx list is a 422 (min_length=1), never a silent
+    widen to a whole-reference ticket — whole-reference is expressed by omitting
+    the field. Guards against a shard builder with an empty roster accidentally
+    streaming the entire reference."""
+    ref = await doget_ctx["seed_reference"]("active")
+    resp = await doget_ctx["sa"].post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref),
+        json={"table": "reference_sequence_chunks", "feature_idx": []},
+    )
+    assert resp.status_code == 422, resp.text

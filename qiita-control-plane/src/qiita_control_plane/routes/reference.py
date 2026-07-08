@@ -353,10 +353,19 @@ async def create_doget_ticket(
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to a reference.
 
-    Reference must be active. The ticket contains only reference_idx — the
-    data plane resolves feature membership at query time via the DuckLake
-    reference_membership table (JOIN for reference_sequences, direct
-    WHERE for taxonomy/phylogeny).
+    The ticket always carries `reference_idx`; when the request body supplies
+    a `feature_idx` subset, the ticket additionally scopes to those features
+    (filter gains `"feature_idx":[...]`), so a shard builder streams only its
+    own roster's sequences. Omitting `feature_idx` yields the whole-reference
+    ticket the data plane resolves at query time via the DuckLake
+    reference_membership table (JOIN for reference_sequences, direct WHERE for
+    taxonomy/phylogeny).
+
+    Status gate admits `active` AND `indexing`: a shard build streams
+    mid-ingest (status `indexing`, post-`register-files`) and a re-index
+    streams from an `active` reference. An `indexing` reference whose data is
+    not yet in DuckLake simply yields an empty stream. `pending`/`loading`
+    (pre-DuckLake) are 409; a missing reference is 404.
 
     Authorization is scope-only at this layer: any principal with
     `tickets:doget` can request a ticket. Row-level visibility (private
@@ -368,22 +377,26 @@ async def create_doget_ticket(
             detail=f"Unknown table {body.table!r}; allowed: {sorted(_REFERENCE_DOGET_TABLES)}",
         )
 
-    # Reference must be active
+    _STREAMABLE_STATUSES = (ReferenceStatus.ACTIVE.value, ReferenceStatus.INDEXING.value)
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if status is None:
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
-    if status != ReferenceStatus.ACTIVE.value:
+    if status not in _STREAMABLE_STATUSES:
         raise HTTPException(
             status_code=409,
-            detail=f"Reference status is {status!r}, must be {ReferenceStatus.ACTIVE.value!r}",
+            detail=f"Reference status is {status!r}, must be one of {list(_STREAMABLE_STATUSES)}",
         )
+
+    filter: dict[str, list[int]] = {"reference_idx": [reference_idx]}
+    if body.feature_idx:
+        filter["feature_idx"] = body.feature_idx
 
     ticket_bytes = sign_ticket(
         table=body.table,
-        filter={"reference_idx": [reference_idx]},
+        filter=filter,
         secret=hmac_secret,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

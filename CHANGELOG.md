@@ -15,6 +15,17 @@ the `no-changelog` label).
 
 ### Added
 
+- **`feature_idx`-scoped DoGet ticket (B6).** `POST /reference/{idx}/ticket/doget`
+  gains an optional `feature_idx` subset on its request body: omitted ⇒ today's
+  whole-reference ticket (`filter={"reference_idx":[idx]}`), byte-identical;
+  present ⇒ the ticket additionally scopes to those features
+  (`filter` gains `"feature_idx":[...]`, bounded at 100k) so a shard builder
+  streams only its own roster's sequences from `reference_sequences` /
+  `reference_sequence_chunks`. The status gate now admits `active` **and**
+  `indexing` (a shard build streams mid-ingest, post-`register-files`);
+  `pending`/`loading` stay 409, missing stays 404. No new route (the existing
+  `URL_REFERENCE_DOGET` triple is reused), no migration, no data-plane change
+  (`feature_idx` filtering already exists and is tested there). (#reference-support)
 - **Per-shard rype `.ryxdi` build (parameterized `build_rype_index` + `plan()`).**
   The `build_rype_index` native job gains an optional **shard mode**: given a
   `shard_id` and a runner-staged feature roster (`shard_features`, a Parquet of
