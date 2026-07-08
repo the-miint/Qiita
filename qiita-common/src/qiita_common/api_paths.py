@@ -94,6 +94,12 @@ class LibraryPrimitive(StrEnum):
     WRITE_MEMBERSHIP = "write-membership"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
+    # Reference sharding: assign a reference's genome-bearing features to N
+    # lineage-sorted shards (reference_membership.shard_id). A CP-side primitive
+    # (its inputs — feature_genome, reference_membership, taxonomy — are
+    # Postgres/DuckLake, and it writes shard_id back), not a native compute job.
+    # See qiita_control_plane.actions.library.plan_shards.
+    PLAN_SHARDS = "plan-shards"
     PERSIST_READ_METRICS = "persist-read-metrics"
     PERSIST_QC_REPORT = "persist-qc-report"
     # Block-compute: idempotent block replace. Runs immediately BEFORE

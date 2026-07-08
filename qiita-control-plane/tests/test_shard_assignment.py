@@ -108,6 +108,27 @@ async def test_write_shard_assignment_is_idempotent(postgres_pool):
         await _cleanup(postgres_pool, idx)
 
 
+async def test_write_shard_assignment_clears_dropped_features_on_replan(postgres_pool):
+    """A re-plan that DROPS a feature (present in the first assignment, absent
+    from the second) must leave its shard_id NULL, not stale. write_shard_
+    assignment clears every membership row for the reference first, then sets
+    the new layout — so a shrinking re-plan can't leave orphaned shard_ids."""
+    idx = await _make_reference(postgres_pool, "shard-assign-replan")
+    try:
+        f0, f1 = await _add_features(postgres_pool, idx, _hashes("a4000000", 2))
+        await write_shard_assignment(postgres_pool, idx, [[f0], [f1]])
+        # Re-plan drops f1 entirely (only f0 assigned this time).
+        await write_shard_assignment(postgres_pool, idx, [[f0]])
+        rows = await postgres_pool.fetch(
+            "SELECT feature_idx, shard_id FROM qiita.reference_membership WHERE reference_idx = $1",
+            idx,
+        )
+        by_feature = {r["feature_idx"]: r["shard_id"] for r in rows}
+        assert by_feature == {f0: 0, f1: None}
+    finally:
+        await _cleanup(postgres_pool, idx)
+
+
 async def test_write_shard_assignment_scoped_to_reference(postgres_pool):
     """A feature shared across two references (same sequence_hash) gets its shard
     assignment written only for the target reference's membership row."""

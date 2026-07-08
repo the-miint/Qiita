@@ -27,12 +27,14 @@ from uuid import UUID
 
 import asyncpg
 import duckdb
+import pyarrow as pa
 import pyarrow.flight as _flight
+import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.models import FeatureHashEntry, GenomeSource
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
-from ..auth.tickets import sign_action
+from ..auth.tickets import sign_action, sign_ticket
 from ..repositories.block import (
     fetch_block_members,
     finalize_mask_sample,
@@ -40,6 +42,7 @@ from ..repositories.block import (
     lock_mask_sample,
     set_block_state,
 )
+from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535
 # scalar parameter limit, but large arrays increase memory pressure and
@@ -479,16 +482,27 @@ async def write_shard_assignment(
     A feature present in no shard list keeps `shard_id NULL` (e.g. a deferred
     16S / no-genome feature the current sharding pass does not cover).
 
-    Idempotent and replay-safe: it is a straight UPDATE, so re-running the same
-    assignment sets the same values without error. Scoped to `reference_idx`, so
-    a feature shared across references (same feature_idx) is stamped only for
-    this reference's membership row. Batched in `_CHUNK_SIZE` slices so a
-    GG2-scale reference doesn't send one giant array. Returns the total number of
-    membership rows updated (feature_idx values not in this reference's
-    membership match nothing and are not counted).
+    Clear-first: as the first statement in the transaction it NULLs every
+    membership row's shard_id for this reference, then sets the new layout. So a
+    re-plan that DROPS a feature (present before, absent now) leaves it NULL
+    instead of carrying a stale shard_id from the prior plan — the persisted
+    assignment always reflects exactly the passed `shards`.
+
+    Idempotent and replay-safe: clear-then-set over one transaction, so
+    re-running the same assignment sets the same values without error. Scoped to
+    `reference_idx`, so a feature shared across references (same feature_idx) is
+    stamped only for this reference's membership row. Batched in `_CHUNK_SIZE`
+    slices so a GG2-scale reference doesn't send one giant array. Returns the
+    total number of membership rows updated to a non-NULL shard (feature_idx
+    values not in this reference's membership match nothing and are not counted;
+    the clear-first NULLing is not counted).
     """
     total_updated = 0
     async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE qiita.reference_membership SET shard_id = NULL WHERE reference_idx = $1",
+            reference_idx,
+        )
         for shard_id, feature_idxs in enumerate(shards):
             for start in range(0, len(feature_idxs), _CHUNK_SIZE):
                 batch = list(feature_idxs[start : start + _CHUNK_SIZE])
@@ -504,6 +518,178 @@ async def write_shard_assignment(
                 )
                 total_updated += len(rows)
     return total_updated
+
+
+# Taxonomy rank columns, coarsest→finest, in the lineage sort-key order. `class`
+# and `order` are quoted — `order` is a SQL keyword and `class` is reserved in
+# some dialects; DuckDB stores the reference_taxonomy columns under these exact
+# (lowercase, prefix-stripped) names (see the data plane's qiita_lake schema).
+_TAXONOMY_RANK_COLUMNS = (
+    "domain",
+    "phylum",
+    '"class"',
+    '"order"',
+    "family",
+    "genus",
+    "species",
+    "strain",
+)
+
+_REFERENCE_TAXONOMY_TABLE = "reference_taxonomy"
+
+
+def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_path: Path) -> Path:
+    """Synchronous Flight DoGet of a reference's taxonomy rows, streamed to a
+    Parquet at `out_path` (one row per feature: feature_idx + the eight rank
+    columns). Runs in a thread executor (pyarrow.flight is sync); isolated as a
+    module function so plan_shards's DB test can stub the whole seam.
+
+    Streams via `.to_reader()` (not `read_all()`) so a GG2-scale taxonomy never
+    fully materializes in memory. The writer is created from the stream schema
+    up front, so an empty stream still writes a valid, correctly-typed Parquet
+    (a reference with no taxonomy loaded → every genome sorts as unclassified)."""
+    with _flight.FlightClient(data_plane_url) as client:
+        reader = client.do_get(_flight.Ticket(ticket_bytes)).to_reader()
+        writer = pq.ParquetWriter(str(out_path), reader.schema, compression="snappy")
+        try:
+            for batch in reader:
+                writer.write_batch(batch)
+        finally:
+            writer.close()
+    return out_path
+
+
+async def _export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path: Path) -> None:
+    """Stream this reference's (feature_idx, genome_idx) pairs from Postgres to a
+    Parquet at `out_path`, in `_CHUNK_SIZE` batches (a GG2-scale reference has
+    millions of members — never one giant array). The INNER JOIN to
+    feature_genome drops features with no genome, which is deliberate: no-genome
+    features (16S / deferred) never enter a shard and keep shard_id NULL.
+
+    An empty result still writes a valid two-column Parquet (schema created up
+    front) so DuckDB's read_parquet doesn't fail on a zero-genome reference."""
+    schema = pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())])
+    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            cursor = await conn.cursor(
+                "SELECT rm.feature_idx, fg.genome_idx"
+                " FROM qiita.reference_membership rm"
+                " JOIN qiita.feature_genome fg USING (feature_idx)"
+                " WHERE rm.reference_idx = $1"
+                " ORDER BY rm.feature_idx",
+                reference_idx,
+            )
+            while batch := await cursor.fetch(_CHUNK_SIZE):
+                writer.write_table(
+                    pa.table(
+                        {
+                            "feature_idx": pa.array([r["feature_idx"] for r in batch], pa.int64()),
+                            "genome_idx": pa.array([r["genome_idx"] for r in batch], pa.int64()),
+                        }
+                    )
+                )
+    finally:
+        writer.close()
+
+
+def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
+    """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
+    relations to one LineageItem per genome. The lineage is the semicolon-joined
+    rank string of the genome's LOWEST-feature_idx member (via `arg_min`), so the
+    representative is deterministic regardless of scan order and independent of
+    which sibling features carry divergent taxonomy. `concat_ws` skips NULL
+    ranks, so an unclassified genome (all ranks NULL, or no taxonomy row via the
+    LEFT JOIN) reduces to lineage '' — which sorts first in the tiler."""
+    ranks = ", ".join(f"t.{col}" for col in _TAXONOMY_RANK_COLUMNS)
+    rows = con.execute(
+        f"SELECT mg.genome_idx,"
+        f"       arg_min(concat_ws(';', {ranks}), mg.feature_idx) AS lineage"
+        f"  FROM member_genome mg"
+        f"  LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
+        f" GROUP BY mg.genome_idx"
+    ).fetchall()
+    return [LineageItem(item_id=genome_idx, lineage=lineage or "") for genome_idx, lineage in rows]
+
+
+def _compute_shards(
+    con: duckdb.DuckDBPyConnection, *, num_shards: int = _SHARD_COUNT
+) -> list[list[int]]:
+    """Given a DuckDB connection with `member_genome` + `taxonomy` relations,
+    return `shards[k]` = the feature_idxs assigned to shard `k`: reduce to one
+    lineage per genome, tile lineage-sorted (`tile_by_lineage`), then expand each
+    genome back to ITS features via a DuckDB join (keeping the fan-out in DuckDB,
+    not Python). Every genome-bearing member feature lands in exactly one shard;
+    a no-genome feature is absent from `member_genome` and so from every shard.
+    A zero-genome reference yields `[]`."""
+    shards = tile_by_lineage(_genome_lineages(con), num_shards)
+    if not shards:
+        return []
+    con.execute("CREATE OR REPLACE TEMP TABLE shard_map (genome_idx BIGINT, shard_id INTEGER)")
+    con.executemany(
+        "INSERT INTO shard_map VALUES (?, ?)",
+        [(genome_idx, k) for k, genomes in enumerate(shards) for genome_idx in genomes],
+    )
+    rows = con.execute(
+        "SELECT sm.shard_id, list(mg.feature_idx ORDER BY mg.feature_idx) AS features"
+        "  FROM member_genome mg"
+        "  JOIN shard_map sm USING (genome_idx)"
+        " GROUP BY sm.shard_id"
+        " ORDER BY sm.shard_id"
+    ).fetchall()
+    return [features for _shard_id, features in rows]
+
+
+async def plan_shards(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    *,
+    hmac_secret: bytes,
+    data_plane_url: str,
+    workspace: Path,
+    num_shards: int = _SHARD_COUNT,
+) -> int:
+    """Assign this reference's genome-bearing features to `num_shards`
+    lineage-sorted shards, persisting the result onto
+    reference_membership.shard_id. Returns N, the number of shards actually
+    produced (`min(num_shards, genome_count)`; 0 for a reference with no
+    genomes — nothing to shard).
+
+    The cross-store assembly stays off the CP event loop's Python heap: the
+    (feature_idx, genome_idx) map streams from Postgres to a Parquet in chunks,
+    the taxonomy streams from the data plane (DoGet) to a Parquet, and the
+    lineage reduce + genome→feature expansion run in a local in-memory DuckDB
+    over those two Parquets. Only the final shard lists (feature_idx arrays)
+    materialize in Python, handed to `write_shard_assignment`.
+
+    Idempotent / re-plan-safe: write_shard_assignment clears-first, so a re-plan
+    that drops a genome leaves its features NULL. DoGet is read-only, so a resume
+    re-materializes the same inputs."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    member_parquet = workspace / "member_genome.parquet"
+    taxonomy_parquet = workspace / "taxonomy.parquet"
+
+    await _export_member_genome(pool, reference_idx, member_parquet)
+
+    ticket = sign_ticket(
+        table=_REFERENCE_TAXONOMY_TABLE,
+        filter={"reference_idx": [reference_idx]},
+        secret=hmac_secret,
+    )
+    await asyncio.get_event_loop().run_in_executor(
+        None, _do_get_reference_taxonomy, data_plane_url, ticket, taxonomy_parquet
+    )
+
+    with duckdb.connect(":memory:") as con:
+        con.execute(
+            "CREATE TABLE member_genome AS"
+            f" SELECT feature_idx, genome_idx FROM read_parquet('{member_parquet}')"
+        )
+        con.execute(f"CREATE TABLE taxonomy AS SELECT * FROM read_parquet('{taxonomy_parquet}')")
+        feature_shards = _compute_shards(con, num_shards=num_shards)
+
+    await write_shard_assignment(pool, reference_idx, feature_shards)
+    return len(feature_shards)
 
 
 async def register_index(
@@ -1088,6 +1274,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
+    LibraryPrimitive.PLAN_SHARDS: plan_shards,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,

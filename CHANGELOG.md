@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Added
 
+- **`plan-shards` assignment core (B5).** A new CP-side `action:` primitive
+  (`plan_shards`, registered in `LIBRARY`) turns the B2 tiler + persistence into
+  an end-to-end shard assignment for one reference: it streams
+  `(feature_idx, genome_idx)` from Postgres to a Parquet, DoGets the reference's
+  `reference_taxonomy` from the data plane to a Parquet, reduces to one
+  lineage per genome in a local DuckDB (`arg_min` over the lowest feature_idx —
+  a deterministic representative; all-NULL taxonomy → unclassified `''`), tiles
+  lineage-sorted via `tile_by_lineage`, expands genome→feature back in DuckDB,
+  and persists onto `reference_membership.shard_id`. Returns N (=
+  `min(num_shards, genome_count)`; 0 for a reference with no genomes).
+  No-genome features are dropped by the inner JOIN and stay `shard_id NULL`
+  (16S / deferred). `write_shard_assignment` now clears every membership row's
+  `shard_id` first, so a re-plan that drops a feature leaves it NULL rather than
+  stale. Dormant — the N-ticket fan-out over the assigned shards is a later
+  commit. (#reference-support)
 - **`work_ticket.shard_id` fan-out discriminant (B5 schema).** A nullable
   `INTEGER` column (CHECK: only legal on `reference` scope, `>= 0`) lets N
   concurrent same-action build tickets fan out over one reference without

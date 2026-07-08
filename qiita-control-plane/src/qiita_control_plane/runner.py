@@ -3827,6 +3827,25 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.PLAN_SHARDS:
+        # Assign this reference's genome-bearing features to N lineage-sorted
+        # shards (reference_membership.shard_id). No file inputs: reference_idx
+        # from the scope target; the taxonomy DoGet + PG export are internal.
+        # This commit lands assignment only — the N-ticket fan-out over the
+        # assigned shards is wired in on top of this arm in a later commit.
+        if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+            raise RuntimeError(
+                f"plan-shards requires a reference-scoped ticket; got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.PLAN_SHARDS](
+            pool,
+            scope_target["reference_idx"],
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+            workspace=workspace,
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_READ_METRICS:
         # Persist the three per-stage read counts onto this prep_sample's
         # 1:1 sequenced_sample, derived from the `read_mask` Parquet (one row per
