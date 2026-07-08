@@ -43,6 +43,17 @@ pub fn connect_ducklake(
     conn.execute_batch(&format!(
         "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake (DATA_PATH '{data_path}');"
     ))?;
+    // Align DuckLake's OWN parquet writes (compaction, merge, any future direct
+    // insert) with how register_files writes our files. DuckLake's defaults are
+    // snappy + Parquet v1; qiita_common.parquet.PARQUET_OPTS writes zstd + v2, so
+    // without this DuckLake's maintenance rewrites would drift from the
+    // register-time format. Persisted in ducklake_metadata (a catalog-global
+    // default; the per-chunks-table row-group override is set alongside each table).
+    // Idempotent — re-set on every boot. Keep the values in sync with PARQUET_OPTS.
+    conn.execute_batch(
+        "CALL qiita_lake.set_option('parquet_compression', 'zstd');
+         CALL qiita_lake.set_option('parquet_version', 2);",
+    )?;
     Ok(())
 }
 
@@ -119,6 +130,13 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             distal_length DOUBLE,
             pendant_length DOUBLE
         );",
+    )?;
+    // The chunked table is written with a 16384-row group (PARQUET_OPTS_CHUNKED
+    // ROW_GROUP_SIZE); pin DuckLake's own rewrites of it to the same layout. Keep
+    // in sync with qiita_common.chunking.CHUNK_ROW_GROUP_SIZE.
+    conn.execute_batch(
+        "CALL qiita_lake.set_option('parquet_row_group_size', 16384, \
+         table_name => 'reference_sequence_chunks');",
     )?;
     Ok(())
 }
@@ -297,6 +315,13 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             das_tool_score DOUBLE,
             source_binner VARCHAR
         );",
+    )?;
+    // Match the 16384-row group the chunk writer uses (PARQUET_OPTS_CHUNKED) so
+    // DuckLake's own rewrites of assembled_sequence_chunks keep the same layout.
+    // Keep in sync with qiita_common.chunking.CHUNK_ROW_GROUP_SIZE.
+    conn.execute_batch(
+        "CALL qiita_lake.set_option('parquet_row_group_size', 16384, \
+         table_name => 'assembled_sequence_chunks');",
     )?;
     Ok(())
 }

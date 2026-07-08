@@ -27,6 +27,11 @@ case "${ASSEMBLER}" in
         GFA="${WORK}/asm.p_ctg.gfa"
         ;;
     myloasm)
+        # NOTE: myloasm is not implemented. When it is, the circular-vs-linear GFA
+        # interpretation below (the `tg[0-9]+c$` segment-name match) is SPECIFIC to
+        # hifiasm-meta's contig-naming convention — myloasm's GFA / circularity
+        # encoding must be verified and branched here before enabling it (tracked
+        # as a follow-up).
         echo "assembler 'myloasm' is not implemented in this image yet" >&2
         exit 64
         ;;

@@ -661,6 +661,16 @@ the `no-changelog` label).
 
 ### Changed
 
+- **DuckLake catalog parquet write-options aligned with our register-time format.**
+  Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
+  options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`
+  per-table on the chunk tables (`reference_sequence_chunks`,
+  `assembled_sequence_chunks`), matching `qiita_common.parquet.PARQUET_OPTS` /
+  `CHUNK_ROW_GROUP_SIZE` — so DuckLake's OWN rewrites (compaction, merge, any future
+  direct insert) stay consistent with the format `register_files` writes rather than
+  drifting to DuckLake's defaults. Set idempotently at data-plane boot
+  (`connect_ducklake` + the `ensure_*_tables`), persisted in `ducklake_metadata`.
+  (#255)
 - **SIF build tooling supports N per-tool images per workflow.** A container
   workflow may now ship several single-tool images under
   `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE` and a
