@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import base64
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -61,7 +62,7 @@ from qiita_common.models import (
 )
 
 from .. import _common
-from .pool import _lookup_accessions
+from .pool import _dedup_accessions, _lookup_accessions, _print_missing_accession_error
 
 # action_id + version for the per-sample read loader this command fans out to.
 # Pinned here so the CLI does not drift from the workflow YAML the operator's
@@ -92,11 +93,9 @@ class _PacbioPreflightRow(NamedTuple):
     resolution is not yet wired, so it is always empty today (see
     `_read_pacbio_preflight_rows`).
 
-    `smrt_cell` is RESERVED for the announced upstream reader (see
-    `_read_pacbio_preflight_rows`): it will carry the sample's SMRT cell so BAM
-    resolution can key on `(smrt_cell, barcode)` and stop failing on barcode
-    reuse across cells. It defaults None until that reader lands; while None,
-    `_resolve_sample_bams` falls back to barcode-only with the collision guard."""
+    `smrt_cell` is RESERVED for the announced upstream reader: once populated it
+    lets BAM resolution key on `(smrt_cell, barcode)` instead of failing on
+    barcode reuse across cells. It defaults None until then (barcode-only path)."""
 
     sample_name: str
     barcode: str
@@ -159,25 +158,14 @@ def _read_pacbio_preflight_rows(
 ) -> list[_PacbioPreflightRow]:
     """Open the preflight SQLite and return one `_PacbioPreflightRow` per PacBio sample.
 
-    PROVISIONAL — the single swap point for the missing upstream reader. Unlike
-    the Illumina path (`pool._read_preflight_rows`, which calls the library's
-    `get_illumina_sample_info`), `kl-run-preflight` ships no `get_pacbio_sample_info`
-    (verified absent on the pinned SHA and on `main`), so this reads the
-    `pacbio_sample` table directly via `_PACBIO_SAMPLE_JOIN` + the library's own
-    `get_single_run_idx` / `get_run_legacy_format` accessors.
-
-    REPLACEMENT TARGET: an upstream `get_pacbio_sample_info` is planned that will
-    return, per sample, a tuple of
-      (preflight-internal int idx, biosample_accession, primary_project_accession,
-       secondary_project_accessions, barcode_id, twist_adaptor_id,
-       syndna_is_twisted, smrt_cell)
-    — the Illumina reader's 4-tuple plus the PacBio columns AND the smrt_cell this
-    flow needs to disambiguate barcode reuse. When it lands: (1) bump the git pin,
-    (2) replace this body with a call to it (dropping `_PACBIO_SAMPLE_JOIN`),
-    populating `_PacbioPreflightRow.smrt_cell` from it and `human_filtering` the
-    same way the Illumina CLI parser does; (3) switch the pool-item-id + BAM
-    resolution to key on smrt_cell (see `_index_run_bams`). The rest of the flow
-    depends only on the `_PacbioPreflightRow` contract, so nothing else changes.
+    PROVISIONAL — the single swap point for the missing upstream reader.
+    `kl-run-preflight` ships no `get_pacbio_sample_info` (verified absent on the
+    pinned SHA and on `main`; cf. the Illumina `get_illumina_sample_info` that
+    `pool._read_preflight_rows` uses), so this reads the `pacbio_sample` table
+    directly via `_PACBIO_SAMPLE_JOIN` + the library's `get_single_run_idx` /
+    `get_run_legacy_format`. When that reader lands, replace this body with a call
+    to it (dropping `_PACBIO_SAMPLE_JOIN`) — the rest of the flow depends only on
+    the `_PacbioPreflightRow` contract, so nothing else changes.
 
     Operator-actionable errors (not a SQLite, an empty sample set, a row missing
     biosample_accession / primary_project_accession, or an impossible protocol
@@ -264,12 +252,31 @@ def _read_pacbio_preflight_rows(
             # lands. Empty keeps parity with the Illumina row shape.
             secondary_project_accessions=[],
             human_filtering=bool(human_filtering),
+            # sheet_type is a RUN-level property (a run is one protocol), read once
+            # from the legacy format above and stamped on every row — there is no
+            # per-sample sheet_type.
             sheet_type=sheet_type,
             twist_adaptor_id=twist_adaptor_id or None,
             syndna_is_twisted=twisted,
         )
         _validate_pacbio_protocol(row, preflight_blob, parser)
         parsed.append(row)
+
+    # Barcode must be unique across samples: it is this flow's pool-item-id AND the
+    # key both `_resolve_sample_bams` and the create-missing roster loop dedup on,
+    # so two rows sharing a barcode would silently collapse into one sample (the
+    # second overwriting the first, its reads dropped). A run demuxes each sample
+    # to a distinct barcode, so a duplicate is a corrupt preflight — fail loud.
+    by_barcode: dict[str, list[str]] = {}
+    for row in parsed:
+        by_barcode.setdefault(row.barcode, []).append(row.sample_name)
+    collisions = {bc: names for bc, names in by_barcode.items() if len(names) > 1}
+    if collisions:
+        detail = "; ".join(f"{bc}: {', '.join(names)}" for bc, names in sorted(collisions.items()))
+        parser.error(
+            f"--preflight-blob {preflight_blob}: barcode reused across samples ({detail});"
+            " each sample in a run must carry a distinct barcode"
+        )
     return parsed
 
 
@@ -369,7 +376,10 @@ def _resolve_sample_bams(
         elif row.barcode not in index:
             missing.append(f"{row.sample_name} ({row.barcode})")
         else:
-            resolved[row.barcode] = index[row.barcode].resolve()
+            # .absolute(), not .resolve(): the orchestrator binds the BAM's parent
+            # dir by its given absolute path, so dereferencing symlinks here could
+            # yield a path outside that bind mount (invisible to the compute node).
+            resolved[row.barcode] = index[row.barcode].absolute()
     if ambiguous:
         parser.error(
             f"--run-folder {run_folder}: barcode reuse across SMRT cells for"
@@ -384,54 +394,6 @@ def _resolve_sample_bams(
     return resolved
 
 
-def _dedup_accessions(rows: list[_PacbioPreflightRow]) -> tuple[list[str], list[str]]:
-    """Order-preserving dedup of biosample + study accessions across all rows, so
-    the lookup routes' `missing` echo is deterministic. Mirrors the dedup in
-    `pool._handle_submit_bcl_convert`."""
-    unique_biosamples: list[str] = []
-    unique_studies: list[str] = []
-    seen_biosample: set[str] = set()
-    seen_study: set[str] = set()
-    for row in rows:
-        if row.biosample_accession not in seen_biosample:
-            seen_biosample.add(row.biosample_accession)
-            unique_biosamples.append(row.biosample_accession)
-        for study in (row.primary_project_accession, *row.secondary_project_accessions):
-            if study not in seen_study:
-                seen_study.add(study)
-                unique_studies.append(study)
-    return unique_biosamples, unique_studies
-
-
-def _print_missing_accession_error(
-    rows: list[_PacbioPreflightRow],
-    missing_biosamples: list[str],
-    missing_studies: list[str],
-) -> None:
-    """One combined stderr block naming every sample carrying a missing accession,
-    so the operator imports the gaps and re-runs. PacBio analogue of
-    `pool._print_missing_accession_error`, keyed by sample_name."""
-    import sys  # noqa: PLC0415
-
-    missing_bio = set(missing_biosamples)
-    missing_study = set(missing_studies)
-    lines: list[str] = []
-    for row in rows:
-        misses = [a for a in [row.biosample_accession] if a in missing_bio]
-        misses += [
-            a
-            for a in (row.primary_project_accession, *row.secondary_project_accessions)
-            if a in missing_study
-        ]
-        if misses:
-            lines.append(f"  - {', '.join(misses)} (sample {row.sample_name})")
-    print(
-        "error: " + f"{len(missing_bio)} biosample + {len(missing_study)} study accession(s)"
-        " not found in qiita:\n" + "\n".join(lines) + "\nimport the missing record(s) and re-run.",
-        file=sys.stderr,
-    )
-
-
 def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Bundle the PacBio HiFi ingest flow into one operator gesture.
 
@@ -442,8 +404,14 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        one combined block and exits 1 with nothing created.
     3. POST /sequencing-run (platform PACBIO_SMRT; instrument_run_id +
        instrument_model from args, since PacBio has no RunInfo.xml) and
-       /sequencing-run/{run}/sequenced-pool (attaching the preflight blob, so a
-       later read-mask submission re-reads the stored protocol columns).
+       /sequencing-run/{run}/sequenced-pool (attaching the preflight blob). The
+       blob is attached per the store-once design so a FUTURE read-mask submission
+       can re-read the protocol columns (human_filtering, twist_adaptor_id,
+       syndna_is_twisted) server-side and derive the case's mask chain — the same
+       way submit-host-filter-pool reads human_filtering from the stored Illumina
+       blob today. That PacBio server-side re-read parser is NOT built yet (it
+       lands with the case-5 mask PR); until then human_filtering is echoed in this
+       command's summary for operator reference only and is not forwarded onward.
     4. GET the pool roster and create only the MISSING sequenced-samples
        (`sequenced_pool_item_id = barcode`, the PacBio demux identifier — the
        analogue of bcl-convert's illumina_sample_idx). The composer 409s on a
@@ -451,14 +419,20 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        a retry converge instead of aborting on the first already-created sample.
     5. Fan out one `bam-to-parquet` ticket per sample (scope prep_sample,
        action_context {bam_path, expect_unaligned: true}). Per-sample resilient:
-       one sample's ticket failure is recorded and the fan-out continues; the
-       command exits non-zero if any sample failed (mirrors submit-host-filter-pool).
+       one sample's ticket failure is recorded and the fan-out continues. A 409
+       (sample already COMPLETED under disallow-without-delete, or already
+       in-flight) is recorded as SKIPPED — the convergence signal, not a failure —
+       so re-running to retry a failed sample never reports the finished ones as
+       failures. The command exits non-zero only if a real (non-409) failure
+       occurred (mirrors submit-host-filter-pool).
 
     Convergent retry: find-or-create on the run + pool, create-missing on the
-    roster (step 4), and the resilient fan-out (step 5) together mean re-running
-    the identical gesture after a partial failure reuses everything already made
-    and only retries the still-missing samples / failed tickets. All calls share
-    one PAT.
+    roster (step 4), and the 409-as-skip fan-out (step 5) together mean re-running
+    the identical gesture after a partial failure reuses everything already made,
+    skips the already-done samples (exit 0), and only re-submits the still-missing
+    / previously-FAILED ones (the route resets a FAILED ticket). --force is the
+    separate, deliberate re-ingest path (it re-registers reads → lake duplicates),
+    NOT the retry route. All calls share one PAT.
     """
     if not args.run_folder.is_absolute():
         parser.error(f"--run-folder must be absolute, got {args.run_folder}")
@@ -505,8 +479,14 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             StudyLookupByAccessionRequest,
         )
         if missing_biosamples or missing_studies:
-            _print_missing_accession_error(preflight_rows, missing_biosamples, missing_studies)
-            raise SystemExit(1)
+            _print_missing_accession_error(
+                preflight_rows,
+                missing_biosamples,
+                missing_studies,
+                row_label=lambda row: f"sample {row.sample_name}",
+                row_noun="sample",
+            )
+            sys.exit(1)
 
         run_resp, run_status = _common.call_with_status(
             "POST", args.base_url, token, PATH_SEQUENCING_RUN_PREFIX, json=run_body
@@ -590,7 +570,18 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # Fan out one bam-to-parquet ingest ticket per sample. Per-sample
         # resilient: a single ticket's failure is recorded and the loop CONTINUES,
         # so one bad sample never strands the rest (mirrors submit-host-filter-pool).
+        #
+        # A 409 is NOT a failure — it is the convergence signal: a sample already
+        # COMPLETED (disallow-without-delete) or already in-flight
+        # (PENDING/QUEUED/PROCESSING) rejects a duplicate submit with 409. That is
+        # exactly "already done / already running", so we record it as SKIPPED and
+        # do NOT count it toward the non-zero exit — re-running the gesture to
+        # retry a failed sample must not report the finished ones as failures.
+        # (A FAILED sample's ticket is reset by the route and re-submitted 201,
+        # so it converges without a skip. --force is the separate, deliberate
+        # re-ingest path and intentionally NOT the recovery route here.)
         failures: list[dict] = []
+        skipped: list[dict] = []
         for entry in per_sample:
             ticket_body = WorkTicketCreateRequest(
                 action_id=_BAM_TO_PARQUET_ACTION_ID,
@@ -610,6 +601,17 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                     "POST", args.base_url, token, PATH_WORK_TICKET_PREFIX, json=ticket_body
                 )
             except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    # Already ingested (COMPLETED) or already in-flight — converged,
+                    # not failed. Skip without contributing to the non-zero exit.
+                    skipped.append(
+                        {
+                            "prep_sample_idx": entry["prep_sample_idx"],
+                            "barcode": entry["barcode"],
+                            "reason": exc.response.text[:500],
+                        }
+                    )
+                    continue
                 failures.append(
                     {
                         "prep_sample_idx": entry["prep_sample_idx"],
@@ -640,8 +642,10 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                 "sequenced_pool_idx": sequenced_pool_idx,
                 "status": "created" if pool_status == 201 else "reused",
             },
-            "samples_submitted": len(per_sample) - len(failures),
+            "samples_submitted": len(per_sample) - len(failures) - len(skipped),
+            "samples_skipped": len(skipped),
             "samples_failed": len(failures),
+            "skipped": skipped,
             "failed": failures,
             "per_sample": per_sample,
             "instrument_run_id": args.instrument_run_id,
@@ -651,8 +655,11 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         if failures:
             import json  # noqa: PLC0415
 
-            print(json.dumps(summary, indent=2))
-            raise SystemExit(1)
+            # Partial fan-out: emit the summary to stderr (it's an error report —
+            # the success path returns it for stdout) and exit non-zero so a
+            # scripted caller can't mistake a partial run for success.
+            print(json.dumps(summary, indent=2), file=sys.stderr)
+            sys.exit(1)
         return summary
 
     return _common.run_http_subcommand(_run)

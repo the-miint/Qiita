@@ -973,7 +973,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
             " uniformly across the pool (the preflight carries no Qiita"
-            " prep_protocol identifier), mirroring submit-bcl-convert."
+            " prep_protocol identifier), mirroring submit-bcl-convert. NOT"
+            " validated against the platform — passing a non-PacBio/short-read"
+            " protocol here silently mislabels every sample, so double-check it is"
+            " the intended long-read protocol."
         ),
     )
     p_submit_pacbio.add_argument(

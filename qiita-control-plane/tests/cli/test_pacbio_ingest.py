@@ -169,7 +169,13 @@ def _build_case5_preflight(tmp_path: Path, *, populate_accessions: bool) -> Path
     Uses run_preflight's own CSV loader so the seam is exercised against the true
     schema. biosample_accession is NULL in the fixture (populated upstream in
     production); optionally set it here via plain sqlite (run_preflight's
-    save_db_file is avoided — it blocks in this harness)."""
+    save_db_file is avoided — it blocks in this harness).
+
+    NOTE: the provisional `_PACBIO_SAMPLE_JOIN` is coupled to run-preflight's
+    pacbio_sample/prepped_sample/input_sample/project schema. This test therefore
+    guards that coupling — a run-preflight pin bump that renames those tables/
+    columns will fail HERE (loudly) rather than silently at runtime, until the seam
+    is replaced by the upstream get_pacbio_sample_info reader."""
     from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
 
     db = tmp_path / "case5.db"
@@ -198,6 +204,19 @@ def test_read_preflight_rows_case5(tmp_path):
         assert r.syndna_is_twisted is False
 
 
+def test_read_preflight_rows_rejects_barcode_reused_across_samples(tmp_path):
+    """Two samples sharing a barcode would collapse into one (barcode is the
+    pool-item-id and the resolve/roster dedup key), so it's a hard error."""
+    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    conn = sqlite3.connect(db)
+    # Force sample.2's barcode to equal sample.1's (bc3011).
+    conn.execute("UPDATE pacbio_sample SET barcode_id = 'bc3011' WHERE barcode_id = 'bc0112'")
+    conn.commit()
+    conn.close()
+    with pytest.raises(_RaisingParser.Error, match="barcode reused across samples"):
+        _read_pacbio_preflight_rows(db, _RaisingParser())
+
+
 def test_read_preflight_rows_fails_on_missing_biosample_accession(tmp_path):
     """A sample with no biosample_accession (not yet populated upstream) is an
     operator-actionable fail-fast, matching the Illumina reader."""
@@ -217,15 +236,16 @@ def _stub_submit_flow(
     *,
     existing_samples: list[dict] | None = None,
     fail_ticket_when=None,
+    conflict_ticket_when=None,
 ) -> None:
     """Route each POST/GET of the submit flow to a canned response and record
     every request.
 
     `existing_samples` seeds the pool roster GET (empty = fresh pool → every
     sample is created; pre-populated = a retry that reuses them). Each dict needs
-    `sequenced_pool_item_id` + `prep_sample_idx`. `fail_ticket_when(body)` (a
-    predicate over the work-ticket request body) forces that ticket POST to 500,
-    exercising the resilient fan-out. sequenced-sample POSTs get a unique
+    `sequenced_pool_item_id` + `prep_sample_idx`. `fail_ticket_when(body)` forces
+    that ticket POST to 500 (real failure); `conflict_ticket_when(body)` forces it
+    to 409 (already-done / in-flight → skip). sequenced-sample POSTs get a unique
     prep_sample_idx per call."""
     captured["requests"] = []
     counter = {"sample": 0}
@@ -262,6 +282,8 @@ def _stub_submit_flow(
         if url.endswith("/work-ticket"):
             if fail_ticket_when is not None and fail_ticket_when(json):
                 return resp(500, {"detail": "boom"})
+            if conflict_ticket_when is not None and conflict_ticket_when(json):
+                return resp(409, {"detail": "already ingested"})
             return resp(201, {"work_ticket_idx": 999})
         raise AssertionError(f"unexpected request to {url}")
 
@@ -492,6 +514,28 @@ def test_submit_pacbio_ingest_retry_reuses_existing_roster(monkeypatch, tmp_path
         301,
         302,
     ]
+
+
+def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(monkeypatch, tmp_path):
+    """A real re-submit: the samples exist AND their ingest tickets already
+    COMPLETED (or are in-flight), so the work-ticket POSTs 409. Those are the
+    convergence signal, not failures — the command records them as skipped and
+    exits 0 (the operator must be able to tell already-done from a real failure)."""
+    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    existing = [
+        {"sequenced_pool_item_id": bc, "prep_sample_idx": 300 + i, "sequenced_sample_idx": 400 + i}
+        for i, bc in enumerate(("bc3011", "bc0112", "bc9992"))
+    ]
+    captured: dict = {}
+    _stub_submit_flow(
+        monkeypatch, captured, existing_samples=existing, conflict_ticket_when=lambda body: True
+    )
+    rc = main(_submit_args(run, db))
+    assert rc == 0  # all-already-done converges to success, not a failure exit
 
 
 def test_read_preflight_rows_rejects_non_pacbio_sheet(tmp_path):

@@ -189,20 +189,49 @@ def _read_preflight_rows(
     return parsed
 
 
+def _dedup_accessions(preflight_rows: list[Any]) -> tuple[list[str], list[str]]:
+    """One-pass order-preserving dedup of the biosample + study accessions across
+    `preflight_rows`, so the lookup routes' `missing` echo is deterministic; the
+    study side pools each row's primary + secondaries so controls land their full
+    set. Returns (unique_biosample_accessions, unique_study_accessions).
+
+    Row-shape-agnostic: works on any preflight row exposing `biosample_accession`,
+    `primary_project_accession`, and `secondary_project_accessions` — shared by the
+    Illumina (`_PreflightRow`) and PacBio (`_PacbioPreflightRow`) submit flows."""
+    unique_biosamples: list[str] = []
+    unique_studies: list[str] = []
+    seen_biosample: set[str] = set()
+    seen_study: set[str] = set()
+    for row in preflight_rows:
+        if row.biosample_accession not in seen_biosample:
+            seen_biosample.add(row.biosample_accession)
+            unique_biosamples.append(row.biosample_accession)
+        for study_accession in (row.primary_project_accession, *row.secondary_project_accessions):
+            if study_accession not in seen_study:
+                seen_study.add(study_accession)
+                unique_studies.append(study_accession)
+    return unique_biosamples, unique_studies
+
+
 def _build_missing_section(
     *,
     label: str,
     missing: list[str],
-    preflight_rows: list[_PreflightRow],
-    row_accessions: Callable[[_PreflightRow], list[str]],
+    preflight_rows: list[Any],
+    row_accessions: Callable[[Any], list[str]],
+    row_label: Callable[[Any], str],
+    row_noun: str,
 ) -> str | None:
     """Build one labeled section naming every preflight row that carries
     a missing accession in this class. Returns None if `missing` is empty.
 
     `row_accessions` extracts the row's accessions in the relevant class
-    (one for biosamples, primary + secondaries for studies). The header
-    counts distinct missing accessions and the rows affected, so the
-    per-row bullet count is no longer ambiguous against the dedup count.
+    (one for biosamples, primary + secondaries for studies). `row_label`
+    renders a row's per-bullet identifier (e.g. `illumina_sample_idx=5` or
+    `sample sample.1`) and `row_noun` names the row kind in the header, so the
+    Illumina and PacBio flows share this with their own row shapes. The header
+    counts distinct missing accessions and the rows affected, so the per-row
+    bullet count is no longer ambiguous against the dedup count.
     """
     if not missing:
         return None
@@ -211,27 +240,29 @@ def _build_missing_section(
     for row in preflight_rows:
         row_misses = [a for a in row_accessions(row) if a in missing_set]
         if row_misses:
-            bullets.append(
-                f"  - {', '.join(row_misses)} (illumina_sample_idx={row.illumina_sample_idx})"
-            )
+            bullets.append(f"  - {', '.join(row_misses)} ({row_label(row)})")
     acc_plural = "s" if len(missing) != 1 else ""
     rows_plural = "s" if len(bullets) != 1 else ""
     return (
         f"{len(missing)} distinct preflight {label} accession{acc_plural}"
-        f" not found in qiita, affecting {len(bullets)} illumina_sample row{rows_plural}:\n"
+        f" not found in qiita, affecting {len(bullets)} {row_noun} row{rows_plural}:\n"
         + "\n".join(bullets)
     )
 
 
 def _print_missing_accession_error(
-    preflight_rows: list[_PreflightRow],
+    preflight_rows: list[Any],
     missing_biosamples: list[str],
     missing_studies: list[str],
+    *,
+    row_label: Callable[[Any], str],
+    row_noun: str,
 ) -> None:
     """Emit one combined stderr block naming every offending preflight row.
 
-    Each present class (biosample, study) gets its own header + bullet
-    list, built by `_build_missing_section`.
+    Each present class (biosample, study) gets its own header + bullet list, built
+    by `_build_missing_section`. `row_label` / `row_noun` are threaded through so
+    the Illumina and PacBio flows reuse this with their own row identifiers.
     """
     sections = [
         s
@@ -241,6 +272,8 @@ def _print_missing_accession_error(
                 missing=missing_biosamples,
                 preflight_rows=preflight_rows,
                 row_accessions=lambda row: [row.biosample_accession],
+                row_label=row_label,
+                row_noun=row_noun,
             ),
             _build_missing_section(
                 label="study",
@@ -250,6 +283,8 @@ def _print_missing_accession_error(
                     row.primary_project_accession,
                     *row.secondary_project_accessions,
                 ],
+                row_label=row_label,
+                row_noun=row_noun,
             ),
         )
         if s is not None
@@ -325,21 +360,9 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # human_filtering flag is still echoed per sample below so the operator knows
     # which samples the run intended to deplete when choosing those later args.
 
-    # One-pass order-preserving dedup over preflight_rows so the lookup
-    # route's `missing` echo is deterministic; the study side pools each
-    # row's primary + secondaries so controls land their full set.
-    unique_biosample_accessions: list[str] = []
-    unique_study_accessions: list[str] = []
-    seen_biosample: set[str] = set()
-    seen_study: set[str] = set()
-    for row in preflight_rows:
-        if row.biosample_accession not in seen_biosample:
-            seen_biosample.add(row.biosample_accession)
-            unique_biosample_accessions.append(row.biosample_accession)
-        for study_accession in (row.primary_project_accession, *row.secondary_project_accessions):
-            if study_accession not in seen_study:
-                seen_study.add(study_accession)
-                unique_study_accessions.append(study_accession)
+    # Order-preserving dedup of biosample + study accessions (shared with the
+    # PacBio flow) so the lookup route's `missing` echo is deterministic.
+    unique_biosample_accessions, unique_study_accessions = _dedup_accessions(preflight_rows)
 
     run_body = SequencingRunCreateRequest(
         instrument_run_id=instrument_run_id,
@@ -377,7 +400,13 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             StudyLookupByAccessionRequest,
         )
         if missing_biosamples or missing_studies:
-            _print_missing_accession_error(preflight_rows, missing_biosamples, missing_studies)
+            _print_missing_accession_error(
+                preflight_rows,
+                missing_biosamples,
+                missing_studies,
+                row_label=lambda row: f"illumina_sample_idx={row.illumina_sample_idx}",
+                row_noun="illumina_sample",
+            )
             raise SystemExit(1)
 
         run_resp, run_status = _common.call_with_status(
