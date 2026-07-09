@@ -112,7 +112,7 @@ _None yet._
   ```bash
   sudo nginx -T 2>/dev/null | grep -A20 'location /arrow.flight.protocol.FlightService/' \
     | grep -E 'client_max_body_size|grpc_read_timeout|limit_conn'
-  # expect: client_max_body_size 1088m; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
+  # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
   ```
 
 ### Notes (no host action)
@@ -150,8 +150,10 @@ _None yet._
   tightens that edge and is picked up automatically by the deploy:
   `activate.sh` re-renders/installs `deploy/nginx/qiita.conf`, runs `nginx -t`,
   and `systemctl reload nginx`, so the new Flight-`location` directives go live on
-  the restart — `client_max_body_size 1088m` (matches the DP's ~1 GiB DoPut decode
-  ceiling; the 1 MB default 413'd reference-load uploads), `grpc_read_timeout` /
+  the restart — `client_max_body_size 0` (a DoPut streams a whole reference through
+  one client-streaming RPC, so the whole-body cap and the DP's per-message decode
+  ceiling measure different quantities; the 1 MB default 413'd reference-load
+  uploads and any finite cap would 413 a multi-GiB reference), `grpc_read_timeout` /
   `grpc_send_timeout` 3600s (the 60s default cut off large masked-read exports
   before the first batch), and a new per-client `limit_conn qiita_flight_conn 64`
   to bound connection floods. The data plane also now refuses an empty-filter

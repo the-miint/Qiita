@@ -680,8 +680,11 @@ the `no-changelog` label).
 - **Data-plane public-edge hardening.** The Arrow Flight service is reachable
   from the internet through nginx on 443 (by design — clients connect directly
   through nginx). Tightened that edge: the nginx Flight `location` now sets
-  `client_max_body_size 1088m` (matching the data plane's ~1 GiB DoPut decode
-  ceiling — nginx's 1 MB default would 413 reference-load uploads), bumps
+  `client_max_body_size 0` (a DoPut streams an entire reference through one
+  client-streaming RPC, so nginx's whole-body cap and the data plane's
+  per-message decode ceiling measure different quantities — nginx's 1 MB default
+  would 413 a reference-load upload, and any finite cap would still 413 a
+  multi-GiB reference even with every gRPC message under the DP ceiling), bumps
   `grpc_read_timeout`/`grpc_send_timeout` to 3600s (the 60s default cut off large
   DoGet exports before the first batch materialized), and caps concurrent Flight
   connections per client (`limit_conn qiita_flight_conn 64`) to blunt connection
