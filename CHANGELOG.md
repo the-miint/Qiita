@@ -15,6 +15,24 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded alignment consumer (C1, native-job-only).** Three native jobs that
+  *consume* the per-shard indexes B5 produces, so a read aligns against only the
+  shard(s) it minimises into. `build_routing_index` builds a whole-reference
+  MULTI-bucket rype router (`references/{idx}/rype-router.ryxdi`, one bucket per
+  shard) that one `rype_classify` pass turns into a `read_to_shard` table.
+  `align_sharded` (aligner `minimap2`|`bowtie2`) streams that routing, calls
+  `align_{minimap2,bowtie2}_sharded` per routed shard, maps the aligner's
+  `reference` subject id to `feature_idx`, and emits a sorted `alignment.parquet`
+  — SE and PE reads aligned as separate uniform sub-batches (bowtie2 rejects a
+  mixed batch), NO dedup (cross-shard rows carry distinct `feature_idx`; a PE
+  read emits one row per mate). The `derived_store` per-shard aligner layout was
+  revised to the exact `shard_directory` shape miint expects
+  (`minimap2-shards/{shard_id}.mmi`, `bowtie2-shards/{shard_id}/index*`), and the
+  `align_{minimap2,bowtie2}_sharded` + multi-bucket `rype_classify` contract is
+  now qiita-verified in `docs/duckdb-miint.md`. Adds `INDEX_TYPE_RYPE_ROUTER`.
+  Not wired into a workflow (C2 wires the runner block × shard fan-out + the
+  DuckLake alignment sink); the `reference_index.index_type` CHECK gains
+  `rype_router` only when C2 registers the router. (#reference-support)
 - **Sharded-index status endpoint (B5, observability).** New
   `GET /api/v1/reference/{idx}/shard-index-status` (model `ReferenceShardIndexStatus`)
   surfaces a sharded reference's fan-out build progress: `expected_shards` (N, derived
