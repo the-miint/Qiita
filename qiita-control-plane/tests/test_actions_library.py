@@ -44,6 +44,8 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.PERSIST_QC_REPORT] is lib.persist_qc_report
     assert LIBRARY[LibraryPrimitive.DELETE_READ_MASK_BLOCK] is lib.delete_read_mask_block
     assert LIBRARY[LibraryPrimitive.RECONCILE_BLOCK] is lib.reconcile_block
+    assert LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK] is lib.delete_alignment_block
+    assert LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK] is lib.reconcile_alignment_block
 
 
 async def test_delete_pool_reads_data_empty_set_short_circuits():
@@ -66,6 +68,21 @@ async def test_delete_read_mask_block_data_empty_members_short_circuits():
 
     rows = await lib.delete_read_mask_block_data(
         mask_idx=7,
+        members=[],
+        hmac_secret=b"\x00" * 32,
+        data_plane_url="grpc://unreachable:1",
+    )
+    assert rows == 0
+
+
+async def test_delete_alignment_block_data_empty_members_short_circuits():
+    """The alignment twin: an empty members list returns 0 without a Flight call —
+    the idempotent alignment-block-replace wrapper never touches the data plane for
+    an empty block."""
+    from qiita_control_plane.actions import library as lib
+
+    rows = await lib.delete_alignment_block_data(
+        alignment_idx=7,
         members=[],
         hmac_secret=b"\x00" * 32,
         data_plane_url="grpc://unreachable:1",

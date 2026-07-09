@@ -1,0 +1,154 @@
+action_id: align
+version: 1.0.0
+target_kind: block
+# Block-scoped, NOT prep_sample-scoped: one ticket aligns a fixed ~10M-read BLOCK
+# drawn from many prep_samples that share ONE alignment identity (alignment_idx).
+# The block↔sample cover-map lives in qiita.block_member; the alignment_idx and the
+# host-depletion mask_idx both ride on the work_ticket. target_processing_kinds is
+# intentionally absent — it is only meaningful for target_kind: prep_sample (the
+# loader + DB CHECK reject it here); the samples a block covers are all `sequenced`
+# by construction (the planner enumerates a sequenced pool).
+
+description: >
+  Align a BLOCK of a sequenced pool's HOST-DEPLETED, QC-passed reads against a
+  sharded reference and land the results in the DuckLake `alignment` table. The
+  consumer side of reference sharding (C2b): C1 shipped the `align_sharded`
+  native job (route each read to its shard(s) via the whole-reference rype
+  router, align against only those shards, emit a verbatim-passthrough
+  `alignment.parquet` carrying feature_idx); C2a made a sharded reference
+  index-complete + resolvable; this workflow wires them into a runnable align run.
+
+  Like `read-mask-block` it decouples the COMPUTE unit (the block) from the
+  ACCOUNTING unit (per-sample completion): the block aligns its multi-sample
+  reads in one job, then reconcile finalizes each covered sample's alignment gate
+  once ALL its covering blocks are done.
+
+  The reads are the MASKED reads — the host-depleted, QC-passed reads the
+  `read-mask-block` milestone produced (the DuckLake `read_masked` view). The
+  runner binds `reads` from the block's `block_member` sub-ranges via the
+  `export_read_masked_block` DoAction (the data plane materializes the union of
+  the members' `read_masked` sub-ranges, scoped to the ticket's `mask_idx`, into a
+  per-ticket `reads.parquet` — the bulk read bytes never transit the control
+  plane), binds `mask_idx` from the work_ticket (resolved at plan time as the
+  samples' completed host-depletion mask), and resolves the reference's
+  `router_index_path` + `shard_directory` from action_context (the C2a
+  `_resolve_sharded_align_indexes`). This workflow never parses reads or mints a
+  sequence_idx range.
+
+  `alignment_idx` is the CP-minted alignment-config identity (deduped on
+  {reference, aligner, mask, shard-set} — the mask-style identity, no
+  processing_idx yet), resolved at plan time and threaded onto every output row so
+  the DuckLake `alignment` table is keyed by it. The `aligner` selects the sharded
+  aligner (minimap2 | bowtie2); both are set on the block ticket's action_context
+  by the align planner.
+
+# reconcile-alignment-block flips each finalized sample's `alignment_sample` gate;
+# it re-materializes host-depleted (human-derived) reads into the ticket workspace
+# via export_read_masked_block, so submitters must hold prep_sample:write — the
+# same privileged scope read-mask-block declares. No new alignment:write scope
+# (reuse bounds the surface).
+scopes:
+  - prep_sample:write
+
+# Admin-only, same rationale as read-mask-block: alignment makes the data plane
+# re-materialize host-depleted reads (derived from human-containing reads) into
+# the ticket workspace via the `export_read_masked_block` DoAction, so this is a
+# privileged lab operation.
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: []
+  properties:
+    # The sharded reference to align against. Plain reference idx, NOT
+    # `*_upload_idx` (the upload-handle walker leaves it alone). Prefixed
+    # `align_` so it does not collide with the reserved `reference_idx` input key
+    # (block scope injects no scope scalar; the CP resolves router/shard paths
+    # from THIS key). Set at plan time.
+    align_reference_idx:
+      type: integer
+      minimum: 1
+    # Which sharded aligner to run. Threaded into the job via `params:`. Set at
+    # plan time from the align request.
+    aligner:
+      type: string
+      enum: [minimap2, bowtie2]
+    # The CP-minted alignment-config identity (mask-style). Threaded into the job
+    # via `params:` (stamped as every output row's leading column) and carried on
+    # work_ticket.alignment_idx (signals the runner's masked-reads path + keys the
+    # covering-block completion gate). Set at plan time.
+    alignment_idx:
+      type: integer
+      minimum: 1
+    # The completed host-depletion mask the block's reads were masked under —
+    # provenance mirror of work_ticket.mask_idx (the runner binds the masked-read
+    # export from the ticket column, not this key). Prefixed `align_` for
+    # symmetry; set at plan time.
+    align_mask_idx:
+      type: integer
+      minimum: 1
+
+steps:
+  # Route + align the block's masked reads against the sharded reference. `reads`
+  # is runner-bound from the block's member sub-ranges over the read_masked view
+  # (_resolve_staged_masked_reads_block, keyed on work_ticket.mask_idx);
+  # `router_index_path` (the whole-reference rype router, router_paths[0]) +
+  # `shard_directory` (the per-aligner shard root) are runner-bound from
+  # action_context (_resolve_sharded_align_indexes on align_reference_idx +
+  # aligner). `aligner` + `alignment_idx` ride through `params:` (scalars can't
+  # ride `inputs:`); `alignment_idx` becomes every output row's leading column so
+  # the DuckLake `alignment` table is keyed by it. Emits `alignment.parquet` into
+  # `alignment_staging_dir` (the job's workspace) — the register-files convention.
+  - step: align_sharded
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.align_sharded
+    inputs: [reads, router_index_path, shard_directory]
+    params: {aligner: aligner, alignment_idx: alignment_idx}
+    outputs: [alignment, alignment_staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT4H
+
+  # Idempotent block replace: delete this block's exact alignment footprint (its
+  # member sub-ranges under the ticket's alignment_idx) from the DuckLake
+  # `alignment` table BEFORE register-files re-writes it, so a block re-run (a
+  # retry, or an operator resubmit covering the same footprint) deletes-then-
+  # re-registers and never double-counts. On a fresh block it deletes 0 rows.
+  # Exact by construction (per-member OR), so a sample split across several blocks
+  # keeps its sibling blocks' rows — only THIS block's footprint goes. The
+  # footprint is feature_idx-agnostic (all of a read's alignment rows go). block_idx
+  # from the scope target, alignment_idx from the ticket — no file inputs.
+  - action: delete-alignment-block
+    inputs: []
+    outputs: []
+
+  # Load the block's alignment.parquet into the DuckLake `alignment` table.
+  # alignment_staging_dir holds only alignment.parquet (the DuckDB spill dir is
+  # torn down before the job returns). Must run BEFORE reconcile: the per-sample
+  # gate flips only after the block's rows are persisted.
+  - action: register-files
+    inputs: [alignment_staging_dir]
+    outputs: []
+
+  # Terminal: mark this block completed, then finalize each covered sample whose
+  # LAST covering block just completed — flip its `alignment_sample` gate to
+  # 'completed'. A sample split across several blocks finalizes only when all its
+  # blocks are done, serialized by a per-sample lock so exactly one block
+  # finalizes it. NO count-assertion (unlike reconcile-block): alignment rows are
+  # NOT 1:1 with reads (cross-shard + PE multiplicity), so completion is "every
+  # covering block done", not "row count == read count". block_idx from the scope
+  # target, alignment_idx from the ticket — no file inputs.
+  - action: reconcile-alignment-block
+    inputs: []
+    outputs: []
+
+# NO success_status / failure_status: a single block's failure must not flip
+# anything reference-wide; reconcile-alignment-block owns the per-sample gate.
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 64
+  walltime: PT8H

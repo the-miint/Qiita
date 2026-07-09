@@ -458,6 +458,17 @@ async def run_workflow(
         # left them untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
 
+        # Sharded-aligner index resolution (the `align` workflow): when a step
+        # lists router_index_path/shard_directory as inputs, resolve them from
+        # action_context (align_reference_idx + aligner) before the loop — the C2b
+        # consumer wiring into the C2a resolver. Same inside-try placement as the
+        # host-filter resolver so a failure (unknown / non-active reference,
+        # unbuilt router / per-shard index) lands in the outer FAILED handler
+        # instead of leaving the ticket stuck in PROCESSING. None of these keys are
+        # `*_upload_idx`, so the upload walker left them untouched.
+        if _workflow_needs_sharded_align_indexes(action.steps):
+            bound.update(await _resolve_sharded_align_index_bindings(pool, action_context=bound))
+
         # QC adapter materialization: when any step needs `adapter_parquet` (the
         # qc step), DoGet the configured artifact_sequence_set reference's
         # sequences and stage them as a local Parquet in the ticket workspace.
@@ -1905,6 +1916,70 @@ async def _resolve_sharded_align_indexes(
     return router_paths, shard_directory
 
 
+# Binding names the align step (`align_sharded`) declares as inputs. Their
+# presence signals the runner to resolve the sharded reference's router + shard
+# root from action_context before the step loop (the C2b consumer wiring). The
+# router is bound as a SINGLE path (router_paths[0] — one router today; the
+# resolver returns a list for the deferred growth case).
+ROUTER_INDEX_PATH_BINDING = "router_index_path"
+SHARD_DIRECTORY_BINDING = "shard_directory"
+
+
+def _workflow_needs_sharded_align_indexes(steps: list[Any]) -> bool:
+    """True iff some entry declares `router_index_path`/`shard_directory` as inputs
+    — the signal the runner must resolve the sharded-aligner router + shard root
+    from action_context before the step loop (the `align` workflow). Mirrors
+    `_workflow_needs_mask`/`_workflow_needs_adapters`; the align step lists both, so
+    either presence triggers."""
+    return _workflow_declares_input(steps, ROUTER_INDEX_PATH_BINDING) or _workflow_declares_input(
+        steps, SHARD_DIRECTORY_BINDING
+    )
+
+
+async def _resolve_sharded_align_index_bindings(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    action_context: dict[str, Any],
+) -> dict[str, Path]:
+    """Resolve `router_index_path` + `shard_directory` for the `align` workflow
+    from action_context (`align_reference_idx` + `aligner`), binding the FIRST
+    router (`router_paths[0]`) as the single-Path `router_index_path` input
+    `align_sharded` takes. The C2b entrypoint into the C2a resolver.
+
+    `align_reference_idx` (not the reserved `reference_idx` key — block scope
+    injects no scope scalar) names the ACTIVE sharded reference; `aligner`
+    (`minimap2`|`bowtie2`) selects the per-aligner shard root. Wraps every failure
+    as a typed `BackendFailure(BAD_INPUT)` at stage=SUBMISSION that `run_workflow`
+    turns into a FAILED work_ticket — mirroring `_resolve_host_filter_indexes`."""
+    reference_idx = action_context.get("align_reference_idx")
+    aligner = action_context.get("aligner")
+    if reference_idx is None or aligner is None:
+        raise _submission_bad_input(
+            "an align ticket requires align_reference_idx + aligner in action_context; "
+            f"got align_reference_idx={reference_idx!r}, aligner={aligner!r}"
+        )
+    try:
+        router_paths, shard_directory = await _resolve_sharded_align_indexes(
+            pool, _coerce_reference_idx(reference_idx, "align_reference_idx"), str(aligner)
+        )
+    except ReferenceNotFound as exc:
+        raise _submission_bad_input(
+            f"align_reference_idx={reference_idx} references an unknown reference"
+        ) from exc
+    except ValueError as exc:
+        # Non-active reference, an unbuilt router / per-shard index
+        # (ReferenceIndexNotBuilt, a ValueError subclass), or an unknown aligner.
+        raise _submission_bad_input(
+            f"could not resolve sharded {aligner!r} indexes for reference {reference_idx}: {exc}"
+        ) from exc
+    # router_paths is non-empty (the resolver raises ReferenceIndexNotBuilt
+    # otherwise); take the newest as the single router align_sharded aligns against.
+    return {
+        ROUTER_INDEX_PATH_BINDING: router_paths[0],
+        SHARD_DIRECTORY_BINDING: shard_directory,
+    }
+
+
 # Binding name the runner stages the canonical adapter set (a Parquet) under. A
 # step that lists this in its `inputs` (the qc step) signals the runner to
 # materialize the adapter set before the step loop (see `_resolve_qc_adapters`).
@@ -2518,6 +2593,31 @@ async def _resolve_staged_reads_block(
     return {STAGED_READS_BINDING: dest}
 
 
+def _write_empty_reads_parquet(dest: Path) -> None:
+    """Write a schema-correct 0-row `reads.parquet` at `dest`, in the exact
+    `export_read_block` column shape (`prep_sample_idx, sequence_idx, read_id,
+    sequence1, qual1, sequence2, qual2`) `align_sharded` binds. Used for the
+    zero-masked-block no-op (see `_resolve_staged_masked_reads_block`): the data
+    plane writes no file for an empty selection, so the align step still needs a
+    valid empty input file to align over (emitting an empty alignment.parquet).
+    pyarrow (already this module's Flight dependency) writes it directly."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array([], type=pa.int64()),
+            "sequence_idx": pa.array([], type=pa.int64()),
+            "read_id": pa.array([], type=pa.string()),
+            "sequence1": pa.array([], type=pa.string()),
+            "qual1": pa.array([], type=pa.string()),
+            "sequence2": pa.array([], type=pa.string()),
+            "qual2": pa.array([], type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(dest))
+
+
 async def _resolve_staged_masked_reads_block(
     members: list[dict[str, int]],
     *,
@@ -2539,10 +2639,13 @@ async def _resolve_staged_masked_reads_block(
     `mask_idx` is the ticket's pre-resolved (plan-time) mask — the SAME
     completed mask the block's samples were masked under. Fails
     SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly, step_name=None) if:
-    `members` is empty (a planning bug); the data plane is unreachable; the block
-    selects zero MASKED reads (every read in range was masked out, or the mask
-    never landed — either way there is nothing to align, a fail-fast); or the
-    data plane reported reads but no file landed."""
+    `members` is empty (a planning bug); the data plane is unreachable; or the
+    data plane reported reads but no file landed. **Unlike the raw path, zero
+    selected reads is NOT a failure** — a completed mask can legitimately carry 0
+    passing reads (a blank/control or fully host/QC-filtered sample the planner
+    still tiles), so an empty selection binds an empty (schema-correct)
+    reads.parquet and the block runs to a clean no-op completion (empty
+    alignment.parquet → register 0 rows → gate flip)."""
     if not members:
         raise _submission_bad_input("an align block requires a non-empty members list")
     workspace.mkdir(parents=True, exist_ok=True)
@@ -2576,12 +2679,21 @@ async def _resolve_staged_masked_reads_block(
         ) from exc
 
     if result.get("count", 0) == 0:
-        raise _submission_bad_input(
-            "the align block selected zero MASKED reads from the data plane; its "
-            "members' sequence_idx ranges matched no passing read_masked rows under "
-            f"mask_idx={mask_idx} (the mask never landed, or every read was masked "
-            "out — nothing to align)"
-        )
+        # Zero passing masked reads is a LEGITIMATE no-op, NOT a failure — unlike
+        # the raw `_resolve_staged_reads_block` path, where zero reads is a planning
+        # bug. A block ticket is only fanned out over samples whose mask_sample gate
+        # is `completed`, and a completed mask can carry 0 passing reads (a
+        # blank/no-template control, or a fully host/QC-filtered sample); a block's
+        # tail sub-range can also be entirely masked out. Failing here would
+        # permanently wedge the ticket (the count is 0 on every redrive) and strand
+        # the sample's alignment_sample gate at `pending` forever. Instead, bind an
+        # empty (schema-correct) reads.parquet: `align_sharded` emits an empty
+        # alignment.parquet (it guards the empty-read_to_shard case miint rejects),
+        # register-files registers 0 rows, and reconcile flips the gate with no
+        # rows (it has no count-assertion). The data plane writes NO file for an
+        # empty selection, so materialize the empty file here.
+        _write_empty_reads_parquet(dest)
+        return {STAGED_READS_BINDING: dest}
     if not dest.exists():
         raise _submission_bad_input(
             f"the data plane reported masked reads for the block but wrote no file at {dest}"
@@ -2607,6 +2719,16 @@ async def _resolve_staged_masked_reads_block(
 # signals the runner to mint the mask before the step loop and carries the value
 # into the step.
 MASK_IDX_BINDING = "mask_idx"
+
+# Binding name the runner threads the align-config identity under. The
+# `align_sharded` step lists it in its `params:` (alignment_idx ->
+# align_sharded.Inputs.alignment_idx), so it must be present in `bound` (seeded
+# from action_context, set at plan time as the align partition key). The
+# delete-alignment-block / reconcile-alignment-block arms also read it from
+# `bound` to scope the DuckLake footprint delete + the per-sample gate. Its twin,
+# `work_ticket.alignment_idx`, is what the pre-loop masked-reads branch keys on
+# (both are set to the same value at plan time).
+ALIGNMENT_IDX_BINDING = "alignment_idx"
 
 # Resolved QC config the mask hash covers — the effective fastp-equivalent
 # filter the qc job applies. Mirrors the constants in
@@ -4480,6 +4602,47 @@ async def _run_action_primitive(
             mask_idx=bound[MASK_IDX_BINDING],
             hmac_secret=hmac_secret,
             data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.DELETE_ALIGNMENT_BLOCK:
+        # Idempotent block replace (align): delete this block's exact alignment
+        # footprint BEFORE register-files re-writes it, so a re-run (retry, or a
+        # resubmitted block covering the same footprint) never double-counts. Exact
+        # by construction (per-member OR) and feature_idx-agnostic (all of a read's
+        # alignment rows go), so a split sample's sibling-block rows survive. No
+        # file inputs: block_idx from the scope target, alignment_idx from the
+        # ticket (runner-bound above for the align block branch).
+        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
+            raise RuntimeError(
+                f"delete-alignment-block requires a block-scoped ticket; got "
+                f"{scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK](
+            pool,
+            block_idx=scope_target["block_idx"],
+            alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK:
+        # Terminal step of the `align` workflow: mark this block completed, then
+        # finalize each covered sample whose last covering block just completed
+        # (flip its alignment_sample gate). No count-assertion / metrics rollup
+        # (alignment rows are not 1:1 with reads), so no data-plane hop. Runs AFTER
+        # register-files. No file inputs: block_idx from the scope target,
+        # alignment_idx from the ticket (runner-bound above for the align branch).
+        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
+            raise RuntimeError(
+                f"reconcile-alignment-block requires a block-scoped ticket; got "
+                f"{scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK](
+            pool,
+            block_idx=scope_target["block_idx"],
+            alignment_idx=bound[ALIGNMENT_IDX_BINDING],
         )
         return {}
 

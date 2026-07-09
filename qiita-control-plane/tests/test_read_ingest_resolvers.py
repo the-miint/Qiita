@@ -403,21 +403,44 @@ def test_resolve_staged_masked_reads_block_empty_members_is_bad_input(tmp_path, 
     assert exc.value.kind == FailureKind.BAD_INPUT
 
 
-def test_resolve_staged_masked_reads_block_zero_count_is_bad_input(tmp_path, monkeypatch):
-    """Zero MASKED reads (every read masked out, or the mask never landed) →
-    BAD_INPUT: there is nothing to align."""
+def test_resolve_staged_masked_reads_block_zero_count_binds_empty_parquet(tmp_path, monkeypatch):
+    """Zero MASKED reads is a LEGITIMATE no-op, NOT a failure — a completed mask
+    can carry 0 passing reads (a blank/control or fully host/QC-filtered sample the
+    planner still tiles). The resolver binds an empty (schema-correct)
+    reads.parquet (the DP writes no file for an empty selection) so the block runs
+    to a clean no-op completion instead of permanently wedging its ticket."""
+    import duckdb
+
+    workspace = tmp_path / "ws"
+    # The DP reports 0 and writes NO file (matches export_select_to_parquet).
     monkeypatch.setattr(_EXPORT_MASKED_BLOCK, lambda _u, _t: {"count": 0, "dest": "x"})
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_masked_reads_block(
-                _BLOCK_MEMBERS,
-                mask_idx=1,
-                data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
-                workspace=tmp_path / "ws",
-            )
+    bound = asyncio.run(
+        _resolve_staged_masked_reads_block(
+            _BLOCK_MEMBERS,
+            mask_idx=1,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=workspace,
         )
-    assert exc.value.kind == FailureKind.BAD_INPUT
+    )
+    dest = bound[STAGED_READS_BINDING]
+    assert dest == workspace / "reads.parquet"
+    assert dest.exists()
+    # A valid, 0-row parquet in the export_read_block column shape align_sharded binds.
+    with duckdb.connect(":memory:") as conn:
+        desc = conn.execute(f"SELECT * FROM read_parquet('{dest}') LIMIT 0").description
+        cols = [c[0] for c in desc]
+        (n,) = conn.execute(f"SELECT count(*) FROM read_parquet('{dest}')").fetchone()
+    assert n == 0
+    assert cols == [
+        "prep_sample_idx",
+        "sequence_idx",
+        "read_id",
+        "sequence1",
+        "qual1",
+        "sequence2",
+        "qual2",
+    ]
 
 
 def test_resolve_staged_masked_reads_block_export_failure_is_bad_input(tmp_path, monkeypatch):

@@ -122,6 +122,20 @@ class LibraryPrimitive(StrEnum):
     # persist-read-metrics, gated on block completion so a partially-masked sample
     # never finalizes). See qiita_control_plane.actions.library.reconcile_block.
     RECONCILE_BLOCK = "reconcile-block"
+    # Block-compute (align): idempotent block replace, the alignment twin of
+    # delete-block-mask. Runs immediately BEFORE register-files in the `align`
+    # workflow — deletes this block's exact alignment footprint (its member
+    # sub-ranges under the ticket's alignment_idx) from the DuckLake `alignment`
+    # table so a re-run deletes-then-re-registers without double-counting. On a
+    # fresh block it deletes 0 rows. See
+    # qiita_control_plane.actions.library.delete_alignment_block.
+    DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Block-compute (align): the `align` workflow's terminal step, the alignment
+    # twin of reconcile-block. Marks the block completed, then finalizes each
+    # covered sample's alignment_sample gate once ALL its covering blocks are done.
+    # No count-assertion (alignment rows are not 1:1 with reads — cross-shard + PE
+    # multiplicity). See qiita_control_plane.actions.library.reconcile_alignment_block.
+    RECONCILE_ALIGNMENT_BLOCK = "reconcile-alignment-block"
 
 
 # =============================================================================
@@ -292,6 +306,23 @@ URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
 
 # =============================================================================
+# /alignment-definition/* — control-plane sharded-alignment config identity
+# =============================================================================
+# The alignment_idx that keys the data plane's DuckLake `alignment` rows is minted
+# at plan time by the align-plan route (not a public POST here). This surface is
+# the destructive DELETE: full purge of an alignment (its DuckLake rows + the
+# Postgres alignment_definition row, cascading the alignment_sample gate) — the
+# disallow-without-delete escape hatch, system_admin-only.
+
+PATH_ALIGNMENT_DEFINITION_PREFIX = "/alignment-definition"
+PATH_ALIGNMENT_DEFINITION_BY_IDX = "/{alignment_idx}"  # DELETE an alignment (lake + Postgres)
+
+URL_ALIGNMENT_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_DEFINITION_PREFIX}"
+URL_ALIGNMENT_DEFINITION_BY_IDX = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_BY_IDX}"
+)
+
+# =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
@@ -449,6 +480,15 @@ PATH_SEQUENCED_POOL_COMPLETION = (
 PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/block-mask-plan"
 )
+# POST action: plan + submit the pool's bulk-block ALIGNMENT against a sharded
+# reference. The align analog of block-mask-plan — one call resolves each sample's
+# already-minted mask, mints an alignment_idx per mask partition, tiles the pool's
+# masked reads into fixed ~10M-read blocks, persists the block cover-map +
+# per-sample alignment gate, and dispatches one block work ticket per block. A verb
+# sub-path (a server-side command), not a resource.
+PATH_SEQUENCED_POOL_ALIGN_PLAN = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -468,6 +508,7 @@ URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POO
 URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
+URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
 
 
 # =============================================================================

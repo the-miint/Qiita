@@ -42,8 +42,11 @@ from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 from ..auth.tickets import sign_action, sign_ticket
 from ..repositories.block import (
     fetch_block_members,
+    finalize_alignment_sample,
     finalize_mask_sample,
+    has_incomplete_covering_alignment_block,
     has_incomplete_covering_block,
+    lock_alignment_sample,
     lock_mask_sample,
     set_block_state,
 )
@@ -319,6 +322,20 @@ def _do_action_delete_read_mask_block(data_plane_url: str, token: bytes) -> list
     """Synchronous gRPC call to data plane — runs in thread executor."""
     with _flight.FlightClient(data_plane_url) as client:
         action = _flight.Action("delete_read_mask_block", token)
+        return list(client.do_action(action))
+
+
+def _do_action_delete_alignment(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_alignment", token)
+        return list(client.do_action(action))
+
+
+def _do_action_delete_alignment_block(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_alignment_block", token)
         return list(client.do_action(action))
 
 
@@ -1194,6 +1211,74 @@ async def delete_read_mask_block_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def delete_alignment_block_data(
+    *,
+    alignment_idx: int,
+    members: list[dict[str, int]],
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete one block's exact `alignment` footprint via the
+    `delete_alignment_block` DoAction, returning the rows-deleted count. The
+    alignment twin of `delete_read_mask_block_data`.
+
+    `members` is the block's cover-map as `{prep_sample_idx, sequence_idx_start,
+    sequence_idx_stop}` dicts (from `block_member`). The data plane deletes the
+    rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)` fall in those
+    sub-ranges — exact by construction (per-member OR) and feature_idx-agnostic
+    (all of a read's alignment rows go, since a read produces multiple rows via
+    cross-shard + PE multiplicity), so a split sample's sibling-block rows survive.
+    This is the idempotent-block-replace step run immediately before register-files.
+
+    Idempotent: a fresh block (no rows yet) deletes 0 and still succeeds; an empty
+    `members` list short-circuits without a Flight call (an empty block is a
+    control-plane bug the runner never dispatches, guarded here too). Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    if not members:
+        return 0
+    token = sign_action(
+        action="delete_alignment_block",
+        payload={"alignment_idx": alignment_idx, "members": members},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_alignment_block, data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
+async def delete_alignment_data(
+    *,
+    alignment_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete an alignment's DuckLake `alignment` rows via the data plane's
+    `delete_alignment` DoAction, returning the rows-deleted count. The alignment
+    twin of `delete_mask_data` — the whole-alignment purge the
+    disallow-without-delete resubmission rule needs.
+
+    Signs a `delete_alignment` action token carrying only `alignment_idx`. The
+    delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
+    DuckLake transaction — no parquet is reclaimed from disk (mirrors
+    `delete_mask`). Idempotent: an alignment whose rows never registered (or were
+    already deleted) deletes zero rows and still succeeds. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    token = sign_action(
+        action="delete_alignment",
+        payload={"alignment_idx": alignment_idx},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_alignment, data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
 async def _finalize_sample_metrics(
     conn: asyncpg.Connection,
     *,
@@ -1366,6 +1451,125 @@ async def reconcile_block(
     return {"block_idx": block_idx, "finalized_samples": finalized}
 
 
+async def delete_alignment_block(
+    pool: asyncpg.Pool,
+    *,
+    block_idx: int,
+    alignment_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Idempotent block replace: delete this block's exact `alignment` footprint
+    before register-files re-writes it, so a block re-run never double-counts. The
+    alignment twin of `delete_read_mask_block`.
+
+    Reads the block's cover-map (`block_member`) and asks the data plane to delete
+    the `alignment` rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)`
+    fall in the members' sub-ranges. The delete is exact by construction (per-member
+    OR residual) and feature_idx-agnostic — it clears ALL of a read's alignment rows
+    (a read produces multiple rows via cross-shard + PE multiplicity) — so a sample
+    split across several blocks keeps its sibling blocks' rows; only THIS block's
+    footprint goes.
+
+    On a fresh block this deletes 0 rows (nothing registered yet); on a re-run
+    (retry, or an operator-resubmitted block covering the same footprint) it clears
+    the prior rows so the subsequent register-files leaves exactly one copy. There
+    is no reconcile count-assertion for alignment (rows are not 1:1 with reads), but
+    the delete-then-register discipline keeps a retried block from accumulating
+    duplicate alignment rows. Read-only on Postgres — the delete lands in DuckLake.
+    Returns the rows-deleted count for the workflow log."""
+    members = [
+        {
+            "prep_sample_idx": prep_sample_idx,
+            "sequence_idx_start": min_seq,
+            "sequence_idx_stop": max_seq,
+        }
+        for prep_sample_idx, min_seq, max_seq in await fetch_block_members(pool, block_idx)
+    ]
+    if not members:
+        raise RuntimeError(
+            f"block {block_idx} has no block_member rows; a block must carry its "
+            "cover-map (materialized at plan time) before any step runs"
+        )
+    rows_deleted = await delete_alignment_block_data(
+        alignment_idx=alignment_idx,
+        members=members,
+        hmac_secret=hmac_secret,
+        data_plane_url=data_plane_url,
+    )
+    return {"block_idx": block_idx, "rows_deleted": rows_deleted}
+
+
+async def reconcile_alignment_block(
+    pool: asyncpg.Pool,
+    *,
+    block_idx: int,
+    alignment_idx: int,
+) -> dict[str, Any]:
+    """Terminal step of the `align` workflow: mark this block done, then finalize
+    each sample it covers whose LAST covering block just completed. The alignment
+    twin of `reconcile_block`, keyed on `alignment_idx` not `mask_idx`.
+
+    In one transaction (the whole reconcile is atomic):
+
+    1. Flip this block to 'completed' — its `alignment` rows are registered
+       (register-files ran before this step).
+    2. For each covered sample, in a stable prep_sample_idx order (deadlock-free):
+       take the `alignment_sample` gate row's `FOR UPDATE` lock (serializes
+       concurrent block finalizers of the same sample), skip if already 'completed'
+       (idempotent / lost the race), skip if any covering block is not yet
+       'completed' (a sibling still owes alignments), else flip the gate to
+       'completed'.
+
+    **No count-assertion, no metrics rollup** (unlike `reconcile_block`): alignment
+    rows are NOT 1:1 with reads — a read routed to K shards emits K rows, and a
+    paired-end read emits one row per mate — so "row count == read count" does not
+    hold and completion is purely "every covering block done". This is also why the
+    primitive needs no data-plane hop (no `hmac_secret`/`data_plane_url`): it only
+    touches Postgres gate rows.
+
+    Idempotent: a re-run flips nothing new (its block is already completed and its
+    samples already finalized). Returns a summary of the samples this block
+    finalized."""
+    finalized: list[int] = []
+    async with pool.acquire() as conn, conn.transaction():
+        # This block's work is done; count it as completed BEFORE the per-sample
+        # gate check below (same txn — the UPDATE is visible to our own SELECTs).
+        # We proceed regardless of the guarded bool: a re-run where it is already
+        # completed still (idempotently) finalizes its samples.
+        await set_block_state(
+            conn,
+            block_idx=block_idx,
+            new_state="completed",
+            expected_states=["pending", "processing", "failed"],
+        )
+        for prep_sample_idx, _min_seq, _max_seq in await fetch_block_members(conn, block_idx):
+            state = await lock_alignment_sample(
+                conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            )
+            if state is None:
+                raise RuntimeError(
+                    f"alignment_sample gate row missing for (alignment={alignment_idx}, "
+                    f"prep_sample={prep_sample_idx}); it must be materialized PENDING "
+                    "at plan time before any block runs"
+                )
+            if state == "completed":
+                # Already finalized (idempotent re-run, or a concurrent block
+                # finalizer won this sample's race) — nothing to do.
+                continue
+            if await has_incomplete_covering_alignment_block(
+                conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            ):
+                # A sibling block still owes this sample alignments — do not
+                # finalize a partially-aligned sample.
+                continue
+            await finalize_alignment_sample(
+                conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            )
+            finalized.append(prep_sample_idx)
+    return {"block_idx": block_idx, "finalized_samples": finalized}
+
+
 # =============================================================================
 # Name → callable lookup for the workflow runner
 # =============================================================================
@@ -1386,4 +1590,6 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
+    LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
+    LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
 }

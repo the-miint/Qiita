@@ -155,8 +155,21 @@ def _write_shard_mapping(path):
 
 
 def _write_reads(path, rows):
-    """rows = (prep_sample_idx, sequence_idx, sequence1, sequence2)."""
+    """rows = (prep_sample_idx, sequence_idx, sequence1, sequence2). An empty
+    `rows` writes a schema-correct 0-row parquet (the zero-masked-block case: a
+    completed mask can legitimately have 0 passing reads)."""
     with duckdb.connect(":memory:") as conn:
+        if not rows:
+            # An empty VALUES clause is invalid SQL — build the typed 0-row shape
+            # with a WHERE false over a single typed row instead.
+            conn.execute(
+                "COPY (SELECT * FROM (VALUES "
+                "(CAST(NULL AS BIGINT), CAST(NULL AS BIGINT), "
+                " CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR))) "
+                "AS t(prep_sample_idx, sequence_idx, sequence1, sequence2) WHERE false) "
+                f"TO '{path}' (FORMAT PARQUET)"
+            )
+            return path
         values_sql = ", ".join(
             "(CAST(? AS BIGINT), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR))"
             for _ in rows
@@ -337,3 +350,29 @@ def test_sharded_alignment_end_to_end(
             f"mate not resolved to feature 100: {mate_reference!r}"
         )
         assert template_length != 0, "proper pair must carry a template_length"
+
+    # ---- EMPTY batch (zero input reads) -----------------------------------------
+    # A completed host-depletion mask can legitimately have ZERO passing reads (a
+    # blank / no-template control, or a fully host/QC-filtered sample), so a block
+    # of such reads is a valid "nothing to align" no-op — NOT a failure. The runner
+    # binds an empty (schema-correct) reads parquet for that case, so align_sharded
+    # must tolerate a 0-row query (empty rype_classify + empty align) and emit a
+    # valid empty alignment.parquet (the schema register-files still matches). This
+    # is the contract the runner's zero-masked-block handling relies on.
+    empty_reads = _write_reads(tmp_path / f"reads_empty_{aligner}.parquet", [])
+    empty_out = _align(empty_reads)
+    with duckdb.connect(":memory:") as _conn:
+        # A valid, correctly-typed parquet with zero rows and the alignment_idx
+        # leading column (so register-files schema-matches an empty block too).
+        assert (
+            _conn.execute(
+                f"SELECT * FROM read_parquet('{empty_out}') LIMIT 0"
+            ).description[0][0]
+            == "alignment_idx"
+        )
+        (empty_count,) = _conn.execute(
+            f"SELECT count(*) FROM read_parquet('{empty_out}')"
+        ).fetchone()
+    assert empty_count == 0, (
+        f"empty input must emit zero alignment rows, got {empty_count}"
+    )

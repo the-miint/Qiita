@@ -142,6 +142,45 @@ _READ_META = "align_sharded_read_meta"
 _READ_TO_SHARD = "align_sharded_read_to_shard"
 _ALIGNMENTS = "align_sharded_alignments"
 
+# The empty-output projection: the DuckLake `alignment` table's columns as typed
+# NULLs, in the exact column order + types of
+# `qiita-data-plane/src/ducklake.rs::ensure_alignment_tables` (5 CP identity
+# columns + the verbatim miint aligner columns). Used only for the no-routed-reads
+# path (see execute()), where miint's `align_*_sharded` cannot be called at all
+# (it rejects an empty `read_to_shard`), so there is no aligner output to pass
+# through and the schema must be written explicitly. `WHERE false` yields zero
+# rows. MUST stay in lockstep with ensure_alignment_tables so register-files
+# schema-matches an empty block exactly as it does a non-empty one.
+_EMPTY_ALIGNMENT_SELECT = (
+    "SELECT "
+    "CAST(NULL AS BIGINT) AS alignment_idx, "
+    "CAST(NULL AS BIGINT) AS prep_sample_idx, "
+    "CAST(NULL AS BIGINT) AS sequence_idx, "
+    "CAST(NULL AS BIGINT) AS feature_idx, "
+    "CAST(NULL AS BIGINT) AS mate_feature_idx, "
+    "CAST(NULL AS USMALLINT) AS flags, "
+    "CAST(NULL AS VARCHAR) AS reference, "
+    "CAST(NULL AS BIGINT) AS position, "
+    "CAST(NULL AS BIGINT) AS stop_position, "
+    "CAST(NULL AS UTINYINT) AS mapq, "
+    "CAST(NULL AS VARCHAR) AS cigar, "
+    "CAST(NULL AS VARCHAR) AS mate_reference, "
+    "CAST(NULL AS BIGINT) AS mate_position, "
+    "CAST(NULL AS BIGINT) AS template_length, "
+    "CAST(NULL AS BIGINT) AS tag_as, "
+    "CAST(NULL AS BIGINT) AS tag_xs, "
+    "CAST(NULL AS BIGINT) AS tag_ys, "
+    "CAST(NULL AS BIGINT) AS tag_xn, "
+    "CAST(NULL AS BIGINT) AS tag_xm, "
+    "CAST(NULL AS BIGINT) AS tag_xo, "
+    "CAST(NULL AS BIGINT) AS tag_xg, "
+    "CAST(NULL AS BIGINT) AS tag_nm, "
+    "CAST(NULL AS VARCHAR) AS tag_yt, "
+    "CAST(NULL AS VARCHAR) AS tag_md, "
+    "CAST(NULL AS VARCHAR) AS tag_sa "
+    "WHERE false"
+)
+
 
 class Inputs(BaseModel):
     """Typed input contract for align_sharded.
@@ -332,10 +371,29 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 threshold=_ROUTING_THRESHOLD,
             )
 
+            # If NO read routed to any shard, `read_to_shard` is empty — and miint's
+            # `align_*_sharded` REJECTS an empty `read_to_shard` at bind
+            # ("empty or has no valid shard names"), so it cannot be called at all.
+            # This is a LEGITIMATE no-op, not a failure: a block's reads can route
+            # nowhere because the block is genuinely empty (a completed
+            # host-depletion mask can carry 0 passing reads — a blank/control or
+            # fully host/QC-filtered sample the align planner still tiles) OR because
+            # none of its reads minimise into THIS reference. Either way, emit a
+            # valid empty (schema-correct) alignment.parquet and skip the aligner —
+            # register-files then registers 0 rows and reconcile flips the per-sample
+            # gate with no rows (it has no count-assertion, by design). Verified
+            # against real miint by the empty-batch case in
+            # tests/integration/test_sharded_alignment.py.
+            routed = conn.execute(f"SELECT count(*) FROM {_READ_TO_SHARD}").fetchone()[0]
+            if routed == 0:
+                conn.execute(f"COPY ({_EMPTY_ALIGNMENT_SELECT}) TO '{out_sql}' ({PARQUET_OPTS})")
+                success = True
+                return {"alignment": alignment, "alignment_staging_dir": workspace}
+
             # ONE sharded-align call. Its FULL output (all SAM columns, verbatim) is
-            # materialised into _ALIGNMENTS by the seam. Empty is VALID — a block
-            # whose reads align nowhere in this reference is legitimate, not a
-            # fail-fast (the tools tolerate an empty query/routing, per host_filter).
+            # materialised into _ALIGNMENTS by the seam. An empty aligner OUTPUT is
+            # still valid here (every routed read failed to align) — only an empty
+            # read_to_shard INPUT is the case handled above.
             if inputs.aligner == "minimap2":
                 _run_align_minimap2_sharded(
                     conn,
@@ -391,7 +449,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if not success:
             alignment.unlink(missing_ok=True)
 
-    return {"alignment": alignment}
+    # `alignment` is the final output path; `alignment_staging_dir` is the
+    # workspace a register-files step loads into the DuckLake `alignment` table
+    # (only alignment.parquet matches its `*.parquet` convention — the DuckDB
+    # spill dir is torn down by `duckdb_tmp_dir` above). A distinct staging-dir
+    # binding (not the generic `staging_dir`), mirroring how host_filter exposes
+    # `read_mask_staging_dir` for the read-mask register-files step.
+    return {"alignment": alignment, "alignment_staging_dir": workspace}
 
 
 def plan(inputs: Inputs) -> JobPlan:

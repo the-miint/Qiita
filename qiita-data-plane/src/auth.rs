@@ -438,6 +438,81 @@ pub fn verify_delete_read_mask_block(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `delete_alignment_block` DoAction — the idempotent
+/// block-replace primitive of the `align` workflow, the alignment twin of
+/// `delete_read_mask_block`.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.delete_alignment_block_data`:
+/// `{"action": "delete_alignment_block", "alignment_idx": N,
+///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
+///                "sequence_idx_stop": b}, ...]}`.
+/// The data plane deletes exactly this block's footprint from the DuckLake
+/// `alignment` table — the rows for `alignment_idx` whose `(prep_sample_idx,
+/// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
+/// delete-then-re-register without double-counting or clobbering a sibling
+/// block's rows for a shared sample. The footprint is the SAME
+/// `(prep_sample_idx, sub-range)` member list `export_read_masked_block` carries
+/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member OR
+/// residual) and feature_idx-agnostic (all of a read's alignment rows go, since a
+/// read produces multiple rows via cross-shard + PE multiplicity). The extra
+/// `alignment_idx` scopes the delete to this align-config identity — the raw
+/// `read` export needs no such column, the `alignment` sink does.
+/// `deny_unknown_fields` keeps the contract tight: any extra field is a design
+/// slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAlignmentBlockPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_alignment_block".
+    pub action: String,
+    /// `i64`, matching the Postgres `alignment_definition.alignment_idx BIGINT`
+    /// source of truth and the `alignment.alignment_idx BIGINT` DuckLake column.
+    pub alignment_idx: i64,
+    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
+    /// an empty list (an empty block is a control-plane bug, not a valid ask).
+    pub members: Vec<ExportReadBlockMember>,
+}
+
+/// Verify a `delete_alignment_block` DoAction token and return its parsed payload.
+pub fn verify_delete_alignment_block(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<DeleteAlignmentBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `delete_alignment` DoAction — the whole-alignment
+/// purge, the alignment twin of `delete_mask`.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.delete_alignment_data`:
+/// `{"action": "delete_alignment", "alignment_idx": N}`. The data plane deletes
+/// every `alignment` row for `alignment_idx` in one DuckLake transaction — the
+/// minimal DELETE path the disallow-without-delete resubmission rule requires (a
+/// completed `alignment_sample` must be cleared before re-aligning). Idempotent:
+/// an alignment whose rows never registered deletes zero rows. `deny_unknown_fields`
+/// keeps the contract tight: any extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAlignmentPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_alignment".
+    pub action: String,
+    /// `i64`, matching the Postgres `alignment_definition.alignment_idx BIGINT`
+    /// source of truth and the `alignment.alignment_idx BIGINT` DuckLake column.
+    pub alignment_idx: i64,
+}
+
+/// Verify a `delete_alignment` DoAction token and return its parsed payload.
+pub fn verify_delete_alignment(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<DeleteAlignmentPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed payload for the `mask_metrics` DoAction.
 ///
 /// Wire shape pinned by `qiita_control_plane.actions.library.mask_metrics_data`:
@@ -1033,6 +1108,82 @@ mod tests {
             br#"{"action":"delete_read_mask_block","mask_idx":1,"members":[],"smuggled":9}"#;
         let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
         match verify_delete_read_mask_block(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // delete_alignment / delete_alignment_block action token variants
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn verify_delete_alignment_round_trip() {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action.
+        let payload = br#"{"action":"delete_alignment","alignment_idx":77}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let parsed =
+            verify_delete_alignment(&ticket, b"dev-secret").expect("valid token should verify");
+        assert_eq!(parsed.action, "delete_alignment");
+        assert_eq!(parsed.alignment_idx, 77);
+    }
+
+    #[test]
+    fn verify_delete_alignment_rejects_bad_hmac() {
+        let payload = br#"{"action":"delete_alignment","alignment_idx":1}"#;
+        let mut ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        ticket[10] ^= 0xFF;
+        assert_eq!(
+            verify_delete_alignment(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_delete_alignment_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
+        let payload = br#"{"action":"delete_alignment","alignment_idx":1,"mask_idx":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_delete_alignment(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_delete_alignment_block_round_trip() {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action.
+        let payload = br#"{"action":"delete_alignment_block","alignment_idx":42,"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let parsed = verify_delete_alignment_block(&ticket, b"dev-secret")
+            .expect("valid token should verify");
+        assert_eq!(parsed.action, "delete_alignment_block");
+        assert_eq!(parsed.alignment_idx, 42);
+        assert_eq!(parsed.members.len(), 2);
+        assert_eq!(parsed.members[0].prep_sample_idx, 101);
+        assert_eq!(parsed.members[0].sequence_idx_start, 100);
+        assert_eq!(parsed.members[0].sequence_idx_stop, 109);
+        assert_eq!(parsed.members[1].prep_sample_idx, 103);
+    }
+
+    #[test]
+    fn verify_delete_alignment_block_rejects_bad_hmac() {
+        let payload = br#"{"action":"delete_alignment_block","alignment_idx":1,"members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]}"#;
+        let mut ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_delete_alignment_block(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_delete_alignment_block_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled top-level field is a contract slip.
+        let payload =
+            br#"{"action":"delete_alignment_block","alignment_idx":1,"members":[],"smuggled":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_delete_alignment_block(&ticket, b"dev-secret").unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
