@@ -110,7 +110,7 @@ _None yet._
   so no manual step — this just asserts the reload carried the new directives): (#261)
 
   ```bash
-  sudo nginx -T 2>/dev/null | grep -A8 'location /arrow.flight.protocol.FlightService/' \
+  sudo nginx -T 2>/dev/null | grep -A20 'location /arrow.flight.protocol.FlightService/' \
     | grep -E 'client_max_body_size|grpc_read_timeout|limit_conn'
   # expect: client_max_body_size 1088m; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
   ```
