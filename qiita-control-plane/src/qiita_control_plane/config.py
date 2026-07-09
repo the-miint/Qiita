@@ -115,9 +115,11 @@ class Settings:
     data_plane_url: str
     # HMAC key for the /auth/login → /auth/handoff cookie, kept DISTINCT from
     # hmac_secret_key (which signs Flight tickets) so one leak can't forge both.
-    # `from_env` requires LOGIN_COOKIE_SECRET_KEY and never uses this default —
-    # the default exists only so direct Settings(...) constructors in tests that
-    # don't exercise the cookie need not supply it.
+    # `from_env` requires LOGIN_COOKIE_SECRET_KEY (fail-loud, ≥16 bytes) and
+    # never uses this default. The default is only a construction convenience for
+    # direct Settings(...) in tests that don't touch the cookie; it can never
+    # actually sign, because sign_login_cookie/verify_login_cookie raise on an
+    # empty secret regardless of how Settings was built.
     login_cookie_secret_key: bytes = b""
     # Compute-orchestrator dispatch. Both fields optional: when
     # `compute_orchestrator_url` is None, the CP boots without an HTTP client

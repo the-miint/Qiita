@@ -3,7 +3,9 @@
 The flow has two pieces of crypto:
 
   1. **Login cookie** — set by GET /auth/login, read by GET /auth/handoff.
-     Carries `{state, timestamp_ms, cli, port}` signed with HMAC_SECRET_KEY.
+     Carries `{state, timestamp_ms, cli, port}` signed with LOGIN_COOKIE_SECRET_KEY
+     (kept distinct from the Flight-ticket HMAC_SECRET_KEY so one leak can't
+     forge both).
      Lives ≤ AUTH_HANDOFF_FRESHNESS_SECONDS to bound how long a user has to
      complete the AuthRocket round-trip (longer windows expand replay risk).
      The cookie is qiita's freshness anchor — AuthRocket re-emits the same
@@ -62,7 +64,14 @@ def sign_login_cookie(payload: dict, secret: bytes) -> str:
     Returns `<base64url(json)>.<base64url(hmac_sha256)>`. The payload should
     contain at least `{"state", "timestamp_ms"}`; routes also include
     `{"cli", "port"}` for the CLI flow.
+
+    Raises `ValueError` on an empty `secret`: `hmac.new(b"", ...)` would sign
+    happily under an empty key, so refuse it here — the login-cookie secret's
+    whole point is that a leak can't forge cookies, and that guarantee must not
+    depend on how `Settings` was constructed.
     """
+    if not secret:
+        raise ValueError("login-cookie secret is empty; refusing to sign")
     body = canonical_json(payload)
     body_b64 = _b64u_encode(body)
     sig = hmac.new(secret, body_b64.encode(), hashlib.sha256).digest()
@@ -84,7 +93,13 @@ def verify_login_cookie(
     `max_age_seconds`.
 
     `now_ms` is injectable for tests; production passes None.
+
+    Raises `ValueError` on an empty `secret` (symmetric with
+    `sign_login_cookie`): an empty key must never validate a signature,
+    regardless of how `Settings` was constructed.
     """
+    if not secret:
+        raise ValueError("login-cookie secret is empty; refusing to verify")
     parts = cookie.split(".")
     if len(parts) != 2:
         raise CookieInvalid("malformed cookie")
