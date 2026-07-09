@@ -700,7 +700,7 @@ the `no-changelog` label).
   (new required control-plane env var) instead of reusing `HMAC_SECRET_KEY`. The
   two were the same key, so one leak forged both Flight tickets and login
   cookies; they are now independent. Control-plane only — the data plane never
-  sees the cookie key. (#TBD)
+  sees the cookie key. (#262)
 
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global

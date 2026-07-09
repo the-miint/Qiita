@@ -32,7 +32,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   cookie is split off `HMAC_SECRET_KEY` onto its own key; `from_env()` fails fast
   without it, so the CP will refuse to start. Generate a **fresh, different** value
   (do not reuse `HMAC_SECRET_KEY`) and set it in `/etc/qiita/control-plane.env`
-  before the CP restart. Control-plane only — the data plane does not get this key. (#TBD)
+  before the CP restart. Control-plane only — the data plane does not get this key. (#262)
   ```bash
   grep -q '^LOGIN_COOKIE_SECRET_KEY=' /etc/qiita/control-plane.env \
     || sudo bash -c 'printf "LOGIN_COOKIE_SECRET_KEY=%s\n" "$(openssl rand -base64 32)" >> /etc/qiita/control-plane.env'
