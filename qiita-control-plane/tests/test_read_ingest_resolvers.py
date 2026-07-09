@@ -74,7 +74,7 @@ _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"
 def _staged_kwargs(tmp_path):
     return {
         "data_plane_url": "grpc://unused",
-        "hmac_secret": b"x" * 16,
+        "hmac_secret": b"x" * 32,
         "workspace": tmp_path / "ticket" / "804",
     }
 
@@ -117,7 +117,7 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
             {"prep_sample_idx": 42},
             tmp_path / "staging",
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -170,7 +170,7 @@ def test_resolve_staged_reads_missing_file_is_bad_input(tmp_path, monkeypatch):
                 {"prep_sample_idx": 7},
                 tmp_path / "staging",
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                hmac_secret=b"x" * 32,
                 workspace=workspace,
             )
         )
@@ -214,7 +214,7 @@ def _run_masked(pool, prep_sample_idx, workspace, mask_idx=77):
             {"prep_sample_idx": prep_sample_idx},
             mask_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -339,7 +339,7 @@ def test_resolve_staged_reads_block_binds_workspace_parquet_and_signs_members(
         _resolve_staged_reads_block(
             _BLOCK_MEMBERS,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -364,7 +364,7 @@ def test_resolve_staged_reads_block_empty_members_is_bad_input(tmp_path, monkeyp
             _resolve_staged_reads_block(
                 [],
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                hmac_secret=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -380,7 +380,7 @@ def test_resolve_staged_reads_block_zero_count_is_bad_input(tmp_path, monkeypatc
             _resolve_staged_reads_block(
                 _BLOCK_MEMBERS,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                hmac_secret=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -399,7 +399,7 @@ def test_resolve_staged_reads_block_export_failure_is_bad_input(tmp_path, monkey
             _resolve_staged_reads_block(
                 _BLOCK_MEMBERS,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                hmac_secret=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -420,7 +420,7 @@ def test_resolve_staged_reads_block_malformed_member_is_bad_input(tmp_path, monk
             _resolve_staged_reads_block(
                 [{"prep_sample_idx": 101, "sequence_idx_start": 100}],  # missing stop
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                hmac_secret=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -438,7 +438,7 @@ def test_resolve_staged_reads_block_missing_file_is_bad_input(tmp_path, monkeypa
             _resolve_staged_reads_block(
                 _BLOCK_MEMBERS,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                hmac_secret=b"x" * 32,
                 workspace=workspace,
             )
         )

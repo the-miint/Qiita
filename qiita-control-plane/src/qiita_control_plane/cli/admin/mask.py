@@ -106,8 +106,8 @@ async def _mask_shared_with_non_failed(pool: asyncpg.Pool, mask_idx: int) -> lis
     many tickets across runs, including COMPLETED ones. Deleting a mask a
     non-failed ticket depends on would silently drop a live result's read_mask
     rows — so if this returns a non-empty list, we SKIP the mask entirely.
-    Relies on backfill-mask-idx having populated mask_idx on non-failed tickets
-    too (else they read NULL and the guard misses them)."""
+    Relies on mask_idx being populated on non-failed tickets (tickets predating
+    mask_idx tracking read NULL and the guard misses them)."""
     rows = await pool.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
         " WHERE mask_idx = $1 AND state <> 'failed'"

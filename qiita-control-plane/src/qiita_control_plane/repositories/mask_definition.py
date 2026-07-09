@@ -67,9 +67,8 @@ async def lookup_mask_idx_by_params(
 
     A pure LOOKUP — it computes the same canonical-JSON SHA-256 the mint path
     uses (`canonical_params_hash`) and SELECTs the existing row; it never
-    mints. Used by the legacy backfill (`backfill_work_ticket_mask_idx`) to map
-    an existing ticket's reconstructed config onto its already-minted mask
-    without risking a fresh mint when the config drifted or the ticket failed
+    mints. Maps an existing ticket's reconstructed config onto its already-minted
+    mask without risking a fresh mint when the config drifted or the ticket failed
     before minting (returns None → the caller skips that ticket).
     """
     params_hash = canonical_params_hash(params)

@@ -36,7 +36,7 @@ def get_db_pool(request: Request) -> asyncpg.Pool:
 def get_settings(request: Request) -> Settings:
     """Return the Settings instance stashed on `app.state.settings` by
     lifespan. Single source of truth for the runtime-not-initialised
-    guard; field-projection helpers (`get_hmac_secret`,
+    guard; field-projection helpers (`get_flight_signing_key`,
     `get_data_plane_url`) delegate here so the check lives in one place.
     """
     settings = getattr(request.app.state, "settings", None)
@@ -45,9 +45,9 @@ def get_settings(request: Request) -> Settings:
     return settings
 
 
-def get_hmac_secret(request: Request) -> bytes:
+def get_flight_signing_key(request: Request) -> bytes:
     """Return the HMAC secret key from app settings."""
-    return get_settings(request).hmac_secret_key
+    return get_settings(request).flight_signing_key
 
 
 def get_data_plane_url(request: Request) -> str:

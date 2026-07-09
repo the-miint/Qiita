@@ -56,7 +56,7 @@ async def ctx(
     # other field falls through to its dataclass default.
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
     )
     transport = ASGITransport(app=app)

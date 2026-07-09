@@ -35,8 +35,9 @@ use crate::ducklake;
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
-    /// HMAC secret key for ticket verification.
-    hmac_secret: Vec<u8>,
+    /// Ed25519 PUBLIC key for ticket verification. Verify-only — the private
+    /// signing seed lives only in the control plane.
+    flight_public_key: ed25519_dalek::VerifyingKey,
     /// DuckLake catalog connection string (libpq format).
     catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files.
@@ -55,14 +56,14 @@ pub struct QiitaFlightService {
 
 impl QiitaFlightService {
     pub fn new(
-        hmac_secret: Vec<u8>,
+        flight_public_key: ed25519_dalek::VerifyingKey,
         catalog_connstr: String,
         data_path: String,
         upload_staging_root: PathBuf,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
-            hmac_secret,
+            flight_public_key,
             catalog_connstr,
             data_path,
             upload_staging_root,
@@ -266,7 +267,7 @@ impl FlightService for QiitaFlightService {
         let ticket_bytes = &request.into_inner().ticket;
 
         // Verify HMAC signature, expiry, and parse payload
-        let payload = auth::verify_ticket(ticket_bytes, &self.hmac_secret)
+        let payload = auth::verify_ticket(ticket_bytes, &self.flight_public_key)
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
         // Validate table name
@@ -379,7 +380,7 @@ impl FlightService for QiitaFlightService {
 
         match action.r#type.as_str() {
             "register_files" => {
-                let payload = auth::verify_action(&action.body, &self.hmac_secret)
+                let payload = auth::verify_action(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "register_files" {
@@ -414,7 +415,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_reference" => {
-                let payload = auth::verify_delete_reference(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_reference(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_reference" {
@@ -449,7 +450,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_mask" => {
-                let payload = auth::verify_delete_mask(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_mask(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_mask" {
@@ -482,7 +483,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_pool_reads" => {
-                let payload = auth::verify_delete_pool_reads(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_pool_reads(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_pool_reads" {
@@ -517,8 +518,9 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_read_mask_block" => {
-                let payload = auth::verify_delete_read_mask_block(&action.body, &self.hmac_secret)
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                let payload =
+                    auth::verify_delete_read_mask_block(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_read_mask_block" {
                     return Err(Status::invalid_argument(format!(
@@ -551,7 +553,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "export_read" => {
-                let payload = auth::verify_export_read(&action.body, &self.hmac_secret)
+                let payload = auth::verify_export_read(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "export_read" {
@@ -592,7 +594,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "export_read_block" => {
-                let payload = auth::verify_export_read_block(&action.body, &self.hmac_secret)
+                let payload = auth::verify_export_read_block(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "export_read_block" {
@@ -654,7 +656,7 @@ impl FlightService for QiitaFlightService {
                 // (prep_sample_idx, mask_idx) authorization already covers it —
                 // no new ticket type or control-plane route is needed, the CLI
                 // sends the same signed bytes it would otherwise stream with.
-                let payload = auth::verify_ticket(&action.body, &self.hmac_secret)
+                let payload = auth::verify_ticket(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
                 if payload.table != "read_masked" {
                     return Err(Status::invalid_argument(format!(
@@ -689,7 +691,7 @@ impl FlightService for QiitaFlightService {
                 // ticket the CLI already holds), the block reconcile primitive
                 // runs control-plane-side and signs a first-class action token —
                 // so this arm verifies a `mask_metrics` payload, not a ticket.
-                let payload = auth::verify_mask_metrics(&action.body, &self.hmac_secret)
+                let payload = auth::verify_mask_metrics(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
                 if payload.action != "mask_metrics" {
                     return Err(Status::invalid_argument(format!(
@@ -776,7 +778,7 @@ impl QiitaFlightService {
                 "FlightDescriptor.cmd is empty (expected signed DoPut ticket)",
             ));
         }
-        let payload = auth::verify_doput(&descriptor.cmd, &self.hmac_secret)
+        let payload = auth::verify_doput(&descriptor.cmd, &self.flight_public_key)
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
         if payload.action != "doput" {
             return Err(Status::invalid_argument(format!(
@@ -2965,7 +2967,7 @@ mod tests {
         // says delete_reference — sent under the register_files header.
         let payload =
             br#"{"action":"delete_reference","staging_dir":"/unused","files":{},"work_ticket_idx":1}"#;
-        let body = sign_raw(payload, b"dev-secret", future_expiry_secs(300));
+        let body = sign_raw(payload, &TEST_SEED, future_expiry_secs(300));
         let action = Action {
             r#type: "register_files".to_string(),
             body: body.into(),
@@ -3649,32 +3651,36 @@ mod tests {
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use hmac::{Hmac, Mac};
+    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use sha2::Sha256;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    type HmacSha256 = Hmac<Sha256>;
+    // Fixed test keypair; WRONG_SEED signs tickets that must NOT verify.
+    const TEST_SEED: [u8; 32] = [7u8; 32];
+    const WRONG_SEED: [u8; 32] = [9u8; 32];
 
-    fn sign_doput_for_test(upload_idx: i64, secret: &[u8], expiry: u64) -> Vec<u8> {
-        let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
-        sign_raw(payload.as_bytes(), secret, expiry)
+    fn test_vk() -> VerifyingKey {
+        SigningKey::from_bytes(&TEST_SEED).verifying_key()
     }
 
-    fn sign_raw(payload: &[u8], secret: &[u8], expiry: u64) -> Vec<u8> {
-        let version: u8 = 1;
+    fn sign_doput_for_test(upload_idx: i64, seed: &[u8; 32], expiry: u64) -> Vec<u8> {
+        let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
+        sign_raw(payload.as_bytes(), seed, expiry)
+    }
+
+    fn sign_raw(payload: &[u8], seed: &[u8; 32], expiry: u64) -> Vec<u8> {
+        let version: u8 = 2;
         let payload_len = (payload.len() as u32).to_be_bytes();
         let expiry_bytes = expiry.to_be_bytes();
-        let mac_input = [&[version][..], &payload_len[..], payload, &expiry_bytes[..]].concat();
-        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-        mac.update(&mac_input);
-        let hmac_result = mac.finalize().into_bytes();
+        let signed_input = [&[version][..], &payload_len[..], payload, &expiry_bytes[..]].concat();
+        let sig = SigningKey::from_bytes(seed).sign(&signed_input).to_bytes();
         let mut ticket = Vec::new();
         ticket.push(version);
         ticket.extend_from_slice(&payload_len);
         ticket.extend_from_slice(payload);
-        ticket.extend_from_slice(&hmac_result);
+        ticket.extend_from_slice(&sig);
         ticket.extend_from_slice(&expiry_bytes);
         ticket
     }
@@ -3730,7 +3736,7 @@ mod tests {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| staging_root.clone());
         QiitaFlightService::new(
-            b"dev-secret".to_vec(),
+            test_vk(),
             // catalog + data_path unused by DoPut path
             "dbname=unused host=localhost".to_string(),
             "/tmp/unused".to_string(),
@@ -3744,7 +3750,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let ticket = sign_doput_for_test(42, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(42, &TEST_SEED, future_expiry_secs(300));
         let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
 
         let result = service
@@ -3798,7 +3804,7 @@ mod tests {
             .unwrap()
             .as_secs()
             - 1000;
-        let ticket = sign_doput_for_test(1, b"dev-secret", expired);
+        let ticket = sign_doput_for_test(1, &TEST_SEED, expired);
         let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
 
         let err = service
@@ -3809,11 +3815,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn do_put_rejects_bad_hmac() {
+    async fn do_put_rejects_bad_signature() {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
         // Sign with a different secret than the service holds.
-        let ticket = sign_doput_for_test(1, b"wrong-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(1, &WRONG_SEED, future_expiry_secs(300));
         let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
 
         let err = service
@@ -3858,7 +3864,7 @@ mod tests {
     async fn do_put_interrupted_stream_leaves_no_parquet() {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
-        let ticket = sign_doput_for_test(99, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(99, &TEST_SEED, future_expiry_secs(300));
 
         // Build a valid first message (descriptor + schema), then yield an
         // Err mid-stream before any batch lands. The handler should
@@ -3891,7 +3897,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let ticket = sign_doput_for_test(7, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(7, &TEST_SEED, future_expiry_secs(300));
         let m1 = flight_stream_with_ticket(vec![sample_batch()], ticket.clone()).await;
         service
             .do_put_inner(stream::iter(m1))
@@ -3925,7 +3931,7 @@ mod tests {
         let service = make_service(tmp.path().to_path_buf());
 
         // First upload occupies upload_idx=88.
-        let t1 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let t1 = sign_doput_for_test(88, &TEST_SEED, future_expiry_secs(300));
         let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
         service
             .do_put_inner(stream::iter(m1))
@@ -3937,7 +3943,7 @@ mod tests {
         // Second DoPut to the same idx: keep only the schema frame, then inject a
         // mid-stream error. The writer hits AlreadyExists on create_new while the
         // decoder surfaces the error, exercising the precedence.
-        let t2 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let t2 = sign_doput_for_test(88, &TEST_SEED, future_expiry_secs(300));
         let mut m2 = flight_stream_with_ticket(vec![sample_batch()], t2).await;
         m2.truncate(1);
         m2.push(Err(Status::internal("simulated mid-stream drop")));
@@ -3973,8 +3979,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let t1 = sign_doput_for_test(1, b"dev-secret", future_expiry_secs(300));
-        let t2 = sign_doput_for_test(2, b"dev-secret", future_expiry_secs(300));
+        let t1 = sign_doput_for_test(1, &TEST_SEED, future_expiry_secs(300));
+        let t2 = sign_doput_for_test(2, &TEST_SEED, future_expiry_secs(300));
         let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
         let m2 = flight_stream_with_ticket(vec![sample_batch()], t2).await;
 
@@ -3998,7 +4004,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let ticket = sign_doput_for_test(55, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(55, &TEST_SEED, future_expiry_secs(300));
         let batches = vec![sample_batch(), sample_batch(), sample_batch()];
         let messages = flight_stream_with_ticket(batches, ticket).await;
 

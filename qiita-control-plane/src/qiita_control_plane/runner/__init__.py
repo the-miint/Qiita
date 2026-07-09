@@ -148,7 +148,6 @@ from ._mask import (
     _mint_read_mask,
     _persist_mask_idx,
     _workflow_needs_mask,
-    backfill_work_ticket_mask_idx,
 )
 from ._processing import (
     PROCESSING_IDX_BINDING,
@@ -344,7 +343,6 @@ __all__: list[str] = [
     "_write_sample_map_parquet",
     "asyncio",
     "asyncpg",
-    "backfill_work_ticket_mask_idx",
     "compute_reads_staging_path",
     "compute_upload_staging_path",
     "fetch_block_members",

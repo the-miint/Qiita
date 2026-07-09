@@ -41,12 +41,6 @@ from .. import _common
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
-from .backfill import (
-    _backfill_mask_idx,
-    _decode_hmac_secret,
-    _handle_work_ticket_backfill_mask_idx,
-    _parse_optional_adapter_ref,
-)
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
@@ -161,24 +155,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="failure_step_name (required iff --stage=step_run)",
     )
     p_force_fail.set_defaults(handler=_handle_ticket_force_fail)
-
-    p_work_ticket = sub.add_parser("work-ticket", help="Work-ticket maintenance operations")
-    p_work_ticket_sub = p_work_ticket.add_subparsers(dest="work_ticket_cmd", required=True)
-    p_backfill = p_work_ticket_sub.add_parser(
-        "backfill-mask-idx",
-        help=(
-            "One-time idempotent backfill of work_ticket.mask_idx for existing"
-            " read-mask / fastq-to-parquet tickets. Re-derives each ticket's mask"
-            " params hash and LOOKS IT UP in mask_definition (never mints). Dry-run"
-            " by default; pass --apply to write."
-        ),
-    )
-    p_backfill.add_argument(
-        "--apply",
-        action="store_true",
-        help="Write the populated mask_idx values (default: dry-run, report only).",
-    )
-    p_backfill.set_defaults(handler=_handle_work_ticket_backfill_mask_idx)
 
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
@@ -529,8 +505,9 @@ async def _purge_failed(
                 f"backfill incomplete: {backfill_incomplete} non-failed work_ticket(s)"
                 f" for {list(action_ids)} have mask_idx IS NULL, so the shared-mask"
                 " guard cannot see them and a shared mask could be wrongly deleted."
-                " Run `qiita-admin work-ticket backfill-mask-idx --apply` first, then"
-                " re-run this command."
+                " These tickets predate mask_idx tracking and should have been"
+                " populated at migration time; investigate and set their mask_idx"
+                " before re-running this command."
             )
 
         # --execute: process each eligible candidate in isolation. Mask deletes
@@ -667,8 +644,8 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
         )
         print(
-            "      Run `qiita-admin work-ticket backfill-mask-idx --apply` first."
-            " --execute will REFUSE until this is 0."
+            "      These tickets predate mask_idx tracking; populate their mask_idx"
+            " before proceeding. --execute will REFUSE until this is 0."
         )
     print(f"  candidates: {report['candidates']}")
     print(f"  eligible:   {len(report['eligible'])}")
@@ -686,7 +663,7 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
             )
     if report["skipped_no_mask_idx"]:
         print(
-            f"  skipped (mask_idx IS NULL — run backfill-mask-idx first):"
+            f"  skipped (mask_idx IS NULL — predates mask tracking):"
             f" {report['skipped_no_mask_idx']}"
         )
     if report["skipped_wrong_kind"]:
@@ -775,13 +752,11 @@ __all__ = [
     "_VALID_ROLE_VALUES",
     "_WAIT_POLL_INTERVAL_SECONDS",
     "_WAIT_TIMEOUT_SECONDS",
-    "_backfill_mask_idx",
     "_build_parser",
     "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
     "_count_non_failed_missing_mask_idx",
-    "_decode_hmac_secret",
     "_export_stem",
     "_force_fail_ticket",
     "_handle_actions_sync",
@@ -795,11 +770,9 @@ __all__ = [
     "_handle_ticket_force_fail",
     "_handle_token_revoke_all",
     "_handle_whoami",
-    "_handle_work_ticket_backfill_mask_idx",
     "_mask_delete_via_route",
     "_mask_shared_with_non_failed",
     "_parquet_row_count",
-    "_parse_optional_adapter_ref",
     "_peek_paired",
     "_poll_ticket_to_terminal",
     "_purge_failed",

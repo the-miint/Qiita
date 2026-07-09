@@ -41,7 +41,7 @@ async def cp_client(postgres_pool, hmac_secret, human_admin_session):
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
+        flight_signing_key=hmac_secret,
         data_plane_url="grpc://unused:0",
     )
     async with AsyncClient(

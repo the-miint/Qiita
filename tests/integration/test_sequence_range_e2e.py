@@ -44,7 +44,7 @@ async def cp_app_with_pool(postgres_pool, hmac_secret):
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
+        flight_signing_key=hmac_secret,
         data_plane_url="grpc://unused:0",
     )
     yield cp_app

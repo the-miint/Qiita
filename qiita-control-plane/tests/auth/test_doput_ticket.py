@@ -10,6 +10,9 @@ import time
 
 import pytest
 
+# A valid 32-byte Ed25519 private seed for tests.
+_TEST_SEED = b"\x01" * 32
+
 
 def test_sign_doput_importable():
     """sign_doput must be importable."""
@@ -22,7 +25,7 @@ def test_sign_doput_returns_bytes():
     """sign_doput returns the same wire-format bytes shape as sign_ticket."""
     from qiita_control_plane.auth.tickets import sign_doput
 
-    ticket = sign_doput(upload_idx=42, secret=b"dev-secret")
+    ticket = sign_doput(upload_idx=42, secret=_TEST_SEED)
     assert isinstance(ticket, bytes)
     assert len(ticket) > 0
 
@@ -35,7 +38,7 @@ def test_sign_doput_payload_carries_action_and_upload_idx():
     """
     from qiita_control_plane.auth.tickets import sign_doput
 
-    ticket = sign_doput(upload_idx=42, secret=b"dev-secret", expiry_epoch=1_000_000)
+    ticket = sign_doput(upload_idx=42, secret=_TEST_SEED, expiry_epoch=1_000_000)
     payload_len = struct.unpack(">I", ticket[1:5])[0]
     payload = json.loads(ticket[5 : 5 + payload_len])
     assert payload == {"action": "doput", "upload_idx": 42}
@@ -45,43 +48,43 @@ def test_sign_doput_is_deterministic():
     """Same inputs + same expiry → identical bytes."""
     from qiita_control_plane.auth.tickets import sign_doput
 
-    t1 = sign_doput(upload_idx=7, secret=b"dev-secret", expiry_epoch=1_000_000)
-    t2 = sign_doput(upload_idx=7, secret=b"dev-secret", expiry_epoch=1_000_000)
+    t1 = sign_doput(upload_idx=7, secret=_TEST_SEED, expiry_epoch=1_000_000)
+    t2 = sign_doput(upload_idx=7, secret=_TEST_SEED, expiry_epoch=1_000_000)
     assert t1 == t2
 
 
 def test_sign_doput_distinct_upload_idx_distinct_ticket():
-    """Different upload_idx → different bytes (sanity check the payload reaches the HMAC)."""
+    """Different upload_idx → different bytes (sanity check the payload reaches the signature)."""
     from qiita_control_plane.auth.tickets import sign_doput
 
-    t1 = sign_doput(upload_idx=1, secret=b"dev-secret", expiry_epoch=1_000_000)
-    t2 = sign_doput(upload_idx=2, secret=b"dev-secret", expiry_epoch=1_000_000)
+    t1 = sign_doput(upload_idx=1, secret=_TEST_SEED, expiry_epoch=1_000_000)
+    t2 = sign_doput(upload_idx=2, secret=_TEST_SEED, expiry_epoch=1_000_000)
     assert t1 != t2
 
 
 def test_sign_doput_wire_format():
-    """Wire format: 1B version, 4B payload_len, payload, 32B HMAC, 8B expiry."""
+    """Wire format: 1B version, 4B payload_len, payload, 64B Ed25519 sig, 8B expiry."""
     from qiita_control_plane.auth.tickets import sign_doput
 
-    ticket = sign_doput(upload_idx=1, secret=b"dev-secret", expiry_epoch=9_999_999_999)
-    assert ticket[0] == 1
+    ticket = sign_doput(upload_idx=1, secret=_TEST_SEED, expiry_epoch=9_999_999_999)
+    assert ticket[0] == 2
 
     payload_len = struct.unpack(">I", ticket[1:5])[0]
-    hmac_start = 5 + payload_len
-    assert len(ticket[hmac_start : hmac_start + 32]) == 32
-    expiry_start = hmac_start + 32
+    sig_start = 5 + payload_len
+    assert len(ticket[sig_start : sig_start + 64]) == 64
+    expiry_start = sig_start + 64
     expiry = struct.unpack(">Q", ticket[expiry_start : expiry_start + 8])[0]
     assert expiry == 9_999_999_999
-    assert len(ticket) == 1 + 4 + payload_len + 32 + 8
+    assert len(ticket) == 1 + 4 + payload_len + 64 + 8
 
 
 def test_sign_doput_default_expiry_in_future():
     """Default TTL puts expiry past now()."""
     from qiita_control_plane.auth.tickets import sign_doput
 
-    ticket = sign_doput(upload_idx=1, secret=b"dev-secret")
+    ticket = sign_doput(upload_idx=1, secret=_TEST_SEED)
     payload_len = struct.unpack(">I", ticket[1:5])[0]
-    expiry_start = 1 + 4 + payload_len + 32
+    expiry_start = 1 + 4 + payload_len + 64
     expiry = struct.unpack(">Q", ticket[expiry_start : expiry_start + 8])[0]
     assert expiry > time.time()
 
@@ -91,6 +94,6 @@ def test_sign_doput_rejects_nonpositive_ttl():
     from qiita_control_plane.auth.tickets import sign_doput
 
     with pytest.raises(ValueError, match="positive"):
-        sign_doput(upload_idx=1, secret=b"dev-secret", ttl_seconds=0)
+        sign_doput(upload_idx=1, secret=_TEST_SEED, ttl_seconds=0)
     with pytest.raises(ValueError, match="positive"):
-        sign_doput(upload_idx=1, secret=b"dev-secret", ttl_seconds=-1)
+        sign_doput(upload_idx=1, secret=_TEST_SEED, ttl_seconds=-1)

@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build Flight service — each request opens its own DuckDB connection
     let flight_svc = flight_service::QiitaFlightService::new(
-        cfg.hmac_secret_key,
+        cfg.flight_public_key,
         cfg.ducklake_catalog_connstr,
         cfg.path_persistent_ducklake,
         cfg.path_scratch_staging,
@@ -140,14 +140,14 @@ mod tests {
     fn config_with_valid_env() {
         let _snapshot = EnvSnapshot::capture(&[
             "LISTEN_ADDR",
-            "HMAC_SECRET_KEY",
+            "FLIGHT_TICKET_PUBLIC_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
         std::env::remove_var("LISTEN_ADDR");
-        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
-        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
         let scratch = tmp_abs("qiita-test-scratch");
         let persistent = tmp_abs("qiita-test-persistent");
@@ -155,7 +155,13 @@ mod tests {
         std::env::set_var("PATH_PERSISTENT", &persistent);
         let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
-        assert_eq!(cfg.hmac_secret_key.len(), 32);
+        // The decoded Ed25519 public key round-trips to the env value's bytes.
+        assert_eq!(
+            cfg.flight_public_key.to_bytes().to_vec(),
+            base64::engine::general_purpose::STANDARD
+                .decode(&secret)
+                .unwrap()
+        );
         assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
         // Leaf paths are derived from the base roots with fixed suffixes.
         assert_eq!(
@@ -170,14 +176,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_rejects_missing_hmac() {
-        let _snapshot = EnvSnapshot::capture(&["HMAC_SECRET_KEY", "DUCKLAKE_CATALOG_CONNSTR"]);
-        std::env::remove_var("HMAC_SECRET_KEY");
+    fn config_rejects_missing_flight_public_key() {
+        let _snapshot =
+            EnvSnapshot::capture(&["FLIGHT_TICKET_PUBLIC_KEY", "DUCKLAKE_CATALOG_CONNSTR"]);
+        std::env::remove_var("FLIGHT_TICKET_PUBLIC_KEY");
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         let err = Settings::from_env().unwrap_err();
         assert!(
-            err.contains("HMAC_SECRET_KEY"),
-            "error should mention HMAC_SECRET_KEY: {err}"
+            err.contains("FLIGHT_TICKET_PUBLIC_KEY"),
+            "error should mention FLIGHT_TICKET_PUBLIC_KEY: {err}"
         );
     }
 
@@ -185,13 +192,13 @@ mod tests {
     #[serial]
     fn config_rejects_missing_path_scratch() {
         let _snapshot = EnvSnapshot::capture(&[
-            "HMAC_SECRET_KEY",
+            "FLIGHT_TICKET_PUBLIC_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
-        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_PERSISTENT", tmp_abs("qiita-test-persistent"));
         std::env::remove_var("PATH_SCRATCH");
@@ -209,13 +216,13 @@ mod tests {
         // fail fast, not fall back to a tmp-rooted default that loses durable
         // lake data on reboot.
         let _snapshot = EnvSnapshot::capture(&[
-            "HMAC_SECRET_KEY",
+            "FLIGHT_TICKET_PUBLIC_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
-        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_SCRATCH", tmp_abs("qiita-test-scratch"));
         std::env::remove_var("PATH_PERSISTENT");
@@ -230,13 +237,13 @@ mod tests {
     #[serial]
     fn config_rejects_relative_path_persistent() {
         let _snapshot = EnvSnapshot::capture(&[
-            "HMAC_SECRET_KEY",
+            "FLIGHT_TICKET_PUBLIC_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
-        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_SCRATCH", tmp_abs("qiita-test-scratch"));
         std::env::set_var("PATH_PERSISTENT", "relative/persistent");
@@ -251,13 +258,13 @@ mod tests {
     #[serial]
     fn config_rejects_relative_path_scratch() {
         let _snapshot = EnvSnapshot::capture(&[
-            "HMAC_SECRET_KEY",
+            "FLIGHT_TICKET_PUBLIC_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
-        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_PERSISTENT", tmp_abs("qiita-test-persistent"));
         std::env::set_var("PATH_SCRATCH", "relative/scratch");

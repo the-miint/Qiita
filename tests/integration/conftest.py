@@ -203,7 +203,10 @@ def ducklake_connect(data_path: str):
 
 @pytest.fixture(scope="module")
 def hmac_secret() -> bytes:
-    """HMAC secret shared between the data plane under test and its clients."""
+    """Ed25519 PRIVATE seed (32 bytes) the signing clients / control plane use to
+    sign Flight tickets. The data plane under test gets the matching PUBLIC key
+    (see the `data_plane` fixture). Named `hmac_secret` for historical reasons —
+    it is the ticket-signing key material, now asymmetric."""
     return secrets.token_bytes(32)
 
 
@@ -224,6 +227,8 @@ def data_plane(hmac_secret, tmp_path_factory):
             f"Run 'make build-data-plane-debug' (or 'make test-integration', "
             f"which builds it first)."
         )
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     _reset_ducklake_catalog()
 
@@ -248,7 +253,10 @@ def data_plane(hmac_secret, tmp_path_factory):
     env = {
         **os.environ,
         "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
-        "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
+        # The data plane verifies with the PUBLIC key derived from the signing seed.
+        "FLIGHT_TICKET_PUBLIC_KEY": base64.b64encode(
+            Ed25519PrivateKey.from_private_bytes(hmac_secret).public_key().public_bytes_raw()
+        ).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "PATH_PERSISTENT": str(persistent_base),
         "PATH_SCRATCH": str(scratch_base),

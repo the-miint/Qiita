@@ -37,6 +37,23 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   grep -q '^LOGIN_COOKIE_SECRET_KEY=' /etc/qiita/control-plane.env \
     || sudo bash -c 'printf "LOGIN_COOKIE_SECRET_KEY=%s\n" "$(openssl rand -base64 32)" >> /etc/qiita/control-plane.env'
   ```
+- **Flight tickets move to Ed25519; `HMAC_SECRET_KEY` is retired.** Generate ONE
+  Ed25519 keypair: the control plane gets the PRIVATE seed
+  (`FLIGHT_TICKET_SIGNING_KEY`), the data plane gets the matching PUBLIC key
+  (`FLIGHT_TICKET_PUBLIC_KEY`). Both are `from_env()` fail-fast. Set both **before**
+  the restart, remove `HMAC_SECRET_KEY` from both env files, and **restart the
+  control plane and data plane together** — a brief window where any in-flight
+  HMAC (v1) ticket fails is expected and self-heals (tickets are short-lived; the
+  runner retries). `make preflight` verifies the keypair (CP seed → public key ==
+  DP public key) before the restart. (#TBD)
+  ```bash
+  # Generate the keypair once (capture both values):
+  python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
+  # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):
+  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env; printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
+  # DP: add the public key, drop HMAC_SECRET_KEY (substitute <PUBLIC>):
+  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env; printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n" "<PUBLIC>" >> /etc/qiita/data-plane.env'
+  ```
 
 ### 2. One-time host setup
 

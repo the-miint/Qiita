@@ -53,7 +53,7 @@ def ctx(role_keyed_clients):
     from qiita_control_plane.config import Settings
 
     app.state.settings = Settings(
-        database_url="unused", hmac_secret_key=_HMAC_SECRET, data_plane_url="unused"
+        database_url="unused", flight_signing_key=_HMAC_SECRET, data_plane_url="unused"
     )
     return role_keyed_clients
 

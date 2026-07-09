@@ -637,8 +637,9 @@ async def test_s2_gate_refuses_execute_on_non_failed_null_mask_idx(seeded, monke
     )
     assert dry["backfill_incomplete"] >= 1
 
-    # --execute REFUSES with an actionable error naming the backfill command.
-    with pytest.raises(RuntimeError, match="backfill-mask-idx"):
+    # --execute REFUSES with an actionable error when any non-failed ticket has
+    # an unpopulated mask_idx (the shared-mask guard would be blind to it).
+    with pytest.raises(RuntimeError, match="mask_idx IS NULL"):
         await admin._purge_failed(
             "unused",
             "http://localhost:8080",

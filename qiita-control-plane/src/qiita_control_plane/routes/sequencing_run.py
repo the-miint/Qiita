@@ -101,7 +101,7 @@ from ..deps import (
     TxConnFactory,
     get_data_plane_url,
     get_db_pool,
-    get_hmac_secret,
+    get_flight_signing_key,
     get_scratch_staging,
     get_tx_conn_factory,
 )
@@ -620,7 +620,7 @@ async def submit_block_mask_plan(
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _run_exists: None = Depends(require_sequencing_run_exists),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    hmac_secret: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     staging_root: Path | None = Depends(get_scratch_staging),
 ) -> BlockMaskPlanResponse:
@@ -731,7 +731,7 @@ async def delete_sequenced_pool(
     force: bool = False,
     pool: asyncpg.Pool = Depends(get_db_pool),
     tx: TxConnFactory = Depends(get_tx_conn_factory),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    hmac_secret: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     staging_root: Path | None = Depends(get_scratch_staging),
     _scope: Principal = Depends(require_scope(Scope.SEQUENCED_POOL_DELETE)),

@@ -57,7 +57,7 @@ async def ctx(postgres_pool, regular_user_session, compute_worker_service_accoun
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=_HMAC_SECRET,
+        flight_signing_key=_HMAC_SECRET,
         data_plane_url="unused",
     )
     transport = ASGITransport(app=app)

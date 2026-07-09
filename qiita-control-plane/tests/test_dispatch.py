@@ -32,7 +32,7 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
         running_dispatches=set(),
         pool=pool,
         settings=SimpleNamespace(
-            hmac_secret_key=b"x" * 16,
+            flight_signing_key=b"x" * 32,
             data_plane_url="grpc://unused",
             # _run_and_log reads both before dispatching to run_workflow.
             # Real Paths keep the defensive None-check happy without

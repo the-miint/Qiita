@@ -26,7 +26,7 @@ arrow-schema = "58"
 # cleanest path. Keep version pinned to arrow-* major.
 parquet = "58"
 duckdb = { version = "1.10504.0" }
-hmac = "0.12"
+ed25519-dalek = "2"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

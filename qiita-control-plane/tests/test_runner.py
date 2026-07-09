@@ -2553,7 +2553,7 @@ async def test_resolve_qc_adapters_writes_parquet(
         postgres_pool,
         default_adapter_reference_idx=reference_idx,
         data_plane_url="grpc://unused",
-        hmac_secret=b"x" * 16,
+        hmac_secret=b"x" * 32,
         workspace=tmp_path,
     )
     adapter_parquet = tmp_path / "adapters.parquet"
@@ -2575,7 +2575,7 @@ async def test_resolve_qc_adapters_unconfigured(postgres_pool, tmp_path):
             postgres_pool,
             default_adapter_reference_idx=None,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2591,7 +2591,7 @@ async def test_resolve_qc_adapters_unknown_reference(postgres_pool, tmp_path):
             postgres_pool,
             default_adapter_reference_idx=999_999_999,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2610,7 +2610,7 @@ async def test_resolve_qc_adapters_wrong_kind(postgres_pool, reference_idx, tmp_
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2630,7 +2630,7 @@ async def test_resolve_qc_adapters_non_active(postgres_pool, reference_idx, tmp_
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2649,7 +2649,7 @@ async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_p
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2676,7 +2676,7 @@ async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            hmac_secret=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT

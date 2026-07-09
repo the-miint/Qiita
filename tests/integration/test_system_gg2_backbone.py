@@ -181,7 +181,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
+        flight_signing_key=hmac_secret,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         path_scratch_staging=Path(data_plane["upload_staging_root"]),
         path_scratch_ticket=Path(data_plane["workspace_root"]),

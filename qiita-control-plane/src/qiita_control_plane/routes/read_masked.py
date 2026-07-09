@@ -57,7 +57,7 @@ from ..deps import (
     TxConnFactory,
     get_data_plane_url,
     get_db_pool,
-    get_hmac_secret,
+    get_flight_signing_key,
     get_tx_conn_factory,
 )
 from ..repositories.mask_definition import mint_mask_definition
@@ -136,7 +136,7 @@ async def mint_mask_definition_route(
 async def delete_mask_definition_route(
     mask_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    hmac_secret: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_DELETE)),
 ) -> MaskDefinitionDeleteResponse:
@@ -198,7 +198,7 @@ async def delete_mask_definition_route(
 @read_masked_router.post(PATH_READ_MASKED_DOGET, status_code=201)
 async def create_read_masked_doget_ticket(
     body: ReadMaskedDoGetTicketRequest,
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    hmac_secret: bytes = Depends(get_flight_signing_key),
     sa: ServiceAccount = Depends(require_service_with_scope(Scope.READ_MASKED_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to (prep_sample_idx, mask_idx) on read_masked.

@@ -55,7 +55,7 @@ async def boundary_client(postgres_pool):
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="grpc://localhost:50051",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:

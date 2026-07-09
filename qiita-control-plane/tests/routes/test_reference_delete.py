@@ -37,7 +37,7 @@ def _install_settings(app):
 
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
     )
 

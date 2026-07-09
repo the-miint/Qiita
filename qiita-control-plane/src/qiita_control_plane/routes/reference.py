@@ -67,7 +67,7 @@ from ..deps import (
     TxConnFactory,
     get_data_plane_url,
     get_db_pool,
-    get_hmac_secret,
+    get_flight_signing_key,
     get_tx_conn_factory,
 )
 
@@ -229,7 +229,7 @@ async def delete_reference(
     force: bool = False,
     pool: asyncpg.Pool = Depends(get_db_pool),
     tx: TxConnFactory = Depends(get_tx_conn_factory),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    hmac_secret: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     _scope: Principal = Depends(require_scope(Scope.REFERENCE_DELETE)),
 ) -> ReferenceDeleteResponse:
@@ -343,7 +343,7 @@ async def create_doget_ticket(
     reference_idx: Annotated[int, Field(gt=0)],
     body: DoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    hmac_secret: bytes = Depends(get_flight_signing_key),
     _scope: Principal = Depends(require_scope(Scope.TICKET_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to a reference.
