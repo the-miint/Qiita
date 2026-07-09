@@ -870,15 +870,16 @@ def _lr_verifier(jwks_harness):
 
 
 def _make_login_cookie(*, cli: bool = False, port: int | None = None, age_ms: int = 0) -> str:
-    """Sign a login cookie using the same secret the auth_client fixture uses
-    (b'\\x00' * 32). `age_ms` shifts the timestamp into the past so tests can
+    """Sign a login cookie with the same key the auth_client fixture verifies it
+    under — `login_cookie_secret_key` (b'\\x11' * 32), which this PR split off the
+    Flight-ticket secret. `age_ms` shifts the timestamp into the past so tests can
     exercise the freshness window."""
     from qiita_control_plane.auth.handoff import sign_login_cookie
 
     payload = {"timestamp_ms": int(time.time() * 1000) - age_ms, "cli": cli}
     if cli and port is not None:
         payload["port"] = port
-    return sign_login_cookie(payload, b"\x00" * 32)
+    return sign_login_cookie(payload, b"\x11" * 32)
 
 
 def _cookie_jar(cookie: str) -> dict[str, str]:
