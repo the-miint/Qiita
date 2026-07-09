@@ -66,3 +66,34 @@ def test_read_mask_counts_spikein_is_zero_without_syndna(tmp_path):
         tmp_path / "m.parquet", n_pass=4, n_host=1, n_qc=2, n_spikein=0, n_twist=0
     )
     assert _read_mask_counts(mask) == (7, 5, 4, 0)
+
+
+# --- Python <-> Rust bucket lockstep ------------------------------------------
+
+
+def _rust_const(name: str) -> str:
+    """Extract a `const NAME: &str = "...";` literal from the data plane source."""
+    import re
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
+    ).read_text()
+    m = re.search(rf'^const {name}: &str = "(.*)";$', src, flags=re.MULTILINE)
+    assert m, f"{name} not found in flight_service.rs"
+    return m.group(1)
+
+
+def test_rust_reason_lists_match_the_python_bucket_map():
+    """`mask_metrics_counts` (Rust) is the block-path twin of `_read_mask_counts`.
+    Rust cannot import `READ_MASK_BUCKET`, so it hardcodes the reason lists — and
+    the block e2e fixture never emits a `spikein_syndna` or a `host_minimap2` read,
+    so a typo there would miscount SILENTLY rather than fail a test.
+
+    This is that test: compare the Rust literals against the Python source of
+    truth, character for character. Adding a ReadMaskReason means editing both.
+    """
+    from qiita_common.models import ReadMaskBucket, read_mask_reason_sql_list
+
+    assert _rust_const("BIOLOGICAL_REASONS") == read_mask_reason_sql_list(ReadMaskBucket.BIOLOGICAL)
+    assert _rust_const("SPIKEIN_REASONS") == read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN)

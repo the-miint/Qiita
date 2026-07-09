@@ -240,15 +240,12 @@ steps:
   #
   # `read_mask` is both an input and an output here: _bind_step_inputs reads
   # `bound` BEFORE bound.update(outputs), so the self-shadow is safe.
-  #
-  # `spikein_counts` is a per-(prep_sample, spike-in) count table, written OUTSIDE
-  # the staging dir — register-files globs every *.parquet in the dir it is given.
   - step: syndna
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.syndna
     when: syndna_enabled
     inputs: [reads, read_mask, syndna_rype_path]
-    outputs: [read_mask, read_mask_staging_dir, spikein_counts]
+    outputs: [read_mask, read_mask_staging_dir]
     baseline_resources:
       cpu: 4
       mem_gb: 32

@@ -71,7 +71,7 @@ _LIMA_PRESET_ARGS = {
 _LIMA_VERSION = "2.13.0"
 
 # MD5 of the Twist adapter FASTA vendored INTO the lima container image
-# (`workflows/lima/twist_adapters_231010.fasta`). The control plane cannot hash a
+# (`workflows/read-mask/twist_adapters_231010.fasta`). The control plane cannot hash a
 # file inside a SIF, so this constant is how the adapter bytes enter the mask
 # identity: re-vendoring a different set re-mints rather than silently reusing a
 # mask built from other adapters. A CI guard asserts it equals the vendored

@@ -11,11 +11,10 @@ That drift is the bug this module exists to prevent: `cli/user/pacbio.py` and th
 copy in each is the same class of defect as a duplicated SQL predicate in two
 languages.
 
-**PacBio is a provisional seam.** `run_preflight` ships `get_illumina_sample_info`
-but no `get_pacbio_sample_info` (verified absent on the pinned SHA), so the PacBio
-facts are read by joining `pacbio_sample` directly. When that upstream reader
-lands, replace `pacbio_protocol_by_barcode`'s body with a call to it and delete
-`PACBIO_SAMPLE_JOIN`; callers depend only on the `PacbioProtocol` contract.
+`run_preflight` ships `get_illumina_sample_info` but no `get_pacbio_sample_info`
+(verified absent on the pinned SHA), which is why the PacBio facts are read by
+joining `pacbio_sample` directly. Callers depend only on the `PacbioProtocol`
+contract, not on that join.
 """
 
 from __future__ import annotations

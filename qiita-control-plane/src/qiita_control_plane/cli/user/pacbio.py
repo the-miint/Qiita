@@ -59,7 +59,9 @@ _BAM_TO_PARQUET_ACTION_VERSION = "1.0.0"
 
 # Preflight sheet_type values (kl-run-preflight [Header] SheetType). syndna is
 # quantified only for the absquant protocol; a bare metaG sheet carries no syndna.
-_SHEET_TYPE_ABSQUANT = "pacbio_absquant"
+# The canonical constant now lives in `qiita_control_plane.preflight`, which the
+# server-side roster route reads too — one spelling of the sheet type.
+_SHEET_TYPE_ABSQUANT = _preflight.SHEET_TYPE_PACBIO_ABSQUANT
 _SHEET_TYPE_METAG = "pacbio_metag"
 
 # Per-cell reads PacBio's demux could not assign to a barcode; never a sample.

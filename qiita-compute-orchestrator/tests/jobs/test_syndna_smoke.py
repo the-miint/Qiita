@@ -3,12 +3,11 @@
 Builds a real per-feature-bucket `.ryxdi` from two synthetic spike-in sequences and
 runs the actual `rype_classify`. What this pins that the stubbed unit tests cannot:
 
-  - `rype_classify` really returns a `bucket_name` and a `score` alongside
-    `read_id`, and a `bucket_per_feature` index makes that name the `feature_idx`;
-  - `arg_max(bucket_name, score)` is valid over that output, so a read attributes
-    to exactly one spike-in;
+  - a real `bucket_per_feature` `.ryxdi` classifies correctly (the mapping the
+    operator is told to build);
   - rype's `read_id` output type (build-dependent — a BIGINT input has come back
-    VARCHAR) coerces into the job's BIGINT accumulator column.
+    VARCHAR) coerces into the job's BIGINT accumulator column;
+  - a biological read matching no spike-in is left alone.
 
 The unit tests own the merge semantics; this owns the miint contract.
 """
@@ -107,7 +106,7 @@ def _write_mask(path: Path, sequence_idxs: list[int]) -> Path:
     return path
 
 
-def test_syndna_smoke_marks_spikeins_and_names_them_by_feature(tmp_path):
+def test_syndna_smoke_marks_spikeins_from_a_real_per_feature_index(tmp_path):
     from qiita_compute_orchestrator.jobs import syndna
 
     reads = _write_reads(
@@ -129,20 +128,12 @@ def test_syndna_smoke_marks_spikeins_and_names_them_by_feature(tmp_path):
             f"SELECT sequence_idx, reason FROM read_parquet('{out['read_mask']}') "
             "ORDER BY sequence_idx"
         ).fetchall()
-        counts = conn.execute(
-            f"SELECT spikein, read_count FROM read_parquet('{out['spikein_counts']}') "
-            "ORDER BY spikein"
-        ).fetchall()
-
     # Both spike-in reads flagged; the biological read untouched.
     assert rows == [(1, _SPIKEIN), (2, _SPIKEIN), (3, _PASS)]
-    # ...and each is attributed to the feature it came from — the real bucket_name.
-    assert counts == [(str(_FEATURE_A), 1), (str(_FEATURE_B), 1)]
 
 
 def test_syndna_smoke_no_spikeins_leaves_the_mask_untouched(tmp_path):
-    """A sample with no spike-ins: the mask passes through and the counts table is
-    empty (not absent — the parquet is always written)."""
+    """A sample with no spike-ins: the mask passes through unchanged."""
     from qiita_compute_orchestrator.jobs import syndna
 
     reads = _write_reads(tmp_path / "reads.parquet", [(1, _BIOLOGICAL)])
@@ -159,9 +150,3 @@ def test_syndna_smoke_no_spikeins_leaves_the_mask_untouched(tmp_path):
         assert conn.execute(
             f"SELECT reason FROM read_parquet('{out['read_mask']}')"
         ).fetchall() == [(_PASS,)]
-        assert (
-            conn.execute(
-                f"SELECT count(*) FROM read_parquet('{out['spikein_counts']}')"
-            ).fetchone()[0]
-            == 0
-        )

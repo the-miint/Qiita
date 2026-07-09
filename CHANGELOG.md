@@ -207,64 +207,33 @@ the `no-changelog` label).
     record name, and a revcomp-canonical `feature_idx` under a
     `(reference_idx, feature_idx)` PK). Reads with no Twist adaptor are masked
     `twist_no_adaptor`. Trims come from miint's `infer_trim`, not from parsing
-    lima's output.
+    lima's output. (#feat/pacbio-case5-mask)
   - **SynDNA spike-in marking (syndna)** runs LAST — spike-ins do not align to
     the host, so counting them in the QC'd, host-depleted space is the correct
-    denominator for the downstream cell-count model. It keeps `rype_classify`'s
-    `bucket_name`, so a `bucket_per_feature` index yields **per-spike-in**
-    counts rather than a bare total.
+    denominator for the downstream cell-count model. Spike-in reads are RETAINED
+    in `read_mask` (their `sequence_idx` survives), so attributing them to a
+    specific spike-in later needs no re-ingest. (#feat/pacbio-case5-mask)
   - `qc` gained an optional incoming partial mask, extending it with trims that
     stay **cumulative from the raw read**.
 - **`sequenced_sample.spikein_read_count_r1r2`** and a `spikein` bucket on the
   pool read-metrics rollup. A spike-in is added in the lab, so it is disjoint
-  from `biological`.
+  from `biological`. (#feat/pacbio-case5-mask)
 - **`build_rype_index --bucket-per-feature`** (`rype_bucket_per_feature` in
   action_context): one rype bucket per `feature_idx` instead of one per
-  reference. Host filtering keeps the single bucket; a spike-in reference wants
-  per-feature so `bucket_name` names WHICH spike-in a read hit.
+  reference. Host filtering keeps the single bucket (its answer is boolean); a
+  spike-in reference is built per-feature so a future per-spike-in count needs no
+  index rebuild. (#feat/pacbio-case5-mask)
 - **`qiita submit-host-filter-pool --syndna-reference-idx`**, and per-sample gate
   derivation for PacBio pools: `lima_enabled`, `syndna_enabled`, and per-sample
-  `host_filter_enabled` are read back from the pool's stored pre-flight blob.
+  `host_filter_enabled` are read back from the pool's stored pre-flight blob. (#feat/pacbio-case5-mask)
 - **PacBio protocol facts on the sequenced-sample roster** (`sheet_type`,
   `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the
   stored pre-flight — the same single-source-of-truth path `human_filtering`
-  already used.
+  already used. (#feat/pacbio-case5-mask)
 - **`compute-readiness` probes `infer_trim`**, invoking the macro rather than
   checking registration. A stale `extension_directory` (a plain `INSTALL` never
   refreshes a warm cache) otherwise yields a build with every other function
-  present and fails at the first real submit.
-
-### Changed
-
-- **The read-mask `biological` count predicate is now a whitelist.** It was
-  `reason NOT LIKE 'qc_%'` — fail-OPEN, so every reason added since would have
-  been counted as biological by default, which is exactly how `spikein_syndna`
-  and `twist_no_adaptor` would have inflated it. Buckets now derive from
-  `READ_MASK_BUCKET` in qiita-common (`biological` = `pass` + `host_*`), and a
-  coverage test fails on any unclassified reason. The data plane's
-  `mask_metrics_counts` carried the same predicate and changed in lockstep; its
-  `mask_metrics` JSON gains a `spikein` key, so control plane and data plane
-  must deploy together.
-- **Read-mask identity (`mask_idx`) now carries `resolved_lima` and
-  `syndna_reference_idx`.** Nothing in the hash distinguished the five PacBio
-  protocols: `prep_protocol_idx` is an operator CLI flag, uniform across them,
-  and no run identifier participates by design. A case-5 run and a case-1 run
-  submitted with the same flags hashed identically and shared one `mask_idx`
-  whose stored params described only one of them. `resolved_lima` is nested and
-  `None` when lima is off, so a future lima knob re-mints only lima masks.
-  **Consequence: `params_hash` changes for every existing mask.** The existing
-  rows stay valid and referenced; a re-run of an identical config mints one new
-  `mask_idx` rather than reusing the old.
-- **The pre-flight `human_filtering` derivation is platform-aware.** It keyed on
-  `illumina_sample_idx` and walked `run_illumina_sample`, so a PacBio pool's
-  samples all came back with a null intent — and `submit-host-filter-pool`
-  aborts on a null intent. It could not run against a PacBio pool at all. PacBio
-  now keys on the barcode (which is the `sequenced_pool_item_id`). PacBio host
-  filtering is per sample; Illumina keeps its pool-uniform guard for now.
-- **`read-mask`'s `context_schema` requires `host_filter_enabled`,
-  `lima_enabled`, and `syndna_enabled`.** `when:` is default-ON — an absent gate
-  key RUNS its step — so a ticket that omitted `lima_enabled` would have executed
-  the long-read lima chain on a short-read sample.
+  present and fails at the first real submit. (#feat/pacbio-case5-mask)
 
 - **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
   analogue of `submit-bcl-convert`: it reads a kl-run-preflight blob, stands up
@@ -973,6 +942,37 @@ the `no-changelog` label).
   `biosample_accession` or `ena_sample_accession`) (#91)
 
 ### Changed
+
+- **The read-mask `biological` count predicate is now a whitelist.** It was
+  `reason NOT LIKE 'qc_%'` — fail-OPEN, so every reason added since would have
+  been counted as biological by default, which is exactly how `spikein_syndna`
+  and `twist_no_adaptor` would have inflated it. Buckets now derive from
+  `READ_MASK_BUCKET` in qiita-common (`biological` = `pass` + `host_*`), and a
+  coverage test fails on any unclassified reason. The data plane's
+  `mask_metrics_counts` carried the same predicate and changed in lockstep; its
+  `mask_metrics` JSON gains a `spikein` key, so control plane and data plane
+  must deploy together. (#feat/pacbio-case5-mask)
+- **Read-mask identity (`mask_idx`) now carries `resolved_lima` and
+  `syndna_reference_idx`.** Nothing in the hash distinguished the five PacBio
+  protocols: `prep_protocol_idx` is an operator CLI flag, uniform across them,
+  and no run identifier participates by design. A case-5 run and a case-1 run
+  submitted with the same flags hashed identically and shared one `mask_idx`
+  whose stored params described only one of them. `resolved_lima` is nested and
+  `None` when lima is off, so a future lima knob re-mints only lima masks.
+  **Consequence: `params_hash` changes for every existing mask.** The existing
+  rows stay valid and referenced; a re-run of an identical config mints one new
+  `mask_idx` rather than reusing the old. (#feat/pacbio-case5-mask)
+- **The pre-flight `human_filtering` derivation is platform-aware.** It keyed on
+  `illumina_sample_idx` and walked `run_illumina_sample`, so a PacBio pool's
+  samples all came back with a null intent — and `submit-host-filter-pool`
+  aborts on a null intent. It could not run against a PacBio pool at all. PacBio
+  now keys on the barcode (which is the `sequenced_pool_item_id`). PacBio host
+  filtering is per sample; Illumina keeps its pool-uniform guard for now. (#feat/pacbio-case5-mask)
+- **`read-mask`'s `context_schema` requires `host_filter_enabled`,
+  `lima_enabled`, and `syndna_enabled`.** `when:` is default-ON — an absent gate
+  key RUNS its step — so a ticket that omitted `lima_enabled` would have executed
+  the long-read lima chain on a short-read sample. (#feat/pacbio-case5-mask)
+
 
 - **`submit-bcl-convert` re-run is now convergent (create-missing roster).** The
   run → pool → sequenced-sample provisioning is unified with `submit-pacbio-ingest`

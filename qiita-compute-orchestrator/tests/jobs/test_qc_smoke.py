@@ -356,3 +356,33 @@ def test_qc_smoke_unbound_incoming_mask_is_unchanged(tmp_path, write_reads_q, wr
     a = _mask(asyncio.run(qc.execute(without, tmp_path / "ws_a"))["qc_mask"])
     b = _mask(asyncio.run(qc.execute(with_identity, tmp_path / "ws_b"))["qc_mask"])
     assert a == b
+
+
+def test_qc_smoke_incoming_mask_consuming_the_whole_read_is_qc_too_short(
+    tmp_path, write_reads_q, write_partial_mask
+):
+    """`_assert_trims_within_read` rejects left+right > length but PERMITS
+    left+right == length (infer_trim can produce it only in the limit). The read
+    then presents to QC as an empty insert with an empty phred array: the chain
+    must survive and call it qc_too_short, not crash and not pass."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    raw = _LEAD + _TRAIL  # nothing between the two blocks lima strips
+    reads = write_reads_q(tmp_path / "reads.parquet", [(60, "r", raw, _q(raw), None, None)])
+    adapter_mask = write_partial_mask(
+        tmp_path / "adapter_mask.parquet",
+        [(60, ReadMaskReason.PASS.value, len(_LEAD), len(_TRAIL))],
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path),
+        adapter_mask=adapter_mask,
+        instrument_model="Illumina MiSeq",
+        prep_sample_idx=5,
+        work_ticket_idx=1,
+    )
+    mask = _mask(asyncio.run(qc.execute(inputs, tmp_path / "ws"))["qc_mask"])
+    assert mask[60]["reason"] == ReadMaskReason.QC_TOO_SHORT.value
+    # The trims stay cumulative-from-raw: the whole read was consumed upstream.
+    assert mask[60]["left_trim1"] == len(_LEAD)
+    assert mask[60]["right_trim1"] == len(_TRAIL)

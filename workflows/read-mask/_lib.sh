@@ -1,12 +1,12 @@
 #!/bin/bash
-# Shared helpers for this workflow's container entrypoints. Each step
+# Shared helpers for this workflow's container entrypoints.
 #
-# NOTE: byte-identical to workflows/long-read-assembly/_lib.sh. build-sif.sh
-# mirrors the repo layout, so a single copy under workflows/_shared/ would be
-# reachable from both — but _shared/ is currently hashed specially by the builder
-# (only manifest_writer.py is auto-included), so consolidating means touching the
-# four long-read-assembly defs and their HASH_INPUTS. Tracked as a follow-up;
-# keep the two copies IDENTICAL until then.
+# The executable body below (from `set -euo pipefail` down) is byte-identical to
+# workflows/long-read-assembly/_lib.sh — keep the two in lockstep. A single copy
+# under workflows/_shared/ would be reachable from both (build-sif.sh mirrors the
+# repo layout), but the builder auto-hashes only _shared/manifest_writer.py, so
+# consolidating means touching the four long-read-assembly defs and their
+# HASH_INPUTS.
 #
 # Each step
 # sources this, reads its inputs from params.json, runs its tool writing under

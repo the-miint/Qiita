@@ -9,9 +9,7 @@ Asserted here:
   - only `reason='pass'` rows are classified; an earlier step's verdict (qc_*,
     host_*, twist_no_adaptor) is never overwritten;
   - hits become `spikein_syndna`, non-hits keep their reason, trims ride through;
-  - per-spike-in counts are emitted, keyed per prep_sample, one row per read even
-    when a read matches several spike-ins (best-scoring bucket wins);
-  - `spikein_counts.parquet` lives OUTSIDE the staging dir register-files globs;
+  - the emitted mask is the ONLY parquet in the staging dir register-files globs;
   - a missing or empty `.ryxdi` fails fast.
 """
 
@@ -77,14 +75,6 @@ def _rows(path: Path) -> list[tuple]:
         ).fetchall()
 
 
-def _counts(path: Path) -> list[tuple]:
-    with duckdb.connect(":memory:") as conn:
-        return conn.execute(
-            f"SELECT prep_sample_idx, spikein, read_count FROM read_parquet('{path}') "
-            "ORDER BY prep_sample_idx, spikein"
-        ).fetchall()
-
-
 def _index(tmp_path: Path) -> Path:
     d = tmp_path / "syndna.ryxdi"
     d.mkdir()
@@ -103,17 +93,17 @@ def _run(tmp_path, reads, mask, index):
     )
 
 
-def _stub_hits(monkeypatch, hits: list[tuple[int, str]]):
-    """Stub rype_classify: insert (sequence_idx, spikein) directly."""
+def _stub_hits(monkeypatch, hits: list[int]):
+    """Stub rype_classify: insert the flagged sequence_idx set directly."""
     from qiita_compute_orchestrator.jobs import syndna
 
     def fake(conn, index_path, sequence_table, dest_table, *, threshold):
         # Only reads visible in the query view may be flagged — mirrors the real
         # function, which classifies exactly that relation.
         visible = {r[0] for r in conn.execute(f"SELECT read_id FROM {sequence_table}").fetchall()}
-        for sidx, spikein in hits:
+        for sidx in hits:
             assert sidx in visible, f"stub flagged {sidx}, not in the query view"
-            conn.execute(f"INSERT INTO {dest_table} VALUES (?, ?)", [sidx, spikein])
+            conn.execute(f"INSERT INTO {dest_table} VALUES (?)", [sidx])
 
     monkeypatch.setattr(syndna, "_run_rype_classify", fake)
 
@@ -121,7 +111,7 @@ def _stub_hits(monkeypatch, hits: list[tuple[int, str]]):
 def test_syndna_marks_hits_and_leaves_others(tmp_path, monkeypatch):
     reads = _write_reads(tmp_path / "reads.parquet", [(5, 1, "ACGT"), (5, 2, "TTTT")])
     mask = _write_mask(tmp_path / "mask.parquet", [(9, 5, 1, _PASS), (9, 5, 2, _PASS)])
-    _stub_hits(monkeypatch, [(1, "77")])
+    _stub_hits(monkeypatch, [1])
     out = _run(tmp_path, reads, mask, _index(tmp_path))
     assert _rows(out["read_mask"]) == [(1, _SPIKEIN), (2, _PASS)]
 
@@ -142,12 +132,10 @@ def test_syndna_never_classifies_a_non_pass_read(tmp_path, monkeypatch, prior):
     _stub_hits(monkeypatch, [])  # the stub asserts read 1 is not even visible
     out = _run(tmp_path, reads, mask, _index(tmp_path))
     assert _rows(out["read_mask"]) == [(1, prior)]
-    assert _counts(out["spikein_counts"]) == []
 
 
-def test_syndna_emits_per_spikein_counts_keyed_per_prep_sample(tmp_path, monkeypatch):
-    """A bare total would not serve the cell-count model; the bucket_name a
-    `bucket_per_feature` index assigns is the spike-in's feature_idx."""
+def test_syndna_marks_every_hit_across_prep_samples(tmp_path, monkeypatch):
+    """A block's mask spans several prep_samples; each hit is marked in place."""
     reads = _write_reads(
         tmp_path / "reads.parquet",
         [(5, 1, "ACGT"), (5, 2, "ACGT"), (5, 3, "TTTT"), (6, 4, "ACGT")],
@@ -156,24 +144,22 @@ def test_syndna_emits_per_spikein_counts_keyed_per_prep_sample(tmp_path, monkeyp
         tmp_path / "mask.parquet",
         [(9, 5, 1, _PASS), (9, 5, 2, _PASS), (9, 5, 3, _PASS), (9, 6, 4, _PASS)],
     )
-    _stub_hits(monkeypatch, [(1, "77"), (2, "77"), (4, "88")])
+    _stub_hits(monkeypatch, [1, 2, 4])
     out = _run(tmp_path, reads, mask, _index(tmp_path))
-    assert _counts(out["spikein_counts"]) == [(5, "77", 2), (6, "88", 1)]
     # read 3 was never a spike-in.
     assert _rows(out["read_mask"]) == [(1, _SPIKEIN), (2, _SPIKEIN), (3, _PASS), (4, _SPIKEIN)]
 
 
-def test_spikein_counts_live_outside_the_register_files_staging_dir(tmp_path, monkeypatch):
-    """register-files globs EVERY *.parquet in the staging dir it is handed; a
-    counts parquet beside read_mask.parquet would be loaded into the read_mask
-    DuckLake table."""
+def test_only_the_mask_lands_in_the_register_files_staging_dir(tmp_path, monkeypatch):
+    """register-files globs EVERY *.parquet in the staging dir it is handed, so
+    anything beside read_mask.parquet would be loaded into the DuckLake read_mask
+    table."""
     reads = _write_reads(tmp_path / "reads.parquet", [(5, 1, "ACGT")])
     mask = _write_mask(tmp_path / "mask.parquet", [(9, 5, 1, _PASS)])
-    _stub_hits(monkeypatch, [(1, "77")])
+    _stub_hits(monkeypatch, [1])
     out = _run(tmp_path, reads, mask, _index(tmp_path))
     staging = Path(out["read_mask_staging_dir"])
     assert sorted(p.name for p in staging.glob("*.parquet")) == ["read_mask.parquet"]
-    assert Path(out["spikein_counts"]).parent != staging
 
 
 def test_syndna_shadows_host_filters_binding_names(tmp_path, monkeypatch):
@@ -208,7 +194,7 @@ def test_syndna_empty_index_raises(tmp_path, monkeypatch):
 def test_syndna_preserves_mask_idx_and_trims(tmp_path, monkeypatch):
     reads = _write_reads(tmp_path / "reads.parquet", [(5, 1, "ACGT")])
     mask = _write_mask(tmp_path / "mask.parquet", [(9, 5, 1, _PASS)])
-    _stub_hits(monkeypatch, [(1, "77")])
+    _stub_hits(monkeypatch, [1])
     out = _run(tmp_path, reads, mask, _index(tmp_path))
     with duckdb.connect(":memory:") as conn:
         row = conn.execute(
