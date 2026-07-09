@@ -494,6 +494,7 @@ async def get_sequenced_pool(
         raw_read_count_r1r2=data.pop("raw_read_count_r1r2"),
         biological_read_count_r1r2=data.pop("biological_read_count_r1r2"),
         quality_filtered_read_count_r1r2=data.pop("quality_filtered_read_count_r1r2"),
+        spikein_read_count_r1r2=data.pop("spikein_read_count_r1r2"),
         sample_count=data.pop("sample_count"),
         samples_with_metrics=data.pop("samples_with_metrics"),
     )
@@ -558,6 +559,7 @@ async def get_sequenced_pool_qc_report(
             raw_read_count_r1r2=rollup["raw_read_count_r1r2"],
             biological_read_count_r1r2=rollup["biological_read_count_r1r2"],
             quality_filtered_read_count_r1r2=rollup["quality_filtered_read_count_r1r2"],
+            spikein_read_count_r1r2=rollup["spikein_read_count_r1r2"],
             sample_count=rollup["sample_count"],
             samples_with_metrics=rollup["samples_with_metrics"],
         ),

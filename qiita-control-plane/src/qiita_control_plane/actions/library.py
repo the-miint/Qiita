@@ -29,7 +29,12 @@ import asyncpg
 import duckdb
 import pyarrow.flight as _flight
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.models import FeatureHashEntry
+from qiita_common.models import (
+    FeatureHashEntry,
+    ReadMaskBucket,
+    ReadMaskReason,
+    read_mask_reason_sql_list,
+)
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action
@@ -492,9 +497,14 @@ async def register_index(
     )
 
 
-def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int]:
-    """Derive the three per-stage both-mates (`*_r1r2`) read counts from a
-    read_mask Parquet, returning (raw, biological, quality_filtered).
+def _both_mates(predicate: str) -> str:
+    """`COUNT(*) + COUNT(right_trim2)` under `predicate` — the both-mates total."""
+    return f"count(*) FILTER (WHERE {predicate}) + count(right_trim2) FILTER (WHERE {predicate})"
+
+
+def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int, int]:
+    """Derive the four per-stage both-mates (`*_r1r2`) read counts from a
+    read_mask Parquet, returning (raw, biological, quality_filtered, spikein).
 
     The mask has one row per read (a single-end read or a paired-end pair), so a
     bare COUNT(*) would silently HALVE paired-end totals — the persisted columns
@@ -504,23 +514,38 @@ def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int]:
     `COUNT(*) + COUNT(right_trim2)` is the both-mates total — correct for SE
     (no R2), PE, and a mix, with no SE/PE branching.
 
-    Buckets by `reason` (ReadMaskReason): raw = every row, biological = rows that
-    didn't fail QC (`reason NOT LIKE 'qc_%'` — i.e. `pass` or a `host_*` hit),
-    quality_filtered = the `pass` rows the read_masked view surfaces. raw >=
-    biological >= quality_filtered holds by construction (host_* only overrides
-    pass), satisfying the sequenced_sample monotonic CHECK."""
+    Buckets come from `READ_MASK_BUCKET` (qiita-common), a WHITELIST: `raw` is
+    every row; `biological` is `pass` + the `host_*` hits (a human read is still a
+    biological read); `spikein` is disjoint from biological (a spike-in is added in
+    the lab); `quality_filtered` is the `pass` SUBSET of biological, the rows the
+    read_masked view surfaces. `qc_*` and `twist_no_adaptor` count toward `raw`
+    only.
+
+    The predicate used to be `reason NOT LIKE 'qc_%'` — fail-OPEN, so any new
+    reason was counted as biological by default. Deriving it from the enum makes an
+    unclassified reason a test failure instead of a silently wrong metric.
+
+    `quality_filtered <= biological` and `biological + spikein <= raw` hold by
+    construction (each step only ever overrides `pass`), satisfying the
+    sequenced_sample monotonic CHECK.
+
+    The data plane's `mask_metrics_counts` (Rust) is the block-path twin of this
+    function and MUST bucket identically; the read-mask block e2e test asserts both
+    paths agree."""
+    biological = f"reason IN ({read_mask_reason_sql_list(ReadMaskBucket.BIOLOGICAL)})"
+    spikein = f"reason IN ({read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN)})"
+    quality_filtered = f"reason = '{ReadMaskReason.PASS.value}'"
     path_sql = validate_parquet_path(read_mask_path)
     with duckdb.connect(":memory:") as duck:
-        raw, biological, quality_filtered = duck.execute(
+        raw, bio, qf, spike = duck.execute(
             "SELECT "
             "  count(*) + count(right_trim2), "
-            "  count(*) FILTER (WHERE reason NOT LIKE 'qc_%') "
-            "    + count(right_trim2) FILTER (WHERE reason NOT LIKE 'qc_%'), "
-            "  count(*) FILTER (WHERE reason = 'pass') "
-            "    + count(right_trim2) FILTER (WHERE reason = 'pass') "
+            f"  {_both_mates(biological)}, "
+            f"  {_both_mates(quality_filtered)}, "
+            f"  {_both_mates(spikein)} "
             f"FROM read_parquet('{path_sql}')"
         ).fetchone()
-    return raw, biological, quality_filtered
+    return raw, bio, qf, spike
 
 
 async def _update_sequenced_sample_read_counts(
@@ -530,8 +555,9 @@ async def _update_sequenced_sample_read_counts(
     raw: int,
     biological: int,
     quality_filtered: int,
+    spikein: int,
 ) -> int | None:
-    """Write the three per-stage both-mates (`*_r1r2`) read counts onto the 1:1
+    """Write the four per-stage both-mates (`*_r1r2`) read counts onto the 1:1
     sequenced_sample row for `prep_sample_idx`; return its idx, or None if no such
     row exists (the caller raises its own ordering-specific error).
 
@@ -539,19 +565,21 @@ async def _update_sequenced_sample_read_counts(
     parquet) and `_finalize_sample_metrics` (block-compute path, counts from the
     DuckLake `mask_metrics` aggregate). Idempotent — a retried workflow overwrites
     with the same counts. Accepts a pool or a connection so it composes standalone
-    or inside a transaction. The DB CHECK (quality_filtered <= biological <= raw)
-    enforces stage monotonicity at write time."""
+    or inside a transaction. The DB CHECK (quality_filtered <= biological and
+    biological + spikein <= raw) enforces the bucket invariants at write time."""
     return await conn.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_read_count_r1r2 = $2,"
         "     biological_read_count_r1r2 = $3,"
-        "     quality_filtered_read_count_r1r2 = $4"
+        "     quality_filtered_read_count_r1r2 = $4,"
+        "     spikein_read_count_r1r2 = $5"
         " WHERE prep_sample_idx = $1"
         " RETURNING idx",
         prep_sample_idx,
         raw,
         biological,
         quality_filtered,
+        spikein,
     )
 
 
@@ -580,15 +608,19 @@ async def persist_read_metrics(
     row did change)."""
     if not read_mask_path.exists():
         raise FileNotFoundError(f"read_mask parquet not found: {read_mask_path}")
-    raw_read_count_r1r2, biological_read_count_r1r2, quality_filtered_read_count_r1r2 = (
-        _read_mask_counts(read_mask_path)
-    )
+    (
+        raw_read_count_r1r2,
+        biological_read_count_r1r2,
+        quality_filtered_read_count_r1r2,
+        spikein_read_count_r1r2,
+    ) = _read_mask_counts(read_mask_path)
     ss_idx = await _update_sequenced_sample_read_counts(
         pool,
         prep_sample_idx,
         raw=raw_read_count_r1r2,
         biological=biological_read_count_r1r2,
         quality_filtered=quality_filtered_read_count_r1r2,
+        spikein=spikein_read_count_r1r2,
     )
     if ss_idx is None:
         raise RuntimeError(
@@ -778,9 +810,11 @@ async def mask_metrics_data(
     """Aggregate a sample's per-stage read counts for one mask from the DuckLake
     `read_mask` table via the data plane's `mask_metrics` DoAction.
 
-    Returns `{raw, biological, quality_filtered, row_count}` — the both-mates
-    (`*_r1r2`) totals `sequenced_sample` stores plus `row_count` (one per
-    read/pair) the reconcile count-assertion checks against `sequence_range`.
+    Returns `{raw, biological, quality_filtered, spikein, row_count}` — the
+    both-mates (`*_r1r2`) totals `sequenced_sample` stores plus `row_count` (one
+    per read/pair) the reconcile count-assertion checks against `sequence_range`.
+    The buckets are produced by the data plane's `mask_metrics_counts`, the Rust
+    twin of `_read_mask_counts`; the two must agree (see the block e2e test).
     Unlike the per-sample path's local-parquet `_read_mask_counts`, this reads the
     PERSISTED table because a block-masked sample's rows are written by several
     blocks. Raises pyarrow.flight.FlightError on transport / data-plane failure,
@@ -883,6 +917,10 @@ async def _finalize_sample_metrics(
         raw=counts["raw"],
         biological=counts["biological"],
         quality_filtered=counts["quality_filtered"],
+        # The block workflow (read-mask-block) is qc -> host_filter only: it runs
+        # no syndna step, so a block mask never carries a spike-in. The data plane
+        # still emits the key; `.get` keeps this honest if an older DP is deployed.
+        spikein=counts.get("spikein", 0),
     )
     if ss_idx is None:
         raise RuntimeError(

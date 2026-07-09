@@ -1340,6 +1340,7 @@ def _expected_read_response(
         "raw_read_count_r1r2": None,
         "biological_read_count_r1r2": None,
         "quality_filtered_read_count_r1r2": None,
+        "spikein_read_count_r1r2": None,
         "fraction_passing_quality_filter": None,
         "last_metadata_change_at": expected_last_meta,
         "created_by_idx": created_by_idx,
@@ -2366,7 +2367,8 @@ async def test_get_sequenced_sample_surfaces_read_metrics(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "get-metrics")
     await ctx["pool"].execute(
         "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = 1000,"
-        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 850"
+        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 850,"
+        " spikein_read_count_r1r2 = 40"
         " WHERE idx = $1",
         seeded["sequenced_sample_idx"],
     )
@@ -2379,6 +2381,7 @@ async def test_get_sequenced_sample_surfaces_read_metrics(ctx):
     assert rj["raw_read_count_r1r2"] == 1000
     assert rj["biological_read_count_r1r2"] == 900
     assert rj["quality_filtered_read_count_r1r2"] == 850
+    assert rj["spikein_read_count_r1r2"] == 40
     assert rj["fraction_passing_quality_filter"] == pytest.approx(0.85)
 
 

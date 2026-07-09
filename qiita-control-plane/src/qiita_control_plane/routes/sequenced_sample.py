@@ -598,6 +598,7 @@ def _sequenced_sample_response_from_row(
             "raw_read_count_r1r2": row["raw_read_count_r1r2"],
             "biological_read_count_r1r2": row["biological_read_count_r1r2"],
             "quality_filtered_read_count_r1r2": row["quality_filtered_read_count_r1r2"],
+            "spikein_read_count_r1r2": row["spikein_read_count_r1r2"],
             "last_metadata_change_at": row["last_metadata_change_at"],
             "created_by_idx": row["created_by_idx"],
             "created_at": row["created_at"],

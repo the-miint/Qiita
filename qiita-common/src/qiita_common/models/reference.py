@@ -80,6 +80,56 @@ class ReadMaskReason(StrEnum):
     SPIKEIN_SYNDNA = "spikein_syndna"
 
 
+class ReadMaskBucket(StrEnum):
+    """Which `sequenced_sample` read-count column a `ReadMaskReason` contributes to.
+
+    Every reason counts toward `raw` (it is a row in the mask). Beyond that:
+
+    * `BIOLOGICAL` — a molecule from the sample that survived the technical
+      filters. `pass` plus the `host_*` hits: a human read is still a biological
+      read, just one we deplete. `quality_filtered` is the `pass` SUBSET of this
+      bucket, not a bucket of its own.
+    * `SPIKEIN` — added in the lab. Disjoint from BIOLOGICAL, with its own column,
+      because the cell-count model divides by it.
+    * `RAW_ONLY` — counted nowhere else. QC failures, and `twist_no_adaptor`
+      (a read with no Twist adaptor is artifactual, not a library molecule).
+
+    This map is a WHITELIST, deliberately. The predicate it replaced was
+    `reason NOT LIKE 'qc_%'` — fail-OPEN, so every reason added since would have
+    been silently counted as biological. `test_read_mask_buckets` fails on any
+    unclassified reason, so a new one must be placed here on purpose.
+    """
+
+    BIOLOGICAL = "biological"
+    SPIKEIN = "spikein"
+    RAW_ONLY = "raw_only"
+
+
+READ_MASK_BUCKET: dict[ReadMaskReason, ReadMaskBucket] = {
+    ReadMaskReason.PASS: ReadMaskBucket.BIOLOGICAL,
+    ReadMaskReason.HOST_RYPE: ReadMaskBucket.BIOLOGICAL,
+    ReadMaskReason.HOST_MINIMAP2: ReadMaskBucket.BIOLOGICAL,
+    ReadMaskReason.SPIKEIN_SYNDNA: ReadMaskBucket.SPIKEIN,
+    ReadMaskReason.QC_TOO_SHORT: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.QC_TOO_LONG: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.QC_LOW_QUALITY: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.QC_TOO_MANY_N: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.TWIST_NO_ADAPTOR: ReadMaskBucket.RAW_ONLY,
+}
+
+
+def read_mask_reason_sql_list(bucket: ReadMaskBucket) -> str:
+    """A SQL `IN (...)` list of the reasons in `bucket`, sorted for determinism.
+
+    The single source of truth for the count predicates in
+    `qiita_control_plane.actions.library._read_mask_counts`. The data plane's
+    `mask_metrics_counts` (Rust) MUST emit the same lists — it cannot import this,
+    so the two are kept in lockstep by the read-mask block e2e test, which asserts
+    both paths produce identical counts."""
+    reasons = sorted(r.value for r, b in READ_MASK_BUCKET.items() if b is bucket)
+    return ", ".join(f"'{r}'" for r in reasons)
+
+
 class TerminologyStatus(StrEnum):
     """Lifecycle states of a terminology row.
 

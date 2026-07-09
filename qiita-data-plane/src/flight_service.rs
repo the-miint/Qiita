@@ -1419,6 +1419,15 @@ fn count_masked_reads(
         .map_err(|e| Status::internal(format!("count_masked query failed: {e}")))
 }
 
+/// Reason lists for the read-mask count buckets — the Rust twin of qiita-common's
+/// `READ_MASK_BUCKET` (`read_mask_reason_sql_list`). A WHITELIST: a ReadMaskReason
+/// absent from both lists counts toward `raw` only, which is the correct default
+/// for a QC failure or `twist_no_adaptor`, and is why the fail-open
+/// `NOT LIKE 'qc_%'` predicate was retired. Adding a reason means editing here AND
+/// the Python map; the block e2e test asserts the two paths agree.
+const BIOLOGICAL_REASONS: &str = "'host_minimap2', 'host_rype', 'pass'";
+const SPIKEIN_REASONS: &str = "'spikein_syndna'";
+
 /// Aggregate a sample's `read_mask` rows for one mask into the per-stage read
 /// counts the block reconcile primitive persists onto `sequenced_sample`.
 ///
@@ -1433,8 +1442,22 @@ fn count_masked_reads(
 /// `right_trim2` is non-NULL for paired-end and NULL for single-end, so
 /// `count(right_trim2)` is the R2 count and `count(*) + count(right_trim2)` is the
 /// both-mates total — matching `_read_mask_counts` exactly (SE / PE / mixed, no
-/// branching). Bucketing mirrors it too: raw = every row, biological =
-/// `reason NOT LIKE 'qc_%'` (pass + host_*), quality_filtered = `reason = 'pass'`.
+/// branching).
+///
+/// Bucketing mirrors it too, and is a WHITELIST rather than the fail-open
+/// `reason NOT LIKE 'qc_%'` it replaced: raw = every row; biological = `pass` +
+/// the `host_*` hits (a human read is still a biological read); spikein =
+/// `spikein_syndna`, disjoint from biological (a spike-in is added in the lab);
+/// quality_filtered = the `pass` subset. `qc_*` and `twist_no_adaptor` count
+/// toward raw only.
+///
+/// The reason lists below are the Rust twin of `READ_MASK_BUCKET` in qiita-common
+/// (`read_mask_reason_sql_list`). Rust cannot import it, so the two are kept in
+/// lockstep by `tests/integration/test_read_mask_block_e2e.py`, which asserts the
+/// per-sample and block paths produce identical counts. Adding a ReadMaskReason
+/// means touching BOTH sides — the Python bucket-coverage test catches the Python
+/// half, this comment is your reminder for the Rust half.
+///
 /// Opens and drops its own connection so the caller can run it on the blocking
 /// pool (mirrors `count_masked_reads`).
 fn mask_metrics_counts(
@@ -1449,23 +1472,32 @@ fn mask_metrics_counts(
     let sql = format!(
         "SELECT \
            count(*) + count(right_trim2), \
-           count(*) FILTER (WHERE reason NOT LIKE 'qc_%') \
-             + count(right_trim2) FILTER (WHERE reason NOT LIKE 'qc_%'), \
+           count(*) FILTER (WHERE reason IN ({BIOLOGICAL_REASONS})) \
+             + count(right_trim2) FILTER (WHERE reason IN ({BIOLOGICAL_REASONS})), \
            count(*) FILTER (WHERE reason = 'pass') \
              + count(right_trim2) FILTER (WHERE reason = 'pass'), \
+           count(*) FILTER (WHERE reason IN ({SPIKEIN_REASONS})) \
+             + count(right_trim2) FILTER (WHERE reason IN ({SPIKEIN_REASONS})), \
            count(*) \
          FROM qiita_lake.read_mask \
          WHERE mask_idx = {mask_idx} AND prep_sample_idx = {prep_sample_idx}"
     );
-    let (raw, biological, quality_filtered, row_count): (i64, i64, i64, i64) = conn
+    let (raw, biological, quality_filtered, spikein, row_count): (i64, i64, i64, i64, i64) = conn
         .query_row(&sql, [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .map_err(|e| Status::internal(format!("mask_metrics query failed: {e}")))?;
     Ok(serde_json::json!({
         "raw": raw,
         "biological": biological,
         "quality_filtered": quality_filtered,
+        "spikein": spikein,
         "row_count": row_count,
     }))
 }
