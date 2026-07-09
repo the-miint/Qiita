@@ -4432,3 +4432,168 @@ def test_reference_list_index_type_no_match_returns_empty(monkeypatch, capsys):
     )
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == []
+
+
+# --- PacBio read-mask gate derivation ----------------------------------------
+#
+# The roster carries the raw pre-flight facts; the POLICY that turns them into
+# `when:` gates lives in the submit. `when:` is DEFAULT-ON, so both keys must be
+# written on EVERY ticket — an Illumina ticket that merely omitted lima_enabled
+# would run the long-read lima chain.
+
+
+def _sample(**kw):
+    base = {"sequenced_pool_item_id": "bc01", "prep_sample_idx": 1, "human_filtering": False}
+    base.update(kw)
+    return base
+
+
+def test_pacbio_gates_none_for_an_illumina_roster():
+    """An Illumina roster carries no sheet_type; the submit must not invent one."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    assert _pacbio_gates(_sample()) is None
+
+
+def test_pacbio_gates_case5_signature():
+    """absquant + twist filled + syndna_is_twisted False -> both gates on."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=False)
+    )
+    assert g == {"syndna_enabled": True, "lima_enabled": True}
+
+
+def test_pacbio_gates_absquant_without_twist_is_syndna_only():
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id=None, syndna_is_twisted=None)
+    )
+    assert g == {"syndna_enabled": True, "lima_enabled": False}
+
+
+def test_pacbio_gates_twisted_syndna_disables_lima():
+    """syndna_is_twisted True means the spike-in already carries the adaptor, so
+    lima must NOT run even though twist_adaptor_id is filled."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=True)
+    )
+    assert g["lima_enabled"] is False
+
+
+def test_pacbio_gates_null_syndna_is_twisted_does_not_enable_lima():
+    """NULL means the pre-flight never answered — not the same as 'no'. `not None`
+    would be True and would silently enable lima."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=None)
+    )
+    assert g["lima_enabled"] is False
+
+
+def test_pacbio_gates_non_absquant_sheet_has_no_syndna():
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_metag", twist_adaptor_id="T1", syndna_is_twisted=False)
+    )
+    assert g == {"syndna_enabled": False, "lima_enabled": True}
+
+
+def _case5(**kw):
+    return _sample(
+        sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=False, **kw
+    )
+
+
+def test_pacbio_submission_requires_syndna_reference():
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit, match="syndna-reference-idx is required"):
+        _assert_pacbio_submission_coherent(
+            [_case5()],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=None,
+            force=False,
+        )
+
+
+def test_pacbio_submission_rejects_minimap2():
+    """Long-read host filtering is rype-only."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit, match="rype-only"):
+        _assert_pacbio_submission_coherent(
+            [_case5()],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=3,
+            host_minimap2_reference_idx=4,
+            syndna_reference_idx=7,
+            force=False,
+        )
+
+
+def test_pacbio_submission_requires_host_ref_when_any_sample_wants_filtering():
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit, match="no.*host-rype-reference-idx"):
+        _assert_pacbio_submission_coherent(
+            [_case5(human_filtering=False), _case5(human_filtering=True)],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=7,
+            force=False,
+        )
+
+
+def test_pacbio_submission_allows_a_mixed_host_filter_pool():
+    """PacBio host filtering is PER SAMPLE: a pool may legitimately mix filtered
+    and unfiltered samples. This is what the Illumina pool-uniform guard forbids."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    _assert_pacbio_submission_coherent(
+        [_case5(human_filtering=True), _case5(human_filtering=False)],
+        sequenced_pool_idx=1,
+        host_rype_reference_idx=3,
+        host_minimap2_reference_idx=None,
+        syndna_reference_idx=7,
+        force=False,
+    )
+
+
+def test_pacbio_submission_aborts_on_a_null_intent():
+    """The pre-flight could not answer; guessing would leak human reads or silently
+    drop a filter the operator asked for."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit, match="no.*human_filtering intent"):
+        _assert_pacbio_submission_coherent(
+            [_case5(human_filtering=None)],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=3,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=7,
+            force=False,
+        )
+
+
+def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool():
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit, match="no sample in this pool carries SynDNA"):
+        _assert_pacbio_submission_coherent(
+            [_sample(sheet_type="pacbio_metag", twist_adaptor_id=None, syndna_is_twisted=None)],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=7,
+            force=False,
+        )

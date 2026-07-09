@@ -428,13 +428,21 @@ async def run_workflow(
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
             # entry when its named action_context key is present and falsy
-            # (default-ON — an absent key runs). Evaluated FIRST, before the
-            # fast-forward / target_status PATCH / dispatch, so a gated-off
-            # entry neither advances status nor binds outputs. `bound` is
-            # seeded from the persisted action_context, so the decision is
-            # deterministic and resume-safe; skipping via `continue` (never by
-            # filtering action.steps) keeps the integer step_index that
-            # `_completed_progress_row` matches on stable across a resume.
+            # (default-ON — an absent key RUNS the step; read-mask's
+            # context_schema `required:` is what stops that being a footgun).
+            # Evaluated FIRST, before the fast-forward / target_status PATCH /
+            # dispatch, so a gated-off entry neither advances status nor binds
+            # outputs.
+            #
+            # `bound` is NOT just the persisted action_context: it is seeded from
+            # it, then accumulates resolved paths, mask bindings, the minted
+            # processing_idx, and `bound.update(outputs)` after EVERY completed
+            # step. So a later entry's gate key can in principle be shadowed by an
+            # earlier step's OUTPUT binding. Nothing does that today (every shipped
+            # `when:` key comes from action_context), but do not assume otherwise
+            # when naming an output. Resume is unaffected: action_context is
+            # persisted, and a skipped entry `continue`s rather than being filtered
+            # out, so step_index stays stable.
             if entry.when is not None and not bool(bound.get(entry.when, True)):
                 _log.info(
                     "workflow %d: skipping entry %d (%s) — when=%r is falsy",

@@ -376,6 +376,44 @@ else
 fi
 rm -f "$MIINT_HOSTFILTER_PROBE"
 
+# `infer_trim` (the read-mask lima chain's trim reconciler) is a table MACRO, not a
+# scalar, so registration alone proves little — INVOKE it. It is cheap: two
+# two-row relations. It is also the newest miint dependency, and the failure mode
+# it guards is nasty: a stale extension_directory (a plain INSTALL never refreshes
+# a warm cache) yields a build with every OTHER function present, so the lima_mask
+# step fails at the first real submit with a bare catalog error. Assert the whole
+# contract here, at deploy: one row per ORIGINAL read, NULL/NULL for a read the
+# tool omitted.
+MIINT_INFERTRIM_PROBE="$(mktemp)"
+cat > "$MIINT_INFERTRIM_PROBE" <<'PYEOF'
+import sys
+try:
+    import duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    conn.execute(
+        "CREATE TABLE orig AS SELECT 1::BIGINT AS sequence_index, 'AAACCCGGGTTT' AS sequence "
+        "UNION ALL SELECT 2::BIGINT, 'TTTTGGGGCCCC'"
+    )
+    conn.execute("CREATE TABLE qcd AS SELECT 1::BIGINT AS sequence_index, 'CCCGGG' AS sequence")
+    rows = conn.execute(
+        "SELECT sequence_index, trimmed_5p, trimmed_3p FROM infer_trim(orig, qcd) "
+        "ORDER BY sequence_index"
+    ).fetchall()
+    assert rows == [(1, 3, 3), (2, None, None)], "infer_trim contract drift: " + str(rows)
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
+PYEOF
+if MIINT_ERR="$("$PYTHON" "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
+    echo "{_PROBE_LINE_PREFIX} miint-infer-trim=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-infer-trim=fail err=$MIINT_ERR"
+fi
+rm -f "$MIINT_INFERTRIM_PROBE"
+
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the
 # per-ticket workspace SLURM jobs actually run in.

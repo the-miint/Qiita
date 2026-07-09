@@ -775,6 +775,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="With --host: rype minimizer window `w` for the rype index build (default 20).",
     )
     p_reference_load.add_argument(
+        "--rype-bucket-per-feature",
+        action="store_true",
+        help=(
+            "With --host: build the rype index with ONE BUCKET PER FEATURE instead of"
+            " one bucket for the whole reference. Host filtering wants the default"
+            " (its answer is boolean); a SynDNA spike-in reference needs this, so"
+            " rype_classify's bucket_name names WHICH spike-in a read hit — that is"
+            " what yields per-spike-in counts rather than a bare total."
+        ),
+    )
+    p_reference_load.add_argument(
         "--minimap2-preset",
         choices=("sr", "map-ont", "map-pb", "map-hifi", "asm5", "asm10", "asm20"),
         help="With --host: minimap2 preset baked into the .mmi index (default sr).",
@@ -1099,6 +1110,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
             " the second host-filter pass on rype's survivors. Requires"
             " --host-rype-reference-idx. Omit for a rype-only host filter."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--syndna-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "ACTIVE reference_idx whose rype (.ryxdi) index identifies SynDNA"
+            " spike-ins. REQUIRED for a PacBio absquant pool (sheet_type"
+            " pacbio_absquant); rejected otherwise. Build it with"
+            " --no-minimap2-index and rype_bucket_per_feature so each spike-in gets"
+            " its own bucket — that is what yields per-spike-in counts."
         ),
     )
     p_submit_hf.add_argument(

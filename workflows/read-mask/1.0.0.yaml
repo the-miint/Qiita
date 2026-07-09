@@ -66,7 +66,17 @@ audience:
 
 context_schema:
   type: object
-  required: []
+  # `when:` is DEFAULT-ON — `bool(action_context.get(key, True))` — so an absent
+  # gate key RUNS its step. These three are REQUIRED so a ticket that omits one is
+  # rejected with a 422 at POST /work-ticket rather than silently executing the
+  # long-read lima chain on a short-read sample.
+  #
+  # NOTE this guards the REST route only: block_planner INSERTs its tickets
+  # directly and so bypasses `validate_context`. It writes all three explicitly.
+  #
+  # (JSON-Schema `default:` is NOT injected — jsonschema never mutates the
+  # instance — so a default here would be documentation, not a gate.)
+  required: [host_filter_enabled, lima_enabled, syndna_enabled]
   properties:
     # Sequencing instrument model (e.g. "NextSeq 550"), forwarded per sample
     # from qiita.sequencing_run. The qc step gates polyG trimming on a 2-color
