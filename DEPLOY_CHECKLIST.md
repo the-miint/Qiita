@@ -42,11 +42,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   (`FLIGHT_TICKET_SIGNING_KEY`), the data plane gets the matching PUBLIC key
   (`FLIGHT_TICKET_PUBLIC_KEY`). Both are `from_env()` fail-fast. Set both **before**
   the restart, remove `HMAC_SECRET_KEY` from both env files, and **restart the
-  control plane and data plane together** — a brief window where any in-flight
-  HMAC (v1) ticket fails is expected and self-heals (tickets are short-lived; the
-  runner retries). `make preflight` verifies the keypair (CP seed → public key ==
-  DP public key) before the restart. (#263)
+  control plane and data plane together — they are a matched set with no partial
+  compatibility.** The DP holds one verifying key and hard-rejects v1 (HMAC)
+  tickets, and with HMAC gone from both sides there is no dual-accept — so a
+  half-completed swap is a *total* Flight outage, not a blip (HTTP routes are
+  unaffected). In-flight Flight work in the window does **not** uniformly
+  self-heal: a `step:` (SLURM) transient Flight error is retried, but an `action:`
+  (DoAction) rejection is classified permanent and needs manual redrive. Keep the
+  window short by restarting both together. `make preflight` checks the keypair
+  (derives the CP seed's public key via the **CP venv** interpreter and compares
+  to the DP's) — but if that interpreter lacks `cryptography` it reports `skip`,
+  not a green pass, so the **bucket-5 live DoGet is the definitive gate**. (#263)
   ```bash
+  # Back up both env files first — the sed below drops HMAC_SECRET_KEY in place,
+  # so keep a copy to roll back to the previous (HMAC) build if the swap misfires:
+  sudo cp -a /etc/qiita/control-plane.env /etc/qiita/control-plane.env.pre-ed25519.bak
+  sudo cp -a /etc/qiita/data-plane.env    /etc/qiita/data-plane.env.pre-ed25519.bak
   # Generate the keypair once (capture both values):
   python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
   # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):

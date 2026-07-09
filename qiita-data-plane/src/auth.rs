@@ -691,6 +691,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verify_export_read_block_rejects_extra_fields() {
+        // Top-level deny_unknown_fields (distinct from the member-level guard above).
+        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
     // -------------------- mask_metrics --------------------
 
     #[test]
@@ -700,6 +711,17 @@ mod tests {
         let parsed = verify_mask_metrics(&ticket, &test_vk()).expect("valid token should verify");
         assert_eq!(parsed.mask_idx, 42);
         assert_eq!(parsed.prep_sample_idx, 7);
+    }
+
+    #[test]
+    fn verify_mask_metrics_rejects_extra_fields() {
+        let payload =
+            br#"{"action":"mask_metrics","mask_idx":42,"prep_sample_idx":7,"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_mask_metrics(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
     }
 
     // -------------------- delete_read_mask_block --------------------
@@ -712,6 +734,16 @@ mod tests {
             verify_delete_read_mask_block(&ticket, &test_vk()).expect("valid token should verify");
         assert_eq!(parsed.mask_idx, 42);
         assert_eq!(parsed.members.len(), 1);
+    }
+
+    #[test]
+    fn verify_delete_read_mask_block_rejects_extra_fields() {
+        let payload = br#"{"action":"delete_read_mask_block","mask_idx":42,"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_read_mask_block(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
     }
 
     // -------------------- delete_pool_reads --------------------
@@ -731,6 +763,17 @@ mod tests {
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         let parsed = verify_delete_pool_reads(&ticket, &test_vk()).expect("should verify");
         assert!(parsed.prep_sample_idxs.is_empty());
+    }
+
+    #[test]
+    fn verify_delete_pool_reads_rejects_extra_fields() {
+        let payload =
+            br#"{"action":"delete_pool_reads","prep_sample_idxs":[10,11,12],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_pool_reads(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
     }
 
     /// Cross-language interop: this ticket was signed by the Python control plane

@@ -94,26 +94,29 @@ if [ -r "$CP_ENV" ] && [ -r "$DP_ENV" ]; then
     elif [ "$seed_len" != "32" ] || [ "$pub_len" != "32" ]; then
         fail "flight-keypair" "keys must decode to 32 bytes (Ed25519); CP seed=${seed_len}B, DP pub=${pub_len}B"
     else
-        # Best-effort: derive the public key from the CP seed and confirm it matches
-        # the DP's public key. Needs python3 + cryptography (present in the CP venv);
-        # degrades to a presence/length check otherwise. The DP only validates the
-        # public key's curve-validity at boot (it never sees the CP seed), so the
-        # bucket-5 live DoGet is what actually exercises the correspondence.
-        derived=$(printf '%s' "$cp_seed" | python3 -c '
+        # Derive the public key from the CP seed and confirm it matches the DP's
+        # public key. This needs `cryptography`, which ships in the CP venv — so
+        # invoke that interpreter explicitly. A bare `python3` may lack it, and an
+        # ImportError there previously degraded this check to a green `pass`; a
+        # check that cannot run must say so (skip), never report success. The DP
+        # only validates the public key's curve-validity at boot (it never sees
+        # the CP seed), so the bucket-5 live DoGet remains the definitive gate.
+        cp_py="${CP_PY:-/opt/qiita/control-plane/.venv/bin/python}"
+        derived=""
+        if [ -x "$cp_py" ]; then
+            derived=$(printf '%s' "$cp_seed" | "$cp_py" -c '
 import sys, base64
-try:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-except Exception:
-    sys.exit(3)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 seed = base64.b64decode(sys.stdin.read())
 print(base64.b64encode(Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()).decode())
-' 2>/dev/null) || true
-        if [ -z "$derived" ]; then
-            pass "flight-keypair" "CP seed (sha256:${cp_fp}) + DP pub (sha256:${dp_fp}) present, 32B each (correspondence not checked here — the bucket-5 live DoGet exercises it)"
-        elif [ "$derived" = "$dp_pub" ]; then
+' 2>/dev/null) || derived=""
+        fi
+        if [ "$derived" = "$dp_pub" ] && [ -n "$derived" ]; then
             pass "flight-keypair" "DP public key matches CP signing seed (pub sha256:${dp_fp})"
-        else
+        elif [ -n "$derived" ]; then
             fail "flight-keypair" "DP FLIGHT_TICKET_PUBLIC_KEY is not the public key of CP FLIGHT_TICKET_SIGNING_KEY — Flight tickets will fail to verify"
+        else
+            skip "flight-keypair" "correspondence NOT verified — CP venv python ($cp_py) missing or lacks cryptography (set CP_PY to override). Both keys present + 32B each (CP sha256:${cp_fp}, DP sha256:${dp_fp}); the bucket-5 live DoGet is the real gate."
         fi
     fi
 else

@@ -699,6 +699,7 @@ source = { directory = "../../qiita-control-plane" }
 dependencies = [
     { name = "aiosmtplib" },
     { name = "asyncpg" },
+    { name = "cryptography" },
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "grpcio" },
@@ -718,6 +719,7 @@ dependencies = [
 requires-dist = [
     { name = "aiosmtplib", specifier = ">=3.0" },
     { name = "asyncpg", specifier = ">=0.31" },
+    { name = "cryptography", specifier = ">=44" },
     { name = "duckdb", specifier = ">=1.5.4" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "grpcio", specifier = ">=1.66" },
