@@ -207,6 +207,41 @@ async def _resolve_host_filter_two_reference(
     return bound
 
 
+async def _resolve_syndna_index(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    action_context: dict[str, Any],
+) -> dict[str, Path]:
+    """Resolve the syndna spike-in rype index when syndna is enabled, else {}.
+
+    A syndna reference is just another **rype** reference — `_resolve_reference_index_path`
+    is generic on `index_type`, so no new index type, builder, or `derived_store`
+    path is needed. Binds `syndna_rype_path` for the syndna step's optional input.
+
+    Run before the step loop (and so before the mask mint) for the same reason the
+    host arms are: a stale, deleted, or non-active `syndna_reference_idx` must fail
+    at SUBMISSION rather than sail into the mask identity hash and die deep in the
+    step loop. Gated by `syndna_enabled`; enabled without a reference is a contract
+    error, not a silent no-op.
+
+    `_resolve_required_host_index` is named for its first caller but is generic —
+    it maps unknown / non-active / index-not-built to a SUBMISSION BAD_INPUT.
+    """
+    if not action_context.get("syndna_enabled"):
+        return {}
+    syndna_idx = action_context.get("syndna_reference_idx")
+    if syndna_idx is None:
+        raise _submission_bad_input("syndna_enabled requires syndna_reference_idx")
+    return {
+        SYNDNA_RYPE_BINDING: await _resolve_required_host_index(
+            pool,
+            _coerce_reference_idx(syndna_idx, "syndna_reference_idx"),
+            HOST_FILTER_INDEX_TYPE_RYPE,
+            "syndna_reference_idx",
+        )
+    }
+
+
 async def _resolve_host_filter_legacy(
     pool: asyncpg.Pool | asyncpg.Connection,
     host_reference_idx: Any,
@@ -253,6 +288,9 @@ async def _resolve_host_filter_legacy(
 # Binding name the runner stages the canonical adapter set (a Parquet) under. A
 # step that lists this in its `inputs` (the qc step) signals the runner to
 # materialize the adapter set before the step loop (see `_resolve_qc_adapters`).
+# Binding for the syndna spike-in rype index (the syndna step's optional input).
+SYNDNA_RYPE_BINDING = "syndna_rype_path"
+
 QC_ADAPTER_BINDING = "adapter_parquet"
 
 # The DuckLake table holding actual sequence bytes (reference_sequences is

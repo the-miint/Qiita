@@ -90,6 +90,23 @@ context_schema:
     host_minimap2_reference_idx:
       type: integer
       minimum: 1
+    # Adapter-removal gate (long reads only). `lima_enabled` selects the lima
+    # chain; `lima_preset` is the ONLY client-facing lima knob — the control
+    # plane resolves the argument string and the vendored adapter set's md5 from
+    # it, so a caller cannot forge mask identity or pass arbitrary flags.
+    lima_enabled:
+      type: boolean
+    lima_preset:
+      type: string
+      enum: [ASYMMETRIC, SYMMETRIC]
+    # Spike-in gate. `syndna_enabled`; when true `syndna_reference_idx` (REQUIRED)
+    # names an ACTIVE reference carrying a rype index — the same index type the
+    # host filter uses, so no new builder or index type is needed.
+    syndna_enabled:
+      type: boolean
+    syndna_reference_idx:
+      type: integer
+      minimum: 1
 
 steps:
   # Always-on QC over the stored reads. Emits a PARTIAL read mask (qc_mask: per

@@ -357,6 +357,12 @@ async def plan_and_submit_blocks(
                 adapter_set_hash=adapter_set_hash,
                 host_rype_reference_idx=host_rype_reference_idx,
                 host_minimap2_reference_idx=host_minimap2_reference_idx,
+                # The block workflow (read-mask-block) is `qc -> host_filter`
+                # only: it has no lima chain and no syndna step, so a block mask
+                # never carries either. Passed explicitly rather than defaulted so
+                # adding a block-path feature has to come here and say so.
+                resolved_lima=None,
+                syndna_reference_idx=None,
             )
             mask_row = await mint_mask_definition(
                 conn,

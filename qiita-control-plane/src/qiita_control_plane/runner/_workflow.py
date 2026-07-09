@@ -58,6 +58,8 @@ from ._mask import (
     MASK_IDX_BINDING,
     _mint_read_mask,
     _persist_mask_idx,
+    _resolved_lima,
+    _resolved_syndna_reference_idx,
     _workflow_needs_mask,
 )
 from ._processing import (
@@ -86,6 +88,7 @@ from ._reference import (
     QC_ADAPTER_BINDING,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
+    _resolve_syndna_index,
     _workflow_needs_adapters,
 )
 from ._upload import (
@@ -234,6 +237,9 @@ async def run_workflow(
         # of the host_*_reference_idx keys are `*_upload_idx`, so the walker above
         # left them untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
+        # Syndna's rype index, resolved (and validated ACTIVE) before the mask
+        # mint below reads `syndna_reference_idx` into the identity hash.
+        bound.update(await _resolve_syndna_index(pool, action_context=bound))
 
         # QC adapter materialization: when any step needs `adapter_parquet` (the
         # qc step), DoGet the configured artifact_sequence_set reference's
@@ -359,6 +365,12 @@ async def run_workflow(
                         adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
                         host_rype_reference_idx=bound.get("host_rype_reference_idx"),
                         host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
+                        # What actually distinguishes the five PacBio protocols:
+                        # prep_protocol_idx is uniform across them. Both are gated
+                        # on their `*_enabled` flag, so a stale key cannot shift
+                        # the hash of a run that did not use the feature.
+                        resolved_lima=_resolved_lima(bound),
+                        syndna_reference_idx=_resolved_syndna_reference_idx(bound),
                     )
                 )
                 # Persist the minted mask_idx onto the ticket for durable
