@@ -53,6 +53,12 @@ class ReadMaskReason(StrEnum):
     a read is not a library molecule from this run — it is artifactual, not a real
     read whose adapter ligation merely failed. It therefore counts toward `raw`
     only, and is excluded from the biological bucket along with the `qc_*` values.
+
+    `spikein_syndna` marks a SynDNA spike-in: added in the lab, so not a molecule
+    from the sample. It is excluded from `biological` and carries its OWN count
+    bucket (the cell-count model needs it), and its rows are RETAINED in `read_mask`
+    so those counts survive.
+
     Note the biological predicate is a WHITELIST (`pass` + `host_*`), not
     `NOT LIKE 'qc_%'`: a new reason must be classified explicitly, never bucketed
     as biological by default.
@@ -71,6 +77,7 @@ class ReadMaskReason(StrEnum):
     HOST_RYPE = "host_rype"
     HOST_MINIMAP2 = "host_minimap2"
     TWIST_NO_ADAPTOR = "twist_no_adaptor"
+    SPIKEIN_SYNDNA = "spikein_syndna"
 
 
 class TerminologyStatus(StrEnum):
