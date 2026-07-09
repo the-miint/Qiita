@@ -1630,6 +1630,10 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
         # the route can't parse an intent and degrades human_filtering to null per
         # sample (see test_list_pool_samples_unparseable_preflight_degrades_to_null).
         "human_filtering": None,
+        # PacBio protocol facts: null for a non-PacBio (here, unparseable) preflight.
+        "sheet_type": None,
+        "twist_adaptor_id": None,
+        "syndna_is_twisted": None,
         # A freshly seeded sample has no work tickets, so both list routes report
         # has_read_mask_ticket False.
         "has_read_mask_ticket": False,
@@ -3221,3 +3225,70 @@ async def test_list_run_samples_missing_scope_403(ctx, no_prep_sample_read_clien
     )
     assert resp.status_code == 403
     assert "prep_sample:read" in resp.json()["detail"]
+
+
+async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, tmp_path):
+    """A PacBio pool's roster carries sheet_type / twist_adaptor_id /
+    syndna_is_twisted AND human_filtering, all derived from the stored blob.
+
+    This is the keying that matters: the PacBio composer uses the BARCODE as the
+    sequenced_pool_item_id, so the barcode-keyed map from the pre-flight lines up
+    with the roster. The Illumina reader keys on illumina_sample_idx and walks
+    run_illumina_sample — which PacBio has no analogue for — so without the
+    platform-aware split every PacBio sample's human_filtering would be null and
+    submit-host-filter-pool would abort before it started.
+    """
+    from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
+
+    from qiita_control_plane.preflight import pacbio_protocol_from_blob
+
+    csv = Path(__file__).parent.parent / "cli" / "data" / "good_pacbio_absquantv11.csv"
+    db = tmp_path / "case5.db"
+    migrate_legacy_csv_to_db_file(str(csv), str(db))
+    blob = db.read_bytes()
+    facts = pacbio_protocol_from_blob(blob)
+    assert facts, "fixture produced no PacBio rows"
+    barcode = sorted(facts)[0]
+
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-pacbio")
+    # Swap the placeholder bytes for the real PacBio pre-flight.
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_pool SET run_preflight_blob = $1 WHERE idx = $2",
+        blob,
+        pool_idx,
+    )
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-pacbio"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    bs = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    # The pool-item-id IS the barcode — that is what makes the roster join work.
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=barcode,
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 201, resp.text
+
+    listed = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert listed.status_code == 200, listed.text
+    (sample,) = listed.json()["samples"]
+    expected = facts[barcode]
+    assert sample["sheet_type"] == expected.sheet_type == "pacbio_absquant"
+    assert sample["twist_adaptor_id"] == expected.twist_adaptor_id
+    assert sample["syndna_is_twisted"] is False
+    # ...and human_filtering comes from the SAME join, not the Illumina reader.
+    assert sample["human_filtering"] == expected.human_filtering
+    assert sample["human_filtering"] is not None

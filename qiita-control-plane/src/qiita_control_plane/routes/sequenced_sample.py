@@ -86,6 +86,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..preflight import PacbioProtocol, pacbio_protocol_from_blob
 from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataUnknownFieldsError,
@@ -385,6 +386,70 @@ def _human_filtering_by_item_id(blob: bytes) -> dict[str, bool]:
     }
 
 
+def _pacbio_facts_by_item_id(blob: bytes) -> dict[str, PacbioProtocol]:
+    """Map each PacBio sample's barcode (== its ``sequenced_pool_item_id``) to its
+    protocol facts. ``{}`` for a non-PacBio blob, so the caller can try both
+    readers without branching. See ``qiita_control_plane.preflight`` — the join
+    lives there so the CLI and this route cannot drift."""
+    return pacbio_protocol_from_blob(blob)
+
+
+async def _pool_sample_facts_by_item_id(
+    pool: asyncpg.Pool,
+    *,
+    sequencing_run_idx: int,
+    sequenced_pool_idx: int,
+) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
+    """Return ``(human_filtering_by_item_id, pacbio_facts_by_item_id)`` for a pool.
+
+    PLATFORM-AWARE. The Illumina map keys on ``str(illumina_sample_idx)``; the
+    PacBio map keys on the barcode. A pool is one or the other (a pre-flight
+    carries a single run-level ``sheet_type``), so exactly one map is populated —
+    but both are returned so the roster route stays branch-free.
+
+    For PacBio, ``human_filtering`` comes from the SAME join as the protocol
+    fields: the Illumina reader walks ``run_illumina_sample``, which PacBio has no
+    analogue for, and would return ``{}`` — leaving every PacBio sample's intent
+    null and aborting ``submit-host-filter-pool`` before it starts.
+
+    Degrades to ``({}, {})`` on an unparseable blob (see the warning below).
+    """
+    row = await fetch_sequenced_pool_preflight(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+    )
+    if row is None or row["run_preflight_blob"] is None:
+        return {}, {}
+    blob = bytes(row["run_preflight_blob"])
+    # The PacBio read is a PROBE: a blob it cannot parse is simply not PacBio, and
+    # must not take the Illumina reader down with it. One `try` around both would do
+    # exactly that — every Illumina pool's intents would go null the moment the
+    # PacBio join raised. Only the Illumina failure warns, because by then the blob
+    # has failed BOTH readers.
+    try:
+        pacbio = _pacbio_facts_by_item_id(blob)
+    except sqlite3.DatabaseError, ValueError:
+        pacbio = {}
+    if pacbio:
+        return {
+            barcode: facts.human_filtering
+            for barcode, facts in pacbio.items()
+            if facts.human_filtering is not None
+        }, pacbio
+    try:
+        return _human_filtering_by_item_id(blob), {}
+    except (sqlite3.DatabaseError, ValueError) as exc:
+        _log.warning(
+            "could not parse stored run-preflight for sequenced_pool %s (run %s);"
+            " human_filtering will be null for its samples: %s",
+            sequenced_pool_idx,
+            sequencing_run_idx,
+            exc,
+        )
+        return {}, {}
+
+
 async def _pool_human_filtering_by_item_id(
     pool: asyncpg.Pool,
     *,
@@ -471,7 +536,7 @@ async def list_sequenced_samples_in_pool(
     # Derive each sample's intake human_filtering intent from the pool's stored
     # preflight blob and attach it by sequenced_pool_item_id; None per sample
     # when the pool has no preflight or the blob omits its row.
-    human_filtering_by_item_id = await _pool_human_filtering_by_item_id(
+    human_filtering_by_item_id, pacbio_by_item_id = await _pool_sample_facts_by_item_id(
         pool,
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
@@ -479,7 +544,15 @@ async def list_sequenced_samples_in_pool(
     samples = []
     for r in rows:
         item = dict(r)
-        item["human_filtering"] = human_filtering_by_item_id.get(item["sequenced_pool_item_id"])
+        item_id = item["sequenced_pool_item_id"]
+        item["human_filtering"] = human_filtering_by_item_id.get(item_id)
+        # PacBio protocol facts; absent (None) for an Illumina pool. The read-mask
+        # submit derives lima_enabled / syndna_enabled from these.
+        facts = pacbio_by_item_id.get(item_id)
+        if facts is not None:
+            item["sheet_type"] = facts.sheet_type
+            item["twist_adaptor_id"] = facts.twist_adaptor_id
+            item["syndna_is_twisted"] = facts.syndna_is_twisted
         samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(
         samples=samples,
