@@ -347,8 +347,9 @@ def _fake_stream_from_parquet(parquet: Path, captured: dict):
 
 def test_build_minimap2_index_shard_mode(tmp_path, monkeypatch):
     """Shard mode streams the roster's chunks (via open_reference_chunk_stream),
-    reassembles the subject, writes to `.../shards/{shard_id}/minimap2/index.mmi`,
-    and records `shard_id` + a stream-source params block in the meta."""
+    reassembles the subject, writes to `.../minimap2-shards/{shard_id}.mmi` (the
+    flat `{shard_directory}/{shard_name}.mmi` shape `align_minimap2_sharded`
+    binds), and records `shard_id` + a stream-source params block in the meta."""
     from qiita_compute_orchestrator.jobs import build_minimap2_index
 
     shared_root = tmp_path / "shared"
@@ -388,13 +389,7 @@ def test_build_minimap2_index_shard_mode(tmp_path, monkeypatch):
     assert save_capture["rows"] == [(100, "ACGTGGGG"), (300, "TTTT")]
 
     expected = (
-        shared_root
-        / "references"
-        / str(reference_idx)
-        / "shards"
-        / str(shard_id)
-        / "minimap2"
-        / "index.mmi"
+        shared_root / "references" / str(reference_idx) / "minimap2-shards" / f"{shard_id}.mmi"
     )
     assert save_capture["output_path"] == str(expected)
     assert expected.is_file()

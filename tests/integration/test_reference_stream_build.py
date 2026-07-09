@@ -107,7 +107,7 @@ def _fake_open_stream(data_plane):
 
 
 @pytest.mark.parametrize(
-    "module, meta_key, index_subdir",
+    "module, meta_key, aligner",
     [
         (build_minimap2_index, "minimap2_index_meta", "minimap2"),
         (build_bowtie2_index, "bowtie2_index_meta", "bowtie2"),
@@ -115,12 +115,14 @@ def _fake_open_stream(data_plane):
     ids=["minimap2", "bowtie2"],
 )
 def test_shard_build_streams_and_writes_artifact(
-    module, meta_key, index_subdir, data_plane, tmp_path, monkeypatch
+    module, meta_key, aligner, data_plane, tmp_path, monkeypatch
 ):
     """A shard build streams the roster's chunks from the live DP and the real
-    miint save_* writes the shard artifact at
-    `.../references/{ref}/shards/{shard}/{minimap2,bowtie2}/index*`, with the meta
-    carrying shard_id."""
+    miint save_* writes the shard artifact at the revised per-aligner shard-root
+    layout — minimap2 a flat `.../{ref}/minimap2-shards/{shard}.mmi`, bowtie2 a
+    per-shard subdir `.../{ref}/bowtie2-shards/{shard}/index.*` — with the meta
+    carrying shard_id. These are the exact `shard_directory` shapes
+    `align_*_sharded` binds."""
     import json
     from pathlib import Path
 
@@ -150,19 +152,16 @@ def test_shard_build_streams_and_writes_artifact(
     assert meta["params"]["num_subjects"] == len(_SUBSET)
 
     fs_path = Path(meta["fs_path"])
-    expected_dir = (
-        Path(tmp_path / "derived")
-        / "references"
-        / str(_REF_IDX)
-        / "shards"
-        / str(shard_id)
-        / index_subdir
-    )
-    assert fs_path.parent == expected_dir
-    if index_subdir == "minimap2":
+    ref_dir = Path(tmp_path / "derived") / "references" / str(_REF_IDX)
+    if aligner == "minimap2":
+        # Flat {shard_directory}/{shard_id}.mmi — the shard dir holds only .mmi files.
+        assert fs_path == ref_dir / "minimap2-shards" / f"{shard_id}.mmi"
         assert fs_path.is_file() and fs_path.stat().st_size > 0  # single .mmi
     else:
-        bt2 = list(expected_dir.glob(f"{fs_path.name}*.bt2"))  # multi-file .bt2 set
+        # Per-shard subdir {shard_directory}/{shard_id}/index.* (multi-file .bt2 set).
+        shard_subdir = ref_dir / "bowtie2-shards" / str(shard_id)
+        assert fs_path == shard_subdir / "index"
+        bt2 = list(shard_subdir.glob(f"{fs_path.name}*.bt2"))
         assert bt2 and all(f.stat().st_size > 0 for f in bt2)
 
 

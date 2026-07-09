@@ -263,7 +263,8 @@ def test_build_bowtie2_index_empty_reference_raises(tmp_path, monkeypatch):
 
 def test_build_bowtie2_index_shard_mode(tmp_path, monkeypatch):
     """Shard mode streams the roster's chunks, writes to
-    `.../shards/{shard_id}/bowtie2/index`, and records shard_id + a stream-source
+    `.../bowtie2-shards/{shard_id}/index` (the `{shard_directory}/{shard_name}/index.*`
+    shape `align_bowtie2_sharded` binds), and records shard_id + a stream-source
     params block (no preset)."""
     from qiita_compute_orchestrator.jobs import build_bowtie2_index
 
@@ -299,13 +300,7 @@ def test_build_bowtie2_index_shard_mode(tmp_path, monkeypatch):
     assert save_capture["rows"] == [(100, "ACGTGGGG"), (300, "TTTT")]
 
     expected_prefix = (
-        shared_root
-        / "references"
-        / str(reference_idx)
-        / "shards"
-        / str(shard_id)
-        / "bowtie2"
-        / "index"
+        shared_root / "references" / str(reference_idx) / "bowtie2-shards" / str(shard_id) / "index"
     )
     assert save_capture["output_path"] == str(expected_prefix)
     for suffix in _BT2_SUFFIXES:

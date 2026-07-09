@@ -11,7 +11,8 @@ C1's `align_bowtie2_sharded` reads. Two modes, identical in shape to
 * **Shard mode** (`shard_id` + `shard_features` roster) — one shard's subject
   index, built over just that shard's features, chunk bytes STREAMED from the
   data plane over Arrow Flight (B6s), written under
-  `.../shards/{shard_id}/bowtie2/index`.
+  `.../bowtie2-shards/{shard_id}/index` — the `{shard_directory}/{shard_name}/index.*`
+  shape `align_bowtie2_sharded` binds (`shard_name = str(shard_id)`).
 
 Both modes reassemble the per-feature contig into a `(read_id, sequence1)` subject
 via the shared `subject.stage_subject` (the same subject minimap2 indexes).
@@ -169,7 +170,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # the ephemeral per-attempt workspace. bowtie2 writes multiple `.bt2` files
     # under this prefix; the layout is owned by `derived_store` (shared with the
     # reference-artifact purge endpoint). A sharded build lands at
-    # `.../shards/{shard_id}/bowtie2/index`.
+    # `.../bowtie2-shards/{shard_id}/index` (a per-shard subdir, the shape
+    # `align_bowtie2_sharded` binds).
     path_derived = get_settings().path_derived
     index_prefix = (
         shard_bowtie2_index_prefix(path_derived, inputs.reference_idx, inputs.shard_id)

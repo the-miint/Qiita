@@ -13,9 +13,10 @@ Two modes, mirroring `build_rype_index`:
   subject index, built over just that shard's features. The roster's small
   `feature_idx` list rides the job input; the chunk bytes STREAM from the data
   plane over Arrow Flight (the B6s `open_reference_chunk_stream` seam), not staging
-  Parquet. Written to `.../shards/{shard_id}/minimap2/index.mmi`. This is the first
-  builder to consume the B6s stream; C1's `align_minimap2_sharded` consumes the
-  per-shard `.mmi` set.
+  Parquet. Written to `.../minimap2-shards/{shard_id}.mmi` — the flat
+  `{shard_directory}/{shard_name}.mmi` shape `align_minimap2_sharded` binds
+  (`shard_name = str(shard_id)`). This is the first builder to consume the B6s
+  stream; C1's `align_minimap2_sharded` consumes the per-shard `.mmi` set.
 
 Both modes reassemble the per-feature contig into a `(read_id, sequence1)` subject
 via the shared `subject.stage_subject` (`string_agg(chunk_data ORDER BY
@@ -192,7 +193,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # PATH_DERIVED into the job env so get_settings() resolves the real value.
     # The layout is owned by `derived_store` (shared with build_rype_index and
     # the reference-artifact purge endpoint). A sharded build lands at
-    # `.../shards/{shard_id}/minimap2/index.mmi` (one `.mmi` per shard).
+    # `.../minimap2-shards/{shard_id}.mmi` (one flat `.mmi` per shard, the shape
+    # `align_minimap2_sharded` binds).
     path_derived = get_settings().path_derived
     index_path = (
         shard_minimap2_index_path(path_derived, inputs.reference_idx, inputs.shard_id)

@@ -716,7 +716,9 @@ async def register_index(
     row (the table has no UNIQUE on that triple, by design, so growth can
     append generations). The conditional INSERT + fallback SELECT returns the
     existing row's id instead. `shard_id` is deliberately NOT part of that key:
-    each shard's `fs_path` is already shard-distinct (`.../shards/{shard_id}/`),
+    each shard's `fs_path` is already shard-distinct (the per-aligner shard root
+    encodes the shard, e.g. `.../minimap2-shards/{shard_id}.mmi`,
+    `.../bowtie2-shards/{shard_id}/index`),
     so distinct shards never collide and re-registering the same shard dedups on
     path exactly like the unsharded case — a future sharded-index builder must
     preserve that shard->path bijection. This guards the sequential re-run path;
