@@ -102,12 +102,12 @@ graph TB
 
 ## Components
 
-- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management, and reference management (genome/feature/reference ID minting, reference membership, taxonomy authority registration). Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion. Hosts the **workflow runner** (`qiita_control_plane.runner`) — for each work ticket, walks the action's `steps:` list, dispatching `action:` entries to in-process LIBRARY primitives and `step:` entries to the orchestrator over HTTP via the decoupled `submit` / `status` / `result` trio. The control plane drives the poll loop and persists per-step progress to `qiita.work_ticket_step`.
-- **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.3, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies HMAC-signed Flight tickets issued by the control plane; performs no user authentication itself. Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Runs as the dedicated `qiita-data` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
+- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management, and reference management (genome/feature/reference ID minting, reference membership, taxonomy authority registration). Signs Flight tickets (Ed25519, asymmetric) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion. Hosts the **workflow runner** (`qiita_control_plane.runner`) — for each work ticket, walks the action's `steps:` list, dispatching `action:` entries to in-process LIBRARY primitives and `step:` entries to the orchestrator over HTTP via the decoupled `submit` / `status` / `result` trio. The control plane drives the poll loop and persists per-step progress to `qiita.work_ticket_step`.
+- **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.3, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies Ed25519-signed Flight tickets issued by the control plane (holds only the public key — it cannot forge tickets); performs no user authentication itself. Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Runs as the dedicated `qiita-data` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
 - **qiita-compute-orchestrator** — Separate Python service for compute step execution. Exposes the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`) which the control-plane runner drives: `submit` `sbatch`es the job and returns a handle immediately, the CP polls `status` until terminal, then `result` verifies the output and returns it. The orchestrator is **stateless across these calls** — it owns no in-flight job state; the handle it returns carries everything (SLURM job id + workspace paths), and the CP persists it (so a CP restart can re-attach). SLURM jobs are truly dumb (read input, process, write output, exit). Also builds aligner indices for references (minimap2 `.mmi`, bowtie2) as SLURM batch jobs. Abstracts compute backend behind a clean `ComputeBackend` interface (`LocalBackend` for dev/test runs DuckDB+miint in-process; `SlurmBackend` is the production target). Has no direct DB access — the orchestrator only knows about identifiers it receives in `/step/*` requests.
 - **qiita-common** — Shared Python library for control plane and compute orchestrator. Pydantic models (work ticket states, API request/response schemas), config patterns, and REST client utilities. Prevents drift between services' understanding of the API contract.
 - **API gateway** — nginx: REST to qiita-control-plane, Arrow Flight/gRPC (HTTP/2+TLS) load-balanced across N qiita-data-plane instances.
-- **Auth** — three principal kinds (human, service, anonymous). Humans authenticate via AuthRocket OIDC; services hold opaque PATs; CP↔DP traffic is HMAC-signed Flight tickets. See [`docs/auth.md`](auth.md) for the principal model, scopes, endpoints, and runbooks.
+- **Auth** — three principal kinds (human, service, anonymous). Humans authenticate via AuthRocket OIDC; services hold opaque PATs; CP↔DP traffic is Ed25519-signed Flight tickets. See [`docs/auth.md`](auth.md) for the principal model, scopes, endpoints, and runbooks.
 - **Client interfaces** — **[UNRESOLVED]** How users interact with Qiita. Placeholder candidates include: CLI tool, web application, Python/R SDK, and notebook integration. Details on which interfaces to build, their scope, and priorities are TBD. All client interfaces connect through nginx and authenticate via AuthRocket. REST-only clients interact with the control plane; clients needing bulk data transfer also use Arrow Flight (gRPC) to the data plane.
 
 ## Data Model
@@ -769,7 +769,7 @@ No hive partitioning: a prep sample can be associated with multiple studies, so 
 
 ## Ticket Signing
 
-The control plane signs short-lived HMAC-SHA256 Flight tickets that authorize a specific (table, identifier-set) read or a register-files action. The data plane verifies the signature and expiry on every request — it never trusts client-supplied identifiers directly. This is the trust boundary between CP and DP: the DP authenticates *the ticket*, not the user. See [`docs/auth.md`](auth.md) for the verification path and ticket lifetime.
+The control plane signs short-lived Ed25519 Flight tickets that authorize a specific (table, identifier-set) read or a register-files action. Signing is asymmetric: the CP holds the private seed, the (publicly-reachable) data plane holds only the public key and verifies the signature and expiry on every request — it never trusts client-supplied identifiers directly, and a DP compromise cannot forge tickets. This is the trust boundary between CP and DP: the DP authenticates *the ticket*, not the user. See [`docs/auth.md`](auth.md) for the verification path and ticket lifetime.
 
 ## Deployment
 
@@ -811,13 +811,13 @@ qiita/
 │   │   └── qiita_control_plane/
 │   │       ├── __init__.py
 │   │       ├── main.py             # FastAPI app entry point + /health endpoint
-│   │       ├── config.py           # settings (DB URL, HMAC secret, AuthRocket JWKS URL)
+│   │       ├── config.py           # settings (DB URL, Flight signing seed, cookie secret, AuthRocket JWKS URL)
 │   │       ├── db.py               # asyncpg connection pool setup
 │   │       ├── deps.py             # FastAPI dependency-injection helpers (sessions, scopes)
 │   │       ├── dispatch.py         # dispatch + reconcile_inflight_tickets (restart re-attach)
 │   │       ├── runner/             # per-ticket workflow runner package (walks action steps; drives submit→poll→result)
 │   │       ├── step_progress.py    # qiita.work_ticket_step writers/readers (restart-recovery spine)
-│   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
+│   │       ├── auth/               # JWT verification, Ed25519 ticket signing, AuthRocket integration
 │   │       ├── actions/            # action library + sync from workflows/
 │   │       ├── cli/                # qiita-admin CLI surface
 │   │       ├── repositories/       # asyncpg query layer per resource (biosample, study, user, ...)
@@ -841,9 +841,9 @@ qiita/
 │   ├── Cargo.toml                  # deps: arrow-flight, tonic, duckdb, hmac, sha2, jsonwebtoken
 │   └── src/
 │       ├── main.rs                 # tonic server entry, Flight service + gRPC health check registration
-│       ├── config.rs               # settings (DuckLake catalog DB URL, HMAC secret, JWKS URL)
+│       ├── config.rs               # settings (DuckLake catalog DB URL, Flight public key)
 │       ├── flight_service.rs       # impl FlightService trait (do_get, do_put, do_action)
-│       ├── auth.rs                 # JWT verification (cached JWKS), HMAC ticket verification
+│       ├── auth.rs                 # Ed25519 Flight-ticket verification (public key)
 │       └── ducklake.rs             # DuckDB/DuckLake connection management, ducklake_add_data_files
 ├── qiita-compute-orchestrator/
 │   ├── pyproject.toml              # uv-managed, depends on qiita-common
@@ -1116,7 +1116,7 @@ jobs:
 
 ## Wiring Notes
 
-- **Shared HMAC secret:** Both control plane and data plane read from environment variable or config file. Rotated by deploying a new secret to both services and restarting.
+- **Flight-ticket signing keypair (Ed25519, asymmetric):** The control plane holds the private seed (`FLIGHT_TICKET_SIGNING_KEY`) and signs; the data plane holds only the matching public key (`FLIGHT_TICKET_PUBLIC_KEY`) and verifies, so a data-plane compromise cannot forge tickets. Both are read from the per-service env file. Rotated by deploying a new keypair to both services and restarting them together — see [`docs/runbooks/key-rotation.md`](runbooks/key-rotation.md). (The login-cookie HMAC secret, `LOGIN_COOKIE_SECRET_KEY`, is a separate control-plane-only key.)
 - **JWKS caching:** Both services fetch AuthRocket's `/.well-known/jwks.json` on startup and refresh periodically (e.g., every 5 minutes). No per-request calls to AuthRocket.
 - **nginx gRPC config:** Requires `grpc_pass` directive (not `proxy_pass`), `http2` on the listener, TLS termination. REST and gRPC routes split by path prefix or content-type.
 - **slurmrestd:** Compute orchestrator authenticates to slurmrestd via SLURM JWT. All job parameters specified in JSON body (not `#SBATCH` directives). Environment variables must be explicitly listed.
