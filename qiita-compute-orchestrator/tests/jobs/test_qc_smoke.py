@@ -208,3 +208,151 @@ def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q):
     assert _apply_se_trim(seq, ns_mask[50]) == _INSERT
     assert ms_mask[50]["right_trim1"] == 0
     assert _apply_se_trim(seq, ms_mask[50]) == seq
+
+
+# A 5' block an upstream mask-emitting step (lima) already removed, and a 3' one.
+# Neither is in the QC adapter set, so QC alone would never trim them — which is
+# what makes the cumulative-trim assertions below meaningful.
+_LEAD = "TTTTTTTTTTTTTTTTTTTT"
+_TRAIL = "CCCCCCCCCCCCCCC"
+assert len(_LEAD) == 20 and len(_TRAIL) == 15
+
+
+def test_qc_smoke_incoming_mask_trims_are_cumulative_from_raw(
+    tmp_path, write_reads_q, write_partial_mask
+):
+    """An incoming `pass` row's trims are ADDED to what QC removes, not replaced.
+
+    The raw read is `_LEAD + _INSERT + _ADAPTER + _TRAIL`. lima is simulated as
+    having stripped `_LEAD` (5') and `_TRAIL` (3'); QC then sees `_INSERT +
+    _ADAPTER` and trims the adapter off the 3' end. The emitted trims must be
+    cumulative from the RAW read, so applying them to the raw read recovers the
+    bare insert. Emitting QC's substring-relative trims instead would leave
+    `_LEAD` in the sequence `host_filter` and the `read_masked` view serve.
+    """
+    from qiita_compute_orchestrator.jobs import qc
+
+    raw = _LEAD + _INSERT + _ADAPTER + _TRAIL
+    reads = write_reads_q(tmp_path / "reads.parquet", [(10, "r", raw, _q(raw), None, None)])
+    adapter_mask = write_partial_mask(
+        tmp_path / "adapter_mask.parquet",
+        [(10, ReadMaskReason.PASS.value, len(_LEAD), len(_TRAIL))],
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path),
+        adapter_mask=adapter_mask,
+        instrument_model="Illumina MiSeq",  # not 2-color: no polyG
+        prep_sample_idx=5,
+        work_ticket_idx=1,
+    )
+    mask = _mask(asyncio.run(qc.execute(inputs, tmp_path / "ws"))["qc_mask"])
+
+    assert mask[10]["reason"] == ReadMaskReason.PASS.value
+    # left: lima's 20 + QC's 0 (the adapter is 3'-only).
+    assert mask[10]["left_trim1"] == len(_LEAD)
+    # right: lima's 15 + QC's 13 (the adapter).
+    assert mask[10]["right_trim1"] == len(_TRAIL) + len(_ADAPTER)
+    # The whole point: raw read + emitted trims == the bare insert.
+    assert _apply_se_trim(raw, mask[10]) == _INSERT
+
+
+def test_qc_smoke_incoming_mask_filter_read_sees_the_trimmed_insert(
+    tmp_path, write_reads_q, write_partial_mask
+):
+    """`filter_read` judges the INSERT, not the raw read.
+
+    The raw read is well over min_length(100), but the insert that survives
+    lima's trims is only `_SHORT` (40 nt). QC must call it `qc_too_short`. A qc
+    that filtered the raw read would call this `pass`.
+    """
+    from qiita_compute_orchestrator.jobs import qc
+
+    # 20 + 40 + 13 + 62 = 135 nt raw; lima strips the lead and the whole tail.
+    tail = _TRAIL + "C" * 47
+    raw = _LEAD + _SHORT + _ADAPTER + tail
+    assert len(raw) > 100  # over QC's min_length, so only the INSERT can fail it
+    reads = write_reads_q(tmp_path / "reads.parquet", [(20, "r", raw, _q(raw), None, None)])
+    adapter_mask = write_partial_mask(
+        tmp_path / "adapter_mask.parquet",
+        [(20, ReadMaskReason.PASS.value, len(_LEAD), len(tail))],
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path),
+        adapter_mask=adapter_mask,
+        instrument_model="Illumina MiSeq",
+        prep_sample_idx=5,
+        work_ticket_idx=1,
+    )
+    mask = _mask(asyncio.run(qc.execute(inputs, tmp_path / "ws"))["qc_mask"])
+    assert mask[20]["reason"] == ReadMaskReason.QC_TOO_SHORT.value
+
+
+def test_qc_smoke_incoming_non_pass_row_is_carried_verbatim(
+    tmp_path, write_reads_q, write_partial_mask
+):
+    """A read an earlier step already rejected is never re-classified.
+
+    Its reason and trims survive QC untouched, even though the read would
+    otherwise sail through (`_INSERT` is 120 nt, adapter-free). The lima commit
+    introduces `twist_no_adaptor` as the reason this carries in production; any
+    non-`pass` value takes the same branch.
+    """
+    from qiita_compute_orchestrator.jobs import qc
+
+    reads = write_reads_q(
+        tmp_path / "reads.parquet",
+        [
+            (30, "rejected", _INSERT, _q(_INSERT), None, None),
+            (40, "kept", _INSERT, _q(_INSERT), None, None),
+        ],
+    )
+    adapter_mask = write_partial_mask(
+        tmp_path / "adapter_mask.parquet",
+        [
+            (30, ReadMaskReason.QC_TOO_SHORT.value, 7, 3),
+            (40, ReadMaskReason.PASS.value, 0, 0),
+        ],
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path),
+        adapter_mask=adapter_mask,
+        instrument_model="Illumina MiSeq",
+        prep_sample_idx=5,
+        work_ticket_idx=1,
+    )
+    mask = _mask(asyncio.run(qc.execute(inputs, tmp_path / "ws"))["qc_mask"])
+
+    # Carried verbatim: reason AND trims, with no QC verdict applied.
+    assert mask[30]["reason"] == ReadMaskReason.QC_TOO_SHORT.value
+    assert (mask[30]["left_trim1"], mask[30]["right_trim1"]) == (7, 3)
+    # The still-pass read is classified normally, and every read is accounted for.
+    assert mask[40]["reason"] == ReadMaskReason.PASS.value
+    assert sorted(mask) == [30, 40]
+
+
+def test_qc_smoke_unbound_incoming_mask_is_unchanged(tmp_path, write_reads_q, write_partial_mask):
+    """QC with no incoming mask == QC with an all-`pass`, all-zero-trim one."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    raw = _INSERT + _ADAPTER
+    rows = [(50, "r", raw, _q(raw), None, None)]
+    common = dict(
+        adapter_parquet=_adapter_parquet(tmp_path),
+        instrument_model="Illumina MiSeq",
+        prep_sample_idx=5,
+        work_ticket_idx=1,
+    )
+    without = qc.Inputs(reads=write_reads_q(tmp_path / "a.parquet", rows), **common)
+    with_identity = qc.Inputs(
+        reads=write_reads_q(tmp_path / "b.parquet", rows),
+        adapter_mask=write_partial_mask(
+            tmp_path / "identity.parquet", [(50, ReadMaskReason.PASS.value, 0, 0)]
+        ),
+        **common,
+    )
+    a = _mask(asyncio.run(qc.execute(without, tmp_path / "ws_a"))["qc_mask"])
+    b = _mask(asyncio.run(qc.execute(with_identity, tmp_path / "ws_b"))["qc_mask"])
+    assert a == b
