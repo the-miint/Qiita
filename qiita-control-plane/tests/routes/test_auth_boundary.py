@@ -46,7 +46,7 @@ async def boundary_client(postgres_pool):
     """Bare client — tests pass their own Authorization header per case.
 
     Settings is initialised because routes/reference.py routes pull
-    `get_hmac_secret` (and one pulls `get_data_plane_url`) before the auth
+    `get_flight_signing_key` (and one pulls `get_data_plane_url`) before the auth
     guard runs; without it those routes 500 instead of 401/403.
     """
     from qiita_control_plane.config import Settings
@@ -55,7 +55,7 @@ async def boundary_client(postgres_pool):
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="grpc://localhost:50051",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:

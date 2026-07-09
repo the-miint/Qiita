@@ -117,8 +117,8 @@ checklist — copy/paste from there.
 
 Then confirm the config/secret files are mutually consistent **before** the
 restart — this catches the silent runtime failures (`PATH_SCRATCH` drift across
-the three env files, `HMAC_SECRET_KEY` mismatch between CP and DP, a missing or
-mis-permed token file) up front rather than at first request:
+the three env files, a Flight signing keypair mismatch between CP and DP, a
+missing or mis-permed token file) up front rather than at first request:
 
 ```bash
 # [admin] read-only; prints non-secret fingerprints, never the values

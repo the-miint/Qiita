@@ -4,7 +4,7 @@ The flow has two pieces of crypto:
 
   1. **Login cookie** — set by GET /auth/login, read by GET /auth/handoff.
      Carries `{state, timestamp_ms, cli, port}` signed with LOGIN_COOKIE_SECRET_KEY
-     (kept distinct from the Flight-ticket HMAC_SECRET_KEY so one leak can't
+     (kept distinct from the Ed25519 Flight-ticket signing key so one leak can't
      forge both).
      Lives ≤ AUTH_HANDOFF_FRESHNESS_SECONDS to bound how long a user has to
      complete the AuthRocket round-trip (longer windows expand replay risk).

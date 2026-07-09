@@ -85,9 +85,9 @@ async def auth_client(postgres_pool, jwks_harness):
     # uses; database_url etc. don't matter here.
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
-        # Distinct from hmac_secret_key: the login/handoff cookie is signed with
-        # its own key, so this round-trip exercises the split.
+        flight_signing_key=b"\x00" * 32,
+        # Distinct from flight_signing_key: the login/handoff cookie is signed
+        # with its own key, so this round-trip exercises the split.
         login_cookie_secret_key=b"\x11" * 32,
         data_plane_url="unused",
         authrocket_issuer=jwks_harness.issuer,

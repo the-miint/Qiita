@@ -183,7 +183,7 @@ async def test_fastq_to_parquet_through_runner(
         work_ticket_idx,
         postgres_pool,
         backend_client,  # type: ignore[arg-type]  # protocol-shaped duck
-        hmac_secret=b"unused-in-smoke",
+        signing_key=b"unused-in-smoke",
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         upload_staging_root=upload_staging_root,

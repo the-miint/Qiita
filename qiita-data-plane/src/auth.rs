@@ -1,24 +1,24 @@
-//! Flight ticket HMAC-SHA256 verification.
+//! Flight ticket Ed25519 verification.
 //!
 //! Used by the Arrow Flight service to verify signed tickets on do_get,
 //! do_action, and do_put.
 //!
 //! Wire format (all multi-byte integers are big-endian):
 //!
-//!     <1B version><4B payload_len><payload_len B payload><32B HMAC-SHA256><8B expiry_epoch>
+//!     <1B version><4B payload_len><payload_len B payload><64B Ed25519 signature><8B expiry_epoch>
 //!
-//! The HMAC covers (version || payload_len || payload || expiry).
-//! The version byte is always 1 for now.
+//! The signature covers (version || payload_len || payload || expiry). Signing
+//! is asymmetric: the control plane holds the private key and signs; this
+//! (publicly reachable) data plane holds only the public key and verifies, so a
+//! data-plane compromise cannot forge tickets. The version byte is 2 (v1 was
+//! HMAC-SHA256 with a 32-byte tag; only v2 is accepted).
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use ed25519_dalek::{Signature, VerifyingKey};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<Sha256>;
-
-const TICKET_VERSION: u8 = 1;
-const HMAC_SIZE: usize = 32;
+const TICKET_VERSION: u8 = 2;
+const SIGNATURE_SIZE: usize = 64;
 const EXPIRY_SIZE: usize = 8;
 /// Clock skew tolerance in seconds between signing and verifying hosts.
 const CLOCK_SKEW_TOLERANCE: u64 = 5;
@@ -44,7 +44,7 @@ pub enum AuthError {
     TooShort,
     UnsupportedVersion(u8),
     BadLength { expected: usize, actual: usize },
-    InvalidHmac,
+    InvalidSignature,
     Expired,
     ExpiryTooFar,
     MalformedPayload(String),
@@ -61,7 +61,7 @@ impl std::fmt::Display for AuthError {
                     "ticket length mismatch: expected {expected}, got {actual}"
                 )
             }
-            AuthError::InvalidHmac => write!(f, "invalid HMAC signature"),
+            AuthError::InvalidSignature => write!(f, "invalid signature"),
             AuthError::Expired => write!(f, "ticket expired"),
             AuthError::ExpiryTooFar => write!(f, "ticket expiry too far in the future"),
             AuthError::MalformedPayload(msg) => write!(f, "malformed payload: {msg}"),
@@ -69,17 +69,20 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-/// Verify a signed ticket's HMAC and expiry, return the raw payload bytes.
+/// Verify a signed ticket's Ed25519 signature and expiry, return the raw payload bytes.
 ///
-/// Checks (in order): version, payload length, HMAC signature, expiry, max
-/// lifetime. HMAC verification is constant-time. The ordering ensures timing
-/// information only leaks for structural issues (not for HMAC or payload content).
+/// Checks (in order): version, payload length, signature, expiry, max lifetime.
+/// The ordering ensures timing information only leaks for structural issues (not
+/// for the signature or payload content).
 ///
 /// Use `verify_ticket` for DoGet (parses into `TicketPayload`) or deserialize
 /// the returned bytes into an action-specific type for DoAction.
-pub fn verify_ticket_raw(ticket: &[u8], secret: &[u8]) -> Result<Vec<u8>, AuthError> {
-    // Minimum size: 1 (version) + 4 (payload_len) + 0 (payload) + 32 (hmac) + 8 (expiry)
-    if ticket.len() < 1 + 4 + HMAC_SIZE + EXPIRY_SIZE {
+pub fn verify_ticket_raw(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<Vec<u8>, AuthError> {
+    // Minimum size: 1 (version) + 4 (payload_len) + 0 (payload) + 64 (sig) + 8 (expiry)
+    if ticket.len() < 1 + 4 + SIGNATURE_SIZE + EXPIRY_SIZE {
         return Err(AuthError::TooShort);
     }
 
@@ -91,7 +94,7 @@ pub fn verify_ticket_raw(ticket: &[u8], secret: &[u8]) -> Result<Vec<u8>, AuthEr
 
     // Payload length
     let payload_len = u32::from_be_bytes([ticket[1], ticket[2], ticket[3], ticket[4]]) as usize;
-    let expected_total = 1 + 4 + payload_len + HMAC_SIZE + EXPIRY_SIZE;
+    let expected_total = 1 + 4 + payload_len + SIGNATURE_SIZE + EXPIRY_SIZE;
     if ticket.len() != expected_total {
         return Err(AuthError::BadLength {
             expected: expected_total,
@@ -101,16 +104,16 @@ pub fn verify_ticket_raw(ticket: &[u8], secret: &[u8]) -> Result<Vec<u8>, AuthEr
 
     let payload_start = 5;
     let payload_end = payload_start + payload_len;
-    let hmac_start = payload_end;
-    let hmac_end = hmac_start + HMAC_SIZE;
-    let expiry_start = hmac_end;
+    let sig_start = payload_end;
+    let sig_end = sig_start + SIGNATURE_SIZE;
+    let expiry_start = sig_end;
 
     let payload_bytes = &ticket[payload_start..payload_end];
-    let received_hmac = &ticket[hmac_start..hmac_end];
+    let signature_bytes = &ticket[sig_start..sig_end];
     let expiry_bytes = &ticket[expiry_start..expiry_start + EXPIRY_SIZE];
 
-    // Verify HMAC (constant-time) — covers version + payload_len + payload + expiry
-    let mac_input = [
+    // Verify the Ed25519 signature — covers version + payload_len + payload + expiry
+    let signed_input = [
         &ticket[0..1], // version
         &ticket[1..5], // payload_len
         payload_bytes, // payload
@@ -118,10 +121,13 @@ pub fn verify_ticket_raw(ticket: &[u8], secret: &[u8]) -> Result<Vec<u8>, AuthEr
     ]
     .concat();
 
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take keys of any size");
-    mac.update(&mac_input);
-    mac.verify_slice(received_hmac)
-        .map_err(|_| AuthError::InvalidHmac)?;
+    let sig_array: [u8; SIGNATURE_SIZE] = signature_bytes
+        .try_into()
+        .map_err(|_| AuthError::InvalidSignature)?;
+    let signature = Signature::from_bytes(&sig_array);
+    verifying_key
+        .verify_strict(&signed_input, &signature)
+        .map_err(|_| AuthError::InvalidSignature)?;
 
     // Check expiry (saturating_add to avoid u64 overflow on crafted input)
     let expiry = u64::from_be_bytes([
@@ -153,8 +159,11 @@ pub fn verify_ticket_raw(ticket: &[u8], secret: &[u8]) -> Result<Vec<u8>, AuthEr
 }
 
 /// Verify a DoGet ticket and return the parsed payload.
-pub fn verify_ticket(ticket: &[u8], secret: &[u8]) -> Result<TicketPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+pub fn verify_ticket(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<TicketPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -176,8 +185,11 @@ pub struct ActionPayload {
 }
 
 /// Verify a DoAction token and return the parsed action payload.
-pub fn verify_action(ticket: &[u8], secret: &[u8]) -> Result<ActionPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+pub fn verify_action(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<ActionPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -202,9 +214,9 @@ pub struct DeleteReferencePayload {
 /// Verify a `delete_reference` DoAction token and return its parsed payload.
 pub fn verify_delete_reference(
     ticket: &[u8],
-    secret: &[u8],
+    verifying_key: &VerifyingKey,
 ) -> Result<DeleteReferencePayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -227,8 +239,11 @@ pub struct DeleteMaskPayload {
 }
 
 /// Verify a `delete_mask` DoAction token and return its parsed payload.
-pub fn verify_delete_mask(ticket: &[u8], secret: &[u8]) -> Result<DeleteMaskPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+pub fn verify_delete_mask(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<DeleteMaskPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -256,9 +271,9 @@ pub struct DeletePoolReadsPayload {
 /// Verify a `delete_pool_reads` DoAction token and return its parsed payload.
 pub fn verify_delete_pool_reads(
     ticket: &[u8],
-    secret: &[u8],
+    verifying_key: &VerifyingKey,
 ) -> Result<DeletePoolReadsPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -285,13 +300,16 @@ pub struct ExportReadPayload {
     /// Absolute destination path for the materialized Parquet. The handler
     /// re-validates it (`validate_export_dest`) before writing — under the
     /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is HMAC-signed by the control plane (defense in depth).
+    /// token is Ed25519-signed by the control plane (defense in depth).
     pub dest: String,
 }
 
 /// Verify an `export_read` DoAction token and return its parsed payload.
-pub fn verify_export_read(ticket: &[u8], secret: &[u8]) -> Result<ExportReadPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+pub fn verify_export_read(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<ExportReadPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -336,7 +354,7 @@ pub struct ExportReadBlockPayload {
     /// Absolute destination path for the materialized Parquet. The handler
     /// re-validates it (`validate_export_dest`) before writing — under the
     /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is HMAC-signed by the control plane (defense in depth).
+    /// token is Ed25519-signed by the control plane (defense in depth).
     pub dest: String,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
@@ -346,9 +364,9 @@ pub struct ExportReadBlockPayload {
 /// Verify an `export_read_block` DoAction token and return its parsed payload.
 pub fn verify_export_read_block(
     ticket: &[u8],
-    secret: &[u8],
+    verifying_key: &VerifyingKey,
 ) -> Result<ExportReadBlockPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -388,9 +406,9 @@ pub struct DeleteReadMaskBlockPayload {
 /// Verify a `delete_read_mask_block` DoAction token and return its parsed payload.
 pub fn verify_delete_read_mask_block(
     ticket: &[u8],
-    secret: &[u8],
+    verifying_key: &VerifyingKey,
 ) -> Result<DeleteReadMaskBlockPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -422,8 +440,11 @@ pub struct MaskMetricsPayload {
 }
 
 /// Verify a `mask_metrics` DoAction token and return its parsed payload.
-pub fn verify_mask_metrics(ticket: &[u8], secret: &[u8]) -> Result<MaskMetricsPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+pub fn verify_mask_metrics(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<MaskMetricsPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
@@ -453,39 +474,41 @@ pub struct DoPutPayload {
 }
 
 /// Verify a DoPut ticket and return the parsed payload.
-pub fn verify_doput(ticket: &[u8], secret: &[u8]) -> Result<DoPutPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+pub fn verify_doput(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<DoPutPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
-    fn make_test_ticket(secret: &[u8], expiry: u64) -> Vec<u8> {
-        // Reproduce the Python wire format for cross-language testing
-        let payload = br#"{"filter":{"feature_idx":[1,2,3]},"table":"reference_sequences"}"#;
-        let version: u8 = 1;
+    // Fixed test keypair. Any 32 bytes is a valid Ed25519 seed; the control
+    // plane's cross-language vector (verify_python_signed_ticket) is signed with
+    // this same seed, so the derived public key matches Python's byte-for-byte.
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+    fn test_vk() -> VerifyingKey {
+        test_signing_key().verifying_key()
+    }
+
+    /// Build a v2 (Ed25519) ticket over an arbitrary payload, signed by `key`.
+    fn build_ticket(payload: &[u8], key: &SigningKey, expiry: u64) -> Vec<u8> {
+        let version: u8 = TICKET_VERSION;
         let payload_len = (payload.len() as u32).to_be_bytes();
         let expiry_bytes = expiry.to_be_bytes();
-
-        let mac_input = [
-            &[version][..],
-            &payload_len[..],
-            &payload[..],
-            &expiry_bytes[..],
-        ]
-        .concat();
-
-        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-        mac.update(&mac_input);
-        let hmac_result = mac.finalize().into_bytes();
-
+        let signed_input = [&[version][..], &payload_len[..], payload, &expiry_bytes[..]].concat();
+        let sig = key.sign(&signed_input).to_bytes();
         let mut ticket = Vec::new();
         ticket.push(version);
         ticket.extend_from_slice(&payload_len);
         ticket.extend_from_slice(payload);
-        ticket.extend_from_slice(&hmac_result);
+        ticket.extend_from_slice(&sig);
         ticket.extend_from_slice(&expiry_bytes);
         ticket
     }
@@ -498,54 +521,62 @@ mod tests {
             + secs_from_now
     }
 
+    const DOGET_PAYLOAD: &[u8] =
+        br#"{"filter":{"feature_idx":[1,2,3]},"table":"reference_sequences"}"#;
+
     #[test]
     fn verify_valid_ticket() {
-        let ticket = make_test_ticket(b"dev-secret", future_expiry(300));
-        let payload = verify_ticket(&ticket, b"dev-secret").expect("valid ticket should verify");
+        let ticket = build_ticket(DOGET_PAYLOAD, &test_signing_key(), future_expiry(300));
+        let payload = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
         assert_eq!(payload.table, "reference_sequences");
         assert!(payload.filter.contains_key("feature_idx"));
     }
 
     #[test]
     fn reject_tampered_payload() {
-        let mut ticket = make_test_ticket(b"dev-secret", future_expiry(300));
+        let mut ticket = build_ticket(DOGET_PAYLOAD, &test_signing_key(), future_expiry(300));
         ticket[10] ^= 0xFF;
         assert_eq!(
-            verify_ticket(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
+            verify_ticket(&ticket, &test_vk()).unwrap_err(),
+            AuthError::InvalidSignature
         );
     }
 
     #[test]
-    fn reject_wrong_secret() {
-        let ticket = make_test_ticket(b"dev-secret", future_expiry(300));
+    fn reject_wrong_key() {
+        // A ticket signed by our key must not verify under a DIFFERENT public key
+        // — the whole point of asymmetric signing.
+        let ticket = build_ticket(DOGET_PAYLOAD, &test_signing_key(), future_expiry(300));
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
         assert_eq!(
-            verify_ticket(&ticket, b"wrong-secret").unwrap_err(),
-            AuthError::InvalidHmac
+            verify_ticket(&ticket, &other).unwrap_err(),
+            AuthError::InvalidSignature
         );
     }
 
     #[test]
     fn reject_expired_ticket() {
-        // Expired 100 seconds ago (well past the 5s clock skew tolerance)
         let expiry = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             - 100;
-        let ticket = make_test_ticket(b"dev-secret", expiry);
+        let ticket = build_ticket(DOGET_PAYLOAD, &test_signing_key(), expiry);
         assert_eq!(
-            verify_ticket(&ticket, b"dev-secret").unwrap_err(),
+            verify_ticket(&ticket, &test_vk()).unwrap_err(),
             AuthError::Expired
         );
     }
 
     #[test]
     fn reject_expiry_too_far_in_future() {
-        // Expiry 100 years from now — beyond MAX_TICKET_LIFETIME
-        let ticket = make_test_ticket(b"dev-secret", future_expiry(100 * 365 * 86400));
+        let ticket = build_ticket(
+            DOGET_PAYLOAD,
+            &test_signing_key(),
+            future_expiry(100 * 365 * 86400),
+        );
         assert_eq!(
-            verify_ticket(&ticket, b"dev-secret").unwrap_err(),
+            verify_ticket(&ticket, &test_vk()).unwrap_err(),
             AuthError::ExpiryTooFar
         );
     }
@@ -553,493 +584,244 @@ mod tests {
     #[test]
     fn reject_truncated_ticket() {
         assert_eq!(
-            verify_ticket(&[1, 0, 0, 0], b"secret").unwrap_err(),
+            verify_ticket(&[2, 0, 0, 0], &test_vk()).unwrap_err(),
             AuthError::TooShort
         );
     }
 
     #[test]
     fn reject_trailing_bytes() {
-        let mut ticket = make_test_ticket(b"dev-secret", future_expiry(300));
-        ticket.push(0xFF); // append garbage
-        let err = verify_ticket(&ticket, b"dev-secret").unwrap_err();
-        match err {
-            AuthError::BadLength { .. } => {} // expected
+        let mut ticket = build_ticket(DOGET_PAYLOAD, &test_signing_key(), future_expiry(300));
+        ticket.push(0xFF);
+        match verify_ticket(&ticket, &test_vk()).unwrap_err() {
+            AuthError::BadLength { .. } => {}
             other => panic!("expected BadLength, got {other:?}"),
         }
     }
 
     #[test]
     fn reject_unsupported_version() {
-        let mut ticket = make_test_ticket(b"dev-secret", future_expiry(300));
-        ticket[0] = 99;
+        // Version is checked before the signature, so a v1 (or garbage) version
+        // byte is rejected as UnsupportedVersion even though the sig won't match.
+        let mut ticket = build_ticket(DOGET_PAYLOAD, &test_signing_key(), future_expiry(300));
+        ticket[0] = 1;
         assert_eq!(
-            verify_ticket(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::UnsupportedVersion(99)
+            verify_ticket(&ticket, &test_vk()).unwrap_err(),
+            AuthError::UnsupportedVersion(1)
         );
     }
 
-    // --------------------------------------------------------------------
-    // DoPut ticket variant
-    // --------------------------------------------------------------------
-
-    /// Build a signed DoPut ticket with an arbitrary payload — lets tests
-    /// drive both the happy path and shape-violation paths.
-    fn make_doput_ticket_raw(payload_json: &[u8], secret: &[u8], expiry: u64) -> Vec<u8> {
-        let version: u8 = 1;
-        let payload_len = (payload_json.len() as u32).to_be_bytes();
-        let expiry_bytes = expiry.to_be_bytes();
-
-        let mac_input = [
-            &[version][..],
-            &payload_len[..],
-            payload_json,
-            &expiry_bytes[..],
-        ]
-        .concat();
-        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-        mac.update(&mac_input);
-        let hmac_result = mac.finalize().into_bytes();
-
-        let mut ticket = Vec::new();
-        ticket.push(version);
-        ticket.extend_from_slice(&payload_len);
-        ticket.extend_from_slice(payload_json);
-        ticket.extend_from_slice(&hmac_result);
-        ticket.extend_from_slice(&expiry_bytes);
-        ticket
-    }
-
-    fn make_doput_ticket(upload_idx: i64, secret: &[u8], expiry: u64) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace — matches sign_doput.
-        let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
-        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
-    }
+    // -------------------- DoPut --------------------
 
     #[test]
     fn verify_doput_round_trip() {
-        let ticket = make_doput_ticket(42, b"dev-secret", future_expiry(300));
-        let payload = verify_doput(&ticket, b"dev-secret").expect("valid ticket should verify");
-        assert_eq!(payload.action, "doput");
-        assert_eq!(payload.upload_idx, 42);
+        let payload = br#"{"action":"doput","upload_idx":42}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed = verify_doput(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert_eq!(parsed.action, "doput");
+        assert_eq!(parsed.upload_idx, 42);
     }
 
     #[test]
-    fn verify_doput_rejects_bad_hmac() {
-        let mut ticket = make_doput_ticket(7, b"dev-secret", future_expiry(300));
+    fn verify_doput_rejects_bad_signature() {
+        let payload = br#"{"action":"doput","upload_idx":7}"#;
+        let mut ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         ticket[10] ^= 0xFF;
         assert_eq!(
-            verify_doput(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
-        );
-    }
-
-    #[test]
-    fn verify_doput_rejects_expired() {
-        let expiry = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - 100;
-        let ticket = make_doput_ticket(1, b"dev-secret", expiry);
-        assert_eq!(
-            verify_doput(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::Expired
+            verify_doput(&ticket, &test_vk()).unwrap_err(),
+            AuthError::InvalidSignature
         );
     }
 
     #[test]
     fn verify_doput_rejects_extra_fields() {
-        // A future signer that accidentally smuggled a reference_idx onto the
-        // ticket would couple the upload domain to that consumer — the
-        // deserializer's deny_unknown_fields catches the slip.
-        let payload = br#"{"action":"doput","upload_idx":1,"reference_idx":99}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        let err = verify_doput(&ticket, b"dev-secret").unwrap_err();
-        match err {
-            AuthError::MalformedPayload(_) => {} // expected
+        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
+        let payload = br#"{"action":"doput","reference_idx":99,"upload_idx":1}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_doput(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
-    #[test]
-    fn verify_doput_passes_action_string_through() {
-        // The auth layer is shape-only — `action` is just a string here.
-        // It still has to be present and parseable; the gRPC handler is
-        // what enforces action == "doput". Locking the parse-only
-        // behaviour: a payload with a different action string verifies
-        // but carries the verbatim value through.
-        let payload = br#"{"action":"register_files","upload_idx":1}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        let parsed = verify_doput(&ticket, b"dev-secret").expect("verify should succeed");
-        assert_eq!(parsed.action, "register_files");
-        assert_eq!(parsed.upload_idx, 1);
-    }
-
-    // --------------------------------------------------------------------
-    // export_read action token variant
-    // --------------------------------------------------------------------
-
-    fn make_export_read_ticket(
-        prep_sample_idx: i64,
-        dest: &str,
-        secret: &[u8],
-        expiry: u64,
-    ) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace — matches sign_action.
-        let payload = format!(
-            r#"{{"action":"export_read","dest":"{dest}","prep_sample_idx":{prep_sample_idx}}}"#
-        );
-        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
-    }
+    // -------------------- export_read --------------------
 
     #[test]
     fn verify_export_read_round_trip() {
-        let ticket = make_export_read_ticket(
-            26154,
-            "/scratch/ticket/804/reads.parquet",
-            b"dev-secret",
-            future_expiry(300),
-        );
-        let payload =
-            verify_export_read(&ticket, b"dev-secret").expect("valid token should verify");
-        assert_eq!(payload.action, "export_read");
-        assert_eq!(payload.prep_sample_idx, 26154);
-        assert_eq!(payload.dest, "/scratch/ticket/804/reads.parquet");
-    }
-
-    #[test]
-    fn verify_export_read_rejects_bad_hmac() {
-        let mut ticket = make_export_read_ticket(
-            1,
-            "/scratch/ticket/1/reads.parquet",
-            b"dev-secret",
-            future_expiry(300),
-        );
-        ticket[10] ^= 0xFF;
-        assert_eq!(
-            verify_export_read(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
-        );
+        let payload = br#"{"action":"export_read","dest":"/scratch/ticket/804/reads.parquet","prep_sample_idx":26154}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed = verify_export_read(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.action, "export_read");
+        assert_eq!(parsed.prep_sample_idx, 26154);
+        assert_eq!(parsed.dest, "/scratch/ticket/804/reads.parquet");
     }
 
     #[test]
     fn verify_export_read_rejects_extra_fields() {
-        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
         let payload =
             br#"{"action":"export_read","dest":"/scratch/x","prep_sample_idx":1,"smuggled":9}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        match verify_export_read(&ticket, b"dev-secret").unwrap_err() {
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_export_read(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
-    // --------------------------------------------------------------------
-    // export_read_block action token variant
-    // --------------------------------------------------------------------
-
-    fn make_export_read_block_ticket(
-        dest: &str,
-        members: &str,
-        secret: &[u8],
-        expiry: u64,
-    ) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace — matches sign_action's
-        // json.dumps(sort_keys=True). Top-level keys: action, dest, members.
-        let payload =
-            format!(r#"{{"action":"export_read_block","dest":"{dest}","members":{members}}}"#);
-        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
-    }
+    // -------------------- export_read_block --------------------
 
     #[test]
     fn verify_export_read_block_round_trip() {
-        // Two members with non-adjacent sequence_idx windows — the block shape.
-        let members = r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]"#;
-        let ticket = make_export_read_block_ticket(
-            "/scratch/ticket/900/reads.parquet",
-            members,
-            b"dev-secret",
-            future_expiry(300),
-        );
-        let payload =
-            verify_export_read_block(&ticket, b"dev-secret").expect("valid token should verify");
-        assert_eq!(payload.action, "export_read_block");
-        assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
-        assert_eq!(payload.members.len(), 2);
-        assert_eq!(payload.members[0].prep_sample_idx, 101);
-        assert_eq!(payload.members[0].sequence_idx_start, 100);
-        assert_eq!(payload.members[0].sequence_idx_stop, 109);
-        assert_eq!(payload.members[1].prep_sample_idx, 103);
-        assert_eq!(payload.members[1].sequence_idx_start, 300);
-        assert_eq!(payload.members[1].sequence_idx_stop, 309);
+        let payload = br#"{"action":"export_read_block","dest":"/scratch/ticket/900/reads.parquet","members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed =
+            verify_export_read_block(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.action, "export_read_block");
+        assert_eq!(parsed.members.len(), 2);
+        assert_eq!(parsed.members[0].prep_sample_idx, 101);
+        assert_eq!(parsed.members[1].sequence_idx_stop, 309);
     }
 
     #[test]
-    fn verify_export_read_block_rejects_bad_hmac() {
-        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
-        let mut ticket = make_export_read_block_ticket(
-            "/scratch/ticket/1/reads.parquet",
-            members,
-            b"dev-secret",
-            future_expiry(300),
-        );
-        ticket[12] ^= 0xFF;
-        assert_eq!(
-            verify_export_read_block(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
-        );
+    fn verify_export_read_block_rejects_member_extra_fields() {
+        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}]}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
     }
 
     #[test]
     fn verify_export_read_block_rejects_extra_fields() {
-        // deny_unknown_fields on the payload: a smuggled top-level field is a
-        // contract slip surfaced here.
-        let payload =
-            br#"{"action":"export_read_block","dest":"/scratch/x","members":[],"smuggled":9}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        match verify_export_read_block(&ticket, b"dev-secret").unwrap_err() {
+        // Top-level deny_unknown_fields (distinct from the member-level guard above).
+        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
-    #[test]
-    fn verify_export_read_block_rejects_extra_member_fields() {
-        // deny_unknown_fields on a member: the member shape is exactly
-        // (prep_sample_idx, sequence_idx_start, sequence_idx_stop).
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}]}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        match verify_export_read_block(&ticket, b"dev-secret").unwrap_err() {
-            AuthError::MalformedPayload(_) => {}
-            other => panic!("expected MalformedPayload, got {other:?}"),
-        }
-    }
-
-    // --------------------------------------------------------------------
-    // mask_metrics action token variant
-    // --------------------------------------------------------------------
-
-    fn make_mask_metrics_ticket(
-        mask_idx: i64,
-        prep_sample_idx: i64,
-        secret: &[u8],
-        expiry: u64,
-    ) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace — matches sign_action's
-        // json.dumps(sort_keys=True). Top-level keys: action, mask_idx,
-        // prep_sample_idx.
-        let payload = format!(
-            r#"{{"action":"mask_metrics","mask_idx":{mask_idx},"prep_sample_idx":{prep_sample_idx}}}"#
-        );
-        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
-    }
+    // -------------------- mask_metrics --------------------
 
     #[test]
     fn verify_mask_metrics_round_trip() {
-        let ticket = make_mask_metrics_ticket(42, 7, b"dev-secret", future_expiry(300));
-        let payload =
-            verify_mask_metrics(&ticket, b"dev-secret").expect("valid token should verify");
-        assert_eq!(payload.action, "mask_metrics");
-        assert_eq!(payload.mask_idx, 42);
-        assert_eq!(payload.prep_sample_idx, 7);
-    }
-
-    #[test]
-    fn verify_mask_metrics_rejects_bad_hmac() {
-        let mut ticket = make_mask_metrics_ticket(42, 7, b"dev-secret", future_expiry(300));
-        ticket[12] ^= 0xFF;
-        assert_eq!(
-            verify_mask_metrics(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
-        );
+        let payload = br#"{"action":"mask_metrics","mask_idx":42,"prep_sample_idx":7}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed = verify_mask_metrics(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.mask_idx, 42);
+        assert_eq!(parsed.prep_sample_idx, 7);
     }
 
     #[test]
     fn verify_mask_metrics_rejects_extra_fields() {
-        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
-        let payload = br#"{"action":"mask_metrics","mask_idx":1,"prep_sample_idx":2,"smuggled":9}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        match verify_mask_metrics(&ticket, b"dev-secret").unwrap_err() {
+        let payload =
+            br#"{"action":"mask_metrics","mask_idx":42,"prep_sample_idx":7,"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_mask_metrics(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
-    // --------------------------------------------------------------------
-    // delete_read_mask_block action token variant
-    // --------------------------------------------------------------------
-
-    fn make_delete_read_mask_block_ticket(
-        mask_idx: i64,
-        members: &str,
-        secret: &[u8],
-        expiry: u64,
-    ) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace — matches sign_action's
-        // json.dumps(sort_keys=True). Top-level keys: action, mask_idx, members.
-        let payload = format!(
-            r#"{{"action":"delete_read_mask_block","mask_idx":{mask_idx},"members":{members}}}"#
-        );
-        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
-    }
+    // -------------------- delete_read_mask_block --------------------
 
     #[test]
     fn verify_delete_read_mask_block_round_trip() {
-        let members = r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]"#;
-        let ticket =
-            make_delete_read_mask_block_ticket(42, members, b"dev-secret", future_expiry(300));
-        let payload = verify_delete_read_mask_block(&ticket, b"dev-secret")
-            .expect("valid token should verify");
-        assert_eq!(payload.action, "delete_read_mask_block");
-        assert_eq!(payload.mask_idx, 42);
-        assert_eq!(payload.members.len(), 2);
-        assert_eq!(payload.members[0].prep_sample_idx, 101);
-        assert_eq!(payload.members[0].sequence_idx_start, 100);
-        assert_eq!(payload.members[0].sequence_idx_stop, 109);
-        assert_eq!(payload.members[1].prep_sample_idx, 103);
-    }
-
-    #[test]
-    fn verify_delete_read_mask_block_rejects_bad_hmac() {
-        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
-        let mut ticket =
-            make_delete_read_mask_block_ticket(1, members, b"dev-secret", future_expiry(300));
-        ticket[12] ^= 0xFF;
-        assert_eq!(
-            verify_delete_read_mask_block(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
-        );
+        let payload = br#"{"action":"delete_read_mask_block","mask_idx":42,"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}]}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed =
+            verify_delete_read_mask_block(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.mask_idx, 42);
+        assert_eq!(parsed.members.len(), 1);
     }
 
     #[test]
     fn verify_delete_read_mask_block_rejects_extra_fields() {
-        // deny_unknown_fields: a smuggled top-level field is a contract slip.
-        let payload =
-            br#"{"action":"delete_read_mask_block","mask_idx":1,"members":[],"smuggled":9}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        match verify_delete_read_mask_block(&ticket, b"dev-secret").unwrap_err() {
+        let payload = br#"{"action":"delete_read_mask_block","mask_idx":42,"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_read_mask_block(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
-    // --------------------------------------------------------------------
-    // delete_pool_reads action token variant
-    // --------------------------------------------------------------------
+    // -------------------- delete_pool_reads --------------------
 
     #[test]
     fn verify_delete_pool_reads_round_trip() {
-        // Canonical JSON: sorted keys, no whitespace — matches sign_action.
         let payload = br#"{"action":"delete_pool_reads","prep_sample_idxs":[10,11,12]}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         let parsed =
-            verify_delete_pool_reads(&ticket, b"dev-secret").expect("valid token should verify");
-        assert_eq!(parsed.action, "delete_pool_reads");
+            verify_delete_pool_reads(&ticket, &test_vk()).expect("valid token should verify");
         assert_eq!(parsed.prep_sample_idxs, vec![10, 11, 12]);
     }
 
     #[test]
     fn verify_delete_pool_reads_accepts_empty_set() {
-        // An empty pool (no prep_samples) signs an empty list; it must verify.
         let payload = br#"{"action":"delete_pool_reads","prep_sample_idxs":[]}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        let parsed = verify_delete_pool_reads(&ticket, b"dev-secret").expect("should verify");
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed = verify_delete_pool_reads(&ticket, &test_vk()).expect("should verify");
         assert!(parsed.prep_sample_idxs.is_empty());
     }
 
     #[test]
-    fn verify_delete_pool_reads_rejects_bad_hmac() {
-        let payload = br#"{"action":"delete_pool_reads","prep_sample_idxs":[1]}"#;
-        let mut ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        ticket[10] ^= 0xFF;
-        assert_eq!(
-            verify_delete_pool_reads(&ticket, b"dev-secret").unwrap_err(),
-            AuthError::InvalidHmac
-        );
-    }
-
-    #[test]
     fn verify_delete_pool_reads_rejects_extra_fields() {
-        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
         let payload =
-            br#"{"action":"delete_pool_reads","prep_sample_idxs":[1],"sequenced_pool_idx":9}"#;
-        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
-        match verify_delete_pool_reads(&ticket, b"dev-secret").unwrap_err() {
+            br#"{"action":"delete_pool_reads","prep_sample_idxs":[10,11,12],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_pool_reads(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
-    /// Cross-language interop test: this ticket was signed by the Python
-    /// implementation (qiita_control_plane.auth.tickets.sign_ticket).
+    /// Cross-language interop: this ticket was signed by the Python control plane
+    /// (`qiita_control_plane.auth.tickets.sign_ticket`) with the fixed test seed
+    /// `[7u8; 32]` — the same seed `test_signing_key()` uses — so the public key
+    /// derived here verifies Python's Ed25519 signature byte-for-byte.
     ///
-    /// To regenerate, run from the repo root:
-    ///
+    /// Regenerate from the repo root:
     /// ```bash
     /// cd qiita-control-plane && uv run python3 -c "
     /// from qiita_control_plane.auth.tickets import sign_ticket
-    /// ticket = sign_ticket(
-    ///     table='reference_sequences',
-    ///     filter={'feature_idx': [1, 2, 3]},
-    ///     secret=b'dev-secret',
-    ///     expiry_epoch=4102444800,  # 2100-01-01T00:00:00Z
-    /// )
-    /// print(', '.join(str(b) for b in ticket))
-    /// "
+    /// t = sign_ticket(table='reference_sequences', filter={'feature_idx':[1,2,3]},
+    ///                 secret=bytes([7]*32), expiry_epoch=4102444800)
+    /// print(', '.join(str(b) for b in t))"
     /// ```
     ///
-    /// Parameters:
-    /// - secret: b"dev-secret" (raw bytes, NOT base64 — test-only shortcut)
-    /// - expiry_epoch: 4102444800 (2100-01-01T00:00:00Z)
-    /// - payload: {"filter":{"feature_idx":[1,2,3]},"table":"reference_sequences"}
-    ///
-    /// NOTE: This test uses verify_ticket_for_test which skips MAX_TICKET_LIFETIME
-    /// check since the test vector has a far-future expiry by design.
+    /// The vector's expiry is in 2100 (beyond MAX_TICKET_LIFETIME), so we verify
+    /// the signature + structure directly rather than through verify_ticket.
     #[test]
     fn verify_python_signed_ticket() {
         #[rustfmt::skip]
         const PYTHON_SIGNED_TICKET: &[u8] = &[
-            1, 0, 0, 0, 64, 123, 34, 102, 105, 108, 116, 101, 114, 34, 58,
-            123, 34, 102, 101, 97, 116, 117, 114, 101, 95, 105, 100, 120, 34,
-            58, 91, 49, 44, 50, 44, 51, 93, 125, 44, 34, 116, 97, 98, 108,
-            101, 34, 58, 34, 114, 101, 102, 101, 114, 101, 110, 99, 101, 95,
-            115, 101, 113, 117, 101, 110, 99, 101, 115, 34, 125, 11, 122, 0,
-            121, 96, 221, 245, 9, 167, 96, 146, 32, 71, 203, 67, 72, 241,
-            158, 190, 111, 214, 244, 166, 238, 152, 162, 233, 150, 194, 188,
-            91, 68, 0, 0, 0, 0, 244, 134, 87, 0,
+            2, 0, 0, 0, 64, 123, 34, 102, 105, 108, 116, 101, 114, 34, 58, 123, 34, 102, 101, 97,
+            116, 117, 114, 101, 95, 105, 100, 120, 34, 58, 91, 49, 44, 50, 44, 51, 93, 125, 44, 34,
+            116, 97, 98, 108, 101, 34, 58, 34, 114, 101, 102, 101, 114, 101, 110, 99, 101, 95, 115,
+            101, 113, 117, 101, 110, 99, 101, 115, 34, 125, 140, 118, 190, 90, 173, 150, 129, 253,
+            206, 242, 111, 248, 36, 170, 8, 139, 141, 12, 204, 198, 124, 220, 121, 254, 16, 14, 40,
+            171, 121, 191, 119, 57, 121, 236, 207, 243, 67, 83, 89, 150, 194, 158, 42, 202, 82, 75,
+            75, 0, 10, 226, 1, 82, 95, 204, 7, 243, 146, 239, 225, 79, 83, 203, 20, 7, 0, 0, 0, 0,
+            244, 134, 87, 0,
         ];
 
-        // The cross-language test vector has expiry in 2100, which exceeds
-        // MAX_TICKET_LIFETIME. We verify HMAC + structure directly rather than
-        // going through verify_ticket which would reject the expiry.
-        // This tests the critical interop property: Python's HMAC output
-        // matches Rust's HMAC verification byte-for-byte.
-        let secret = b"dev-secret";
         let ticket = PYTHON_SIGNED_TICKET;
-
-        // Parse wire format manually
         let payload_len = u32::from_be_bytes([ticket[1], ticket[2], ticket[3], ticket[4]]) as usize;
         let payload_bytes = &ticket[5..5 + payload_len];
-        let hmac_start = 5 + payload_len;
-        let received_hmac = &ticket[hmac_start..hmac_start + 32];
-        let expiry_bytes = &ticket[hmac_start + 32..];
+        let sig_start = 5 + payload_len;
+        let sig_bytes = &ticket[sig_start..sig_start + SIGNATURE_SIZE];
+        let expiry_bytes = &ticket[sig_start + SIGNATURE_SIZE..];
 
-        // Verify HMAC matches
-        let mac_input = [&ticket[0..1], &ticket[1..5], payload_bytes, expiry_bytes].concat();
-        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-        mac.update(&mac_input);
-        mac.verify_slice(received_hmac)
-            .expect("Python-signed HMAC must verify in Rust");
+        let signed_input = [&ticket[0..1], &ticket[1..5], payload_bytes, expiry_bytes].concat();
+        let sig_array: [u8; SIGNATURE_SIZE] = sig_bytes.try_into().unwrap();
+        test_vk()
+            .verify_strict(&signed_input, &Signature::from_bytes(&sig_array))
+            .expect("Python-signed Ed25519 ticket must verify in Rust");
 
-        // Verify payload deserializes correctly into typed filter
         let payload: TicketPayload =
             serde_json::from_slice(payload_bytes).expect("payload should parse");
         assert_eq!(payload.table, "reference_sequences");
-        let feature_idx = payload
-            .filter
-            .get("feature_idx")
-            .expect("filter should have feature_idx");
-        assert_eq!(feature_idx.len(), 3);
+        assert_eq!(payload.filter.get("feature_idx").unwrap().len(), 3);
     }
 }

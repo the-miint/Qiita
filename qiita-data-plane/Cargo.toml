@@ -26,7 +26,11 @@ arrow-schema = "58"
 # cleanest path. Keep version pinned to arrow-* major.
 parquet = "58"
 duckdb = { version = "1.10504.0" }
-hmac = "0.12"
+# Pin the feature set explicitly (these are v2's current defaults) so a future
+# upstream default-feature change can't silently alter behavior on a bare
+# `cargo update`. `rand_core` is deliberately omitted — the data plane only ever
+# verifies, never signs, so it needs no key generation.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "std", "zeroize"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

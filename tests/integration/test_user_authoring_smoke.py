@@ -56,7 +56,7 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-def cp_server(tmp_path, hmac_secret):
+def cp_server(tmp_path, signing_key):
     """Spawn the control-plane app under uvicorn against the test
     Postgres; yield its base URL.
 
@@ -79,9 +79,9 @@ def cp_server(tmp_path, hmac_secret):
     env = {
         **os.environ,
         "DATABASE_URL": resolve_postgres_url(),
-        "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
-        # Distinct from HMAC_SECRET_KEY: the login/handoff cookie is signed with
-        # its own key, required by from_env since the cookie split.
+        # CP signs Flight tickets with the Ed25519 private seed; the cookie key
+        # is a distinct required secret (from_env fails without it).
+        "FLIGHT_TICKET_SIGNING_KEY": base64.b64encode(signing_key).decode(),
         "LOGIN_COOKIE_SECRET_KEY": base64.b64encode(b"\x02" * 32).decode(),
         "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
         "CP_TO_CO_TOKEN_PATH": str(token_file),

@@ -705,6 +705,16 @@ the `no-changelog` label).
   users mid-handoff in the ≤5-minute cookie window (`Max-Age` 300s) simply
   re-login once. No dual-verify or coordinated cutover needed. (#262)
 
+- **Flight tickets are now Ed25519-signed (asymmetric), not HMAC-SHA256.** The
+  control plane signs with an Ed25519 private seed (`FLIGHT_TICKET_SIGNING_KEY`);
+  the publicly-reachable data plane holds only the matching public key
+  (`FLIGHT_TICKET_PUBLIC_KEY`) and verifies — so a data-plane host/env compromise
+  can no longer forge tickets (previously the symmetric `HMAC_SECRET_KEY` on the
+  DP could both verify and forge). Ticket wire version bumps to 2 (64-byte
+  signature); the DP accepts only v2. `HMAC_SECRET_KEY` is removed from both
+  services (the cookie moved to `LOGIN_COOKIE_SECRET_KEY`, tickets to the
+  keypair). End-user CLIs are unchanged — tickets are minted server-side. (#263)
+
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
   options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`
@@ -1315,6 +1325,13 @@ the `no-changelog` label).
 
 ### Removed
 
+- **`qiita-admin work-ticket backfill-mask-idx` retired.** The one-time mask_idx
+  backfill (for tickets predating the column) has run in production; the CLI
+  command — the only ticket signer outside the control-plane web process, which
+  read the raw signing key from the environment — and its `backfill_work_ticket_mask_idx`
+  runner helper are removed. `mask purge-failed`'s NULL-mask_idx safety guard is
+  unchanged; only its guidance text (which named the removed command) is
+  reworded. (#263)
 - Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag

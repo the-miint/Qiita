@@ -100,7 +100,7 @@ async def run_workflow(
     pool: asyncpg.Pool,
     backend_client: ComputeBackendClient,
     *,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
     work_ticket_workspace_root: Path,
     upload_staging_root: Path,
@@ -247,7 +247,7 @@ async def run_workflow(
                     pool,
                     default_adapter_reference_idx=default_adapter_reference_idx,
                     data_plane_url=data_plane_url,
-                    hmac_secret=hmac_secret,
+                    signing_key=signing_key,
                     workspace=workspace,
                 )
             )
@@ -275,7 +275,7 @@ async def run_workflow(
                         scope_target,
                         upload_staging_root,
                         data_plane_url=data_plane_url,
-                        hmac_secret=hmac_secret,
+                        signing_key=signing_key,
                         workspace=workspace,
                     )
                 )
@@ -292,7 +292,7 @@ async def run_workflow(
                     await _resolve_staged_reads_block(
                         members,
                         data_plane_url=data_plane_url,
-                        hmac_secret=hmac_secret,
+                        signing_key=signing_key,
                         workspace=workspace,
                     )
                 )
@@ -326,7 +326,7 @@ async def run_workflow(
                     scope_target,
                     int(mask_idx),
                     data_plane_url=data_plane_url,
-                    hmac_secret=hmac_secret,
+                    signing_key=signing_key,
                     workspace=workspace,
                 )
             )
@@ -480,7 +480,7 @@ async def run_workflow(
                 workspace=workspace,
                 scope_target=scope_target,
                 backend_client=backend_client,
-                hmac_secret=hmac_secret,
+                signing_key=signing_key,
                 data_plane_url=data_plane_url,
                 max_retries=max_retries,
                 poll_interval_seconds=poll_interval_seconds,
@@ -643,7 +643,7 @@ async def _run_entry_with_retry(
     workspace: Path,
     scope_target: dict[str, Any],
     backend_client: ComputeBackendClient,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
     max_retries: int,
     poll_interval_seconds: float,
@@ -775,7 +775,7 @@ async def _run_entry_with_retry(
                     work_ticket_idx=work_ticket_idx,
                     step_index=index,
                     attempt=attempt,
-                    hmac_secret=hmac_secret,
+                    signing_key=signing_key,
                     data_plane_url=data_plane_url,
                 )
             # WorkflowEntry is a closed union; the discriminator on

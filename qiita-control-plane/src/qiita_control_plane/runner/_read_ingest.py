@@ -204,7 +204,7 @@ async def _resolve_staged_reads(
     staging_root: Path,
     *,
     data_plane_url: str,
-    hmac_secret: bytes,
+    signing_key: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
     """Bind `reads` to the prep_sample's stored reads for a read-mask workflow.
@@ -235,7 +235,7 @@ async def _resolve_staged_reads(
     token = sign_action(
         action="export_read",
         payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
     # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
@@ -278,7 +278,7 @@ async def _resolve_staged_masked_reads(
     mask_idx: int,
     *,
     data_plane_url: str,
-    hmac_secret: bytes,
+    signing_key: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
     """Bind `masked_reads_fastq` to a gzip FASTQ of a prep_sample's MASKED read
@@ -319,7 +319,7 @@ async def _resolve_staged_masked_reads(
     ticket = sign_ticket(
         table="read_masked",
         filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.fastq.gz"
@@ -366,7 +366,7 @@ async def _resolve_staged_reads_block(
     members: list[dict[str, int]],
     *,
     data_plane_url: str,
-    hmac_secret: bytes,
+    signing_key: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
     """Bind `reads` to a BLOCK's reads for a read-mask-block workflow — the
@@ -409,7 +409,7 @@ async def _resolve_staged_reads_block(
     token = sign_action(
         action="export_read_block",
         payload={"dest": str(dest), "members": member_payload},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
     # wrap it as a SUBMISSION BAD_INPUT like the per-sample resolver so the outer

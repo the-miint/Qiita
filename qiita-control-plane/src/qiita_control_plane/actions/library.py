@@ -643,12 +643,12 @@ async def register_files(
     staging_dir: str,
     files: dict[str, str],
     work_ticket_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> list[str]:
     """Register Parquet files in DuckLake via the data plane's DoAction.
 
-    Signs the HMAC action token, calls Flight in a thread (FlightClient
+    Signs the Ed25519 action token, calls Flight in a thread (FlightClient
     is synchronous), and returns the list of registered permanent paths.
     Status-state guards live in the caller; reference-add typically
     requires status='loading' before invoking.
@@ -667,7 +667,7 @@ async def register_files(
             "files": files,
             "work_ticket_idx": work_ticket_idx,
         },
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action, "register_files", data_plane_url, token
@@ -681,7 +681,7 @@ async def register_files(
 async def delete_reference_data(
     *,
     reference_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict:
     """Delete a reference's DuckLake rows via the data plane's DoAction.
@@ -696,7 +696,7 @@ async def delete_reference_data(
     token = sign_action(
         action="delete_reference",
         payload={"reference_idx": reference_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action, "delete_reference", data_plane_url, token
@@ -709,7 +709,7 @@ async def delete_reference_data(
 async def delete_pool_reads_data(
     *,
     prep_sample_idxs: list[int],
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict:
     """Delete a sequenced_pool's `read` / `read_mask` DuckLake rows via the data
@@ -729,7 +729,7 @@ async def delete_pool_reads_data(
     token = sign_action(
         action="delete_pool_reads",
         payload={"prep_sample_idxs": prep_sample_idxs},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action, "delete_pool_reads", data_plane_url, token
@@ -742,7 +742,7 @@ async def delete_pool_reads_data(
 async def delete_mask_data(
     *,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> int:
     """Delete a mask's DuckLake read_mask rows via the data plane's DoAction.
@@ -758,7 +758,7 @@ async def delete_mask_data(
     token = sign_action(
         action="delete_mask",
         payload={"mask_idx": mask_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action, "delete_mask", data_plane_url, token
@@ -772,7 +772,7 @@ async def mask_metrics_data(
     *,
     mask_idx: int,
     prep_sample_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, int]:
     """Aggregate a sample's per-stage read counts for one mask from the DuckLake
@@ -788,7 +788,7 @@ async def mask_metrics_data(
     token = sign_action(
         action="mask_metrics",
         payload={"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action, "mask_metrics", data_plane_url, token
@@ -802,7 +802,7 @@ async def delete_read_mask_block_data(
     *,
     mask_idx: int,
     members: list[dict[str, int]],
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> int:
     """Delete one block's exact `read_mask` footprint via the `delete_read_mask_block`
@@ -824,7 +824,7 @@ async def delete_read_mask_block_data(
     token = sign_action(
         action="delete_read_mask_block",
         payload={"mask_idx": mask_idx, "members": members},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action, "delete_read_mask_block", data_plane_url, token
@@ -839,7 +839,7 @@ async def _finalize_sample_metrics(
     *,
     prep_sample_idx: int,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> None:
     """Roll a finalized sample's per-stage read counts onto its sequenced_sample,
@@ -857,7 +857,7 @@ async def _finalize_sample_metrics(
     counts = await mask_metrics_data(
         mask_idx=mask_idx,
         prep_sample_idx=prep_sample_idx,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         data_plane_url=data_plane_url,
     )
     expected = await conn.fetchval(
@@ -897,7 +897,7 @@ async def delete_read_mask_block(
     *,
     block_idx: int,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Idempotent block replace: delete this block's exact `read_mask` footprint
@@ -930,7 +930,7 @@ async def delete_read_mask_block(
     rows_deleted = await delete_read_mask_block_data(
         mask_idx=mask_idx,
         members=members,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         data_plane_url=data_plane_url,
     )
     return {"block_idx": block_idx, "rows_deleted": rows_deleted}
@@ -941,7 +941,7 @@ async def reconcile_block(
     *,
     block_idx: int,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Terminal step of the bulk-block read-mask workflow: mark this block done,
@@ -998,7 +998,7 @@ async def reconcile_block(
                 conn,
                 prep_sample_idx=prep_sample_idx,
                 mask_idx=mask_idx,
-                hmac_secret=hmac_secret,
+                signing_key=signing_key,
                 data_plane_url=data_plane_url,
             )
             await finalize_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
