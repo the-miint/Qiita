@@ -55,6 +55,7 @@ from ._dispatch import (
     _patch_resource_status,
 )
 from ._mask import (
+    LIMA_ARGS_BINDING,
     MASK_IDX_BINDING,
     _mint_read_mask,
     _persist_mask_idx,
@@ -240,6 +241,13 @@ async def run_workflow(
         # Syndna's rype index, resolved (and validated ACTIVE) before the mask
         # mint below reads `syndna_reference_idx` into the identity hash.
         bound.update(await _resolve_syndna_index(pool, action_context=bound))
+        # lima's argument string is CP-resolved from the client's `lima_preset`
+        # (never client-supplied) and bound so the lima_export step's `params:`
+        # can thread it into `lima_config.json` for the container. Resolving here
+        # also fails a bad preset at SUBMISSION rather than mid-loop.
+        _lima = _resolved_lima(bound)
+        if _lima is not None:
+            bound[LIMA_ARGS_BINDING] = _lima["args"]
 
         # QC adapter materialization: when any step needs `adapter_parquet` (the
         # qc step), DoGet the configured artifact_sequence_set reference's

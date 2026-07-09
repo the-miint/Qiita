@@ -32,6 +32,12 @@ from ._upload import _submission_bad_input
 # into the step.
 MASK_IDX_BINDING = "mask_idx"
 
+# Binding for the CP-resolved lima argument string. The `lima_export` step lists
+# it in its `params:` and writes it into `lima_config.json`, which the container
+# reads — a scalar cannot ride a container step's `inputs` (they are bind-mount
+# paths).
+LIMA_ARGS_BINDING = "lima_args"
+
 # Resolved QC config the mask hash covers — the effective fastp-equivalent
 # filter the qc job applies. Mirrors the constants in
 # qiita_compute_orchestrator.jobs.qc (the fastp `-l 100` defaults); kept here

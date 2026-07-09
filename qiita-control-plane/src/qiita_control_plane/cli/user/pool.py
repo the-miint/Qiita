@@ -961,6 +961,12 @@ def _handle_submit_host_filter_pool(
         for sample in samples:
             action_context: dict[str, Any] = {
                 "host_filter_enabled": host_filter_enabled,
+                # `when:` is DEFAULT-ON — an absent gate key RUNS the step. These
+                # must be written explicitly or a short-read read-mask ticket would
+                # execute the long-read lima chain. The PacBio submit derives them
+                # per sample from the pool's pre-flight blob.
+                "lima_enabled": False,
+                "syndna_enabled": False,
             }
             if host_filter_enabled:
                 action_context["host_rype_reference_idx"] = host_rype

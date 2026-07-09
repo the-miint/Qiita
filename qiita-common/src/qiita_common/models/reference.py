@@ -39,12 +39,23 @@ class ReadMaskReason(StrEnum):
     `pass` survives the mask (its recorded trims are applied by the `read_masked`
     view); every other value excludes the read from `read_masked`. The `qc_*`
     values come from the `qc` step's `filter_read` fail reasons; the `host_*`
-    values come from the `host_filter` step's rype / minimap2 hits.
+    values come from the `host_filter` step's rype / minimap2 hits;
+    `twist_no_adaptor` comes from the long-read `lima` adapter chain.
 
     Reason precedence (privacy-critical): a read that both fails QC and hits the
     host filter records the `host_*` hit, so a host/human read can never leak
     through a code path that only inspects `qc_*`. Host classification runs only
-    on the QC-pass subset, so `host_*` only ever overrides `pass`.
+    on the QC-pass subset, so `host_*` only ever overrides `pass`. Each step in
+    the chain classifies only rows still `pass` and falls through to the incoming
+    reason, so an earlier verdict is never overwritten by a later step.
+
+    `twist_no_adaptor` marks a HiFi read in which lima found no Twist adaptor. Such
+    a read is not a library molecule from this run — it is artifactual, not a real
+    read whose adapter ligation merely failed. It therefore counts toward `raw`
+    only, and is excluded from the biological bucket along with the `qc_*` values.
+    Note the biological predicate is a WHITELIST (`pass` + `host_*`), not
+    `NOT LIKE 'qc_%'`: a new reason must be classified explicitly, never bucketed
+    as biological by default.
 
     Backs a DuckLake VARCHAR column, NOT a Postgres `CREATE TYPE ... AS ENUM`.
     Per the enum-parity carve-out in CLAUDE.md (a StrEnum backed by a
@@ -59,6 +70,7 @@ class ReadMaskReason(StrEnum):
     QC_TOO_MANY_N = "qc_too_many_n"
     HOST_RYPE = "host_rype"
     HOST_MINIMAP2 = "host_minimap2"
+    TWIST_NO_ADAPTOR = "twist_no_adaptor"
 
 
 class TerminologyStatus(StrEnum):

@@ -422,7 +422,15 @@ async def plan_and_submit_blocks(
     for s in to_plan:
         partitions.setdefault(mask_by_protocol[s.prep_protocol_idx], []).append(s)
 
-    action_context = {"host_filter_enabled": host_filter_enabled}
+    # `when:` is DEFAULT-ON, and this INSERTs the ticket directly (bypassing the
+    # REST route's context_schema `required:` check), so the gate keys must be
+    # written here explicitly. read-mask-block is `qc -> host_filter` only: it has
+    # neither the lima chain nor the syndna step.
+    action_context = {
+        "host_filter_enabled": host_filter_enabled,
+        "lima_enabled": False,
+        "syndna_enabled": False,
+    }
     if host_filter_enabled:
         action_context["host_rype_reference_idx"] = host_rype_reference_idx
         if host_minimap2_reference_idx is not None:

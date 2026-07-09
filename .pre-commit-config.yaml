@@ -2,21 +2,27 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
-      # Vendored third-party docs assets (Swagger UI / ReDoc) are kept
-      # byte-for-byte upstream — see docs/api-docs.md. They are minified
-      # (whitespace fixers would corrupt them) and large by nature (the
-      # 500 KB cap exists to catch accidental blobs, not deliberate
-      # vendored bundles), so they are exempt from these three hooks.
-      # landing.css / landing.js in the same dir are NOT exempt.
+      # Files kept BYTE-FOR-BYTE as vendored from upstream, exempt from these
+      # three hooks:
+      #
+      #  - Swagger UI / ReDoc docs assets (see docs/api-docs.md). Minified, so a
+      #    whitespace fixer would corrupt them, and large by nature (the 500 KB
+      #    cap catches accidental blobs, not deliberate bundles).
+      #    landing.css / landing.js in the same dir are NOT exempt.
+      #  - The Twist adapter FASTA the lima image bakes in. Its md5 is pinned
+      #    into the read-mask identity hash (`_LIMA_ADAPTER_SET_MD5`), and
+      #    end-of-file-fixer WOULD append the trailing newline PacBio's published
+      #    file lacks — silently changing the md5 and breaking the pin. Keeping it
+      #    byte-exact also lets anyone verify it against the upstream artifact.
       - id: trailing-whitespace
-        exclude: &vendored_docs_assets ^qiita-control-plane/src/qiita_control_plane/static/(swagger-ui-bundle\.js|swagger-ui\.css|redoc\.standalone\.js)$
+        exclude: &vendored_verbatim ^(qiita-control-plane/src/qiita_control_plane/static/(swagger-ui-bundle\.js|swagger-ui\.css|redoc\.standalone\.js)|workflows/read-mask/twist_adapters_231010\.fasta)$
       - id: end-of-file-fixer
-        exclude: *vendored_docs_assets
+        exclude: *vendored_verbatim
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
-        exclude: *vendored_docs_assets
+        exclude: *vendored_verbatim
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.0

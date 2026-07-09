@@ -109,15 +109,83 @@ context_schema:
       minimum: 1
 
 steps:
+  # ---- Long-read adapter removal (lima), gated on `lima_enabled` -------------
+  #
+  # Runs FIRST, before QC: lima needs the intact adaptor, and QC's length filter
+  # must judge the INSERT, not the adaptored read. All three entries carry the
+  # same `when:` so they skip together (as host-reference-add's builder + its
+  # register-index action do).
+  #
+  # WARNING: `when:` is DEFAULT-ON — `bool(action_context.get(key, True))`. An
+  # action_context that omits `lima_enabled` RUNS these steps. Every producer
+  # writes it explicitly, and `context_schema.required` enforces it on the REST
+  # route (block_planner INSERTs directly and so bypasses that check).
+  #
+  # Serializing the reads to FASTQ is an on-disk hand-off to a container binary
+  # (CLAUDE.local.md: called out, not silently entrenched). It cannot be streamed:
+  # `_resolve_staged_masked_reads` needs an already-completed mask, and this chain
+  # is what builds it; the raw `read` table is not Flight-reachable.
+  - step: lima_export
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.lima_export
+    when: lima_enabled
+    inputs: [reads]
+    # `lima_args` is resolved by the control plane from the client's
+    # `lima_preset`; it is never client-supplied (it would otherwise let a caller
+    # forge mask identity and pass arbitrary flags to a container).
+    params: {lima_args: lima_args}
+    outputs: [lima_in_fastq, lima_config]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT2H
+
+  # The adapter FASTA is BAKED INTO the image (record order is load-bearing —
+  # lima's `--neighbors` keeps only barcode pairs adjacent in the file, and the
+  # reference store cannot round-trip an ordered set). `lima_args` reaches the
+  # container as a FILE: a container step's `inputs` are bind-mount paths, so a
+  # scalar param would be rejected as CONTRACT_VIOLATION.
+  - step: lima
+    step_type: singleton
+    container: lima-2.13.0.sif
+    when: lima_enabled
+    inputs: [lima_in_fastq, lima_config]
+    outputs: [lima_out_fastq]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 16
+      walltime: PT4H
+
+  # lima's clipped FASTQ -> a partial read mask, via miint's `infer_trim`. Reads
+  # lima dropped become `twist_no_adaptor`. Emits the `adapter_mask` qc consumes.
+  - step: lima_mask
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.lima_mask
+    when: lima_enabled
+    inputs: [reads, lima_out_fastq]
+    outputs: [adapter_mask]
+    baseline_resources:
+      cpu: 4
+      # infer_trim materializes both sequence sets and substring-searches per row,
+      # so this scales with total SEQUENCE BYTES, not row count.
+      mem_gb: 32
+      walltime: PT4H
+
   # Always-on QC over the stored reads. Emits a PARTIAL read mask (qc_mask: per
   # read, reason + per-end trims) — it drops nothing. `reads` is runner-bound
   # from the prep_sample's stored reads (_resolve_staged_reads); `adapter_parquet`
   # is materialized by the runner before the loop. `instrument_model` rides
   # through `params:` to gate polyG.
+  #
+  # `adapter_mask` is OPTIONAL: bound only when the lima chain ran. When bound, QC
+  # re-classifies only its still-`pass` rows (on the trimmed insert) and carries
+  # every non-`pass` row through verbatim, emitting trims cumulative from the RAW
+  # read. Unbound, QC is the first step and behaves exactly as before.
   - step: qc
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.qc
     inputs: [reads, adapter_parquet]
+    optional_inputs: [adapter_mask]
     params: {instrument_model: instrument_model}
     outputs: [qc_mask]
     baseline_resources:
