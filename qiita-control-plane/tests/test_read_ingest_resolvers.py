@@ -23,6 +23,7 @@ from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
     STAGED_READS_BINDING,
     _resolve_sample_map,
+    _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
     _workflow_declares_input,
@@ -342,3 +343,97 @@ def test_resolve_staged_reads_block_missing_file_is_bad_input(tmp_path, monkeypa
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "wrote no file" in exc.value.reason
+
+
+# --- masked block-export resolver (_resolve_staged_masked_reads_block) ------
+
+_EXPORT_MASKED_BLOCK = "qiita_control_plane.runner._do_action_export_read_masked_block"
+
+
+def test_resolve_staged_masked_reads_block_binds_and_signs_mask_and_members(tmp_path, monkeypatch):
+    """An align block sources the DP `export_read_masked_block` action; `reads`
+    binds to the written file, and the signed token carries the mask_idx + the
+    members verbatim (the MASKED-reads twin of the raw block resolver)."""
+    workspace = tmp_path / "ticket" / "901"
+    dest = workspace / "reads.parquet"
+    captured: dict = {}
+
+    def _fake_export(_url, token):
+        captured["payload"] = _decode_token_payload(token)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("parquet-bytes")
+        return {"count": 3, "dest": str(dest)}
+
+    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, _fake_export)
+
+    bound = asyncio.run(
+        _resolve_staged_masked_reads_block(
+            _BLOCK_MEMBERS,
+            mask_idx=42,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=workspace,
+        )
+    )
+    assert bound[STAGED_READS_BINDING] == dest
+    assert dest.exists()
+
+    payload = captured["payload"]
+    assert payload["action"] == "export_read_masked_block"
+    assert payload["dest"] == str(dest)
+    assert payload["mask_idx"] == 42
+    assert payload["members"] == _BLOCK_MEMBERS
+
+
+def test_resolve_staged_masked_reads_block_empty_members_is_bad_input(tmp_path, monkeypatch):
+    def _boom(_url, _token):
+        raise AssertionError("export_read_masked_block must not fire for an empty block")
+
+    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_masked_reads_block(
+                [],
+                mask_idx=1,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_resolve_staged_masked_reads_block_zero_count_is_bad_input(tmp_path, monkeypatch):
+    """Zero MASKED reads (every read masked out, or the mask never landed) →
+    BAD_INPUT: there is nothing to align."""
+    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, lambda _u, _t: {"count": 0, "dest": "x"})
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_masked_reads_block(
+                _BLOCK_MEMBERS,
+                mask_idx=1,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_resolve_staged_masked_reads_block_export_failure_is_bad_input(tmp_path, monkeypatch):
+    def _boom(_url, _token):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_masked_reads_block(
+                _BLOCK_MEMBERS,
+                mask_idx=1,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "masked reads" in exc.value.reason

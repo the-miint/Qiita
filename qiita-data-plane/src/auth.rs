@@ -352,6 +352,50 @@ pub fn verify_export_read_block(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `export_read_masked_block` DoAction — the MASKED-reads
+/// sibling of `export_read_block`.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.runner._resolve_staged_masked_reads_block`:
+/// `{"action": "export_read_masked_block", "dest": "<abs path>", "mask_idx": N,
+///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
+///                "sequence_idx_stop": b}, ...]}`.
+/// The data plane re-materializes the union of the members' sub-ranges from its
+/// DuckLake `read_masked` VIEW (filtered `mask_idx = ?`, so already trimmed and
+/// host/QC-`pass`-filtered) to `dest` — a per-ticket `reads.parquet` the sharded
+/// `align_sharded` job then consumes, in the SAME column shape `export_read_block`
+/// writes. It is `export_read_block` (dest + members, reusing
+/// `ExportReadBlockMember`) plus the `mask_idx` scope — the raw `read` export
+/// needs no mask column, a masked export does. `deny_unknown_fields` keeps the
+/// contract tight: any extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportReadMaskedBlockPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "export_read_masked_block".
+    pub action: String,
+    /// Absolute destination path for the materialized Parquet. The handler
+    /// re-validates it (`validate_export_dest`) before writing — under the
+    /// data plane's scratch root, no `..`, no single quote — even though the
+    /// token is HMAC-signed by the control plane (defense in depth).
+    pub dest: String,
+    /// `i64`, matching the Postgres `alignment_definition` mask scope and the
+    /// `read_mask.mask_idx BIGINT` column the `read_masked` view filters on.
+    pub mask_idx: i64,
+    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
+    /// an empty list (an empty block is a control-plane bug, not a valid ask).
+    pub members: Vec<ExportReadBlockMember>,
+}
+
+/// Verify an `export_read_masked_block` DoAction token and return its payload.
+pub fn verify_export_read_masked_block(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<ExportReadMaskedBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed payload for the `delete_read_mask_block` DoAction — the idempotent
 /// block-replace sibling of `export_read_block`.
 ///
@@ -811,6 +855,76 @@ mod tests {
         let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}]}"#;
         let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
         match verify_export_read_block(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // export_read_masked_block action token variant
+    // --------------------------------------------------------------------
+
+    fn make_export_read_masked_block_ticket(
+        dest: &str,
+        mask_idx: i64,
+        members: &str,
+        secret: &[u8],
+        expiry: u64,
+    ) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace. Top-level keys sorted:
+        // action, dest, mask_idx, members.
+        let payload = format!(
+            r#"{{"action":"export_read_masked_block","dest":"{dest}","mask_idx":{mask_idx},"members":{members}}}"#
+        );
+        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
+    }
+
+    #[test]
+    fn verify_export_read_masked_block_round_trip() {
+        let members =
+            r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}]"#;
+        let ticket = make_export_read_masked_block_ticket(
+            "/scratch/ticket/900/reads.parquet",
+            7,
+            members,
+            b"dev-secret",
+            future_expiry(300),
+        );
+        let payload = verify_export_read_masked_block(&ticket, b"dev-secret")
+            .expect("valid token should verify");
+        assert_eq!(payload.action, "export_read_masked_block");
+        assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
+        assert_eq!(payload.mask_idx, 7);
+        assert_eq!(payload.members.len(), 1);
+        assert_eq!(payload.members[0].prep_sample_idx, 101);
+        assert_eq!(payload.members[0].sequence_idx_start, 100);
+        assert_eq!(payload.members[0].sequence_idx_stop, 109);
+    }
+
+    #[test]
+    fn verify_export_read_masked_block_rejects_bad_hmac() {
+        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
+        let mut ticket = make_export_read_masked_block_ticket(
+            "/scratch/ticket/1/reads.parquet",
+            3,
+            members,
+            b"dev-secret",
+            future_expiry(300),
+        );
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_export_read_masked_block(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_export_read_masked_block_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled top-level field (or a missing mask_idx)
+        // is a contract slip surfaced here.
+        let payload = br#"{"action":"export_read_masked_block","dest":"/scratch/x","mask_idx":1,"members":[],"smuggled":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_export_read_masked_block(&ticket, b"dev-secret").unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }

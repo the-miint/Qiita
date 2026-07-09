@@ -511,14 +511,38 @@ async def run_workflow(
                     }
                     for (ps, lo, hi) in await fetch_block_members(pool, scope_target["block_idx"])
                 ]
-                bound.update(
-                    await _resolve_staged_reads_block(
-                        members,
-                        data_plane_url=data_plane_url,
-                        hmac_secret=hmac_secret,
-                        workspace=workspace,
+                # An ALIGN block ticket carries a non-NULL alignment_idx and aligns
+                # the block's HOST-DEPLETED reads: stage the MASKED reads (the
+                # read_masked view scoped to the ticket's completed mask_idx). A
+                # read-mask-block ticket (alignment_idx NULL) masks the RAW reads,
+                # so it stages the raw `read` table. mask_idx is pre-resolved at
+                # plan time on both paths (the align planner sets it to the samples'
+                # completed mask; the block-mask planner to the partition mask).
+                if work_ticket.get("alignment_idx") is not None:
+                    align_mask_idx = work_ticket["mask_idx"]
+                    if align_mask_idx is None:
+                        raise _submission_bad_input(
+                            "an align block ticket must carry the completed mask_idx its "
+                            "reads were masked under (set at plan time); found NULL"
+                        )
+                    bound.update(
+                        await _resolve_staged_masked_reads_block(
+                            members,
+                            mask_idx=align_mask_idx,
+                            data_plane_url=data_plane_url,
+                            hmac_secret=hmac_secret,
+                            workspace=workspace,
+                        )
                     )
-                )
+                else:
+                    bound.update(
+                        await _resolve_staged_reads_block(
+                            members,
+                            data_plane_url=data_plane_url,
+                            hmac_secret=hmac_secret,
+                            workspace=workspace,
+                        )
+                    )
             else:
                 raise _submission_bad_input(
                     "a workflow that masks stored reads must be prep_sample- or "
@@ -1103,7 +1127,7 @@ _WORK_TICKET_COLS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx, "
     "wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx, "
     "wt.prep_sample_idx, wt.sequenced_pool_idx, sp.sequencing_run_idx, "
-    "wt.block_idx, wt.mask_idx, wt.shard_id, "
+    "wt.block_idx, wt.mask_idx, wt.alignment_idx, wt.shard_id, "
     "wt.action_context, wt.state, wt.retry_count, wt.max_retries, "
     "wt.resource_override"
 )
@@ -2335,6 +2359,16 @@ def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str,
     return _do_action_export("export_read_block", data_plane_url, token)
 
 
+def _do_action_export_read_masked_block(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """`export_read_masked_block` DoAction: the data plane materializes the UNION
+    of a block's members from its DuckLake `read_masked` VIEW (trimmed +
+    host/QC-`pass`-filtered), scoped to the ticket's `mask_idx`, into one
+    per-ticket Parquet — the MASKED-reads sibling of `export_read_block` (same
+    output column shape). Isolated (thin wrapper over `_do_action_export`) so unit
+    tests stub the real call by name."""
+    return _do_action_export("export_read_masked_block", data_plane_url, token)
+
+
 async def _resolve_staged_reads(
     scope_target: dict[str, Any],
     staging_root: Path,
@@ -2480,6 +2514,77 @@ async def _resolve_staged_reads_block(
     if not dest.exists():
         raise _submission_bad_input(
             f"the data plane reported reads for the block but wrote no file at {dest}"
+        )
+    return {STAGED_READS_BINDING: dest}
+
+
+async def _resolve_staged_masked_reads_block(
+    members: list[dict[str, int]],
+    *,
+    mask_idx: int,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Bind `reads` to a BLOCK's MASKED reads for an align workflow — the
+    host-depleted, QC-passed twin of `_resolve_staged_reads_block`.
+
+    Same block-member shape and per-ticket `reads.parquet` contract as the raw
+    path, but the data plane sources the `read_masked` VIEW (trimmed +
+    `pass`-filtered) scoped to `mask_idx` via the `export_read_masked_block`
+    DoAction, so `align_sharded` aligns exactly the reads that survived the
+    host-depletion mask. The output column shape is identical to
+    `export_read_block`, so the `align_sharded.reads` contract is unchanged.
+
+    `mask_idx` is the ticket's pre-resolved (plan-time) mask — the SAME
+    completed mask the block's samples were masked under. Fails
+    SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly, step_name=None) if:
+    `members` is empty (a planning bug); the data plane is unreachable; the block
+    selects zero MASKED reads (every read in range was masked out, or the mask
+    never landed — either way there is nothing to align, a fail-fast); or the
+    data plane reported reads but no file landed."""
+    if not members:
+        raise _submission_bad_input("an align block requires a non-empty members list")
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "reads.parquet"
+    try:
+        member_payload = [
+            {
+                "prep_sample_idx": int(m["prep_sample_idx"]),
+                "sequence_idx_start": int(m["sequence_idx_start"]),
+                "sequence_idx_stop": int(m["sequence_idx_stop"]),
+            }
+            for m in members
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _submission_bad_input(
+            f"malformed align block member (a planning bug): {type(exc).__name__}: {exc}"
+        ) from exc
+    token = sign_action(
+        action="export_read_masked_block",
+        payload={"dest": str(dest), "mask_idx": int(mask_idx), "members": member_payload},
+        secret=hmac_secret,
+    )
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _do_action_export_read_masked_block, data_plane_url, token
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize masked reads for the block from the data plane: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if result.get("count", 0) == 0:
+        raise _submission_bad_input(
+            "the align block selected zero MASKED reads from the data plane; its "
+            "members' sequence_idx ranges matched no passing read_masked rows under "
+            f"mask_idx={mask_idx} (the mask never landed, or every read was masked "
+            "out — nothing to align)"
+        )
+    if not dest.exists():
+        raise _submission_bad_input(
+            f"the data plane reported masked reads for the block but wrote no file at {dest}"
         )
     return {STAGED_READS_BINDING: dest}
 
