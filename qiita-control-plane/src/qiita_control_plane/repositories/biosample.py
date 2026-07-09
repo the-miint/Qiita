@@ -24,10 +24,8 @@ from ._sample_helpers import (
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
-    preflight_sample_metadata,
     validate_primary_secondary_studies,
-    write_global_metadata_entries,
-    write_local_metadata_entries,
+    write_sample_metadata,
 )
 from .biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
@@ -36,7 +34,7 @@ from .biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 
-# Owner display values often contain real names (PII), so the
+# Owners' ids for their own samples sometimes inadvertently PII, so the
 # owner-biosample-id field is pinned above the study's default tier:
 # even on a public study, only study members may read the owner-id
 # metadata.
@@ -255,7 +253,7 @@ class BiosampleImportResult:
 
     owner_id_biosample_study_field_* name the biosample_study_field
     row that holds the owner-biosample-id for this study — the
-    purely-local, PII-tier-pinned field flagged
+    purely-local, member-tier-restricted field flagged
     is_owner_biosample_id=True on the associated biosample_metadata
     row.
     """
@@ -320,8 +318,9 @@ async def import_biosample_from_owner_biosample_id(
     value_missing_reason_idx rather than typed-parsed; a text value on a
     TERMINOLOGY-typed field that matches a qiita.terminology_term row
     scoped to the field's terminology_idx is recorded as
-    value_terminology_term_idx. Pre-flight validation runs before any
-    writes:
+    value_terminology_term_idx. Validation raises the following; the
+    call is atomic under the caller's transaction, so any raise rolls
+    back the rows written above it:
 
         - BiosampleOwnerIdFieldCollisionError when metadata carries an
           entry whose key equals owner_biosample_id_field_name.
@@ -361,10 +360,10 @@ async def import_biosample_from_owner_biosample_id(
     if owner_biosample_id_field_name in metadata:
         raise BiosampleOwnerIdFieldCollisionError(owner_biosample_id_field_name)
 
-    # Pre-flight: resolve every text value that could plausibly be a
-    # missing-reason marker in one DB round trip, including the owner-id
-    # text. Values are stripped so a padded marker (e.g. " not collected ")
-    # still resolves; the set covers every value the composer will inspect.
+    # Resolve every text value that could plausibly be a missing-reason
+    # marker in one DB round trip, including the owner-id text. Values are
+    # stripped so a padded marker (e.g. " not collected ") still resolves;
+    # the set covers every value the composer will inspect.
     stripped_owner_id = owner_biosample_id_value.strip()
     candidate_texts = {v.strip() for v in metadata.values()} | {stripped_owner_id}
     known_missing_reasons = await fetch_missing_value_reason_idxs_by_names(conn, candidate_texts)
@@ -383,17 +382,6 @@ async def import_biosample_from_owner_biosample_id(
     # UNRESOLVED and abort its pool at submit.
     await assert_required_global_fields_supplied(
         conn, spec=BIOSAMPLE_METADATA_SPEC, metadata=metadata
-    )
-
-    # Pre-flight: resolve each metadata entry against the study's global and
-    # existing study-local fields; any unresolvable/conflicting case raises pre-write.
-    global_pairs, local_pairs = await preflight_sample_metadata(
-        conn,
-        spec=BIOSAMPLE_METADATA_SPEC,
-        study_idx=primary_study_idx,
-        metadata=metadata,
-        known_missing_reasons=known_missing_reasons,
-        allow_local=True,
     )
 
     bs_idx = await insert_biosample(
@@ -415,28 +403,10 @@ async def import_biosample_from_owner_biosample_id(
         caller_idx=caller_idx,
     )
 
-    await write_global_metadata_entries(
-        conn,
-        spec=BIOSAMPLE_METADATA_SPEC,
-        entity_idx=bs_idx,
-        study_idx=primary_study_idx,
-        caller_idx=caller_idx,
-        parsed_metadata=global_pairs,
-    )
-
-    # Write each metadata entry that resolved to an *existing* purely-local
-    # study field against that field directly (no field is created here).
-    await write_local_metadata_entries(
-        conn,
-        spec=BIOSAMPLE_METADATA_SPEC,
-        entity_idx=bs_idx,
-        study_idx=primary_study_idx,
-        caller_idx=caller_idx,
-        resolved_metadata=local_pairs,
-    )
-
-    # tier_override pins the field above any study-level default so
-    # the owner display value never surfaces to non-members (PII).
+    # tier_override pins the field to member tier: the owner's sample name
+    # is theirs to see, but restricted to study members because sample
+    # names sometimes carry incautiously-entered PII. (Tier enforcement is
+    # not yet built — see docs/architecture.md.)
     (
         field_idx,
         field_created,
@@ -469,6 +439,21 @@ async def import_biosample_from_owner_biosample_id(
         biosample_study_field_idx=field_idx,
         value_text=owner_biosample_id_value,
         created_by_idx=caller_idx,
+    )
+
+    # Validate and write the supplied metadata against primary_study_idx: a
+    # global field writes through its slot, an existing study-local field
+    # writes locally. The pre-resolved marker set is reused so no second
+    # missing-reason lookup runs; allow_local admits the local-field path.
+    await write_sample_metadata(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=primary_study_idx,
+        metadata=metadata,
+        caller_idx=caller_idx,
+        allow_local=True,
+        known_missing_reasons=known_missing_reasons,
     )
 
     return BiosampleImportResult(

@@ -2137,6 +2137,22 @@ _None yet._
   image's own inputs so a change to one tool's def or entrypoint rebuilds only its
   image. `long-read-assembly` is the first consumer, shipping four per-tool images
   (assemble / binning / dastool / checkm). (#255)
+- **Idempotent upsert for sample-metadata writes.** The shared metadata-write
+  path gained an `on_conflict="upsert"` mode: when a write collides with an
+  existing value the caller's own study contributed, it overwrites the value in
+  place (symmetrically across the intentionally-missing↔real boundary) and
+  reports per write whether it inserted, updated, or left an identical value
+  unchanged; a value another study contributed to a global field still raises
+  rather than being overwritten. The default `on_conflict="raise"` preserves
+  the prior insert-only behavior, so existing import callers are unaffected. No
+  env var, migration, scope, route, or wire change. (#TBD)
+- **Sample-metadata writes extracted into one composer — no behavior change.**
+  Factored the resolve-markers → validate → write-global → write-local sequence
+  shared by the biosample and sequenced-prep-sample import composers into a
+  single spec-parameterized `write_sample_metadata` helper, and routed both
+  import composers through it. The self-contained composer is the reuse point
+  for the forthcoming update-a-biosample's-metadata surface. No env var,
+  migration, scope, route, or wire change. (#TBD)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
   helper; split the orchestrator's all-nullable `StepHandle` into typed

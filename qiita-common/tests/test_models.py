@@ -900,3 +900,53 @@ def test_read_mask_reason_sql_list_is_sorted_and_quoted():
         "'host_minimap2', 'host_rype', 'pass'"
     )
     assert read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN) == "'spikein_syndna'"
+
+
+def test_biosample_metadata_write_request_rejects_empty_metadata():
+    """Tests the case where the metadata dict is empty: an empty write is
+    rejected at the wire boundary (min_length=1), matching the core PATCH's
+    at-least-one-field rule.
+    """
+    from qiita_common.models import BiosampleMetadataWriteRequest
+
+    with pytest.raises(ValidationError):
+        BiosampleMetadataWriteRequest(metadata={})
+
+
+def test_biosample_metadata_write_request_rejects_extra_field():
+    """Tests the case where an unknown top-level key is supplied: extra="forbid"
+    rejects it rather than silently ignoring it.
+    """
+    from qiita_common.models import BiosampleMetadataWriteRequest
+
+    with pytest.raises(ValidationError):
+        BiosampleMetadataWriteRequest(metadata={"ph": "7.2"}, typo="x")
+
+
+def test_metadata_entry_round_trips_ref_values():
+    """Tests the case where a MetadataEntry carries the discriminated-union Ref
+    variants: both a MissingReasonRef and a TerminologyTermRef validate and
+    round-trip through the shared SampleMetadataValue alias.
+    """
+    from qiita_common.models import (
+        FieldDataType,
+        MetadataEntry,
+        MissingReasonRef,
+        TerminologyTermRef,
+    )
+
+    missing = MetadataEntry(
+        display_name="pH",
+        description=None,
+        data_type=FieldDataType.NUMERIC,
+        value=MissingReasonRef(idx=3, name="not collected"),
+    )
+    term = MetadataEntry(
+        display_name="Env Material",
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=TerminologyTermRef(idx=5, term_id="ENVO:00002007", label="soil"),
+    )
+
+    assert MetadataEntry.model_validate(missing.model_dump()) == missing
+    assert MetadataEntry.model_validate(term.model_dump()) == term

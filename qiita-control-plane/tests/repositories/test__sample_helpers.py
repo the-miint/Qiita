@@ -33,7 +33,12 @@ from decimal import Decimal
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
-from qiita_common.models import FieldDataType, MissingReasonRef, TerminologyTermRef
+from qiita_common.models import (
+    FieldDataType,
+    FieldWriteOutcome,
+    MissingReasonRef,
+    TerminologyTermRef,
+)
 
 from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -45,8 +50,11 @@ from qiita_control_plane.repositories._sample_helpers import (
     GlobalMetadataRow,
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
+    MetadataRow,
     MetadataUnknownFieldsError,
+    OwnerSampleIdMetadataWriteError,
     SampleEntityKind,
+    SampleMetadataFieldResult,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     StudyFieldConflictError,
@@ -55,8 +63,10 @@ from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     _insert_metadata,
+    _update_metadata,
     fetch_global_fields_by_display_names,
     fetch_global_metadata,
+    fetch_local_metadata,
     fetch_missing_value_reason_idxs_by_names,
     fetch_study_fields_by_display_names,
     fetch_terminology_term_idxs_by_term_ids,
@@ -69,6 +79,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     write_global_metadata_or_diagnose,
     write_local_metadata_entries,
     write_local_metadata_or_diagnose,
+    write_sample_metadata,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
@@ -88,6 +99,7 @@ from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
     _create_biosample_with_link,
+    _create_linked_entity_for_spec,
     _create_local_field,
     _create_prep_sample_with_link,
     _seed_global_field_for_spec,
@@ -133,6 +145,7 @@ async def _commit_write(
     data_type: FieldDataType,
     value,
     caller_idx: int | None = None,
+    on_conflict: str = "raise",
 ):
     """Run write_global_metadata_or_diagnose inside its own committed
     transaction, track the resulting rows for cleanup, and return the
@@ -151,6 +164,7 @@ async def _commit_write(
                 data_type=data_type,
                 value=value,
                 caller_idx=caller_idx,
+                on_conflict=on_conflict,
             )
     ctx["created"]["biosample_study_field"].append(result.study_field_idx)
     ctx["created"]["biosample_metadata"].append(result.metadata_idx)
@@ -1121,6 +1135,7 @@ async def _commit_local_write(
     value,
     caller_idx: int | None = None,
     required: bool = False,
+    on_conflict: str = "raise",
 ):
     """Run write_local_metadata_or_diagnose inside its own committed
     transaction, track the resulting rows for cleanup, and return the
@@ -1139,6 +1154,7 @@ async def _commit_local_write(
                 value=value,
                 caller_idx=caller_idx,
                 required=required,
+                on_conflict=on_conflict,
             )
     ctx["created"]["biosample_study_field"].append(result.study_field_idx)
     ctx["created"]["biosample_metadata"].append(result.metadata_idx)
@@ -2810,6 +2826,166 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
     assert result == expected
 
 
+# ---------------------------------------------------------------------------
+# fetch_local_metadata
+# ---------------------------------------------------------------------------
+
+
+async def _seed_local_metadata(ctx, *, spec, entity_idx, display_name, value):
+    """Seed a purely-local study_field plus one TEXT metadata row for
+    entity_idx, tracking both for cleanup; returns the study_field idx."""
+    field_idx = await _seed_local_study_field(ctx, spec=spec, display_name=display_name)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        meta_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
+    return field_idx
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_local_metadata_returns_local_excludes_global(ctx, spec):
+    """Tests the case where an entity carries both a purely-local value and a
+    globally-linked value on the study: fetch_local_metadata returns only the
+    local one, keyed by display_name, and omits the globally-linked row.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    suffix = secrets.token_hex(4)
+    local_name = f"Local Field {suffix}"
+
+    await _seed_local_metadata(
+        ctx, spec=spec, entity_idx=entity_idx, display_name=local_name, value="LOCAL-VAL"
+    )
+    # A globally-linked row on the same entity must NOT appear in the local read.
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=spec,
+        entity_idx=entity_idx,
+        internal_name=f"global_{suffix}",
+        display_name=f"Global {suffix}",
+        description=None,
+        data_type=FieldDataType.TEXT,
+        value="GLOBAL-VAL",
+    )
+
+    result = await fetch_local_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"]
+    )
+
+    expected = {
+        local_name: MetadataRow(
+            display_name=local_name,
+            description=None,
+            data_type=FieldDataType.TEXT,
+            value="LOCAL-VAL",
+        )
+    }
+    assert result == expected
+
+
+async def test_fetch_local_metadata_scopes_to_study(ctx):
+    """Tests the case where a biosample linked to two studies carries a
+    purely-local value in each: fetch_local_metadata returns only the value
+    whose study_field belongs to the requested study.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
+    suffix = secrets.token_hex(4)
+    first_name = f"First Study Field {suffix}"
+    second_name = f"Second Study Field {suffix}"
+
+    # One local value in the primary study (its study_field is on ctx study).
+    await _seed_local_metadata(
+        ctx,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        display_name=first_name,
+        value="FIRST",
+    )
+    # One local value in the second study, seeded on that study's own field.
+    second_field_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=second_study_idx,
+        display_name=second_name,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(second_field_idx)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        second_meta = await _insert_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=bs_idx,
+            study_field_idx=second_field_idx,
+            data_type=FieldDataType.TEXT,
+            value="SECOND",
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"]["biosample_metadata"].append(second_meta)
+
+    first_result = await fetch_local_metadata(
+        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
+    )
+    second_result = await fetch_local_metadata(
+        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=second_study_idx
+    )
+
+    assert first_result == {
+        first_name: MetadataRow(
+            display_name=first_name, description=None, data_type=FieldDataType.TEXT, value="FIRST"
+        )
+    }
+    assert second_result == {
+        second_name: MetadataRow(
+            display_name=second_name, description=None, data_type=FieldDataType.TEXT, value="SECOND"
+        )
+    }
+
+
+async def test_fetch_local_metadata_includes_owner_sample_id_row(ctx):
+    """Tests the case where a biosample carries an owner-sample-id row: it is a
+    study-local value and fetch_local_metadata returns it like any other (the
+    caller, not this read, gates study-member access).
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+    owner_field_name = f"Owner Sample Name {suffix}"
+    owner_field_idx = await _seed_local_study_field(
+        ctx, spec=BIOSAMPLE_METADATA_SPEC, display_name=owner_field_name
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        owner_meta = await insert_owner_biosample_id_metadata(
+            conn,
+            biosample_idx=bs_idx,
+            biosample_study_field_idx=owner_field_idx,
+            value_text="OWNER-123",
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"]["biosample_metadata"].append(owner_meta)
+
+    result = await fetch_local_metadata(
+        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
+    )
+    assert result == {
+        owner_field_name: MetadataRow(
+            display_name=owner_field_name,
+            description=None,
+            data_type=FieldDataType.TEXT,
+            value="OWNER-123",
+        )
+    }
+
+
 @pytest.mark.parametrize(
     "spec",
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
@@ -3319,7 +3495,7 @@ async def test_write_global_metadata_entries_writes_each_entry(ctx, spec):
     # persist for the post-call SELECT below.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            await write_global_metadata_entries(
+            results = await write_global_metadata_entries(
                 conn,
                 spec=spec,
                 entity_idx=entity_idx,
@@ -3327,6 +3503,22 @@ async def test_write_global_metadata_entries_writes_each_entry(ctx, spec):
                 caller_idx=ctx["principal_idx"],
                 parsed_metadata=parsed_metadata,
             )
+
+    # One global-scope INSERTED result per entry, in input order.
+    assert results == [
+        SampleMetadataFieldResult(
+            display_name=gf_first.display_name,
+            scope="global",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="alpha",
+        ),
+        SampleMetadataFieldResult(
+            display_name=gf_second.display_name,
+            scope="global",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="beta",
+        ),
+    ]
 
     # Recover the persisted rows and track each for FK-reverse cleanup;
     # the metadata-side teardown depends on the matching study_field row
@@ -3375,7 +3567,7 @@ async def test_write_global_metadata_entries_empty_input_is_noop(ctx, spec):
 
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            await write_global_metadata_entries(
+            results = await write_global_metadata_entries(
                 conn,
                 spec=spec,
                 entity_idx=entity_idx,
@@ -3384,6 +3576,8 @@ async def test_write_global_metadata_entries_empty_input_is_noop(ctx, spec):
                 parsed_metadata=[],
             )
 
+    # Empty input yields no results and touches no rows.
+    assert results == []
     count = await ctx["pool"].fetchval(
         f"SELECT COUNT(*) FROM {spec.metadata_table} WHERE {spec.entity_key_column} = $1",
         entity_idx,
@@ -3931,7 +4125,7 @@ async def test_write_local_metadata_entries_persists(ctx):
         global_field_idx=None,
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        await write_local_metadata_entries(
+        results = await write_local_metadata_entries(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,
@@ -3939,6 +4133,16 @@ async def test_write_local_metadata_entries_persists(ctx):
             caller_idx=ctx["principal_idx"],
             resolved_metadata=[(field_row, "hello")],
         )
+
+    # One local-scope INSERTED result for the single entry.
+    assert results == [
+        SampleMetadataFieldResult(
+            display_name=local_name,
+            scope="local",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="hello",
+        )
+    ]
 
     metadata_idx = await ctx["pool"].fetchval(
         "SELECT idx FROM qiita.biosample_metadata"
@@ -4306,3 +4510,777 @@ async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec):
         )
     }
     assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# write_sample_metadata (the resolve + preflight + write composer)
+# ---------------------------------------------------------------------------
+
+
+async def _track_entity_metadata_and_fields(ctx, spec, entity_idx):
+    """Track every metadata row (and its source study_field) the entity
+    carries so FK-reverse teardown sweeps whatever write_sample_metadata
+    created. Duplicate study_field idxs are harmless — the delete is by ANY().
+    """
+    rows = await ctx["pool"].fetch(
+        f"SELECT idx, {spec.study_field_idx_column} AS study_field_idx"
+        f" FROM {spec.metadata_table} WHERE {spec.entity_key_column} = $1",
+        entity_idx,
+    )
+    for r in rows:
+        ctx["created"][f"{spec.entity_kind}_metadata"].append(r["idx"])
+        ctx["created"][f"{spec.entity_kind}_study_field"].append(r["study_field_idx"])
+
+
+async def test_write_sample_metadata_writes_global_and_local(ctx):
+    """Tests the case where allow_local is True and metadata names both a
+    global field and an existing purely-local study field: one globally-linked
+    row and one purely-local row persist, each carrying its value.
+    """
+    entity_idx = await _create_biosample_with_link(ctx)
+    gf_row = await _seed_global_field_for_spec(ctx, BIOSAMPLE_METADATA_SPEC, FieldDataType.TEXT)
+    local_name = unique_field_name("ws_local")
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        local_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            display_name=local_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+        )
+    ctx["created"]["biosample_study_field"].append(local_idx)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        results = await write_sample_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            metadata={gf_row.display_name: "g", local_name: "l"},
+            caller_idx=ctx["principal_idx"],
+            allow_local=True,
+        )
+    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
+
+    # Per-field results come back in the caller's metadata key order: the
+    # global field first, the local field second, each scoped and INSERTED.
+    assert results == [
+        SampleMetadataFieldResult(
+            display_name=gf_row.display_name,
+            scope="global",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="g",
+        ),
+        SampleMetadataFieldResult(
+            display_name=local_name,
+            scope="local",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="l",
+        ),
+    ]
+
+    # The global entry carries the global_field_idx; the local entry leaves
+    # it NULL. ORDER BY value_text puts "g" (global) before "l" (local).
+    rows = await ctx["pool"].fetch(
+        "SELECT value_text, global_field_idx FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 ORDER BY value_text",
+        entity_idx,
+    )
+    expected = [
+        {"value_text": "g", "global_field_idx": gf_row.idx},
+        {"value_text": "l", "global_field_idx": None},
+    ]
+    assert [dict(r) for r in rows] == expected
+
+
+async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
+    """Tests the case where the same field is written repeatedly under
+    on_conflict="upsert": write_sample_metadata reports INSERTED on the first
+    write, UPDATED when the value changes, and UNCHANGED when it repeats.
+    """
+    entity_idx = await _create_biosample_with_link(ctx)
+    gf_row = await _seed_global_field_for_spec(ctx, BIOSAMPLE_METADATA_SPEC, FieldDataType.TEXT)
+
+    # Each write commits in its own transaction so the next one collides with
+    # the persisted slot; the returned result reports what the upsert did.
+    async def _upsert(value):
+        async with ctx["pool"].acquire() as conn, conn.transaction():
+            return await write_sample_metadata(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=entity_idx,
+                study_idx=ctx["study_idx"],
+                metadata={gf_row.display_name: value},
+                caller_idx=ctx["principal_idx"],
+                allow_local=False,
+                on_conflict="upsert",
+            )
+
+    inserted = await _upsert("v1")
+    updated = await _upsert("v2")
+    unchanged = await _upsert("v2")
+    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
+
+    assert inserted == [
+        SampleMetadataFieldResult(
+            display_name=gf_row.display_name,
+            scope="global",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="v1",
+        )
+    ]
+    assert updated == [
+        SampleMetadataFieldResult(
+            display_name=gf_row.display_name,
+            scope="global",
+            outcome=FieldWriteOutcome.UPDATED,
+            value="v2",
+        )
+    ]
+    assert unchanged == [
+        SampleMetadataFieldResult(
+            display_name=gf_row.display_name,
+            scope="global",
+            outcome=FieldWriteOutcome.UNCHANGED,
+            value="v2",
+        )
+    ]
+
+
+async def test_write_sample_metadata_rejects_owner_sample_id_field(ctx):
+    """Tests the case where metadata names a field serving as the biosample's
+    owner-sample-id field: write_sample_metadata raises
+    OwnerSampleIdMetadataWriteError rather than overwriting that value.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+    owner_field_name = f"Owner Sample Name {suffix}"
+    owner_field_idx = await _seed_local_study_field(
+        ctx, spec=BIOSAMPLE_METADATA_SPEC, display_name=owner_field_name
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        owner_meta = await insert_owner_biosample_id_metadata(
+            conn,
+            biosample_idx=bs_idx,
+            biosample_study_field_idx=owner_field_idx,
+            value_text="OWNER-123",
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"]["biosample_metadata"].append(owner_meta)
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(OwnerSampleIdMetadataWriteError) as excinfo:
+            async with conn.transaction():
+                await write_sample_metadata(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    metadata={owner_field_name: "HACKED"},
+                    caller_idx=ctx["principal_idx"],
+                    allow_local=True,
+                    on_conflict="upsert",
+                )
+    assert excinfo.value.display_name == owner_field_name
+    assert excinfo.value.study_field_idx == owner_field_idx
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_write_sample_metadata_global_only_writes_entry(ctx, spec):
+    """Tests the case where allow_local is False and metadata names a global
+    field: one globally-linked metadata row persists with its value.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await write_sample_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            metadata={gf_row.display_name: "val"},
+            caller_idx=ctx["principal_idx"],
+            allow_local=False,
+        )
+    await _track_entity_metadata_and_fields(ctx, spec, entity_idx)
+
+    rows = await ctx["pool"].fetch(
+        f"SELECT value_text, global_field_idx FROM {spec.metadata_table}"
+        f" WHERE {spec.entity_key_column} = $1",
+        entity_idx,
+    )
+    assert [dict(r) for r in rows] == [{"value_text": "val", "global_field_idx": gf_row.idx}]
+
+
+async def test_write_sample_metadata_allow_local_false_rejects_local_field(ctx):
+    """Tests the case where allow_local is False and metadata names an
+    existing purely-local study field: MetadataUnknownFieldsError, since only
+    global fields are admitted with local writes disabled.
+    """
+    entity_idx = await _create_biosample_with_link(ctx)
+    local_name = unique_field_name("ws_reject")
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        local_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            display_name=local_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+        )
+    ctx["created"]["biosample_study_field"].append(local_idx)
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(MetadataUnknownFieldsError) as excinfo:
+            async with conn.transaction():
+                await write_sample_metadata(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=entity_idx,
+                    study_idx=ctx["study_idx"],
+                    metadata={local_name: "x"},
+                    caller_idx=ctx["principal_idx"],
+                    allow_local=False,
+                )
+    assert excinfo.value.unknown_display_names == [local_name]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_write_sample_metadata_raises_unknown_field(ctx, spec):
+    """Tests the case where a metadata name matches neither a global field
+    nor an existing study-local field: MetadataUnknownFieldsError names it.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    bogus = f"no_field_{secrets.token_hex(4)}"
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(MetadataUnknownFieldsError) as excinfo:
+            async with conn.transaction():
+                await write_sample_metadata(
+                    conn,
+                    spec=spec,
+                    entity_idx=entity_idx,
+                    study_idx=ctx["study_idx"],
+                    metadata={bogus: "v"},
+                    caller_idx=ctx["principal_idx"],
+                    allow_local=True,
+                )
+    assert excinfo.value.unknown_display_names == [bogus]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_write_sample_metadata_resolves_missing_reason(ctx, spec):
+    """Tests the case where known_missing_reasons is not supplied and a value
+    matches a missing_value_reason name: the value is resolved here and lands
+    as value_missing_reason_idx rather than value_text.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+    reason_name = f"not_collected_{secrets.token_hex(4)}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await write_sample_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            metadata={gf_row.display_name: reason_name},
+            caller_idx=ctx["principal_idx"],
+            allow_local=True,
+        )
+    await _track_entity_metadata_and_fields(ctx, spec, entity_idx)
+
+    row = await ctx["pool"].fetchrow(
+        f"SELECT value_text, value_missing_reason_idx FROM {spec.metadata_table}"
+        f" WHERE {spec.entity_key_column} = $1",
+        entity_idx,
+    )
+    assert dict(row) == {"value_text": None, "value_missing_reason_idx": reason_idx}
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_write_sample_metadata_rejects_non_transactional_connection(ctx, spec):
+    """Tests the case where the connection has no open transaction: the
+    fail-fast guard raises RuntimeError before any DB write.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(RuntimeError, match="transaction"):
+            await write_sample_metadata(
+                conn,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_idx=ctx["study_idx"],
+                metadata={gf_row.display_name: "v"},
+                caller_idx=ctx["principal_idx"],
+                allow_local=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Idempotent upsert (on_conflict="upsert") — global path
+# ---------------------------------------------------------------------------
+
+
+async def _biosample_metadata_count(ctx, bs_idx, gf_idx):
+    """Count globally-linked metadata rows on a biosample for one global field
+    — asserts an upsert overwrote the single slot rather than adding a row."""
+    return await ctx["pool"].fetchval(
+        "SELECT COUNT(*) FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx = $2",
+        bs_idx,
+        gf_idx,
+    )
+
+
+async def test_write_global_metadata_or_diagnose_upsert_empty_slot_inserts(ctx):
+    """Upsert into an unoccupied slot behaves like a plain insert and reports
+    INSERTED."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "upsert_insert")
+
+    result = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=unique_field_name("upsert_insert"),
+        data_type=FieldDataType.TEXT,
+        value="v1",
+        on_conflict="upsert",
+    )
+
+    assert result.outcome == FieldWriteOutcome.INSERTED
+    row = await _fetch_metadata_row(ctx["pool"], result.metadata_idx)
+    assert row["value_text"] == "v1"
+
+
+async def test_write_global_metadata_or_diagnose_upsert_same_value_unchanged(ctx):
+    """A same-study re-write of the same value through the same field is a
+    no-op: the pre-existing row is reported UNCHANGED and untouched."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "upsert_same")
+    display_name = unique_field_name("upsert_same")
+
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+    )
+    # Same display_name re-write trips the per-field constraint; under upsert
+    # that routes into diagnosis and resolves to the unchanged slot.
+    second = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+        on_conflict="upsert",
+    )
+
+    assert second.outcome == FieldWriteOutcome.UNCHANGED
+    assert second.metadata_idx == first.metadata_idx
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] == "v1"
+    assert await _biosample_metadata_count(ctx, bs_idx, gf_idx) == 1
+
+
+async def test_write_global_metadata_or_diagnose_upsert_different_value_updates(ctx):
+    """A same-study re-write of a different value through the same field
+    overwrites the existing row in place and reports UPDATED."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "upsert_diff")
+    display_name = unique_field_name("upsert_diff")
+
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+    )
+    second = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v2",
+        on_conflict="upsert",
+    )
+
+    assert second.outcome == FieldWriteOutcome.UPDATED
+    assert second.metadata_idx == first.metadata_idx
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] == "v2"
+    assert await _biosample_metadata_count(ctx, bs_idx, gf_idx) == 1
+
+
+async def test_write_global_metadata_or_diagnose_upsert_missing_to_real_updates(ctx):
+    """Overwriting an intentionally-missing marker with a real value (the
+    'collected at last' case) clears value_missing_reason_idx and populates
+    the typed column, reported UPDATED."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "upsert_m2r")
+    display_name = unique_field_name("upsert_m2r")
+    reason_name = f"not_collected_{secrets.token_hex(4)}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value=MissingReasonRef(idx=reason_idx, name=reason_name),
+    )
+    second = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="real",
+        on_conflict="upsert",
+    )
+
+    assert second.outcome == FieldWriteOutcome.UPDATED
+    assert second.metadata_idx == first.metadata_idx
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] == "real"
+    assert row["value_missing_reason_idx"] is None
+
+
+async def test_write_global_metadata_or_diagnose_upsert_real_to_missing_updates(ctx):
+    """Overwriting a real value with an intentionally-missing marker (a
+    retraction) clears the typed column and populates
+    value_missing_reason_idx, reported UPDATED."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "upsert_r2m")
+    display_name = unique_field_name("upsert_r2m")
+    reason_name = f"withdrawn_{secrets.token_hex(4)}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="real",
+    )
+    second = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value=MissingReasonRef(idx=reason_idx, name=reason_name),
+        on_conflict="upsert",
+    )
+
+    assert second.outcome == FieldWriteOutcome.UPDATED
+    assert second.metadata_idx == first.metadata_idx
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] is None
+    assert row["value_missing_reason_idx"] == reason_idx
+
+
+async def test_write_global_metadata_or_diagnose_upsert_foreign_study_still_raises(ctx):
+    """Upsert never overwrites a value contributed by another study: a
+    different study writing the same global slot still raises the cross-study
+    conflict, so one study cannot clobber another's contribution."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "upsert_foreign")
+
+    # ctx's study contributes the slot value.
+    await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=unique_field_name("upsert_foreign_a"),
+        data_type=FieldDataType.TEXT,
+        value="owned",
+    )
+
+    # The second study attempts to overwrite via its own field; even under
+    # upsert this is a foreign contribution and must raise, not overwrite.
+    with pytest.raises(ConflictingValueDifferentStudyError):
+        await _commit_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=second_study_idx,
+            gf_idx=gf_idx,
+            display_name=unique_field_name("upsert_foreign_b"),
+            data_type=FieldDataType.TEXT,
+            value="stolen",
+            on_conflict="upsert",
+        )
+
+    # The owning study's value is intact.
+    row = await ctx["pool"].fetchrow(
+        "SELECT value_text FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx = $2",
+        bs_idx,
+        gf_idx,
+    )
+    assert row["value_text"] == "owned"
+
+
+async def test_write_global_metadata_or_diagnose_upsert_prep_sample_spec(postgres_pool):
+    """Upsert drives PREP_SAMPLE_METADATA_SPEC too: a same-study re-write of a
+    different value overwrites the prep_sample_metadata row in place. Pattern 1
+    (transaction-rollback); mirrors the raise-mode prep sanity test."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            token = secrets.token_hex(4)
+            principal_idx = await conn.fetchval(
+                "INSERT INTO qiita.principal (display_name, created_by_idx)"
+                " VALUES ($1, $2) RETURNING idx",
+                f"ps-{token}",
+                SYSTEM_PRINCIPAL_IDX,
+            )
+            await conn.execute(
+                "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+                principal_idx,
+                f"ps-{token}@test.local",
+            )
+            study_idx = await conn.fetchval(
+                "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+                " VALUES ($1, $2, $1) RETURNING idx",
+                principal_idx,
+                f"ps-{token}",
+            )
+            biosample_idx = await conn.fetchval(
+                "INSERT INTO qiita.biosample (owner_idx, created_by_idx)"
+                " VALUES ($1, $1) RETURNING idx",
+                principal_idx,
+            )
+            await conn.execute(
+                "INSERT INTO qiita.biosample_to_study"
+                " (biosample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
+                biosample_idx,
+                study_idx,
+                principal_idx,
+            )
+            protocol_idx = await conn.fetchval(
+                "SELECT idx FROM qiita.prep_protocol WHERE name = 'short_read_metagenomics'",
+            )
+            prep_sample_idx = await conn.fetchval(
+                "INSERT INTO qiita.prep_sample"
+                "  (biosample_idx, owner_idx, prep_protocol_idx,"
+                "   processing_kind, created_by_idx)"
+                " VALUES ($1, $2, $3, 'sequenced'::qiita.processing_kind, $2)"
+                " RETURNING idx",
+                biosample_idx,
+                principal_idx,
+                protocol_idx,
+            )
+            await conn.execute(
+                "INSERT INTO qiita.prep_sample_to_study"
+                " (prep_sample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
+                prep_sample_idx,
+                study_idx,
+                principal_idx,
+            )
+            gf_idx = await conn.fetchval(
+                "INSERT INTO qiita.prep_sample_global_field"
+                "  (internal_name, display_name, data_type, created_by_idx)"
+                " VALUES ($1, $2, 'text', $3) RETURNING idx",
+                f"gf_{token}",
+                f"GF {token}",
+                principal_idx,
+            )
+            display_name = f"PS Field {token}"
+
+            first = await write_global_metadata_or_diagnose(
+                conn,
+                spec=PREP_SAMPLE_METADATA_SPEC,
+                entity_idx=prep_sample_idx,
+                study_idx=study_idx,
+                global_field_idx=gf_idx,
+                display_name=display_name,
+                data_type=FieldDataType.TEXT,
+                value="prep_v1",
+                caller_idx=principal_idx,
+            )
+            second = await write_global_metadata_or_diagnose(
+                conn,
+                spec=PREP_SAMPLE_METADATA_SPEC,
+                entity_idx=prep_sample_idx,
+                study_idx=study_idx,
+                global_field_idx=gf_idx,
+                display_name=display_name,
+                data_type=FieldDataType.TEXT,
+                value="prep_v2",
+                caller_idx=principal_idx,
+                on_conflict="upsert",
+            )
+
+            assert second.outcome == FieldWriteOutcome.UPDATED
+            assert second.metadata_idx == first.metadata_idx
+            value_text = await conn.fetchval(
+                "SELECT value_text FROM qiita.prep_sample_metadata WHERE idx = $1",
+                first.metadata_idx,
+            )
+            assert value_text == "prep_v2"
+        finally:
+            await tr.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Idempotent upsert (on_conflict="upsert") — local path
+# ---------------------------------------------------------------------------
+
+
+async def test_write_local_metadata_or_diagnose_upsert_same_value_unchanged(ctx):
+    """A same-study re-write of the same local value is a no-op reported
+    UNCHANGED."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("local_upsert_same")
+
+    first = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+    )
+    second = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+        on_conflict="upsert",
+    )
+
+    assert second.outcome == FieldWriteOutcome.UNCHANGED
+    assert second.metadata_idx == first.metadata_idx
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] == "v1"
+    assert row["global_field_idx"] is None
+
+
+async def test_write_local_metadata_or_diagnose_upsert_different_value_updates(ctx):
+    """A same-study re-write of a different local value overwrites the row in
+    place and reports UPDATED; the field stays purely-local."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("local_upsert_diff")
+
+    first = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+    )
+    second = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v2",
+        on_conflict="upsert",
+    )
+
+    assert second.outcome == FieldWriteOutcome.UPDATED
+    assert second.metadata_idx == first.metadata_idx
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] == "v2"
+    assert row["global_field_idx"] is None
+
+
+# ---------------------------------------------------------------------------
+# _update_metadata (direct): kind-change column clearing + vanished-row race
+# ---------------------------------------------------------------------------
+
+
+async def test__update_metadata_kind_change_clears_old_column(ctx):
+    """A kind-changing overwrite (typed -> missing-reason) NULLs the old typed
+    column and populates value_missing_reason_idx in one statement, so the
+    exactly-one-value CHECK still holds."""
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("upd_kind")
+    reason_name = f"nc_{secrets.token_hex(4)}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    first = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+    )
+    # The existing row populates value_text; the overwrite is a missing-reason.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await _update_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            metadata_idx=first.metadata_idx,
+            data_type=FieldDataType.TEXT,
+            value=MissingReasonRef(idx=reason_idx, name=reason_name),
+            existing_value_column="value_text",
+        )
+
+    row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    assert row["value_text"] is None
+    assert row["value_missing_reason_idx"] == reason_idx
+
+
+async def test__update_metadata_raises_transient_write_race_on_missing_row(ctx):
+    """When the target row has already vanished (a concurrent delete won the
+    race), the UPDATE matches nothing and _update_metadata signals a retry."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(TransientWriteRaceError):
+            await _update_metadata(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                metadata_idx=987654321,
+                data_type=FieldDataType.TEXT,
+                value="x",
+                existing_value_column="value_text",
+            )

@@ -203,6 +203,19 @@ The guardrail that keeps this coherent is the uniqueness on globally-linked valu
 
 A study-local field's global link may be **added** (a local→global upgrade propagates the link onto the field's existing values, gated by the per-entity uniqueness index) but never **rebound** to a different global field, nor **unlinked** while values exist; the propagate trigger rejects both, and the correct move is to create a new study-local field.
 
+#### Metadata visibility tiers (not yet enforced)
+
+The schema models per-field and per-value access tiers, but no code reads or enforces them yet. Every metadata read and write today ignores these columns entirely; visibility is instead controlled coarsely, at the route's `require_study_access` tier gate. Building the enforcement described here is outstanding work.
+
+Two mechanisms compose to set the tier a caller must hold — on the study, via their `study_access` row — to read *or* write a given metadata field or value:
+
+- **Field-level tier** — the minimum tier for every value of one field within a study. For a globally-linked field this is `*_global_field.default_tier` (NOT NULL, defaults to `public`); for a purely study-local field it is `*_study_field.tier_override` (nullable; NULL means no field-level restriction). A linked `*_study_field` row leaves `tier_override` NULL and inherits the global field's `default_tier`.
+- **Value-level exception** — a row in `*_field_exception` narrows one individual `(biosample, field)` value below its field-level tier, carrying a NOT NULL `tier_override`. It is keyed on `global_field_idx` (so a globally-linked value's exception follows it across studies) or on `*_study_field_idx` (for a purely-local value). The motivating case is a field that is broadly visible in general but where one biosample's value must be restricted — e.g. a free-text field into which one submitter incautiously entered PII.
+
+When enforcement is built, the effective required tier for a field or value is the most restrictive that applies (field-level tier, further tightened by any matching value-level exception). A caller whose study-access tier is below that threshold must not see the value on any read path, and must be refused when attempting to write it. This applies uniformly to reads and writes and to both globally-linked and study-local metadata.
+
+This is the mechanism that will ultimately decide who can see or change the owner-biosample-id (a study-local field pinned to `member` tier) and any other tier-restricted field or value — replacing today's coarse interim rule that clamps the study-scoped biosample metadata read and write routes to admin-tier callers.
+
 ### Raw Data Fingerprint
 
 A SHA-256 fingerprint of uploaded raw data is recorded per `prep_sample_idx` at upload time in the control plane. Its purpose is **upload-time duplicate detection only** — it is not the processing deduplication key:

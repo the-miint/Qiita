@@ -22,7 +22,7 @@ from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
 from qiita_common.models._base import PatchRequestModel, _fraction_passing_quality_filter
-from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
+from qiita_common.models.biosample import MetadataChecklistRef, MetadataEntry
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
 
@@ -762,7 +762,7 @@ class SequencedSampleResponse(BaseModel):
     retired_by_idx: int | None
     retired_at: AwareDatetime | None
     retire_reason: str | None
-    global_metadata: dict[str, GlobalMetadataEntry]
+    global_metadata: dict[str, MetadataEntry]
     caller_system_role: SystemRole
 
     @computed_field  # type: ignore[prop-decorator]

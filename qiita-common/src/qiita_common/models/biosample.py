@@ -4,6 +4,7 @@ PATCH body."""
 
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated, ClassVar, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -22,6 +23,18 @@ from qiita_common.models.reference import FieldDataType
 # boundary with a per-field 422; the DB side is the last line of defense.
 # Change one and you must change the other in the same PR.
 MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
+
+
+class FieldWriteOutcome(StrEnum):
+    """What a single metadata upsert did to one field's slot: created a new
+    row, overwrote an existing value in place, or left an already-identical
+    value untouched. Reported per field by the metadata-write surface. Not a
+    stored value, so it has no Postgres twin.
+    """
+
+    INSERTED = "inserted"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
 
 
 class BiosampleImportRequest(BaseModel):
@@ -54,7 +67,7 @@ class BiosampleImportResponse(BaseModel):
 
     `owner_id_biosample_study_field_*` name the biosample_study_field row
     that holds the owner-biosample-id for this study — the purely-local,
-    PII-tier-pinned field flagged is_owner_biosample_id=True on the
+    member-tier-restricted field flagged is_owner_biosample_id=True on the
     associated biosample_metadata row.
     """
 
@@ -68,9 +81,12 @@ class OwnerBiosampleIdRow(BaseModel):
 
     Pairs a biosample's stable minted idx and public accession with the
     owner-submitted original sample name — biosample_metadata.value_text on
-    the row flagged is_owner_biosample_id=True. That value is PII-pinned and
-    masked on the normal biosample read path; this export is the only way to
-    recover it, hence system_admin + admin:biosample_owner_id_read.
+    the row flagged is_owner_biosample_id=True. That value is the owner's
+    own name for their sample; the owner legitimately needs to recover it.
+    Its visibility is restricted to authorized study members rather than
+    exposed on the general read path, because submitters sometimes
+    incautiously place PII in sample names; this export is the
+    system_admin-gated path for recovering it across studies.
 
     `biosample_accession` is None until the biosample is submitted to NCBI.
     `owner_biosample_id` is None only when the biosample has no owner-id
@@ -167,7 +183,7 @@ class MissingReasonRef(BaseModel):
     for an intentionally-missing entry. Carries the qiita.missing_value_reason
     row's idx (the FK target on *_metadata.value_missing_reason_idx) and
     the matched reason name. `kind` discriminates this variant from other
-    dict-shaped value variants on GlobalMetadataEntry.value. value_column
+    dict-shaped value variants on MetadataEntry.value. value_column
     is the target value_* column for a missing-reason write.
     """
 
@@ -187,7 +203,7 @@ class TerminologyTermRef(BaseModel):
     *_metadata.value_terminology_term_idx), its term_id (the CURIE the
     caller passed) and its label (the human-readable term name).
     `kind` discriminates this variant from other dict-shaped value
-    variants on GlobalMetadataEntry.value. value_column is the target
+    variants on MetadataEntry.value. value_column is the target
     value_* column for a terminology-term write.
     """
 
@@ -199,6 +215,18 @@ class TerminologyTermRef(BaseModel):
     @property
     def value_column(self) -> str:
         return TERMINOLOGY_TERM_VALUE_COLUMN
+
+
+# One resolved metadata value: a scalar, an intentionally-missing marker, or a
+# terminology term. The two Ref variants form a discriminated union on `kind`.
+# Shared by MetadataEntry and MetadataFieldWriteResult, and imported by the
+# control-plane repositories, so the union has a single definition.
+SampleMetadataValue = (
+    str
+    | Decimal
+    | date
+    | Annotated[MissingReasonRef | TerminologyTermRef, Field(discriminator="kind")]
+)
 
 
 class MetadataChecklistRef(BaseModel):
@@ -219,30 +247,25 @@ class MetadataChecklistRef(BaseModel):
         return cls(idx=idx, name=name)
 
 
-class GlobalMetadataEntry(BaseModel):
-    """One globally-linked metadata value for a biosample or prep_sample,
-    with cosmetic context.
+class MetadataEntry(BaseModel):
+    """One resolved metadata value for a biosample or prep_sample, with
+    cosmetic context.
 
-    Returned as a value inside *Response.global_metadata, keyed on the
-    field's `internal_name`. display_name and description are taken from
-    the canonical *_global_field row, not from any per-study *_study_field
-    override, because these reads are not study-scoped. data_type
-    identifies which Python type carries the value: TEXT -> str,
-    NUMERIC -> Decimal, DATE -> date; a MissingReasonRef carries an
-    intentionally-missing entry's reason idx + name; a TerminologyTermRef
-    carries a terminology-term entry's idx + term_id + label. Both Ref
-    variants supersede data_type-driven decoding.
+    Returned as a value inside a response's metadata dict. On the
+    globally-linked read the dict is keyed on the field's `internal_name` and
+    display_name / description are the canonical *_global_field values; on a
+    study-scoped local read the dict is keyed on `display_name` and both come
+    from the study-local field. data_type identifies which Python type carries
+    the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date; a MissingReasonRef
+    carries an intentionally-missing entry's reason idx + name; a
+    TerminologyTermRef carries a terminology-term entry's idx + term_id + label.
+    Both Ref variants supersede data_type-driven decoding.
     """
 
     display_name: str
     description: str | None
     data_type: FieldDataType
-    value: (
-        str
-        | Decimal
-        | date
-        | Annotated[MissingReasonRef | TerminologyTermRef, Field(discriminator="kind")]
-    )
+    value: SampleMetadataValue
 
 
 class BiosampleResponse(BaseModel):
@@ -278,8 +301,57 @@ class BiosampleResponse(BaseModel):
     retired_by_idx: int | None
     retired_at: AwareDatetime | None
     retire_reason: str | None
-    global_metadata: dict[str, GlobalMetadataEntry]
+    global_metadata: dict[str, MetadataEntry]
     caller_system_role: SystemRole
+
+
+class StudyScopedBiosampleResponse(BiosampleResponse):
+    """Returned by GET /api/v1/study/{study_idx}/biosample/{biosample_idx}.
+
+    A study-scoped view: every field of the biosample-level BiosampleResponse
+    (core columns, caller_system_role, and the globally-linked global_metadata
+    keyed by internal_name) plus this study's purely-local metadata, keyed by
+    display_name. local_metadata is returned only on a study-scoped response,
+    where the caller is already authorized on the study.
+    """
+
+    local_metadata: dict[str, MetadataEntry]
+
+
+class MetadataFieldWriteResult(BaseModel):
+    """What a metadata write did to one field's slot: whether the field
+    resolved globally-linked or purely-local, the write outcome, and the value
+    that now occupies the slot. Reported per field by the metadata write route.
+    """
+
+    scope: Literal["global", "local"]
+    outcome: FieldWriteOutcome
+    value: SampleMetadataValue
+
+
+class BiosampleMetadataWriteRequest(BaseModel):
+    """Body for PATCH /api/v1/study/{study_idx}/biosample/{biosample_idx}/metadata.
+
+    metadata carries text values keyed on biosample field display_name; the
+    route resolves each against the study's existing global or study-local
+    fields and upserts it. At least one entry is required — an empty write is
+    almost certainly a client error. Unknown field names are rejected by the
+    route rather than created.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: dict[str, str] = Field(min_length=1)
+
+
+class BiosampleMetadataWriteResponse(BaseModel):
+    """Returned by PATCH /api/v1/study/{study_idx}/biosample/{biosample_idx}/metadata.
+
+    results maps each display_name the caller sent to what the write did to
+    that field (scope, outcome, resulting value), in the caller's input order.
+    """
+
+    results: dict[str, MetadataFieldWriteResult]
 
 
 # The two qiita.biosample accession columns a lookup may key on; each value is

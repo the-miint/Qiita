@@ -57,9 +57,9 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
-    GlobalMetadataEntry,
     IdxsListResponse,
     MetadataChecklistRef,
+    MetadataEntry,
     SequencedSampleCreateRequest,
     SequencedSampleCreateResponse,
     SequencedSampleListItem,
@@ -560,7 +560,7 @@ async def list_sequenced_sample_idxs_in_study(
 def _sequenced_sample_response_from_row(
     row: asyncpg.Record,
     *,
-    global_metadata: dict[str, GlobalMetadataEntry],
+    global_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
 ) -> SequencedSampleResponse:
     """Shape a JOIN(sequenced_sample, prep_sample) row + decoded global
@@ -659,7 +659,7 @@ async def get_sequenced_sample(
         )
 
     global_metadata = {
-        internal_name: GlobalMetadataEntry(
+        internal_name: MetadataEntry(
             display_name=entry.display_name,
             description=entry.description,
             data_type=entry.data_type,
@@ -804,7 +804,7 @@ async def patch_sequenced_sample(
     # Reuse the GET route's row -> response shaper so PATCH and GET share
     # one source of truth for the response shape.
     global_metadata = {
-        internal_name: GlobalMetadataEntry(
+        internal_name: MetadataEntry(
             display_name=entry.display_name,
             description=entry.description,
             data_type=entry.data_type,

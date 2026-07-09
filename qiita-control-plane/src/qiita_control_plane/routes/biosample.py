@@ -44,9 +44,9 @@ from qiita_common.models import (
     BiosampleLookupByMatrixTubeIdResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
-    GlobalMetadataEntry,
     IdxsListResponse,
     MetadataChecklistRef,
+    MetadataEntry,
     Tier,
 )
 
@@ -358,7 +358,7 @@ _BIOSAMPLE_GET_BYPASS_ROLE: SystemRole = SystemRole.WET_LAB_ADMIN
 def _biosample_response_from_row(
     row: asyncpg.Record,
     *,
-    global_metadata: dict[str, GlobalMetadataEntry],
+    global_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
 ) -> BiosampleResponse:
     """Shape a qiita.biosample row + decoded global metadata into BiosampleResponse.
@@ -459,7 +459,7 @@ async def get_biosample(
         )
 
     global_metadata = {
-        internal_name: GlobalMetadataEntry(
+        internal_name: MetadataEntry(
             display_name=entry.display_name,
             description=entry.description,
             data_type=entry.data_type,
@@ -693,7 +693,7 @@ async def patch_biosample(
     # Reuse the GET route's row -> response shaper so the PATCH and GET
     # surfaces share one source of truth for the response shape.
     global_metadata = {
-        internal_name: GlobalMetadataEntry(
+        internal_name: MetadataEntry(
             display_name=entry.display_name,
             description=entry.description,
             data_type=entry.data_type,
