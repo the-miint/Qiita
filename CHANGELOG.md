@@ -713,7 +713,7 @@ the `no-changelog` label).
   DP could both verify and forge). Ticket wire version bumps to 2 (64-byte
   signature); the DP accepts only v2. `HMAC_SECRET_KEY` is removed from both
   services (the cookie moved to `LOGIN_COOKIE_SECRET_KEY`, tickets to the
-  keypair). End-user CLIs are unchanged — tickets are minted server-side. (#TBD)
+  keypair). End-user CLIs are unchanged — tickets are minted server-side. (#263)
 
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
@@ -1331,7 +1331,7 @@ the `no-changelog` label).
   read the raw signing key from the environment — and its `backfill_work_ticket_mask_idx`
   runner helper are removed. `mask purge-failed`'s NULL-mask_idx safety guard is
   unchanged; only its guidance text (which named the removed command) is
-  reworded. (#TBD)
+  reworded. (#263)
 - Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag

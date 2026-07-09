@@ -45,7 +45,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   control plane and data plane together** — a brief window where any in-flight
   HMAC (v1) ticket fails is expected and self-heals (tickets are short-lived; the
   runner retries). `make preflight` verifies the keypair (CP seed → public key ==
-  DP public key) before the restart. (#TBD)
+  DP public key) before the restart. (#263)
   ```bash
   # Generate the keypair once (capture both values):
   python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
