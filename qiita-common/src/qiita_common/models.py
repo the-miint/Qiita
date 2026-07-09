@@ -315,6 +315,21 @@ HOST_FILTER_REQUIRED_INDEX_TYPES = frozenset(
 # allow-list (plain TEXT+CHECK, no Postgres ENUM twin — see CLAUDE.md "Enum parity").
 INDEX_TYPE_BOWTIE2 = "bowtie2"
 
+# The whole-reference rype ROUTER `.ryxdi` (C1): a single multi-bucket rype index
+# over the entire reference, one bucket per shard (`bucket_name = str(shard_id)`),
+# that one `rype_classify` pass turns into the `read_to_shard` table the sharded
+# aligners need. Analysis-only (like bowtie2) — NOT in
+# HOST_FILTER_REQUIRED_INDEX_TYPES. Written by the `build_routing_index` native
+# job with `shard_id` NULL (whole-reference, not per-shard).
+#
+# NOTE: this value is deliberately NOT yet in the `reference_index.index_type`
+# CHECK allow-list. C1 is native-job-only and does not register a router row (its
+# smoke passes the router path directly to the align job), so no row ever carries
+# it. C2 — which builds the router in production and registers it — adds the
+# one-line CHECK migration (`... IN ('rype','minimap2','bowtie2','rype_router')`)
+# in the same PR that starts inserting the row.
+INDEX_TYPE_RYPE_ROUTER = "rype_router"
+
 
 class ReferenceIndex(BaseModel):
     """A built search index for a reference (e.g. a rype `.ryxdi` directory).
