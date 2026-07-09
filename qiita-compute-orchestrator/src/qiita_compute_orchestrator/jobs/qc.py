@@ -505,12 +505,21 @@ def _assert_trims_within_read(
     original), but a hand-staged mask can. It must not pass silently: DuckDB's
     `substr` with a negative length walks BACKWARDS and returns bases, while the
     qual list-slice returns `[]` — so `filter_read` would judge a sequence
-    against an empty phred array instead of erroring."""
+    against an empty phred array instead of erroring.
+
+    `left + right == length` is PERMITTED (strict `>`): both slices come out empty
+    and the read is `qc_too_short`, which is the truthful verdict.
+
+    Checked against BOTH lengths. The sequence slice bounds on `length(sequence1)`
+    and the qual slice on `length(qual1)`; the DuckLake `read` table makes those
+    equal by construction, but a guard that trusts one to speak for the other is
+    exactly how the two silently desync."""
     (bad,) = conn.execute(
         f"SELECT count(*) FROM read_parquet('{reads_sql}') r JOIN {incoming_view} m "
         "USING (sequence_idx) "
         f"WHERE m.reason = '{ReadMaskReason.PASS.value}' "
-        "AND m.left_trim1 + m.right_trim1 > length(r.sequence1)"
+        "AND (m.left_trim1 + m.right_trim1 > length(r.sequence1) "
+        "  OR m.left_trim1 + m.right_trim1 > length(r.qual1))"
     ).fetchone()
     if bad:
         raise ValueError(

@@ -16,13 +16,16 @@ rather than omitting the optional mapping table: it keeps the index
 self-describing.
 
 `bucket_per_feature=True` switches that mapping to one bucket PER feature, named
-by `feature_idx`. Host filtering does not want this — its answer is boolean — but
-a spike-in reference does: `rype_classify` returns `bucket_name` alongside each
-hit, so a per-feature index tells the syndna step WHICH spike-in a read matched,
-which is what the downstream cell-count model needs. Without it the step could
-only report a bare spike-in total, and recovering per-spike-in counts later would
-mean re-classifying archived reads. Same mapping path either way; only the
-bucket_name expression differs.
+by `feature_idx`, so `rype_classify`'s `bucket_name` says WHICH feature a read
+matched rather than merely that it matched something.
+
+**Nothing in the tree consumes that yet.** Host filtering does not want it (its
+answer is boolean), and the `syndna` step asks the same boolean question, so it
+uses the same DISTINCT seam. The flag exists because a rype index is built ONCE by
+an operator: a SynDNA reference built per-feature today needs no rebuild the day
+per-spike-in counts land (they need a durable per-`(prep_sample, feature_idx)`
+table, which does not exist). Deliberately staged, not dead by accident. Same
+mapping path either way; only the bucket_name expression differs.
 
 rype build parameters default to k=64, w=20 (the function's own w default is
 50, so we pass 20 explicitly); `w` is overridable per build via the `rype_w`
@@ -137,10 +140,10 @@ class Inputs(BaseModel):
 
     `bucket_per_feature` switches the mapping from ONE bucket over every feature
     to one bucket PER feature (named by `feature_idx`). Host filtering wants the
-    single bucket — the answer is boolean, "is this read host?" — while a spike-in
-    reference wants per-feature buckets, so `rype_classify`'s `bucket_name` names
-    WHICH spike-in a read hit. That is what lets the syndna step emit per-spike-in
-    counts instead of a bare total. Mutually exclusive with `bucket_name`.
+    single bucket — the answer is boolean, "is this read host?" — and so, today,
+    does `syndna`. It is set on a spike-in reference so the index needs no rebuild
+    when per-spike-in counts land (see the module docstring). Mutually exclusive
+    with `bucket_name`.
     """
 
     reference_sequence_chunks: Path

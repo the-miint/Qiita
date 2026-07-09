@@ -567,3 +567,26 @@ def test_qc_incoming_mask_rejects_unmatched_read(tmp_path, write_reads, write_pa
     )
     with pytest.raises(ValueError, match="covering 1 of 2 read"):
         asyncio.run(qc.execute(inputs, tmp_path / "ws"))
+
+
+def test_qc_incoming_mask_rejects_trims_longer_than_the_qual_array(
+    tmp_path, write_reads_q, write_partial_mask
+):
+    """The sequence slice bounds on length(sequence1), the qual slice on
+    length(qual1). A guard that trusts one to speak for the other is exactly how
+    the two silently desync — so both are checked."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    # A hand-corrupted read: qual shorter than the sequence. Trims fit the sequence
+    # but overrun the qual array.
+    reads = write_reads_q(
+        tmp_path / "reads.parquet", [(1, "a", "ACGTACGTAC", [35, 35, 35], None, None)]
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path, _AD),
+        adapter_mask=write_partial_mask(tmp_path / "m.parquet", [(1, _PASS, 2, 2)]),
+        work_ticket_idx=1,
+    )
+    with pytest.raises(ValueError, match="exceeds the read length"):
+        asyncio.run(qc.execute(inputs, tmp_path / "ws"))
