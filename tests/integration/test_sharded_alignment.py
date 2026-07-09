@@ -58,6 +58,9 @@ from qiita_compute_orchestrator.jobs import (
 from conftest import ducklake_connect
 
 _REF_IDX = 8
+# The CP-minted alignment-config identity stamped as the leading column of every
+# output row (mask-style identity; keys the DuckLake `alignment` table).
+_ALIGN_IDX = 71
 # Each feature = a DISTINCT region + a region SHARED by both features. A read from
 # a distinct region aligns to exactly one feature (one shard); a read from the
 # shared region aligns END-TO-END to BOTH features — so it routes to both shards
@@ -259,6 +262,7 @@ def test_sharded_alignment_end_to_end(
             aligner=aligner,
             router_index_path=router_dir,
             shard_directory=shard_directory,
+            alignment_idx=_ALIGN_IDX,
             work_ticket_idx=1,
         )
         return Path(
@@ -282,6 +286,19 @@ def test_sharded_alignment_end_to_end(
     )
     se_out = _align(se_reads)
     by_read, prep_of = _features_by_read(se_out)
+
+    # alignment_idx is the leading column and carries the run's identity on EVERY
+    # row (keys the DuckLake `alignment` table; register-files schema-matches).
+    with duckdb.connect(":memory:") as _conn:
+        assert (
+            _conn.execute(
+                f"SELECT * FROM read_parquet('{se_out}') LIMIT 0"
+            ).description[0][0]
+            == "alignment_idx"
+        )
+        assert _conn.execute(
+            f"SELECT DISTINCT alignment_idx FROM read_parquet('{se_out}')"
+        ).fetchall() == [(_ALIGN_IDX,)]
 
     # Each single-feature read aligns to exactly its feature.
     assert by_read.get(1) == [100], f"read 1 -> {by_read.get(1)}"

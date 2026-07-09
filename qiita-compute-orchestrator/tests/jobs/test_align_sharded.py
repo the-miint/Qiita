@@ -145,16 +145,17 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
 
 def _read_alignment(path: Path):
     """Return (columns, rows) of alignment.parquet. Rows project the columns the
-    tests assert on, in a stable order; the parquet itself carries the full set."""
+    tests assert on (leading `alignment_idx`, then the identity + a representative
+    SAM subset), in a stable order; the parquet itself carries the full set."""
     with duckdb.connect(":memory:") as conn:
         cols = [
             d[0] for d in conn.execute(f"SELECT * FROM read_parquet('{path}') LIMIT 0").description
         ]
         rows = conn.execute(
-            "SELECT prep_sample_idx, sequence_idx, feature_idx, mate_feature_idx, "
+            "SELECT alignment_idx, prep_sample_idx, sequence_idx, feature_idx, mate_feature_idx, "
             "flags, reference, position, stop_position, mapq, cigar, mate_reference, "
             f"mate_position, template_length FROM read_parquet('{path}') "
-            "ORDER BY prep_sample_idx, sequence_idx, feature_idx, position, flags"
+            "ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx, position, flags"
         ).fetchall()
     return cols, rows
 
@@ -196,6 +197,7 @@ def test_align_sharded_single_call_and_full_passthrough_minimap2(tmp_path, monke
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=42,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -211,10 +213,11 @@ def test_align_sharded_single_call_and_full_passthrough_minimap2(tmp_path, monke
     assert captured["threshold"] == align_sharded._ROUTING_THRESHOLD
 
     cols, rows = _read_alignment(Path(out["alignment"]))
-    # Full aligner output preserved + the three added identity columns; read_id was
-    # renamed to sequence_idx (same value), nothing dropped. Both the raw VARCHAR
-    # reference/mate_reference AND the typed feature_idx/mate_feature_idx are present.
+    # Leading alignment_idx + full aligner output preserved + the identity columns;
+    # read_id was renamed to sequence_idx (same value), nothing dropped. Both the raw
+    # VARCHAR reference/mate_reference AND the typed feature_idx/mate_feature_idx are present.
     assert cols == [
+        "alignment_idx",
         "prep_sample_idx",
         "sequence_idx",
         "feature_idx",
@@ -229,11 +232,12 @@ def test_align_sharded_single_call_and_full_passthrough_minimap2(tmp_path, monke
         "mate_position",
         "template_length",
     ]
-    # prep_sample_idx stamped PER ROW (read 1 -> 10, read 3 -> 20); feature_idx is
-    # CAST(reference); mate columns (incl. mate_feature_idx) are NULL for these SE hits.
+    # alignment_idx stamped on every row (the run's identity); prep_sample_idx stamped
+    # PER ROW (read 1 -> 10, read 3 -> 20); feature_idx is CAST(reference); mate columns
+    # (incl. mate_feature_idx) are NULL for these SE hits.
     assert rows == [
-        (10, 1, 100, None, 0, "100", 5, 45, 60, "40M", None, None, 0),
-        (20, 3, 200, None, 0, "200", 12, 52, 60, "40M", None, None, 0),
+        (555, 10, 1, 100, None, 0, "100", 5, 45, 60, "40M", None, None, 0),
+        (555, 20, 3, 200, None, 0, "200", 12, 52, 60, "40M", None, None, 0),
     ]
 
 
@@ -257,6 +261,7 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=42,
+        alignment_idx=555,
         aligner="bowtie2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -266,7 +271,7 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
     assert [c["aligner"] for c in calls] == ["bowtie2"]
     assert calls[0]["preset"] is None
     _cols, rows = _read_alignment(Path(out["alignment"]))
-    assert rows == [(10, 1, 100, None, 0, "100", 1, 41, 60, "40M", None, None, 0)]
+    assert rows == [(555, 10, 1, 100, None, 0, "100", 1, 41, 60, "40M", None, None, 0)]
 
 
 def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
@@ -286,6 +291,7 @@ def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=42,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -294,8 +300,8 @@ def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
     out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
     _cols, rows = _read_alignment(Path(out["alignment"]))
     assert rows == [
-        (10, 7, 100, None, 0, "100", 1, 41, 60, "40M", None, None, 0),
-        (10, 7, 200, None, 0, "200", 3, 43, 60, "40M", None, None, 0),
+        (555, 10, 7, 100, None, 0, "100", 1, 41, 60, "40M", None, None, 0),
+        (555, 10, 7, 200, None, 0, "200", 3, 43, 60, "40M", None, None, 0),
     ]
 
 
@@ -332,6 +338,7 @@ def test_align_sharded_pe_pair_keeps_mate_columns(tmp_path, monkeypatch):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=42,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -344,8 +351,8 @@ def test_align_sharded_pe_pair_keeps_mate_columns(tmp_path, monkeypatch):
     # signed template_length, AND the decoded mate_feature_idx (100 either way).
     # NOT collapsed, NOT stripped to two anonymous rows.
     assert rows == [
-        (10, 5, 100, 100, 99, "100", 1, 151, 60, "150M", "=", 151, 300),
-        (10, 5, 100, 100, 147, "100", 151, 301, 60, "150M", "100", 1, -300),
+        (555, 10, 5, 100, 100, 99, "100", 1, 151, 60, "150M", "=", 151, 300),
+        (555, 10, 5, 100, 100, 147, "100", 151, 301, 60, "150M", "100", 1, -300),
     ]
 
 
@@ -361,6 +368,7 @@ def test_align_sharded_empty_alignment_is_valid(tmp_path, monkeypatch):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=42,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -371,8 +379,15 @@ def test_align_sharded_empty_alignment_is_valid(tmp_path, monkeypatch):
     assert alignment.exists()
     cols, rows = _read_alignment(alignment)
     assert rows == []
-    # The schema is intact even when empty (full aligner columns + the three added).
-    assert cols[:4] == ["prep_sample_idx", "sequence_idx", "feature_idx", "mate_feature_idx"]
+    # The schema is intact even when empty (leading alignment_idx + the identity
+    # columns + the full aligner columns).
+    assert cols[:5] == [
+        "alignment_idx",
+        "prep_sample_idx",
+        "sequence_idx",
+        "feature_idx",
+        "mate_feature_idx",
+    ]
     assert "mate_reference" in cols and "template_length" in cols
 
 
@@ -393,6 +408,7 @@ def test_align_sharded_partial_output_removed_on_failure(tmp_path, monkeypatch):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=42,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -410,6 +426,7 @@ def test_align_sharded_missing_reads_raises(tmp_path):
     inputs = align_sharded.Inputs(
         reads=tmp_path / "nope.parquet",
         reference_idx=1,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=shard_dir,
@@ -427,6 +444,7 @@ def test_align_sharded_missing_router_raises(tmp_path):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=1,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=tmp_path / "absent.ryxdi",
         shard_directory=shard_dir,
@@ -446,6 +464,7 @@ def test_align_sharded_empty_router_raises(tmp_path):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=1,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=empty_router,
         shard_directory=shard_dir,
@@ -463,6 +482,7 @@ def test_align_sharded_missing_shard_directory_raises(tmp_path):
     inputs = align_sharded.Inputs(
         reads=reads,
         reference_idx=1,
+        alignment_idx=555,
         aligner="minimap2",
         router_index_path=router,
         shard_directory=tmp_path / "absent-shards",
@@ -482,6 +502,7 @@ def test_align_sharded_rejects_unknown_aligner(tmp_path):
         align_sharded.Inputs(
             reads=tmp_path / "reads.parquet",
             reference_idx=1,
+            alignment_idx=555,
             aligner="bwa",
             router_index_path=tmp_path / "r.ryxdi",
             shard_directory=tmp_path / "shards",
@@ -502,6 +523,7 @@ def test_align_sharded_plan_sizes_walltime_from_read_count(tmp_path):
         inputs = align_sharded.Inputs(
             reads=reads,
             reference_idx=1,
+            alignment_idx=555,
             aligner="minimap2",
             router_index_path=tmp_path / "r.ryxdi",
             shard_directory=tmp_path / "shards",

@@ -50,19 +50,25 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      read (or read-pair), never per mate. The only collapse applied is the aligner's
      own within-shard secondary drop (`max_secondary := 0`).
 
-**Output is the FULL aligner output + `prep_sample_idx` + `feature_idx` +
-`mate_feature_idx`.** C1 is a documented, stable intermediate — nothing is dropped
-from what miint emits. Sorted
-by `(prep_sample_idx, sequence_idx, feature_idx, position, flags)`. The output
-carries `feature_idx` but NOT `reference_idx` — reference scoping is a query-time
-join against `reference_membership` (see the identifier-ownership note in
-CLAUDE.md). The DuckLake alignment-detail sink (its exact columns, order, the
-`register-files` path, and any collapse of a pair's mate rows) is finalised by
-C2/D6; this job produces a documented, stable intermediate.
+**Output is `alignment_idx` + `prep_sample_idx` + `feature_idx` +
+`mate_feature_idx` + the FULL aligner output.** Nothing is dropped from what miint
+emits. The leading `alignment_idx` (from `Inputs`, the align run's CP-minted
+config identity) keys the DuckLake `alignment` table (the mask-style identity — no
+processing_idx yet). Sorted by `(alignment_idx, prep_sample_idx, sequence_idx,
+feature_idx, position, flags)` — the column order + sort match the DuckLake
+`alignment` table (`qiita-data-plane/src/ducklake.rs::ensure_alignment_tables`) so
+the `register-files` step schema-matches. The output carries `feature_idx` but NOT
+`reference_idx` — reference scoping is a query-time join against
+`reference_membership` (see the identifier-ownership note in CLAUDE.md).
 
-**Not wired into a workflow yet.** C1 is native-job-only: the smoke drives
-`execute()` directly with the router + shard-directory paths. The runner staging
-(read-block + shard-index resolution) and the block × shard fan-out are C2.
+**Wired by the C2b `align` workflow.** `workflows/align/1.0.0.yaml`
+(`target_kind: block`) drives `align_sharded` → `delete-alignment-block` →
+`register-files` → `reconcile-alignment-block`. The runner resolves the
+router/shard paths from action_context (the C2a `_resolve_sharded_align_indexes`)
+and stages the block's MASKED reads (`export_read_masked_block`); the align
+planner fans out one block ticket per ~10M-read block. The integration smoke
+(`tests/integration/test_sharded_alignment.py`) still drives `execute()` directly
+against real miint.
 
 miint contracts — qiita-verified against the team-mirror build via the C1 smoke
 (see docs/duckdb-miint.md; C1 replaces the prior "needs a full read" note):
@@ -140,28 +146,42 @@ _ALIGNMENTS = "align_sharded_alignments"
 class Inputs(BaseModel):
     """Typed input contract for align_sharded.
 
-    `reads` is the staged read-block Parquet (`export_read_block`'s
-    `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
-    qual2)`) — the block of reads to align. `aligner` selects the sharded aligner
-    (`minimap2` or `bowtie2`); `router_index_path` is the whole-reference rype
-    ROUTER `.ryxdi` (`build_routing_index`); `shard_directory` is the per-aligner
-    shard-root the aligner scans (`{ref}/minimap2-shards` of flat `{shard}.mmi`, or
-    `{ref}/bowtie2-shards` of `{shard}/index.*` subdirs — see `derived_store`).
+    `reads` is the staged read-block Parquet in the `export_read_block` column
+    shape `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
+    qual2)` — the block of reads to align. Under the C2b `align` workflow this is
+    the block's HOST-DEPLETED, QC-passed reads (the runner stages the `read_masked`
+    view via `export_read_masked_block`); the job treats `reads` as an opaque
+    export-shaped file either way, so this is a source change, not a job change.
+    `aligner` selects the sharded aligner (`minimap2` or `bowtie2`);
+    `router_index_path` is the whole-reference rype ROUTER `.ryxdi`
+    (`build_routing_index`) — a SINGLE path (the C2a resolver returns a LIST for
+    the growable-reference case; the CP passes `router_paths[0]`, one router
+    today); `shard_directory` is the per-aligner shard-root the aligner scans
+    (`{ref}/minimap2-shards` of flat `{shard}.mmi`, or `{ref}/bowtie2-shards` of
+    `{shard}/index.*` subdirs — see `derived_store`).
 
-    `reference_idx` identifies which reference is being aligned against (provenance
-    / the eventual scope scalar); it is NOT written into the output — the alignment
-    carries `feature_idx`, and reference scoping is a query-time join against
-    `reference_membership`. `work_ticket_idx` is the framework-injected scope
-    scalar. `prep_sample_idx` is OPTIONAL and unused: like host_filter, each output
-    row's owner is stamped PER ROW from the reads Parquet, so a multi-sample block
-    needs no scalar (a single-sample ticket still has it injected, but the per-row
-    value is authoritative)."""
+    `alignment_idx` is the CP-minted alignment-config identity (the align run this
+    block belongs to); it is stamped as the leading column of EVERY output row so
+    the DuckLake `alignment` table is keyed by it (the mask-style identity — no
+    processing_idx yet). Provided via the workflow `params:` (the field name
+    `alignment_idx` is NOT a reserved input key).
+
+    `reference_idx` is provenance-only and OPTIONAL (`None`): it is NOT written into
+    the output — the alignment carries `feature_idx`, and reference scoping is a
+    query-time join against `reference_membership`. Under BLOCK scope the framework
+    injects no scope scalar and `reference_idx` is a RESERVED input key that cannot
+    be passed via `params:`, so the CP resolves the router/shard paths from
+    action_context (the `align_reference_idx` context key) instead. `work_ticket_idx`
+    is the framework-injected scope scalar. `prep_sample_idx` is OPTIONAL and unused:
+    like host_filter, each output row's owner is stamped PER ROW from the reads
+    Parquet, so a multi-sample block needs no scalar."""
 
     reads: Path
-    reference_idx: int
+    reference_idx: int | None = None
     aligner: Literal["minimap2", "bowtie2"]
     router_index_path: Path
     shard_directory: Path
+    alignment_idx: int
     prep_sample_idx: int | None = None
     work_ticket_idx: int
 
@@ -270,8 +290,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     _validate_shard_directory(inputs.shard_directory)
 
     workspace.mkdir(parents=True, exist_ok=True)
-    # Output basename is the DuckLake-facing table name a future register-files
-    # (C2) step would map: `alignment.parquet` -> the alignment-detail table.
+    # Output basename is the DuckLake-facing table name the register-files step
+    # maps: `alignment.parquet` -> the `alignment` table.
     alignment = workspace / "alignment.parquet"
     reads_sql = validate_parquet_path(inputs.reads)
     out_sql = validate_parquet_path(alignment)
@@ -330,22 +350,29 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     conn, _QUERY, inputs.shard_directory, _READ_TO_SHARD, _ALIGNMENTS
                 )
 
-            # Stream a sorted COPY. Pass the aligner output through VERBATIM
-            # (`a.* EXCLUDE (read_id)`, which we rename to `sequence_idx`), and ADD
-            # the typed identity columns: `prep_sample_idx` (per-row owner via the
-            # _READ_META join, 1:many onto the alignments), `feature_idx`
-            # (`CAST(reference)`), and `mate_feature_idx` (the mate's feature, cast
-            # from `mate_reference`). NOTHING is dropped — the raw VARCHAR
-            # `reference`/`mate_reference` stay too, and the mate columns + flags keep
-            # a PE read's two mate rows an explicit pair. `mate_reference` uses SAM's
-            # RNEXT encoding, so decode it: `'='` means the same feature as this row,
-            # `'*'`/`''`/NULL means no mapped mate, else it's the mate's own feature
-            # id. `(sequence_idx, feature_idx)` is NOT a key: cross-shard rows carry
-            # distinct feature_idx (a feature is in one shard), and a PE read's two
-            # mate rows share it. Sorted by the identifier order, with position/flags
-            # as tiebreakers so a PE read's mate rows land in a deterministic order.
+            # Stream a sorted COPY. Prepend the CP-minted `alignment_idx` as the
+            # LEADING column (a constant for this align run — the block ticket
+            # carries one), so the DuckLake `alignment` table is keyed by it. Then
+            # pass the aligner output through VERBATIM (`a.* EXCLUDE (read_id)`,
+            # which we rename to `sequence_idx`), and ADD the typed identity
+            # columns: `prep_sample_idx` (per-row owner via the _READ_META join,
+            # 1:many onto the alignments), `feature_idx` (`CAST(reference)`), and
+            # `mate_feature_idx` (the mate's feature, cast from `mate_reference`).
+            # NOTHING is dropped — the raw VARCHAR `reference`/`mate_reference` stay
+            # too, and the mate columns + flags keep a PE read's two mate rows an
+            # explicit pair. `mate_reference` uses SAM's RNEXT encoding, so decode
+            # it: `'='` means the same feature as this row, `'*'`/`''`/NULL means no
+            # mapped mate, else it's the mate's own feature id. `(sequence_idx,
+            # feature_idx)` is NOT a key: cross-shard rows carry distinct feature_idx
+            # (a feature is in one shard), and a PE read's two mate rows share it.
+            # `alignment_idx` is a validated int (pydantic Inputs), safe to inline.
+            # Sorted by the identifier order (alignment_idx leads to match the
+            # register-side sort), with position/flags as tiebreakers so a PE read's
+            # mate rows land in a deterministic order — the column order + this sort
+            # match the DuckLake `alignment` table so register-files schema-matches.
             conn.execute(
-                "COPY (SELECT rm.prep_sample_idx, a.read_id AS sequence_idx, "
+                f"COPY (SELECT CAST({inputs.alignment_idx} AS BIGINT) AS alignment_idx, "
+                "rm.prep_sample_idx, a.read_id AS sequence_idx, "
                 "CAST(a.reference AS BIGINT) AS feature_idx, "
                 "CASE WHEN a.mate_reference = '=' THEN CAST(a.reference AS BIGINT) "
                 "WHEN a.mate_reference IS NULL OR a.mate_reference IN ('*', '') THEN NULL "
@@ -353,7 +380,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "a.* EXCLUDE (read_id) "
                 f"FROM {_ALIGNMENTS} a "
                 f"JOIN {_READ_META} rm ON rm.sequence_idx = a.read_id "
-                "ORDER BY rm.prep_sample_idx, a.read_id, feature_idx, "
+                "ORDER BY alignment_idx, rm.prep_sample_idx, a.read_id, feature_idx, "
                 "a.position, a.flags) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
