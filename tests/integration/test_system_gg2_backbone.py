@@ -171,7 +171,7 @@ async def gg2_reference(postgres_pool, human_admin_session):
 
 
 @pytest.fixture
-async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_plane):
+async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_plane):
     """Same shape as the e2e test's cli_cp_client — wires cp_app.state so
     POST /work-ticket can fire schedule_dispatch against a real backend."""
     from qiita_common.api_paths import LOOPBACK_HOST
@@ -181,7 +181,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        flight_signing_key=hmac_secret,
+        flight_signing_key=signing_key,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         path_scratch_staging=Path(data_plane["upload_staging_root"]),
         path_scratch_ticket=Path(data_plane["workspace_root"]),
@@ -208,7 +208,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
 async def test_gg2_backbone_full_pipeline(
     postgres_pool,
     data_plane,
-    hmac_secret,
+    signing_key,
     flight_client,
     synced_reference_add_action,
     gg2_reference,
@@ -283,7 +283,7 @@ async def test_gg2_backbone_full_pipeline(
         ticket_bytes = sign_ticket(
             table=table,
             filter={"reference_idx": [gg2_reference]},
-            secret=hmac_secret,
+            secret=signing_key,
         )
         return flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 

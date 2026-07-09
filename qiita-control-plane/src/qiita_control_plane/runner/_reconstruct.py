@@ -152,7 +152,7 @@ async def _dispatch_action(
     work_ticket_idx: int,
     step_index: int,
     attempt: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Run one in-process `action:` entry and record its progress.
@@ -185,7 +185,7 @@ async def _dispatch_action(
             workspace,
             scope_target,
             work_ticket_idx=work_ticket_idx,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
     except BackendFailure as exc:
@@ -225,7 +225,7 @@ async def _run_action_primitive(
     scope_target: dict[str, Any],
     *,
     work_ticket_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Translate a workflow `action:` entry into the matching LIBRARY call.
@@ -311,7 +311,7 @@ async def _run_action_primitive(
             staging_dir=str(staging_dir),
             files=files,
             work_ticket_idx=work_ticket_idx,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
         return {}
@@ -398,7 +398,7 @@ async def _run_action_primitive(
             pool,
             block_idx=scope_target["block_idx"],
             mask_idx=bound[MASK_IDX_BINDING],
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
         return {}
@@ -418,7 +418,7 @@ async def _run_action_primitive(
             pool,
             block_idx=scope_target["block_idx"],
             mask_idx=bound[MASK_IDX_BINDING],
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
         return {}

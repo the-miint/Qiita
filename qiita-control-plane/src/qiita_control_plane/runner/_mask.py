@@ -1,4 +1,4 @@
-"""Runner read-mask identity (mask_idx) minting and backfill."""
+"""Runner read-mask identity (mask_idx) minting."""
 
 from __future__ import annotations
 
@@ -164,7 +164,7 @@ async def _mint_read_mask(
             )
 
     # Resolved config — assembled by the shared `_build_mask_params` so the mint
-    # path and the legacy backfill derive the SAME hash for the same effective
+    # path and the block planner derive the SAME hash for the same effective
     # config. The adapter identity is the SHA-256 of the materialized adapter
     # bytes (None when this workflow uses no adapter set).
     params = _build_mask_params(
@@ -209,18 +209,12 @@ async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: 
     )
 
 
-# Actions whose tickets thread a `mask_idx`; the backfill scopes to these so it
-# never touches a ticket that never minted a mask. Keep in sync with the
-# workflows that declare `_workflow_needs_mask` (read-mask + fastq-to-parquet).
-_MASK_BEARING_ACTION_IDS = ("read-mask", "fastq-to-parquet")
-
-
 async def _materialize_backfill_adapter_set_hash(
     pool: asyncpg.Pool,
     *,
     default_adapter_reference_idx: int | None,
     data_plane_url: str,
-    hmac_secret: bytes,
+    signing_key: bytes,
     workspace: Path,
 ) -> str | None:
     """Re-derive the canonical adapter-set hash for the backfill, once.
@@ -243,7 +237,7 @@ async def _materialize_backfill_adapter_set_hash(
         pool,
         default_adapter_reference_idx=default_adapter_reference_idx,
         data_plane_url=data_plane_url,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         workspace=workspace,
     )
     return _adapter_set_hash(bound[QC_ADAPTER_BINDING])

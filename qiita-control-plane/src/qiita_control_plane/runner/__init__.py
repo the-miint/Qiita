@@ -79,7 +79,7 @@ from ..actions.reference import (
 )
 from ..auth.tickets import sign_action, sign_ticket
 from ..repositories.block import fetch_block_members
-from ..repositories.mask_definition import lookup_mask_idx_by_params, mint_mask_definition
+from ..repositories.mask_definition import mint_mask_definition
 from ._base import (
     _INFRA_RETRY_BACKOFF_CAP_SECONDS,
     _INFRA_UNREACHABLE_KINDS,
@@ -138,7 +138,6 @@ from ._dispatch import (
     _result_with_infra_retry,
 )
 from ._mask import (
-    _MASK_BEARING_ACTION_IDS,
     _QC_RESOLVED_FILTER_TAIL,
     _QC_RESOLVED_MIN_LENGTH,
     MASK_IDX_BINDING,
@@ -250,7 +249,6 @@ __all__: list[str] = [
     "_ACTION_COLS",
     "_INFRA_RETRY_BACKOFF_CAP_SECONDS",
     "_INFRA_UNREACHABLE_KINDS",
-    "_MASK_BEARING_ACTION_IDS",
     "_NON_TERMINAL_STATES",
     "_OOM_MEMORY_GROWTH",
     "_PATH_SUFFIX",
@@ -349,7 +347,6 @@ __all__: list[str] = [
     "hashlib",
     "json",
     "logging",
-    "lookup_mask_idx_by_params",
     "mint_mask_definition",
     "run_workflow",
     "sign_action",

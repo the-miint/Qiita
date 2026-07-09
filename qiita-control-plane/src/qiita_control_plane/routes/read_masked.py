@@ -5,7 +5,7 @@ Two routers live here because they are the two halves of one feature:
 * ``POST /mask-definition`` mints (idempotently, deduped on a canonical-config
   hash) the ``mask_idx`` that identifies a read-filtering config. Same config →
   same ``mask_idx`` fleet-wide.
-* ``POST /read-masked/ticket/doget`` signs an HMAC DoGet ticket scoped to a
+* ``POST /read-masked/ticket/doget`` signs an Ed25519 DoGet ticket scoped to a
   single ``(prep_sample_idx, mask_idx)`` on the data plane's ``read_masked``
   view — the only Flight-reachable read surface (raw ``read``/``read_mask`` are
   out of Flight by construction, so unmasked/human reads are unreachable).
@@ -136,7 +136,7 @@ async def mint_mask_definition_route(
 async def delete_mask_definition_route(
     mask_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_flight_signing_key),
+    signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_DELETE)),
 ) -> MaskDefinitionDeleteResponse:
@@ -179,7 +179,7 @@ async def delete_mask_definition_route(
     try:
         rows_deleted = await delete_mask_data(
             mask_idx=mask_idx,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
     except _flight.FlightError as exc:
@@ -198,7 +198,7 @@ async def delete_mask_definition_route(
 @read_masked_router.post(PATH_READ_MASKED_DOGET, status_code=201)
 async def create_read_masked_doget_ticket(
     body: ReadMaskedDoGetTicketRequest,
-    hmac_secret: bytes = Depends(get_flight_signing_key),
+    signing_key: bytes = Depends(get_flight_signing_key),
     sa: ServiceAccount = Depends(require_service_with_scope(Scope.READ_MASKED_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to (prep_sample_idx, mask_idx) on read_masked.
@@ -228,6 +228,6 @@ async def create_read_masked_doget_ticket(
     ticket_bytes = sign_ticket(
         table=_READ_MASKED_TABLE,
         filter=filter_,
-        secret=hmac_secret,
+        secret=signing_key,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

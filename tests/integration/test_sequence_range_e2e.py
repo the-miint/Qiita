@@ -36,7 +36,7 @@ from qiita_control_plane.main import app as cp_app
 
 
 @pytest.fixture
-async def cp_app_with_pool(postgres_pool, hmac_secret):
+async def cp_app_with_pool(postgres_pool, signing_key):
     """Wire the CP FastAPI app to the integration postgres pool +
     settings so its routes work in-process under ASGITransport. Same
     setup pattern as test_e2e_reference.test_ticket_endpoint_rejects_*.
@@ -44,7 +44,7 @@ async def cp_app_with_pool(postgres_pool, hmac_secret):
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        flight_signing_key=hmac_secret,
+        flight_signing_key=signing_key,
         data_plane_url="grpc://unused:0",
     )
     yield cp_app

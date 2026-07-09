@@ -19,7 +19,7 @@ through POST /work-ticket → schedule_dispatch → background asyncio task
 running `run_workflow`. The test awaits completion via the CLI's
 work_ticket-poll loop (short poll interval).
 
-Shared fixtures: `data_plane`, `hmac_secret`, `postgres_pool`,
+Shared fixtures: `data_plane`, `signing_key`, `postgres_pool`,
 `human_admin_session` live in conftest.py.
 """
 
@@ -153,7 +153,7 @@ def tree_e2e(tmp_path):
 
 
 @pytest.fixture
-async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_plane):
+async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_plane):
     """Configure cp_app.state for dispatch — pool + settings (with the
     data plane's actual gRPC URL and the spawned PATH_SCRATCH/staging) +
     LocalComputeBackendClient + dispatch task tracking. Yield an
@@ -165,7 +165,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        flight_signing_key=hmac_secret,
+        flight_signing_key=signing_key,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         path_scratch_staging=Path(data_plane["upload_staging_root"]),
         path_scratch_ticket=Path(data_plane["workspace_root"]),
@@ -194,7 +194,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
 async def test_e2e_create_to_doget(
     postgres_pool,
     data_plane,
-    hmac_secret,
+    signing_key,
     flight_client,
     synced_reference_add_action,
     fresh_reference,
@@ -257,7 +257,7 @@ async def test_e2e_create_to_doget(
         ticket_bytes = sign_ticket(
             table=table_name,
             filter={"reference_idx": [fresh_reference]},
-            secret=hmac_secret,
+            secret=signing_key,
         )
         return flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 
@@ -290,7 +290,7 @@ async def test_e2e_create_to_doget(
 
 
 async def test_ticket_endpoint_rejects_non_active_reference(
-    postgres_pool, hmac_secret, fresh_reference, compute_worker_service_account
+    postgres_pool, signing_key, fresh_reference, compute_worker_service_account
 ):
     """Ticket route guard still works — reference at status='pending' refuses."""
     from qiita_common.api_paths import LOOPBACK_HOST, URL_REFERENCE_DOGET
@@ -300,7 +300,7 @@ async def test_ticket_endpoint_rejects_non_active_reference(
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused-in-test",
-        flight_signing_key=hmac_secret,
+        flight_signing_key=signing_key,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:0",
     )
 

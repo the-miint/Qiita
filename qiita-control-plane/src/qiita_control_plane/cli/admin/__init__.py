@@ -419,18 +419,20 @@ async def _purge_failed(
             f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
         ) from exc
     try:
-        # Backfill-completeness gate (computed up front so dry-run reports it and
+        # Mask-idx coverage gate (computed up front so dry-run reports it and
         # --execute can refuse on it before any destructive work). The shared-mask
         # guard is only sound once every NON-failed ticket carries its mask_idx;
         # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
         # the mask could be wrongly deleted out from under a live result.
-        backfill_incomplete = await _count_non_failed_missing_mask_idx(pool, action_ids=action_ids)
+        non_failed_missing_mask_idx = await _count_non_failed_missing_mask_idx(
+            pool, action_ids=action_ids
+        )
 
         candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
 
         # Classify candidates up front so the dry-run report and the execute
         # path see the same buckets. A candidate is:
-        #   - skipped_no_mask_idx: mask_idx is NULL (backfill never matched it —
+        #   - skipped_no_mask_idx: mask_idx is NULL (never populated —
         #     can't safely purge a mask we can't name; resubmit alone would
         #     duplicate the existing read_mask rows). Report, never touch.
         #   - skipped_wrong_kind: not prep_sample-scoped (defensive; the two
@@ -480,7 +482,7 @@ async def _purge_failed(
             "executed": execute,
             "with_tickets": with_tickets,
             "action_ids": list(action_ids),
-            "backfill_incomplete": backfill_incomplete,
+            "non_failed_missing_mask_idx": non_failed_missing_mask_idx,
             "candidates": len(candidates),
             "eligible": [
                 {k: e[k] for k in ("work_ticket_idx", "mask_idx", "prep_sample_idx")}
@@ -499,15 +501,17 @@ async def _purge_failed(
 
         # Refuse to do any destructive work while the shared-mask guard is unsound
         # (some non-failed ticket still has a NULL mask_idx, invisible to the
-        # guard). Fail loudly with the count and the exact fix-up command.
-        if backfill_incomplete:
+        # guard). Fail loudly with the count and how to investigate.
+        if non_failed_missing_mask_idx:
             raise RuntimeError(
-                f"backfill incomplete: {backfill_incomplete} non-failed work_ticket(s)"
-                f" for {list(action_ids)} have mask_idx IS NULL, so the shared-mask"
-                " guard cannot see them and a shared mask could be wrongly deleted."
-                " These tickets predate mask_idx tracking and should have been"
-                " populated at migration time; investigate and set their mask_idx"
-                " before re-running this command."
+                f"mask-idx coverage incomplete: {non_failed_missing_mask_idx} non-failed"
+                f" work_ticket(s) for {list(action_ids)} have mask_idx IS NULL, so the"
+                " shared-mask guard cannot see them and a shared mask could be wrongly"
+                " deleted. A non-failed masking ticket should always carry its mask_idx"
+                " (minted at submit time); the one-time backfill that populated"
+                " pre-tracking tickets has been retired. Investigate why these are"
+                " unmasked (a submit-path regression, or a pre-tracking ticket that"
+                " backfill never reached) and set their mask_idx before re-running."
             )
 
         # --execute: process each eligible candidate in isolation. Mask deletes
@@ -633,18 +637,19 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
     mode = "EXECUTED" if report["executed"] else "DRY-RUN (no writes; pass --execute to commit)"
     print(f"mask purge-failed [{mode}]")
     print(f"  actions:    {report['action_ids']}")
-    if report["backfill_incomplete"]:
+    if report["non_failed_missing_mask_idx"]:
         # Prominent banner so the operator sees this BEFORE attempting --execute
-        # (which refuses outright while backfill is incomplete).
+        # (which refuses outright while mask-idx coverage is incomplete).
         print(
-            f"  *** BACKFILL INCOMPLETE: {report['backfill_incomplete']} non-failed"
+            f"  *** MASK-IDX COVERAGE INCOMPLETE: {report['non_failed_missing_mask_idx']} non-failed"
             f" work_ticket(s) for {report['action_ids']} have mask_idx IS NULL."
         )
         print(
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
         )
         print(
-            "      These tickets predate mask_idx tracking; populate their mask_idx"
+            "      A non-failed masking ticket should always carry its mask_idx; the"
+            " one-time backfill has been retired. Investigate and set their mask_idx"
             " before proceeding. --execute will REFUSE until this is 0."
         )
     print(f"  candidates: {report['candidates']}")
@@ -711,7 +716,7 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
             # A non-empty failures list is an operator-actionable signal.
             return 1
     else:
-        # Mirror the backfill command's "verify before you commit" caveat.
+        # "Verify before you commit" caveat for the destructive --execute path.
         print(
             "  Before running --execute: eyeball the eligible list above and"
             " confirm the skipped-shared masks are genuinely shared (a non-failed"

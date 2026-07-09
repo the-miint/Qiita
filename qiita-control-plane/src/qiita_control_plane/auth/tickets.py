@@ -70,7 +70,7 @@ def sign_ticket(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     expiry_epoch: int | None = None,
 ) -> bytes:
-    """Sign a DoGet Flight ticket with HMAC-SHA256.
+    """Sign a DoGet Flight ticket with Ed25519.
 
     An empty ``filter`` (or a filter with any empty value list) is rejected here
     at the signing boundary: the data plane treats an empty filter as
@@ -96,7 +96,7 @@ def sign_action(
     secret: bytes,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> bytes:
-    """Sign a DoAction token with HMAC-SHA256."""
+    """Sign a DoAction token with Ed25519."""
     return _sign_payload(
         {"action": action, **payload},
         secret,

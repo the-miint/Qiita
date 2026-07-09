@@ -300,7 +300,7 @@ pub struct ExportReadPayload {
     /// Absolute destination path for the materialized Parquet. The handler
     /// re-validates it (`validate_export_dest`) before writing — under the
     /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is HMAC-signed by the control plane (defense in depth).
+    /// token is Ed25519-signed by the control plane (defense in depth).
     pub dest: String,
 }
 
@@ -354,7 +354,7 @@ pub struct ExportReadBlockPayload {
     /// Absolute destination path for the materialized Parquet. The handler
     /// re-validates it (`validate_export_dest`) before writing — under the
     /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is HMAC-signed by the control plane (defense in depth).
+    /// token is Ed25519-signed by the control plane (defense in depth).
     pub dest: String,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).

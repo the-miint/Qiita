@@ -1,6 +1,6 @@
 //! Arrow Flight service implementation for the qiita data plane.
 //!
-//! Handles DoGet requests by verifying HMAC-signed tickets, querying DuckLake,
+//! Handles DoGet requests by verifying Ed25519-signed tickets, querying DuckLake,
 //! and streaming results as Arrow RecordBatches.
 //!
 //! Each request opens its own DuckDB connection and attaches DuckLake. This
@@ -212,7 +212,7 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 
 /// DoAction variants that are safe to replay — the accepted-risk registry.
 ///
-/// Flight action tokens are HMAC-authenticated but carry **no single-use
+/// Flight action tokens are Ed25519-authenticated but carry **no single-use
 /// ledger**: within a token's lifetime (bounded by `MAX_TICKET_LIFETIME`, ~1h)
 /// a captured, still-valid token can be replayed. We deliberately do NOT add a
 /// server-side nonce/consumed-token store — the operational cost of one is not
@@ -266,7 +266,7 @@ impl FlightService for QiitaFlightService {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket_bytes = &request.into_inner().ticket;
 
-        // Verify HMAC signature, expiry, and parse payload
+        // Verify Ed25519 signature, expiry, and parse payload
         let payload = auth::verify_ticket(ticket_bytes, &self.flight_public_key)
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
@@ -361,7 +361,7 @@ impl FlightService for QiitaFlightService {
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
 
-        // replay: Flight action tokens are HMAC-authenticated but have NO
+        // replay: Flight action tokens are Ed25519-authenticated but have NO
         // single-use ledger — a captured, still-valid token can be replayed
         // within its lifetime. We accept that risk (see docs/auth.md and the
         // REPLAY_SAFE_ACTIONS registry) because every arm below is idempotent or
@@ -563,7 +563,7 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Defense in depth on the HMAC-trusted destination before it is
+                // Defense in depth on the signature-trusted destination before it is
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
@@ -611,7 +611,7 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                // Defense in depth on the HMAC-trusted destination before it is
+                // Defense in depth on the signature-trusted destination before it is
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
@@ -1106,7 +1106,7 @@ const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
 
 /// Validate a control-plane-signed `export_read` destination before the data
-/// plane writes to it. The token is HMAC-trusted, so this is defense in depth:
+/// plane writes to it. The token is signature-trusted, so this is defense in depth:
 /// the dest must be absolute, contain no single quote (it is inlined into a
 /// DuckDB `COPY ... TO '<dest>'` literal), carry no `..`/prefix component, and
 /// resolve under the data plane's scratch root (the shared tree the control
@@ -1144,7 +1144,7 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 
 /// Re-materialize a selection of the DuckLake `read` table into a Parquet at
 /// `dest`, filtered by the caller-supplied `where_clause` (an already-safe SQL
-/// predicate — HMAC-verified inlined integers only). Returns the row count.
+/// predicate — signature-verified inlined integers only). Returns the row count.
 ///
 /// Shared machinery for the read-export DoActions: `export_read` (one whole
 /// sample) and `export_read_block` (the union of a block's `(prep_sample,
@@ -1212,7 +1212,7 @@ fn export_read_where_to_parquet(
     // Write to a sibling temp, then publish atomically. `dest` is validated
     // (absolute, under the scratch root, no `..`, no single quote) and the
     // `.partial` suffix preserves all of that; the `where_clause` carries only
-    // HMAC-verified inlined integers — all safe to inline. The column list is
+    // signature-verified inlined integers — all safe to inline. The column list is
     // the full `read` schema in table order, so the file is a drop-in for the
     // durable staging copy (modulo row order, which does not matter).
     let tmp = {
@@ -1270,7 +1270,7 @@ fn export_read_where_to_parquet(
 
 /// Re-materialize one prep_sample's reads into a per-ticket `reads.parquet` a
 /// read-mask job consumes (the per-sample export). A sample with no stored reads
-/// writes NO file and returns 0. `prep_sample_idx` is an HMAC-verified i64, safe
+/// writes NO file and returns 0. `prep_sample_idx` is an signature-verified i64, safe
 /// to inline. See `export_read_where_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
     catalog_connstr: &str,
@@ -1303,7 +1303,7 @@ fn export_read_to_parquet(
 /// so the part of that sample living in a sibling block never leaks, independent
 /// of any tiling order or boundary-alignment invariant. The coarse pair is a
 /// superset of the OR, so `coarse AND exact == exact`. All member integers are
-/// HMAC-verified i64s, safe to inline. An empty `members` list writes no file and
+/// signature-verified i64s, safe to inline. An empty `members` list writes no file and
 /// returns 0 (the DoAction arm rejects it earlier too).
 fn export_read_block_to_parquet(
     catalog_connstr: &str,
@@ -1338,7 +1338,7 @@ fn export_read_block_to_parquet(
 /// residual on the pruned rows, so a split member never leaks a sibling block's
 /// rows (independent of tiling order). The coarse pair is a superset of the OR,
 /// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
-/// all integers are HMAC-verified i64s, safe to inline.
+/// all integers are signature-verified i64s, safe to inline.
 fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
     let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
     preps.sort_unstable();
@@ -1371,7 +1371,7 @@ fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
 /// Pull exactly one i64 out of a ticket filter column. The count path needs a
 /// single `prep_sample_idx` / `mask_idx`, not an IN-set, so a missing, empty,
 /// multi-valued, or non-integer column is a malformed-ticket error — the export
-/// ticket always signs a one-element list per column. Input is HMAC-verified
+/// ticket always signs a one-element list per column. Input is signature-verified
 /// (set by the control plane), but we validate anyway for defense in depth.
 fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Status> {
     let values = filter.get(col).ok_or_else(|| {
@@ -1407,7 +1407,7 @@ fn count_masked_reads(
     mask_idx: i64,
 ) -> Result<i64, Status> {
     let conn = open_ducklake(catalog_connstr, data_path)?;
-    // `prep_sample_idx`/`mask_idx` are HMAC-verified i64s, safe to inline (same
+    // `prep_sample_idx`/`mask_idx` are signature-verified i64s, safe to inline (same
     // rationale as build_query: parsed integers reach SQL, no string data); the
     // 'pass' filter mirrors the read_masked view's privacy filter.
     let sql = format!(
@@ -1444,7 +1444,7 @@ fn mask_metrics_counts(
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
     let conn = open_ducklake(catalog_connstr, data_path)?;
-    // `mask_idx`/`prep_sample_idx` are HMAC-verified i64s, safe to inline (same
+    // `mask_idx`/`prep_sample_idx` are signature-verified i64s, safe to inline (same
     // rationale as count_masked_reads: parsed integers reach SQL, no string data).
     let sql = format!(
         "SELECT \
@@ -1495,7 +1495,7 @@ fn register_files(
     // (e.g. "reference_sequence_chunks/part_00000.parquet") to register
     // multiple parts under one DuckLake table, but must not contain
     // `..` or absolute components. Although `payload.files` is
-    // HMAC-signed by the control plane and so already trusted, this
+    // Ed25519-signed by the control plane and so already trusted, this
     // defense-in-depth check keeps the data plane's filesystem
     // contract independent of CP correctness.
     for filename in payload.files.keys() {
@@ -1787,7 +1787,7 @@ fn delete_mask(
 /// owns file lifecycle; orphan parquets are reclaimed by a future maintenance
 /// pass). Idempotent: an empty set, or a set whose rows are already gone,
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
-/// HMAC-signed payload, so inlining them into the `IN (...)` list carries no
+/// Ed25519-signed payload, so inlining them into the `IN (...)` list carries no
 /// injection surface and avoids per-row parameter binding for the large
 /// (hundreds of samples) pool case.
 fn delete_pool_reads(
@@ -1879,7 +1879,7 @@ fn delete_pool_reads(
 /// DuckLake owns file lifecycle). Idempotent: a fresh block (no rows yet) deletes
 /// 0. Empty `members` is a control-plane bug (the DoAction arm rejects it before
 /// this); guarded here too, returning a zero-count noop. All integers are
-/// HMAC-verified i64s, safe to inline.
+/// signature-verified i64s, safe to inline.
 fn delete_read_mask_block(
     catalog_connstr: &str,
     data_path: &str,
@@ -2009,7 +2009,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// - Table name: whitelist (`ALLOWED_TABLES`) — only known-safe values
 /// - Column names: whitelist (`ALLOWED_FILTER_COLUMNS`) — only known identifier columns
 /// - Values: parsed as i64 then stringified — no string data reaches SQL
-/// - All inputs are also HMAC-verified (set by the control plane, not the client)
+/// - All inputs are also signature-verified (set by the control plane, not the client)
 ///
 /// DuckDB does not support parameterized identifiers (table/column names), so
 /// whitelisting is the correct defense. Values could be parameterized but are
@@ -2049,7 +2049,7 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     let mut where_clauses = Vec::new();
     for (col, values) in filter {
         // Whitelist column names — all SQL is constructed from known-safe identifiers.
-        // Input is HMAC-verified (set by control plane), but we validate anyway for
+        // Input is signature-verified (set by control plane), but we validate anyway for
         // defense-in-depth.
         if !ALLOWED_FILTER_COLUMNS.contains(&col.as_str()) {
             return Err(Status::invalid_argument(format!(
@@ -2923,7 +2923,7 @@ mod tests {
 
     /// `register_files` rejects any filename that could escape the staging dir
     /// before it touches the filesystem or the catalog. `payload.files` is
-    /// HMAC-signed by the control plane, but this defense-in-depth check keeps
+    /// Ed25519-signed by the control plane, but this defense-in-depth check keeps
     /// the data plane's filesystem contract independent of CP correctness. A
     /// `..` (parent) or a rooted/absolute component must be refused; the check
     /// runs first, so a bogus connstr/data_path is never reached.
@@ -2955,7 +2955,7 @@ mod tests {
     // --- do_action dispatch trust checks (pure; no DuckDB) ---
 
     /// An action whose `Action.type` header disagrees with the signed
-    /// `payload.action` is rejected. `verify_action` succeeds (HMAC + shape are
+    /// `payload.action` is rejected. `verify_action` succeeds (signature + shape are
     /// valid), then the handler's discriminator check catches the mismatch — the
     /// two must agree so a token minted for one action can't be replayed under a
     /// different action header.
@@ -3825,7 +3825,7 @@ mod tests {
         let err = service
             .do_put_inner(stream::iter(messages))
             .await
-            .expect_err("bad HMAC must be rejected");
+            .expect_err("bad signature must be rejected");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 

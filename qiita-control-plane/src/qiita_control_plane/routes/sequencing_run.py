@@ -620,7 +620,7 @@ async def submit_block_mask_plan(
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _run_exists: None = Depends(require_sequencing_run_exists),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
-    hmac_secret: bytes = Depends(get_flight_signing_key),
+    signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     staging_root: Path | None = Depends(get_scratch_staging),
 ) -> BlockMaskPlanResponse:
@@ -685,7 +685,7 @@ async def submit_block_mask_plan(
             pool,
             default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
             data_plane_url=data_plane_url,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             staging_root=staging_root,
             sequencing_run_idx=sequencing_run_idx,
             sequenced_pool_idx=sequenced_pool_idx,
@@ -731,7 +731,7 @@ async def delete_sequenced_pool(
     force: bool = False,
     pool: asyncpg.Pool = Depends(get_db_pool),
     tx: TxConnFactory = Depends(get_tx_conn_factory),
-    hmac_secret: bytes = Depends(get_flight_signing_key),
+    signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     staging_root: Path | None = Depends(get_scratch_staging),
     _scope: Principal = Depends(require_scope(Scope.SEQUENCED_POOL_DELETE)),
@@ -807,7 +807,7 @@ async def delete_sequenced_pool(
     try:
         purge = await delete_pool_reads_data(
             prep_sample_idxs=prep_sample_idxs,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
     except _flight.FlightError as exc:

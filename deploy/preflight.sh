@@ -96,8 +96,9 @@ if [ -r "$CP_ENV" ] && [ -r "$DP_ENV" ]; then
     else
         # Best-effort: derive the public key from the CP seed and confirm it matches
         # the DP's public key. Needs python3 + cryptography (present in the CP venv);
-        # degrades to a presence/length check otherwise — the DP verifies the
-        # correspondence at boot and the bucket-5 live DoGet exercises it end-to-end.
+        # degrades to a presence/length check otherwise. The DP only validates the
+        # public key's curve-validity at boot (it never sees the CP seed), so the
+        # bucket-5 live DoGet is what actually exercises the correspondence.
         derived=$(printf '%s' "$cp_seed" | python3 -c '
 import sys, base64
 try:
@@ -108,7 +109,7 @@ seed = base64.b64decode(sys.stdin.read())
 print(base64.b64encode(Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()).decode())
 ' 2>/dev/null) || true
         if [ -z "$derived" ]; then
-            pass "flight-keypair" "CP seed (sha256:${cp_fp}) + DP pub (sha256:${dp_fp}) present, 32B each (keypair match verified at DP boot)"
+            pass "flight-keypair" "CP seed (sha256:${cp_fp}) + DP pub (sha256:${dp_fp}) present, 32B each (correspondence not checked here — the bucket-5 live DoGet exercises it)"
         elif [ "$derived" = "$dp_pub" ]; then
             pass "flight-keypair" "DP public key matches CP signing seed (pub sha256:${dp_fp})"
         else

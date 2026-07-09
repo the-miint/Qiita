@@ -26,7 +26,7 @@ class _RecordingDeleteMaskData:
         self.rows_deleted = rows_deleted
         self.calls: list[int] = []
 
-    async def __call__(self, *, mask_idx, hmac_secret, data_plane_url):
+    async def __call__(self, *, mask_idx, signing_key, data_plane_url):
         self.calls.append(mask_idx)
         return self.rows_deleted
 
@@ -46,7 +46,7 @@ def stub_data_plane(monkeypatch):
 
 
 def _install_settings(app):
-    """Minimal Settings so get_hmac_secret / get_data_plane_url resolve. The
+    """Minimal Settings so get_flight_signing_key / get_data_plane_url resolve. The
     data-plane URL is never dialed — `delete_mask_data` is stubbed."""
     from qiita_control_plane.config import Settings
 
@@ -239,7 +239,7 @@ async def test_delete_mask_data_plane_failure_returns_502(client, postgres_pool,
 
     mask_idx = await _seed_mask(postgres_pool, client._created_masks)
 
-    async def _boom(*, mask_idx, hmac_secret, data_plane_url):
+    async def _boom(*, mask_idx, signing_key, data_plane_url):
         raise flight.FlightUnavailableError("data plane down")
 
     monkeypatch.setattr("qiita_control_plane.routes.read_masked.delete_mask_data", _boom)

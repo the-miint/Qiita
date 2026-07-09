@@ -686,7 +686,7 @@ async def export_masked_read_manifest(
 async def create_masked_read_export_ticket(
     body: MaskedReadExportTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_flight_signing_key),
+    signing_key: bytes = Depends(get_flight_signing_key),
     _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
 ) -> DoGetTicketResponse:
@@ -744,7 +744,7 @@ async def create_masked_read_export_ticket(
     ticket_bytes = sign_ticket(
         table=_READ_MASKED_TABLE,
         filter=filter_,
-        secret=hmac_secret,
+        secret=signing_key,
         ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

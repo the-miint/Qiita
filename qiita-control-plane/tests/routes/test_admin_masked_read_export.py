@@ -40,20 +40,20 @@ from qiita_control_plane.testing.db_seeds import (
 
 pytestmark = pytest.mark.db
 
-# Any 32-byte value: the tests decode the ticket payload + expiry, not the MAC.
-_HMAC_SECRET = b"\x00" * 32
+# Any 32-byte value: the tests decode the ticket payload + expiry, not the signature.
+_TEST_SEED = b"\x00" * 32
 _TICKET_BODY = {"prep_sample_idx": 11, "mask_idx": 4}
 
 
 @pytest.fixture
 def ctx(role_keyed_clients):
-    """Shared role-keyed clients, plus a known hmac secret on app.state so the
-    ticket route's get_hmac_secret resolves (role_keyed_clients sets only the
+    """Shared role-keyed clients, plus a known signing key on app.state so the
+    ticket route's get_flight_signing_key resolves (role_keyed_clients sets only the
     pool)."""
     from qiita_control_plane.config import Settings
 
     app.state.settings = Settings(
-        database_url="unused", flight_signing_key=_HMAC_SECRET, data_plane_url="unused"
+        database_url="unused", flight_signing_key=_TEST_SEED, data_plane_url="unused"
     )
     return role_keyed_clients
 
@@ -64,7 +64,7 @@ def _manifest_url(sequenced_pool_idx: int) -> str:
 
 def _decode_ticket_payload(ticket_b64: str) -> dict:
     """Parse the JSON payload from a base64 signed Flight ticket.
-    Wire: <1B version><4B payload_len><payload><32B HMAC><8B expiry>."""
+    Wire: <1B version><4B payload_len><payload><64B Ed25519 signature><8B expiry>."""
     raw = base64.b64decode(ticket_b64)
     payload_len = struct.unpack(">I", raw[1:5])[0]
     return json.loads(raw[5 : 5 + payload_len])
@@ -73,7 +73,7 @@ def _decode_ticket_payload(ticket_b64: str) -> dict:
 def _decode_ticket_expiry(ticket_b64: str) -> int:
     raw = base64.b64decode(ticket_b64)
     payload_len = struct.unpack(">I", raw[1:5])[0]
-    expiry_start = 1 + 4 + payload_len + 32
+    expiry_start = 1 + 4 + payload_len + 64
     return struct.unpack(">Q", raw[expiry_start : expiry_start + 8])[0]
 
 

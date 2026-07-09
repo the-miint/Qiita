@@ -32,15 +32,15 @@ from qiita_control_plane.testing.db_seeds import seed_user_principal
 pytestmark = pytest.mark.db
 
 
-# HMAC secret the test app signs tickets with; the test decodes the payload
-# (not the MAC) so any 32-byte value works.
-_HMAC_SECRET = b"\x00" * 32
+# Ed25519 signing seed the test app signs tickets with; the test decodes the
+# payload (not the signature) so any 32-byte value works.
+_TEST_SEED = b"\x00" * 32
 
 
 def _decode_ticket_payload(ticket_b64: str) -> dict:
     """Parse the JSON payload out of a base64 signed Flight ticket.
 
-    Wire format: <1B version><4B payload_len><payload><32B HMAC><8B expiry>.
+    Wire format: <1B version><4B payload_len><payload><64B Ed25519 signature><8B expiry>.
     """
     raw = base64.b64decode(ticket_b64)
     payload_len = struct.unpack(">I", raw[1:5])[0]
@@ -57,7 +57,7 @@ async def ctx(postgres_pool, regular_user_session, compute_worker_service_accoun
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused",
-        flight_signing_key=_HMAC_SECRET,
+        flight_signing_key=_TEST_SEED,
         data_plane_url="unused",
     )
     transport = ASGITransport(app=app)

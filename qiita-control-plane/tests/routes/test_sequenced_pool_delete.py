@@ -41,7 +41,7 @@ def stub_data_plane_purge(monkeypatch):
     re-patches `_sr_routes.delete_pool_reads_data` itself."""
     calls: list[list[int]] = []
 
-    async def _fake(*, prep_sample_idxs, hmac_secret, data_plane_url):
+    async def _fake(*, prep_sample_idxs, signing_key, data_plane_url):
         calls.append(list(prep_sample_idxs))
         return {
             "read_rows_deleted": 0,
@@ -427,7 +427,7 @@ async def test_delete_pool_issues_ducklake_purge(
     surfaces the returned DuckLake counts in the response."""
     ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
 
-    async def _fake(*, prep_sample_idxs, hmac_secret, data_plane_url):
+    async def _fake(*, prep_sample_idxs, signing_key, data_plane_url):
         stub_data_plane_purge.append(list(prep_sample_idxs))
         return {"read_rows_deleted": 7, "read_mask_rows_deleted": 3, "prep_sample_count": 1}
 
@@ -451,7 +451,7 @@ async def test_delete_pool_dataplane_failure_502_leaves_postgres_intact(
     the Postgres teardown, so the pool and its rows survive for a retry."""
     ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
 
-    async def _boom(*, prep_sample_idxs, hmac_secret, data_plane_url):
+    async def _boom(*, prep_sample_idxs, signing_key, data_plane_url):
         raise _flight.FlightError("data plane unreachable")
 
     monkeypatch.setattr(_sr_routes, "delete_pool_reads_data", _boom)

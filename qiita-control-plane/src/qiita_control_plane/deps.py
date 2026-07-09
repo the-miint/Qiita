@@ -46,7 +46,7 @@ def get_settings(request: Request) -> Settings:
 
 
 def get_flight_signing_key(request: Request) -> bytes:
-    """Return the HMAC secret key from app settings."""
+    """Return the Ed25519 Flight-ticket signing key from app settings."""
     return get_settings(request).flight_signing_key
 
 

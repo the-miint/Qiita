@@ -57,6 +57,12 @@ impl Settings {
             ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array).map_err(|e| {
                 format!("FLIGHT_TICKET_PUBLIC_KEY is not a valid Ed25519 public key: {e}")
             })?;
+        // Reject a small-order (weak) key at boot. `verify_strict` would reject
+        // every ticket signed against it anyway, but that surfaces as a confusing
+        // per-request "invalid signature"; fail loudly here with a clear cause.
+        if flight_public_key.is_weak() {
+            return Err("FLIGHT_TICKET_PUBLIC_KEY is a weak (small-order) Ed25519 key".to_string());
+        }
 
         let ducklake_catalog_connstr = std::env::var("DUCKLAKE_CATALOG_CONNSTR")
             .map_err(|_| "DUCKLAKE_CATALOG_CONNSTR is required but not set".to_string())?;

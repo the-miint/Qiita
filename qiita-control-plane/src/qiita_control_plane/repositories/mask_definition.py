@@ -59,25 +59,6 @@ async def mint_mask_definition(
     )
 
 
-async def lookup_mask_idx_by_params(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    params: dict,
-) -> int | None:
-    """Return the mask_idx whose params_hash matches ``params``, or None.
-
-    A pure LOOKUP — it computes the same canonical-JSON SHA-256 the mint path
-    uses (`canonical_params_hash`) and SELECTs the existing row; it never
-    mints. Maps an existing ticket's reconstructed config onto its already-minted
-    mask without risking a fresh mint when the config drifted or the ticket failed
-    before minting (returns None → the caller skips that ticket).
-    """
-    params_hash = canonical_params_hash(params)
-    return await pool_or_conn.fetchval(
-        "SELECT mask_idx FROM qiita.mask_definition WHERE params_hash = $1",
-        params_hash,
-    )
-
-
 async def fetch_mask_definition_by_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     mask_idx: int,
