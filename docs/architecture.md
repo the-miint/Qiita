@@ -838,7 +838,7 @@ qiita/
 │       ├── repositories/
 │       └── routes/
 ├── qiita-data-plane/
-│   ├── Cargo.toml                  # deps: arrow-flight, tonic, duckdb, hmac, sha2, jsonwebtoken
+│   ├── Cargo.toml                  # deps: arrow-flight, tonic, duckdb, ed25519-dalek, sha2
 │   └── src/
 │       ├── main.rs                 # tonic server entry, Flight service + gRPC health check registration
 │       ├── config.rs               # settings (DuckLake catalog DB URL, Flight public key)

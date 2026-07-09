@@ -67,11 +67,15 @@ sudo sed -i "s|^FLIGHT_TICKET_PUBLIC_KEY=.*|FLIGHT_TICKET_PUBLIC_KEY=<PUBLIC>|" 
 ```
 
 **3. Preflight — confirm the keypair matches BEFORE restarting.** This derives
-the public key from the CP's seed and compares it to the DP's public key, so a
-copy-paste slip is caught before it takes the Flight path down:
+the public key from the CP's seed (using the CP venv's `cryptography`) and
+compares it to the DP's public key, so a copy-paste slip is caught before it
+takes the Flight path down. If that interpreter can't run the derivation,
+preflight prints `skip` for this line — *not* a green pass — so a `skip` means
+"not verified here," and step 5's live DoGet is then the definitive gate:
 
 ```bash
 sudo make preflight        # expect: flight-keypair … DP public key matches CP signing seed
+                           # a `skip` means the check couldn't run — rely on step 5, not this
 ```
 
 **4. Restart both services together** (the brief cross-key window above):
