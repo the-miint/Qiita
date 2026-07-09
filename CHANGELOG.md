@@ -15,6 +15,26 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded-reference alignment consumer (C2b).** Wires the C1 `align_sharded`
+  native job into a runnable `align` workflow: an operator submits an align run
+  for a sequenced-pool against an ACTIVE sharded reference + an aligner, the CP
+  mints an `alignment_idx` (deduped on the align config — reference + aligner +
+  mask + the reference's sorted shard-set, the growth foundation), tiles the
+  pool's already-MASKED samples into blocks, fans out one `align` block ticket
+  per block, each streams that block's masked reads (new Rust
+  `export_read_masked_block` DoAction over the `read_masked` view), runs
+  `align_sharded`, and registers an `alignment.parquet` into a new DuckLake
+  `alignment` table (keyed by `alignment_idx`, NOT `processing_idx` — the formal
+  hierarchy is deferred). A per-`(alignment_idx, prep_sample)` gate
+  (`alignment_sample`, twin of `mask_sample`) flips `completed` once every
+  covering block finishes; re-submitting a completed sample is refused until its
+  rows are DELETEd (disallow-without-delete). Adds the `alignment_definition` /
+  `alignment_sample` identity + gate tables and `mint_alignment_definition`
+  (migrations `20260712000000`/`010000`), a nullable `work_ticket.alignment_idx`
+  (`20260712020000`), the `delete-alignment-block` / `reconcile-alignment-block`
+  library primitives, the `align_planner` fan-out, and
+  `POST .../sequenced-pool/{}/align-plan`. (#reference-support)
+
 - **Sharded-reference alignment foundation (C2a).** Makes a *sharded* reference
   index-complete and resolvable — the piece C1 left missing (it shipped the
   `align_sharded` consumer but nothing built the whole-reference router in
