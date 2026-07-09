@@ -2016,6 +2016,24 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     let full_table = format!("qiita_lake.{table}");
 
     if filter.is_empty() {
+        // Defense-in-depth against a full-table read leak. `read_masked`
+        // exposes per-sample human read data; the control plane scopes each
+        // ticket to an explicit (prep_sample_idx, mask_idx) before signing, so
+        // an empty filter should never reach here. If the CP ever mis-signed,
+        // an empty filter would `SELECT *` every sample's pass-reads across all
+        // studies — refuse it. This rejects only the *empty* case, not every
+        // under-scoped one: a non-empty but non-scoping filter (e.g. feature_idx
+        // alone) still passes today. Making an unfiltered read opt-in via an
+        // allowlist, and requiring prep_sample_idx for read_masked, is a tracked
+        // durability follow-up.
+        // The reference_* tables are broadly readable by design (this mirrors
+        // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
+        // legitimate there — reject empty filters only for the read surface.
+        if table == "read_masked" {
+            return Err(Status::invalid_argument(
+                "read_masked requires a non-empty filter (refusing full-table read)",
+            ));
+        }
         return Ok((format!("SELECT * FROM {full_table}"), full_table));
     }
 
@@ -3599,6 +3617,30 @@ mod tests {
             result.is_err(),
             "sequence_idx is not an allowed filter column"
         );
+    }
+
+    #[test]
+    fn build_query_read_masked_rejects_empty_filter() {
+        // An empty filter on the human-read surface would SELECT * every
+        // sample's pass-reads across all studies — refuse it (the CP always
+        // scopes read_masked tickets, this is defense-in-depth).
+        let empty = auth::TicketFilter::new();
+        let result = build_query("read_masked", &empty);
+        assert!(
+            result.is_err(),
+            "empty filter on read_masked must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_reference_table_allows_empty_filter() {
+        // Reference tables are broadly readable by design (mirrors the
+        // anonymous REST reference GET), so an unfiltered SELECT is legitimate.
+        let empty = auth::TicketFilter::new();
+        let (sql, table) = build_query("reference_sequences", &empty)
+            .expect("empty filter on a reference table is allowed");
+        assert_eq!(table, "qiita_lake.reference_sequences");
+        assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
     }
 
     // ------------------------------------------------------------------

@@ -345,7 +345,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-plane-url",
         required=True,
         dest="data_plane_url",
-        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051).",
+        help=(
+            "gRPC URL of the data plane. From off the deploy host use the public "
+            "TLS edge (e.g. grpc+tls://qiita.example.com:443); grpc://<host>:50051 "
+            "is the direct/on-host form and is not reachable off-host."
+        ),
     )
     p_export.set_defaults(handler=_handle_masked_read_export)
 

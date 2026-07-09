@@ -105,6 +105,16 @@ _None yet._
   # expect: bam-to-parquet|1.0.0|prep_sample
   ```
 
+- Confirm the deploy re-rendered nginx with the hardened Flight edge
+  (`activate.sh` re-installs `qiita.conf` + `nginx -t` + `systemctl reload nginx`,
+  so no manual step — this just asserts the reload carried the new directives): (#261)
+
+  ```bash
+  sudo nginx -T 2>/dev/null | grep -A20 'location /arrow.flight.protocol.FlightService/' \
+    | grep -E 'client_max_body_size|grpc_read_timeout|limit_conn'
+  # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
+  ```
+
 ### Notes (no host action)
 
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
@@ -135,6 +145,22 @@ _None yet._
   needs apptainer + network on the build host; the two-gate idempotency is now
   per-image, so a later change to one tool rebuilds only its SIF. Beyond the
   bucket-2 CheckM DB, no new env var, scope, or group. (#255)
+- **Data-plane public-edge hardening — auto-applied, no manual step.** The Arrow
+  Flight service is publicly reachable through nginx on 443 (by design). This
+  tightens that edge and is picked up automatically by the deploy:
+  `activate.sh` re-renders/installs `deploy/nginx/qiita.conf`, runs `nginx -t`,
+  and `systemctl reload nginx`, so the new Flight-`location` directives go live on
+  the restart — `client_max_body_size 0` (a DoPut streams a whole reference through
+  one client-streaming RPC, so the whole-body cap and the DP's per-message decode
+  ceiling measure different quantities; the 1 MB default 413'd reference-load
+  uploads and any finite cap would 413 a multi-GiB reference), `grpc_read_timeout` /
+  `grpc_send_timeout` 3600s (the 60s default cut off large masked-read exports
+  before the first batch), and a new per-client `limit_conn qiita_flight_conn 64`
+  to bound connection floods. The data plane also now refuses an empty-filter
+  `read_masked` DoGet (defense-in-depth; via the binary restart), and the CLI
+  `--data-plane-url` help now points at the public `grpc+tls://<host>:443` form
+  (the `grpc://<host>:50051` example is the firewalled on-host port). No new env
+  var, host dir, scope, migration, or SIF. (#261)
 
 ---
 
