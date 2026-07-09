@@ -146,8 +146,11 @@ mod tests {
             "PATH_PERSISTENT",
         ]);
         std::env::remove_var("LISTEN_ADDR");
-        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
-        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
+        // Ed25519 PUBLIC key (base64) — the verification half of the fixed test
+        // seed [7u8; 32] used across the suite. A public key is not secret
+        // (it only verifies; it cannot sign), so hardcoding it here is safe.
+        let pubkey = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &pubkey);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
         let scratch = tmp_abs("qiita-test-scratch");
         let persistent = tmp_abs("qiita-test-persistent");
@@ -159,7 +162,7 @@ mod tests {
         assert_eq!(
             cfg.flight_public_key.to_bytes().to_vec(),
             base64::engine::general_purpose::STANDARD
-                .decode(&secret)
+                .decode(&pubkey)
                 .unwrap()
         );
         assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
@@ -197,8 +200,8 @@ mod tests {
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
-        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
+        let pubkey = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &pubkey);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_PERSISTENT", tmp_abs("qiita-test-persistent"));
         std::env::remove_var("PATH_SCRATCH");
@@ -221,8 +224,8 @@ mod tests {
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
-        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
+        let pubkey = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &pubkey);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_SCRATCH", tmp_abs("qiita-test-scratch"));
         std::env::remove_var("PATH_PERSISTENT");
@@ -242,8 +245,8 @@ mod tests {
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
-        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
+        let pubkey = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &pubkey);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_SCRATCH", tmp_abs("qiita-test-scratch"));
         std::env::set_var("PATH_PERSISTENT", "relative/persistent");
@@ -263,8 +266,8 @@ mod tests {
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
         ]);
-        let secret = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
-        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &secret);
+        let pubkey = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".to_string();
+        std::env::set_var("FLIGHT_TICKET_PUBLIC_KEY", &pubkey);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         std::env::set_var("PATH_PERSISTENT", tmp_abs("qiita-test-persistent"));
         std::env::set_var("PATH_SCRATCH", "relative/scratch");

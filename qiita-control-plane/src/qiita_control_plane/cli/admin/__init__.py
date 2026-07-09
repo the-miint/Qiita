@@ -641,8 +641,9 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
         # Prominent banner so the operator sees this BEFORE attempting --execute
         # (which refuses outright while mask-idx coverage is incomplete).
         print(
-            f"  *** MASK-IDX COVERAGE INCOMPLETE: {report['non_failed_missing_mask_idx']} non-failed"
-            f" work_ticket(s) for {report['action_ids']} have mask_idx IS NULL."
+            f"  *** MASK-IDX COVERAGE INCOMPLETE:"
+            f" {report['non_failed_missing_mask_idx']} non-failed work_ticket(s)"
+            f" for {report['action_ids']} have mask_idx IS NULL."
         )
         print(
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
