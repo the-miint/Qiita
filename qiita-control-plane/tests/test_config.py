@@ -16,6 +16,7 @@ def _set_workspace_root(monkeypatch):
     values can `delenv` / `setenv` to override after this fixture runs."""
     monkeypatch.setenv("PATH_SCRATCH", "/tmp/qiita-test-scratch-unused")
     monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
+    monkeypatch.setenv("LOGIN_COOKIE_SECRET_KEY", _TEST_SECRET_B64)
 
 
 def test_settings_has_database_url(monkeypatch):
@@ -83,6 +84,57 @@ def test_settings_requires_hmac_secret_key(monkeypatch):
     from qiita_control_plane.config import Settings
 
     with pytest.raises(RuntimeError, match="HMAC_SECRET_KEY"):
+        Settings.from_env()
+
+
+def test_settings_login_cookie_key_is_distinct_bytes(monkeypatch):
+    """login_cookie_secret_key is decoded independently of hmac_secret_key —
+    the split is the whole point (one leak can't forge both)."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    cookie_bytes = secrets.token_bytes(32)
+    monkeypatch.setenv("LOGIN_COOKIE_SECRET_KEY", base64.b64encode(cookie_bytes).decode())
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.login_cookie_secret_key == cookie_bytes
+    assert settings.login_cookie_secret_key != settings.hmac_secret_key
+
+
+def test_settings_requires_login_cookie_secret_key(monkeypatch):
+    """Settings must raise if LOGIN_COOKIE_SECRET_KEY is missing."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("LOGIN_COOKIE_SECRET_KEY", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="LOGIN_COOKIE_SECRET_KEY"):
+        Settings.from_env()
+
+
+def test_settings_rejects_invalid_base64_login_cookie(monkeypatch):
+    """Settings must raise if LOGIN_COOKIE_SECRET_KEY is not valid base64."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("LOGIN_COOKIE_SECRET_KEY", "not!!!valid%%%base64")
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="base64"):
+        Settings.from_env()
+
+
+def test_settings_rejects_short_login_cookie(monkeypatch):
+    """Settings must raise if LOGIN_COOKIE_SECRET_KEY decodes to < 16 bytes."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("LOGIN_COOKIE_SECRET_KEY", base64.b64encode(b"short").decode())
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="at least 16 bytes"):
         Settings.from_env()
 
 

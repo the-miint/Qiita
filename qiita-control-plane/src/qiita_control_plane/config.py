@@ -113,6 +113,12 @@ class Settings:
     database_url: str
     hmac_secret_key: bytes
     data_plane_url: str
+    # HMAC key for the /auth/login → /auth/handoff cookie, kept DISTINCT from
+    # hmac_secret_key (which signs Flight tickets) so one leak can't forge both.
+    # `from_env` requires LOGIN_COOKIE_SECRET_KEY and never uses this default —
+    # the default exists only so direct Settings(...) constructors in tests that
+    # don't exercise the cookie need not supply it.
+    login_cookie_secret_key: bytes = b""
     # Compute-orchestrator dispatch. Both fields optional: when
     # `compute_orchestrator_url` is None, the CP boots without an HTTP client
     # and any work-ticket dispatch route returns 503 — useful for tests and
@@ -220,6 +226,17 @@ class Settings:
         if len(secret) < 16:
             raise RuntimeError("HMAC_SECRET_KEY must decode to at least 16 bytes")
 
+        # Separate secret for the login/handoff cookie — deliberately NOT the
+        # Flight-ticket key, so a leak of one can't forge the other. Required
+        # and fail-loud (same posture as HMAC_SECRET_KEY).
+        cookie_raw = require_env("LOGIN_COOKIE_SECRET_KEY")
+        try:
+            login_cookie_secret_key = base64.b64decode(cookie_raw)
+        except Exception as exc:
+            raise RuntimeError("LOGIN_COOKIE_SECRET_KEY must be valid base64") from exc
+        if len(login_cookie_secret_key) < 16:
+            raise RuntimeError("LOGIN_COOKIE_SECRET_KEY must decode to at least 16 bytes")
+
         issuer = os.environ.get("AUTHROCKET_ISSUER") or None
         # JWKS URL defaults from issuer when issuer is set; explicit override wins.
         jwks_url = os.environ.get("AUTHROCKET_JWKS_URL")
@@ -276,6 +293,7 @@ class Settings:
         return cls(
             database_url=require_env("DATABASE_URL"),
             hmac_secret_key=secret,
+            login_cookie_secret_key=login_cookie_secret_key,
             data_plane_url=os.environ.get("DATA_PLANE_URL", "grpc://localhost:50051"),
             compute_orchestrator_url=compute_orchestrator_url,
             cp_to_co_token_path=cp_to_co_token_path,
