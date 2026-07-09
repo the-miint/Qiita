@@ -315,7 +315,10 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     # Per-submission index selection + tunable build params: build_rype_index is
     # gated on the build_rype action_context flag and surfaces rype_w -> w.
     assert build.when == "build_rype"
-    assert build.params == {"rype_w": "w"}
+    assert build.params == {
+        "rype_w": "w",
+        "rype_bucket_per_feature": "bucket_per_feature",
+    }
 
     # The minimap2 builder consumes the SAME feature-keyed chunks as the rype
     # builder (reassembled into whole contigs), not a raw-FASTA side channel.
@@ -520,7 +523,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     rype = next(s for s in local_host.steps if s.name == "build_rype_index")
     assert (rype.when, rype.params, rype.target_status) == (
         "build_rype",
-        {"rype_w": "w"},
+        {"rype_w": "w", "rype_bucket_per_feature": "bucket_per_feature"},
         "indexing",
     )
     assert (mm2.when, mm2.params, mm2.target_status) == (
