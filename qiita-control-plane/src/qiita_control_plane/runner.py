@@ -55,6 +55,8 @@ from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    INDEX_TYPE_BOWTIE2,
+    INDEX_TYPE_RYPE_ROUTER,
     ComputeTarget,
     FailureType,
     FoundJobWire,
@@ -593,6 +595,18 @@ async def run_workflow(
                     f"prep_sample- or block-scoped; got {scope_target['kind']!r}"
                 )
 
+        # Default-OFF anchor for the whole-reference rype_router build gate. The
+        # `when: router_pending` router entries (sharded reference-add) must NOT
+        # run unless the plan-shards arm sets router_pending True (N > 0). Because
+        # an absent `when:` key defaults ON, seed it False here so the gate is OFF
+        # in every no-router case — including when plan-shards is skipped
+        # (shard_index explicitly false, so it never runs and never sets the key)
+        # or a no-op. plan-shards overrides this to True on a real fan-out; on a
+        # resume the completed plan-shards re-derives it from the durable shard
+        # assignment (see `_reconstruct_completed_outputs`). Harmless for
+        # workflows with no router entries (nothing reads the key).
+        bound.setdefault(ROUTER_PENDING_BINDING, False)
+
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
             # entry when its named action_context key is present and falsy
@@ -644,6 +658,7 @@ async def run_workflow(
                         pool=pool,
                         work_ticket_idx=work_ticket_idx,
                         poll_interval_seconds=poll_interval_seconds,
+                        scope_target=scope_target,
                     )
                 )
                 continue
@@ -1763,6 +1778,109 @@ async def _resolve_host_filter_legacy(
     return bound
 
 
+# Sharded-aligner index resolution ------------------------------------------
+#
+# Maps a sharded aligner to (a) the reference_index.index_type its per-shard rows
+# carry and (b) how deep the per-aligner shard-ROOT sits above a single shard
+# row's fs_path. There is no reference_index row for the root itself, so the root
+# is derived from any one shard row's fs_path via `Path(fs_path).parents[depth]`:
+#   * minimap2 stores `.../minimap2-shards/{shard_id}.mmi`  -> root = parents[0]
+#   * bowtie2  stores `.../bowtie2-shards/{shard_id}/index` -> root = parents[1]
+# (see derived_store.shard_minimap2_index_path / shard_bowtie2_index_prefix). The
+# CP derives the root from the DB fs_path rather than reconstructing the path
+# convention — it cannot import the orchestrator's derived_store.
+_SHARD_ALIGNER_INDEX_TYPE: dict[str, str] = {
+    "minimap2": HOST_FILTER_INDEX_TYPE_MINIMAP2,
+    "bowtie2": INDEX_TYPE_BOWTIE2,
+}
+_SHARD_ALIGNER_ROOT_PARENT_DEPTH: dict[str, int] = {
+    "minimap2": 0,
+    "bowtie2": 1,
+}
+
+
+async def _resolve_sharded_align_indexes(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    aligner: str,
+) -> tuple[list[Path], Path]:
+    """Resolve `(router_index_paths, shard_directory)` for `align_sharded`
+    against an ACTIVE sharded reference and one sharded aligner
+    (`minimap2` | `bowtie2`).
+
+    * **router_index_paths** — the whole-reference `rype_router` `.ryxdi`
+      path(s) (shard_id NULL), newest-first. Today exactly one, but returned as a
+      LIST so a future GROWABLE reference (new shards land in a SEPARATE router
+      UNIONed at classify time, no full rebuild) resolves to the SET the consumer
+      classifies against without a signature change. `align_sharded`'s current
+      single-Path `router_index_path` input is a C2b consumer-side change.
+    * **shard_directory** — the per-aligner root holding all shards. There is no
+      `reference_index` row for the root, so it is derived from any one per-shard
+      row's `fs_path` (see `_SHARD_ALIGNER_ROOT_PARENT_DEPTH`): minimap2's root is
+      the fs_path PARENT (`.../minimap2-shards`), bowtie2's the PARENT-OF-PARENT
+      (`.../bowtie2-shards`).
+
+    This ships tested but UNWIRED — C2b calls it from the align workflow's runner
+    staging (like C1's align job shipped unwired). Fail-fast, mirroring
+    `_resolve_reference_index_path`:
+      * ReferenceNotFound — no such reference.
+      * ValueError — the reference isn't `active` (an unknown aligner is also a
+        ValueError — a programming error, not a caller BAD_INPUT).
+      * ReferenceIndexNotBuilt (a ValueError subclass) — the reference is active
+        but the router, or the per-shard `aligner` index, isn't built yet.
+    """
+    if aligner not in _SHARD_ALIGNER_INDEX_TYPE:
+        raise ValueError(
+            f"unknown sharded aligner {aligner!r}; expected one of "
+            f"{sorted(_SHARD_ALIGNER_INDEX_TYPE)}"
+        )
+    index_type = _SHARD_ALIGNER_INDEX_TYPE[aligner]
+
+    status = await pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if status is None:
+        raise ReferenceNotFound(reference_idx)
+    if status != ReferenceStatus.ACTIVE.value:
+        raise ValueError(
+            f"reference {reference_idx} status is {status!r}, must be "
+            f"{ReferenceStatus.ACTIVE.value!r} to resolve its sharded {aligner} indexes"
+        )
+
+    # The router(s): whole-reference rype_router rows (shard_id NULL), newest
+    # first. `active` already guarantees >= 1 (finalize_shard gates on it), but
+    # resolve defensively.
+    router_rows = await pool.fetch(
+        "SELECT fs_path FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NULL"
+        " ORDER BY created_at DESC, reference_index_idx DESC",
+        reference_idx,
+        INDEX_TYPE_RYPE_ROUTER,
+    )
+    if not router_rows:
+        raise ReferenceIndexNotBuilt(
+            f"reference {reference_idx} has no {INDEX_TYPE_RYPE_ROUTER!r} routing index built yet"
+        )
+    router_paths = [Path(r["fs_path"]) for r in router_rows]
+
+    # Any one per-shard row of this aligner fixes the shard-root (all shards of a
+    # given aligner share the root by construction — the shard->path bijection
+    # register_index preserves).
+    shard_fs_path = await pool.fetchval(
+        "SELECT fs_path FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NOT NULL"
+        " LIMIT 1",
+        reference_idx,
+        index_type,
+    )
+    if shard_fs_path is None:
+        raise ReferenceIndexNotBuilt(
+            f"reference {reference_idx} has no per-shard {index_type!r} index built yet"
+        )
+    shard_directory = Path(shard_fs_path).parents[_SHARD_ALIGNER_ROOT_PARENT_DEPTH[aligner]]
+    return router_paths, shard_directory
+
+
 # Binding name the runner stages the canonical adapter set (a Parquet) under. A
 # step that lists this in its `inputs` (the qc step) signals the runner to
 # materialize the adapter set before the step loop (see `_resolve_qc_adapters`).
@@ -1966,6 +2084,22 @@ SHARD_FEATURES_BINDING = "shard_features"
 SHARD_ID_BINDING = "shard_id"
 _REFERENCE_SEQUENCES_TABLE = "reference_sequences"
 
+# Binding the plan-shards arm sets to gate the whole-reference rype_router build
+# entries (build_routing_index → register-index → finalize-shard) that follow it
+# in the sharded reference-add flow. Present-and-True only when plan-shards fanned
+# out (N > 0 shards); present-and-False otherwise so the `when: router_pending`
+# gate skips those entries — an ABSENT gate key defaults ON, so the runner seeds
+# this False before the step loop (below) to make the router build default-OFF
+# even when plan-shards is skipped (shard_index explicitly false) or a no-op.
+ROUTER_PENDING_BINDING = "router_pending"
+# The runner-staged shard→bucket mapping Parquet `(feature_idx BIGINT,
+# bucket_name VARCHAR = str(shard_id))` build_routing_index consumes. Staged by
+# the plan-shards arm from qiita.reference_membership.shard_id right after the
+# fan-out assigns it — shard_id is authoritative in Postgres (the DuckLake
+# reference_membership has no shard_id column), so this is a direct PG read, not
+# a Flight export.
+SHARD_MAPPING_BINDING = "shard_mapping"
+
 
 def _do_get_reference_sequences_roster(
     data_plane_url: str, ticket_bytes: bytes, out_path: Path
@@ -2041,6 +2175,60 @@ async def _stage_shard_roster(
             f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}"
         ) from exc
     return {SHARD_FEATURES_BINDING: roster_path, SHARD_ID_BINDING: shard_id}
+
+
+def _write_shard_mapping_parquet(rows: list[tuple[int, int]], out_path: Path) -> None:
+    """Write `(feature_idx, shard_id)` rows to a
+    `(feature_idx BIGINT, bucket_name VARCHAR)` Parquet — one row per sharded
+    feature, `bucket_name = str(shard_id)`. This is exactly the shape
+    `build_routing_index.Inputs.shard_mapping` expects (the router build's
+    multi-bucket `rype_index_create` mapping table). pyarrow (already a Flight
+    dependency) writes it directly, mirroring `_write_sample_map_parquet`."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    feature = [int(f) for f, _ in rows]
+    bucket = [str(s) for _, s in rows]
+    table = pa.table(
+        {
+            "feature_idx": pa.array(feature, type=pa.int64()),
+            "bucket_name": pa.array(bucket, type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
+async def _stage_shard_mapping(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    out_path: Path,
+) -> Path:
+    """Stage the whole-reference shard→bucket mapping the router build consumes.
+
+    Exports `qiita.reference_membership` (the authoritative store for
+    `shard_id` — the DuckLake mirror has no such column) to a
+    `(feature_idx BIGINT, bucket_name VARCHAR)` Parquet at `out_path`, one row
+    per feature assigned to a shard (`bucket_name = str(shard_id)`,
+    `shard_id IS NOT NULL`). Called by the plan-shards arm right after
+    `plan_and_submit_shards` has written the assignment (N > 0), so the rows are
+    present; re-staged verbatim on resume from the durable assignment. A missing
+    assignment where one is expected is a fail-loud bug (the caller only stages
+    when the fan-out reported N > 0)."""
+    rows = await pool.fetch(
+        "SELECT feature_idx, shard_id FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND shard_id IS NOT NULL"
+        " ORDER BY feature_idx",
+        reference_idx,
+    )
+    if not rows:
+        raise RuntimeError(
+            f"reference {reference_idx}: no reference_membership.shard_id assignment "
+            "to build a routing index from (plan-shards reported a fan-out but wrote "
+            "no shard assignment)"
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_shard_mapping_parquet([(r["feature_idx"], r["shard_id"]) for r in rows], out_path)
+    return out_path
 
 
 def _workflow_declares_input(steps: list[Any], name: str) -> bool:
@@ -2700,18 +2888,27 @@ async def _shard_fanout_owns_finalize(
     scope_target: dict[str, Any],
     bound: dict[str, Any],
 ) -> bool:
-    """True when this ticket kicked off a sharded fan-out now in progress, so the
-    parent action's finalize must NOT apply its success_status — the terminal
-    `finalize-shard` owns `indexing → active` once every shard registers.
+    """True when this ticket kicked off a sharded fan-out, so the parent action's
+    finalize must NOT apply its success_status — the terminal `finalize-shard`
+    (each shard's, AND the parent's own router-tail one) owns `indexing → active`
+    once every shard + the router register.
 
-    Fires only for a reference-scoped ticket whose action_context set
-    `shard_index` AND whose reference is currently `indexing` (plan-shards
-    transitioned it because N > 0). A sharded reference with no genomes stays
-    `loading` (N = 0, no fan-out) → this returns False → the parent patches
-    `active` inline (nothing to shard). An unsharded reference-add (no
-    `shard_index`) also returns False → patches `active` unchanged. `bound`
-    carries the action_context (resume-safe: reseeded from the persisted ticket
-    context), so this is correct across a CP restart."""
+    Fires for a reference-scoped ticket whose action_context set `shard_index`
+    AND whose reference is `indexing` (plan-shards transitioned it because N > 0)
+    OR already `active`. The `active` case is essential: the parent reference-add
+    now runs its OWN terminal `finalize-shard` (the C2a router tail), and because
+    the parent's whole-reference router build is the long pole, that parent
+    finalize is usually the LAST completion event — so it flips `indexing →
+    active` itself, and by the time this workflow-finalize runs the reference is
+    already `active`. Without admitting `active` here the parent would then
+    re-`_patch_resource_status(active)`, an illegal `active → active` transition
+    that fails the whole (successful) ticket.
+
+    A sharded reference with no genomes stays `loading` (N = 0, no fan-out) →
+    this returns False → the parent patches `active` inline (nothing to shard).
+    An unsharded reference-add (no `shard_index`) also returns False → patches
+    `active` unchanged. `bound` carries the action_context (resume-safe: reseeded
+    from the persisted ticket context), so this is correct across a CP restart."""
     if not bound.get("shard_index"):
         return False
     if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
@@ -2720,7 +2917,7 @@ async def _shard_fanout_owns_finalize(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         scope_target["reference_idx"],
     )
-    return status == ReferenceStatus.INDEXING.value
+    return status in (ReferenceStatus.INDEXING.value, ReferenceStatus.ACTIVE.value)
 
 
 async def _patch_resource_status(
@@ -3748,6 +3945,7 @@ async def _reconstruct_completed_outputs(
     pool: asyncpg.Pool,
     work_ticket_idx: int,
     poll_interval_seconds: float,
+    scope_target: dict[str, Any],
 ) -> dict[str, Any]:
     """Rebuild the bound outputs of an already-COMPLETED entry from disk,
     without re-running it.
@@ -3762,6 +3960,10 @@ async def _reconstruct_completed_outputs(
 
     An `action:` entry rebuilds its deterministic output paths in-process (see
     `_reconstruct_action_outputs`) — the in-process primitive must not re-run.
+    `plan-shards` is the one action whose control-flow bindings (`router_pending`
+    + the staged `shard_mapping`) are re-derived from the DURABLE shard
+    assignment rather than a scratch path, so the router build stays gated and
+    fed correctly across a CP restart (see `_reconstruct_plan_shards_outputs`).
 
     A non-SLURM (local) completed step has no on-disk manifest to re-read;
     recovery is a SLURM-backend concern (local steps are synchronous and don't
@@ -3769,6 +3971,8 @@ async def _reconstruct_completed_outputs(
     downstream consumer that needs a missing binding fails loudly via KeyError."""
     attempt_workspace = workspace / entry.name / f"attempt-{completed.attempt}"
     if isinstance(entry, WorkflowAction):
+        if entry.name == LibraryPrimitive.PLAN_SHARDS:
+            return await _reconstruct_plan_shards_outputs(pool, scope_target, attempt_workspace)
         return _reconstruct_action_outputs(entry, attempt_workspace)
     if completed.compute_target is not ComputeTarget.SLURM:
         return {}
@@ -3796,11 +4000,43 @@ def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) 
     """Deterministic output paths an `action:` primitive wrote, for resume.
     Only `mint-features` contributes a binding (the feature-map Parquet it
     wrote into its workspace); the other primitives produce no bound output.
-    Mirrors the output shapes in `_run_action_primitive` — keep the two in
-    step when a primitive's outputs change."""
+    (`plan-shards` is handled separately in `_reconstruct_completed_outputs` —
+    its bindings come from the DB, not a scratch path.) Mirrors the output
+    shapes in `_run_action_primitive` — keep the two in step when a primitive's
+    outputs change."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
         return {entry.outputs[0]: attempt_workspace / "feature_map.parquet"}
     return {}
+
+
+async def _reconstruct_plan_shards_outputs(
+    pool: asyncpg.Pool,
+    scope_target: dict[str, Any],
+    attempt_workspace: Path,
+) -> dict[str, Any]:
+    """Re-derive the plan-shards arm's control-flow bindings on resume.
+
+    plan-shards produces the router gate `router_pending` and — when it fanned
+    out (N > 0) — the staged `shard_mapping` Parquet the router build consumes.
+    Neither is a declared step output, so rebuild them from the DURABLE shard
+    assignment (`reference_membership.shard_id`) rather than trusting a scratch
+    file to survive: `router_pending = (N > 0)`, and when N > 0 re-stage
+    `shard_mapping` to the same deterministic path the live arm used. This keeps
+    the router build resume-robust — a CP restart between plan-shards and
+    build_routing_index re-provides the mapping and re-opens the gate. Mirrors
+    the live plan-shards arm's return; keep the two in step."""
+    reference_idx = scope_target["reference_idx"]
+    n = await pool.fetchval(
+        "SELECT count(DISTINCT shard_id) FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND shard_id IS NOT NULL",
+        reference_idx,
+    )
+    if not n:
+        return {ROUTER_PENDING_BINDING: False}
+    mapping_path = await _stage_shard_mapping(
+        pool, reference_idx, attempt_workspace / "shard_mapping.parquet"
+    )
+    return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
 
 
 async def _dispatch_action(
@@ -3999,9 +4235,10 @@ async def _run_action_primitive(
         # `when: shard_index` gate ALSO skips an explicit `shard_index: false`
         # opt-out before we get here; this guard covers the absent-key default,
         # which the gate treats as ON (its absent⇒ON default is correct for the
-        # build_* gates but not for this opt-in flag).
+        # build_* gates but not for this opt-in flag). A no-op → router_pending
+        # False so the router build entries stay OFF (see ROUTER_PENDING_BINDING).
         if not bound.get("shard_index"):
-            return {}
+            return {ROUTER_PENDING_BINDING: False}
         if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
             raise RuntimeError(
                 f"plan-shards requires a reference-scoped ticket; got {scope_target['kind']!r}"
@@ -4016,7 +4253,7 @@ async def _run_action_primitive(
             work_ticket_idx,
         )
         shard_context = {k: bound[k] for k in SHARD_BUILD_CONTEXT_KEYS if k in bound}
-        await plan_and_submit_shards(
+        summary = await plan_and_submit_shards(
             pool,
             scope_target["reference_idx"],
             hmac_secret=hmac_secret,
@@ -4028,7 +4265,19 @@ async def _run_action_primitive(
             action_context=shard_context,
             dispatch_cb=dispatch_cb,
         )
-        return {}
+        # N == 0 (no-genome reference) → no fan-out, no router: router_pending
+        # False leaves the reference to go `active` inline (the parent's finalize
+        # patches it). N > 0 → stage the shard→bucket mapping the whole-reference
+        # rype_router build consumes (from the assignment plan_and_submit_shards
+        # just wrote) and flip router_pending True so the router build entries run.
+        if summary.get("shards", 0) <= 0:
+            return {ROUTER_PENDING_BINDING: False}
+        mapping_path = await _stage_shard_mapping(
+            pool,
+            scope_target["reference_idx"],
+            workspace / "shard_mapping.parquet",
+        )
+        return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
 
     if entry.name == LibraryPrimitive.FINALIZE_SHARD:
         # Terminal step of a build-shard-index ticket: count-based, fail-closed

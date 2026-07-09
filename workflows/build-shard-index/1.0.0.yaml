@@ -17,9 +17,11 @@ description: >
   registered shards per expected index_type against N and, when every expected
   type is complete for all N shards, does the guarded `indexing → active`.
 
-  Index selection mirrors host-reference-add: by default all of rype / minimap2 /
-  bowtie2 are built, and `build_*: false` in action_context skips a builder (and
-  its register-index). The reference is already `indexing` when this runs (the
+  Per-shard analysis indexes are minimap2 + bowtie2: by default both are built,
+  and `build_*: false` in action_context skips a builder (and its register-index).
+  Per-shard rype no longer exists — routing is served by the ONE whole-reference
+  `rype_router` the parent reference-add builds (C2), so a shard builds only the
+  aligner subject indexes. The reference is already `indexing` when this runs (the
   parent's plan-shards transitioned it), so the build steps carry no
   target_status and the action carries NO success_status — finalize-shard owns
   the transition to `active`.
@@ -39,21 +41,19 @@ context_schema:
   properties:
     # Which per-shard indexes to build (default-ON via the steps' `when:`;
     # finalize-shard expects exactly the ON set). An omitted key builds that index.
-    build_rype: {type: boolean}
     build_minimap2: {type: boolean}
     build_bowtie2: {type: boolean}
-    # Build params: rype_w -> build_rype_index.w, minimap2_preset ->
-    # build_minimap2_index.preset (bowtie2 is preset-independent).
-    rype_w: {type: integer, minimum: 1}
+    # Build params: minimap2_preset -> build_minimap2_index.preset (bowtie2 is
+    # preset-independent; per-shard rype no longer exists — routing is the
+    # parent's whole-reference rype_router).
     minimap2_preset:
       type: string
       enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
   # At least one index type must be built (mirrors the parent's backstop). Fires
-  # only when all three build_* are explicitly false.
+  # only when both build_* are explicitly false.
   not:
-    required: [build_rype, build_minimap2, build_bowtie2]
+    required: [build_minimap2, build_bowtie2]
     properties:
-      build_rype: {const: false}
       build_minimap2: {const: false}
       build_bowtie2: {const: false}
 
@@ -72,26 +72,6 @@ steps:
   # streams) and no target_status (the reference is already `indexing`). Each
   # `register-index` sibling carries the same `when:` gate, and the runner's
   # register-index arm reads meta.shard_id → a per-shard reference_index row.
-  - step: build_rype_index
-    step_type: singleton
-    module: qiita_compute_orchestrator.jobs.build_rype_index
-    inputs: [shard_features]
-    # rype_w (action_context) -> Inputs.w; shard_id (runner-bound) -> Inputs.shard_id.
-    params: {rype_w: w, shard_id: shard_id}
-    when: build_rype
-    outputs: [rype_index_meta]
-    # Whole-reference host baseline; build_rype_index.plan() sizes a small shard
-    # DOWN from here (down-only), so 1000 shards don't each grab 64 GB.
-    baseline_resources:
-      cpu: 4
-      mem_gb: 64
-      walltime: PT2H
-
-  - action: register-index
-    inputs: [rype_index_meta]
-    when: build_rype
-    outputs: []
-
   - step: build_minimap2_index
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.build_minimap2_index

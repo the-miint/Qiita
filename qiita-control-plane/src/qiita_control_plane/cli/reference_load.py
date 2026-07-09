@@ -515,18 +515,20 @@ async def do_reference_load(
     `shard_index=True` builds per-shard ANALYSIS indexes on a plain (non-host)
     reference: after the base ingest, the `plan-shards` action assigns the
     reference's genome-bearing features to lineage-sorted shards and fans out one
-    build-shard-index ticket per shard (rype + minimap2 + bowtie2 per shard), so
-    the reference goes loading → indexing → active. Like `host`, it requires
-    `taxonomy_path` (sharding sorts by lineage). `host` and `shard_index` are
-    mutually exclusive (host references build host-filter indexes via a different
-    action; sharding is a context flag on plain reference-add, not a new action).
+    build-shard-index ticket per shard (minimap2 + bowtie2 per shard) while the
+    parent builds the ONE whole-reference `rype_router` that routes reads to
+    shards, so the reference goes loading → indexing → active. Like `host`, it
+    requires `taxonomy_path` (sharding sorts by lineage). `host` and `shard_index`
+    are mutually exclusive (host references build host-filter indexes via a
+    different action; sharding is a context flag on plain reference-add, not a new
+    action).
 
-    Index selection / params (apply when `host` OR `shard_index`; rejected
-    otherwise): `build_rype` / `build_minimap2` choose which indexes to build
-    (both default True; at least one must be True). `build_bowtie2` (default
-    True) is analysis-only, so it applies only with `shard_index`, never `host`.
-    `rype_w` overrides the rype window `w` and `minimap2_preset` the minimap2
-    preset; left None they use the builders' defaults. Selection is
+    Index selection / params: `build_rype` (host-filter rype) and `rype_w` apply
+    to `host` ONLY — a sharded reference builds no per-shard rype (its routing is
+    the auto-built whole-reference router). `build_minimap2` / `minimap2_preset`
+    apply to `host` OR `shard_index` (minimap2 is built in both). `build_bowtie2`
+    is analysis-only, so it applies to `shard_index` only. Each buildable index
+    defaults True; at least one applicable index must be built. Selection is
     initial-build-time only — adding an index type to an already-active reference
     is unsupported (the status FSM is terminal at `active`)."""
     has_idx = reference_idx is not None
@@ -557,35 +559,43 @@ async def do_reference_load(
             " authority, sharding as the lineage sort key"
         )
 
-    # Index-selection / build-param knobs apply only when an index build is
-    # requested (--host or --shard-index). Reject them up front (boundary-local
-    # message) rather than silently dropping them server-side. build_bowtie2 is
-    # analysis-only, so --no-bowtie2-index requires --shard-index specifically.
+    # Index-selection / build-param knobs are index-type-scoped. Reject them up
+    # front (boundary-local message) rather than silently dropping them
+    # server-side.
+    #   * bowtie2 is analysis-only (per-shard)   -> --no-bowtie2-index needs --shard-index.
+    #   * rype is a host-filter index; a sharded reference's routing is the
+    #     auto-built whole-reference router (no per-shard rype, no CLI knob)
+    #                                              -> --no-rype-index / --rype-w need --host.
+    #   * minimap2 is built by both host and shard -> its knobs need --host OR --shard-index.
     if not build_bowtie2 and not shard_index:
         raise ValueError(
             "--no-bowtie2-index applies only with --shard-index (bowtie2 is an"
             " analysis-only per-shard index; host references build no bowtie2 index)"
         )
-    index_opts_given = (
-        not build_rype or not build_minimap2 or rype_w is not None or minimap2_preset is not None
-    )
-    if index_opts_given and not (host or shard_index):
+    if (not build_rype or rype_w is not None) and not host:
         raise ValueError(
-            "--no-rype-index / --no-minimap2-index / --rype-w / --minimap2-preset apply only"
-            " with --host or --shard-index (a plain reference builds no index)"
+            "--no-rype-index / --rype-w apply only with --host (rype is a host-filter"
+            " index; a sharded reference's routing index is built automatically, and a"
+            " plain reference builds no index)"
         )
-    # At least one index must be built. The workflow's context_schema `not`
-    # backstop rejects the all-off case server-side too; checking here fails fast
-    # before any upload / submit.
+    if (not build_minimap2 or minimap2_preset is not None) and not (host or shard_index):
+        raise ValueError(
+            "--no-minimap2-index / --minimap2-preset apply only with --host or"
+            " --shard-index (a plain reference builds no index)"
+        )
+    # At least one applicable index must be built. The workflow's context_schema
+    # `not` backstop rejects the all-off case server-side too; checking here fails
+    # fast before any upload / submit.
     if host and not build_rype and not build_minimap2:
         raise ValueError(
             "at least one host index must be built: --no-rype-index and --no-minimap2-index"
             " cannot both be set"
         )
-    if shard_index and not build_rype and not build_minimap2 and not build_bowtie2:
+    if shard_index and not build_minimap2 and not build_bowtie2:
         raise ValueError(
-            "at least one shard index must be built: --no-rype-index, --no-minimap2-index,"
-            " and --no-bowtie2-index cannot all be set"
+            "at least one per-shard index must be built: --no-minimap2-index and"
+            " --no-bowtie2-index cannot both be set (the whole-reference routing index"
+            " is always built)"
         )
 
     # FASTA source mode. --fasta (remote DoPut) and --fasta-manifest (--local
@@ -740,18 +750,18 @@ async def do_reference_load(
             action_context["minimap2_preset"] = minimap2_preset
 
     # Analysis sharding (plain reference, mutually exclusive with host). Records
-    # shard_index=true + the three build gates explicitly so the persisted
+    # shard_index=true + the two per-shard build gates explicitly so the persisted
     # action_context captures the choice; plan-shards fans out one
-    # build-shard-index ticket per shard, and finalize-shard expects exactly the
-    # ON build_* set. rype_w / minimap2_preset ride only when the submitter set
-    # them (else the shard builders use their Inputs defaults).
+    # build-shard-index ticket per shard (minimap2 + bowtie2) and builds the
+    # whole-reference rype_router, and finalize-shard expects exactly the ON
+    # per-shard build_* set. Per-shard rype no longer exists (routing is the
+    # auto-built router), so build_rype / rype_w are NOT forwarded here.
+    # minimap2_preset rides only when the submitter set it (else the shard builder
+    # uses its Inputs default).
     if shard_index:
         action_context["shard_index"] = True
-        action_context["build_rype"] = build_rype
         action_context["build_minimap2"] = build_minimap2
         action_context["build_bowtie2"] = build_bowtie2
-        if rype_w is not None:
-            action_context["rype_w"] = rype_w
         if minimap2_preset is not None:
             action_context["minimap2_preset"] = minimap2_preset
 

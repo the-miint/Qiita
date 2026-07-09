@@ -31,7 +31,12 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.models import FeatureHashEntry, GenomeSource, ReferenceStatus
+from qiita_common.models import (
+    INDEX_TYPE_RYPE_ROUTER,
+    FeatureHashEntry,
+    GenomeSource,
+    ReferenceStatus,
+)
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action, sign_ticket
@@ -761,13 +766,22 @@ async def finalize_shard(
     shard_id) over the non-NULL rows — no `shard_count` column to keep in sync),
     then, for each expected `index_type` (the build_* subset this reference was
     sharded for), counts registered shard rows in `reference_index`. Iff every
-    expected type has a registered row for all N shards, it does the guarded
-    `indexing -> active` transition so `active` guarantees complete sharded
-    indexes (the C1 consumer needs no coverage check). A single still-missing
-    shard leaves the reference honestly in `indexing` (fail-closed) — this
-    primitive NEVER transitions to `failed` (the FSM's only exit from `failed`
-    is `-> pending`, a full-ingest restart — wrong blast radius; an operator
-    redrives the failed shard ticket instead).
+    expected type has a registered row for all N shards AND the ONE
+    whole-reference `rype_router` row is registered (shard_id NULL), it does the
+    guarded `indexing -> active` transition so `active` guarantees a
+    fully-index-complete AND routable sharded reference (the C1 consumer needs no
+    coverage check). A single still-missing shard, or a missing router, leaves the
+    reference honestly in `indexing` (fail-closed) — this primitive NEVER
+    transitions to `failed` (the FSM's only exit from `failed` is `-> pending`, a
+    full-ingest restart — wrong blast radius; an operator redrives the failed
+    shard / router ticket instead).
+
+    The router is checked SEPARATELY from `expected_index_types` (which is the
+    per-shard set): it is whole-reference, built once by the parent reference-add
+    ticket, not per shard. Both the child shard `finalize-shard` calls and the
+    parent's own `finalize-shard` (after it registers the router) converge on this
+    check — whichever completes the full set (all N shards for every expected type
+    + the router) last flips `active`.
 
     Race-safe: register_index rows are dedup'd on (reference_idx, index_type,
     fs_path) and committed before each ticket's own finalize_shard, so the last
@@ -793,11 +807,27 @@ async def finalize_shard(
                 reference_idx,
                 index_type,
             )
-        # Fail-closed: require at least one expected type AND at least one shard,
-        # so a degenerate call (no expected types → registered={} → all([]) is
-        # vacuously True) can NEVER flip `active` with zero indexes. `active`
-        # must always mean "every expected index is built for all N shards".
-        complete = n > 0 and bool(registered) and all(count >= n for count in registered.values())
+        # The whole-reference rype_router (shard_id NULL) — built once by the
+        # parent, not per shard. Required for `active`: without it the sharded
+        # aligners can't route a read to its shard(s), so the reference is not
+        # actually alignable.
+        router_present = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM qiita.reference_index"
+            " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NULL)",
+            reference_idx,
+            INDEX_TYPE_RYPE_ROUTER,
+        )
+        # Fail-closed: require at least one expected type AND at least one shard
+        # AND the router, so a degenerate call (no expected types → registered={}
+        # → all([]) is vacuously True) can NEVER flip `active` with zero indexes.
+        # `active` must always mean "every expected index is built for all N shards
+        # and the whole-reference router is registered".
+        complete = (
+            n > 0
+            and bool(registered)
+            and all(count >= n for count in registered.values())
+            and router_present
+        )
         activated = False
         if complete:
             try:
@@ -817,6 +847,7 @@ async def finalize_shard(
         "reference_idx": reference_idx,
         "expected_shards": n,
         "registered_shards": registered,
+        "router_present": bool(router_present),
         "activated": activated,
     }
 

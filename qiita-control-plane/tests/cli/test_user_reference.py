@@ -359,8 +359,10 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
     fasta_file, taxonomy_file, tmp_path, cp_transport, upload_state
 ):
     """`--shard-index` keeps the plain `reference-add` action (sharding is a
-    context flag, not a new action) and writes shard_index + the three build
-    gates into action_context; the reference is a plain (non-host) reference."""
+    context flag, not a new action) and writes shard_index + the two per-shard
+    build gates into action_context; the reference is a plain (non-host)
+    reference. Per-shard rype no longer exists — routing is the auto-built
+    whole-reference router — so build_rype / rype_w are NOT written."""
     from qiita_control_plane.cli.reference_load import do_reference_load
 
     transport, calls = cp_transport
@@ -390,7 +392,6 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
         "fasta_upload_idx": 100,
         "taxonomy_upload_idx": 101,
         "shard_index": True,
-        "build_rype": True,
         "build_minimap2": True,
         "build_bowtie2": True,
     }
@@ -445,13 +446,41 @@ async def test_do_reference_load_shard_index_and_host_mutually_exclusive(
 async def test_do_reference_load_shard_index_all_off_rejected(
     fasta_file, taxonomy_file, tmp_path, cp_transport
 ):
-    """`--shard-index` with every builder disabled is rejected (fail-fast) —
-    a sharded reference must carry at least one index type."""
+    """`--shard-index` with both per-shard builders disabled is rejected
+    (fail-fast) — a sharded reference must carry at least one per-shard index
+    (the whole-reference router is always built regardless)."""
     from qiita_control_plane.cli.reference_load import do_reference_load
 
     transport, calls = cp_transport
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
-        with pytest.raises(ValueError, match="at least one shard index"):
+        with pytest.raises(ValueError, match="at least one per-shard index"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                build_minimap2=False,
+                build_bowtie2=False,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_rejects_rype_knobs(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--no-rype-index` / `--rype-w` do NOT apply to `--shard-index` — a sharded
+    reference builds no per-shard rype (its routing is the auto-built
+    whole-reference router). Rejected before any network call."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match=r"--no-rype-index / --rype-w apply only with --host"):
             await do_reference_load(
                 http=http,
                 token="t",
@@ -462,8 +491,6 @@ async def test_do_reference_load_shard_index_all_off_rejected(
                 version="1.0",
                 shard_index=True,
                 build_rype=False,
-                build_minimap2=False,
-                build_bowtie2=False,
                 watch=False,
             )
     assert calls == []

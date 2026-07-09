@@ -16,6 +16,11 @@ rather than omitting the optional mapping table: it keeps the index
 self-describing and exercises the same mapping path future multi-bucket
 (microbial) uses will reuse.
 
+This job is WHOLE-REFERENCE / host-only. The multi-bucket sharded ROUTER (one
+bucket per shard) is a separate job (`build_routing_index`); per-shard rype
+`.ryxdi` builds no longer exist — the whole-reference router replaced them for
+routing (C2).
+
 rype build parameters default to k=64, w=20 (the function's own w default is
 50, so we pass 20 explicitly); `w` is overridable per build via the `rype_w`
 action_context key. The authoritative build manifest lives inside
@@ -39,18 +44,16 @@ create them as plain VIEW/TABLE (see docs/duckdb-miint.md).
 from __future__ import annotations
 
 import json
-import math
 import shutil
 from pathlib import Path
 
 import duckdb
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 from qiita_common.models import HOST_FILTER_INDEX_TYPE_RYPE
 from qiita_common.parquet import validate_parquet_path
 
 from ..config import get_settings
-from ..data_plane_client import open_reference_chunk_stream
-from ..derived_store import rype_index_path, shard_rype_index_path
+from ..derived_store import rype_index_path
 from ..miint import (
     apply_duckdb_settings,
     duckdb_headroom_gb,
@@ -59,7 +62,6 @@ from ..miint import (
     resolve_duckdb_memory_gb,
     slurm_alloc_gb,
 )
-from . import JobPlan, JobResourcePlan
 
 YAML_STEP_NAME = "build_rype_index"
 
@@ -107,21 +109,6 @@ _DUCKDB_THREADS = 8
 # grows elastically as an OOM retry escalates the allocation.
 _RYPE_MAX_MEMORY_GB = 30
 
-# plan() memory sizing for SHARD mode (advisory, down-only). A shard is ~1/1000
-# of the reference, so it needn't request the whole-reference 64 GB YAML baseline;
-# plan() sizes mem_gb from the shard's total bp and lets the CP's down-only
-# composition lower the SLURM allocation. The FLOOR is the smallest allocation the
-# runtime DuckDB/rype split stays consistent at: rype's max_memory is floored at
-# `_RYPE_MAX_MEMORY_GB`, so the cgroup must hold rype's floor + DuckDB's cap + the
-# shared headroom, else the split would hand rype more than the cgroup has. Above
-# the floor, add a gentle per-bp term (the rype build is memory-bounded/windowed,
-# so this over-provisions safely rather than tracking a hard requirement). Tune
-# against a real shard build; an under-estimate is still caught by OOM escalation.
-_SHARD_PLAN_FLOOR_GB = (
-    _RYPE_MAX_MEMORY_GB + _DUCKDB_MEMORY_CAP_GB + duckdb_headroom_gb(_DUCKDB_THREADS)
-)
-_SHARD_PLAN_BP_PER_GB = 1_000_000_000
-
 # rype build defaults. w=20 is passed explicitly (the function default is 50).
 # Override per-build with the `rype_w` action_context key (host-reference-add).
 _DEFAULT_K = 64
@@ -140,48 +127,22 @@ class Inputs(BaseModel):
     """Typed input contract for build_rype_index.
 
     `reference_sequence_chunks` is the feature-keyed chunk output of the `load`
-    step (a DIRECTORY of `part_*.parquet`, or a single Parquet file). It is
-    REQUIRED in host mode and unused in shard mode (the shard streams its chunks
-    from the data plane), hence `Path | None`. `reference_idx` and
-    `work_ticket_idx` are framework-injected scope scalars. `k` / `w` are the
-    rype build parameters (host-filter defaults); `bucket_name` overrides the
-    default single-bucket name.
+    step (a DIRECTORY of `part_*.parquet`, or a single Parquet file) — the
+    whole reference's sequences. `reference_idx` and `work_ticket_idx` are
+    framework-injected scope scalars. `k` / `w` are the rype build parameters
+    (host-filter defaults); `bucket_name` overrides the default single-bucket
+    name.
 
-    SHARD mode (both `shard_id` and `shard_features` set) builds one shard's
-    routing `.ryxdi` over just that shard's features: `shard_features` is a
-    runner-staged Parquet roster `(feature_idx BIGINT, sequence_length_bp BIGINT)`
-    (the shard's members, from `reference_membership.shard_id`) whose
-    `feature_idx` list scopes a B6s DoGet ticket, and the chunk bytes STREAM from
-    the data plane over Arrow Flight — a shard build runs AFTER the ingest
-    ticket's register-files has moved the staging chunks into DuckLake, so there
-    is no staging Parquet to read. Left unset (both None) is HOST/unsharded
-    mode — today's whole-reference behavior, byte-identical (staging read).
+    Whole-reference / host mode only — the sharded ROUTER is a separate job
+    (`build_routing_index`).
     """
 
-    reference_sequence_chunks: Path | None = None
+    reference_sequence_chunks: Path
     reference_idx: int
     work_ticket_idx: int
     k: int = _DEFAULT_K
     w: int = _DEFAULT_W
     bucket_name: str | None = None
-    shard_id: int | None = None
-    shard_features: Path | None = None
-
-    @model_validator(mode="after")
-    def _shard_fields_both_or_neither(self) -> Inputs:
-        if (self.shard_id is None) != (self.shard_features is None):
-            raise ValueError(
-                "shard_id and shard_features must be supplied together (both for a"
-                " sharded build, or neither for a whole-reference/host build)"
-            )
-        # Host mode reads staging Parquet, so it needs the chunk binding; shard
-        # mode streams and ignores it.
-        if self.shard_id is None and self.reference_sequence_chunks is None:
-            raise ValueError(
-                "reference_sequence_chunks is required in host/whole-reference mode"
-                " (supply shard_id + shard_features for a sharded streaming build)"
-            )
-        return self
 
 
 def _run_rype_index_create(
@@ -219,40 +180,26 @@ def _run_rype_index_create(
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    # SHARD mode when shard_id/shard_features are set (the validator guarantees
-    # both-or-neither, and that host mode carries `reference_sequence_chunks`).
-    # A sharded build streams only the shard's features and writes a per-shard
-    # `.ryxdi`; host/unsharded mode reads staging Parquet, byte-identical to before.
-    sharded = inputs.shard_id is not None
-
-    read_target: Path | None = None
-    if not sharded:
-        chunks = inputs.reference_sequence_chunks
-        if not chunks.exists():
-            raise FileNotFoundError(f"reference_sequence_chunks not found: {chunks}")
-        # reference_load emits chunks as a directory of part_*.parquet; accept a
-        # single file too (tests / future producers).
-        read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
-    if inputs.bucket_name is not None:
-        bucket = inputs.bucket_name
-    elif sharded:
-        bucket = f"reference_{inputs.reference_idx}_shard_{inputs.shard_id}"
-    else:
-        bucket = f"reference_{inputs.reference_idx}"
+    chunks = inputs.reference_sequence_chunks
+    if not chunks.exists():
+        raise FileNotFoundError(f"reference_sequence_chunks not found: {chunks}")
+    # reference_load emits chunks as a directory of part_*.parquet; accept a
+    # single file too (tests / future producers).
+    read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
+    bucket = (
+        inputs.bucket_name
+        if inputs.bucket_name is not None
+        else f"reference_{inputs.reference_idx}"
+    )
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value
     # here instead of the $TMPDIR/qiita/derived default. The layout is owned by
     # `derived_store` (the orchestrator's derived-storage convention, shared with
-    # build_minimap2_index and the reference-artifact purge endpoint). A sharded
-    # build lands at `.../shards/{shard_id}/index.ryxdi` (one `.ryxdi` per shard).
+    # build_minimap2_index and the reference-artifact purge endpoint).
     path_derived = get_settings().path_derived
-    index_dir = (
-        shard_rype_index_path(path_derived, inputs.reference_idx, inputs.shard_id)
-        if sharded
-        else rype_index_path(path_derived, inputs.reference_idx)
-    )
+    index_dir = rype_index_path(path_derived, inputs.reference_idx)
     index_dir.parent.mkdir(parents=True, exist_ok=True)
     # On a workflow retry the build re-runs against the same persistent path;
     # clear any prior (possibly partial) `.ryxdi` so the rebuild is
@@ -283,46 +230,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
-        # Non-temp view/table (`_CHUNK_VIEW`) so rype's separate bind/execute
-        # connection can resolve it by name. Host mode reads the staging Parquet
-        # lazily (a VIEW rype windows over); shard mode streams the roster's
-        # chunks from the data plane and MATERIALIZES them into a table inside the
-        # stream `with` (draining the Flight stream so the client closes before
-        # the long rype build — a shard is ~1/1000 of the reference, so the
-        # materialized set is small).
-        if sharded:
-            # Read the shard's feature roster (small — one row per feature) to
-            # scope the DoGet ticket, then stream that roster's chunks. Mirrors
-            # build_minimap2_index's shard path.
-            roster_sql = validate_parquet_path(inputs.shard_features)
-            feature_ids = [
-                r[0]
-                for r in conn.execute(
-                    f"SELECT feature_idx FROM read_parquet('{roster_sql}')"
-                ).fetchall()
-            ]
-            if not feature_ids:
-                raise ValueError(
-                    f"shard {inputs.shard_id} roster ({inputs.shard_features}) is empty:"
-                    " nothing to build a rype index from"
-                )
-            async with open_reference_chunk_stream(
-                conn, reference_idx=inputs.reference_idx, feature_idx=feature_ids
-            ) as rel:
-                conn.execute(
-                    f"CREATE OR REPLACE TABLE {_CHUNK_VIEW} AS "
-                    f"SELECT feature_idx, chunk_index, chunk_data FROM {rel}"
-                )
-        else:
-            # DuckDB rejects prepared parameters inside CREATE VIEW, so the path
-            # is inlined; validate_parquet_path rejects quote/backslash/control
-            # chars (the repo's fail-fast escaping contract).
-            read_target_sql = validate_parquet_path(read_target)
-            conn.execute(
-                f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
-                "SELECT feature_idx, chunk_index, chunk_data "
-                f"FROM read_parquet('{read_target_sql}')"
-            )
+        # Non-temp view (`_CHUNK_VIEW`) so rype's separate bind/execute connection
+        # can resolve it by name and windows over the on-disk staging Parquet
+        # lazily (never materialised into an in-memory table). DuckDB rejects
+        # prepared parameters inside CREATE VIEW, so the path is inlined;
+        # validate_parquet_path rejects quote/backslash/control chars (the repo's
+        # fail-fast escaping contract).
+        read_target_sql = validate_parquet_path(read_target)
+        conn.execute(
+            f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
+            "SELECT feature_idx, chunk_index, chunk_data "
+            f"FROM read_parquet('{read_target_sql}')"
+        )
         # Single-bucket mapping over every distinct feature. bucket is a
         # controlled string; escape quotes for the inlined literal.
         bucket_sql = bucket.replace("'", "''")
@@ -348,16 +267,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     params = {"k": inputs.k, "w": inputs.w, "bucket_name": bucket}
     meta_path = workspace / "rype_index_meta.json"
-    # Only a sharded build adds `shard_id` to the meta JSON; host mode omits it
-    # (keeping the host meta byte-identical). The runner's register-index arm
-    # reads it via `meta.get("shard_id")` — absent → None → a whole-reference row.
-    meta: dict = {
+    # The runner's register-index arm reads meta.get("shard_id") -> None -> a
+    # whole-reference row (host rype is never sharded).
+    meta = {
         "index_type": HOST_FILTER_INDEX_TYPE_RYPE,
         "fs_path": str(index_dir),
         "params": params,
     }
-    if sharded:
-        meta["shard_id"] = inputs.shard_id
     meta_path.write_text(json.dumps(meta))
     # Only the in-tree meta JSON is a step output. The `.ryxdi` itself lives
     # under PATH_DERIVED (outside the per-attempt workspace) on purpose — it
@@ -365,28 +281,3 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # manifest write and the verifier both require every output to resolve under
     # $QIITA_OUTPUT_PATH. register-index reads its location from meta `fs_path`.
     return {"rype_index_meta": meta_path}
-
-
-def plan(inputs: Inputs) -> JobPlan:
-    """Size a SHARD build's memory down from the whole-reference baseline.
-
-    Host/unsharded mode → no opinion (empty `JobPlan` → keep the step's YAML
-    baseline; the whole-reference build still gets its 64 GB). Shard mode → size
-    `mem_gb` from the shard's total bp: the runtime-consistent floor
-    (`_SHARD_PLAN_FLOOR_GB` — rype's `max_memory` floor + DuckDB's cap + shared
-    headroom) plus a gentle per-bp term. The control plane applies this ONLY when
-    it is below the step's baseline (down-only composition), so a small shard runs
-    in a smaller SLURM slot (1000 shards don't each grab 64 GB) while an
-    over-estimate harmlessly stays at baseline. Advisory — an under-estimate is
-    still caught by the existing OOM-retry escalation. `plan()` runs at submit
-    time in the orchestrator process and reads only the small roster (bp sum), not
-    the chunk data."""
-    if inputs.shard_id is None or inputs.shard_features is None:
-        return JobPlan()
-    with duckdb.connect(":memory:") as conn:
-        total_bp = conn.execute(
-            "SELECT COALESCE(sum(sequence_length_bp), 0) FROM read_parquet(?)",
-            [str(inputs.shard_features)],
-        ).fetchone()[0]
-    mem_gb = _SHARD_PLAN_FLOOR_GB + math.ceil(total_bp / _SHARD_PLAN_BP_PER_GB)
-    return JobPlan(resources=JobResourcePlan(mem_gb=mem_gb))

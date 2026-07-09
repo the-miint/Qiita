@@ -15,6 +15,26 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded-reference alignment foundation (C2a).** Makes a *sharded* reference
+  index-complete and resolvable — the piece C1 left missing (it shipped the
+  `align_sharded` consumer but nothing built the whole-reference router in
+  production or resolved its path). A sharded `reference-add` /
+  `local-reference-add` now builds and registers the ONE whole-reference
+  `rype_router` after `plan-shards`: the `plan-shards` runner arm stages a
+  `shard_mapping` Parquet from `reference_membership.shard_id` (Postgres — the
+  authoritative store) and returns `router_pending`, which gates three new
+  workflow entries (`build_routing_index` → `register-index` → `finalize-shard`)
+  run by the PARENT ticket in parallel with the per-shard build children.
+  `finalize_shard` now gates `indexing → active` on the `rype_router` row being
+  present (shard_id NULL) in addition to every per-shard index — so `active`
+  guarantees a routable, alignable sharded reference. Adds a shard-aware resolver
+  `_resolve_sharded_align_indexes(reference_idx, aligner) → (router_paths,
+  shard_directory)` (router paths returned as a LIST for the forward growable-
+  reference case; `shard_directory` derived from a per-shard row's fs_path parent)
+  — shipped tested but UNWIRED (the align workflow / DuckLake alignment sink /
+  block fan-out are the deferred C2b). The `reference_index.index_type` CHECK now
+  admits `rype_router` (migration `20260711000000`). (#reference-support)
+
 - **Sharded alignment consumer (C1, native-job-only).** Three native jobs that
   *consume* the per-shard indexes B5 produces, so a read aligns against only the
   shard(s) it minimises into. `build_routing_index` builds a whole-reference
@@ -1416,6 +1436,16 @@ the `no-changelog` label).
 
 ### Removed
 
+- **Per-shard rype build (C2a).** The whole-reference `rype_router` replaces the
+  per-shard `.ryxdi` for read routing, so the vestigial per-shard rype build is
+  gone: `build_rype_index` is now host/whole-reference only (its SHARD-mode
+  Inputs, both-or-neither validator, streaming branch, shard bucket, and `plan()`
+  shard sizing removed); `build-shard-index` drops the `build_rype_index` step +
+  its `register-index` + the `build_rype`/`rype_w` context keys (per-shard indexes
+  are now minimap2 + bowtie2 only); `reference-add` / `local-reference-add` drop
+  `build_rype`/`rype_w` from their sharded context (rype/`rype_w` now apply to
+  `--host` only in the CLI); and `derived_store` drops `shard_rype_index_path` +
+  `reference_shard_dir`. (#reference-support)
 - Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag

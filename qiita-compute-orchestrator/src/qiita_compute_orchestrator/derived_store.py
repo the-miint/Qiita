@@ -45,14 +45,12 @@ __all__ = [
     "bowtie2_index_path",
     "minimap2_index_path",
     "reference_derived_dir",
-    "reference_shard_dir",
     "rype_index_path",
     "rype_router_index_path",
     "shard_bowtie2_dir",
     "shard_bowtie2_index_prefix",
     "shard_minimap2_dir",
     "shard_minimap2_index_path",
-    "shard_rype_index_path",
 ]
 
 
@@ -67,40 +65,10 @@ def reference_derived_dir(derived_root: Path | str, reference_idx: int) -> Path:
     return Path(derived_root) / "references" / str(reference_idx)
 
 
-def reference_shard_dir(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
-    """``{PATH_DERIVED}/references/{reference_idx}/shards/{shard_id}`` — the
-    per-shard directory of a sharded *analysis* index (one ``shard_id`` per
-    shard, 0..N-1). Composed off ``reference_derived_dir`` so it sits inside the
-    per-reference subtree the ``DELETE /reference-artifact/{idx}`` rmtree purges
-    — no separate cleanup path.
-
-    B1 lays down only the directory *layout*; what a shard directory contains
-    (a ``.mmi`` vs vendored FASTA vs a ``.ryxdi``) is decided by the later
-    sharded-index build milestone."""
-    return reference_derived_dir(derived_root, reference_idx) / "shards" / str(shard_id)
-
-
 def rype_index_path(derived_root: Path | str, reference_idx: int) -> Path:
     """The rype ``.ryxdi`` index directory for a reference (a DIRECTORY:
     ``manifest.toml`` + Parquet shards), written by ``build_rype_index``."""
     return reference_derived_dir(derived_root, reference_idx) / "rype" / "index.ryxdi"
-
-
-def shard_rype_index_path(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
-    """The per-shard rype ``.ryxdi`` ROUTING index directory of a sharded
-    *analysis* reference:
-    ``{PATH_DERIVED}/references/{reference_idx}/shards/{shard_id}/index.ryxdi``.
-    Composed off ``reference_shard_dir`` so it sits inside the per-reference
-    subtree the ``DELETE /reference-artifact/{idx}`` rmtree purges. Written by
-    ``build_rype_index`` in shard mode (one ``.ryxdi`` per shard, over just that
-    shard's features).
-
-    **Vestigial for routing as of C1.** C1 routes reads with a single
-    whole-reference multi-bucket rype router (``rype_router_index_path``), not a
-    per-shard ``.ryxdi``. The B5 fan-out still produces these per-shard ``.ryxdi``
-    (unchanged), but nothing consumes them for routing; C2 removes the per-shard
-    rype build and wires the router into the fan-out."""
-    return reference_shard_dir(derived_root, reference_idx, shard_id) / "index.ryxdi"
 
 
 def rype_router_index_path(derived_root: Path | str, reference_idx: int) -> Path:
@@ -111,10 +79,10 @@ def rype_router_index_path(derived_root: Path | str, reference_idx: int) -> Path
     (``bucket_name = str(shard_id)``) — written by ``build_routing_index``. One
     ``rype_classify`` pass against it yields the ``read_to_shard`` table
     ``align_*_sharded`` need (see C1). Distinct from the per-reference host-filter
-    ``rype_index_path`` (a single POSITIVE bucket) and the vestigial per-shard
-    ``shard_rype_index_path``. Sits directly under the per-reference subtree so the
-    ``DELETE /reference-artifact/{idx}`` rmtree purges it; ``shard_id`` is NULL on
-    its ``reference_index`` row (whole-reference, not per-shard)."""
+    ``rype_index_path`` (a single POSITIVE bucket). Sits directly under the
+    per-reference subtree so the ``DELETE /reference-artifact/{idx}`` rmtree purges
+    it; ``shard_id`` is NULL on its ``reference_index`` row (whole-reference, not
+    per-shard). It replaced the per-shard routing ``.ryxdi`` removed in C2."""
     return reference_derived_dir(derived_root, reference_idx) / "rype-router.ryxdi"
 
 

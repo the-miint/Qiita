@@ -103,6 +103,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `work_ticket_one_in_flight_per_reference` with `AND shard_id IS NULL`, and adds
   `work_ticket_one_in_flight_per_shard`). Additive; existing tickets read NULL and are
   unaffected, no backfill or out-of-band steps. (#reference-support)
+- **`rype_router` `reference_index.index_type`.** `make migrate` applies
+  `20260711000000_reference_index_rype_router_type.sql` (extends the
+  `reference_index_index_type_check` allow-list to
+  `rype`/`minimap2`/`bowtie2`/`rype_router`). Additive CHECK expansion; the sharded
+  reference-add path starts inserting `rype_router` rows (the whole-reference router),
+  no out-of-band steps. (#reference-support)
 
 ### 4. Deploy
 
@@ -121,13 +127,17 @@ _None yet._
   ```
 
 - Confirm the new `build-shard-index/1.0.0` workflow synced into `qiita.action` (the
-  sharded-index fan-out target — one build-shard-index ticket per shard; synced by
-  `qiita-admin actions sync` inside `activate.sh`). The extended `reference-add` /
-  `local-reference-add` context (the opt-in `shard_index` flag) re-syncs in place with
-  no separate check. No new env var, host directory, scope, group, or SIF (the shard
-  builders reuse the existing native rype/minimap2/bowtie2 job modules — no container;
-  the `compute` SA's `ticket:doget` grant above already covers the per-shard streaming).
-  Inert until a submitter opts in with `--shard-index`. (#reference-support)
+  sharded-index fan-out target — one build-shard-index ticket per shard, now minimap2 +
+  bowtie2 only; synced by `qiita-admin actions sync` inside `activate.sh`). The extended
+  `reference-add` / `local-reference-add` (the opt-in `shard_index` flag **and** the new
+  whole-reference `rype_router` build tail — `build_routing_index` → `register-index` →
+  `finalize-shard`, run by the parent after `plan-shards`) re-sync in place with no
+  separate check. No new env var, host directory, scope, group, or SIF (the shard +
+  router builders reuse the existing native rype/minimap2/bowtie2 job modules — no
+  container; the `compute` SA's `ticket:doget` grant above already covers the per-shard
+  and whole-reference streaming). Inert until a submitter opts in with `--shard-index`;
+  a sharded reference then reaches `active` only once every per-shard index AND the
+  `rype_router` row are registered. (#reference-support)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='build-shard-index'"

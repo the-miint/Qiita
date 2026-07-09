@@ -322,12 +322,10 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 # HOST_FILTER_REQUIRED_INDEX_TYPES. Written by the `build_routing_index` native
 # job with `shard_id` NULL (whole-reference, not per-shard).
 #
-# NOTE: this value is deliberately NOT yet in the `reference_index.index_type`
-# CHECK allow-list. C1 is native-job-only and does not register a router row (its
-# smoke passes the router path directly to the align job), so no row ever carries
-# it. C2 — which builds the router in production and registers it — adds the
-# one-line CHECK migration (`... IN ('rype','minimap2','bowtie2','rype_router')`)
-# in the same PR that starts inserting the row.
+# Admitted into the `reference_index.index_type` CHECK allow-list by
+# 20260711000000_reference_index_rype_router_type.sql: C2 builds the router in
+# the sharded reference-add path and registers the row. C1 was native-job-only
+# and passed the router path directly to the align job, so no row carried it yet.
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
 

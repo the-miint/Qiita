@@ -1043,16 +1043,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument("--tree", type=Path)
     p_reference_load.add_argument("--jplace", type=Path)
     p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
-    # Index selection + build params (apply with --host OR --shard-index). Default
-    # builds every index; the opt-out flags skip one (the entry point rejects
-    # building none). --rype-w / --minimap2-preset tune the builders; omitted,
-    # they use the builders' defaults (w=20, preset=sr).
+    # Index selection + build params, scoped by index type: rype knobs apply to
+    # --host ONLY (a sharded reference's routing index is the auto-built
+    # whole-reference router, not a per-shard rype); minimap2 knobs to --host OR
+    # --shard-index; --no-bowtie2-index to --shard-index only. Default builds
+    # every applicable index; the opt-out flags skip one (the entry point rejects
+    # building none). --minimap2-preset tunes the builder; omitted, it uses the
+    # builder's default (preset=sr).
     p_reference_load.add_argument(
         "--no-rype-index",
         action="store_true",
         help=(
-            "With --host/--shard-index: skip the rype index. Cannot be combined with"
-            " the other --no-*-index flags such that none is built."
+            "With --host: skip the rype host-filter index. Cannot be combined with"
+            " --no-minimap2-index such that neither host index is built."
         ),
     )
     p_reference_load.add_argument(
@@ -1075,7 +1078,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument(
         "--rype-w",
         type=int,
-        help="With --host/--shard-index: rype minimizer window `w` (default 20).",
+        help="With --host: rype minimizer window `w` (default 20).",
     )
     p_reference_load.add_argument(
         "--minimap2-preset",

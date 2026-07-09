@@ -380,27 +380,19 @@ async def test_shard_index_status_reports_progress(client, postgres_pool):
             shard_id,
         )
 
-    # rype registered for all 3 shards; minimap2 for 2 of 3; bowtie2 for none.
-    for shard_id in range(3):
-        await postgres_pool.execute(
-            "INSERT INTO qiita.reference_index"
-            " (reference_idx, index_type, fs_path, params, shard_id)"
-            " VALUES ($1, 'rype', $2, '{}'::jsonb, $3)",
-            idx,
-            f"/derived/{idx}/shards/{shard_id}/rype",
-            shard_id,
-        )
+    # Per-shard indexes are minimap2 + bowtie2 (no per-shard rype). minimap2
+    # registered for 2 of 3 shards; bowtie2 for none.
     for shard_id in range(2):
         await postgres_pool.execute(
             "INSERT INTO qiita.reference_index"
             " (reference_idx, index_type, fs_path, params, shard_id)"
             " VALUES ($1, 'minimap2', $2, '{}'::jsonb, $3)",
             idx,
-            f"/derived/{idx}/shards/{shard_id}/minimap2",
+            f"/derived/{idx}/minimap2-shards/{shard_id}.mmi",
             shard_id,
         )
 
-    # build-shard-index tickets: all three build_* flags on (so bowtie2 is an
+    # build-shard-index tickets: both build_* flags on (so bowtie2 is an
     # expected type despite zero registered rows); shard 0 completed, 1 & 2 failed.
     await _seed_build_shard_action(postgres_pool)
     principal_idx = await postgres_pool.fetchval("SELECT MIN(idx) FROM qiita.principal")
@@ -419,7 +411,7 @@ async def test_shard_index_status_reports_progress(client, postgres_pool):
             idx,
             shard_id,
             state,
-            '{"build_rype": true, "build_minimap2": true, "build_bowtie2": true}',
+            '{"build_minimap2": true, "build_bowtie2": true}',
             # Failed tickets must carry failure metadata (work_ticket_failure_consistent);
             # `finalize` stage needs no failure_step_name (…_step_name_consistent).
             "permanent" if failed else None,
@@ -437,7 +429,7 @@ async def test_shard_index_status_reports_progress(client, postgres_pool):
 
     assert resp.status_code == 200
     assert body["expected_shards"] == 3
-    assert body["registered_shards"] == {"rype": 3, "minimap2": 2, "bowtie2": 0}
+    assert body["registered_shards"] == {"minimap2": 2, "bowtie2": 0}
     assert body["failed_shard_tickets"] == 2
 
 

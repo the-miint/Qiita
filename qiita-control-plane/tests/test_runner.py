@@ -1684,9 +1684,9 @@ async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference
     try:
         await _dispatch(
             {
-                "index_type": "rype",
-                "fs_path": f"/srv/qiita/references/{reference_idx}/shards/1/index.ryxdi",
-                "params": {"k": 64},
+                "index_type": "minimap2",
+                "fs_path": f"/srv/qiita/references/{reference_idx}/minimap2-shards/1.mmi",
+                "params": {"preset": "sr"},
                 "shard_id": 1,
             },
             "shard_index_meta",
@@ -1702,7 +1702,7 @@ async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference
         assert (
             await postgres_pool.fetchval(
                 "SELECT shard_id FROM qiita.reference_index"
-                " WHERE reference_idx = $1 AND fs_path LIKE '%/shards/1/%'",
+                " WHERE reference_idx = $1 AND fs_path LIKE '%minimap2-shards/1.mmi'",
                 reference_idx,
             )
             == 1
@@ -1722,12 +1722,14 @@ async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference
 
 
 async def test_run_action_primitive_plan_shards_is_opt_in(postgres_pool, tmp_path):
-    """plan-shards is OPT-IN: the arm no-ops (returns {}) when `shard_index` is
-    absent or falsy in `bound`, so a plain reference-add never fans out — this is
-    the guard that keeps a genome-bearing reference nobody asked to shard from
-    being sharded, and it fires BEFORE the dispatch_cb requirement, so a no-op
-    needs no dispatch_cb. When `shard_index` IS set the dispatch_cb requirement
-    still bites (fanning out with no dispatch mechanism would strand tickets)."""
+    """plan-shards is OPT-IN: the arm no-ops when `shard_index` is absent or
+    falsy in `bound`, so a plain reference-add never fans out — this is the guard
+    that keeps a genome-bearing reference nobody asked to shard from being
+    sharded, and it fires BEFORE the dispatch_cb requirement, so a no-op needs no
+    dispatch_cb. A no-op still returns `router_pending: False` so the downstream
+    router-build entries (`when: router_pending`) stay OFF. When `shard_index` IS
+    set the dispatch_cb requirement still bites (fanning out with no dispatch
+    mechanism would strand tickets)."""
     from qiita_common.actions import WorkflowAction
 
     from qiita_control_plane.runner import _run_action_primitive
@@ -1749,9 +1751,10 @@ async def test_run_action_primitive_plan_shards_is_opt_in(postgres_pool, tmp_pat
         )
 
     # Absent key => no-op, even without a dispatch_cb (the failing-smoke case).
-    assert await _call({}, dispatch_cb=None) == {}
+    # The no-op returns router_pending False so the router build stays gated off.
+    assert await _call({}, dispatch_cb=None) == {"router_pending": False}
     # Explicit false => no-op too.
-    assert await _call({"shard_index": False}, dispatch_cb=None) == {}
+    assert await _call({"shard_index": False}, dispatch_cb=None) == {"router_pending": False}
     # Opt-in true + no dispatch_cb => the fan-out precondition still fails loud.
     with pytest.raises(RuntimeError, match="requires a dispatch_cb"):
         await _call({"shard_index": True}, dispatch_cb=None)
@@ -2194,6 +2197,186 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
     )
     with pytest.raises(ValueError, match="no 'rype' index"):
         await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+
+
+# =============================================================================
+# _resolve_sharded_align_indexes  (C2a — router + per-aligner shard dir)
+# =============================================================================
+#
+# Resolves (router_index_paths, shard_directory) for align_sharded against an
+# ACTIVE sharded reference. Built + tested now, UNWIRED (the align workflow is
+# C2b) — like C1's align job it ships tested but with no consumer yet.
+
+
+async def _activate(pool, reference_idx):
+    await pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+
+
+async def _seed_sharded_reference(pool, reference_idx, *, n_shards=3, router=True):
+    """Seed an active sharded reference's reference_index rows: one rype_router
+    (shard_id NULL) when `router`, plus per-shard minimap2 + bowtie2 rows at the
+    exact derived-store fs_path shapes the resolver derives the shard-root from."""
+    await _activate(pool, reference_idx)
+    if router:
+        await _insert_reference_index(
+            pool,
+            reference_idx,
+            f"/derived/references/{reference_idx}/rype-router.ryxdi",
+            index_type="rype_router",
+        )
+    for shard_id in range(n_shards):
+        await _insert_reference_index(
+            pool,
+            reference_idx,
+            f"/derived/references/{reference_idx}/minimap2-shards/{shard_id}.mmi",
+            index_type="minimap2",
+            shard_id=shard_id,
+        )
+        await _insert_reference_index(
+            pool,
+            reference_idx,
+            f"/derived/references/{reference_idx}/bowtie2-shards/{shard_id}/index",
+            index_type="bowtie2",
+            shard_id=shard_id,
+        )
+
+
+async def test_resolve_sharded_align_indexes_minimap2(postgres_pool, reference_idx):
+    """minimap2's shard-root is the fs_path PARENT (`.../minimap2-shards`); the
+    router path list carries the one whole-reference rype_router."""
+    from pathlib import Path
+
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    try:
+        routers, shard_dir = await _resolve_sharded_align_indexes(
+            postgres_pool, reference_idx, "minimap2"
+        )
+        assert routers == [Path(f"/derived/references/{reference_idx}/rype-router.ryxdi")]
+        assert shard_dir == Path(f"/derived/references/{reference_idx}/minimap2-shards")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_bowtie2(postgres_pool, reference_idx):
+    """bowtie2's shard-root is the fs_path PARENT-OF-PARENT (`.../bowtie2-shards`)
+    — the prefix sits inside a per-shard `{shard_id}` subdir."""
+    from pathlib import Path
+
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    try:
+        routers, shard_dir = await _resolve_sharded_align_indexes(
+            postgres_pool, reference_idx, "bowtie2"
+        )
+        assert routers == [Path(f"/derived/references/{reference_idx}/rype-router.ryxdi")]
+        assert shard_dir == Path(f"/derived/references/{reference_idx}/bowtie2-shards")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_returns_all_routers_newest_first(
+    postgres_pool, reference_idx
+):
+    """Multiple routers (the forward growable-reference case) resolve to the SET,
+    newest-first (highest reference_index_idx wins the ordering)."""
+    from pathlib import Path
+
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    # A second router generation (higher idx → sorts first).
+    await _insert_reference_index(
+        postgres_pool,
+        reference_idx,
+        f"/derived/references/{reference_idx}/rype-router-2.ryxdi",
+        index_type="rype_router",
+    )
+    try:
+        routers, _ = await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+        assert routers == [
+            Path(f"/derived/references/{reference_idx}/rype-router-2.ryxdi"),
+            Path(f"/derived/references/{reference_idx}/rype-router.ryxdi"),
+        ]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_missing_router_fails(postgres_pool, reference_idx):
+    """No router row → ReferenceIndexNotBuilt (a sharded ref isn't routable
+    without it)."""
+    from qiita_control_plane.runner import ReferenceIndexNotBuilt, _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx, router=False)
+    try:
+        with pytest.raises(ReferenceIndexNotBuilt, match="rype_router"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_missing_shard_fails(postgres_pool, reference_idx):
+    """Router present but no per-shard index of the requested aligner →
+    ReferenceIndexNotBuilt."""
+    from qiita_control_plane.runner import ReferenceIndexNotBuilt, _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx, n_shards=0)  # router only
+    try:
+        with pytest.raises(ReferenceIndexNotBuilt, match="per-shard 'minimap2'"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_non_active_fails(postgres_pool, reference_idx):
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'indexing' WHERE reference_idx = $1", reference_idx
+    )
+    try:
+        with pytest.raises(ValueError, match="active"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_unknown_reference(postgres_pool):
+    from qiita_control_plane.actions.reference import ReferenceNotFound
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    with pytest.raises(ReferenceNotFound):
+        await _resolve_sharded_align_indexes(postgres_pool, 999_999_999, "minimap2")
+
+
+async def test_resolve_sharded_align_indexes_unknown_aligner(postgres_pool, reference_idx):
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    try:
+        with pytest.raises(ValueError, match="unknown sharded aligner"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "bwa")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
 
 
 # =============================================================================
@@ -2815,9 +2998,11 @@ async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
 
 async def test_shard_fanout_owns_finalize_matrix(postgres_pool, reference_idx):
     """The conditional-finalize predicate: the parent reference-add finalize skips
-    its success_status patch iff a sharded fan-out is in progress — shard_index
-    set AND the reference currently `indexing` (N>0 fanned out). Every other case
-    (no shard_index, sharded-but-still-loading = N=0, non-reference scope) returns
+    its success_status patch iff this ticket kicked off a sharded fan-out —
+    shard_index set AND the reference `indexing` (N>0 fanned out) OR already
+    `active` (the parent's own router-tail finalize-shard flipped it — the common
+    case, since the router build is the long pole). Every other case (no
+    shard_index, sharded-but-still-loading = N=0, non-reference scope) returns
     False → the parent patches `active` inline."""
     from qiita_control_plane import runner
 
@@ -2832,6 +3017,10 @@ async def test_shard_fanout_owns_finalize_matrix(postgres_pool, reference_idx):
 
     # shard_index + indexing (fan-out happened, N>0) → skip the parent patch.
     assert await owns({"shard_index": True}, status="indexing") is True
+    # shard_index + already active (the parent's own finalize-shard won the race)
+    # → STILL skip the inline patch, else the parent re-patches active→active
+    # (illegal) and fails a fully-successful ticket.
+    assert await owns({"shard_index": True}, status="active") is True
     # shard_index + still loading (N=0, no fan-out) → parent patches active.
     assert await owns({"shard_index": True}, status="loading") is False
     # No shard_index (unsharded ref-add) → parent patches active, even if indexing.
@@ -2990,6 +3179,181 @@ async def test_stage_shard_roster_dataplane_failure_is_submission(
         assert ei.value.kind == FailureKind.BAD_INPUT
         assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
         assert ei.value.step_name is None
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+# =============================================================================
+# _stage_shard_mapping + plan-shards router gate (C2a)
+# =============================================================================
+#
+# _stage_shard_mapping exports reference_membership.shard_id (Postgres — the
+# authoritative store) to the (feature_idx, bucket_name) Parquet build_routing_index
+# consumes. The plan-shards arm stages it + flips router_pending only on a real
+# fan-out (N > 0); the reconstruct helper re-derives both on resume.
+
+
+async def test_stage_shard_mapping_exports_shard_id_as_bucket(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Exports only the shard-assigned features (shard_id NOT NULL), with
+    bucket_name = str(shard_id). A no-genome (NULL shard_id) member is excluded."""
+    import duckdb
+
+    from qiita_control_plane import runner
+
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0, 1, 1, None])
+    try:
+        out = await runner._stage_shard_mapping(
+            postgres_pool, reference_idx, tmp_path / "shard_mapping.parquet"
+        )
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"SELECT feature_idx, bucket_name FROM read_parquet('{out}') ORDER BY feature_idx"
+            ).fetchall()
+        # The three shard-assigned features (bucket = str(shard_id)); the NULL one dropped.
+        assert rows == [(feats[0], "0"), (feats[1], "1"), (feats[2], "1")]
+        # Column types: feature_idx BIGINT, bucket_name VARCHAR (the router build's contract).
+        with duckdb.connect(":memory:") as con:
+            types = {
+                r[0]: r[1]
+                for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()
+            }
+        assert types["feature_idx"] == "BIGINT"
+        assert types["bucket_name"] == "VARCHAR"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+async def test_stage_shard_mapping_raises_when_no_assignment(
+    postgres_pool, reference_idx, tmp_path
+):
+    """No shard-assigned membership → fail-loud (the arm only calls this after a
+    reported fan-out, so an empty result is a bug)."""
+    from qiita_control_plane import runner
+
+    with pytest.raises(RuntimeError, match="no reference_membership.shard_id"):
+        await runner._stage_shard_mapping(
+            postgres_pool, reference_idx, tmp_path / "shard_mapping.parquet"
+        )
+
+
+async def test_plan_shards_arm_stages_router_on_fanout(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """On a real fan-out (N > 0) the plan-shards arm returns router_pending True
+    and a staged shard_mapping Parquet built from the shard assignment. The
+    fan-out itself (plan_and_submit_shards) is stubbed — this pins the arm's
+    router-gate + mapping-staging behavior, not the fan-out."""
+    import duckdb
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane import runner
+
+    entry = WorkflowAction(kind="action", name="plan-shards", inputs=[], outputs=[])
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+    # Seed the assignment the fan-out would have written; the arm stages the
+    # mapping from it. (plan_and_submit_shards is stubbed, so no work_ticket /
+    # status transition is needed.)
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0, 1])
+
+    async def fake_fanout(pool, ref, **kwargs):
+        return {"reference_idx": ref, "shards": 2, "tickets": [10, 11]}
+
+    monkeypatch.setattr(runner, "plan_and_submit_shards", fake_fanout)
+
+    try:
+        out = await runner._run_action_primitive(
+            postgres_pool,
+            entry,
+            {"shard_index": True},
+            tmp_path,
+            ref_scope,
+            work_ticket_idx=1,
+            hmac_secret=b"x" * 32,
+            data_plane_url="grpc://unused:1",
+            dispatch_cb=lambda _idx: None,
+        )
+        assert out["router_pending"] is True
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"SELECT bucket_name FROM read_parquet('{out['shard_mapping']}')"
+                " ORDER BY feature_idx"
+            ).fetchall()
+        assert [r[0] for r in rows] == ["0", "1"]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+async def test_plan_shards_arm_no_router_on_zero_shards(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """N == 0 (no-genome reference): router_pending False, no shard_mapping."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane import runner, shard_orchestration
+
+    entry = WorkflowAction(kind="action", name="plan-shards", inputs=[], outputs=[])
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+
+    async def fake_noop(pool, reference_idx, **kwargs):
+        return 0
+
+    monkeypatch.setattr(shard_orchestration, "plan_shards", fake_noop)
+    out = await runner._run_action_primitive(
+        postgres_pool,
+        entry,
+        {"shard_index": True},
+        tmp_path,
+        ref_scope,
+        work_ticket_idx=1,
+        hmac_secret=b"x" * 32,
+        data_plane_url="grpc://unused:1",
+        dispatch_cb=lambda _idx: None,
+    )
+    assert out == {"router_pending": False}
+
+
+async def test_reconstruct_plan_shards_outputs_rederives_from_db(
+    postgres_pool, reference_idx, tmp_path
+):
+    """On resume the reconstruct helper re-derives router_pending from the durable
+    shard assignment and RE-STAGES the shard_mapping (not trusting a scratch file
+    to survive). No assignment → router_pending False, no mapping."""
+    import duckdb
+
+    from qiita_control_plane import runner
+
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+
+    # No assignment yet → False, no mapping.
+    out = await runner._reconstruct_plan_shards_outputs(postgres_pool, ref_scope, tmp_path)
+    assert out == {"router_pending": False}
+
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0, 1, 1])
+    try:
+        out = await runner._reconstruct_plan_shards_outputs(postgres_pool, ref_scope, tmp_path)
+        assert out["router_pending"] is True
+        with duckdb.connect(":memory:") as con:
+            n = con.execute(
+                f"SELECT count(*) FROM read_parquet('{out['shard_mapping']}')"
+            ).fetchone()[0]
+        assert n == 3
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx

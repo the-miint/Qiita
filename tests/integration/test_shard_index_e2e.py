@@ -2,30 +2,35 @@
 
 Closes the loop the per-commit tests cover only in pieces — it runs the FULL
 sharded-index build for ONE shard through `run_workflow` against a LIVE data
-plane + real miint, exercising every new B5 runner seam:
+plane + real miint, exercising every shard runner seam:
 
   - `_stage_shard_roster` (runner pre-step) reads the shard's feature set from
     Postgres `reference_membership.shard_id`, signs a REAL feature_idx-scoped
     `reference_sequences` DoGet against the live DP, and stages
     `shard_roster.parquet` (binding `shard_features` + `shard_id`)
-  - `build_rype_index` in shard mode streams that shard's chunks from the live DP
-    and runs the REAL miint `rype_index_create` to write the per-shard `.ryxdi`
+  - `build_minimap2_index` in shard mode streams that shard's chunks from the
+    live DP and runs the REAL miint `save_minimap2_index` to write the per-shard
+    `.mmi`
   - the runner's `register-index` arm writes a per-shard `reference_index` row
     (shard_id set)
-  - the terminal `finalize-shard` counts registered shards == N and does the
-    guarded `indexing -> active`
+  - the terminal `finalize-shard` counts registered shards == N AND requires the
+    whole-reference `rype_router` row, then does the guarded `indexing -> active`
 
-`build_rype_index.open_reference_chunk_stream` (which would hop to the CP for a
-ticket) is monkeypatched to sign the chunk ticket DIRECTLY with the fixture DP's
-secret — the CO->CP ticket hop has its own tests; what's exercised here is the
-runner drive + DP DoGet + real streaming build. The roster DoGet in
+`build_minimap2_index.open_reference_chunk_stream` (which would hop to the CP for
+a ticket) is monkeypatched to sign the chunk ticket DIRECTLY with the fixture
+DP's secret — the CO->CP ticket hop has its own tests; what's exercised here is
+the runner drive + DP DoGet + real streaming build. The roster DoGet in
 `_stage_shard_roster` is NOT stubbed: run_workflow gets the DP secret as
 `hmac_secret`, so it hits the live DP for real.
 
-Only `build_rype` is enabled (minimap2/bowtie2 off) to keep the real build tiny;
-finalize-shard then expects exactly {rype} and flips the reference active. The
-per-shard minimap2/bowtie2 stream builds are covered at the job level by
-test_reference_stream_build.
+Only `build_minimap2` is enabled (bowtie2 off) to keep the real build tiny;
+finalize-shard then expects exactly {minimap2}. Because per-shard rype no longer
+exists (C2), routing is the whole-reference `rype_router` the PARENT reference-add
+builds — this child-workflow test pre-registers that router row (standing in for
+the parent's build_routing_index) so finalize-shard's router gate is satisfied and
+the reference flips active. The per-shard minimap2/bowtie2 stream builds and the
+router build are covered at the job level by test_reference_stream_build and
+test_routing_index_build.
 """
 
 import json
@@ -200,19 +205,33 @@ async def test_build_shard_index_workflow_end_to_end(
 ):
     """Drive build-shard-index for one shard via the in-process runner +
     LocalBackend against the live data plane. After the run: ticket COMPLETED, a
-    rype reference_index row for shard 0, and the reference flipped
-    `indexing -> active` by finalize-shard."""
-    from qiita_compute_orchestrator.jobs import build_rype_index
+    minimap2 reference_index row for shard 0, and the reference flipped
+    `indexing -> active` by finalize-shard (which also required the pre-registered
+    whole-reference rype_router row)."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
 
     from qiita_control_plane.runner import run_workflow
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "derived"))
     monkeypatch.setattr(
-        build_rype_index, "open_reference_chunk_stream", _fake_open_stream(data_plane)
+        build_minimap2_index,
+        "open_reference_chunk_stream",
+        _fake_open_stream(data_plane),
     )
 
     action_id, action_version = synced_build_shard_index_action
     reference_idx, _feature_idxs = sharded_reference
+
+    # The whole-reference rype_router is built + registered by the PARENT
+    # reference-add ticket (build_routing_index), not the per-shard child this
+    # test drives. finalize-shard now gates `active` on it, so stand in for the
+    # parent by registering the router row up front.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " VALUES ($1, 'rype_router', $2, '{}'::jsonb, NULL)",
+        reference_idx,
+        f"/derived/references/{reference_idx}/rype-router.ryxdi",
+    )
 
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket ("
@@ -225,10 +244,9 @@ async def test_build_shard_index_workflow_end_to_end(
         human_admin_session["principal_idx"],
         reference_idx,
         _SHARD_ID,
-        # rype only — keeps the real build tiny; finalize then expects exactly {rype}.
-        json.dumps(
-            {"build_rype": True, "build_minimap2": False, "build_bowtie2": False}
-        ),
+        # minimap2 only — keeps the real build tiny; finalize then expects exactly
+        # {minimap2} (+ the pre-registered router).
+        json.dumps({"build_minimap2": True, "build_bowtie2": False}),
     )
 
     await run_workflow(
@@ -250,16 +268,20 @@ async def test_build_shard_index_workflow_end_to_end(
     )
     assert state == "completed"
 
-    # register-index wrote exactly one per-shard rype row for shard 0.
+    # register-index wrote the per-shard minimap2 row for shard 0; the router row
+    # was pre-registered (shard_id NULL). No per-shard rype row exists (removed).
     index_rows = await postgres_pool.fetch(
-        "SELECT index_type, shard_id FROM qiita.reference_index WHERE reference_idx = $1",
+        "SELECT index_type, shard_id FROM qiita.reference_index"
+        " WHERE reference_idx = $1 ORDER BY index_type",
         reference_idx,
     )
     assert [(r["index_type"], r["shard_id"]) for r in index_rows] == [
-        ("rype", _SHARD_ID)
+        ("minimap2", _SHARD_ID),
+        ("rype_router", None),
     ]
 
-    # finalize-shard saw rype complete for all N (=1) shards and flipped active.
+    # finalize-shard saw minimap2 complete for all N (=1) shards AND the router
+    # present, and flipped active.
     ref_status = await postgres_pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )

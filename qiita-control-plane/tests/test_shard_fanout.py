@@ -10,8 +10,9 @@ against work_ticket_one_in_flight_per_shard).
 `finalize_shard` (qiita_control_plane.actions.library) is the terminal step of
 each build ticket: it counts registered shards per expected `index_type`
 against the planner's N (derived from reference_membership) and, when every
-expected type is complete, does the guarded `indexing -> active`. A single
-still-missing shard leaves the reference honestly in `indexing`.
+expected type is complete AND the whole-reference `rype_router` row is present,
+does the guarded `indexing -> active`. A single still-missing shard, or a
+missing router, leaves the reference honestly in `indexing`.
 """
 
 import secrets
@@ -93,6 +94,18 @@ async def _register_index_shard(pool, reference_idx, index_type, shard_id):
     )
 
 
+async def _register_router(pool, reference_idx):
+    """Register the whole-reference rype_router row (shard_id NULL) — required
+    for finalize_shard to flip `active` (a sharded reference isn't routable, so
+    not alignable, without it)."""
+    await pool.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " VALUES ($1, 'rype_router', $2, '{}'::jsonb, NULL)",
+        reference_idx,
+        f"/derived/{reference_idx}/rype-router.ryxdi",
+    )
+
+
 async def _status(pool, reference_idx):
     return await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -127,7 +140,7 @@ async def test_plan_and_submit_shards_fans_out_n_tickets(postgres_pool, monkeypa
             originator_principal_idx=sc["principal_idx"],
             build_action_id=sc["action_id"],
             build_action_version=sc["version"],
-            action_context={"build_rype": True},
+            action_context={"build_minimap2": True},
             dispatch_cb=dispatched.append,
         )
 
@@ -173,7 +186,7 @@ async def test_plan_and_submit_shards_zero_is_noop(postgres_pool, monkeypatch):
             originator_principal_idx=sc["principal_idx"],
             build_action_id=sc["action_id"],
             build_action_version=sc["version"],
-            action_context={"build_rype": True},
+            action_context={"build_minimap2": True},
             dispatch_cb=dispatched.append,
         )
 
@@ -218,7 +231,7 @@ async def test_plan_and_submit_shards_idempotent_redrive(postgres_pool, monkeypa
             originator_principal_idx=sc["principal_idx"],
             build_action_id=sc["action_id"],
             build_action_version=sc["version"],
-            action_context={"build_rype": True},
+            action_context={"build_minimap2": True},
         )
         await shard_orchestration.plan_and_submit_shards(
             postgres_pool, ref, dispatch_cb=dispatched.append, **kwargs
@@ -245,32 +258,61 @@ async def test_plan_and_submit_shards_idempotent_redrive(postgres_pool, monkeypa
 # ---------------------------------------------------------------------------
 
 
-async def test_finalize_shard_activates_when_all_types_complete(postgres_pool):
+async def test_finalize_shard_activates_when_all_types_and_router_complete(postgres_pool):
     sc = await _scaffold(postgres_pool, status="indexing")
     ref = sc["reference_idx"]
     try:
         await _seed_shard_membership(postgres_pool, ref, 3)
         for shard_id in range(3):
-            await _register_index_shard(postgres_pool, ref, "rype", shard_id)
             await _register_index_shard(postgres_pool, ref, "minimap2", shard_id)
-        result = await finalize_shard(postgres_pool, ref, ["rype", "minimap2"])
+            await _register_index_shard(postgres_pool, ref, "bowtie2", shard_id)
+        await _register_router(postgres_pool, ref)
+        result = await finalize_shard(postgres_pool, ref, ["minimap2", "bowtie2"])
+        assert result["router_present"] is True
         assert result["activated"] is True
         assert await _status(postgres_pool, ref) == "active"
     finally:
         await _cleanup(postgres_pool, ref)
 
 
-async def test_finalize_shard_leaves_indexing_when_missing(postgres_pool):
+async def test_finalize_shard_leaves_indexing_without_router(postgres_pool):
+    """All per-shard indexes present but the whole-reference rype_router is not
+    yet registered — fail-closed: stays `indexing` (a router-less sharded
+    reference can't route reads, so it isn't alignable)."""
     sc = await _scaffold(postgres_pool, status="indexing")
     ref = sc["reference_idx"]
     try:
         await _seed_shard_membership(postgres_pool, ref, 3)
         for shard_id in range(3):
-            await _register_index_shard(postgres_pool, ref, "rype", shard_id)
-        # minimap2 missing shard 2.
-        await _register_index_shard(postgres_pool, ref, "minimap2", 0)
-        await _register_index_shard(postgres_pool, ref, "minimap2", 1)
-        result = await finalize_shard(postgres_pool, ref, ["rype", "minimap2"])
+            await _register_index_shard(postgres_pool, ref, "minimap2", shard_id)
+            await _register_index_shard(postgres_pool, ref, "bowtie2", shard_id)
+        # No router row yet.
+        result = await finalize_shard(postgres_pool, ref, ["minimap2", "bowtie2"])
+        assert result["router_present"] is False
+        assert result["activated"] is False
+        assert await _status(postgres_pool, ref) == "indexing"
+        # Registering the router now flips it active (the parent's finalize).
+        await _register_router(postgres_pool, ref)
+        result = await finalize_shard(postgres_pool, ref, ["minimap2", "bowtie2"])
+        assert result["router_present"] is True
+        assert result["activated"] is True
+        assert await _status(postgres_pool, ref) == "active"
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+async def test_finalize_shard_leaves_indexing_when_shard_missing(postgres_pool):
+    sc = await _scaffold(postgres_pool, status="indexing")
+    ref = sc["reference_idx"]
+    try:
+        await _seed_shard_membership(postgres_pool, ref, 3)
+        for shard_id in range(3):
+            await _register_index_shard(postgres_pool, ref, "minimap2", shard_id)
+        # bowtie2 missing shard 2; router present.
+        await _register_index_shard(postgres_pool, ref, "bowtie2", 0)
+        await _register_index_shard(postgres_pool, ref, "bowtie2", 1)
+        await _register_router(postgres_pool, ref)
+        result = await finalize_shard(postgres_pool, ref, ["minimap2", "bowtie2"])
         assert result["activated"] is False
         assert await _status(postgres_pool, ref) == "indexing"
     finally:
@@ -279,11 +321,13 @@ async def test_finalize_shard_leaves_indexing_when_missing(postgres_pool):
 
 async def test_finalize_shard_empty_expected_types_never_activates(postgres_pool):
     """Fail-closed guard: an empty expected-type set must NOT vacuously flip
-    `active` (all([]) is True) — the reference stays `indexing`."""
+    `active` (all([]) is True) — the reference stays `indexing`, even with a
+    router present."""
     sc = await _scaffold(postgres_pool, status="indexing")
     ref = sc["reference_idx"]
     try:
         await _seed_shard_membership(postgres_pool, ref, 3)
+        await _register_router(postgres_pool, ref)
         result = await finalize_shard(postgres_pool, ref, [])
         assert result["activated"] is False
         assert await _status(postgres_pool, ref) == "indexing"
@@ -299,13 +343,14 @@ async def test_finalize_shard_idempotent_when_already_active(postgres_pool):
     try:
         await _seed_shard_membership(postgres_pool, ref, 2)
         for shard_id in range(2):
-            await _register_index_shard(postgres_pool, ref, "rype", shard_id)
-        first = await finalize_shard(postgres_pool, ref, ["rype"])
+            await _register_index_shard(postgres_pool, ref, "minimap2", shard_id)
+        await _register_router(postgres_pool, ref)
+        first = await finalize_shard(postgres_pool, ref, ["minimap2"])
         assert first["activated"] is True
         assert await _status(postgres_pool, ref) == "active"
         # Second observer: all still complete, but the reference is already
         # active — no error, reported as an idempotent success.
-        second = await finalize_shard(postgres_pool, ref, ["rype"])
+        second = await finalize_shard(postgres_pool, ref, ["minimap2"])
         assert second["activated"] is True
         assert await _status(postgres_pool, ref) == "active"
     finally:

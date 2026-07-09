@@ -30,7 +30,6 @@ from typing import Any
 import asyncpg
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
-    HOST_FILTER_INDEX_TYPE_RYPE,
     INDEX_TYPE_BOWTIE2,
     ReferenceStatus,
 )
@@ -47,9 +46,10 @@ BUILD_SHARD_INDEX_ACTION_VERSION = "1.0.0"
 # action_context build-gate flag -> the reference_index.index_type it produces.
 # finalize_shard counts registered shards per expected type; the fan-out copies
 # these flags (+ knobs) into each shard ticket's context. Ordered so the gate
-# subset is stable.
+# subset is stable. Per-shard rype is no longer built (C2): routing is served by
+# the ONE whole-reference `rype_router` the parent reference-add builds, so the
+# per-shard analysis indexes are minimap2 + bowtie2 only.
 SHARD_BUILD_INDEX_TYPES: dict[str, str] = {
-    "build_rype": HOST_FILTER_INDEX_TYPE_RYPE,
     "build_minimap2": HOST_FILTER_INDEX_TYPE_MINIMAP2,
     "build_bowtie2": INDEX_TYPE_BOWTIE2,
 }
@@ -58,10 +58,8 @@ SHARD_BUILD_INDEX_TYPES: dict[str, str] = {
 # each shard build ticket (the build gates + their scalar knobs). The child
 # build-shard-index workflow's context_schema is exactly these.
 SHARD_BUILD_CONTEXT_KEYS: tuple[str, ...] = (
-    "build_rype",
     "build_minimap2",
     "build_bowtie2",
-    "rype_w",
     "minimap2_preset",
 )
 
