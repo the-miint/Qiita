@@ -20,12 +20,17 @@ the `no-changelog` label).
   shard(s) it minimises into. `build_routing_index` builds a whole-reference
   MULTI-bucket rype router (`references/{idx}/rype-router.ryxdi`, one bucket per
   shard) that one `rype_classify` pass turns into a `read_to_shard` table.
-  `align_sharded` (aligner `minimap2`|`bowtie2`) streams that routing, calls
-  `align_{minimap2,bowtie2}_sharded` per routed shard, maps the aligner's
-  `reference` subject id to `feature_idx`, and emits a sorted `alignment.parquet`
-  — SE and PE reads aligned as separate uniform sub-batches (bowtie2 rejects a
-  mixed batch), NO dedup (cross-shard rows carry distinct `feature_idx`; a PE
-  read emits one row per mate). The `derived_store` per-shard aligner layout was
+  `align_sharded` (aligner `minimap2`|`bowtie2`) streams that routing, makes a
+  SINGLE `align_{minimap2,bowtie2}_sharded` call over the whole read block
+  (modelled on `host_filter` — no SE/PE split; a read set is uniformly SE or PE
+  by construction and the aligners handle the mode natively), passes the aligner's
+  FULL output through verbatim, and adds only `prep_sample_idx`, `feature_idx`
+  (`CAST(reference)`), and `mate_feature_idx` (`CAST(mate_reference)`), emitting a
+  sorted `alignment.parquet`. NO dedup — `(sequence_idx, feature_idx)` is not a
+  key: a read routed to K shards yields K distinct-`feature_idx` rows, and a PE
+  read's two mate rows are ONE read's alignment to a feature (the pairing explicit
+  in `flags` + the mate columns), not two independent alignments. The
+  `derived_store` per-shard aligner layout was
   revised to the exact `shard_directory` shape miint expects
   (`minimap2-shards/{shard_id}.mmi`, `bowtie2-shards/{shard_id}/index*`), and the
   `align_{minimap2,bowtie2}_sharded` + multi-bucket `rype_classify` contract is
@@ -158,6 +163,15 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **`plan-shards` is now genuinely opt-in (B5).** The `when: shard_index` gate
+  defaults ON for an absent key (correct for the `build_*` gates, which default to
+  building all index types), so `plan-shards` ran on a plain `reference-add` that
+  never set `shard_index` — fanning out (or, in production with a dispatch
+  callback, even sharding a genome-bearing reference nobody asked to shard). The
+  runner's `plan-shards` arm now self-defends — no-op when `bound.get("shard_index")`
+  is falsy, mirroring the finalize `_is_sharded_fanout_in_progress` check — before
+  the fan-out precondition (`dispatch_cb`) is required. `when: shard_index` is kept
+  as the explicit-opt-out gate. Fixes the two reference-add smokes. (#reference-support)
 - **Data plane: ambiguous `feature_idx` under the reference-membership JOIN.**
   `build_query` qualified only `reference_idx` (with the membership alias `m.`)
   when a `reference_sequences` / `reference_sequence_chunks` filter triggered the

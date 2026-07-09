@@ -3,17 +3,20 @@
 The real miint seams — `rype_classify` (read_to_shard build) and
 `align_{minimap2,bowtie2}_sharded` — need the extension, real sequence bytes, and
 per-shard indexes, so they are exercised by the integration smoke
-(`tests/integration/test_sharded_alignment.py`). Here both seams are stubbed with
-QUERY-AWARE fakes (they read the sub-batch's query so the SE/PE split is honoured)
-and we assert the orchestration around them:
+(`tests/integration/test_sharded_alignment.py`). Here both seams are stubbed and we
+assert the orchestration around them:
 
-  - the query is `(read_id = sequence_idx, sequence1[, sequence2])`, split into a
-    single-end sub-batch (no `sequence2`) and a paired-end sub-batch (with it);
-  - `read_to_shard` is rebuilt per sub-batch and handed to align;
-  - the aligner is dispatched by `Inputs.aligner` (minimap2 carries a preset,
-    bowtie2 does not);
-  - the sorted `alignment.parquet` stamps `prep_sample_idx` PER ROW from the reads
-    and emits every alignment with NO cross-shard dedup;
+  - the query is the WHOLE read set as `(read_id = sequence_idx, sequence1,
+    sequence2)` — ONE query, no SE/PE split (a read set is uniformly SE or PE by
+    construction; the tools handle the mode natively);
+  - a SINGLE align call runs (the aligner is dispatched by `Inputs.aligner` —
+    minimap2 carries a preset, bowtie2 does not);
+  - the aligner's FULL output is passed through VERBATIM (nothing dropped — the
+    mate columns survive), with only `prep_sample_idx` (stamped PER ROW from the
+    reads) and `feature_idx` (`CAST(reference)`) added;
+  - a paired-end read's two mate rows both survive AND keep their mate columns, so
+    the pairing is explicit (not two unrelated rows);
+  - cross-shard multiplicity emits one distinct-feature row per shard (no dedup);
   - an empty alignment set is VALID (no fail-fast);
   - a failed align leaves no partial output.
 """
@@ -25,6 +28,23 @@ from pathlib import Path
 
 import duckdb
 import pytest
+
+# The columns the stubbed align seam materialises, mimicking the real
+# align_*_sharded output (a representative subset of the full SAM columns — enough
+# to prove the mate columns pass through verbatim). `reference`/`mate_reference` are
+# VARCHAR subject ids (our feature_idx), matching the real function.
+_ALIGN_COLS = (
+    "read_id",
+    "flags",
+    "reference",
+    "position",
+    "stop_position",
+    "mapq",
+    "cigar",
+    "mate_reference",
+    "mate_position",
+    "template_length",
+)
 
 
 def _write_reads_parquet(path: Path, rows: list[tuple[int, int, str, str | None]]) -> Path:
@@ -73,9 +93,12 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
     """Install QUERY-AWARE stubs for the read_to_shard build + both align seams.
 
     `routing`: {read_id: [shard_name, ...]} — the read_to_shard build inserts a row
-    per (read in THIS sub-batch's query, shard_name). `alignments`: {read_id:
-    [(feature_idx, flags, position, stop_position, mapq, cigar), ...]} — the align
-    seam inserts those rows for each read present in the sub-batch's query. `calls`
+    per (read in the query, shard_name). `alignments`: {read_id: [align_row, ...]}
+    where an `align_row` is the tuple `(flags, reference, position, stop_position,
+    mapq, cigar, mate_reference, mate_position, template_length)` the align seam
+    emits for each read present in the query (one row per mate for a PE read). The
+    seam CTAS's a full-schema raw table + inserts those rows, mirroring the real
+    align_*_sharded (whose FULL output execute() passes through verbatim). `calls`
     (optional list) records each align call's (aligner, query_columns, preset);
     `captured` (optional dict) records the routing `threshold`."""
 
@@ -91,13 +114,23 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
                 )
 
     def _do_align(conn, query_table, dest_table, *, aligner, preset):
-        cols = [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
         if calls is not None:
+            cols = [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
             calls.append({"aligner": aligner, "cols": cols, "preset": preset})
+        # CTAS the raw alignments table with the full align schema (verbatim), so
+        # execute()'s `a.* EXCLUDE (read_id)` passes every column through.
+        conn.execute(
+            f"CREATE TABLE {dest_table} ("
+            "read_id BIGINT, flags INTEGER, reference VARCHAR, position BIGINT, "
+            "stop_position BIGINT, mapq INTEGER, cigar VARCHAR, "
+            "mate_reference VARCHAR, mate_position BIGINT, template_length BIGINT)"
+        )
         read_ids = [r[0] for r in conn.execute(f"SELECT read_id FROM {query_table}").fetchall()]
         for rid in read_ids:
             for row in alignments.get(rid, []):
-                conn.execute(f"INSERT INTO {dest_table} VALUES (?, ?, ?, ?, ?, ?, ?)", [rid, *row])
+                conn.execute(
+                    f"INSERT INTO {dest_table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [rid, *row]
+                )
 
     def fake_mm2(conn, query_table, shard_directory, read_to_shard_table, dest_table, *, preset):
         _do_align(conn, query_table, dest_table, aligner="minimap2", preset=preset)
@@ -111,25 +144,38 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
 
 
 def _read_alignment(path: Path):
+    """Return (columns, rows) of alignment.parquet. Rows project the columns the
+    tests assert on, in a stable order; the parquet itself carries the full set."""
     with duckdb.connect(":memory:") as conn:
         cols = [
             d[0] for d in conn.execute(f"SELECT * FROM read_parquet('{path}') LIMIT 0").description
         ]
         rows = conn.execute(
-            f"SELECT prep_sample_idx, sequence_idx, feature_idx, flags, position, "
-            f"stop_position, mapq, cigar FROM read_parquet('{path}') "
+            "SELECT prep_sample_idx, sequence_idx, feature_idx, mate_feature_idx, "
+            "flags, reference, position, stop_position, mapq, cigar, mate_reference, "
+            f"mate_position, template_length FROM read_parquet('{path}') "
             "ORDER BY prep_sample_idx, sequence_idx, feature_idx, position, flags"
         ).fetchall()
     return cols, rows
 
 
-def test_align_sharded_orchestration_minimap2(tmp_path, monkeypatch):
+# An align row for a simple single-end primary hit to `feature`: no mate (mate_*
+# NULL, template_length 0). `(flags, reference, position, stop_position, mapq,
+# cigar, mate_reference, mate_position, template_length)`.
+def _se_hit(feature, *, flags=0, position=1, stop=41, mapq=60, cigar="40M"):
+    return (flags, str(feature), position, stop, mapq, cigar, None, None, 0)
+
+
+def test_align_sharded_single_call_and_full_passthrough_minimap2(tmp_path, monkeypatch):
+    """A uniformly-SE block runs ONE minimap2 call over the whole set (no split),
+    and the output carries the FULL align columns + prep_sample_idx + feature_idx,
+    with prep_sample_idx stamped per row and NOTHING dropped."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    # read 1 SE, read 2 PE (routes nowhere), read 3 SE. prep_sample per row.
+    # reads 1 & 3 align (distinct prep_samples), read 2 routes nowhere.
     reads = _write_reads_parquet(
         tmp_path / "reads.parquet",
-        [(10, 1, "ACGT", None), (10, 2, "TTGG", "CCAA"), (20, 3, "GGCC", None)],
+        [(10, 1, "ACGT", None), (10, 2, "TTGG", None), (20, 3, "GGCC", None)],
     )
     router, shard_dir = _make_indexes(tmp_path)
 
@@ -139,7 +185,10 @@ def test_align_sharded_orchestration_minimap2(tmp_path, monkeypatch):
         align_sharded,
         monkeypatch,
         routing={1: ["0"], 3: ["1"]},
-        alignments={1: [(100, 0, 5, 45, 60, "40M")], 3: [(200, 0, 12, 52, 60, "40M")]},
+        alignments={
+            1: [_se_hit(100, position=5, stop=45)],
+            3: [_se_hit(200, position=12, stop=52)],
+        },
         calls=calls,
         captured=captured,
     )
@@ -154,34 +203,43 @@ def test_align_sharded_orchestration_minimap2(tmp_path, monkeypatch):
     )
     out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    # Both sub-batches ran the minimap2 seam: SE query (no sequence2), PE query (with).
-    assert [c["aligner"] for c in calls] == ["minimap2", "minimap2"]
-    assert [c["preset"] for c in calls] == ["sr", "sr"]
-    assert calls[0]["cols"] == ["read_id", "sequence1"]  # SE sub-batch
-    assert calls[1]["cols"] == ["read_id", "sequence1", "sequence2"]  # PE sub-batch
-    # The documented routing threshold is what actually reaches rype_classify.
+    # Exactly ONE align call over the WHOLE set (no SE/PE split), carrying the
+    # full query columns; the documented preset + routing threshold reach miint.
+    assert [c["aligner"] for c in calls] == ["minimap2"]
+    assert calls[0]["preset"] == "sr"
+    assert calls[0]["cols"] == ["read_id", "sequence1", "sequence2"]
     assert captured["threshold"] == align_sharded._ROUTING_THRESHOLD
 
     cols, rows = _read_alignment(Path(out["alignment"]))
+    # Full aligner output preserved + the three added identity columns; read_id was
+    # renamed to sequence_idx (same value), nothing dropped. Both the raw VARCHAR
+    # reference/mate_reference AND the typed feature_idx/mate_feature_idx are present.
     assert cols == [
         "prep_sample_idx",
         "sequence_idx",
         "feature_idx",
+        "mate_feature_idx",
         "flags",
+        "reference",
         "position",
         "stop_position",
         "mapq",
         "cigar",
+        "mate_reference",
+        "mate_position",
+        "template_length",
     ]
-    # prep_sample_idx stamped PER ROW from the reads (read 1 -> 10, read 3 -> 20).
+    # prep_sample_idx stamped PER ROW (read 1 -> 10, read 3 -> 20); feature_idx is
+    # CAST(reference); mate columns (incl. mate_feature_idx) are NULL for these SE hits.
     assert rows == [
-        (10, 1, 100, 0, 5, 45, 60, "40M"),
-        (20, 3, 200, 0, 12, 52, 60, "40M"),
+        (10, 1, 100, None, 0, "100", 5, 45, 60, "40M", None, None, 0),
+        (20, 3, 200, None, 0, "200", 12, 52, 60, "40M", None, None, 0),
     ]
 
 
 def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
-    """aligner='bowtie2' routes to the bowtie2 seam (no preset), never minimap2."""
+    """aligner='bowtie2' routes to the bowtie2 seam (no preset), never minimap2,
+    in a single call."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
@@ -192,7 +250,7 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
         align_sharded,
         monkeypatch,
         routing={1: ["0"]},
-        alignments={1: [(100, 0, 1, 41, 60, "40M")]},
+        alignments={1: [_se_hit(100)]},
         calls=calls,
     )
 
@@ -205,16 +263,15 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
         work_ticket_idx=1,
     )
     out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
-    # Only the SE sub-batch has reads → one bowtie2 call, no preset.
     assert [c["aligner"] for c in calls] == ["bowtie2"]
     assert calls[0]["preset"] is None
     _cols, rows = _read_alignment(Path(out["alignment"]))
-    assert rows == [(10, 1, 100, 0, 1, 41, 60, "40M")]
+    assert rows == [(10, 1, 100, None, 0, "100", 1, 41, 60, "40M", None, None, 0)]
 
 
-def test_align_sharded_multiplicity_no_dedup(tmp_path, monkeypatch):
+def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
     """A read routed to two shards aligns to a DISTINCT feature per shard and emits
-    BOTH rows — no cross-shard dedup (feature unique per shard)."""
+    BOTH rows — no cross-shard dedup (a feature is in exactly one shard)."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 7, "ACGTTTGG", None)])
@@ -223,7 +280,7 @@ def test_align_sharded_multiplicity_no_dedup(tmp_path, monkeypatch):
         align_sharded,
         monkeypatch,
         routing={7: ["0", "1"]},  # routes to BOTH shards
-        alignments={7: [(100, 0, 1, 41, 60, "40M"), (200, 0, 3, 43, 60, "40M")]},
+        alignments={7: [_se_hit(100, position=1, stop=41), _se_hit(200, position=3, stop=43)]},
     )
 
     inputs = align_sharded.Inputs(
@@ -237,28 +294,39 @@ def test_align_sharded_multiplicity_no_dedup(tmp_path, monkeypatch):
     out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
     _cols, rows = _read_alignment(Path(out["alignment"]))
     assert rows == [
-        (10, 7, 100, 0, 1, 41, 60, "40M"),
-        (10, 7, 200, 0, 3, 43, 60, "40M"),
+        (10, 7, 100, None, 0, "100", 1, 41, 60, "40M", None, None, 0),
+        (10, 7, 200, None, 0, "200", 3, 43, 60, "40M", None, None, 0),
     ]
 
 
-def test_align_sharded_pe_mate_rows_both_survive(tmp_path, monkeypatch):
+def test_align_sharded_pe_pair_keeps_mate_columns(tmp_path, monkeypatch):
     """A paired-end read aligning within ONE shard emits one SAM row per mate —
-    two rows sharing (sequence_idx, feature_idx) but differing in flags/position.
-    BOTH must survive (no dedup): `(sequence_idx, feature_idx)` is not a key. This
-    pins the per-mate multiplicity source at the unit level (the integration smoke
-    verifies it against real miint)."""
+    two rows sharing (sequence_idx, feature_idx). BOTH survive AND keep their mate
+    columns (mate_reference / mate_position / template_length) so the pairing is
+    EXPLICIT — they are one read's alignment to a feature, not two unrelated rows.
+    Also pins the `mate_feature_idx` cast across BOTH SAM RNEXT encodings of a mate
+    on the same feature: `'='` and the numeric id. This pins the correct PE
+    representation at the unit level (the integration smoke verifies it against
+    real miint)."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 5, "ACGTACGT", "TTGGCCAA")])
     router, shard_dir = _make_indexes(tmp_path)
-    # One PE read routed to a single shard; the align seam emits two mate rows,
-    # same feature 100, distinct flags/position (mimicking R1 fwd + R2 rev).
+    # One PE read routed to a single shard; the align seam emits two mate rows to
+    # the same feature 100 with a signed template_length (+/- the insert size),
+    # mimicking an fr pair (R1 fwd flags 99, R2 rev flags 147). mate_reference is
+    # given as '=' on R1 and the numeric id "100" on R2 so both cast branches
+    # resolve to mate_feature_idx 100.
     _install_stubs(
         align_sharded,
         monkeypatch,
         routing={5: ["0"]},
-        alignments={5: [(100, 97, 1, 151, 60, "150M"), (100, 145, 151, 301, 60, "150M")]},
+        alignments={
+            5: [
+                (99, "100", 1, 151, 60, "150M", "=", 151, 300),
+                (147, "100", 151, 301, 60, "150M", "100", 1, -300),
+            ]
+        },
     )
 
     inputs = align_sharded.Inputs(
@@ -271,56 +339,19 @@ def test_align_sharded_pe_mate_rows_both_survive(tmp_path, monkeypatch):
     )
     out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
     _cols, rows = _read_alignment(Path(out["alignment"]))
-    # Both mate rows kept, ordered by position (mate1 at 1, mate2 at 151).
+    # Both mate rows kept (ordered by position), each carrying its mate columns so
+    # the pair is explicit — the raw mate_reference ('='/'100'), a mate_position, a
+    # signed template_length, AND the decoded mate_feature_idx (100 either way).
+    # NOT collapsed, NOT stripped to two anonymous rows.
     assert rows == [
-        (10, 5, 100, 97, 1, 151, 60, "150M"),
-        (10, 5, 100, 145, 151, 301, 60, "150M"),
-    ]
-
-
-def test_align_sharded_se_pe_split_isolates_batches(tmp_path, monkeypatch):
-    """A mixed SE/PE block runs the aligner on two uniform sub-batches: the SE
-    query omits sequence2, the PE query carries it, and each read aligns in exactly
-    one sub-batch (no double-counting)."""
-    from qiita_compute_orchestrator.jobs import align_sharded
-
-    reads = _write_reads_parquet(
-        tmp_path / "reads.parquet",
-        [(10, 1, "ACGT", None), (10, 2, "TTGG", "CCAA")],  # 1 SE, 2 PE
-    )
-    router, shard_dir = _make_indexes(tmp_path)
-    calls: list = []
-    _install_stubs(
-        align_sharded,
-        monkeypatch,
-        routing={1: ["0"], 2: ["1"]},
-        alignments={1: [(100, 0, 1, 41, 60, "40M")], 2: [(200, 0, 2, 42, 60, "40M")]},
-        calls=calls,
-    )
-
-    inputs = align_sharded.Inputs(
-        reads=reads,
-        reference_idx=42,
-        aligner="bowtie2",
-        router_index_path=router,
-        shard_directory=shard_dir,
-        work_ticket_idx=1,
-    )
-    out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
-    # SE sub-batch first (no sequence2), then PE (with sequence2).
-    assert calls[0]["cols"] == ["read_id", "sequence1"]
-    assert calls[1]["cols"] == ["read_id", "sequence1", "sequence2"]
-    _cols, rows = _read_alignment(Path(out["alignment"]))
-    # Each read aligned once, in its own sub-batch.
-    assert rows == [
-        (10, 1, 100, 0, 1, 41, 60, "40M"),
-        (10, 2, 200, 0, 2, 42, 60, "40M"),
+        (10, 5, 100, 100, 99, "100", 1, 151, 60, "150M", "=", 151, 300),
+        (10, 5, 100, 100, 147, "100", 151, 301, 60, "150M", "100", 1, -300),
     ]
 
 
 def test_align_sharded_empty_alignment_is_valid(tmp_path, monkeypatch):
     """A block whose reads align nowhere yields an EMPTY alignment.parquet — valid,
-    not a fail-fast."""
+    not a fail-fast — while keeping the full column schema."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
@@ -338,8 +369,11 @@ def test_align_sharded_empty_alignment_is_valid(tmp_path, monkeypatch):
     out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
     alignment = Path(out["alignment"])
     assert alignment.exists()
-    _cols, rows = _read_alignment(alignment)
+    cols, rows = _read_alignment(alignment)
     assert rows == []
+    # The schema is intact even when empty (full aligner columns + the three added).
+    assert cols[:4] == ["prep_sample_idx", "sequence_idx", "feature_idx", "mate_feature_idx"]
+    assert "mate_reference" in cols and "template_length" in cols
 
 
 def test_align_sharded_partial_output_removed_on_failure(tmp_path, monkeypatch):

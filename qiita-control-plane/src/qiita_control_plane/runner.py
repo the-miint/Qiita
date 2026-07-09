@@ -3990,6 +3990,18 @@ async def _run_action_primitive(
         # the taxonomy DoGet + PG export are internal. The build gates/knobs the
         # shard tickets carry are copied from THIS ticket's action_context
         # (present in `bound`); the originator is inherited from this ticket.
+        #
+        # Sharding is OPT-IN. The step self-defends on `shard_index` and no-ops
+        # when it is absent/falsy — mirroring the finalize check in
+        # `_is_sharded_fanout_in_progress` (which reads the same `bound` key), so a
+        # plain reference-add never fans out (and, absent this guard, would even
+        # shard a genome-bearing reference nobody asked to shard). The YAML's
+        # `when: shard_index` gate ALSO skips an explicit `shard_index: false`
+        # opt-out before we get here; this guard covers the absent-key default,
+        # which the gate treats as ON (its absent⇒ON default is correct for the
+        # build_* gates but not for this opt-in flag).
+        if not bound.get("shard_index"):
+            return {}
         if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
             raise RuntimeError(
                 f"plan-shards requires a reference-scoped ticket; got {scope_target['kind']!r}"

@@ -1721,6 +1721,42 @@ async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference
         )
 
 
+async def test_run_action_primitive_plan_shards_is_opt_in(postgres_pool, tmp_path):
+    """plan-shards is OPT-IN: the arm no-ops (returns {}) when `shard_index` is
+    absent or falsy in `bound`, so a plain reference-add never fans out — this is
+    the guard that keeps a genome-bearing reference nobody asked to shard from
+    being sharded, and it fires BEFORE the dispatch_cb requirement, so a no-op
+    needs no dispatch_cb. When `shard_index` IS set the dispatch_cb requirement
+    still bites (fanning out with no dispatch mechanism would strand tickets)."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="plan-shards", inputs=[], outputs=[])
+    ref_scope = {"kind": "reference", "reference_idx": 1}
+
+    async def _call(bound, *, dispatch_cb):
+        return await _run_action_primitive(
+            postgres_pool,
+            entry,
+            bound,
+            tmp_path,
+            ref_scope,
+            work_ticket_idx=1,
+            hmac_secret=b"unused",
+            data_plane_url="grpc://unused:50051",
+            dispatch_cb=dispatch_cb,
+        )
+
+    # Absent key => no-op, even without a dispatch_cb (the failing-smoke case).
+    assert await _call({}, dispatch_cb=None) == {}
+    # Explicit false => no-op too.
+    assert await _call({"shard_index": False}, dispatch_cb=None) == {}
+    # Opt-in true + no dispatch_cb => the fan-out precondition still fails loud.
+    with pytest.raises(RuntimeError, match="requires a dispatch_cb"):
+        await _call({"shard_index": True}, dispatch_cb=None)
+
+
 # =============================================================================
 # Block-scope wiring (bulk-block read-mask): scope target + reconcile-block arm
 # =============================================================================

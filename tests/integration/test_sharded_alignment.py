@@ -4,17 +4,26 @@ Builds, over a tiny 2-shard reference and the LIVE data plane, everything C1
 produces — the whole-reference rype ROUTER (`build_routing_index`) and the
 per-shard minimap2 + bowtie2 indexes (`build_{minimap2,bowtie2}_index` in shard
 mode, the revised `derived_store` layout) — then drives `align_sharded` over
-crafted reads and asserts the routing + alignment behaviour end to end:
+crafted reads and asserts the routing + alignment behaviour end to end.
 
+A read set is uniformly single-end OR paired-end by construction, so the two modes
+are exercised as SEPARATE, uniform batches (never mixed — a mix is invalid input
+that bowtie2 rejects at bind):
+
+  SINGLE-END batch:
   - a read drawn from a feature's DISTINCT region aligns to that feature (its
     shard) and no other;
   - a read from a region SHARED by a feature in each shard routes to BOTH shards
     and emits TWO rows with DISTINCT feature_idx — cross-shard multiplicity, no
     dedup (a shared region so it aligns end-to-end for bowtie2 too, not just the
     soft-clipping minimap2);
-  - a non-matching read emits nothing;
-  - a paired-end read emits one row PER MATE (two rows, same feature_idx) — the
-    per-mate multiplicity, pinned as an exact count.
+  - a non-matching read emits nothing.
+
+  PAIRED-END batch:
+  - a proper pair whose mates both fall in one feature aligns as ONE read: two
+    mate rows to the SAME feature, carrying their mate columns (mate_feature_idx,
+    template_length, mate_reference) so the pairing is EXPLICIT — not two unrelated
+    single-end rows. Pinned as an exact per-feature count PLUS a mate-column check.
 
 Parametrized over both aligners (minimap2, bowtie2). The index BUILDS stream
 reference chunks from the DP, so their `open_reference_chunk_stream` is
@@ -214,6 +223,19 @@ def _features_by_read(alignment_path):
     return by_read, prep_of
 
 
+def _mate_rows(alignment_path, sequence_idx):
+    """Rows for one read as (feature_idx, mate_feature_idx, mate_reference,
+    template_length), ordered by position — the mate columns that must survive so a
+    PE pair's rows are an explicit pair, not two unrelated single-end rows."""
+    with duckdb.connect(":memory:") as conn:
+        return conn.execute(
+            "SELECT feature_idx, mate_feature_idx, mate_reference, template_length "
+            f"FROM read_parquet('{alignment_path}') WHERE sequence_idx = ? "
+            "ORDER BY position, flags",
+            [sequence_idx],
+        ).fetchall()
+
+
 @pytest.mark.parametrize(
     "aligner, module, shard_dir_fn",
     [
@@ -230,32 +252,36 @@ def test_sharded_alignment_end_to_end(
         aligner, module, shard_dir_fn, data_plane, derived_root, tmp_path, monkeypatch
     )
 
-    # Crafted reads. 1 = feature-100-distinct (shard 0), 2 = feature-200-distinct
-    # (shard 1), 3 = SHARED region (routes to BOTH shards -> two distinct-feature
-    # rows, the multiplicity/no-dedup case), 4 = non-matching (routes nowhere),
-    # 5 = PE both mates in feature 100's distinct region (proper fr pair: mate2 is
-    # the reverse-complement of a downstream segment). prep_sample 10 for 1-4, 20 for 5.
-    reads = _write_reads(
-        tmp_path / f"reads_{aligner}.parquet",
+    def _align(reads_path):
+        inputs = align_sharded.Inputs(
+            reads=reads_path,
+            reference_idx=_REF_IDX,
+            aligner=aligner,
+            router_index_path=router_dir,
+            shard_directory=shard_directory,
+            work_ticket_idx=1,
+        )
+        return Path(
+            asyncio.run(
+                align_sharded.execute(inputs, tmp_path / f"ws_align_{aligner}")
+            )["alignment"]
+        )
+
+    # ---- SINGLE-END batch (uniform: every sequence2 is NULL) --------------------
+    # 1 = feature-100-distinct (shard 0), 2 = feature-200-distinct (shard 1),
+    # 3 = SHARED region (routes to BOTH shards -> two distinct-feature rows, the
+    # multiplicity/no-dedup case), 4 = non-matching (routes nowhere). prep_sample 10.
+    se_reads = _write_reads(
+        tmp_path / f"reads_se_{aligner}.parquet",
         [
             (10, 1, _DISTINCT_A[:240], None),
             (10, 2, _DISTINCT_B[:240], None),
             (10, 3, _SHARED[:240], None),
             (10, 4, "TTTTTTGGGGGGCCCCCCAAAAAA" * 10, None),
-            (20, 5, _A[:150], _revcomp(_A[300:450])),
         ],
     )
-
-    inputs = align_sharded.Inputs(
-        reads=reads,
-        reference_idx=_REF_IDX,
-        aligner=aligner,
-        router_index_path=router_dir,
-        shard_directory=shard_directory,
-        work_ticket_idx=1,
-    )
-    out = asyncio.run(align_sharded.execute(inputs, tmp_path / f"ws_align_{aligner}"))
-    by_read, prep_of = _features_by_read(Path(out["alignment"]))
+    se_out = _align(se_reads)
+    by_read, prep_of = _features_by_read(se_out)
 
     # Each single-feature read aligns to exactly its feature.
     assert by_read.get(1) == [100], f"read 1 -> {by_read.get(1)}"
@@ -264,11 +290,33 @@ def test_sharded_alignment_end_to_end(
     assert by_read.get(3) == [100, 200], f"chimera -> {by_read.get(3)}"
     # Non-matching read emits nothing.
     assert 4 not in by_read, f"non-matching read aligned: {by_read.get(4)}"
-    # PE read: one SAM row PER MATE, both to feature 100 (per-mate multiplicity —
-    # two rows sharing (sequence_idx, feature_idx), NOT collapsed). Pinned as an
-    # exact count, not a set, so a change in mate-row emission is caught.
-    assert by_read.get(5) == [100, 100], f"PE read 5 -> {by_read.get(5)}"
-
-    # prep_sample_idx is stamped per row from the reads (reads 1-3 -> 10, read 5 -> 20).
+    # prep_sample_idx is stamped per row from the reads.
     assert prep_of.get(1) == {10}
-    assert prep_of.get(5) == {20}
+
+    # ---- PAIRED-END batch (uniform: every sequence2 is non-NULL) ----------------
+    # 5 = a proper fr pair, both mates in feature 100's distinct region (mate2 is
+    # the reverse-complement of a downstream segment). prep_sample 20.
+    pe_reads = _write_reads(
+        tmp_path / f"reads_pe_{aligner}.parquet",
+        [(20, 5, _A[:150], _revcomp(_A[300:450]))],
+    )
+    pe_out = _align(pe_reads)
+    by_read_pe, prep_of_pe = _features_by_read(pe_out)
+
+    # PE read aligns as ONE read: one SAM row per mate, both to feature 100 (NOT
+    # collapsed). Exact count, not a set, so a change in mate-row emission is caught.
+    assert by_read_pe.get(5) == [100, 100], f"PE read 5 -> {by_read_pe.get(5)}"
+    assert prep_of_pe.get(5) == {20}
+
+    # The mate columns survive so the pair is EXPLICIT (not two unrelated SE rows):
+    # both rows resolve their mate to feature 100 and carry a non-zero (signed)
+    # template_length. mate_reference is SAM's RNEXT ('=' or the numeric id); the
+    # decoded mate_feature_idx must be 100 on both.
+    mate_rows = _mate_rows(pe_out, 5)
+    assert len(mate_rows) == 2, f"expected 2 mate rows, got {mate_rows}"
+    for feature_idx, mate_feature_idx, mate_reference, template_length in mate_rows:
+        assert feature_idx == 100
+        assert mate_feature_idx == 100, (
+            f"mate not resolved to feature 100: {mate_reference!r}"
+        )
+        assert template_length != 0, "proper pair must carry a template_length"

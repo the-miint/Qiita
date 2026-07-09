@@ -11,46 +11,54 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`).
      `sequence_idx` is the globally-unique BIGINT read identity; exposing it AS
      `read_id` lets classify + align round-trip it and the output map straight back.
-     A `_READ_META` VIEW carries `(sequence_idx -> prep_sample_idx)` so each output
-     row is stamped with its true owner (a block spans many prep_samples).
+     Exactly like `host_filter`, a read pair rides as ONE row
+     `(read_id, sequence1, sequence2)` and is aligned natively as a pair —
+     `sequence2 IS NULL` marks a single-end read. There is NO SE/PE branching: the
+     sharded aligners handle a uniformly-single-end (all-NULL `sequence2`) or
+     uniformly-paired-end (all-non-null) batch natively, and a read set is uniformly
+     one or the other by construction (a prep/run is SE or PE, never a mix). A mixed
+     batch is invalid input — bowtie2 rejects it at bind, minimap2 tolerates it — and
+     we neither split around that nor paper over it. A `_READ_META` VIEW carries
+     `(sequence_idx -> prep_sample_idx)` so each output row is stamped with its true
+     owner (a block spans many prep_samples).
   2. `read_to_shard` — one `rype_classify` pass against the whole-reference ROUTER
      emits `(read_id, bucket_name)` = `(sequence_idx, str(shard_id))`, ≥0 rows per
      read (a read whose minimisers span K shards yields K rows). Materialised into
      a non-temp TABLE `(read_id BIGINT, shard_name VARCHAR)` — the exact shape
      `align_*_sharded` binds. Factored so a future multi-router just UNIONs more
      classify results into the same table.
-  3. `align_{minimap2,bowtie2}_sharded(query, shard_directory:=, read_to_shard:=)`
-     aligns each read against ONLY its routed shard(s). Output = the 21 standard
-     alignment columns; `reference` is VARCHAR = the subject's stored id, which our
-     builders set to `feature_idx`, so the aligned `feature_idx` is
-     `CAST(reference AS BIGINT)` (there is no `feature_idx`/`shard_id` column in
-     miint's output). `max_secondary := 0` keeps the primary alignment per read
-     per shard. Steps 2-3 run TWICE — once for the single-end reads
-     (`sequence2 IS NULL`) and once for the paired-end reads
-     (`sequence2 IS NOT NULL`) — because `align_bowtie2_sharded` rejects a query
-     that mixes null and non-null `sequence2` (a batch is single- OR paired-end,
-     not both; `align_minimap2_sharded` tolerates the mix, but one split path
-     serves both). Each read is in exactly one sub-batch, so no double-counting.
-  4. Map `reference -> feature_idx`, join `prep_sample_idx`, and stream a sorted
-     `COPY` to `alignment.parquet`. **Every alignment row is emitted — NO dedup.** A
-     read produces multiple rows two intentional ways: (a) CROSS-shard — a read
-     routed to K shards aligns to a DISTINCT `feature_idx` per shard (a feature is
-     in exactly one shard, so these never collide); and (b) PER-MATE — a paired-end
-     read aligning within ONE shard emits one SAM row per mate, i.e. two rows
-     sharing the SAME `(sequence_idx, feature_idx)` but differing in
-     `flags`/`position`/`cigar`. So `(sequence_idx, feature_idx)` is NOT unique in
-     the output — a downstream consumer must not treat it as a key. The only
-     collapse applied is the aligner's own within-shard secondary drop
-     (`max_secondary := 0`).
+  3. ONE `align_{minimap2,bowtie2}_sharded(query, shard_directory:=,
+     read_to_shard:=)` call aligns each read against ONLY its routed shard(s). Its
+     output is passed through VERBATIM — all standard alignment columns, INCLUDING
+     the mate columns (`mate_reference`, `mate_position`, `template_length`) and the
+     SAM `flags` that make a paired-end read's two mate rows an explicit pair, not
+     two unrelated rows. We DROP nothing and ADD three typed identity columns:
+     `prep_sample_idx` (the per-row owner, joined from `_READ_META`), `feature_idx`
+     (the aligner's `reference` subject id cast to BIGINT — our builders store
+     `feature_idx` there), and `mate_feature_idx` (the mate's feature, cast from
+     `mate_reference`, decoding SAM's RNEXT `'='`/`'*'` encoding). The raw VARCHAR
+     `reference`/`mate_reference` are kept too. `max_secondary := 0` keeps the
+     primary alignment per read per shard.
+  4. Stream a sorted `COPY` to `alignment.parquet`. **Every alignment row is
+     emitted.** A read produces multiple rows two legitimate ways: (a) CROSS-shard —
+     a read routed to K shards aligns to a DISTINCT `feature_idx` per shard (a
+     feature is in exactly one shard, so these never collide); and (b) a PAIRED-END
+     read's two mate rows, which together are ONE read's alignment to a feature (the
+     pairing carried by `flags` + the mate columns), NOT two independent alignments.
+     So `(sequence_idx, feature_idx)` is NOT unique in the output — a consumer reads
+     the mate columns / flags to relate a pair's rows, and reasons multiplicity per
+     read (or read-pair), never per mate. The only collapse applied is the aligner's
+     own within-shard secondary drop (`max_secondary := 0`).
 
-**Output shape is a stable C1 contract, not the final sink.** C1 emits
-`(prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position,
-mapq, cigar)` sorted by `(prep_sample_idx, sequence_idx, feature_idx)`. The
-alignment output carries `feature_idx` but NOT `reference_idx` — reference scoping
-is a query-time join against `reference_membership` (see the identifier-ownership
-note in CLAUDE.md). The DuckLake alignment-detail sink (columns, order, the
-`register-files` path) is finalised by C2/D6; this job produces a documented,
-stable intermediate.
+**Output is the FULL aligner output + `prep_sample_idx` + `feature_idx` +
+`mate_feature_idx`.** C1 is a documented, stable intermediate — nothing is dropped
+from what miint emits. Sorted
+by `(prep_sample_idx, sequence_idx, feature_idx, position, flags)`. The output
+carries `feature_idx` but NOT `reference_idx` — reference scoping is a query-time
+join against `reference_membership` (see the identifier-ownership note in
+CLAUDE.md). The DuckLake alignment-detail sink (its exact columns, order, the
+`register-files` path, and any collapse of a pair's mate rows) is finalised by
+C2/D6; this job produces a documented, stable intermediate.
 
 **Not wired into a workflow yet.** C1 is native-job-only: the smoke drives
 `execute()` directly with the router + shard-directory paths. The runner staging
@@ -61,14 +69,17 @@ miint contracts — qiita-verified against the team-mirror build via the C1 smok
   - `rype_classify(index_path, sequence_table, [id_column='read_id'],
     [threshold=0.1])` -> `(read_id, bucket_id, bucket_name, score)`, ≥0 rows per
     read (one per bucket above threshold — multi-bucket, so a read routes to every
-    shard it overlaps).
+    shard it overlaps). Reads `sequence1` and, when present, `sequence2`.
   - `align_minimap2_sharded(query_table, shard_directory:=, read_to_shard:=,
     [preset, max_secondary, include_shard_name, …])` and
     `align_bowtie2_sharded(query_table, shard_directory:=, read_to_shard:=,
     [max_secondary, include_shard_name, …])`. `query_table` + `read_to_shard` are
     table NAMEs resolved on a SEPARATE connection, so both are non-temp VIEW/TABLE.
     `read_to_shard.read_id` type must EXACTLY equal `query.read_id` (BIGINT here).
-    Output `reference`/`mate_reference` are VARCHAR subject ids (our `feature_idx`).
+    Output = the standard SAM columns; `reference`/`mate_reference` are VARCHAR
+    subject ids (our `feature_idx`), and a PE read emits one row per mate. Both
+    accept a uniformly-SE (all-NULL `sequence2`) or uniformly-PE batch; a MIXED
+    batch is rejected by bowtie2 (`gpl_boundary`) and tolerated by minimap2.
 """
 
 from __future__ import annotations
@@ -116,9 +127,10 @@ _MINIMAP2_PRESET = "sr"
 _PLAN_BASE_WALLTIME_SECONDS = 600  # 10 min: process + DuckDB init + index load + fixed I/O
 _PLAN_WALLTIME_SECONDS_PER_MILLION_PAIRS = 600.0
 
-# In-DuckDB relation names. The query + read-meta are VIEWs; read_to_shard and the
-# alignment accumulator are TABLEs (read_to_shard is resolved by align's separate
-# connection; the accumulator collects the mapped align output for the sorted COPY).
+# In-DuckDB relation names. The query + read-meta are VIEWs; read_to_shard is a
+# TABLE resolved by align's separate connection; the alignments TABLE is CTAS'd by
+# the aligner seam from the align function's full output, then joined + sorted into
+# the COPY.
 _QUERY = "align_sharded_query"
 _READ_META = "align_sharded_read_meta"
 _READ_TO_SHARD = "align_sharded_read_to_shard"
@@ -211,23 +223,21 @@ def _run_align_minimap2_sharded(
     *,
     preset: str,
 ) -> None:
-    """Seam around miint's `align_minimap2_sharded`. Appends the mapped alignment
-    rows into `dest_table`. Isolated so unit tests stub the real align.
+    """Seam around miint's `align_minimap2_sharded`. Materialises the aligner's
+    FULL output VERBATIM into a fresh `dest_table` via CTAS (nothing dropped) —
+    `execute()` adds `prep_sample_idx` + `feature_idx` at COPY time. Isolated so
+    unit tests stub the real align.
 
     `query_table` (positional) + `shard_directory` + `read_to_shard` (the table
-    NAME) are all bound as `?` — INSERT...SELECT is DML, so the table-function's
-    VARCHAR table-name / path args take prepared params (verified against the real
-    function; no string interpolation, so no injection surface). `reference` is the
-    VARCHAR subject id our builder stored (`feature_idx`), so
-    `CAST(reference AS BIGINT)` recovers the aligned feature. `max_secondary := 0`
-    keeps the primary alignment per read per shard (the aligner's own within-shard
-    collapse); cross-shard multiplicity (distinct feature per shard) and per-mate PE
-    rows (same feature, one row per mate) are both preserved."""
+    NAME) are all bound as `?` — a table-function call in a CTAS still takes
+    prepared params for its VARCHAR table-name / path args (verified against the
+    real function; no string interpolation, so no injection surface).
+    `max_secondary := 0` keeps the primary alignment per read per shard (the
+    aligner's own within-shard collapse); cross-shard multiplicity (a distinct
+    feature per shard) and a PE read's two mate rows are both preserved."""
     conn.execute(
-        f"INSERT INTO {dest_table} "
-        "SELECT read_id AS sequence_idx, CAST(reference AS BIGINT) AS feature_idx, "
-        "flags, position, stop_position, mapq, cigar "
-        "FROM align_minimap2_sharded(?, shard_directory := ?, "
+        f"CREATE TABLE {dest_table} AS "
+        "SELECT * FROM align_minimap2_sharded(?, shard_directory := ?, "
         "read_to_shard := ?, preset := ?, max_secondary := 0)",
         [query_table, str(shard_directory), read_to_shard_table, preset],
     )
@@ -243,13 +253,11 @@ def _run_align_bowtie2_sharded(
     """Seam around miint's `align_bowtie2_sharded` — the bowtie2 twin of
     `_run_align_minimap2_sharded`. No `preset` (a bowtie2 index is
     preset-independent; presets are an align-time knob left at default here).
-    Same `reference -> feature_idx` map and within-shard `max_secondary := 0`; the
+    Same VERBATIM full-output CTAS and within-shard `max_secondary := 0`; the
     three table-name / path args are bound as `?` like the minimap2 seam."""
     conn.execute(
-        f"INSERT INTO {dest_table} "
-        "SELECT read_id AS sequence_idx, CAST(reference AS BIGINT) AS feature_idx, "
-        "flags, position, stop_position, mapq, cigar "
-        "FROM align_bowtie2_sharded(?, shard_directory := ?, "
+        f"CREATE TABLE {dest_table} AS "
+        "SELECT * FROM align_bowtie2_sharded(?, shard_directory := ?, "
         "read_to_shard := ?, max_secondary := 0)",
         [query_table, str(shard_directory), read_to_shard_table],
     )
@@ -282,82 +290,70 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"CREATE VIEW {_READ_META} AS "
                 f"SELECT sequence_idx, prep_sample_idx FROM read_parquet('{reads_sql}')"
             )
-            # Alignment accumulator (mapped to feature_idx). Populated by the
-            # aligner seam, once per non-empty sub-batch below. Empty is VALID — a
-            # block whose reads align nowhere in this reference is legitimate, not a
-            # fail-fast.
-            # Column types match the real align_*_sharded output (probe-verified):
-            # position/stop_position are BIGINT (a shard's concatenated contigs can
-            # exceed INT32) — never narrow them to INTEGER; flags (USMALLINT) and
-            # mapq (UTINYINT) widen losslessly into INTEGER.
+            # The align query: the WHOLE read set, keyed by sequence_idx AS read_id,
+            # carrying sequence1 + sequence2. ONE query, no SE/PE split — the sharded
+            # aligners handle the mode natively (the host_filter pattern);
+            # `sequence2 IS NULL` marks single-end. A non-temp VIEW so miint's
+            # separate connection can resolve it by name.
             conn.execute(
-                f"CREATE TABLE {_ALIGNMENTS} ("
-                "sequence_idx BIGINT, feature_idx BIGINT, flags INTEGER, "
-                "position BIGINT, stop_position BIGINT, mapq INTEGER, cigar VARCHAR)"
+                f"CREATE VIEW {_QUERY} AS "
+                "SELECT sequence_idx AS read_id, sequence1, sequence2 "
+                f"FROM read_parquet('{reads_sql}')"
+            )
+            # read_to_shard (non-temp — align resolves it by name on its own
+            # connection). One rype_classify pass fills it; multi-bucket, so a read
+            # spanning K shards gets K rows and aligns against all K.
+            conn.execute(f"CREATE TABLE {_READ_TO_SHARD} (read_id BIGINT, shard_name VARCHAR)")
+            _build_read_to_shard(
+                conn,
+                inputs.router_index_path,
+                _QUERY,
+                _READ_TO_SHARD,
+                threshold=_ROUTING_THRESHOLD,
             )
 
-            # Align SINGLE-END and PAIRED-END reads as SEPARATE uniform sub-batches.
-            # `align_bowtie2_sharded` rejects a query that MIXES null and non-null
-            # `sequence2` ("all must be non-null for paired-end") — a batch is single-
-            # OR paired-end, never both. `align_minimap2_sharded` tolerates the mix,
-            # but splitting keeps ONE correct code path for both aligners. Each read
-            # falls in exactly one sub-batch (by `sequence2` nullness), so there is no
-            # double-counting; `read_to_shard` is rebuilt per sub-batch to match the
-            # query the aligner binds it against (its `read_id` type must equal the
-            # query's). The SE sub-query omits `sequence2` entirely (a pure-SE batch);
-            # the PE sub-query carries it (all non-null by the predicate).
-            for projection, predicate in (
-                ("SELECT sequence_idx AS read_id, sequence1", "sequence2 IS NULL"),
-                ("SELECT sequence_idx AS read_id, sequence1, sequence2", "sequence2 IS NOT NULL"),
-            ):
-                conn.execute(
-                    f"CREATE OR REPLACE VIEW {_QUERY} AS {projection} "
-                    f"FROM read_parquet('{reads_sql}') WHERE {predicate}"
-                )
-                if conn.execute(f"SELECT count(*) FROM {_QUERY}").fetchone()[0] == 0:
-                    continue  # no reads in this mode — skip the classify + align
-                # read_to_shard (non-temp — align resolves it by name on its own
-                # connection). One rype_classify pass fills it; multi-bucket, so a
-                # read spanning K shards gets K rows and aligns against all K.
-                conn.execute(
-                    f"CREATE OR REPLACE TABLE {_READ_TO_SHARD} (read_id BIGINT, shard_name VARCHAR)"
-                )
-                _build_read_to_shard(
+            # ONE sharded-align call. Its FULL output (all SAM columns, verbatim) is
+            # materialised into _ALIGNMENTS by the seam. Empty is VALID — a block
+            # whose reads align nowhere in this reference is legitimate, not a
+            # fail-fast (the tools tolerate an empty query/routing, per host_filter).
+            if inputs.aligner == "minimap2":
+                _run_align_minimap2_sharded(
                     conn,
-                    inputs.router_index_path,
                     _QUERY,
+                    inputs.shard_directory,
                     _READ_TO_SHARD,
-                    threshold=_ROUTING_THRESHOLD,
+                    _ALIGNMENTS,
+                    preset=_MINIMAP2_PRESET,
                 )
-                if inputs.aligner == "minimap2":
-                    _run_align_minimap2_sharded(
-                        conn,
-                        _QUERY,
-                        inputs.shard_directory,
-                        _READ_TO_SHARD,
-                        _ALIGNMENTS,
-                        preset=_MINIMAP2_PRESET,
-                    )
-                else:
-                    _run_align_bowtie2_sharded(
-                        conn, _QUERY, inputs.shard_directory, _READ_TO_SHARD, _ALIGNMENTS
-                    )
+            else:
+                _run_align_bowtie2_sharded(
+                    conn, _QUERY, inputs.shard_directory, _READ_TO_SHARD, _ALIGNMENTS
+                )
 
-            # Stream a sorted COPY. prep_sample_idx is stamped PER ROW from the
-            # reads (the _READ_META join, 1:many onto the alignments). NO dedup —
-            # every alignment row is kept. `(sequence_idx, feature_idx)` is NOT
-            # unique: cross-shard rows carry distinct feature_idx (a feature is in
-            # one shard), and a PE read's two mate rows share (sequence_idx,
-            # feature_idx) but differ in flags/position — a downstream consumer must
-            # not assume that pair is a key. Sorted by the identifier order, with
-            # position/flags as tiebreakers so a PE read's mate rows land in a
-            # deterministic order.
+            # Stream a sorted COPY. Pass the aligner output through VERBATIM
+            # (`a.* EXCLUDE (read_id)`, which we rename to `sequence_idx`), and ADD
+            # the typed identity columns: `prep_sample_idx` (per-row owner via the
+            # _READ_META join, 1:many onto the alignments), `feature_idx`
+            # (`CAST(reference)`), and `mate_feature_idx` (the mate's feature, cast
+            # from `mate_reference`). NOTHING is dropped — the raw VARCHAR
+            # `reference`/`mate_reference` stay too, and the mate columns + flags keep
+            # a PE read's two mate rows an explicit pair. `mate_reference` uses SAM's
+            # RNEXT encoding, so decode it: `'='` means the same feature as this row,
+            # `'*'`/`''`/NULL means no mapped mate, else it's the mate's own feature
+            # id. `(sequence_idx, feature_idx)` is NOT a key: cross-shard rows carry
+            # distinct feature_idx (a feature is in one shard), and a PE read's two
+            # mate rows share it. Sorted by the identifier order, with position/flags
+            # as tiebreakers so a PE read's mate rows land in a deterministic order.
             conn.execute(
-                "COPY (SELECT rm.prep_sample_idx, a.sequence_idx, a.feature_idx, "
-                "a.flags, a.position, a.stop_position, a.mapq, a.cigar "
+                "COPY (SELECT rm.prep_sample_idx, a.read_id AS sequence_idx, "
+                "CAST(a.reference AS BIGINT) AS feature_idx, "
+                "CASE WHEN a.mate_reference = '=' THEN CAST(a.reference AS BIGINT) "
+                "WHEN a.mate_reference IS NULL OR a.mate_reference IN ('*', '') THEN NULL "
+                "ELSE CAST(a.mate_reference AS BIGINT) END AS mate_feature_idx, "
+                "a.* EXCLUDE (read_id) "
                 f"FROM {_ALIGNMENTS} a "
-                f"JOIN {_READ_META} rm ON rm.sequence_idx = a.sequence_idx "
-                "ORDER BY rm.prep_sample_idx, a.sequence_idx, a.feature_idx, "
+                f"JOIN {_READ_META} rm ON rm.sequence_idx = a.read_id "
+                "ORDER BY rm.prep_sample_idx, a.read_id, feature_idx, "
                 "a.position, a.flags) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
