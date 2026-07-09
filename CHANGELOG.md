@@ -15,6 +15,12 @@ the `no-changelog` label).
 
 ### Added
 
+- **Key-rotation runbook** (`docs/runbooks/key-rotation.md`) — restart-based
+  rotation for the Ed25519 Flight signing keypair and the login-cookie secret,
+  with a `make preflight` keypair check before the coordinated CP+DP restart.
+  `first-deploy.md` provisioning and `auth.md` updated to match the keypair
+  model. (#265)
+
 - **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
   reads, selected by a required `mask_idx`: the runner's

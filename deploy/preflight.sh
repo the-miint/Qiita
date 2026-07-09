@@ -96,14 +96,25 @@ if [ -r "$CP_ENV" ] && [ -r "$DP_ENV" ]; then
     else
         # Derive the public key from the CP seed and confirm it matches the DP's
         # public key. This needs `cryptography`, which ships in the CP venv — so
-        # invoke that interpreter explicitly. A bare `python3` may lack it, and an
-        # ImportError there previously degraded this check to a green `pass`; a
-        # check that cannot run must say so (skip), never report success. The DP
-        # only validates the public key's curve-validity at boot (it never sees
-        # the CP seed), so the bucket-5 live DoGet remains the definitive gate.
-        cp_py="${CP_PY:-/opt/qiita/control-plane/.venv/bin/python}"
+        # invoke that interpreter explicitly rather than a bare `python3` that may
+        # lack it (a bare-python3 ImportError previously degraded this to a green
+        # `pass`; a check that cannot run must say so — skip, never pass). Prefer
+        # the operator's checkout venv (this script lives in <checkout>/deploy/,
+        # matching key-rotation.md's Prerequisites and reachable as the operator
+        # who runs `make preflight`), then the deployed service venv, honoring an
+        # explicit CP_PY override. The DP only checks the public key's
+        # curve-validity at boot (it never sees the CP seed), so the bucket-5 live
+        # DoGet remains the definitive gate.
+        pf_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+        cp_py=""
+        for cand in \
+            "${CP_PY:-}" \
+            "$pf_dir/../qiita-control-plane/.venv/bin/python" \
+            "/opt/qiita/control-plane/.venv/bin/python"; do
+            if [ -n "$cand" ] && [ -x "$cand" ]; then cp_py="$cand"; break; fi
+        done
         derived=""
-        if [ -x "$cp_py" ]; then
+        if [ -n "$cp_py" ]; then
             derived=$(printf '%s' "$cp_seed" | "$cp_py" -c '
 import sys, base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -111,12 +122,12 @@ seed = base64.b64decode(sys.stdin.read())
 print(base64.b64encode(Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()).decode())
 ' 2>/dev/null) || derived=""
         fi
-        if [ "$derived" = "$dp_pub" ] && [ -n "$derived" ]; then
+        if [ -n "$derived" ] && [ "$derived" = "$dp_pub" ]; then
             pass "flight-keypair" "DP public key matches CP signing seed (pub sha256:${dp_fp})"
         elif [ -n "$derived" ]; then
             fail "flight-keypair" "DP FLIGHT_TICKET_PUBLIC_KEY is not the public key of CP FLIGHT_TICKET_SIGNING_KEY — Flight tickets will fail to verify"
         else
-            skip "flight-keypair" "correspondence NOT verified — CP venv python ($cp_py) missing or lacks cryptography (set CP_PY to override). Both keys present + 32B each (CP sha256:${cp_fp}, DP sha256:${dp_fp}); the bucket-5 live DoGet is the real gate."
+            skip "flight-keypair" "correspondence NOT verified — no CP venv with cryptography found (tried CP_PY, <checkout>/qiita-control-plane/.venv, /opt/qiita/control-plane/.venv; set CP_PY to override). Both keys present + 32B each (CP sha256:${cp_fp}, DP sha256:${dp_fp}); the bucket-5 live DoGet is the real gate."
         fi
     fi
 else

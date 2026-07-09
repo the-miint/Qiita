@@ -383,3 +383,5 @@ See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full seq
 ## Token rotation
 
 See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full rotation procedure: mint replacement → `install-orchestrator-token.sh` (atomic write + `.previous` save) → pick-up step (cron: next invocation reads the new file; long-running daemons: `systemctl reload`, gated on the not-yet-implemented orchestrator reload handler) → `wait-for-token-use.sh` (polls `last_used_at`) → revoke old.
+
+For the **Flight-ticket signing keypair** (`FLIGHT_TICKET_SIGNING_KEY` / `FLIGHT_TICKET_PUBLIC_KEY`) and the **login-cookie secret** (`LOGIN_COOKIE_SECRET_KEY`), see [`docs/runbooks/key-rotation.md`](runbooks/key-rotation.md) — restart-based (the data plane holds a single verification key), with a `make preflight` keypair check before the coordinated CP+DP restart.
