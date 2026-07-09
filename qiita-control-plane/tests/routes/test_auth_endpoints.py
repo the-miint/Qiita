@@ -86,6 +86,9 @@ async def auth_client(postgres_pool, jwks_harness):
     app.state.settings = Settings(
         database_url="unused",
         hmac_secret_key=b"\x00" * 32,
+        # Distinct from hmac_secret_key: the login/handoff cookie is signed with
+        # its own key, so this round-trip exercises the split.
+        login_cookie_secret_key=b"\x11" * 32,
         data_plane_url="unused",
         authrocket_issuer=jwks_harness.issuer,
         authrocket_audience=_TEST_AUDIENCE,
@@ -867,15 +870,16 @@ def _lr_verifier(jwks_harness):
 
 
 def _make_login_cookie(*, cli: bool = False, port: int | None = None, age_ms: int = 0) -> str:
-    """Sign a login cookie using the same secret the auth_client fixture uses
-    (b'\\x00' * 32). `age_ms` shifts the timestamp into the past so tests can
+    """Sign a login cookie with the same key the auth_client fixture verifies it
+    under — `login_cookie_secret_key` (b'\\x11' * 32), which this PR split off the
+    Flight-ticket secret. `age_ms` shifts the timestamp into the past so tests can
     exercise the freshness window."""
     from qiita_control_plane.auth.handoff import sign_login_cookie
 
     payload = {"timestamp_ms": int(time.time() * 1000) - age_ms, "cli": cli}
     if cli and port is not None:
         payload["port"] = port
-    return sign_login_cookie(payload, b"\x00" * 32)
+    return sign_login_cookie(payload, b"\x11" * 32)
 
 
 def _cookie_jar(cookie: str) -> dict[str, str]:

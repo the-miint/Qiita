@@ -23,10 +23,17 @@ from qiita_common.api_paths import LOOPBACK_HOST
 @pytest.fixture(autouse=True)
 def _workspace_root_env(monkeypatch):
     """Settings.from_env() (called by several AuthRocket tests below)
-    requires PATH_SCRATCH and CONTACT_EMAIL. Set defaults so those tests
-    can focus on the OIDC surface they actually care about."""
+    requires PATH_SCRATCH, CONTACT_EMAIL, and LOGIN_COOKIE_SECRET_KEY. Set
+    defaults so those tests can focus on the OIDC surface they actually care
+    about."""
+    import base64
+    import secrets
+
     monkeypatch.setenv("PATH_SCRATCH", "/tmp/qiita-test-scratch-unused")
     monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
+    monkeypatch.setenv(
+        "LOGIN_COOKIE_SECRET_KEY", base64.b64encode(secrets.token_bytes(32)).decode()
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -695,6 +695,16 @@ the `no-changelog` label).
   `grpc+tls://<host>:443` form — the old `grpc://<host>:50051` example is the
   on-host/direct port and is not reachable off the deploy host. (#261)
 
+- **Login-cookie secret split off the Flight-ticket secret.** The `/auth/login`
+  → `/auth/handoff` cookie now signs with a dedicated `LOGIN_COOKIE_SECRET_KEY`
+  (new required control-plane env var) instead of reusing `HMAC_SECRET_KEY`. The
+  two were the same key, so one leak forged both Flight tickets and login
+  cookies; they are now independent. Control-plane only — the data plane never
+  sees the cookie key. Operator note: at the restart, login cookies signed with
+  the old key fail verification — a clean 401 (`CookieInvalid`), not a 500 — so
+  users mid-handoff in the ≤5-minute cookie window (`Max-Age` 300s) simply
+  re-login once. No dual-verify or coordinated cutover needed. (#262)
+
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
   options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`
