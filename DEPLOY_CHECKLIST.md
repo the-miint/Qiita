@@ -109,6 +109,14 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `rype`/`minimap2`/`bowtie2`/`rype_router`). Additive CHECK expansion; the sharded
   reference-add path starts inserting `rype_router` rows (the whole-reference router),
   no out-of-band steps. (#reference-support)
+- **Sharded-alignment identity + gate (C2b).** `make migrate` applies three additive
+  migrations, no backfill: `20260712000000_alignment_definition.sql` (the
+  `qiita.alignment_definition` params-hash identity table + `mint_alignment_definition`,
+  plain `BYTEA`/CHECK — no Postgres ENUM), `20260712010000_alignment_sample.sql` (the
+  per-`(alignment_idx, prep_sample)` completion gate, twin of `mask_sample`, FK
+  `alignment_idx` ON DELETE CASCADE), and `20260712020000_work_ticket_alignment_idx.sql`
+  (a nullable `qiita.work_ticket.alignment_idx` FK ON DELETE SET NULL + partial index).
+  Existing rows read NULL; no out-of-band steps. (#reference-support)
 
 ### 4. Deploy
 
@@ -144,6 +152,17 @@ _None yet._
   # expect: build-shard-index|1.0.0|reference
   ```
 
+- Confirm the new `align/1.0.0` workflow synced into `qiita.action` (the C2b
+  sharded-alignment consumer — `POST …/sequenced-pool/{P}/align-plan` fans out one
+  `align` block ticket per block; synced by `qiita-admin actions sync` inside
+  `activate.sh`). Inert until a submitter runs an align plan against an ACTIVE
+  sharded reference. (#reference-support)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='align'"
+  # expect: align|1.0.0|block
+  ```
+
 ### Notes (no host action)
 
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
@@ -169,6 +188,21 @@ _None yet._
   action, no migration; **already-ingested references are NOT backfilled** — only new
   ingests get the 1-1-at-rest shape, so analysts querying `reference_taxonomy` across a
   mix of old and new references will see both shapes. (#reference-support)
+- **Sharded-reference alignment consumer (C2b) is inert until an operator runs it.**
+  The `align/1.0.0` workflow, the `alignment_definition`/`alignment_sample` tables,
+  the nullable `work_ticket.alignment_idx`, and `POST …/sequenced-pool/{P}/align-plan`
+  add nothing to the existing read-mask / reference paths. The submit route reuses the
+  existing `prep_sample:write` scope at `wet_lab_admin+` — **no new submit scope**. A
+  **data-plane restart** picks up the compiled-in additions — the new DuckLake
+  `alignment` table (ensured at startup; NOT Flight-readable — a sink this milestone),
+  the `export_read_masked_block` DoAction (masked-read block export), and the
+  `delete_alignment` / `delete_alignment_block` DoActions — so the normal bucket-4
+  binary restart is the only action; no new env var, host dir, group, or SIF. The
+  disallow-without-delete escape hatch adds a new system_admin-only scope
+  `alignment_definition:delete` (role-implied in `auth/scopes.py`, like
+  `mask_definition:delete`) gating `DELETE /alignment-definition/{alignment_idx}` — **an
+  existing system_admin PAT does not carry it until re-minted** (`qiita-admin login` or a
+  fresh PAT); no grant step. (#reference-support)
 - **New sharded-index observability endpoint (control-plane).**
   `GET /api/v1/reference/{idx}/shard-index-status` returns a sharded reference's
   `expected_shards` (N), per-`index_type` `registered_shards`, and `failed_shard_tickets`

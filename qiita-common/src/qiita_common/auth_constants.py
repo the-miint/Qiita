@@ -59,6 +59,13 @@ class Scope(StrEnum):
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     # Mirrors REFERENCE_DELETE.
     MASK_DEFINITION_DELETE = "mask_definition:delete"
+    # Full purge of an alignment (the alignment_definition row + its DuckLake
+    # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
+    # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
+    # is destructive and admin-only, granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. Mirrors
+    # MASK_DEFINITION_DELETE; it is the disallow-without-delete escape hatch.
+    ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. Carried by admins (humans uploading via qiita-admin)
     # and service accounts (workers driving import flows).

@@ -32,8 +32,14 @@ the `no-changelog` label).
   `alignment_sample` identity + gate tables and `mint_alignment_definition`
   (migrations `20260712000000`/`010000`), a nullable `work_ticket.alignment_idx`
   (`20260712020000`), the `delete-alignment-block` / `reconcile-alignment-block`
-  library primitives, the `align_planner` fan-out, and
-  `POST .../sequenced-pool/{}/align-plan`. (#reference-support)
+  library primitives (backed by new replay-safe `delete_alignment_block` /
+  `delete_alignment` data-plane DoActions over the `alignment` table), the
+  `align_planner` fan-out, and `POST .../sequenced-pool/{}/align-plan`. The
+  disallow-without-delete escape hatch is `DELETE
+  /alignment-definition/{alignment_idx}` (new system_admin-only
+  `alignment_definition:delete` scope) — it purges the alignment's DuckLake rows
+  and its `alignment_definition` row, cascading the `alignment_sample` gate so a
+  fresh plan can re-align. (#reference-support)
 
 - **Sharded-reference alignment foundation (C2a).** Makes a *sharded* reference
   index-complete and resolvable — the piece C1 left missing (it shipped the
