@@ -270,13 +270,12 @@ async def _resolve_host_filter_legacy(
 # (see derived_store.shard_minimap2_index_path / shard_bowtie2_index_prefix). The
 # CP derives the root from the DB fs_path rather than reconstructing the path
 # convention — it cannot import the orchestrator's derived_store.
-_SHARD_ALIGNER_INDEX_TYPE: dict[str, str] = {
-    "minimap2": HOST_FILTER_INDEX_TYPE_MINIMAP2,
-    "bowtie2": INDEX_TYPE_BOWTIE2,
-}
-_SHARD_ALIGNER_ROOT_PARENT_DEPTH: dict[str, int] = {
-    "minimap2": 0,
-    "bowtie2": 1,
+# Per-aligner facts, kept together so a new aligner is one entry: the DB
+# `reference_index.index_type` string, and the number of `fs_path` parents to
+# climb to reach the shared shard-root directory (the path convention above).
+_SHARD_ALIGNER: dict[str, tuple[str, int]] = {
+    "minimap2": (HOST_FILTER_INDEX_TYPE_MINIMAP2, 0),
+    "bowtie2": (INDEX_TYPE_BOWTIE2, 1),
 }
 
 
@@ -297,12 +296,13 @@ async def _resolve_sharded_align_indexes(
       single-Path `router_index_path` input is a C2b consumer-side change.
     * **shard_directory** — the per-aligner root holding all shards. There is no
       `reference_index` row for the root, so it is derived from any one per-shard
-      row's `fs_path` (see `_SHARD_ALIGNER_ROOT_PARENT_DEPTH`): minimap2's root is
+      row's `fs_path` (see `_SHARD_ALIGNER`): minimap2's root is
       the fs_path PARENT (`.../minimap2-shards`), bowtie2's the PARENT-OF-PARENT
       (`.../bowtie2-shards`).
 
-    This ships tested but UNWIRED — C2b calls it from the align workflow's runner
-    staging (like C1's align job shipped unwired). Fail-fast, mirroring
+    Reached from the align workflow's runner staging (via
+    `_resolve_sharded_align_index_bindings`) and from
+    `align_planner.plan_and_submit_alignments`. Fail-fast, mirroring
     `_resolve_reference_index_path`:
       * ReferenceNotFound — no such reference.
       * ValueError — the reference isn't `active` (an unknown aligner is also a
@@ -310,12 +310,11 @@ async def _resolve_sharded_align_indexes(
       * ReferenceIndexNotBuilt (a ValueError subclass) — the reference is active
         but the router, or the per-shard `aligner` index, isn't built yet.
     """
-    if aligner not in _SHARD_ALIGNER_INDEX_TYPE:
+    if aligner not in _SHARD_ALIGNER:
         raise ValueError(
-            f"unknown sharded aligner {aligner!r}; expected one of "
-            f"{sorted(_SHARD_ALIGNER_INDEX_TYPE)}"
+            f"unknown sharded aligner {aligner!r}; expected one of {sorted(_SHARD_ALIGNER)}"
         )
-    index_type = _SHARD_ALIGNER_INDEX_TYPE[aligner]
+    index_type, root_parent_depth = _SHARD_ALIGNER[aligner]
 
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -358,7 +357,7 @@ async def _resolve_sharded_align_indexes(
         raise ReferenceIndexNotBuilt(
             f"reference {reference_idx} has no per-shard {index_type!r} index built yet"
         )
-    shard_directory = Path(shard_fs_path).parents[_SHARD_ALIGNER_ROOT_PARENT_DEPTH[aligner]]
+    shard_directory = Path(shard_fs_path).parents[root_parent_depth]
     return router_paths, shard_directory
 
 

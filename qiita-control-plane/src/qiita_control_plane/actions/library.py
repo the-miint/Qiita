@@ -301,20 +301,6 @@ def _do_action(action_type: str, data_plane_url: str, token: bytes) -> list:
         return list(client.do_action(_flight.Action(action_type, token)))
 
 
-def _do_action_delete_alignment(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_alignment", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_alignment_block(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_alignment_block", token)
-        return list(client.do_action(action))
-
-
 # =============================================================================
 # Public primitives — exposed through LIBRARY by name
 # =============================================================================
@@ -1294,7 +1280,7 @@ async def delete_alignment_block_data(
         secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_alignment_block, data_plane_url, token
+        None, _do_action, "delete_alignment_block", data_plane_url, token
     )
     if not results:
         return 0
@@ -1324,7 +1310,7 @@ async def delete_alignment_data(
         secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_alignment, data_plane_url, token
+        None, _do_action, "delete_alignment", data_plane_url, token
     )
     if not results:
         return 0

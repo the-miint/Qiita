@@ -156,6 +156,7 @@ from ._processing import (
     _workflow_needs_processing,
 )
 from ._read_ingest import (
+    _REFERENCE_SEQUENCES_TABLE,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
@@ -164,7 +165,6 @@ from ._read_ingest import (
     SHARD_MAPPING_BINDING,
     STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
-    _REFERENCE_SEQUENCES_TABLE,
     _do_action_export,
     _do_action_export_read,
     _do_action_export_read_block,
@@ -196,8 +196,7 @@ from ._reconstruct import (
 )
 from ._reference import (
     _REFERENCE_CHUNKS_TABLE,
-    _SHARD_ALIGNER_INDEX_TYPE,
-    _SHARD_ALIGNER_ROOT_PARENT_DEPTH,
+    _SHARD_ALIGNER,
     QC_ADAPTER_BINDING,
     ROUTER_INDEX_PATH_BINDING,
     SHARD_DIRECTORY_BINDING,
@@ -369,8 +368,7 @@ __all__: list[str] = [
     "SHARD_ID_BINDING",
     "SHARD_MAPPING_BINDING",
     "_REFERENCE_SEQUENCES_TABLE",
-    "_SHARD_ALIGNER_INDEX_TYPE",
-    "_SHARD_ALIGNER_ROOT_PARENT_DEPTH",
+    "_SHARD_ALIGNER",
     "_do_action_export_read_masked_block",
     "_do_get_reference_sequences_roster",
     "_reconstruct_plan_shards_outputs",
