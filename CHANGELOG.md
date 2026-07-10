@@ -18,7 +18,7 @@ the `no-changelog` label).
 - **Seed water/marine metadata for early data entry** — the `GSC MIxS water`
   checklist (ERC000024, under the ENA default), a `depth_m` biosample global
   field, the `seawater metagenome` / `estuary metagenome` NCBI taxa, and eight
-  marine/aquatic ENVO environmental-context terms. (#266)
+  marine/aquatic ENVO environmental-context terms. (#267)
 
 - **Key-rotation runbook** (`docs/runbooks/key-rotation.md`) — restart-based
   rotation for the Ed25519 Flight signing keypair and the login-cookie secret,
