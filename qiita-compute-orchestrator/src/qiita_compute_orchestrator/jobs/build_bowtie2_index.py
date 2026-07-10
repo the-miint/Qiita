@@ -25,8 +25,10 @@ row `(success BOOLEAN, index_path VARCHAR, num_subjects BIGINT)`. Unlike
 `save_minimap2_index` it takes **no `preset`** — a bowtie2 index is
 preset-independent (presets apply at align time via `align_bowtie2_sharded`), so
 this builder has no preset knob. The subject `read_id` may be BIGINT (it is here,
-the feature_idx). The function needs no GPL boundary (`install_gpl_boundary` is
-NOT required — verified by the smoke; bowtie2 is statically linked in this build).
+the feature_idx). `save_bowtie2_index` shells out to a GPL-licensed `gpl-boundary`
+helper on the current mirror build, so the seam runs `install_gpl_boundary()`
+first (downloads to miint's cache dir, no-op once cached) — an earlier build
+needed none, but the mirror added the requirement upstream.
 
 **Multi-file output.** bowtie2 writes SIX files under the shared prefix
 (`index.1.bt2 … index.4.bt2`, `index.rev.1.bt2`, `index.rev.2.bt2`), so
@@ -141,8 +143,13 @@ def _run_save_bowtie2_index(
 
     The function always emits exactly one status row, so a missing row is a
     structural contract violation (not a clean `success=false`) — raise loudly.
-    No `install_gpl_boundary()` is needed (verified by the host-mode smoke): the
-    call is a straight invocation like the minimap2 seam."""
+
+    `save_bowtie2_index` on the current team-mirror build shells out to a
+    GPL-licensed `gpl-boundary` helper (bowtie2 itself is GPL), so
+    `install_gpl_boundary()` must run first: it downloads a prebuilt binary into
+    miint's cache dir (a no-op once cached), and raises if it can't. An earlier
+    mirror build needed no boundary; the requirement was added upstream since."""
+    conn.execute("SELECT install_gpl_boundary()").fetchone()
     row = conn.execute(
         "SELECT success FROM save_bowtie2_index(?, ?)",
         [subject_table, output_path],

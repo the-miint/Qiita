@@ -403,8 +403,9 @@ def test_build_bowtie2_index_real_smoke(tmp_path, monkeypatch):
     This is the AUTHORITATIVE miint verification for the bowtie2 builder:
       - confirms save_bowtie2_index exists on the team-mirror build and its
         two-positional call shape (subject_table, output_path), no preset;
-      - confirms NO GPL boundary (install_gpl_boundary) is needed — the call
-        runs straight through.
+      - confirms the seam's `install_gpl_boundary()` call satisfies the mirror
+        build's GPL-boundary requirement so the save runs (the binary downloads
+        into miint's cache dir; this exercises real network on first run).
 
     Runs against the team-mirror miint build (conftest sets MIINT_EXTENSION_REPO).
     """
