@@ -234,7 +234,7 @@ async def test_delete_alignment_block_builds_footprint_from_members(ab, monkeypa
 
     recorded: dict = {}
 
-    async def fake_delete_data(*, alignment_idx, members, hmac_secret, data_plane_url):
+    async def fake_delete_data(*, alignment_idx, members, signing_key, data_plane_url):
         recorded.update(alignment_idx=alignment_idx, members=members)
         return 6
 
@@ -244,7 +244,7 @@ async def test_delete_alignment_block_builds_footprint_from_members(ab, monkeypa
         pool,
         block_idx=block,
         alignment_idx=alignment_idx,
-        hmac_secret=b"s",
+        signing_key=b"s",
         data_plane_url="grpc://x",
     )
     assert result == {"block_idx": block, "rows_deleted": 6}

@@ -1,6 +1,6 @@
 //! Arrow Flight service implementation for the qiita data plane.
 //!
-//! Handles DoGet requests by verifying HMAC-signed tickets, querying DuckLake,
+//! Handles DoGet requests by verifying Ed25519-signed tickets, querying DuckLake,
 //! and streaming results as Arrow RecordBatches.
 //!
 //! Each request opens its own DuckDB connection and attaches DuckLake. This
@@ -35,8 +35,9 @@ use crate::ducklake;
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
-    /// HMAC secret key for ticket verification.
-    hmac_secret: Vec<u8>,
+    /// Ed25519 PUBLIC key for ticket verification. Verify-only — the private
+    /// signing seed lives only in the control plane.
+    flight_public_key: ed25519_dalek::VerifyingKey,
     /// DuckLake catalog connection string (libpq format).
     catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files.
@@ -55,14 +56,14 @@ pub struct QiitaFlightService {
 
 impl QiitaFlightService {
     pub fn new(
-        hmac_secret: Vec<u8>,
+        flight_public_key: ed25519_dalek::VerifyingKey,
         catalog_connstr: String,
         data_path: String,
         upload_staging_root: PathBuf,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
-            hmac_secret,
+            flight_public_key,
             catalog_connstr,
             data_path,
             upload_staging_root,
@@ -211,7 +212,7 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 
 /// DoAction variants that are safe to replay — the accepted-risk registry.
 ///
-/// Flight action tokens are HMAC-authenticated but carry **no single-use
+/// Flight action tokens are Ed25519-authenticated but carry **no single-use
 /// ledger**: within a token's lifetime (bounded by `MAX_TICKET_LIFETIME`, ~1h)
 /// a captured, still-valid token can be replayed. We deliberately do NOT add a
 /// server-side nonce/consumed-token store — the operational cost of one is not
@@ -269,8 +270,8 @@ impl FlightService for QiitaFlightService {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket_bytes = &request.into_inner().ticket;
 
-        // Verify HMAC signature, expiry, and parse payload
-        let payload = auth::verify_ticket(ticket_bytes, &self.hmac_secret)
+        // Verify Ed25519 signature, expiry, and parse payload
+        let payload = auth::verify_ticket(ticket_bytes, &self.flight_public_key)
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
         // Validate table name
@@ -364,7 +365,7 @@ impl FlightService for QiitaFlightService {
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
 
-        // replay: Flight action tokens are HMAC-authenticated but have NO
+        // replay: Flight action tokens are Ed25519-authenticated but have NO
         // single-use ledger — a captured, still-valid token can be replayed
         // within its lifetime. We accept that risk (see docs/auth.md and the
         // REPLAY_SAFE_ACTIONS registry) because every arm below is idempotent or
@@ -383,7 +384,7 @@ impl FlightService for QiitaFlightService {
 
         match action.r#type.as_str() {
             "register_files" => {
-                let payload = auth::verify_action(&action.body, &self.hmac_secret)
+                let payload = auth::verify_action(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "register_files" {
@@ -418,7 +419,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_reference" => {
-                let payload = auth::verify_delete_reference(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_reference(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_reference" {
@@ -453,7 +454,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_mask" => {
-                let payload = auth::verify_delete_mask(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_mask(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_mask" {
@@ -486,7 +487,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_pool_reads" => {
-                let payload = auth::verify_delete_pool_reads(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_pool_reads(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_pool_reads" {
@@ -521,8 +522,9 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_read_mask_block" => {
-                let payload = auth::verify_delete_read_mask_block(&action.body, &self.hmac_secret)
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                let payload =
+                    auth::verify_delete_read_mask_block(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_read_mask_block" {
                     return Err(Status::invalid_argument(format!(
@@ -555,7 +557,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_alignment" => {
-                let payload = auth::verify_delete_alignment(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_alignment(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_alignment" {
@@ -590,7 +592,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_alignment_block" => {
-                let payload = auth::verify_delete_alignment_block(&action.body, &self.hmac_secret)
+                let payload = auth::verify_delete_alignment_block(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_alignment_block" {
@@ -625,7 +627,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "export_read" => {
-                let payload = auth::verify_export_read(&action.body, &self.hmac_secret)
+                let payload = auth::verify_export_read(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "export_read" {
@@ -635,7 +637,7 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Defense in depth on the HMAC-trusted destination before it is
+                // Defense in depth on the signature-trusted destination before it is
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
@@ -666,7 +668,7 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "export_read_block" => {
-                let payload = auth::verify_export_read_block(&action.body, &self.hmac_secret)
+                let payload = auth::verify_export_read_block(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "export_read_block" {
@@ -683,7 +685,7 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                // Defense in depth on the HMAC-trusted destination before it is
+                // Defense in depth on the signature-trusted destination before it is
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
@@ -723,7 +725,7 @@ impl FlightService for QiitaFlightService {
             }
             "export_read_masked_block" => {
                 let payload =
-                    auth::verify_export_read_masked_block(&action.body, &self.hmac_secret)
+                    auth::verify_export_read_masked_block(&action.body, &self.flight_public_key)
                         .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "export_read_masked_block" {
@@ -788,7 +790,7 @@ impl FlightService for QiitaFlightService {
                 // (prep_sample_idx, mask_idx) authorization already covers it —
                 // no new ticket type or control-plane route is needed, the CLI
                 // sends the same signed bytes it would otherwise stream with.
-                let payload = auth::verify_ticket(&action.body, &self.hmac_secret)
+                let payload = auth::verify_ticket(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
                 if payload.table != "read_masked" {
                     return Err(Status::invalid_argument(format!(
@@ -823,7 +825,7 @@ impl FlightService for QiitaFlightService {
                 // ticket the CLI already holds), the block reconcile primitive
                 // runs control-plane-side and signs a first-class action token —
                 // so this arm verifies a `mask_metrics` payload, not a ticket.
-                let payload = auth::verify_mask_metrics(&action.body, &self.hmac_secret)
+                let payload = auth::verify_mask_metrics(&action.body, &self.flight_public_key)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
                 if payload.action != "mask_metrics" {
                     return Err(Status::invalid_argument(format!(
@@ -910,7 +912,7 @@ impl QiitaFlightService {
                 "FlightDescriptor.cmd is empty (expected signed DoPut ticket)",
             ));
         }
-        let payload = auth::verify_doput(&descriptor.cmd, &self.hmac_secret)
+        let payload = auth::verify_doput(&descriptor.cmd, &self.flight_public_key)
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
         if payload.action != "doput" {
             return Err(Status::invalid_argument(format!(
@@ -1247,7 +1249,7 @@ const EXPORT_READ_COLUMNS: &str =
     "prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2";
 
 /// Validate a control-plane-signed `export_read` destination before the data
-/// plane writes to it. The token is HMAC-trusted, so this is defense in depth:
+/// plane writes to it. The token is signature-trusted, so this is defense in depth:
 /// the dest must be absolute, contain no single quote (it is inlined into a
 /// DuckDB `COPY ... TO '<dest>'` literal), carry no `..`/prefix component, and
 /// resolve under the data plane's scratch root (the shared tree the control
@@ -1283,7 +1285,7 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
     Ok(path.to_path_buf())
 }
 
-/// Run a caller-supplied `select_sql` (an already-safe SELECT — HMAC-verified
+/// Run a caller-supplied `select_sql` (an already-safe SELECT — signature-verified
 /// inlined integers only) and materialize its rows into a Parquet at `dest`.
 /// Returns the row count.
 ///
@@ -1356,7 +1358,7 @@ fn export_select_to_parquet(
     // Write to a sibling temp, then publish atomically. `dest` is validated
     // (absolute, under the scratch root, no `..`, no single quote) and the
     // `.partial` suffix preserves all of that; the `select_sql` carries only
-    // HMAC-verified inlined integers — all safe to inline. Callers project the
+    // signature-verified inlined integers — all safe to inline. Callers project the
     // full `EXPORT_READ_COLUMNS` set in table order, so the file is a drop-in for
     // the durable staging copy (modulo row order, which does not matter).
     let tmp = {
@@ -1410,7 +1412,7 @@ fn export_select_to_parquet(
 
 /// Re-materialize one prep_sample's reads into a per-ticket `reads.parquet` a
 /// read-mask job consumes (the per-sample export). A sample with no stored reads
-/// writes NO file and returns 0. `prep_sample_idx` is an HMAC-verified i64, safe
+/// writes NO file and returns 0. `prep_sample_idx` is a signature-verified i64, safe
 /// to inline. See `export_select_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
     catalog_connstr: &str,
@@ -1446,7 +1448,7 @@ fn export_read_to_parquet(
 /// so the part of that sample living in a sibling block never leaks, independent
 /// of any tiling order or boundary-alignment invariant. The coarse pair is a
 /// superset of the OR, so `coarse AND exact == exact`. All member integers are
-/// HMAC-verified i64s, safe to inline. An empty `members` list writes no file and
+/// signature-verified i64s, safe to inline. An empty `members` list writes no file and
 /// returns 0 (the DoAction arm rejects it earlier too).
 fn export_read_block_to_parquet(
     catalog_connstr: &str,
@@ -1522,7 +1524,7 @@ fn export_read_masked_block_to_parquet(
 /// residual on the pruned rows, so a split member never leaks a sibling block's
 /// rows (independent of tiling order). The coarse pair is a superset of the OR,
 /// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
-/// all integers are HMAC-verified i64s, safe to inline.
+/// all integers are signature-verified i64s, safe to inline.
 fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
     let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
     preps.sort_unstable();
@@ -1555,7 +1557,7 @@ fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
 /// Pull exactly one i64 out of a ticket filter column. The count path needs a
 /// single `prep_sample_idx` / `mask_idx`, not an IN-set, so a missing, empty,
 /// multi-valued, or non-integer column is a malformed-ticket error — the export
-/// ticket always signs a one-element list per column. Input is HMAC-verified
+/// ticket always signs a one-element list per column. Input is signature-verified
 /// (set by the control plane), but we validate anyway for defense in depth.
 fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Status> {
     let values = filter.get(col).ok_or_else(|| {
@@ -1591,7 +1593,7 @@ fn count_masked_reads(
     mask_idx: i64,
 ) -> Result<i64, Status> {
     let conn = open_ducklake(catalog_connstr, data_path)?;
-    // `prep_sample_idx`/`mask_idx` are HMAC-verified i64s, safe to inline (same
+    // `prep_sample_idx`/`mask_idx` are signature-verified i64s, safe to inline (same
     // rationale as build_query: parsed integers reach SQL, no string data); the
     // 'pass' filter mirrors the read_masked view's privacy filter.
     let sql = format!(
@@ -1628,7 +1630,7 @@ fn mask_metrics_counts(
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
     let conn = open_ducklake(catalog_connstr, data_path)?;
-    // `mask_idx`/`prep_sample_idx` are HMAC-verified i64s, safe to inline (same
+    // `mask_idx`/`prep_sample_idx` are signature-verified i64s, safe to inline (same
     // rationale as count_masked_reads: parsed integers reach SQL, no string data).
     let sql = format!(
         "SELECT \
@@ -1679,7 +1681,7 @@ fn register_files(
     // (e.g. "reference_sequence_chunks/part_00000.parquet") to register
     // multiple parts under one DuckLake table, but must not contain
     // `..` or absolute components. Although `payload.files` is
-    // HMAC-signed by the control plane and so already trusted, this
+    // Ed25519-signed by the control plane and so already trusted, this
     // defense-in-depth check keeps the data plane's filesystem
     // contract independent of CP correctness.
     for filename in payload.files.keys() {
@@ -1971,7 +1973,7 @@ fn delete_mask(
 /// owns file lifecycle; orphan parquets are reclaimed by a future maintenance
 /// pass). Idempotent: an empty set, or a set whose rows are already gone,
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
-/// HMAC-signed payload, so inlining them into the `IN (...)` list carries no
+/// Ed25519-signed payload, so inlining them into the `IN (...)` list carries no
 /// injection surface and avoids per-row parameter binding for the large
 /// (hundreds of samples) pool case.
 fn delete_pool_reads(
@@ -2063,7 +2065,7 @@ fn delete_pool_reads(
 /// DuckLake owns file lifecycle). Idempotent: a fresh block (no rows yet) deletes
 /// 0. Empty `members` is a control-plane bug (the DoAction arm rejects it before
 /// this); guarded here too, returning a zero-count noop. All integers are
-/// HMAC-verified i64s, safe to inline.
+/// signature-verified i64s, safe to inline.
 fn delete_read_mask_block(
     catalog_connstr: &str,
     data_path: &str,
@@ -2320,7 +2322,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// - Table name: whitelist (`ALLOWED_TABLES`) — only known-safe values
 /// - Column names: whitelist (`ALLOWED_FILTER_COLUMNS`) — only known identifier columns
 /// - Values: parsed as i64 then stringified — no string data reaches SQL
-/// - All inputs are also HMAC-verified (set by the control plane, not the client)
+/// - All inputs are also signature-verified (set by the control plane, not the client)
 ///
 /// DuckDB does not support parameterized identifiers (table/column names), so
 /// whitelisting is the correct defense. Values could be parameterized but are
@@ -2329,6 +2331,24 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     let full_table = format!("qiita_lake.{table}");
 
     if filter.is_empty() {
+        // Defense-in-depth against a full-table read leak. `read_masked`
+        // exposes per-sample human read data; the control plane scopes each
+        // ticket to an explicit (prep_sample_idx, mask_idx) before signing, so
+        // an empty filter should never reach here. If the CP ever mis-signed,
+        // an empty filter would `SELECT *` every sample's pass-reads across all
+        // studies — refuse it. This rejects only the *empty* case, not every
+        // under-scoped one: a non-empty but non-scoping filter (e.g. feature_idx
+        // alone) still passes today. Making an unfiltered read opt-in via an
+        // allowlist, and requiring prep_sample_idx for read_masked, is a tracked
+        // durability follow-up.
+        // The reference_* tables are broadly readable by design (this mirrors
+        // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
+        // legitimate there — reject empty filters only for the read surface.
+        if table == "read_masked" {
+            return Err(Status::invalid_argument(
+                "read_masked requires a non-empty filter (refusing full-table read)",
+            ));
+        }
         return Ok((format!("SELECT * FROM {full_table}"), full_table));
     }
 
@@ -2342,7 +2362,7 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     let mut where_clauses = Vec::new();
     for (col, values) in filter {
         // Whitelist column names — all SQL is constructed from known-safe identifiers.
-        // Input is HMAC-verified (set by control plane), but we validate anyway for
+        // Input is signature-verified (set by control plane), but we validate anyway for
         // defense-in-depth.
         if !ALLOWED_FILTER_COLUMNS.contains(&col.as_str()) {
             return Err(Status::invalid_argument(format!(
@@ -3378,7 +3398,7 @@ mod tests {
 
     /// `register_files` rejects any filename that could escape the staging dir
     /// before it touches the filesystem or the catalog. `payload.files` is
-    /// HMAC-signed by the control plane, but this defense-in-depth check keeps
+    /// Ed25519-signed by the control plane, but this defense-in-depth check keeps
     /// the data plane's filesystem contract independent of CP correctness. A
     /// `..` (parent) or a rooted/absolute component must be refused; the check
     /// runs first, so a bogus connstr/data_path is never reached.
@@ -3410,7 +3430,7 @@ mod tests {
     // --- do_action dispatch trust checks (pure; no DuckDB) ---
 
     /// An action whose `Action.type` header disagrees with the signed
-    /// `payload.action` is rejected. `verify_action` succeeds (HMAC + shape are
+    /// `payload.action` is rejected. `verify_action` succeeds (signature + shape are
     /// valid), then the handler's discriminator check catches the mismatch — the
     /// two must agree so a token minted for one action can't be replayed under a
     /// different action header.
@@ -3422,7 +3442,7 @@ mod tests {
         // says delete_reference — sent under the register_files header.
         let payload =
             br#"{"action":"delete_reference","staging_dir":"/unused","files":{},"work_ticket_idx":1}"#;
-        let body = sign_raw(payload, b"dev-secret", future_expiry_secs(300));
+        let body = sign_raw(payload, &TEST_SEED, future_expiry_secs(300));
         let action = Action {
             r#type: "register_files".to_string(),
             body: body.into(),
@@ -4249,38 +4269,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_query_read_masked_rejects_empty_filter() {
+        // An empty filter on the human-read surface would SELECT * every
+        // sample's pass-reads across all studies — refuse it (the CP always
+        // scopes read_masked tickets, this is defense-in-depth).
+        let empty = auth::TicketFilter::new();
+        let result = build_query("read_masked", &empty);
+        assert!(
+            result.is_err(),
+            "empty filter on read_masked must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_reference_table_allows_empty_filter() {
+        // Reference tables are broadly readable by design (mirrors the
+        // anonymous REST reference GET), so an unfiltered SELECT is legitimate.
+        let empty = auth::TicketFilter::new();
+        let (sql, table) = build_query("reference_sequences", &empty)
+            .expect("empty filter on a reference table is allowed");
+        assert_eq!(table, "qiita_lake.reference_sequences");
+        assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
+    }
+
     // ------------------------------------------------------------------
     // DoPut handler tests
     // ------------------------------------------------------------------
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use hmac::{Hmac, Mac};
+    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use sha2::Sha256;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    type HmacSha256 = Hmac<Sha256>;
+    // Fixed test keypair; WRONG_SEED signs tickets that must NOT verify.
+    const TEST_SEED: [u8; 32] = [7u8; 32];
+    const WRONG_SEED: [u8; 32] = [9u8; 32];
 
-    fn sign_doput_for_test(upload_idx: i64, secret: &[u8], expiry: u64) -> Vec<u8> {
-        let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
-        sign_raw(payload.as_bytes(), secret, expiry)
+    fn test_vk() -> VerifyingKey {
+        SigningKey::from_bytes(&TEST_SEED).verifying_key()
     }
 
-    fn sign_raw(payload: &[u8], secret: &[u8], expiry: u64) -> Vec<u8> {
-        let version: u8 = 1;
+    fn sign_doput_for_test(upload_idx: i64, seed: &[u8; 32], expiry: u64) -> Vec<u8> {
+        let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
+        sign_raw(payload.as_bytes(), seed, expiry)
+    }
+
+    fn sign_raw(payload: &[u8], seed: &[u8; 32], expiry: u64) -> Vec<u8> {
+        let version: u8 = 2;
         let payload_len = (payload.len() as u32).to_be_bytes();
         let expiry_bytes = expiry.to_be_bytes();
-        let mac_input = [&[version][..], &payload_len[..], payload, &expiry_bytes[..]].concat();
-        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-        mac.update(&mac_input);
-        let hmac_result = mac.finalize().into_bytes();
+        let signed_input = [&[version][..], &payload_len[..], payload, &expiry_bytes[..]].concat();
+        let sig = SigningKey::from_bytes(seed).sign(&signed_input).to_bytes();
         let mut ticket = Vec::new();
         ticket.push(version);
         ticket.extend_from_slice(&payload_len);
         ticket.extend_from_slice(payload);
-        ticket.extend_from_slice(&hmac_result);
+        ticket.extend_from_slice(&sig);
         ticket.extend_from_slice(&expiry_bytes);
         ticket
     }
@@ -4336,7 +4384,7 @@ mod tests {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| staging_root.clone());
         QiitaFlightService::new(
-            b"dev-secret".to_vec(),
+            test_vk(),
             // catalog + data_path unused by DoPut path
             "dbname=unused host=localhost".to_string(),
             "/tmp/unused".to_string(),
@@ -4350,7 +4398,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let ticket = sign_doput_for_test(42, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(42, &TEST_SEED, future_expiry_secs(300));
         let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
 
         let result = service
@@ -4404,7 +4452,7 @@ mod tests {
             .unwrap()
             .as_secs()
             - 1000;
-        let ticket = sign_doput_for_test(1, b"dev-secret", expired);
+        let ticket = sign_doput_for_test(1, &TEST_SEED, expired);
         let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
 
         let err = service
@@ -4415,17 +4463,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn do_put_rejects_bad_hmac() {
+    async fn do_put_rejects_bad_signature() {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
         // Sign with a different secret than the service holds.
-        let ticket = sign_doput_for_test(1, b"wrong-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(1, &WRONG_SEED, future_expiry_secs(300));
         let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
 
         let err = service
             .do_put_inner(stream::iter(messages))
             .await
-            .expect_err("bad HMAC must be rejected");
+            .expect_err("bad signature must be rejected");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
@@ -4464,7 +4512,7 @@ mod tests {
     async fn do_put_interrupted_stream_leaves_no_parquet() {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
-        let ticket = sign_doput_for_test(99, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(99, &TEST_SEED, future_expiry_secs(300));
 
         // Build a valid first message (descriptor + schema), then yield an
         // Err mid-stream before any batch lands. The handler should
@@ -4497,7 +4545,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let ticket = sign_doput_for_test(7, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(7, &TEST_SEED, future_expiry_secs(300));
         let m1 = flight_stream_with_ticket(vec![sample_batch()], ticket.clone()).await;
         service
             .do_put_inner(stream::iter(m1))
@@ -4531,7 +4579,7 @@ mod tests {
         let service = make_service(tmp.path().to_path_buf());
 
         // First upload occupies upload_idx=88.
-        let t1 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let t1 = sign_doput_for_test(88, &TEST_SEED, future_expiry_secs(300));
         let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
         service
             .do_put_inner(stream::iter(m1))
@@ -4543,7 +4591,7 @@ mod tests {
         // Second DoPut to the same idx: keep only the schema frame, then inject a
         // mid-stream error. The writer hits AlreadyExists on create_new while the
         // decoder surfaces the error, exercising the precedence.
-        let t2 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let t2 = sign_doput_for_test(88, &TEST_SEED, future_expiry_secs(300));
         let mut m2 = flight_stream_with_ticket(vec![sample_batch()], t2).await;
         m2.truncate(1);
         m2.push(Err(Status::internal("simulated mid-stream drop")));
@@ -4579,8 +4627,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let t1 = sign_doput_for_test(1, b"dev-secret", future_expiry_secs(300));
-        let t2 = sign_doput_for_test(2, b"dev-secret", future_expiry_secs(300));
+        let t1 = sign_doput_for_test(1, &TEST_SEED, future_expiry_secs(300));
+        let t2 = sign_doput_for_test(2, &TEST_SEED, future_expiry_secs(300));
         let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
         let m2 = flight_stream_with_ticket(vec![sample_batch()], t2).await;
 
@@ -4604,7 +4652,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = make_service(tmp.path().to_path_buf());
 
-        let ticket = sign_doput_for_test(55, b"dev-secret", future_expiry_secs(300));
+        let ticket = sign_doput_for_test(55, &TEST_SEED, future_expiry_secs(300));
         let batches = vec![sample_batch(), sample_batch(), sample_batch()];
         let messages = flight_stream_with_ticket(batches, ticket).await;
 

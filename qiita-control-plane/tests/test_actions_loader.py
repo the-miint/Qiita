@@ -178,6 +178,76 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
 
 
+def test_load_actions_loads_on_disk_long_read_assembly_yaml():
+    """The on-disk `workflows/long-read-assembly/1.0.0.yaml` loads as a valid
+    ActionDefinition with the per-sample assembly→MAG shape:
+
+      * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
+        for the masked read_masked pass-set to assemble);
+      * the step chain is assembly_run_config (module) → assemble → binning →
+        bin_refine → checkm (four container steps) → assembly_hash (module) →
+        mint-features → write-assembly-membership → assembly_load (module) →
+        register-files, in that order — the storage tail reuses the reference-add
+        primitives;
+      * each of the four heavy tools has its OWN per-tool SIF + entrypoint — the
+        packaging the multi-SIF-per-workflow-dir build tooling supports;
+      * assembly_run_config threads the `assembler` scalar and assembly_load
+        threads `processing_idx` via params (a container step can't take a scalar
+        param — the runner treats it as a bind path).
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "long-read-assembly" in by_id, "workflows/long-read-assembly/1.0.0.yaml must load"
+    assembly = by_id["long-read-assembly"]
+
+    assert assembly.target_kind == ScopeTargetKind.PREP_SAMPLE
+    assert assembly.version == "1.0.0"
+    assert assembly.context_schema["required"] == ["mask_idx"]
+
+    assert [s.name for s in assembly.steps] == [
+        "assembly_run_config",
+        "assemble",
+        "binning",
+        "bin_refine",
+        "checkm",
+        "assembly_hash",
+        "mint-features",
+        "write-assembly-membership",
+        "assembly_load",
+        "register-files",
+    ]
+
+    export_step = next(s for s in assembly.steps if s.name == "assembly_run_config")
+    assert export_step.module == "qiita_compute_orchestrator.jobs.assembly_run_config"
+    assert export_step.params == {"assembler": "assembler"}
+    hash_step = next(s for s in assembly.steps if s.name == "assembly_hash")
+    assert hash_step.module == "qiita_compute_orchestrator.jobs.assembly_hash"
+    load_step = next(s for s in assembly.steps if s.name == "assembly_load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.assembly_load"
+    # assembly_load threads processing_idx via params so the runner mints the run
+    # identity before the step loop; write-assembly-membership then reads it.
+    assert load_step.params == {"processing_idx": "processing_idx"}
+
+    # One per-tool image per container step (assemble / binning / bin_refine /
+    # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
+    container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
+    assert len(container_steps) == 4
+    assert {s.container for s in container_steps} == {
+        "long-read-assembly-assemble-1.0.0.sif",
+        "long-read-assembly-binning-1.0.0.sif",
+        "long-read-assembly-dastool-1.0.0.sif",
+        "long-read-assembly-checkm-1.0.0.sif",
+    }
+    assert len({s.entrypoint for s in container_steps}) == 4
+
+
 def test_load_actions_loads_on_disk_host_reference_add_yaml():
     """The actual on-disk `workflows/host-reference-add/1.0.0.yaml` loads as a
     valid ActionDefinition with the host-indexing shape:

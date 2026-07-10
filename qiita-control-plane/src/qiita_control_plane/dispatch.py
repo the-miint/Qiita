@@ -84,7 +84,7 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fal
             work_ticket_idx,
             app.state.pool,
             app.state.compute_backend_client,
-            hmac_secret=app.state.settings.hmac_secret_key,
+            signing_key=app.state.settings.flight_signing_key,
             data_plane_url=app.state.settings.data_plane_url,
             work_ticket_workspace_root=workspace_root,
             upload_staging_root=upload_staging_root,

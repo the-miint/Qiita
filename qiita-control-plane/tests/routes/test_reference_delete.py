@@ -24,20 +24,20 @@ def _stub_data_plane(monkeypatch):
     `delete_reference_data(...)` call is the no-op, leaving the Postgres
     teardown (the thing under test) intact."""
 
-    async def _noop(*, reference_idx, hmac_secret, data_plane_url):
+    async def _noop(*, reference_idx, signing_key, data_plane_url):
         return {"reference_idx": reference_idx}
 
     monkeypatch.setattr("qiita_control_plane.routes.reference.delete_reference_data", _noop)
 
 
 def _install_settings(app):
-    """Minimal Settings so get_hmac_secret / get_data_plane_url resolve. The
+    """Minimal Settings so get_flight_signing_key / get_data_plane_url resolve. The
     data-plane URL is never dialed — `delete_reference_data` is stubbed."""
     from qiita_control_plane.config import Settings
 
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
     )
 
@@ -351,7 +351,7 @@ async def test_delete_reference_data_plane_failure_returns_502(client, postgres_
 
     ref_idx = await _create_ref(client, f"del-502-{uuid.uuid4()}")
 
-    async def _boom(*, reference_idx, hmac_secret, data_plane_url):
+    async def _boom(*, reference_idx, signing_key, data_plane_url):
         raise flight.FlightUnavailableError("data plane down")
 
     monkeypatch.setattr("qiita_control_plane.routes.reference.delete_reference_data", _boom)

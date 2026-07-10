@@ -23,10 +23,20 @@ from qiita_common.api_paths import LOOPBACK_HOST
 @pytest.fixture(autouse=True)
 def _workspace_root_env(monkeypatch):
     """Settings.from_env() (called by several AuthRocket tests below)
-    requires PATH_SCRATCH and CONTACT_EMAIL. Set defaults so those tests
-    can focus on the OIDC surface they actually care about."""
+    requires PATH_SCRATCH, CONTACT_EMAIL, FLIGHT_TICKET_SIGNING_KEY, and
+    LOGIN_COOKIE_SECRET_KEY. Set defaults so those tests can focus on the OIDC
+    surface they actually care about."""
+    import base64
+    import secrets
+
     monkeypatch.setenv("PATH_SCRATCH", "/tmp/qiita-test-scratch-unused")
     monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
+    monkeypatch.setenv(
+        "FLIGHT_TICKET_SIGNING_KEY", base64.b64encode(secrets.token_bytes(32)).decode()
+    )
+    monkeypatch.setenv(
+        "LOGIN_COOKIE_SECRET_KEY", base64.b64encode(secrets.token_bytes(32)).decode()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +59,12 @@ class JwksHarness:
         self._jwks = self._build_jwks(self._private_key, self._kid)
         self._server = HTTPServer((LOOPBACK_HOST, 0), self._make_handler())
         self.port = self._server.server_address[1]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # poll_interval bounds how long shutdown() waits for the serve_forever
+        # loop to notice the stop flag; the 0.5s default added ~0.5s of pure
+        # wall-clock wait to every teardown that takes this fixture.
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, args=(0.01,), daemon=True
+        )
         self._thread.start()
 
     @property
@@ -442,13 +457,6 @@ def test_authrocket_verifier_fails_fast_on_missing_settings(monkeypatch):
     """from_settings raises when required AUTHROCKET_* env vars aren't populated.
     AUTHROCKET_AUDIENCE is no longer required (LoginRocket Web emits no `aud`)."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
-    import base64
-    import secrets as _secrets
-
-    monkeypatch.setenv(
-        "HMAC_SECRET_KEY",
-        base64.b64encode(_secrets.token_bytes(32)).decode(),
-    )
     monkeypatch.delenv("AUTHROCKET_ISSUER", raising=False)
     monkeypatch.delenv("AUTHROCKET_AUDIENCE", raising=False)
     monkeypatch.delenv("AUTHROCKET_JWKS_URL", raising=False)
@@ -466,13 +474,6 @@ def test_authrocket_verifier_constructs_when_all_env_set(monkeypatch, jwks_harne
     Includes AUTHROCKET_AUDIENCE for the OIDC-with-aud case (e.g. an OAuth2
     Server integration on a higher AuthRocket plan tier)."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
-    import base64
-    import secrets as _secrets
-
-    monkeypatch.setenv(
-        "HMAC_SECRET_KEY",
-        base64.b64encode(_secrets.token_bytes(32)).decode(),
-    )
     monkeypatch.setenv("AUTHROCKET_ISSUER", jwks_harness.issuer)
     monkeypatch.setenv("AUTHROCKET_AUDIENCE", _TEST_AUDIENCE)
     monkeypatch.setenv("AUTHROCKET_JWKS_URL", jwks_harness.jwks_url)
@@ -492,13 +493,6 @@ def test_authrocket_verifier_constructs_when_audience_unset(monkeypatch, jwks_ha
     """LoginRocket Web realm: AUTHROCKET_AUDIENCE unset, verifier still
     constructs and accepts tokens that lack the `aud` claim."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
-    import base64
-    import secrets as _secrets
-
-    monkeypatch.setenv(
-        "HMAC_SECRET_KEY",
-        base64.b64encode(_secrets.token_bytes(32)).decode(),
-    )
     monkeypatch.setenv("AUTHROCKET_ISSUER", jwks_harness.issuer)
     monkeypatch.delenv("AUTHROCKET_AUDIENCE", raising=False)
     monkeypatch.setenv("AUTHROCKET_JWKS_URL", jwks_harness.jwks_url)

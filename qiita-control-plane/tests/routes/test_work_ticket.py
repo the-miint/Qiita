@@ -70,7 +70,7 @@ async def wt_client(postgres_pool, stub_compute_backend_client):
     app.state.oidc_verifier = None
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
     )
     app.state.compute_backend_client = stub_compute_backend_client

@@ -476,6 +476,66 @@ def test_build_inputs_hash_survives_unreadable_cwd(tmp_path: Path) -> None:
     assert result.stdout.strip() == expected
 
 
+# --- qiita_sif_build_inputs_hash_scoped: the per-tool-image variant. Hashes an
+# EXPLICIT file list + _shared instead of the whole workflow dir, so an edit to a
+# sibling tool's def/entrypoint leaves this image's stamp unchanged (the rebuild
+# granularity the multi-image split delivers). ------------------------------------
+
+
+def _call_scoped_hash(repo_root: Path, shared: Path, files: list[Path]) -> str:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{_COMMON}"; qiita_sif_build_inputs_hash_scoped "$@"',
+            "_",
+            str(repo_root),
+            str(shared),
+            *[str(f) for f in files],
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_scoped_hash_is_deterministic(tmp_path: Path) -> None:
+    wf, shared = _make_workflow_tree(tmp_path)
+    files = [wf / "Apptainer.def", wf / "entrypoint.sh"]
+    assert _call_scoped_hash(tmp_path, shared, files) == _call_scoped_hash(tmp_path, shared, files)
+
+
+def test_scoped_hash_changes_when_a_listed_input_edits(tmp_path: Path) -> None:
+    wf, shared = _make_workflow_tree(tmp_path)
+    files = [wf / "Apptainer.def", wf / "entrypoint.sh"]
+    before = _call_scoped_hash(tmp_path, shared, files)
+    (wf / "entrypoint.sh").write_text("#!/bin/sh\necho changed\n")
+    assert _call_scoped_hash(tmp_path, shared, files) != before
+
+
+def test_scoped_hash_ignores_files_not_in_its_input_set(tmp_path: Path) -> None:
+    """The whole point of scoping: a sibling tool's file (present in the workflow
+    dir but NOT in this image's declared input list) must NOT change the digest —
+    that is what lets one tool's image rebuild independently of the others."""
+    wf, shared = _make_workflow_tree(tmp_path)
+    files = [wf / "Apptainer.def", wf / "entrypoint.sh"]
+    before = _call_scoped_hash(tmp_path, shared, files)
+    (wf / "sibling-tool.def").write_text("Bootstrap: docker\nFrom: oraclelinux:9\n")
+    (wf / "sibling.sh").write_text("#!/bin/sh\necho sibling\n")
+    assert _call_scoped_hash(tmp_path, shared, files) == before
+
+
+def test_scoped_hash_changes_on_shared_edit(tmp_path: Path) -> None:
+    """_shared/ is always in scope (every image %files-copies manifest_writer.py),
+    so a change there rebuilds every image — the intended fan-out."""
+    wf, shared = _make_workflow_tree(tmp_path)
+    files = [wf / "Apptainer.def", wf / "entrypoint.sh"]
+    before = _call_scoped_hash(tmp_path, shared, files)
+    (shared / "manifest_writer.py").write_text("x = 2\n")
+    assert _call_scoped_hash(tmp_path, shared, files) != before
+
+
 # --- qiita_sif_missing_sources: gates whether build-sifs.sh SKIPS an image whose
 # licensed artifact isn't staged. rc 0 = all present, 1 = some missing (echoed). --
 

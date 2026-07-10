@@ -9,6 +9,18 @@
 # forbids hand-rolled `scripts/build-*-sif.sh`, so new workflows are forced
 # through this path.
 #
+# Two spec layouts, both handled here (a workflow uses one OR the other):
+#   * SINGLE image (legacy, unchanged): workflows/<wf>/sif-build.env builds
+#     workflows/<wf>/Apptainer.def into one SIF. Invoke: `build-sif.sh <wf>`.
+#   * MULTI image (per-tool): workflows/<wf>/sif-build.d/<image>.env each
+#     builds its own def (DEF_FILE, relative to the workflow dir) into its own
+#     SIF, so one workflow can ship N single-tool images that rebuild
+#     independently. Invoke: `build-sif.sh <wf> <image>`. The entrypoints and
+#     shared _lib.sh stay at the workflow root and each def %files-copies just
+#     the ones it needs; the whole workflow tree is staged so those relative
+#     paths still resolve. A multi spec declares HASH_INPUTS (its own build
+#     inputs) so the idempotency hash is scoped to that image alone (see below).
+#
 # Critically, the build runs in a temp build root OWNED BY THE INVOKING
 # USER — the in-repo checkout is only ever READ. That lets a locked-down
 # service account (e.g. qiita-orch on the deploy host) build without write
@@ -31,12 +43,13 @@
 #   * `apptainer` is on PATH.
 #
 # Usage:
-#   PATH_DERIVED=/scratch/persistent bash scripts/build-sif.sh <workflow>
+#   PATH_DERIVED=/scratch/persistent bash scripts/build-sif.sh <workflow> [<image>]
 set -euo pipefail
 
 WORKFLOW="${1:-}"
+IMAGE="${2:-}"
 if [[ -z "${WORKFLOW}" ]]; then
-    echo "usage: PATH_DERIVED=<root> bash scripts/build-sif.sh <workflow>" >&2
+    echo "usage: PATH_DERIVED=<root> bash scripts/build-sif.sh <workflow> [<image>]" >&2
     exit 64
 fi
 
@@ -44,8 +57,15 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$( cd "${SCRIPT_DIR}/.." && pwd )"
 WORKFLOW_DIR="${REPO_ROOT}/workflows/${WORKFLOW}"
 SHARED_DIR="${REPO_ROOT}/workflows/_shared"
-SPEC="${WORKFLOW_DIR}/sif-build.env"
-DEF="${WORKFLOW_DIR}/Apptainer.def"
+
+# Resolve the spec: legacy single (workflows/<wf>/sif-build.env) vs. a named
+# per-tool image (workflows/<wf>/sif-build.d/<image>.env). The def to build and
+# the idempotency-hash scope are derived from the spec after it is sourced.
+if [[ -n "${IMAGE}" ]]; then
+    SPEC="${WORKFLOW_DIR}/sif-build.d/${IMAGE}.env"
+else
+    SPEC="${WORKFLOW_DIR}/sif-build.env"
+fi
 
 # Reach over to the deploy/ shared shell helpers for qiita_sif_build_inputs_hash
 # (pure; no side effects on source — see its header). Keeps the hash logic in one
@@ -54,19 +74,18 @@ DEF="${WORKFLOW_DIR}/Apptainer.def"
 source "${REPO_ROOT}/deploy/_common.sh"
 
 if [[ ! -f "${SPEC}" ]]; then
-    echo "No sif-build.env for workflow '${WORKFLOW}' at:" >&2
+    echo "No sif build spec for workflow '${WORKFLOW}'${IMAGE:+ image '${IMAGE}'} at:" >&2
     echo "  ${SPEC}" >&2
     echo "A container workflow opts into the generic SIF build by adding one." >&2
     exit 64
 fi
-if [[ ! -f "${DEF}" ]]; then
-    echo "Missing ${DEF}" >&2
-    exit 64
-fi
 
-# Per-workflow declarative spec. Required keys: SIF_FILENAME, VERIFY_CMD,
-# VERIFY_MATCH. Optional: SOURCES (space-separated licensed/vendored
-# artifacts staged from images/sources next to the def).
+# Per-image declarative spec. Required keys: SIF_FILENAME, VERIFY_CMD,
+# VERIFY_MATCH. Optional: SOURCES (space-separated licensed/vendored artifacts
+# staged from images/sources next to the def); DEF_FILE (the def to build,
+# relative to the workflow dir — defaults to Apptainer.def, the legacy name);
+# HASH_INPUTS (space-separated workflow-relative files that are THIS image's
+# build inputs — set by multi-image specs to scope the idempotency hash).
 # shellcheck source=/dev/null
 source "${SPEC}"
 for var in SIF_FILENAME VERIFY_CMD VERIFY_MATCH; do
@@ -75,6 +94,12 @@ for var in SIF_FILENAME VERIFY_CMD VERIFY_MATCH; do
         exit 64
     fi
 done
+
+DEF="${WORKFLOW_DIR}/${DEF_FILE:-Apptainer.def}"
+if [[ ! -f "${DEF}" ]]; then
+    echo "Missing ${DEF} (DEF_FILE=${DEF_FILE:-Apptainer.def} declared by ${SPEC})" >&2
+    exit 64
+fi
 
 if [[ -z "${PATH_DERIVED:-}" ]]; then
     echo "PATH_DERIVED is not set; set it to the derived-artifact FS root" >&2
@@ -121,10 +146,29 @@ SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"
 # qiita_sif_build_inputs_hash in deploy/_common.sh.
 HASH_PATH="${SIF_PATH}.buildhash"
 
-# Content hash of the in-repo build inputs (qiita_sif_build_inputs_hash, in
-# deploy/_common.sh): a changed def/entrypoint/manifest changes it and so triggers
-# a rebuild below, while a re-vendored SOURCES (deliberately excluded) does not.
-WANT_HASH="$(qiita_sif_build_inputs_hash "${REPO_ROOT}" "${WORKFLOW_DIR}" "${SHARED_DIR}")"
+# Content hash of the in-repo build inputs (in deploy/_common.sh): a changed
+# def/entrypoint/manifest changes it and so triggers a rebuild below, while a
+# re-vendored SOURCES (deliberately excluded) does not.
+#
+# A multi-image spec declares HASH_INPUTS (its own def + entrypoint(s) + any
+# shared helper it %files-copies, workflow-relative) so the hash is scoped to
+# THIS image — an edit to a sibling tool's def then leaves this image's stamp
+# unchanged and skips its rebuild. Without HASH_INPUTS (the legacy single-image
+# case) the whole workflow dir is hashed, exactly as before.
+if [[ -n "${HASH_INPUTS:-}" ]]; then
+    hash_files=("${DEF}")
+    for rel in ${HASH_INPUTS}; do
+        f="${WORKFLOW_DIR}/${rel}"
+        if [[ ! -f "${f}" ]]; then
+            echo "${SPEC} lists HASH_INPUTS entry '${rel}' but ${f} does not exist" >&2
+            exit 64
+        fi
+        hash_files+=("${f}")
+    done
+    WANT_HASH="$(qiita_sif_build_inputs_hash_scoped "${REPO_ROOT}" "${SHARED_DIR}" "${hash_files[@]}")"
+else
+    WANT_HASH="$(qiita_sif_build_inputs_hash "${REPO_ROOT}" "${WORKFLOW_DIR}" "${SHARED_DIR}")"
+fi
 
 # Idempotency check: if a SIF already exists AND satisfies VERIFY_MATCH,
 # leave it alone. `apptainer exec` runs the embedded binary in a fresh
@@ -173,7 +217,7 @@ rm -rf "${BUILD_ROOT}/_shared/__pycache__"
 for f in "${WORKFLOW_DIR}"/*; do
     base="$(basename "${f}")"
     case "${base}" in
-        sif-build.env|.gitignore|__pycache__|*.sif|*.rpm) continue ;;
+        sif-build.env|sif-build.d|.gitignore|__pycache__|*.sif|*.rpm) continue ;;
     esac
     cp -R "${f}" "${BUILD_WF_DIR}/${base}"
 done
@@ -193,9 +237,10 @@ done
 
 # apptainer build --force overwrites any leftover SIF in $IMAGES_DIR.
 # Run from the staged workflow dir so the relative paths in the def resolve.
+# DEF_FILE is workflow-dir-relative, so it names the staged def directly.
 (
     cd "${BUILD_WF_DIR}"
-    apptainer build --force "${SIF_PATH}" Apptainer.def
+    apptainer build --force "${SIF_PATH}" "${DEF_FILE:-Apptainer.def}"
 )
 
 # Re-verify after build so a build that silently produced a broken SIF

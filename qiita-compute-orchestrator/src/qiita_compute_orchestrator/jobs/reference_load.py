@@ -52,11 +52,15 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
     PARQUET_OPTS,
-    PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
+)
+from ._feature_load import (
+    build_feature_id_map,
+    write_feature_sequence_chunks,
+    write_feature_sequences,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -72,20 +76,6 @@ YAML_STEP_NAME = "load"
 # co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 31
 _DUCKDB_THREADS = 8
-
-# Per-batch chunk budget for `_write_reference_sequence_chunks`. The
-# writer streams chunk_data straight to the Parquet writer (no sort — see
-# that function), so per-batch memory is ~constant in file size no matter
-# this value; the budget instead bounds each output part's SIZE. Each
-# batch is a contiguous feature_idx range (bin-packed ascending), so a
-# part's feature_idx min/max drives DuckLake FILE-level pruning — a
-# smaller budget makes those ranges narrower (finer pruning) at the cost
-# of more parts and more full-glob sequence_hash re-scans. Bin-packing by
-# chunk-count (not feature-count) keeps part sizes even on GG2 backbone
-# where feature sizes span 3+ orders of magnitude. Reduced from 50_000
-# once the per-batch sort was removed: memory no longer caps it, so it is
-# sized for pruning granularity.
-_CHUNK_BUDGET_PER_BATCH = 10_000
 
 
 class Inputs(BaseModel):
@@ -166,7 +156,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Pull feature_map into a TEMP TABLE once — every downstream
             # write JOINs against it (sequences, chunks, membership) and
-            # _build_id_map needs it too. Without this each helper would
+            # build_feature_id_map needs it too. Without this each helper would
             # re-scan the file.
             conn.execute(
                 "CREATE TEMP TABLE feature_map AS SELECT * FROM read_parquet(?)",
@@ -177,12 +167,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # taxonomy / phylogeny / placements writes all key off
             # read_id, so this single JOIN is the bridge to feature_idx.
             # Counts also drive the unmapped-hash check below.
-            _build_id_map(conn, inputs.manifest)
+            build_feature_id_map(conn, inputs.manifest)
 
-            _write_reference_sequences(conn, sequences_out)
+            write_feature_sequences(conn, sequences_out)
             written.append(sequences_path)
 
-            _write_reference_sequence_chunks(
+            write_feature_sequence_chunks(
                 conn,
                 inputs.reference_sequence_chunks,
                 chunks_dir,
@@ -241,7 +231,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # top-level subdirs of `part_*.parquet` (multi-file tables).
     #
     # `reference_sequence_chunks` re-exposes the feature-keyed chunks dir
-    # (written by `_write_reference_sequence_chunks` above) as its own binding.
+    # (written by `write_feature_sequence_chunks` above) as its own binding.
     # The hash_sequences step's same-named binding is sequence_hash-keyed
     # (pre-minting); this is the feature_idx-keyed re-key, which is what rype
     # needs. host-reference-add's build_rype_index step consumes it — and must
@@ -281,195 +271,6 @@ def _unwrap_chunks_to_temp_file(
     if out_path.stat().st_size == 0:
         raise ValueError(f"{parquet_path} produced an empty file — upload was malformed")
     return out_path
-
-
-def _build_id_map(
-    conn: duckdb.DuckDBPyConnection,
-    manifest_path: Path,
-) -> None:
-    """Join manifest + feature_map (TEMP TABLE pre-loaded by execute) on
-    sequence_hash. Raises ValueError if any manifest row lacks a matching
-    feature_map row — mint-features is supposed to mint a feature_idx for
-    every distinct hash, so a gap means upstream produced inconsistent
-    inputs (permanent error)."""
-    manifest_count = conn.execute(
-        "SELECT count(*) FROM read_parquet(?)",
-        [str(manifest_path)],
-    ).fetchone()[0]
-
-    conn.execute(
-        "CREATE TEMP TABLE id_map AS "
-        "SELECT m.read_id, fm.feature_idx,"
-        "  m.sequence_hash,"
-        "  m.sequence_length_bp "
-        "FROM read_parquet(?) m "
-        "JOIN feature_map fm "
-        "  ON m.sequence_hash = fm.sequence_hash",
-        [str(manifest_path)],
-    )
-
-    id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
-    if id_map_count != manifest_count:
-        n_unmapped = manifest_count - id_map_count
-        unmapped = conn.execute(
-            "SELECT m.sequence_hash FROM read_parquet(?) m "
-            "ANTI JOIN id_map x ON m.sequence_hash = x.sequence_hash "
-            "LIMIT 10",
-            [str(manifest_path)],
-        ).fetchall()
-        hashes = [str(r[0]) for r in unmapped]
-        raise ValueError(f"{n_unmapped} unmapped sequence hash(es) in feature_map: {hashes}")
-
-
-def _write_reference_sequences(
-    conn: duckdb.DuckDBPyConnection,
-    out: str,
-) -> None:
-    """Emit DuckLake's `reference_sequences` shape — one row per unique
-    feature_idx with `(feature_idx, sequence_hash, sequence_length_bp)`.
-    Pulls everything from id_map (which already carries the per-read
-    triple from the manifest × feature_map JOIN); reads sharing a
-    canonical hash all carry the same length, so DISTINCT ON
-    feature_idx collapses them deterministically."""
-    conn.execute(
-        "COPY ("
-        "  SELECT DISTINCT ON (feature_idx)"
-        "    feature_idx, sequence_hash, sequence_length_bp"
-        "  FROM id_map"
-        "  ORDER BY feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})"
-    )
-
-
-def _write_reference_sequence_chunks(
-    conn: duckdb.DuckDBPyConnection,
-    reference_sequence_chunks_path: Path,
-    out_dir: Path,
-) -> None:
-    """Re-key hash_sequences' chunks (hash-keyed) to DuckLake's
-    `reference_sequence_chunks` schema (feature_idx-keyed), as a
-    DIRECTORY of `part_*.parquet` files.
-
-    `reference_sequence_chunks_path` (input) is a DIRECTORY of
-    `part_*.parquet` files written by hash_sequences. Read via glob.
-
-    `out_dir` (output) likewise becomes a directory of part files.
-    The runner's register-files convention picks up this directory as
-    a multi-file DuckLake table (table name = `reference_sequence_chunks`).
-
-    **Never sort chunk_data — stream it.** This matches hash_sequences,
-    which writes the same table shape upstream. A whole-file — or even a
-    per-batch — `ORDER BY` over 64 KB `chunk_data` rows OOMs DuckDB's caps:
-    the sort is a pipeline breaker that buffers the fat rows and can't
-    spill them (`memory_limit` is a soft target it overshoots on
-    wide-string sorts). An earlier version sorted each batch and OOM'd at
-    GG2 scale even after batching, because the parallel sort's working set
-    ballooned far past the ~3.2 GB batch input. So each part is a SINGLE
-    streaming COPY: the narrow `fmb` CTE (this batch's feature_map subset)
-    is the hash-join BUILD side and `chunk_data` rides the PROBE straight
-    to the writer — never buffered into a build side or a sort. Peak
-    memory is ~1 GB/thread, constant in file size.
-
-    **Batched for pruning, not for memory.** Bin-pack features by chunk
-    count into batches walking feature_idx ASCENDING, one `part_NNNNN`
-    per batch. Because the batches are disjoint, contiguous feature_idx
-    ranges, each part's feature_idx min/max drives DuckLake catalog-level
-    FILE pruning (a `WHERE feature_idx IN (...)` DoGet reads only the parts
-    whose range overlaps). There is deliberately NO within-part ordering:
-    reassembly sorts `chunk_index` in memory per feature and DoGet filters
-    by feature_idx, so on-disk order is not load-bearing — which is why
-    `_CHUNK_BUDGET_PER_BATCH` is kept small, to keep the per-part ranges
-    narrow (finer file pruning) rather than to bound a sort.
-
-    **Memory safety of the re-key.** The `fmb` CTE pre-filters feature_map
-    to the batch's hashes, so it (not the 30 GB glob) is the hash-join
-    build side; the `WHERE rc.sequence_hash = ANY(?)` keeps the filter on
-    the Parquet scan so late materialisation skips chunk_data for
-    non-matching rows.
-
-    **Cost tradeoff.** Each batch re-scans the input glob filtered by hash.
-    Total chunk_data I/O is constant (each chunk matches exactly one
-    batch); only the narrow sequence_hash column is re-read per batch, so
-    more (smaller) batches cost little beyond extra part files."""
-    parts_glob = str(reference_sequence_chunks_path / "part_*.parquet")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Metadata scan: (feature_idx, sequence_hash, n_chunks) ordered by
-    # feature_idx. Only sequence_hash is read from the input Parquet —
-    # columnar storage makes the count(*) cheap (~1-2 sec) even though
-    # the input is ~30 GB total. JOIN with the small feature_map TEMP
-    # TABLE attaches feature_idx; defensive against any hash without a
-    # mint (every input hash should have one via _build_id_map's gap
-    # check, but this keeps the count semantically correct).
-    rows = conn.execute(
-        "SELECT fm.feature_idx, rc.sequence_hash, count(*) AS n_chunks "
-        "FROM read_parquet(?) rc "
-        "JOIN feature_map fm ON rc.sequence_hash = fm.sequence_hash "
-        "GROUP BY rc.sequence_hash, fm.feature_idx "
-        "ORDER BY fm.feature_idx",
-        [parts_glob],
-    ).fetchall()
-
-    # Each batch is a list of sequence_hash strings to filter on. Bin-pack
-    # in feature_idx order so each output part is a disjoint, contiguous
-    # feature_idx range — that range (its Parquet min/max) is what drives
-    # DuckLake FILE-level pruning.
-    batches: list[list[str]] = []
-    current_batch: list[str] = []
-    current_chunks = 0
-    for _feature_idx, sequence_hash, n_chunks in rows:
-        if current_batch and current_chunks + n_chunks > _CHUNK_BUDGET_PER_BATCH:
-            batches.append(current_batch)
-            current_batch = []
-            current_chunks = 0
-        current_batch.append(str(sequence_hash))
-        current_chunks += n_chunks
-    if current_batch:
-        batches.append(current_batch)
-
-    if batches:
-        for i, batch_hashes in enumerate(batches):
-            part_path = out_dir / f"part_{i:05d}.parquet"
-            part_out = validate_parquet_path(part_path)
-            # SINGLE streaming COPY, re-keyed hash → feature_idx, with NO
-            # write-time ORDER BY — chunk_data must never go through a sort
-            # (see the docstring; this is the hash_sequences pattern). The
-            # `fmb` CTE (this batch's feature_map subset) is the narrow
-            # hash-join BUILD side, so chunk_data rides the PROBE straight
-            # to the writer, never buffered into a build side or a sort. The
-            # `WHERE ... = ANY(...)` on the input column keeps the filter on
-            # the Parquet scan so late materialisation skips chunk_data for
-            # non-matching rows.
-            conn.execute(
-                "COPY ("
-                "  WITH fmb AS ("
-                "    SELECT feature_idx, sequence_hash"
-                "    FROM feature_map"
-                "    WHERE sequence_hash = ANY(CAST(? AS UUID[]))"
-                "  )"
-                "  SELECT fmb.feature_idx, rc.chunk_index, rc.chunk_data"
-                "  FROM read_parquet(?) rc"
-                "  JOIN fmb ON rc.sequence_hash = fmb.sequence_hash"
-                "  WHERE rc.sequence_hash = ANY(CAST(? AS UUID[]))"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
-                [batch_hashes, parts_glob, batch_hashes],
-            )
-    else:
-        # No minted features → emit one empty part so the directory is
-        # non-empty and the runner's `dir.glob('*.parquet')` discovers
-        # the multi-file table. register-files would otherwise error
-        # on a zero-file directory.
-        empty_part = out_dir / "part_00000.parquet"
-        empty_out = validate_parquet_path(empty_part)
-        conn.execute(
-            "COPY ("
-            "  SELECT"
-            "    CAST(NULL AS BIGINT) AS feature_idx,"
-            "    CAST(NULL AS INTEGER) AS chunk_index,"
-            "    CAST(NULL AS VARCHAR) AS chunk_data"
-            "  WHERE FALSE"
-            f") TO '{empty_out}' ({PARQUET_OPTS_CHUNKED})"
-        )
 
 
 def _write_reference_membership(

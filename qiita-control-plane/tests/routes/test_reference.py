@@ -512,7 +512,7 @@ async def doget_ctx(postgres_pool, compute_worker_service_account):
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=_DOGET_HMAC_SECRET,
+        flight_signing_key=_DOGET_HMAC_SECRET,
         data_plane_url="unused",
     )
 
@@ -606,7 +606,7 @@ async def test_doget_missing_reference_404(doget_ctx, postgres_pool):
 async def test_doget_feature_idx_over_bound_422(doget_ctx):
     """The _MAX_DOGET_FEATURE_IDX bound rejects an over-long subset at the
     request layer (422), before any reference lookup."""
-    from qiita_common.models import _MAX_DOGET_FEATURE_IDX
+    from qiita_common.models.step import _MAX_DOGET_FEATURE_IDX
 
     ref = await doget_ctx["seed_reference"]("active")
     resp = await doget_ctx["sa"].post(

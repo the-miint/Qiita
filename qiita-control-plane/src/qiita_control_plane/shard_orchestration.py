@@ -81,7 +81,7 @@ async def plan_and_submit_shards(
     pool: asyncpg.Pool,
     reference_idx: int,
     *,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
     workspace: Path,
     originator_principal_idx: int,
@@ -115,7 +115,7 @@ async def plan_and_submit_shards(
     n = await plan_shards(
         pool,
         reference_idx,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         data_plane_url=data_plane_url,
         workspace=workspace,
         num_shards=num_shards,

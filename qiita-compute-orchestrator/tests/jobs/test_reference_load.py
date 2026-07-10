@@ -235,15 +235,16 @@ def test_returns_feature_keyed_chunks_binding(staging_inputs, tmp_path):
 
 
 def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_path, monkeypatch):
-    """When features exceed the per-batch chunk budget the writer emits
-    multiple parts, each a DISJOINT, CONTIGUOUS feature_idx range — that
-    per-part min/max is what drives DuckLake FILE-level pruning now that
-    there is no within-part sort. The streaming re-key (no chunk_data sort)
-    still carries every feature's chunk_data through exactly once."""
-    import qiita_compute_orchestrator.jobs.reference_load as rl
+    """When features exceed the per-batch chunk budget the shared re-key writer
+    (`_feature_load.write_feature_sequence_chunks`, which reference_load delegates
+    to) emits multiple parts, each a DISJOINT, CONTIGUOUS feature_idx range — that
+    per-part min/max is what drives DuckLake FILE-level pruning. Bin-packed
+    ascending by feature_idx, the writer carries every feature's chunk_data through
+    exactly once (no chunk lost or duplicated across the parts)."""
+    import qiita_compute_orchestrator.jobs._feature_load as fl
 
     # 5 single-chunk features, budget of 2 chunks -> 3 parts (2 + 2 + 1).
-    monkeypatch.setattr(rl, "_CHUNK_BUDGET_PER_BATCH", 2)
+    monkeypatch.setattr(fl, "_CHUNK_BUDGET_PER_BATCH", 2)
     outputs = _run(_inputs(**staging_inputs), tmp_path / "ws")
     chunks_dir = outputs["staging_dir"] / "reference_sequence_chunks"
     parts = sorted(chunks_dir.glob("part_*.parquet"))

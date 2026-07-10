@@ -196,7 +196,7 @@ async def _run_align_action(
         workspace,
         {"kind": "block", "block_idx": block_idx},
         work_ticket_idx=work_ticket_idx,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
 

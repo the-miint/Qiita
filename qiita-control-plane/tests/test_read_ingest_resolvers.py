@@ -17,16 +17,19 @@ from types import SimpleNamespace
 import duckdb
 import pytest
 from qiita_common.api_paths import compute_reads_staging_path
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
+    STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
     _resolve_sample_map,
+    _resolve_staged_masked_reads,
     _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
     _workflow_declares_input,
+    _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
 
@@ -72,7 +75,7 @@ _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"
 def _staged_kwargs(tmp_path):
     return {
         "data_plane_url": "grpc://unused",
-        "hmac_secret": b"x" * 16,
+        "signing_key": b"x" * 32,
         "workspace": tmp_path / "ticket" / "804",
     }
 
@@ -115,7 +118,7 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
             {"prep_sample_idx": 42},
             tmp_path / "staging",
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -168,7 +171,7 @@ def test_resolve_staged_reads_missing_file_is_bad_input(tmp_path, monkeypatch):
                 {"prep_sample_idx": 7},
                 tmp_path / "staging",
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=workspace,
             )
         )
@@ -189,6 +192,105 @@ def test_workflow_needs_staged_reads_gate():
     assert _workflow_needs_staged_reads(no_reads) is False
 
 
+# --- masked-read resolver (_resolve_staged_masked_reads) -------------------
+
+_STREAM_MASKED = "qiita_control_plane.runner._stream_masked_reads_to_fastq"
+
+
+class _FakePool:
+    """Minimal asyncpg.Pool stand-in: `fetchval` returns a fixed mask_sample
+    gate state (None = no gate row = allowed)."""
+
+    def __init__(self, gate_state: str | None = None):
+        self._gate_state = gate_state
+
+    async def fetchval(self, *_args, **_kwargs):
+        return self._gate_state
+
+
+def _run_masked(pool, prep_sample_idx, workspace, mask_idx=77):
+    return asyncio.run(
+        _resolve_staged_masked_reads(
+            pool,
+            {"prep_sample_idx": prep_sample_idx},
+            mask_idx,
+            data_plane_url="grpc://unused",
+            signing_key=b"x" * 32,
+            workspace=workspace,
+        )
+    )
+
+
+def test_workflow_needs_staged_masked_reads_gate():
+    """`masked_reads_fastq` consumed but not produced → needs the masked staged
+    binding (assembly). The raw-`reads` gate must NOT fire on it, and vice-versa."""
+    assembly = [_step(inputs=["masked_reads_fastq"], outputs=["genomes_dir"])]
+    assert _workflow_needs_staged_masked_reads(assembly) is True
+    assert _workflow_needs_staged_reads(assembly) is False
+
+    raw = [_step(inputs=["reads", "qc_mask"], outputs=["read_mask"])]
+    assert _workflow_needs_staged_masked_reads(raw) is False
+
+
+def test_resolve_staged_masked_reads_streams_fastq_and_binds(tmp_path, monkeypatch):
+    """No gate row + count>0: the runner streams read_masked to a gzip FASTQ (miint
+    COPY FORMAT FASTQ), which `masked_reads_fastq` binds to. No parquet, no
+    DoAction."""
+    workspace = tmp_path / "ticket" / "804"
+    dest = workspace / "masked_reads.fastq.gz"
+
+    def _fake_stream(_url, _ticket, out):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("fastq-bytes")
+        return 9
+
+    monkeypatch.setattr(_STREAM_MASKED, _fake_stream)
+
+    bound = _run_masked(_FakePool(), 42, workspace)
+    assert bound[STAGED_MASKED_READS_BINDING] == dest
+    assert dest.exists()
+
+
+def test_resolve_staged_masked_reads_incomplete_mask_is_bad_input(tmp_path, monkeypatch):
+    """A mask_sample gate row that is not 'completed' (a covering block still
+    masking) → BAD_INPUT before any stream — never assemble a partial pass-set."""
+    monkeypatch.setattr(_STREAM_MASKED, lambda _u, _t, _d: pytest.fail("must not stream"))
+    with pytest.raises(BackendFailure) as exc:
+        _run_masked(_FakePool("processing"), 7, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "not completed" in exc.value.reason
+
+
+def test_resolve_staged_masked_reads_empty_stream_is_no_data(tmp_path, monkeypatch):
+    """0 passing reads under the mask is a COMMON outcome (heavy filtering removed
+    everything) → terminal StepNoData, NOT a failure; the empty fastq is removed."""
+    workspace = tmp_path / "ws"
+
+    def _fake_stream(_url, _ticket, out):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("")  # COPY may create an empty file
+        return 0
+
+    monkeypatch.setattr(_STREAM_MASKED, _fake_stream)
+    with pytest.raises(StepNoData) as exc:
+        _run_masked(_FakePool(), 7, workspace)
+    assert "nothing to assemble" in exc.value.reason
+    assert not (workspace / "masked_reads.fastq.gz").exists()
+
+
+def test_resolve_staged_masked_reads_stream_failure_is_bad_input(tmp_path, monkeypatch):
+    """A Flight/stream failure is wrapped as BAD_INPUT (never an untyped exception)."""
+
+    def _boom(_url, _ticket, _dest):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(_STREAM_MASKED, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        _run_masked(_FakePool(), 7, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "data plane" in exc.value.reason
+
+
 def test_workflow_declares_input_checks_optional_too():
     steps = [_step(inputs=["reads"], optional_inputs=["host_rype_path"])]
     assert _workflow_declares_input(steps, "host_rype_path") is True
@@ -202,7 +304,7 @@ _EXPORT_READ_BLOCK = "qiita_control_plane.runner._do_action_export_read_block"
 
 def _decode_token_payload(token: bytes) -> dict:
     """Extract the canonical-JSON payload from a signed action token. Wire
-    format: <1B version><4B big-endian len><payload><32B hmac><8B expiry>."""
+    format: <1B version><4B big-endian len><payload><64B Ed25519 sig><8B expiry>."""
     import json
     import struct
 
@@ -238,7 +340,7 @@ def test_resolve_staged_reads_block_binds_workspace_parquet_and_signs_members(
         _resolve_staged_reads_block(
             _BLOCK_MEMBERS,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -263,7 +365,7 @@ def test_resolve_staged_reads_block_empty_members_is_bad_input(tmp_path, monkeyp
             _resolve_staged_reads_block(
                 [],
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -279,7 +381,7 @@ def test_resolve_staged_reads_block_zero_count_is_bad_input(tmp_path, monkeypatc
             _resolve_staged_reads_block(
                 _BLOCK_MEMBERS,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -298,7 +400,7 @@ def test_resolve_staged_reads_block_export_failure_is_bad_input(tmp_path, monkey
             _resolve_staged_reads_block(
                 _BLOCK_MEMBERS,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -319,7 +421,7 @@ def test_resolve_staged_reads_block_malformed_member_is_bad_input(tmp_path, monk
             _resolve_staged_reads_block(
                 [{"prep_sample_idx": 101, "sequence_idx_start": 100}],  # missing stop
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -337,7 +439,7 @@ def test_resolve_staged_reads_block_missing_file_is_bad_input(tmp_path, monkeypa
             _resolve_staged_reads_block(
                 _BLOCK_MEMBERS,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=workspace,
             )
         )
@@ -371,7 +473,7 @@ def test_resolve_staged_masked_reads_block_binds_and_signs_mask_and_members(tmp_
             _BLOCK_MEMBERS,
             mask_idx=42,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -396,7 +498,7 @@ def test_resolve_staged_masked_reads_block_empty_members_is_bad_input(tmp_path, 
                 [],
                 mask_idx=1,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )
@@ -419,7 +521,7 @@ def test_resolve_staged_masked_reads_block_zero_count_binds_empty_parquet(tmp_pa
             _BLOCK_MEMBERS,
             mask_idx=1,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=workspace,
         )
     )
@@ -454,7 +556,7 @@ def test_resolve_staged_masked_reads_block_export_failure_is_bad_input(tmp_path,
                 _BLOCK_MEMBERS,
                 mask_idx=1,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path / "ws",
             )
         )

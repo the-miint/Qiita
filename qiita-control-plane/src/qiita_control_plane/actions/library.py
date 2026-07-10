@@ -40,6 +40,7 @@ from qiita_common.models import (
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action, sign_ticket
+from ..repositories.assembly import insert_assembly_membership_rows
 from ..repositories.block import (
     fetch_block_members,
     finalize_alignment_sample,
@@ -58,6 +59,11 @@ from .reference import IllegalStatusTransition, transition_reference_status
 # transaction duration. 10K is a pragmatic default for the expected
 # feature batch sizes.
 _CHUNK_SIZE = 10_000
+
+# Deterministic basename `mint_features` writes its feature-map Parquet under.
+# Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
+# rebuilds this path WITHOUT re-running the primitive, so the two must not drift.
+MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
 
 
 # =============================================================================
@@ -283,46 +289,16 @@ async def _write_membership_rows(
     return len(rows)
 
 
-def _do_action_register(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
+def _do_action(action_type: str, data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC DoAction against the data plane — runs in a thread
+    executor. Every CP-side DoAction primitive differs only by action name, so
+    they share this one client-open/call/collect body: the single place the
+    Flight client is constructed, hence the single place to add a timeout, TLS,
+    or error mapping later. `action_type` is positional so it forwards cleanly
+    through `run_in_executor(None, _do_action, name, url, token)`.
+    """
     with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("register_files", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_reference(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_reference", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_mask(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_mask", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_pool_reads(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_pool_reads", token)
-        return list(client.do_action(action))
-
-
-def _do_action_mask_metrics(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("mask_metrics", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_read_mask_block(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_read_mask_block", token)
-        return list(client.do_action(action))
+        return list(client.do_action(_flight.Action(action_type, token)))
 
 
 def _do_action_delete_alignment(data_plane_url: str, token: bytes) -> list:
@@ -387,7 +363,7 @@ async def mint_features(
     if genome_map_path is not None and not genome_map_path.exists():
         raise FileNotFoundError(f"Genome map not found: {genome_map_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    feature_map_path = output_dir / "feature_map.parquet"
+    feature_map_path = output_dir / MINT_FEATURES_OUTPUT_BASENAME
 
     total_minted = 0
     total_reused = 0
@@ -667,7 +643,7 @@ async def plan_shards(
     pool: asyncpg.Pool,
     reference_idx: int,
     *,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
     workspace: Path,
     num_shards: int = _SHARD_COUNT,
@@ -697,7 +673,7 @@ async def plan_shards(
     ticket = sign_ticket(
         table=_REFERENCE_TAXONOMY_TABLE,
         filter={"reference_idx": [reference_idx]},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     await asyncio.get_event_loop().run_in_executor(
         None, _do_get_reference_taxonomy, data_plane_url, ticket, taxonomy_parquet
@@ -713,6 +689,82 @@ async def plan_shards(
 
     await write_shard_assignment(pool, reference_idx, feature_shards)
     return len(feature_shards)
+
+
+# DuckDB JOIN that resolves each assembly contig to its bin + feature_idx.
+# bin_map (read_id -> kind, bin_id) x manifest (read_id -> sequence_hash) x
+# feature_map (sequence_hash -> feature_idx). The read_id is assembly_hash's
+# synthetic globally-unique id (kind:bin_id:contig_id), so the join is 1:1 per
+# contig. INNER JOINs by construction: every bin_map read_id is a manifest read_id
+# (both from the same assembly_hash scan) and every manifest hash was minted by
+# mint-features, so no contig is dropped. Exposed as a module constant so the join
+# is unit-testable against Parquet fixtures without a Postgres pool.
+ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
+    "SELECT bm.kind, bm.bin_id, fm.feature_idx"
+    " FROM read_parquet(?) AS bm"
+    " JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
+    " JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+)
+
+
+async def write_assembly_membership(
+    pool: asyncpg.Pool,
+    prep_sample_idx: int,
+    processing_idx: int,
+    bin_map_path: Path,
+    manifest_path: Path,
+    feature_map_path: Path,
+) -> tuple[int, int]:
+    """Link a prep_sample's assembly-run contigs to qiita.assembly_membership.
+
+    The assembly analogue of `write_membership`. DuckDB JOINs `bin_map`
+    (read_id -> kind, bin_id) against `manifest` (read_id -> sequence_hash) and
+    the already-minted `feature_map` (sequence_hash -> feature_idx), resolving
+    each contig set-side to `(kind, bin_id, feature_idx)`; the stream is read in
+    `_CHUNK_SIZE` batches and bulk-inserted into qiita.assembly_membership with
+    `(prep_sample_idx, processing_idx)` stamped from this run. Never materialises
+    the whole mapping in Python — same streaming contract mint_features /
+    write_membership follow.
+
+    Returns `(linked, already_linked)`. Idempotent (ON CONFLICT DO NOTHING on the
+    natural PK): a workflow retried from the start re-links nothing new. Raises
+    ValueError (FK violation surfaced structured) if any feature_idx is missing
+    from qiita.feature.
+    """
+    for label, path in [
+        ("bin_map", bin_map_path),
+        ("manifest", manifest_path),
+        ("feature_map", feature_map_path),
+    ]:
+        if not path.exists():
+            raise FileNotFoundError(f"{label} not found: {path}")
+
+    total_linked = 0
+    total_seen = 0
+    async with pool.acquire() as conn:
+        with duckdb.connect(":memory:") as duck:
+            reader = duck.execute(
+                ASSEMBLY_MEMBERSHIP_JOIN_SQL,
+                [str(bin_map_path), str(manifest_path), str(feature_map_path)],
+            ).to_arrow_reader(_CHUNK_SIZE)
+            for batch in reader:
+                kinds = batch.column("kind").to_pylist()
+                if not kinds:
+                    continue
+                bin_ids = batch.column("bin_id").to_pylist()
+                feature_idxs = batch.column("feature_idx").to_pylist()
+                async with conn.transaction():
+                    linked = await insert_assembly_membership_rows(
+                        conn,
+                        prep_sample_idx=prep_sample_idx,
+                        processing_idx=processing_idx,
+                        kinds=kinds,
+                        bin_ids=bin_ids,
+                        feature_idxs=feature_idxs,
+                    )
+                total_linked += linked
+                total_seen += len(feature_idxs)
+    return total_linked, total_seen - total_linked
 
 
 async def register_index(
@@ -1020,12 +1072,12 @@ async def register_files(
     staging_dir: str,
     files: dict[str, str],
     work_ticket_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> list[str]:
     """Register Parquet files in DuckLake via the data plane's DoAction.
 
-    Signs the HMAC action token, calls Flight in a thread (FlightClient
+    Signs the Ed25519 action token, calls Flight in a thread (FlightClient
     is synchronous), and returns the list of registered permanent paths.
     Status-state guards live in the caller; reference-add typically
     requires status='loading' before invoking.
@@ -1044,10 +1096,10 @@ async def register_files(
             "files": files,
             "work_ticket_idx": work_ticket_idx,
         },
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_register, data_plane_url, token
+        None, _do_action, "register_files", data_plane_url, token
     )
     if not results:
         return []
@@ -1058,7 +1110,7 @@ async def register_files(
 async def delete_reference_data(
     *,
     reference_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict:
     """Delete a reference's DuckLake rows via the data plane's DoAction.
@@ -1073,10 +1125,10 @@ async def delete_reference_data(
     token = sign_action(
         action="delete_reference",
         payload={"reference_idx": reference_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_reference, data_plane_url, token
+        None, _do_action, "delete_reference", data_plane_url, token
     )
     if not results:
         return {}
@@ -1086,7 +1138,7 @@ async def delete_reference_data(
 async def delete_pool_reads_data(
     *,
     prep_sample_idxs: list[int],
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict:
     """Delete a sequenced_pool's `read` / `read_mask` DuckLake rows via the data
@@ -1106,10 +1158,10 @@ async def delete_pool_reads_data(
     token = sign_action(
         action="delete_pool_reads",
         payload={"prep_sample_idxs": prep_sample_idxs},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_pool_reads, data_plane_url, token
+        None, _do_action, "delete_pool_reads", data_plane_url, token
     )
     if not results:
         return {}
@@ -1119,7 +1171,7 @@ async def delete_pool_reads_data(
 async def delete_mask_data(
     *,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> int:
     """Delete a mask's DuckLake read_mask rows via the data plane's DoAction.
@@ -1135,10 +1187,10 @@ async def delete_mask_data(
     token = sign_action(
         action="delete_mask",
         payload={"mask_idx": mask_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_mask, data_plane_url, token
+        None, _do_action, "delete_mask", data_plane_url, token
     )
     if not results:
         return 0
@@ -1149,7 +1201,7 @@ async def mask_metrics_data(
     *,
     mask_idx: int,
     prep_sample_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, int]:
     """Aggregate a sample's per-stage read counts for one mask from the DuckLake
@@ -1165,10 +1217,10 @@ async def mask_metrics_data(
     token = sign_action(
         action="mask_metrics",
         payload={"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_mask_metrics, data_plane_url, token
+        None, _do_action, "mask_metrics", data_plane_url, token
     )
     if not results:
         raise RuntimeError("mask_metrics DoAction returned no result")
@@ -1179,7 +1231,7 @@ async def delete_read_mask_block_data(
     *,
     mask_idx: int,
     members: list[dict[str, int]],
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> int:
     """Delete one block's exact `read_mask` footprint via the `delete_read_mask_block`
@@ -1201,10 +1253,10 @@ async def delete_read_mask_block_data(
     token = sign_action(
         action="delete_read_mask_block",
         payload={"mask_idx": mask_idx, "members": members},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_read_mask_block, data_plane_url, token
+        None, _do_action, "delete_read_mask_block", data_plane_url, token
     )
     if not results:
         return 0
@@ -1215,7 +1267,7 @@ async def delete_alignment_block_data(
     *,
     alignment_idx: int,
     members: list[dict[str, int]],
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> int:
     """Delete one block's exact `alignment` footprint via the
@@ -1239,7 +1291,7 @@ async def delete_alignment_block_data(
     token = sign_action(
         action="delete_alignment_block",
         payload={"alignment_idx": alignment_idx, "members": members},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action_delete_alignment_block, data_plane_url, token
@@ -1252,7 +1304,7 @@ async def delete_alignment_block_data(
 async def delete_alignment_data(
     *,
     alignment_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> int:
     """Delete an alignment's DuckLake `alignment` rows via the data plane's
@@ -1269,7 +1321,7 @@ async def delete_alignment_data(
     token = sign_action(
         action="delete_alignment",
         payload={"alignment_idx": alignment_idx},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action_delete_alignment, data_plane_url, token
@@ -1284,7 +1336,7 @@ async def _finalize_sample_metrics(
     *,
     prep_sample_idx: int,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> None:
     """Roll a finalized sample's per-stage read counts onto its sequenced_sample,
@@ -1302,7 +1354,7 @@ async def _finalize_sample_metrics(
     counts = await mask_metrics_data(
         mask_idx=mask_idx,
         prep_sample_idx=prep_sample_idx,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         data_plane_url=data_plane_url,
     )
     expected = await conn.fetchval(
@@ -1342,7 +1394,7 @@ async def delete_read_mask_block(
     *,
     block_idx: int,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Idempotent block replace: delete this block's exact `read_mask` footprint
@@ -1375,7 +1427,7 @@ async def delete_read_mask_block(
     rows_deleted = await delete_read_mask_block_data(
         mask_idx=mask_idx,
         members=members,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         data_plane_url=data_plane_url,
     )
     return {"block_idx": block_idx, "rows_deleted": rows_deleted}
@@ -1386,7 +1438,7 @@ async def reconcile_block(
     *,
     block_idx: int,
     mask_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Terminal step of the bulk-block read-mask workflow: mark this block done,
@@ -1443,7 +1495,7 @@ async def reconcile_block(
                 conn,
                 prep_sample_idx=prep_sample_idx,
                 mask_idx=mask_idx,
-                hmac_secret=hmac_secret,
+                signing_key=signing_key,
                 data_plane_url=data_plane_url,
             )
             await finalize_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
@@ -1456,7 +1508,7 @@ async def delete_alignment_block(
     *,
     block_idx: int,
     alignment_idx: int,
-    hmac_secret: bytes,
+    signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
     """Idempotent block replace: delete this block's exact `alignment` footprint
@@ -1494,7 +1546,7 @@ async def delete_alignment_block(
     rows_deleted = await delete_alignment_block_data(
         alignment_idx=alignment_idx,
         members=members,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         data_plane_url=data_plane_url,
     )
     return {"block_idx": block_idx, "rows_deleted": rows_deleted}
@@ -1525,7 +1577,7 @@ async def reconcile_alignment_block(
     rows are NOT 1:1 with reads — a read routed to K shards emits K rows, and a
     paired-end read emits one row per mate — so "row count == read count" does not
     hold and completion is purely "every covering block done". This is also why the
-    primitive needs no data-plane hop (no `hmac_secret`/`data_plane_url`): it only
+    primitive needs no data-plane hop (no `signing_key`/`data_plane_url`): it only
     touches Postgres gate rows.
 
     Idempotent: a re-run flips nothing new (its block is already completed and its
@@ -1582,6 +1634,7 @@ async def reconcile_alignment_block(
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
+    LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PLAN_SHARDS: plan_shards,

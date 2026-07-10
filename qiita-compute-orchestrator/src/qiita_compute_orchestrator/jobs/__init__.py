@@ -412,10 +412,12 @@ def scan_native_jobs(
     that imports cleanly but is malformed from surprising the runner
     at submit time.
 
-    The scan does NOT skip underscore-prefixed modules — every
-    non-dunder file under jobs/ must be a valid native job. Shared
-    helpers go in a sibling module outside jobs/ (e.g.
-    qiita_compute_orchestrator/job_helpers.py).
+    Leading-underscore modules are skipped: a `_name.py` under jobs/ is a
+    PRIVATE shared helper (e.g. `_feature_load.py`), not a dispatchable
+    job, so it is exempt from the Inputs+execute contract. Dispatch is by
+    explicit module name from YAML and never targets a private module.
+    Every OTHER (non-dunder, non-underscore) file under jobs/ must be a
+    valid native job.
     """
     if package_path is None:
         package_path = __path__
@@ -423,7 +425,9 @@ def scan_native_jobs(
     errors: list[str] = []
     for _finder, modname, _ispkg in pkgutil.walk_packages(package_path, prefix=prefix):
         leaf = modname.rsplit(".", 1)[-1]
-        if leaf in ("__init__", "__main__"):
+        # Dunder scaffolding (`__init__`/`__main__`) and any leading-underscore
+        # private helper are not native jobs — skip them before validation.
+        if leaf.startswith("_"):
             continue
         try:
             mod = importlib.import_module(modname)
@@ -443,8 +447,9 @@ def scan_native_jobs(
         raise RuntimeError(
             "native job tree is malformed; refusing to start orchestrator:\n"
             + "\n".join(errors)
-            + "\n\nShared helpers go in a sibling module outside `jobs/` "
-            "(e.g. `qiita_compute_orchestrator/job_helpers.py`); every "
+            + "\n\nShared helpers go in a leading-underscore private module "
+            "inside `jobs/` (e.g. `jobs/_feature_load.py`, skipped by this scan) "
+            "or a sibling module outside `jobs/`; every non-underscore, "
             "non-dunder file in `jobs/` must export `Inputs` (BaseModel) "
             "and `execute` (async)."
         )

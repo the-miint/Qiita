@@ -29,7 +29,12 @@ from qiita_common.models import (
 )
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
-from qiita_compute_orchestrator.backend import StepHandle, StepStatusInfo
+from qiita_compute_orchestrator.backend import (
+    LocalStepHandle,
+    SlurmStepHandle,
+    StepHandle,
+    StepStatusInfo,
+)
 from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
 
@@ -928,8 +933,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
 def _slurm_handle(tmp_path, *, job_id: int = 1) -> StepHandle:
     """A SLURM StepHandle pointing at the workspace tree, for driving
     status_step / result_step in isolation."""
-    return StepHandle(
-        compute_target=ComputeTarget.SLURM,
+    return SlurmStepHandle(
         step_name="hash",
         slurm_job_id=job_id,
         job_name="qiita-wt99-hash-a0",
@@ -964,12 +968,12 @@ async def test_submit_step_returns_slurm_handle_without_polling(jwt_path, baseli
         entrypoint="/usr/local/bin/hash",
         baseline_resources=baseline,
     )
+    assert isinstance(handle, SlurmStepHandle)
     assert handle.compute_target == ComputeTarget.SLURM
     assert handle.slurm_job_id == 4242
     assert handle.job_name == "qiita-wt99-hash-a3"
     assert handle.output_path == tmp_path / "output"
     assert handle.logs_path == tmp_path / "logs"
-    assert handle.terminal_outputs is None
     # The deterministic name also went onto the submit payload.
     assert captured["payload"]["job"]["name"] == "qiita-wt99-hash-a3"
     # params.json was written so a later status/result (or a re-attach)
@@ -1110,7 +1114,7 @@ async def test_result_step_rejects_non_slurm_handle(jwt_path, tmp_path):
     fail loudly with a typed BackendFailure, not an opaque AttributeError
     from dereferencing a None path."""
     backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
-    local_handle = StepHandle(compute_target=ComputeTarget.LOCAL, step_name="hash")
+    local_handle = LocalStepHandle(step_name="hash", terminal_outputs={})
     with pytest.raises(BackendFailure) as ei:
         await backend.result_step(
             local_handle,

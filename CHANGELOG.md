@@ -84,6 +84,7 @@ the `no-changelog` label).
   Not wired into a workflow (C2 wires the runner block × shard fan-out + the
   DuckLake alignment sink); the `reference_index.index_type` CHECK gains
   `rype_router` only when C2 registers the router. (#reference-support)
+
 - **Sharded-index status endpoint (B5, observability).** New
   `GET /api/v1/reference/{idx}/shard-index-status` (model `ReferenceShardIndexStatus`)
   surfaces a sharded reference's fan-out build progress: `expected_shards` (N, derived
@@ -94,6 +95,7 @@ the `no-changelog` label).
   shard diagnosable; remediation is an operator redrive of the FAILED ticket. Scoped to
   `reference:read` like the `/index` listing; an unsharded reference reads all-zero /
   empty. (#reference-support)
+
 - **Sharded reference-add wiring + build-shard-index workflow + CLI (B5,
   live end-to-end).** `reference-add` / `local-reference-add` gain an opt-in
   `shard_index` context flag (+ `build_rype`/`build_minimap2`/`build_bowtie2`
@@ -110,6 +112,7 @@ the `no-changelog` label).
   and the existing index knobs (`--no-rype-index`/`--no-minimap2-index`/`--rype-w`/
   `--minimap2-preset`) now apply to `--shard-index` as well as `--host`. Default
   (no `shard_index`) is byte-identical to today's `loading → active`. (#reference-support)
+
 - **Runner shard-roster staging + rype shard build streams (B5).** For a
   reference-scoped ticket carrying a non-NULL `shard_id`, the runner now stages
   the shard's feature roster before the step loop (`_stage_shard_roster`): it
@@ -125,6 +128,7 @@ the `no-changelog` label).
   stream). Host/whole-reference rype mode is byte-identical (staging read).
   A Flight failure / empty shard is wrapped as a SUBMISSION BAD_INPUT.
   (#reference-support)
+
 - **Sharded-index fan-out + count-based completion (B5).** A new
   `shard_orchestration.plan_and_submit_shards` turns a `plan_shards` assignment
   into N build tickets: it transitions the reference `loading → indexing` and,
@@ -145,6 +149,7 @@ the `no-changelog` label).
   last-observer-race-safe (the guarded UPDATE lets exactly one racer win;
   a finalize that finds the reference already `active` is idempotent success).
   Dormant — no workflow YAML references these actions yet. (#reference-support)
+
 - **`plan-shards` assignment core (B5).** A new CP-side `action:` primitive
   (`plan_shards`, registered in `LIBRARY`) turns the B2 tiler + persistence into
   an end-to-end shard assignment for one reference: it streams
@@ -160,6 +165,7 @@ the `no-changelog` label).
   `shard_id` first, so a re-plan that drops a feature leaves it NULL rather than
   stale. Dormant — the N-ticket fan-out over the assigned shards is a later
   commit. (#reference-support)
+
 - **`work_ticket.shard_id` fan-out discriminant (B5 schema).** A nullable
   `INTEGER` column (CHECK: only legal on `reference` scope, `>= 0`) lets N
   concurrent same-action build tickets fan out over one reference without
@@ -170,6 +176,7 @@ the `no-changelog` label).
   non-terminal ticket per `(action, reference, shard)`. The `WorkTicket` model
   and the runner/route read paths carry `shard_id`; a racing INSERT maps to 409
   like every other scope. Dormant — nothing sets `shard_id` yet. (#reference-support)
+
 - **Per-shard aligner-subject builders (B4): minimap2 `.mmi` + bowtie2 `.bt2`,
   streaming via B6s.** `build_minimap2_index` gains a shard mode and a new
   `build_bowtie2_index` native job lands alongside it. Given a `shard_id` + a
@@ -186,6 +193,7 @@ the `no-changelog` label).
   needs no GPL boundary — both verified against the team-mirror miint build by the
   host-mode real-miint smokes. The builders are unwired (jobs only); shard
   assignment, roster staging, fan-out, and workflow wiring are B5. (#reference-support)
+
 - **`reference_index.index_type` admits `'bowtie2'` (B4 precursor).** A one-line
   additive CHECK migration extends the `reference_index_index_type_check` allow-list
   to `rype`/`minimap2`/`bowtie2`; a matching `INDEX_TYPE_BOWTIE2` constant lands in
@@ -193,6 +201,7 @@ the `no-changelog` label).
   absent from `HOST_FILTER_REQUIRED_INDEX_TYPES` (unlike the dual-purpose
   rype/minimap2). No Postgres ENUM twin (TEXT+CHECK), no `register_index`/runner
   change (already generic over `index_type`). (#reference-support)
+
 - **Compute-side reference-chunk streaming (B6s).** The orchestrator can now pull a
   reference's sequence chunks from the data plane over Arrow Flight instead of
   reading staging Parquet — the streaming foundation the B4 shard builders sit on.
@@ -207,87 +216,67 @@ the `no-changelog` label).
   service account needs the `ticket:doget` scope (already within
   `SERVICE_ACCOUNT_SCOPE_CEILING`) to mint the ticket. (#reference-support)
 
-### Fixed
+- **Key-rotation runbook** (`docs/runbooks/key-rotation.md`) — restart-based
+  rotation for the Ed25519 Flight signing keypair and the login-cookie secret,
+  with a `make preflight` keypair check before the coordinated CP+DP restart.
+  `first-deploy.md` provisioning and `auth.md` updated to match the keypair
+  model. (#265)
 
-- **`plan-shards` is now genuinely opt-in (B5).** The `when: shard_index` gate
-  defaults ON for an absent key (correct for the `build_*` gates, which default to
-  building all index types), so `plan-shards` ran on a plain `reference-add` that
-  never set `shard_index` — fanning out (or, in production with a dispatch
-  callback, even sharding a genome-bearing reference nobody asked to shard). The
-  runner's `plan-shards` arm now self-defends — no-op when `bound.get("shard_index")`
-  is falsy, mirroring the finalize `_is_sharded_fanout_in_progress` check — before
-  the fan-out precondition (`dispatch_cb`) is required. `when: shard_index` is kept
-  as the explicit-opt-out gate. Fixes the two reference-add smokes. (#reference-support)
-- **Data plane: ambiguous `feature_idx` under the reference-membership JOIN.**
-  `build_query` qualified only `reference_idx` (with the membership alias `m.`)
-  when a `reference_sequences` / `reference_sequence_chunks` filter triggered the
-  membership JOIN, leaving any other column unqualified. A combined
-  `{reference_idx, feature_idx}` filter — exactly what the B6 `feature_idx`-scoped
-  DoGet ticket mints — then failed to bind with "Ambiguous reference to column name
-  feature_idx" (`feature_idx` exists on both joined tables). The non-reference_idx
-  columns are now qualified with the base-table alias `t.`. (#reference-support)
-- **`feature_idx`-scoped DoGet ticket (B6).** `POST /reference/{idx}/ticket/doget`
-  gains an optional `feature_idx` subset on its request body: omitted ⇒ today's
-  whole-reference ticket (`filter={"reference_idx":[idx]}`), byte-identical;
-  present ⇒ the ticket additionally scopes to those features
-  (`filter` gains `"feature_idx":[...]`, bounded at 100k) so a shard builder
-  streams only its own roster's sequences from `reference_sequences` /
-  `reference_sequence_chunks`. The status gate now admits `active` **and**
-  `indexing` (a shard build streams mid-ingest, post-`register-files`);
-  `pending`/`loading` stay 409, missing stays 404. No new route (the existing
-  `URL_REFERENCE_DOGET` triple is reused), no migration, no data-plane change
-  (`feature_idx` filtering already exists and is tested there). (#reference-support)
-- **Per-shard rype `.ryxdi` build (parameterized `build_rype_index` + `plan()`).**
-  The `build_rype_index` native job gains an optional **shard mode**: given a
-  `shard_id` and a runner-staged feature roster (`shard_features`, a Parquet of
-  `(feature_idx, sequence_length_bp)`), it builds one shard's rype `.ryxdi` routing
-  index over just that shard's features and writes it to
-  `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/index.ryxdi`
-  (`derived_store.shard_rype_index_path`), recording `shard_id` in the meta JSON
-  (the register-index arm already threads it, B1). Both shard fields unset =
-  today's whole-reference host build, byte-identical. Adds a `plan()` that sizes
-  the shard build's `mem_gb` down from the whole-reference baseline (floored at the
-  runtime-consistent rype+DuckDB+headroom minimum, scaled by the shard's total bp),
-  so a fleet of small shards doesn't each grab the 64 GB whole-reference slot.
-  Re-verified `rype_index_create` against upstream miint (`docs/duckdb-miint.md`
-  refreshed). No shard fan-out / workflow wiring yet — that's a later milestone;
-  16S/no-genome sharding deferred. (#reference-support)
-- **Lineage-sorted shard planner + `reference_membership.shard_id` persistence.**
-  The deterministic partition of an analysis reference's features into shards. A
-  pure tiler `qiita_control_plane.shard_planner.tile_by_lineage(items, num_shards)`
-  sorts the sharding units lexicographically by taxonomy lineage string and cuts
-  the sorted list into a fixed `_SHARD_COUNT = 1000` approximately-even shards
-  (fixed count / variable size — the mirror image of the read-block planner). The
-  tiler is generic over units (the caller chooses `item_id = genome_idx` for a
-  genome reference so shards balance by genome count and a genome's contigs stay
-  together); it is deterministic and re-derivable (internal `(lineage, item_id)`
-  sort). A new nullable `qiita.reference_membership.shard_id INTEGER` (+ a `>= 0`
-  CHECK) records the assignment (NULL = unassigned/unsharded), written by
-  `write_shard_assignment` (idempotent, replay-safe, reference-scoped). No shard
-  builds, fan-out, routing, or workflow wiring yet — those are later milestones;
-  16S / no-genome sharding is deferred. (#reference-support)
-- **Per-shard `reference_index.shard_id` + register/GET/derived-store plumbing.**
-  The foundation for per-shard *analysis* reference indexes: `qiita.reference_index`
-  gains a nullable `shard_id INTEGER` (+ a `>= 0` CHECK) so a sharded index writes
-  one row per shard (`shard_id` 0..N-1) while the existing unsharded host index
-  keeps `shard_id` NULL. Additive and backward-compatible — no `shard_count`
-  (it's `COUNT(*)` per `(reference_idx, index_type)`), no new UNIQUE (the
-  `(reference_idx, index_type, fs_path)` idempotency key already dedups
-  path-distinct shard rows). `register_index` and `GET /reference/{idx}/index`
-  thread `shard_id`; the runner's register-index arm reads it from the meta JSON
-  (`meta.get` → NULL for host metas); the whole-reference resolver
-  (`_resolve_reference_index_path`) filters `shard_id IS NULL` so a shard row is
-  never served as the unsharded index; and `derived_store.reference_shard_dir`
-  lays down the `references/{idx}/shards/{shard_id}/` layout (under the existing
-  purge subtree). No shard builds, planner, or routing yet — those are later
-  milestones. (#reference-support)
-- **`genome_source` controlled vocabulary + qiita-origin sample link.** `qiita.genome.source`
-  is now a closed vocabulary (`genbank`, `refseq`, `qiita`), enforced both up front at ingest
-  (fail-fast in `_associate_genomes`, before any DB write) and by a `CHECK`, mirrored by the new
-  `GenomeSource` `StrEnum`. Qiita-derived genomes (`source='qiita'`) now record the exact
-  originating sample via a new nullable `qiita.genome.prep_sample_idx` (FK to `qiita.prep_sample`,
-  required iff the source is `qiita` — a biconditional `CHECK`); the genome-map Parquet gains an
-  optional `prep_sample_idx` column. (#reference-support)
+- **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
+  recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
+  reads, selected by a required `mask_idx`: the runner's
+  `_resolve_staged_masked_reads` STREAMS the `read_masked` pass-set from the data
+  plane (the existing `read_masked` DoGet — **no bespoke DoAction or payload**) to
+  a gzip FASTQ via miint's native `COPY … FORMAT FASTQ` (the `masked_reads_fastq`
+  binding, the same capability the admin masked-read export uses), so no
+  intermediate Parquet and the data plane never writes a file. It enforces the
+  `mask_sample` completion gate (a partially-masked sample is rejected, not
+  assembled from a partial pass-set) and treats a fully-masked-out sample as a
+  terminal NO_DATA. A native step records the assembler; four container steps run
+  hifiasm_meta → metawrap binning → DAS_Tool → CheckM, each in its OWN per-tool
+  image (`long-read-assembly-{assemble,binning,dastool,checkm}`, one micromamba env
+  each) so a change to one tool's solve rebuilds only that image. CheckM requires
+  its reference DB — the `checkm` step fails loud without it (a required deploy
+  step) — and DAS_Tool fails loud on a real crash while treating a genuine no-bins
+  result as a benign empty. The storage tail REUSES the reference-add pipeline
+  rather than a bespoke parser: `assembly_hash` reads the LCG + MAG contigs with
+  miint `read_fastx` (circular contigs arrive as one multi-FASTA, no per-contig
+  split) and emits the manifest + hash-keyed chunks + bin_map, `mint-features`
+  mints the contig features against the SHARED `qiita.feature` (identical bytes
+  collapse to one feature_idx — an assembled contig and a reference sequence share
+  identity), `write-assembly-membership` links them to `qiita.assembly_membership`,
+  and `assembly_load` (reusing reference_load's re-key writers) + register-files
+  load four DuckLake tables — `assembled_sequence` / `assembled_sequence_chunks`
+  (feature-keyed contig sequences), `assembly_membership` (which features each
+  (prep_sample, run, bin) contains), and `bin_quality` (per-MAG CheckM + DAS_Tool
+  provenance, read with DuckDB's CSV reader). Each run has a `processing_idx`
+  identity (deduped on the canonical params hash — workflow/version/mask_idx/
+  assembler, so a different mask's pass-set is a distinct run that never collides a
+  prior run's bins). The step-1 assembler is a parameter (`hifiasm_meta` default;
+  `myloasm` reserved), threaded through the native steps' `params:` (a container
+  step can't take a scalar). Empty-branch semantics: LCG-only samples store
+  successfully, zero-contig samples are a terminal NO_DATA; sub-512 kb circular
+  contigs (plasmids / small replicons) are kept as LCG and separated from
+  chromosome-scale genomes by length at query time rather than deleted. The
+  cross-sample dereplication / taxonomy / abundance stage
+  (galah/gtdbtk/GToTree/coverm) is a separate follow-on that reads these per-sample
+  results across many preps. (#255)
+- **`bam-to-parquet` workflow — load a sample's BAM into the `read` table.** The
+  BAM analogue of `fastq-to-parquet`, structurally near-identical: a single native
+  `bam` step reads the file with miint's `read_sequences_sam` (which emits a
+  `read_fastx`-compatible schema, so `sequence_idx` comes from its per-file
+  `sequence_index` just like the FASTQ path), keeps only the read payload
+  (read_id, sequence, quality), mints a `sequence_idx` range, and writes
+  `read.parquet` that a `register-files` step loads into the existing DuckLake
+  `read` table. A plain read loader — it discards all alignment fields and every
+  aux tag (methylation MM/ML, kinetics). It targets an unaligned basecaller uBAM:
+  the caller declares `expect_unaligned` (default true), which the job trusts
+  (an `expect_unaligned=false` ticket is rejected — aligned loading is
+  unsupported; verifying the FLAGs can be layered on later); a duplicate-QNAME
+  guard rejects a paired uBAM so one read never gets two `sequence_idx`. No new
+  table, migration, container, or env var. The
+  `PreMintedRange` retry-recovery model moved from `jobs/fastq_to_parquet.py` to
+  `sequence_range.py` so both read-ingest jobs share it. (#254)
 - **`export_read_block` DoAction** — the block-compute sibling of `export_read`,
   the first piece of bulk-block read masking. The data plane materializes the
   UNION of a block's `(prep_sample_idx, sequence_idx sub-range)` members from its
@@ -901,6 +890,7 @@ the `no-changelog` label).
   reassembly (previously hand-written in `build_minimap2_index` and
   `hash_sequences`) has one home for both directions of the chunk contract.
   Pure refactor — both call sites emit byte-identical SQL. (#reference-support)
+
 - **`reference_taxonomy` is now 1-1 with a reference's features; taxonomy
   coverage gaps warn loudly instead of dropping silently.** `reference_load`'s
   `_write_taxonomy` used an INNER JOIN on `read_id`, which silently dropped both
@@ -917,6 +907,110 @@ the `no-changelog` label).
   (the rank columns are already nullable) and no migration; already-ingested
   references are not backfilled — only new ingests get the 1-1-at-rest shape.
   (#reference-support)
+
+- **Data-plane public-edge hardening.** The Arrow Flight service is reachable
+  from the internet through nginx on 443 (by design — clients connect directly
+  through nginx). Tightened that edge: the nginx Flight `location` now sets
+  `client_max_body_size 0` (a DoPut streams an entire reference through one
+  client-streaming RPC, so nginx's whole-body cap and the data plane's
+  per-message decode ceiling measure different quantities — nginx's 1 MB default
+  would 413 a reference-load upload, and any finite cap would still 413 a
+  multi-GiB reference even with every gRPC message under the DP ceiling), bumps
+  `grpc_read_timeout`/`grpc_send_timeout` to 3600s (the 60s default cut off large
+  DoGet exports before the first batch materialized), and caps concurrent Flight
+  connections per client (`limit_conn qiita_flight_conn 64`) to blunt connection
+  floods. The data plane's `build_query` now refuses an empty filter on the
+  `read_masked` view (which would `SELECT *` every sample's pass-reads across all
+  studies) as defense-in-depth; the reference_* tables still allow an unfiltered
+  read by design. CLI `--data-plane-url` help now shows the public
+  `grpc+tls://<host>:443` form — the old `grpc://<host>:50051` example is the
+  on-host/direct port and is not reachable off the deploy host. (#261)
+
+- **Login-cookie secret split off the Flight-ticket secret.** The `/auth/login`
+  → `/auth/handoff` cookie now signs with a dedicated `LOGIN_COOKIE_SECRET_KEY`
+  (new required control-plane env var) instead of reusing `HMAC_SECRET_KEY`. The
+  two were the same key, so one leak forged both Flight tickets and login
+  cookies; they are now independent. Control-plane only — the data plane never
+  sees the cookie key. Operator note: at the restart, login cookies signed with
+  the old key fail verification — a clean 401 (`CookieInvalid`), not a 500 — so
+  users mid-handoff in the ≤5-minute cookie window (`Max-Age` 300s) simply
+  re-login once. No dual-verify or coordinated cutover needed. (#262)
+
+- **Flight tickets are now Ed25519-signed (asymmetric), not HMAC-SHA256.** The
+  control plane signs with an Ed25519 private seed (`FLIGHT_TICKET_SIGNING_KEY`);
+  the publicly-reachable data plane holds only the matching public key
+  (`FLIGHT_TICKET_PUBLIC_KEY`) and verifies — so a data-plane host/env compromise
+  can no longer forge tickets (previously the symmetric `HMAC_SECRET_KEY` on the
+  DP could both verify and forge). Ticket wire version bumps to 2 (64-byte
+  signature); the DP accepts only v2. `HMAC_SECRET_KEY` is removed from both
+  services (the cookie moved to `LOGIN_COOKIE_SECRET_KEY`, tickets to the
+  keypair). End-user CLIs are unchanged — tickets are minted server-side. (#263)
+
+- **DuckLake catalog parquet write-options aligned with our register-time format.**
+  Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
+  options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`
+  per-table on the chunk tables (`reference_sequence_chunks`,
+  `assembled_sequence_chunks`), matching `qiita_common.parquet.PARQUET_OPTS` /
+  `CHUNK_ROW_GROUP_SIZE` — so DuckLake's OWN rewrites (compaction, merge, any future
+  direct insert) stay consistent with the format `register_files` writes rather than
+  drifting to DuckLake's defaults. Set idempotently at data-plane boot
+  (`connect_ducklake` + the `ensure_*_tables`), persisted in `ducklake_metadata`.
+  (#255)
+- **SIF build tooling supports N per-tool images per workflow.** A container
+  workflow may now ship several single-tool images under
+  `workflows/<wf>/sif-build.d/<image>.env` (each declaring its own `DEF_FILE` and a
+  `HASH_INPUTS` of the entrypoint(s) + shared helper it %files-copies; the def is
+  auto-included in the scoped hash) alongside — and fully
+  backward-compatible with — the legacy single `sif-build.env` + `Apptainer.def`
+  form (bcl-convert untouched). `build-sif.sh` takes an optional `<image>`
+  selector, `deploy/build-sifs.sh` discovers both layouts, and a new
+  `qiita_sif_build_inputs_hash_scoped` keys the two-gate idempotency hash to each
+  image's own inputs so a change to one tool's def or entrypoint rebuilds only its
+  image. `long-read-assembly` is the first consumer, shipping four per-tool images
+  (assemble / binning / dastool / checkm). (#255)
+- **Internal decomposition — no behavior change.** Consolidated the six
+  near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
+  helper; split the orchestrator's all-nullable `StepHandle` into typed
+  `LocalStepHandle` / `SlurmStepHandle` (the `StepHandleWire` wire form is
+  byte-for-byte unchanged, so no migration and no CP↔CO contract change); and
+  broke four monoliths into cohesive packages that re-export every name at the
+  same import path — `qiita_common.models` (→ health / reference / step /
+  upload / user / biosample / study / auth / work_ticket / sequencing + a
+  shared `_base`), the `qiita_control_plane.cli.user` and `.cli.admin` CLIs, and
+  `qiita_control_plane.runner`. Pure moves: every top-level definition is
+  carried over verbatim and each module's public-name set is a superset of the
+  original, so no consumer needed editing. No env var, migration, scope, route,
+  or wire change. (#248)
+
+- **Scope-403s now flag when your token lacks a scope your role grants, and
+  point at re-login.** A human's PAT scopes are fixed at mint time, so a scope
+  that's in the caller's live `role_ceiling` but absent from the token yields a
+  confusing `missing required scope 'X'` 403 even though the role grants X —
+  whether the scope was added to the ceiling after mint, or the PAT was minted
+  below the ceiling. `require_scope` / `require_any_scope` now append an
+  actionable "run `qiita login` to mint a fresh token with your full role scopes"
+  hint in that case. Genuinely-unentitled callers and service accounts get the
+  plain 403 unchanged — no security-model change (nothing is granted, only the
+  message improves). (#161)
+- **Control-plane test suite parallelized and de-latencied.** Several changes so
+  the ~1980 control-plane tests stop dominating CI wall-clock: (1) the
+  `test-control-plane-with-db` / `-without-db` targets run under `pytest-xdist`
+  (`-n auto --dist worksteal`) — the `postgres_url` fixture is now xdist-aware,
+  DROP+CREATEing and migrating a per-worker `qiita_test_<worker>` DB (from
+  `template0`, so concurrent creates don't race on a shared template), while
+  serial runs (no `PYTEST_XDIST_WORKER`) keep the shared base DB, leaving the
+  integration tier and single-test runs untouched; `worksteal` keeps an
+  end-of-run block of slow DB tests from stranding on one idle-surrounded worker.
+  (2) The JWKS / loopback test harnesses pass `poll_interval=0.01` to
+  `HTTPServer.serve_forever`, cutting a ~0.5s-per-test shutdown wait (the 0.5s
+  default) that ~120 auth/CLI tests each paid. Local Docker harness: serial
+  suite ~95s → ~34s, parallel run ~30s → ~9s; 1979/1979 pass in both modes. (#253)
+- **CI runs the macOS matrix leg only on `main`, not on PRs.** macOS runners are
+  ~6-15× slower than Ubuntu for the test suite and set the whole PR run's
+  wall-clock, while the deploy target is Linux. A `config` job now emits the
+  matrix OS list per event — Ubuntu-only for `pull_request`, Ubuntu + macOS for
+  `push` to `main` — so PR feedback is fast and macOS still gates every merge.
+  (#253)
 - **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
   required and must be absolute (previously optional, falling back to
   `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /
@@ -1472,6 +1566,14 @@ the `no-changelog` label).
   `build_rype`/`rype_w` from their sharded context (rype/`rype_w` now apply to
   `--host` only in the CLI); and `derived_store` drops `shard_rype_index_path` +
   `reference_shard_dir`. (#reference-support)
+
+- **`qiita-admin work-ticket backfill-mask-idx` retired.** The one-time mask_idx
+  backfill (for tickets predating the column) has run in production; the CLI
+  command — the only ticket signer outside the control-plane web process, which
+  read the raw signing key from the environment — and its `backfill_work_ticket_mask_idx`
+  runner helper are removed. `mask purge-failed`'s NULL-mask_idx safety guard is
+  unchanged; only its guidance text (which named the removed command) is
+  reworded. (#263)
 - Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag
@@ -1484,6 +1586,92 @@ the `no-changelog` label).
   are manual and there is no CI/tag-triggered deploy path. (#233)
 
 ### Fixed
+
+- **`plan-shards` is now genuinely opt-in (B5).** The `when: shard_index` gate
+  defaults ON for an absent key (correct for the `build_*` gates, which default to
+  building all index types), so `plan-shards` ran on a plain `reference-add` that
+  never set `shard_index` — fanning out (or, in production with a dispatch
+  callback, even sharding a genome-bearing reference nobody asked to shard). The
+  runner's `plan-shards` arm now self-defends — no-op when `bound.get("shard_index")`
+  is falsy, mirroring the finalize `_is_sharded_fanout_in_progress` check — before
+  the fan-out precondition (`dispatch_cb`) is required. `when: shard_index` is kept
+  as the explicit-opt-out gate. Fixes the two reference-add smokes. (#reference-support)
+
+- **Data plane: ambiguous `feature_idx` under the reference-membership JOIN.**
+  `build_query` qualified only `reference_idx` (with the membership alias `m.`)
+  when a `reference_sequences` / `reference_sequence_chunks` filter triggered the
+  membership JOIN, leaving any other column unqualified. A combined
+  `{reference_idx, feature_idx}` filter — exactly what the B6 `feature_idx`-scoped
+  DoGet ticket mints — then failed to bind with "Ambiguous reference to column name
+  feature_idx" (`feature_idx` exists on both joined tables). The non-reference_idx
+  columns are now qualified with the base-table alias `t.`. (#reference-support)
+
+- **`feature_idx`-scoped DoGet ticket (B6).** `POST /reference/{idx}/ticket/doget`
+  gains an optional `feature_idx` subset on its request body: omitted ⇒ today's
+  whole-reference ticket (`filter={"reference_idx":[idx]}`), byte-identical;
+  present ⇒ the ticket additionally scopes to those features
+  (`filter` gains `"feature_idx":[...]`, bounded at 100k) so a shard builder
+  streams only its own roster's sequences from `reference_sequences` /
+  `reference_sequence_chunks`. The status gate now admits `active` **and**
+  `indexing` (a shard build streams mid-ingest, post-`register-files`);
+  `pending`/`loading` stay 409, missing stays 404. No new route (the existing
+  `URL_REFERENCE_DOGET` triple is reused), no migration, no data-plane change
+  (`feature_idx` filtering already exists and is tested there). (#reference-support)
+
+- **Per-shard rype `.ryxdi` build (parameterized `build_rype_index` + `plan()`).**
+  The `build_rype_index` native job gains an optional **shard mode**: given a
+  `shard_id` and a runner-staged feature roster (`shard_features`, a Parquet of
+  `(feature_idx, sequence_length_bp)`), it builds one shard's rype `.ryxdi` routing
+  index over just that shard's features and writes it to
+  `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/index.ryxdi`
+  (`derived_store.shard_rype_index_path`), recording `shard_id` in the meta JSON
+  (the register-index arm already threads it, B1). Both shard fields unset =
+  today's whole-reference host build, byte-identical. Adds a `plan()` that sizes
+  the shard build's `mem_gb` down from the whole-reference baseline (floored at the
+  runtime-consistent rype+DuckDB+headroom minimum, scaled by the shard's total bp),
+  so a fleet of small shards doesn't each grab the 64 GB whole-reference slot.
+  Re-verified `rype_index_create` against upstream miint (`docs/duckdb-miint.md`
+  refreshed). No shard fan-out / workflow wiring yet — that's a later milestone;
+  16S/no-genome sharding deferred. (#reference-support)
+
+- **Lineage-sorted shard planner + `reference_membership.shard_id` persistence.**
+  The deterministic partition of an analysis reference's features into shards. A
+  pure tiler `qiita_control_plane.shard_planner.tile_by_lineage(items, num_shards)`
+  sorts the sharding units lexicographically by taxonomy lineage string and cuts
+  the sorted list into a fixed `_SHARD_COUNT = 1000` approximately-even shards
+  (fixed count / variable size — the mirror image of the read-block planner). The
+  tiler is generic over units (the caller chooses `item_id = genome_idx` for a
+  genome reference so shards balance by genome count and a genome's contigs stay
+  together); it is deterministic and re-derivable (internal `(lineage, item_id)`
+  sort). A new nullable `qiita.reference_membership.shard_id INTEGER` (+ a `>= 0`
+  CHECK) records the assignment (NULL = unassigned/unsharded), written by
+  `write_shard_assignment` (idempotent, replay-safe, reference-scoped). No shard
+  builds, fan-out, routing, or workflow wiring yet — those are later milestones;
+  16S / no-genome sharding is deferred. (#reference-support)
+
+- **Per-shard `reference_index.shard_id` + register/GET/derived-store plumbing.**
+  The foundation for per-shard *analysis* reference indexes: `qiita.reference_index`
+  gains a nullable `shard_id INTEGER` (+ a `>= 0` CHECK) so a sharded index writes
+  one row per shard (`shard_id` 0..N-1) while the existing unsharded host index
+  keeps `shard_id` NULL. Additive and backward-compatible — no `shard_count`
+  (it's `COUNT(*)` per `(reference_idx, index_type)`), no new UNIQUE (the
+  `(reference_idx, index_type, fs_path)` idempotency key already dedups
+  path-distinct shard rows). `register_index` and `GET /reference/{idx}/index`
+  thread `shard_id`; the runner's register-index arm reads it from the meta JSON
+  (`meta.get` → NULL for host metas); the whole-reference resolver
+  (`_resolve_reference_index_path`) filters `shard_id IS NULL` so a shard row is
+  never served as the unsharded index; and `derived_store.reference_shard_dir`
+  lays down the `references/{idx}/shards/{shard_id}/` layout (under the existing
+  purge subtree). No shard builds, planner, or routing yet — those are later
+  milestones. (#reference-support)
+
+- **`genome_source` controlled vocabulary + qiita-origin sample link.** `qiita.genome.source`
+  is now a closed vocabulary (`genbank`, `refseq`, `qiita`), enforced both up front at ingest
+  (fail-fast in `_associate_genomes`, before any DB write) and by a `CHECK`, mirrored by the new
+  `GenomeSource` `StrEnum`. Qiita-derived genomes (`source='qiita'`) now record the exact
+  originating sample via a new nullable `qiita.genome.prep_sample_idx` (FK to `qiita.prep_sample`,
+  required iff the source is `qiita` — a biconditional `CHECK`); the genome-map Parquet gains an
+  optional `prep_sample_idx` column. (#reference-support)
 
 - **Reference-load's sequence-chunk re-key no longer sorts `chunk_data` (fixes a
   GG2-scale OOM).** `_write_reference_sequence_chunks` re-keyed hash → feature_idx
@@ -1500,6 +1688,7 @@ the `no-changelog` label).
   (on-disk order isn't load-bearing — reassembly sorts `chunk_index` in memory and
   DoGet filters by feature_idx), and `_CHUNK_BUDGET_PER_BATCH` drops 50k→10k to keep
   the per-part ranges narrow for pruning. (#reference-support)
+
 - The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)

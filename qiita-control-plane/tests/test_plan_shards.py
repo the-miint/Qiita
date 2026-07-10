@@ -192,7 +192,7 @@ async def test_plan_shards_assigns_and_leaves_no_genome_null(postgres_pool, monk
         n = await library.plan_shards(
             postgres_pool,
             ref,
-            hmac_secret=b"\x00" * 32,
+            signing_key=b"\x00" * 32,
             data_plane_url="grpc://unused:1",
             workspace=tmp_path,
             num_shards=1000,

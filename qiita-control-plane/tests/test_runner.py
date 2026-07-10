@@ -166,7 +166,7 @@ def library_spy(monkeypatch):
             raise RuntimeError("simulated write-membership failure")
         return 0, 0
 
-    async def register_files(*, staging_dir, files, work_ticket_idx, hmac_secret, data_plane_url):
+    async def register_files(*, staging_dir, files, work_ticket_idx, signing_key, data_plane_url):
         # work_ticket_idx is keyword-required: if the runner stops threading it
         # (it rides in the signed payload so the data plane can mint unique,
         # ticket-traceable lake filenames), this stub raises TypeError and the
@@ -398,7 +398,7 @@ async def _run(
         work_ticket_idx,
         pool,
         backend,  # type: ignore[arg-type]  # protocol-shaped duck
-        hmac_secret=b"unused",
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         upload_staging_root=effective_upload_root,
@@ -1585,7 +1585,7 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
         tmp_path,
         {"kind": "reference", "reference_idx": reference_idx},
         work_ticket_idx=1,  # register-index ignores it; required by the signature
-        hmac_secret=b"unused",
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unused:50051",
     )
     assert out == {}
@@ -1639,7 +1639,7 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
         tmp_path,
         {"kind": "reference", "reference_idx": reference_idx},
         work_ticket_idx=1,  # register-index ignores it; required by the signature
-        hmac_secret=b"unused",
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unused:50051",
     )
     assert out == {}
@@ -1676,7 +1676,7 @@ async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference
             tmp_path,
             {"kind": "reference", "reference_idx": reference_idx},
             work_ticket_idx=1,
-            hmac_secret=b"unused",
+            signing_key=b"unused",
             data_plane_url="grpc://unused:50051",
         )
         assert out == {}
@@ -1745,7 +1745,7 @@ async def test_run_action_primitive_plan_shards_is_opt_in(postgres_pool, tmp_pat
             tmp_path,
             ref_scope,
             work_ticket_idx=1,
-            hmac_secret=b"unused",
+            signing_key=b"unused",
             data_plane_url="grpc://unused:50051",
             dispatch_cb=dispatch_cb,
         )
@@ -1779,7 +1779,7 @@ def test_build_scope_target_block():
 async def test_run_action_primitive_reconcile_block_dispatches(monkeypatch, tmp_path):
     """The reconcile-block arm calls the RECONCILE_BLOCK primitive with block_idx
     from the scope target and mask_idx from the runner-bound `bound` (the ticket's
-    mask_idx), plus the hmac_secret / data_plane_url for the mask_metrics read."""
+    mask_idx), plus the signing_key / data_plane_url for the mask_metrics read."""
     from qiita_common.actions import WorkflowAction
     from qiita_common.api_paths import LibraryPrimitive
 
@@ -1788,11 +1788,11 @@ async def test_run_action_primitive_reconcile_block_dispatches(monkeypatch, tmp_
 
     recorded: dict = {}
 
-    async def fake_reconcile(pool, *, block_idx, mask_idx, hmac_secret, data_plane_url):
+    async def fake_reconcile(pool, *, block_idx, mask_idx, signing_key, data_plane_url):
         recorded.update(
             block_idx=block_idx,
             mask_idx=mask_idx,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
         return {"block_idx": block_idx, "finalized_samples": []}
@@ -1807,14 +1807,14 @@ async def test_run_action_primitive_reconcile_block_dispatches(monkeypatch, tmp_
         tmp_path,
         {"kind": "block", "block_idx": 42},
         work_ticket_idx=9,
-        hmac_secret=b"sekret",
+        signing_key=b"sekret",
         data_plane_url="grpc://dp:50051",
     )
     assert out == {}
     assert recorded == {
         "block_idx": 42,
         "mask_idx": 77,
-        "hmac_secret": b"sekret",
+        "signing_key": b"sekret",
         "data_plane_url": "grpc://dp:50051",
     }
 
@@ -1835,7 +1835,7 @@ async def test_run_action_primitive_reconcile_block_rejects_non_block_scope(tmp_
             tmp_path,
             {"kind": "prep_sample", "prep_sample_idx": 5},
             work_ticket_idx=1,
-            hmac_secret=b"x",
+            signing_key=b"x",
             data_plane_url="grpc://x",
         )
 
@@ -1843,7 +1843,7 @@ async def test_run_action_primitive_reconcile_block_rejects_non_block_scope(tmp_
 async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tmp_path):
     """The delete-block-mask arm calls the DELETE_READ_MASK_BLOCK primitive with
     block_idx from the scope target and mask_idx from the runner-bound `bound`,
-    plus the hmac_secret / data_plane_url for the footprint delete DoAction."""
+    plus the signing_key / data_plane_url for the footprint delete DoAction."""
     from qiita_common.actions import WorkflowAction
     from qiita_common.api_paths import LibraryPrimitive
 
@@ -1852,11 +1852,11 @@ async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tm
 
     recorded: dict = {}
 
-    async def fake_delete(pool, *, block_idx, mask_idx, hmac_secret, data_plane_url):
+    async def fake_delete(pool, *, block_idx, mask_idx, signing_key, data_plane_url):
         recorded.update(
             block_idx=block_idx,
             mask_idx=mask_idx,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
         return {"block_idx": block_idx, "rows_deleted": 0}
@@ -1871,14 +1871,14 @@ async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tm
         tmp_path,
         {"kind": "block", "block_idx": 42},
         work_ticket_idx=9,
-        hmac_secret=b"sekret",
+        signing_key=b"sekret",
         data_plane_url="grpc://dp:50051",
     )
     assert out == {}
     assert recorded == {
         "block_idx": 42,
         "mask_idx": 77,
-        "hmac_secret": b"sekret",
+        "signing_key": b"sekret",
         "data_plane_url": "grpc://dp:50051",
     }
 
@@ -1899,7 +1899,7 @@ async def test_run_action_primitive_delete_block_mask_rejects_non_block_scope(tm
             tmp_path,
             {"kind": "prep_sample", "prep_sample_idx": 5},
             work_ticket_idx=1,
-            hmac_secret=b"x",
+            signing_key=b"x",
             data_plane_url="grpc://x",
         )
 
@@ -2864,7 +2864,7 @@ async def test_resolve_qc_adapters_writes_parquet(
         postgres_pool,
         default_adapter_reference_idx=reference_idx,
         data_plane_url="grpc://unused",
-        hmac_secret=b"x" * 16,
+        signing_key=b"x" * 32,
         workspace=tmp_path,
     )
     adapter_parquet = tmp_path / "adapters.parquet"
@@ -2886,7 +2886,7 @@ async def test_resolve_qc_adapters_unconfigured(postgres_pool, tmp_path):
             postgres_pool,
             default_adapter_reference_idx=None,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2902,7 +2902,7 @@ async def test_resolve_qc_adapters_unknown_reference(postgres_pool, tmp_path):
             postgres_pool,
             default_adapter_reference_idx=999_999_999,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2921,7 +2921,7 @@ async def test_resolve_qc_adapters_wrong_kind(postgres_pool, reference_idx, tmp_
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2941,7 +2941,7 @@ async def test_resolve_qc_adapters_non_active(postgres_pool, reference_idx, tmp_
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2960,7 +2960,7 @@ async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_p
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2987,7 +2987,7 @@ async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -3104,7 +3104,7 @@ async def test_stage_shard_roster_scopes_ticket_to_shard(
         )
         return len(fids)
 
-    monkeypatch.setattr(runner, "sign_ticket", fake_sign)
+    monkeypatch.setattr("qiita_control_plane.runner._read_ingest.sign_ticket", fake_sign)
     monkeypatch.setattr(runner, "_do_get_reference_sequences_roster", fake_doget)
 
     try:
@@ -3113,7 +3113,7 @@ async def test_stage_shard_roster_scopes_ticket_to_shard(
             reference_idx,
             0,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 16,
             workspace=tmp_path,
         )
         assert captured["table"] == "reference_sequences"
@@ -3145,7 +3145,7 @@ async def test_stage_shard_roster_empty_shard_fails(postgres_pool, reference_idx
             reference_idx,
             99,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 16,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -3173,7 +3173,7 @@ async def test_stage_shard_roster_dataplane_failure_is_submission(
                 reference_idx,
                 0,
                 data_plane_url="grpc://unused",
-                hmac_secret=b"x" * 16,
+                signing_key=b"x" * 32,
                 workspace=tmp_path,
             )
         assert ei.value.kind == FailureKind.BAD_INPUT
@@ -3270,7 +3270,9 @@ async def test_plan_shards_arm_stages_router_on_fanout(
     async def fake_fanout(pool, ref, **kwargs):
         return {"reference_idx": ref, "shards": 2, "tickets": [10, 11]}
 
-    monkeypatch.setattr(runner, "plan_and_submit_shards", fake_fanout)
+    monkeypatch.setattr(
+        "qiita_control_plane.runner._reconstruct.plan_and_submit_shards", fake_fanout
+    )
 
     try:
         out = await runner._run_action_primitive(
@@ -3280,7 +3282,7 @@ async def test_plan_shards_arm_stages_router_on_fanout(
             tmp_path,
             ref_scope,
             work_ticket_idx=1,
-            hmac_secret=b"x" * 32,
+            signing_key=b"x" * 32,
             data_plane_url="grpc://unused:1",
             dispatch_cb=lambda _idx: None,
         )
@@ -3322,7 +3324,7 @@ async def test_plan_shards_arm_no_router_on_zero_shards(
         tmp_path,
         ref_scope,
         work_ticket_idx=1,
-        hmac_secret=b"x" * 32,
+        signing_key=b"x" * 32,
         data_plane_url="grpc://unused:1",
         dispatch_cb=lambda _idx: None,
     )

@@ -51,7 +51,7 @@ The operator is, however, granted a **narrow POSIX ACL read on the three
 `/etc/qiita/*.env` files only** — *not* the bearer tokens, *not* lake
 data. This removes the deploy friction of an operator who can't see the
 config it deploys (e.g. sourcing `DATABASE_URL` for `make migrate`, or
-eyeballing `PATH_SCRATCH`/`HMAC` consistency) without joining any service
+eyeballing `PATH_SCRATCH`/Flight-keypair consistency) without joining any service
 group. An ACL is the right tool here precisely because it adds the
 operator as an *extra* reader while leaving each env file's
 `root:qiita-<svc>` ownership — and thus the service's own read path and
@@ -482,14 +482,16 @@ If `~/.local/bin` isn't on the operator's PATH, add it via `.bash_profile`
 ## 1. Write the control plane env file
 
 systemd loads `/etc/qiita/control-plane.env` for the CP. This step
-generates the shared HMAC secret and installs a rendered copy of the
-committed template at `.env.control-plane.example`.
+generates the Flight-ticket signing keypair (Ed25519) and the login-cookie
+secret, and installs a rendered copy of the committed template at
+`.env.control-plane.example`.
 
 **Keep these shell-resident across steps 1-8b** (use tmux/screen or
 otherwise ensure the shell doesn't close):
 
-- `$HMAC_SECRET_KEY` — step 8b's data-plane env file must see the
-  byte-identical value.
+- `$FLIGHT_TICKET_SIGNING_KEY` / `$FLIGHT_TICKET_PUBLIC_KEY` / `$LOGIN_COOKIE_SECRET_KEY`
+  — the Flight signing keypair (step 8b's data-plane env file must see the PUBLIC
+  key) and the control-plane cookie secret.
 - `$DATABASE_URL` — step 2 (`make migrate`), step 3 (`verify_jwt.py`),
   and step 6 (`qiita-admin set-system-role` — direct DB, no HTTP) all
   read it. Sourced from `/tmp/control-plane.env` below; once `[admin]`
@@ -499,14 +501,14 @@ otherwise ensure the shell doesn't close):
   operator can `source /etc/qiita/control-plane.env` directly — the
   shell-resident copy then just covers the brief window before the ACL).
 
-If either var goes missing between steps, recover via
-`sudo cat /etc/qiita/control-plane.env` (admin shell) and re-export
-manually — or for the HMAC specifically, regenerate (in which case
-you must also re-render the data-plane env file with the new value
-and restart both services).
+If a var goes missing between steps, recover via
+`sudo cat /etc/qiita/{control,data}-plane.env` (admin shell) and re-export
+manually — or for the Flight keypair, regenerate it (in which case you must
+re-render BOTH env files — the CP's signing seed and the DP's public key — and
+restart both services; see [`key-rotation.md`](key-rotation.md)).
 
 **The cross-account handoff.** The CP env file holds secrets (DB password,
-HMAC). `[operator]` renders the working copy at `/tmp/control-plane.env`
+Flight signing seed, login-cookie secret). `[operator]` renders the working copy at `/tmp/control-plane.env`
 (mode `0600` qiita-owned), `[operator]` sources it into their own shell
 **before** `[admin]` shreds it (otherwise the operator can't read
 `DATABASE_URL` for `make migrate` and the `verify_jwt.py` step), then
@@ -522,12 +524,15 @@ you're committing to the path here even though the leaf dirs show up a few
 steps later.
 
 ```bash
-# [operator] in a stable shell (use tmux/screen — HMAC_SECRET_KEY must survive
+# [operator] in a stable shell (use tmux/screen — the Flight keypair + cookie secret must survive
 # into step 8b's data-plane env file)
 cd ~/qiita-miint
 
-# Shared HMAC. CP and DP must see the byte-identical value.
-export HMAC_SECRET_KEY=$(openssl rand -base64 32)
+# Flight-ticket signing keypair (Ed25519): the CP signs with the PRIVATE seed,
+# the DP verifies with the PUBLIC key (both kept shell-resident into step 8b).
+# Plus a DISTINCT login-cookie secret (control-plane only).
+eval "$(python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('export FLIGHT_TICKET_SIGNING_KEY=' + base64.b64encode(k.private_bytes_raw()).decode()); print('export FLIGHT_TICKET_PUBLIC_KEY=' + base64.b64encode(k.public_key().public_bytes_raw()).decode())")"
+export LOGIN_COOKIE_SECRET_KEY=$(openssl rand -base64 32)
 
 # Render and tighten perms before any secrets land in the file
 cp .env.control-plane.example /tmp/control-plane.env
@@ -535,7 +540,8 @@ chmod 0600 /tmp/control-plane.env
 
 # Substitute every value we have. The password is filled by the editor pass below.
 sed -i.bak \
-    -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
+    -e "s|^FLIGHT_TICKET_SIGNING_KEY=.*|FLIGHT_TICKET_SIGNING_KEY=$FLIGHT_TICKET_SIGNING_KEY|" \
+    -e "s|^LOGIN_COOKIE_SECRET_KEY=.*|LOGIN_COOKIE_SECRET_KEY=$LOGIN_COOKIE_SECRET_KEY|" \
     -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint?sslmode=prefer'|" \
     -e "s|^# AUTHROCKET_ISSUER=.*|AUTHROCKET_ISSUER='https://authrocket.com'|" \
     -e "s|^# AUTHROCKET_LOGINROCKET_URL=.*|AUTHROCKET_LOGINROCKET_URL='https://<realm>.loginrocket.com'|" \
@@ -574,10 +580,10 @@ Error: pq: SSL is not enabled on the server
 `asyncpg` (used by the CP at runtime) defaults to `prefer` already, so the
 explicit setting only changes `make migrate`'s behavior.
 
-**If HMAC values disagree** later. Every Flight DoGet/DoAction will return
-`Unauthenticated: invalid HMAC signature` from the data plane. The control
+**If the keypair doesn't correspond** later. Every Flight DoGet/DoAction will return
+`Unauthenticated: invalid signature` from the data plane. The control
 plane logs the signed ticket with no error — the failure shows up only at
-the DP. Fix: confirm `HMAC_SECRET_KEY` is byte-identical in both env files,
+the DP. Fix: confirm the CP `FLIGHT_TICKET_SIGNING_KEY` and DP `FLIGHT_TICKET_PUBLIC_KEY` are a matching keypair (`make preflight` checks this),
 then `sudo systemctl restart qiita-control-plane qiita-data-plane@*`.
 
 See [`authrocket-realm-setup.md`](authrocket-realm-setup.md) for the
@@ -799,7 +805,7 @@ of the writing process's primary group, so the data plane (also in
 ### 8b. Write the data plane env file
 
 Render the committed template at `.env.data-plane.example`, substituting
-the HMAC secret from step 1's shell.
+the Flight-ticket public key from step 1's shell.
 
 ```bash
 # [operator]
@@ -808,7 +814,7 @@ cp .env.data-plane.example /tmp/data-plane.env
 chmod 0600 /tmp/data-plane.env
 
 sed -i.bak \
-    -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
+    -e "s|^FLIGHT_TICKET_PUBLIC_KEY=.*|FLIGHT_TICKET_PUBLIC_KEY=$FLIGHT_TICKET_PUBLIC_KEY|" \
     -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password> sslmode=prefer'|" \
     -e "s|^PATH_SCRATCH=.*|PATH_SCRATCH=<scratch>|" \
     -e "s|^# PATH_PERSISTENT=.*|PATH_PERSISTENT=<persistent>|" \
@@ -829,15 +835,15 @@ pairs, NOT a `postgresql://` URL. (`DATABASE_URL` in the CP env is the
 URL form because asyncpg accepts that; the data plane reads the raw
 libpq form because DuckDB's postgres extension expects it.)
 
-After this step the shared `$HMAC_SECRET_KEY` is no longer needed in
-the operator's shell (it's persisted in `/etc/qiita/{control,data}-plane.env`).
+After this step the Flight keypair + cookie secret are no longer needed in
+the operator's shell (they're persisted in `/etc/qiita/{control,data}-plane.env`).
 Same for the `DATABASE_URL` / `AUTHROCKET_*` env vars we sourced in
 step 1 — they're only used by `make migrate` (step 2) and `verify_jwt.py`
 (step 3), both already done. Clear them to limit exposure:
 
 ```bash
 # [operator]
-unset HMAC_SECRET_KEY DATABASE_URL \
+unset FLIGHT_TICKET_SIGNING_KEY FLIGHT_TICKET_PUBLIC_KEY LOGIN_COOKIE_SECRET_KEY DATABASE_URL \
       AUTHROCKET_ISSUER AUTHROCKET_LOGINROCKET_URL AUTHROCKET_JWKS_URL \
       QIITA_ENDPOINT_URL COMPUTE_ORCHESTRATOR_URL
 ```
@@ -867,8 +873,8 @@ restarts are safe.
 make verify-health
 ```
 
-Expected: `status: SERVING`. `Unauthenticated: invalid HMAC signature`
-from later Flight calls means `HMAC_SECRET_KEY` differs between the CP
+Expected: `status: SERVING`. `Unauthenticated: invalid signature`
+from later Flight calls means the Flight keypair does not correspond between the CP
 and DP env files (see step 1).
 
 ## 9. Start the orchestrator
@@ -976,7 +982,7 @@ make verify-health
 
 > Now that all three env files + token files exist, you can also run the
 > read-only consistency preflight — it confirms `PATH_SCRATCH` is byte-identical
-> across the three env files, `HMAC_SECRET_KEY` matches between CP and DP, and
+> across the three env files, the Flight keypair matches between CP and DP, and
 > the token files have the expected owner/mode, printing non-secret fingerprints
 > (never the values):
 > ```bash

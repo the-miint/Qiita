@@ -28,7 +28,7 @@ class _RecordingDeleteAlignmentData:
         self.rows_deleted = rows_deleted
         self.calls: list[int] = []
 
-    async def __call__(self, *, alignment_idx, hmac_secret, data_plane_url):
+    async def __call__(self, *, alignment_idx, signing_key, data_plane_url):
         self.calls.append(alignment_idx)
         return self.rows_deleted
 
@@ -47,7 +47,7 @@ def _install_settings(app):
     from qiita_control_plane.config import Settings
 
     app.state.settings = Settings(
-        database_url="unused", hmac_secret_key=b"\x00" * 32, data_plane_url="unused"
+        database_url="unused", flight_signing_key=b"\x00" * 32, data_plane_url="unused"
     )
 
 
@@ -240,7 +240,7 @@ async def test_delete_alignment_data_plane_failure_returns_502(client, postgres_
 
     alignment_idx = await _seed_alignment(postgres_pool, client._created)
 
-    async def _boom(*, alignment_idx, hmac_secret, data_plane_url):
+    async def _boom(*, alignment_idx, signing_key, data_plane_url):
         raise flight.FlightUnavailableError("data plane down")
 
     monkeypatch.setattr("qiita_control_plane.routes.alignment.delete_alignment_data", _boom)

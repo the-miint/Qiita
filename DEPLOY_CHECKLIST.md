@@ -13,7 +13,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
-### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast — a missing one keeps the unit down; entries that instead fall back to a default when unset are flagged inline)
+### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
 - **Email notification (control-plane).** To turn on work-ticket terminal-digest emails, set `SMTP_*` in `/etc/qiita/control-plane.env` before the restart; leaving `SMTP_HOST` unset keeps the no-op transport (no mail). None are secrets (relay is no-auth, IP-allowlisted, validated end-to-end). Optional `NOTIFY_*` knobs keep their defaults if unset. (#238)
   ```bash
@@ -28,6 +28,44 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   grep -q '^PATH_PERSISTENT=' /etc/qiita/data-plane.env || echo 'MISSING: set PATH_PERSISTENT in /etc/qiita/data-plane.env'
   ```
+- **`LOGIN_COOKIE_SECRET_KEY` now required for the control plane.** The login/handoff
+  cookie is split off `HMAC_SECRET_KEY` onto its own key; `from_env()` fails fast
+  without it, so the CP will refuse to start. Generate a **fresh, different** value
+  (do not reuse `HMAC_SECRET_KEY`) and set it in `/etc/qiita/control-plane.env`
+  before the CP restart. Control-plane only — the data plane does not get this key. (#262)
+  ```bash
+  grep -q '^LOGIN_COOKIE_SECRET_KEY=' /etc/qiita/control-plane.env \
+    || sudo bash -c 'printf "LOGIN_COOKIE_SECRET_KEY=%s\n" "$(openssl rand -base64 32)" >> /etc/qiita/control-plane.env'
+  ```
+- **Flight tickets move to Ed25519; `HMAC_SECRET_KEY` is retired.** Generate ONE
+  Ed25519 keypair: the control plane gets the PRIVATE seed
+  (`FLIGHT_TICKET_SIGNING_KEY`), the data plane gets the matching PUBLIC key
+  (`FLIGHT_TICKET_PUBLIC_KEY`). Both are `from_env()` fail-fast. Set both **before**
+  the restart, remove `HMAC_SECRET_KEY` from both env files, and **restart the
+  control plane and data plane together — they are a matched set with no partial
+  compatibility.** The DP holds one verifying key and hard-rejects v1 (HMAC)
+  tickets, and with HMAC gone from both sides there is no dual-accept — so a
+  half-completed swap is a *total* Flight outage, not a blip (HTTP routes are
+  unaffected). In-flight Flight work in the window does **not** uniformly
+  self-heal: a `step:` (SLURM) transient Flight error is retried, but an `action:`
+  (DoAction) rejection is classified permanent and needs manual redrive. Keep the
+  window short by restarting both together. `make preflight` checks the keypair
+  (derives the CP seed's public key via the **CP venv** interpreter and compares
+  to the DP's) — but if that interpreter lacks `cryptography` it reports `skip`,
+  not a green pass, so the **bucket-5 live DoGet is the definitive gate**. (#263)
+  ```bash
+  # Back up both env files first — the sed below drops HMAC_SECRET_KEY in place,
+  # so keep a copy to roll back to the previous (HMAC) build if the swap misfires:
+  sudo cp -a /etc/qiita/control-plane.env /etc/qiita/control-plane.env.pre-ed25519.bak
+  sudo cp -a /etc/qiita/data-plane.env    /etc/qiita/data-plane.env.pre-ed25519.bak
+  # Generate the keypair once (capture both values):
+  python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
+  # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):
+  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env; printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
+  # DP: add the public key, drop HMAC_SECRET_KEY (substitute <PUBLIC>):
+  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env; printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n" "<PUBLIC>" >> /etc/qiita/data-plane.env'
+  ```
+
 - **`DATA_PLANE_URL` for the compute orchestrator.** Native reference-index build
   jobs stream reference sequence chunks from the data plane over Arrow Flight; the
   orchestrator propagates `DATA_PLANE_URL` into the SLURM job env so the compute
@@ -41,6 +79,26 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```
 
 ### 2. One-time host setup
+
+- **CheckM reference database for `long-read-assembly`.** The workflow's `checkm`
+  step needs CheckM's ~1.4 GB reference data, which is deliberately NOT baked into
+  the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
+  time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
+  `/opt/checkm_data`), so the DB dir must be bind-mounted there (or
+  `QIITA_CHECKM_DB` set to its in-container path). (#255)
+  ```bash
+  # verify the tarball against CheckM's published checksum before extracting.
+  sudo -u qiita-orch bash -c 'mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data" \
+    && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
+    && tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
+  ```
+  REQUIRED before the first `long-read-assembly` run: the `checkm` step now **fails
+  loud** (non-zero exit) when the DB is absent or misconfigured — it no longer
+  degrades to an empty `checkm_dir` — so a MAG-producing sample's ticket cannot
+  COMPLETE until the DB is staged AND the container can see it (bind-mount it to
+  `CHECKM_DATA_PATH`, or set `QIITA_CHECKM_DB` to its in-container path). Wiring the
+  bind into the container step is part of this setup (the orchestrator binds only
+  declared step inputs today). assemble/binning/bin_refine are unaffected.
 
 - **Grant `ticket:doget` to the `compute` service account.** The orchestrator's
   reference-chunk streaming makes a CO→CP call to mint a `feature_idx`-scoped DoGet
@@ -74,6 +132,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     applies it standalone).
   - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
     extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
+- **Assembly-processing schema for `long-read-assembly`.** `make migrate` applies
+  `20260707000000_assembly.sql`: creates `qiita.processing` (+ the idempotent
+  `qiita.mint_processing` mint function) and `qiita.assembly_membership`. Plain
+  `make migrate`, no backfill or out-of-band setup. (The four DuckLake assembly
+  tables are auto-created at data-plane startup — see the note below.) (#255)
+
 - **genome_source controlled vocabulary + qiita-origin sample.** `make migrate` applies
   `20260706000000_genome_source_and_origin_sample.sql` (adds nullable `qiita.genome.prep_sample_idx`
   FK to `qiita.prep_sample`, a `source` vocabulary CHECK, and a biconditional origin CHECK). Both
@@ -85,7 +149,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   # row needs its prep_sample_idx backfilled (the new biconditional CHECK requires it).
   ```
 - **Per-shard `reference_index.shard_id`.** `make migrate` applies
-  `20260707000000_reference_index_shard_id.sql` (adds a nullable
+  `20260707010000_reference_index_shard_id.sql` (adds a nullable
   `qiita.reference_index.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
   no backfill or out-of-band steps. (#reference-support)
 - **Shard planner `reference_membership.shard_id`.** `make migrate` applies
@@ -134,6 +198,33 @@ _None yet._
   # expect: read-mask-block|1.0.0|block
   ```
 
+- Confirm the `long-read-assembly/1.0.0` workflow synced into `qiita.action`
+  (synced by `qiita-admin actions sync` inside `activate.sh`): (#255)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='long-read-assembly'"
+  # expect: long-read-assembly|1.0.0|prep_sample
+  ```
+- Confirm the `bam-to-parquet/1.0.0` workflow synced into `qiita.action` (new
+  BAM read-loader — synced by `qiita-admin actions sync` inside `activate.sh`,
+  covered by `make verify-deploy`'s `qiita.action` list; this asserts the specific
+  new action): (#254)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='bam-to-parquet'"
+  # expect: bam-to-parquet|1.0.0|prep_sample
+  ```
+
+- Confirm the deploy re-rendered nginx with the hardened Flight edge
+  (`activate.sh` re-installs `qiita.conf` + `nginx -t` + `systemctl reload nginx`,
+  so no manual step — this just asserts the reload carried the new directives): (#261)
+
+  ```bash
+  sudo nginx -T 2>/dev/null | grep -A20 'location /arrow.flight.protocol.FlightService/' \
+    | grep -E 'client_max_body_size|grpc_read_timeout|limit_conn'
+  # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
+  ```
+
 - Confirm the new `build-shard-index/1.0.0` workflow synced into `qiita.action` (the
   sharded-index fan-out target — one build-shard-index ticket per shard, now minimap2 +
   bowtie2 only; synced by `qiita-admin actions sync` inside `activate.sh`). The extended
@@ -151,7 +242,6 @@ _None yet._
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='build-shard-index'"
   # expect: build-shard-index|1.0.0|reference
   ```
-
 - Confirm the new `align/1.0.0` workflow synced into `qiita.action` (the C2b
   sharded-alignment consumer — `POST …/sequenced-pool/{P}/align-plan` fans out one
   `align` block ticket per block; synced by `qiita-admin actions sync` inside
@@ -179,6 +269,39 @@ _None yet._
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
   read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
+- **`long-read-assembly/1.0.0` is inert until an operator runs it.** The four new
+  DuckLake tables (`assembled_sequence`, `assembled_sequence_chunks`,
+  `assembly_membership`, `bin_quality`) are created automatically at data-plane
+  startup by `ensure_assembly_tables` — **no data-plane action** (the Postgres
+  `qiita.processing` / `qiita.assembly_membership` side is the bucket-3 migration).
+  The workflow's FOUR per-tool images (`long-read-assembly-assemble-1.0.0.sif`,
+  `long-read-assembly-binning-1.0.0.sif`, `long-read-assembly-dastool-1.0.0.sif`,
+  `long-read-assembly-checkm-1.0.0.sif`) are built automatically by `build-sifs.sh` during
+  the deploy — it now iterates `workflows/*/sif-build.d/*.env` in addition to the
+  legacy `sif-build.env`, so no new manual build step. The first build resolves
+  several bioconda envs (metawrap / DAS_Tool / CheckM), so it is **slow** and
+  needs apptainer + network on the build host; the two-gate idempotency is now
+  per-image, so a later change to one tool rebuilds only its SIF. Beyond the
+  bucket-2 CheckM DB, no new env var, scope, or group. (#255)
+- **Data-plane public-edge hardening — auto-applied, no manual step.** The Arrow
+  Flight service is publicly reachable through nginx on 443 (by design). This
+  tightens that edge and is picked up automatically by the deploy:
+  `activate.sh` re-renders/installs `deploy/nginx/qiita.conf`, runs `nginx -t`,
+  and `systemctl reload nginx`, so the new Flight-`location` directives go live on
+  the restart — `client_max_body_size 0` (a DoPut streams a whole reference through
+  one client-streaming RPC, so the whole-body cap and the DP's per-message decode
+  ceiling measure different quantities; the 1 MB default 413'd reference-load
+  uploads and any finite cap would 413 a multi-GiB reference), `grpc_read_timeout` /
+  `grpc_send_timeout` 3600s (the 60s default cut off large masked-read exports
+  before the first batch), and a new per-client `limit_conn qiita_flight_conn 64`
+  to bound connection floods. The data plane also now refuses an empty-filter
+  `read_masked` DoGet (defense-in-depth; via the binary restart), and the CLI
+  `--data-plane-url` help now points at the public `grpc+tls://<host>:443` form
+  (the `grpc://<host>:50051` example is the firewalled on-host port). No new env
+  var, host dir, scope, migration, or SIF. (#261)
+
+---
+
 - **`reference_taxonomy` row semantics changed (reference ingest).** After this
   deploys, a newly-ingested reference gets one `reference_taxonomy` row per feature —
   a feature with no supplied taxonomy is stored as an all-NULL-rank ("unclassified")

@@ -9,6 +9,10 @@ dependencies = [
     "asyncpg>=0.31",
     "pyarrow>=19",
     "pyjwt[crypto]>=2.9",
+    # Ed25519 Flight-ticket signing (`auth/tickets.py`) imports `cryptography`
+    # directly. It also arrives transitively via `pyjwt[crypto]`, but a
+    # trust-boundary module must not rely on a transitive dep — pin it explicitly.
+    "cryptography>=44",
     "httpx>=0.28",
     "pyyaml>=6",
     "duckdb>=1.5.4",
@@ -45,6 +49,7 @@ qiita = "qiita_control_plane.cli._bootstrap:qiita"
 dev = [
     "pytest>=9",
     "pytest-asyncio>=0.25",
+    "pytest-xdist>=3",
     "httpx>=0.28",
     "ruff>=0.15",
 ]

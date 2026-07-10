@@ -109,7 +109,7 @@ async def planned(ctx, monkeypatch):
         "rd": getattr(app.state, "running_dispatches", None),
     }
     app.state.settings = Settings(
-        database_url="unused", hmac_secret_key=b"\x00" * 32, data_plane_url="unused"
+        database_url="unused", flight_signing_key=b"\x00" * 32, data_plane_url="unused"
     )
     app.state.compute_backend_client = object()
     app.state.running_dispatches = set()

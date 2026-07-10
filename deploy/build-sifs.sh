@@ -7,7 +7,10 @@
 # we build there (no host fakeroot/subuid setup needed) and hand the produced SIF
 # to qiita-orch, which is what owns ${PATH_DERIVED}/images and runs SLURM jobs.
 #
-# Iterates workflows/*/sif-build.env, skipping:
+# Iterates every image spec — both the legacy single form
+# (workflows/*/sif-build.env) and the per-tool multi form
+# (workflows/*/sif-build.d/*.env), so a workflow that ships N single-tool images
+# builds all N. Skips:
 #   * names starting with "_" (e.g. _sif-build-smoke — a test fixture, _shared);
 #   * a spec opting out with AUTO_BUILD=0;
 #   * any image whose licensed/vendored SOURCES aren't staged under
@@ -66,10 +69,25 @@ fi
 sources_dir="${images_dir}/sources"
 
 built=() skipped=() failed=()
-for spec in "${WORKFLOWS_DIR}"/*/sif-build.env; do
-    [[ -e "${spec}" ]] || continue
-    wf="$(basename "$(dirname "${spec}")")"
+# Both spec layouts: the legacy single form at the workflow root, and the
+# per-tool multi form under sif-build.d/. A workflow uses one or the other; the
+# two globs never name the same SIF. `image` is empty for a legacy spec and the
+# spec's basename (sans .env) for a multi spec — passed as build-sif.sh's
+# optional second arg. `label` (wf, or wf/image) is what we report.
+specs=()
+for spec in "${WORKFLOWS_DIR}"/*/sif-build.env "${WORKFLOWS_DIR}"/*/sif-build.d/*.env; do
+    [[ -e "${spec}" ]] && specs+=("${spec}")
+done
+for spec in "${specs[@]}"; do
+    if [[ "$(basename "${spec}")" == "sif-build.env" ]]; then
+        wf="$(basename "$(dirname "${spec}")")"
+        image=""
+    else
+        wf="$(basename "$(dirname "$(dirname "${spec}")")")"
+        image="$(basename "${spec}" .env)"
+    fi
     case "${wf}" in _*) continue ;; esac   # _sif-build-smoke, _shared, …
+    label="${wf}${image:+/${image}}"
 
     # Read the spec's declarative keys in a subshell so its `source` can't leak
     # into ours (and so a stray exit in one spec can't abort the loop). Pre-declared
@@ -84,8 +102,8 @@ for spec in "${WORKFLOWS_DIR}"/*/sif-build.env; do
     )"
 
     if [[ "${spec_auto}" == "0" ]]; then
-        echo "SIF auto-build: ${wf} — opted out (AUTO_BUILD=0); skipping."
-        skipped+=("${wf} (AUTO_BUILD=0)")
+        echo "SIF auto-build: ${label} — opted out (AUTO_BUILD=0); skipping."
+        skipped+=("${label} (AUTO_BUILD=0)")
         continue
     fi
 
@@ -94,17 +112,19 @@ for spec in "${WORKFLOWS_DIR}"/*/sif-build.env; do
     # image — skip with a clear pointer, never fail the deploy over it.
     if ! missing="$(qiita_sif_missing_sources "${sources_dir}" "${spec_sources}")"; then
         missing_oneline="$(printf '%s' "${missing}" | tr '\n' ' ')"
-        echo "SIF auto-build: ${wf} — skipping; vendored source(s) not staged under ${sources_dir}: ${missing_oneline}" >&2
+        echo "SIF auto-build: ${label} — skipping; vendored source(s) not staged under ${sources_dir}: ${missing_oneline}" >&2
         echo "                place them there per DEPLOY_CHECKLIST.md, then re-run the deploy." >&2
-        skipped+=("${wf} (missing sources: ${missing_oneline})")
+        skipped+=("${label} (missing sources: ${missing_oneline})")
         continue
     fi
 
-    echo "SIF auto-build: ${wf} → ${images_dir}/${spec_sif} (building as root)…"
+    echo "SIF auto-build: ${label} → ${images_dir}/${spec_sif} (building as root)…"
     # build-sif.sh is idempotent (VERIFY_MATCH + the build-inputs hash stamp), so
     # an unchanged image prints "nothing to do" and exits 0 cheaply. A non-zero
     # exit here is a genuine build/verify failure — record it, keep going.
-    if PATH_DERIVED="${derived}" bash "${BUILD_SIF}" "${wf}"; then
+    build_args=("${wf}")
+    [[ -n "${image}" ]] && build_args+=("${image}")
+    if PATH_DERIVED="${derived}" bash "${BUILD_SIF}" "${build_args[@]}"; then
         # Hand the produced SIF (+ its build-inputs stamp) to the orchestrator
         # account — the deploy's "build as root, chown to qiita-orch" model. This
         # ownership IS the point: qiita-orch must own the SIF to run it, so a chown
@@ -114,14 +134,14 @@ for spec in "${WORKFLOWS_DIR}"/*/sif-build.env; do
         # after a successful build (build-sif.sh writes it), so chowning both is safe.
         sif="${images_dir}/${spec_sif}"
         if chown "${QIITA_ORCH_USER}:${QIITA_ORCH_USER}" "${sif}" "${sif}.buildhash"; then
-            built+=("${wf}")
+            built+=("${label}")
         else
-            echo "SIF auto-build: ${wf} — built, but chown to ${QIITA_ORCH_USER} FAILED (see error above)." >&2
-            failed+=("${wf} (chown)")
+            echo "SIF auto-build: ${label} — built, but chown to ${QIITA_ORCH_USER} FAILED (see error above)." >&2
+            failed+=("${label} (chown)")
         fi
     else
-        echo "SIF auto-build: ${wf} — BUILD FAILED (see log above)." >&2
-        failed+=("${wf}")
+        echo "SIF auto-build: ${label} — BUILD FAILED (see log above)." >&2
+        failed+=("${label}")
     fi
 done
 

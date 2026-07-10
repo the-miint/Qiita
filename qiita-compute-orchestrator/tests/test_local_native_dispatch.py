@@ -88,6 +88,8 @@ async def test_submit_status_result_runs_synchronously(monkeypatch, tmp_path):
     uniformly without lying about a non-existent job id."""
     from qiita_common.models import ComputeTarget, StepStatus
 
+    from qiita_compute_orchestrator.backend import LocalStepHandle
+
     async def execute(inputs, workspace):
         out = workspace / "result.parquet"
         out.write_bytes(b"FAKE")
@@ -104,9 +106,8 @@ async def test_submit_status_result_runs_synchronously(monkeypatch, tmp_path):
         work_ticket_idx=99,
         module=full,
     )
+    assert isinstance(handle, LocalStepHandle)
     assert handle.compute_target == ComputeTarget.LOCAL
-    assert handle.slurm_job_id is None
-    assert handle.job_name is None
     assert handle.terminal_outputs == {"result": tmp_path / "result.parquet"}
 
     info = await backend.status_step(handle)
@@ -128,16 +129,12 @@ async def test_result_step_raises_on_non_completed_status(tmp_path):
     """LocalBackend.result_step honors the ABC contract: a non-COMPLETED
     status is a caller bug and raises, rather than silently returning
     outputs for a step that didn't succeed."""
-    from qiita_common.models import ComputeTarget, StepStatus
+    from qiita_common.models import StepStatus
 
-    from qiita_compute_orchestrator.backend import StepHandle, StepStatusInfo
+    from qiita_compute_orchestrator.backend import LocalStepHandle, StepStatusInfo
 
     backend = LocalBackend()
-    handle = StepHandle(
-        compute_target=ComputeTarget.LOCAL,
-        step_name="x",
-        terminal_outputs={"a": tmp_path / "a"},
-    )
+    handle = LocalStepHandle(step_name="x", terminal_outputs={"a": tmp_path / "a"})
     with pytest.raises(BackendFailure) as ei:
         await backend.result_step(handle, StepStatusInfo(status=StepStatus.FAILED))
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT

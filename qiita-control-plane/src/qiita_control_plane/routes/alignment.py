@@ -28,7 +28,7 @@ from qiita_common.models import AlignmentDefinitionDeleteResponse
 from ..actions.library import delete_alignment_data
 from ..auth.guards import require_scope
 from ..auth.principal import Principal
-from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
+from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 
 _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 
@@ -41,7 +41,7 @@ alignment_definition_router = APIRouter(
 async def delete_alignment_definition_route(
     alignment_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_DELETE)),
 ) -> AlignmentDefinitionDeleteResponse:
@@ -88,7 +88,7 @@ async def delete_alignment_definition_route(
     try:
         rows_deleted = await delete_alignment_data(
             alignment_idx=alignment_idx,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
     except _flight.FlightError as exc:

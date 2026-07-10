@@ -152,7 +152,7 @@ async def test_local_reference_add_workflow_end_to_end(
     register_calls: list[tuple] = []
 
     async def _stub_register_files(
-        *, staging_dir, files, work_ticket_idx, hmac_secret, data_plane_url
+        *, staging_dir, files, work_ticket_idx, signing_key, data_plane_url
     ):
         # work_ticket_idx is keyword-required: the runner must thread it so the
         # data plane can mint unique, ticket-traceable lake filenames.
@@ -170,7 +170,7 @@ async def test_local_reference_add_workflow_end_to_end(
         work_ticket_idx,
         postgres_pool,
         backend_client,  # type: ignore[arg-type]  # protocol-shaped duck
-        hmac_secret=b"unused-in-smoke",
+        signing_key=b"unused-in-smoke",
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         # No uploads on the local path, but the kwarg is required; an empty

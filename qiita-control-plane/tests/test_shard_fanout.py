@@ -134,7 +134,7 @@ async def test_plan_and_submit_shards_fans_out_n_tickets(postgres_pool, monkeypa
         result = await shard_orchestration.plan_and_submit_shards(
             postgres_pool,
             ref,
-            hmac_secret=b"\x00" * 32,
+            signing_key=b"\x00" * 32,
             data_plane_url="grpc://unused:1",
             workspace=None,
             originator_principal_idx=sc["principal_idx"],
@@ -180,7 +180,7 @@ async def test_plan_and_submit_shards_zero_is_noop(postgres_pool, monkeypatch):
         result = await shard_orchestration.plan_and_submit_shards(
             postgres_pool,
             ref,
-            hmac_secret=b"\x00" * 32,
+            signing_key=b"\x00" * 32,
             data_plane_url="grpc://unused:1",
             workspace=None,
             originator_principal_idx=sc["principal_idx"],
@@ -225,7 +225,7 @@ async def test_plan_and_submit_shards_idempotent_redrive(postgres_pool, monkeypa
         monkeypatch.setattr(shard_orchestration, "plan_shards", fake_plan_shards)
 
         kwargs = dict(
-            hmac_secret=b"\x00" * 32,
+            signing_key=b"\x00" * 32,
             data_plane_url="grpc://unused:1",
             workspace=None,
             originator_principal_idx=sc["principal_idx"],

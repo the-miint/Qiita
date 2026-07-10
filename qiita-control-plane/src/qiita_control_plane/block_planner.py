@@ -193,7 +193,7 @@ async def resolve_block_mask_adapter_hash(
     *,
     default_adapter_reference_idx: int | None,
     data_plane_url: str,
-    hmac_secret: bytes,
+    signing_key: bytes,
     staging_root,
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
@@ -235,7 +235,7 @@ async def resolve_block_mask_adapter_hash(
         pool,
         default_adapter_reference_idx=default_adapter_reference_idx,
         data_plane_url=data_plane_url,
-        hmac_secret=hmac_secret,
+        signing_key=signing_key,
         workspace=workspace,
     )
 

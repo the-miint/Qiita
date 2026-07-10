@@ -94,6 +94,11 @@ class LibraryPrimitive(StrEnum):
 
     MINT_FEATURES = "mint-features"
     WRITE_MEMBERSHIP = "write-membership"
+    # Assembly analogue of write-membership: link a prep_sample's assembly RUN
+    # (processing_idx) contigs — already minted against the shared qiita.feature —
+    # to qiita.assembly_membership, tagged by (kind, bin_id). See
+    # qiita_control_plane.actions.library.write_assembly_membership.
+    WRITE_ASSEMBLY_MEMBERSHIP = "write-assembly-membership"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
     # Reference sharding: assign a reference's genome-bearing features to N

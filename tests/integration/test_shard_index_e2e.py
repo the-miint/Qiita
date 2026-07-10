@@ -21,7 +21,7 @@ a ticket) is monkeypatched to sign the chunk ticket DIRECTLY with the fixture
 DP's secret — the CO->CP ticket hop has its own tests; what's exercised here is
 the runner drive + DP DoGet + real streaming build. The roster DoGet in
 `_stage_shard_roster` is NOT stubbed: run_workflow gets the DP secret as
-`hmac_secret`, so it hits the live DP for real.
+`signing_key`, so it hits the live DP for real.
 
 Only `build_minimap2` is enabled (bowtie2 off) to keep the real build tiny;
 finalize-shard then expects exactly {minimap2}. Because per-shard rype no longer
@@ -255,7 +255,7 @@ async def test_build_shard_index_workflow_end_to_end(
         LocalComputeBackendClient(),  # type: ignore[arg-type]  # protocol-shaped duck
         # The DP fixture's secret, so _stage_shard_roster's REAL roster DoGet
         # verifies at the live DP.
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         work_ticket_workspace_root=tmp_path / "workspace",
         upload_staging_root=tmp_path / "upload-staging",
