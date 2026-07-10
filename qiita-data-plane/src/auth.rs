@@ -851,8 +851,8 @@ mod tests {
             &test_signing_key(),
             future_expiry(300),
         );
-        let payload =
-            verify_export_read_masked_block(&ticket, &test_vk()).expect("valid token should verify");
+        let payload = verify_export_read_masked_block(&ticket, &test_vk())
+            .expect("valid token should verify");
         assert_eq!(payload.action, "export_read_masked_block");
         assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
         assert_eq!(payload.mask_idx, 7);

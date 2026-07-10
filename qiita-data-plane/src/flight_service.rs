@@ -592,8 +592,9 @@ impl FlightService for QiitaFlightService {
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_alignment_block" => {
-                let payload = auth::verify_delete_alignment_block(&action.body, &self.flight_public_key)
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                let payload =
+                    auth::verify_delete_alignment_block(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
                 if payload.action != "delete_alignment_block" {
                     return Err(Status::invalid_argument(format!(

@@ -144,7 +144,11 @@ async def _stage_shard_roster(
     roster_path = workspace / "shard_roster.parquet"
     try:
         await asyncio.get_event_loop().run_in_executor(
-            None, _runner_pkg._do_get_reference_sequences_roster, data_plane_url, ticket, roster_path
+            None,
+            _runner_pkg._do_get_reference_sequences_roster,
+            data_plane_url,
+            ticket,
+            roster_path,
         )
     except Exception as exc:
         raise _submission_bad_input(
