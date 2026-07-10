@@ -73,7 +73,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   missing value falls back to `grpc://localhost:50051` (the unit still boots), but
   a compute node cannot reach a localhost data plane, so set it to the
   nginx-fronted gRPC origin (same host the data plane's own `DATA_PLANE_URL`
-  names) before the restart. (#reference-support)
+  names) before the restart. (#268)
   ```bash
   sudo bash -c 'echo "DATA_PLANE_URL=grpc://qiita-miint.ucsd.edu:50051" >> /etc/qiita/compute-orchestrator.env'
   ```
@@ -115,7 +115,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   build path at its token instead — see the provisioning runbook's "Why a separate
   principal". Extending `compute` is simplest; `ticket:doget` is a read scope (it
   signs a ticket to read reference chunks), not cross-domain minting authority.
-  (#reference-support)
+  (#268)
 
 ### 3. Migrations
 
@@ -142,7 +142,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `20260706000000_genome_source_and_origin_sample.sql` (adds nullable `qiita.genome.prep_sample_idx`
   FK to `qiita.prep_sample`, a `source` vocabulary CHECK, and a biconditional origin CHECK). Both
   new CHECKs validate **existing** `qiita.genome` rows, so **before** migrating confirm none would
-  violate them: (#reference-support)
+  violate them: (#268)
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.genome WHERE source NOT IN ('genbank','refseq')"
   # expect: 0 — any out-of-vocab source must be fixed first, and any pre-existing source='qiita'
@@ -151,28 +151,28 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - **Per-shard `reference_index.shard_id`.** `make migrate` applies
   `20260707010000_reference_index_shard_id.sql` (adds a nullable
   `qiita.reference_index.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
-  no backfill or out-of-band steps. (#reference-support)
+  no backfill or out-of-band steps. (#268)
 - **Shard planner `reference_membership.shard_id`.** `make migrate` applies
   `20260708000000_reference_membership_shard_id.sql` (adds a nullable
   `qiita.reference_membership.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
-  no backfill or out-of-band steps. (#reference-support)
+  no backfill or out-of-band steps. (#268)
 - **bowtie2 `reference_index.index_type`.** `make migrate` applies
   `20260709000000_reference_index_bowtie2_type.sql` (extends the
   `reference_index_index_type_check` allow-list to `rype`/`minimap2`/`bowtie2`).
   Additive CHECK; no `'bowtie2'` rows exist yet (the shard builders are unwired), no
-  out-of-band steps. (#reference-support)
+  out-of-band steps. (#268)
 - **`work_ticket.shard_id` sharded-fan-out discriminant.** `make migrate` applies
   `20260710000000_work_ticket_shard_id.sql` (adds a nullable `qiita.work_ticket.shard_id
   INTEGER` + a reference-scope-only CHECK, re-partitions
   `work_ticket_one_in_flight_per_reference` with `AND shard_id IS NULL`, and adds
   `work_ticket_one_in_flight_per_shard`). Additive; existing tickets read NULL and are
-  unaffected, no backfill or out-of-band steps. (#reference-support)
+  unaffected, no backfill or out-of-band steps. (#268)
 - **`rype_router` `reference_index.index_type`.** `make migrate` applies
   `20260711000000_reference_index_rype_router_type.sql` (extends the
   `reference_index_index_type_check` allow-list to
   `rype`/`minimap2`/`bowtie2`/`rype_router`). Additive CHECK expansion; the sharded
   reference-add path starts inserting `rype_router` rows (the whole-reference router),
-  no out-of-band steps. (#reference-support)
+  no out-of-band steps. (#268)
 - **Sharded-alignment identity + gate (C2b).** `make migrate` applies three additive
   migrations, no backfill: `20260712000000_alignment_definition.sql` (the
   `qiita.alignment_definition` params-hash identity table + `mint_alignment_definition`,
@@ -180,7 +180,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   per-`(alignment_idx, prep_sample)` completion gate, twin of `mask_sample`, FK
   `alignment_idx` ON DELETE CASCADE), and `20260712020000_work_ticket_alignment_idx.sql`
   (a nullable `qiita.work_ticket.alignment_idx` FK ON DELETE SET NULL + partial index).
-  Existing rows read NULL; no out-of-band steps. (#reference-support)
+  Existing rows read NULL; no out-of-band steps. (#268)
 
 ### 4. Deploy
 
@@ -236,7 +236,7 @@ _None yet._
   container; the `compute` SA's `ticket:doget` grant above already covers the per-shard
   and whole-reference streaming). Inert until a submitter opts in with `--shard-index`;
   a sharded reference then reaches `active` only once every per-shard index AND the
-  `rype_router` row are registered. (#reference-support)
+  `rype_router` row are registered. (#268)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='build-shard-index'"
@@ -246,7 +246,7 @@ _None yet._
   sharded-alignment consumer — `POST …/sequenced-pool/{P}/align-plan` fans out one
   `align` block ticket per block; synced by `qiita-admin actions sync` inside
   `activate.sh`). Inert until a submitter runs an align plan against an ACTIVE
-  sharded reference. (#reference-support)
+  sharded reference. (#268)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='align'"
@@ -310,7 +310,7 @@ _None yet._
   supplied rows now log loud `WARNING`s in the SLURM job log rather than failing. No host
   action, no migration; **already-ingested references are NOT backfilled** — only new
   ingests get the 1-1-at-rest shape, so analysts querying `reference_taxonomy` across a
-  mix of old and new references will see both shapes. (#reference-support)
+  mix of old and new references will see both shapes. (#268)
 - **Sharded-reference alignment consumer (C2b) is inert until an operator runs it.**
   The `align/1.0.0` workflow, the `alignment_definition`/`alignment_sample` tables,
   the nullable `work_ticket.alignment_idx`, and `POST …/sequenced-pool/{P}/align-plan`
@@ -325,7 +325,7 @@ _None yet._
   `alignment_definition:delete` (role-implied in `auth/scopes.py`, like
   `mask_definition:delete`) gating `DELETE /alignment-definition/{alignment_idx}` — **an
   existing system_admin PAT does not carry it until re-minted** (`qiita-admin login` or a
-  fresh PAT); no grant step. (#reference-support)
+  fresh PAT); no grant step. (#268)
 - **New sharded-index observability endpoint (control-plane).**
   `GET /api/v1/reference/{idx}/shard-index-status` returns a sharded reference's
   `expected_shards` (N), per-`index_type` `registered_shards`, and `failed_shard_tickets`
@@ -333,7 +333,7 @@ _None yet._
   (remediation: an operator redrives the FAILED build-shard-index ticket; its
   finalize-shard re-counts and, as the last observer, flips `active`). Scoped to
   `reference:read` (universal), additive, no new env var / migration / scope / sync.
-  Reads all-zero / empty for an unsharded reference. (#reference-support)
+  Reads all-zero / empty for an unsharded reference. (#268)
 
 ---
 
