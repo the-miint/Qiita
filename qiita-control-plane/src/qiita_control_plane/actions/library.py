@@ -19,6 +19,7 @@ it differently.
 """
 
 import asyncio
+import itertools
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -488,20 +489,28 @@ async def write_shard_assignment(
             "UPDATE qiita.reference_membership SET shard_id = NULL WHERE reference_idx = $1",
             reference_idx,
         )
-        for shard_id, feature_idxs in enumerate(shards):
-            for start in range(0, len(feature_idxs), _CHUNK_SIZE):
-                batch = list(feature_idxs[start : start + _CHUNK_SIZE])
-                if not batch:
-                    continue
-                rows = await conn.fetch(
-                    "UPDATE qiita.reference_membership SET shard_id = $1"
-                    " WHERE reference_idx = $2 AND feature_idx = ANY($3::bigint[])"
-                    " RETURNING feature_idx",
-                    shard_id,
-                    reference_idx,
-                    batch,
-                )
-                total_updated += len(rows)
+        # Flatten to a (feature_idx, shard_id) pair stream and apply one
+        # set-based UPDATE...FROM unnest per _CHUNK_SIZE slice — a handful of
+        # round-trips instead of one per shard. `itertools.islice` keeps only a
+        # slice in memory at a time (the generator never materializes all pairs).
+        # Each feature is in exactly one shard (feature_genome.feature_idx is
+        # UNIQUE), so no pair targets a row twice. RETURNING preserves the count.
+        pair_stream = (
+            (feature_idx, shard_id)
+            for shard_id, feature_idxs in enumerate(shards)
+            for feature_idx in feature_idxs
+        )
+        while batch := list(itertools.islice(pair_stream, _CHUNK_SIZE)):
+            rows = await conn.fetch(
+                "UPDATE qiita.reference_membership rm SET shard_id = t.shard_id"
+                " FROM unnest($1::bigint[], $2::int[]) AS t(feature_idx, shard_id)"
+                " WHERE rm.reference_idx = $3 AND rm.feature_idx = t.feature_idx"
+                " RETURNING rm.feature_idx",
+                [feature_idx for feature_idx, _ in batch],
+                [shard_id for _, shard_id in batch],
+                reference_idx,
+            )
+            total_updated += len(rows)
     return total_updated
 
 
@@ -611,10 +620,22 @@ def _compute_shards(
     if not shards:
         return []
     con.execute("CREATE OR REPLACE TEMP TABLE shard_map (genome_idx BIGINT, shard_id INTEGER)")
-    con.executemany(
-        "INSERT INTO shard_map VALUES (?, ?)",
-        [(genome_idx, k) for k, genomes in enumerate(shards) for genome_idx in genomes],
+    # One vectorized insert via a registered Arrow table, not a row-by-row
+    # executemany (genome count is GG2-scale). The pre-created typed shard_map +
+    # INSERT...SELECT pins the column types (BIGINT/INTEGER) regardless of Arrow.
+    shard_pairs = pa.table(
+        {
+            "genome_idx": pa.array(
+                [genome_idx for genomes in shards for genome_idx in genomes], pa.int64()
+            ),
+            "shard_id": pa.array(
+                [k for k, genomes in enumerate(shards) for _ in genomes], pa.int32()
+            ),
+        }
     )
+    con.register("shard_pairs", shard_pairs)
+    con.execute("INSERT INTO shard_map SELECT genome_idx, shard_id FROM shard_pairs")
+    con.unregister("shard_pairs")
     rows = con.execute(
         "SELECT sm.shard_id, list(mg.feature_idx ORDER BY mg.feature_idx) AS features"
         "  FROM member_genome mg"

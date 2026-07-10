@@ -139,26 +139,31 @@ async def plan_and_submit_shards(
             )
             if current != ReferenceStatus.INDEXING.value:
                 raise
-        for shard_id in range(n):
-            work_ticket_idx = await conn.fetchval(
-                "INSERT INTO qiita.work_ticket ("
-                "  action_id, action_version, originator_principal_idx,"
-                "  scope_target_kind, reference_idx, shard_id, action_context"
-                ") VALUES ($1, $2, $3, 'reference', $4, $5, $6::jsonb)"
-                " ON CONFLICT (action_id, action_version, reference_idx, shard_id)"
-                "   WHERE shard_id IS NOT NULL"
-                "     AND state IN ('pending', 'queued', 'processing')"
-                " DO NOTHING"
-                " RETURNING work_ticket_idx",
-                build_action_id,
-                build_action_version,
-                originator_principal_idx,
-                reference_idx,
-                shard_id,
-                action_context_json,
-            )
-            if work_ticket_idx is not None:
-                fresh_tickets.append(work_ticket_idx)
+        # One set-based INSERT over generate_series(0, n-1) instead of n
+        # per-shard round-trips. ON CONFLICT DO NOTHING RETURNING emits a row
+        # only for tuples actually inserted, so `fresh_tickets` stays exactly the
+        # freshly-minted set (a full redrive returns nothing → dispatches
+        # nothing) — the same idempotency the loop had. The ON CONFLICT arbiter
+        # clause is byte-identical (the per-shard partial unique index).
+        rows = await conn.fetch(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, reference_idx, shard_id, action_context"
+            ") SELECT $1, $2, $3, 'reference', $4, s.shard_id, $6::jsonb"
+            "    FROM generate_series(0, $5 - 1) AS s(shard_id)"
+            " ON CONFLICT (action_id, action_version, reference_idx, shard_id)"
+            "   WHERE shard_id IS NOT NULL"
+            "     AND state IN ('pending', 'queued', 'processing')"
+            " DO NOTHING"
+            " RETURNING work_ticket_idx",
+            build_action_id,
+            build_action_version,
+            originator_principal_idx,
+            reference_idx,
+            n,
+            action_context_json,
+        )
+        fresh_tickets.extend(r["work_ticket_idx"] for r in rows)
 
     for work_ticket_idx in fresh_tickets:
         dispatch_cb(work_ticket_idx)
