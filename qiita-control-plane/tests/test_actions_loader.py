@@ -891,3 +891,60 @@ def test_load_actions_read_mask_audience_is_admin_only():
         SystemRole.WET_LAB_ADMIN,
         SystemRole.SYSTEM_ADMIN,
     }
+
+
+def test_read_mask_yaml_shadowing_and_ordering_contract():
+    """Pin the structural contract the read-mask chain depends on.
+
+    `syndna` DELIBERATELY declares the same output names `host_filter` does, so
+    when it runs its bindings shadow host_filter's (bound.update is
+    last-writer-wins) and the trailing entries consume the EXTENDED mask; when
+    `syndna_enabled` is false it is skipped and host_filter's bindings stand.
+    Distinct names would break the skipped case — register-files takes exactly ONE
+    input binding.
+
+    Nothing about that is enforced by the runner, so a rename or a reorder would
+    silently persist the PRE-syndna mask (every spike-in reverts to `pass`) with
+    no test red. The behavioral half lives in test_runner.py's shadowing tests;
+    this is the structural half, read off the shipped YAML.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    rm = {a.action_id: a for a in load_actions(repo_root / "workflows")}["read-mask"]
+    names = [e.name for e in rm.steps]
+
+    # lima trio BEFORE qc (lima needs the intact adaptor; QC must judge the
+    # insert); syndna AFTER host_filter (spike-ins survive host depletion);
+    # persist-read-metrics BEFORE register-files (which MOVES the parquet out).
+    assert names == [
+        "lima_export",
+        "lima",
+        "lima_mask",
+        "qc",
+        "host_filter",
+        "syndna",
+        "persist-read-metrics",
+        "register-files",
+    ]
+
+    by_name = {e.name: e for e in rm.steps}
+    host_filter, syndna = by_name["host_filter"], by_name["syndna"]
+
+    # The shadow: identical output names, syndna second.
+    assert syndna.outputs == host_filter.outputs == ["read_mask", "read_mask_staging_dir"]
+    # The self-shadow: syndna reads the binding it also writes.
+    assert "read_mask" in syndna.inputs
+    # ...and the consumers take exactly one binding each, which is why distinct
+    # names cannot work for the skipped case.
+    assert by_name["persist-read-metrics"].inputs == ["read_mask"]
+    assert by_name["register-files"].inputs == ["read_mask_staging_dir"]
+
+    # The gates: the lima trio skips together; syndna has its own.
+    assert [by_name[n].when for n in ("lima_export", "lima", "lima_mask")] == ["lima_enabled"] * 3
+    assert syndna.when == "syndna_enabled"
+    # qc and host_filter are ALWAYS present (host optionality is via optional_inputs).
+    assert by_name["qc"].when is None and host_filter.when is None
+    assert "adapter_mask" in by_name["qc"].optional_inputs

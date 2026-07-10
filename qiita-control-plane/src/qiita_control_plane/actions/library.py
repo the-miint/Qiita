@@ -530,8 +530,10 @@ def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int, int]:
     sequenced_sample monotonic CHECK.
 
     The data plane's `mask_metrics_counts` (Rust) is the block-path twin of this
-    function and MUST bucket identically; the read-mask block e2e test asserts both
-    paths agree."""
+    function and MUST bucket identically. That is pinned by
+    `tests/test_read_mask_counts.py::test_rust_reason_lists_match_the_python_bucket_map`,
+    which compares the Rust consts to `read_mask_reason_sql_list` — not by the block
+    e2e test, whose fixture emits no `spikein_syndna`/`host_minimap2` rows."""
     biological = f"reason IN ({read_mask_reason_sql_list(ReadMaskBucket.BIOLOGICAL)})"
     spikein = f"reason IN ({read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN)})"
     quality_filtered = f"reason = '{ReadMaskReason.PASS.value}'"
@@ -814,7 +816,8 @@ async def mask_metrics_data(
     both-mates (`*_r1r2`) totals `sequenced_sample` stores plus `row_count` (one
     per read/pair) the reconcile count-assertion checks against `sequence_range`.
     The buckets are produced by the data plane's `mask_metrics_counts`, the Rust
-    twin of `_read_mask_counts`; the two must agree (see the block e2e test).
+    twin of `_read_mask_counts`; the two must agree (pinned by
+    `tests/test_read_mask_counts.py::test_rust_reason_lists_match_the_python_bucket_map`).
     Unlike the per-sample path's local-parquet `_read_mask_counts`, this reads the
     PERSISTED table because a block-masked sample's rows are written by several
     blocks. Raises pyarrow.flight.FlightError on transport / data-plane failure,
