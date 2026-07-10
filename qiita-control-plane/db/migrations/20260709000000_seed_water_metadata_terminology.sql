@@ -1,5 +1,10 @@
 -- migrate:up
 
+-- These placeholder MVP seeds append terms directly rather than running the
+-- terminology reload pipeline, so version/loaded_at on the NCBI Taxonomy and
+-- ENVO rows are left as originally seeded (the reload contract moves both
+-- together and does not apply here).
+
 -- Add the marine/estuarine metagenome taxa to the existing NCBI Taxonomy
 -- terminology (seeded earlier as 'pre-release MVP').
 INSERT INTO qiita.terminology_term (terminology_idx, term_id, label)
