@@ -52,6 +52,7 @@ from ..repositories.block import (
     lock_mask_sample,
     set_block_state,
 )
+from ..repositories.reference_membership import count_reference_shards
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
 
@@ -570,8 +571,7 @@ async def _export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path
                 "SELECT rm.feature_idx, fg.genome_idx"
                 " FROM qiita.reference_membership rm"
                 " JOIN qiita.feature_genome fg USING (feature_idx)"
-                " WHERE rm.reference_idx = $1"
-                " ORDER BY rm.feature_idx",
+                " WHERE rm.reference_idx = $1",
                 reference_idx,
             )
             while batch := await cursor.fetch(_CHUNK_SIZE):
@@ -870,11 +870,7 @@ async def finalize_shard(
     active), the derived `expected_shards` N, and per-type `registered_shards`.
     """
     async with pool.acquire() as conn, conn.transaction():
-        n = await conn.fetchval(
-            "SELECT count(DISTINCT shard_id) FROM qiita.reference_membership"
-            " WHERE reference_idx = $1 AND shard_id IS NOT NULL",
-            reference_idx,
-        )
+        n = await count_reference_shards(conn, reference_idx)
         registered: dict[str, int] = {}
         for index_type in expected_index_types:
             registered[index_type] = await conn.fetchval(

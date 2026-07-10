@@ -884,6 +884,21 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Reference-arc efficiency/latency/DRY follow-ups.** Dropped a redundant
+  `ORDER BY rm.feature_idx` from `_export_member_genome` (no consumer relies on
+  the row order — every downstream reducer/tiler re-sorts — so it only risked an
+  explicit Sort over millions of `(feature_idx, genome_idx)` rows at GG2 scale).
+  Moved the `delete_read_mask_block` / `delete_alignment_block` data-plane
+  DoActions onto `tokio::task::spawn_blocking` so their blocking DuckLake delete
+  transactions never starve a tonic async worker (matching the four sibling
+  delete arms). Single-sourced the reference shard-set queries
+  (`count(DISTINCT shard_id)` / sorted `DISTINCT shard_id` over the non-NULL
+  `reference_membership` rows) into a new `repositories/reference_membership.py`
+  (`count_reference_shards` / `reference_shard_ids`), replacing four
+  byte-identical copies whose drift would make the reference-add finalizer gate
+  on a different threshold than the planner assigned. Pure quality — no change to
+  persisted data. (#268)
+
 - **Single-sourced the sequence-chunk reassembly SQL.** Added
   `reassemble_chunks_expr` to `qiita_common.chunking` next to the existing
   `sequence_split_expr`, so the `string_agg(chunk_data, '' ORDER BY chunk_index)`

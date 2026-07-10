@@ -28,6 +28,7 @@ from qiita_common.models import (
 
 from .. import step_progress
 from ..actions.library import LIBRARY, MINT_FEATURES_OUTPUT_BASENAME
+from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     BUILD_SHARD_INDEX_ACTION_VERSION,
@@ -181,11 +182,7 @@ async def _reconstruct_plan_shards_outputs(
     build_routing_index re-provides the mapping and re-opens the gate. Mirrors
     the live plan-shards arm's return; keep the two in step."""
     reference_idx = scope_target["reference_idx"]
-    n = await pool.fetchval(
-        "SELECT count(DISTINCT shard_id) FROM qiita.reference_membership"
-        " WHERE reference_idx = $1 AND shard_id IS NOT NULL",
-        reference_idx,
-    )
+    n = await count_reference_shards(pool, reference_idx)
     if not n:
         return {ROUTER_PENDING_BINDING: False}
     mapping_path = await _stage_shard_mapping(

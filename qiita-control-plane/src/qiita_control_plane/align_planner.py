@@ -50,6 +50,7 @@ from .repositories.block import (
     set_block_work_ticket,
 )
 from .repositories.mask_definition import lookup_mask_idx_by_params
+from .repositories.reference_membership import reference_shard_ids
 from .runner import (
     ReferenceIndexNotBuilt,
     _build_mask_params,
@@ -103,23 +104,6 @@ class AlignResubmitError(RuntimeError):
             "alignment first to re-align, or pass only_missing=true to plan only the ungated "
             f"samples. prep_sample_idxs: {conflicting_prep_sample_idxs}"
         )
-
-
-async def _resolve_shard_ids(pool: asyncpg.Pool, reference_idx: int) -> list[int]:
-    """The reference's current shard-set — the sorted DISTINCT non-NULL
-    `reference_membership.shard_id` values. Baked into the alignment identity
-    (`mint_alignment_definition`), so a grown reference (a different shard-set)
-    mints a NEW alignment_idx over only its new shards (the growth foundation,
-    Decision 3). Non-empty by construction here: the caller already asserted a
-    per-shard index is built, which is only registered after the shard assignment
-    stamped these rows."""
-    rows = await pool.fetch(
-        "SELECT DISTINCT shard_id FROM qiita.reference_membership"
-        " WHERE reference_idx = $1 AND shard_id IS NOT NULL"
-        " ORDER BY shard_id",
-        reference_idx,
-    )
-    return [r["shard_id"] for r in rows]
 
 
 async def plan_and_submit_alignments(
@@ -176,7 +160,12 @@ async def plan_and_submit_alignments(
         # Non-active reference, or an unknown aligner (both ValueError).
         raise AlignReferenceNotReady(str(exc)) from exc
 
-    shard_ids = await _resolve_shard_ids(pool, reference_idx)
+    # The reference's current shard-set, baked into the alignment identity
+    # (`mint_alignment_definition`) so a grown reference mints a NEW alignment_idx
+    # over only its new shards (the growth foundation, Decision 3). Non-empty by
+    # construction here: the caller already asserted a per-shard index is built,
+    # which is only registered after the shard assignment stamped these rows.
+    shard_ids = await reference_shard_ids(pool, reference_idx)
 
     # instrument_model is part of the mask identity (gates QC polyG); read it once
     # from the run so the mask LOOKUP reconstructs the same params.

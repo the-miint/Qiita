@@ -73,6 +73,7 @@ from ..deps import (
     get_flight_signing_key,
     get_tx_conn_factory,
 )
+from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     expected_shard_index_types,
@@ -232,11 +233,7 @@ async def get_reference_shard_index_status(
     # N = the shards the planner assigned (COUNT(DISTINCT shard_id) over the
     # non-NULL membership rows — the same derivation finalize_shard uses; there
     # is no shard_count column). 0 for an unsharded reference.
-    expected_shards = await pool.fetchval(
-        "SELECT count(DISTINCT shard_id) FROM qiita.reference_membership"
-        " WHERE reference_idx = $1 AND shard_id IS NOT NULL",
-        reference_idx,
-    )
+    expected_shards = await count_reference_shards(pool, reference_idx)
 
     # Registered shard rows per index_type — the observed ground truth.
     rows = await pool.fetch(
