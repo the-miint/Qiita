@@ -540,12 +540,21 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                let deleted = delete_read_mask_block(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    payload.mask_idx,
-                    &payload.members,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_alignment_block). The closure opens and drops its own
+                // connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let mask_idx = payload.mask_idx;
+                let members = payload.members;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_read_mask_block(&catalog, &data_path, mask_idx, &members)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_read_mask_block task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -611,12 +620,21 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                let deleted = delete_alignment_block(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    payload.alignment_idx,
-                    &payload.members,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_alignment). The closure opens and drops its own
+                // connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let alignment_idx = payload.alignment_idx;
+                let members = payload.members;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_alignment_block(&catalog, &data_path, alignment_idx, &members)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_alignment_block task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
