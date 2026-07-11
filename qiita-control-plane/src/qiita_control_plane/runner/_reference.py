@@ -342,7 +342,7 @@ async def _resolve_qc_adapters(
     *,
     default_adapter_reference_idx: int | None,
     data_plane_url: str,
-    hmac_secret: bytes,
+    signing_key: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
     """Materialize the canonical adapter set as a local one-`sequence`-column
@@ -391,7 +391,7 @@ async def _resolve_qc_adapters(
     ticket = sign_ticket(
         table=_REFERENCE_CHUNKS_TABLE,
         filter={"reference_idx": [default_adapter_reference_idx]},
-        secret=hmac_secret,
+        secret=signing_key,
     )
     # A Flight failure (data plane unreachable / errored) raises
     # pyarrow.flight.FlightError, which is NOT a BackendFailure — letting it

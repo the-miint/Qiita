@@ -161,7 +161,7 @@ def _stub_metrics(monkeypatch, *, row_count=_SAMPLE_READS, raw=None, biological=
         "row_count": row_count,
     }
 
-    async def fake(*, mask_idx, prep_sample_idx, hmac_secret, data_plane_url):
+    async def fake(*, mask_idx, prep_sample_idx, signing_key, data_plane_url):
         return dict(counts)
 
     monkeypatch.setattr(library, "mask_metrics_data", fake)
@@ -202,7 +202,7 @@ async def test_reconcile_single_block_finalizes_sample(rb, monkeypatch):
     )
 
     result = await reconcile_block(
-        pool, block_idx=block, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+        pool, block_idx=block, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
     )
 
     assert result == {"block_idx": block, "finalized_samples": [ps]}
@@ -231,7 +231,7 @@ async def test_reconcile_split_sample_waits_for_last_block(rb, monkeypatch):
     # Reconcile block A while B is still processing → A completes, sample NOT
     # finalized (a sibling still owes reads).
     res_a = await reconcile_block(
-        pool, block_idx=block_a, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+        pool, block_idx=block_a, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
     )
     assert res_a["finalized_samples"] == []
     assert await _block_state(pool, block_a) == "completed"
@@ -239,7 +239,7 @@ async def test_reconcile_split_sample_waits_for_last_block(rb, monkeypatch):
 
     # Reconcile block B (now the last) → sample finalizes.
     res_b = await reconcile_block(
-        pool, block_idx=block_b, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+        pool, block_idx=block_b, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
     )
     assert res_b["finalized_samples"] == [ps]
     assert await _mask_sample_state(pool, mask_idx, ps) == "completed"
@@ -265,10 +265,10 @@ async def test_reconcile_concurrent_finalize_exactly_once(rb, monkeypatch):
     # them so the sample finalizes in exactly ONE of the two results.
     res_a, res_b = await asyncio.gather(
         reconcile_block(
-            pool, block_idx=block_a, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+            pool, block_idx=block_a, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
         ),
         reconcile_block(
-            pool, block_idx=block_b, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+            pool, block_idx=block_b, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
         ),
     )
     finalized = res_a["finalized_samples"] + res_b["finalized_samples"]
@@ -291,13 +291,13 @@ async def test_reconcile_is_idempotent(rb, monkeypatch):
     )
 
     first = await reconcile_block(
-        pool, block_idx=block, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+        pool, block_idx=block, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
     )
     assert first["finalized_samples"] == [ps]
     # Re-run (a redrive): the block is already completed, the sample already
     # finalized → nothing new is finalized.
     second = await reconcile_block(
-        pool, block_idx=block, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+        pool, block_idx=block, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
     )
     assert second["finalized_samples"] == []
     assert await _mask_sample_state(pool, mask_idx, ps) == "completed"
@@ -320,7 +320,7 @@ async def test_reconcile_count_mismatch_raises(rb, monkeypatch):
 
     with pytest.raises(RuntimeError, match="does not fully tile"):
         await reconcile_block(
-            pool, block_idx=block, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+            pool, block_idx=block, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
         )
     # The transaction rolled back: neither the gate nor (in the same txn) the
     # block flip persisted a finalize.
@@ -349,11 +349,11 @@ async def test_delete_read_mask_block_builds_footprint_from_members(rb, monkeypa
 
     recorded: dict = {}
 
-    async def fake_delete_data(*, mask_idx, members, hmac_secret, data_plane_url):
+    async def fake_delete_data(*, mask_idx, members, signing_key, data_plane_url):
         recorded.update(
             mask_idx=mask_idx,
             members=members,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
         return 3
@@ -361,7 +361,7 @@ async def test_delete_read_mask_block_builds_footprint_from_members(rb, monkeypa
     monkeypatch.setattr(library, "delete_read_mask_block_data", fake_delete_data)
 
     result = await delete_read_mask_block(
-        pool, block_idx=block, mask_idx=mask_idx, hmac_secret=b"s", data_plane_url="grpc://x"
+        pool, block_idx=block, mask_idx=mask_idx, signing_key=b"s", data_plane_url="grpc://x"
     )
 
     assert result == {"block_idx": block, "rows_deleted": 3}

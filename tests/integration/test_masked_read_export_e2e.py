@@ -17,14 +17,14 @@ proves, against the running data-plane process + integration Postgres:
 The manifest + per-sample ticket are produced by calling the REAL route
 functions in-process (`export_masked_read_manifest` /
 `create_masked_read_export_ticket`) against the integration Postgres and the data
-plane's HMAC secret; the single-pass CLI's synchronous HTTP layer
+plane's Ed25519 signing key; the single-pass CLI's synchronous HTTP layer
 (`_common.httpx.request`) is bridged to those precomputed real responses so
 `main()` can run unchanged. The HTTP transport + the system_admin/scope auth
 gates are covered exhaustively by the ASGI route tests in
 qiita-control-plane/tests/routes/test_admin_masked_read_export.py; here the value
 is everything downstream of a correctly-signed ticket.
 
-Shared fixtures (`data_plane`, `hmac_secret`, `postgres_pool`,
+Shared fixtures (`data_plane`, `signing_key`, `postgres_pool`,
 `human_admin_session`, `ducklake_connect`) live in conftest.py.
 """
 
@@ -221,7 +221,7 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
                 prep_sample_idx=sample["prep_sample_idx"], mask_idx=mask_idx
             ),
             pool=postgres_pool,
-            hmac_secret=secret,
+            signing_key=secret,
             _role=None,
             _scope=None,
         )
@@ -346,7 +346,7 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
                 prep_sample_idx=sample["prep_sample_idx"], mask_idx=mask_idx
             ),
             pool=postgres_pool,
-            hmac_secret=secret,
+            signing_key=secret,
             _role=None,
             _scope=None,
         )

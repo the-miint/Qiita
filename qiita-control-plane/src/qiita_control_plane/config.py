@@ -111,8 +111,16 @@ def _parse_optional_positive_int_env(var: str) -> int | None:
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
-    hmac_secret_key: bytes
+    flight_signing_key: bytes
     data_plane_url: str
+    # HMAC key for the /auth/login → /auth/handoff cookie, kept DISTINCT from
+    # flight_signing_key (which signs Flight tickets) so one leak can't forge both.
+    # `from_env` requires LOGIN_COOKIE_SECRET_KEY (fail-loud, ≥16 bytes) and
+    # never uses this default. The default is only a construction convenience for
+    # direct Settings(...) in tests that don't touch the cookie; it can never
+    # actually sign, because sign_login_cookie/verify_login_cookie raise on an
+    # empty secret regardless of how Settings was built.
+    login_cookie_secret_key: bytes = b""
     # Compute-orchestrator dispatch. Both fields optional: when
     # `compute_orchestrator_url` is None, the CP boots without an HTTP client
     # and any work-ticket dispatch route returns 503 — useful for tests and
@@ -212,13 +220,31 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
-        raw = require_env("HMAC_SECRET_KEY")
+        # Ed25519 private seed (32 raw bytes, base64-encoded) used to SIGN Flight
+        # tickets. The data plane holds only the matching public key and verifies,
+        # so a data-plane compromise can't forge tickets. Fail-loud on a missing /
+        # malformed / wrong-length value.
+        raw = require_env("FLIGHT_TICKET_SIGNING_KEY")
         try:
-            secret = base64.b64decode(raw)
+            signing_seed = base64.b64decode(raw)
         except Exception as exc:
-            raise RuntimeError("HMAC_SECRET_KEY must be valid base64") from exc
-        if len(secret) < 16:
-            raise RuntimeError("HMAC_SECRET_KEY must decode to at least 16 bytes")
+            raise RuntimeError("FLIGHT_TICKET_SIGNING_KEY must be valid base64") from exc
+        if len(signing_seed) != 32:
+            raise RuntimeError(
+                "FLIGHT_TICKET_SIGNING_KEY must decode to exactly 32 bytes "
+                f"(an Ed25519 private seed), got {len(signing_seed)}"
+            )
+
+        # Separate secret for the login/handoff cookie — deliberately NOT the
+        # Flight-ticket key, so a leak of one can't forge the other. Required
+        # and fail-loud (same posture as FLIGHT_TICKET_SIGNING_KEY).
+        cookie_raw = require_env("LOGIN_COOKIE_SECRET_KEY")
+        try:
+            login_cookie_secret_key = base64.b64decode(cookie_raw)
+        except Exception as exc:
+            raise RuntimeError("LOGIN_COOKIE_SECRET_KEY must be valid base64") from exc
+        if len(login_cookie_secret_key) < 16:
+            raise RuntimeError("LOGIN_COOKIE_SECRET_KEY must decode to at least 16 bytes")
 
         issuer = os.environ.get("AUTHROCKET_ISSUER") or None
         # JWKS URL defaults from issuer when issuer is set; explicit override wins.
@@ -275,7 +301,8 @@ class Settings:
 
         return cls(
             database_url=require_env("DATABASE_URL"),
-            hmac_secret_key=secret,
+            flight_signing_key=signing_seed,
+            login_cookie_secret_key=login_cookie_secret_key,
             data_plane_url=os.environ.get("DATA_PLANE_URL", "grpc://localhost:50051"),
             compute_orchestrator_url=compute_orchestrator_url,
             cp_to_co_token_path=cp_to_co_token_path,

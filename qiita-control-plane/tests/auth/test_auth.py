@@ -6,6 +6,9 @@ import time
 
 import pytest
 
+# A valid 32-byte Ed25519 private seed for tests (any 32 bytes is a valid seed).
+_TEST_SEED = b"\x01" * 32
+
 
 def test_sign_ticket_importable():
     """sign_ticket must be importable."""
@@ -21,44 +24,45 @@ def test_sign_ticket_returns_bytes():
     ticket = sign_ticket(
         table="reference_sequences",
         filter={"feature_idx": [1, 2, 3]},
-        secret=b"dev-secret",
+        secret=_TEST_SEED,
     )
     assert isinstance(ticket, bytes)
     assert len(ticket) > 0
 
 
 def test_sign_ticket_is_deterministic():
-    """Same inputs must produce the same ticket (given same expiry)."""
+    """Same inputs must produce the same ticket (given same expiry). Ed25519 is
+    deterministic per RFC 8032, so a fixed seed + payload + expiry is stable."""
     from qiita_control_plane.auth.tickets import sign_ticket
 
     t1 = sign_ticket(
         table="reference_sequences",
         filter={"feature_idx": [1]},
-        secret=b"dev-secret",
+        secret=_TEST_SEED,
         expiry_epoch=1000000,
     )
     t2 = sign_ticket(
         table="reference_sequences",
         filter={"feature_idx": [1]},
-        secret=b"dev-secret",
+        secret=_TEST_SEED,
         expiry_epoch=1000000,
     )
     assert t1 == t2
 
 
 def test_sign_ticket_wire_format():
-    """Ticket wire format: 1B version, 4B payload len, payload, 32B HMAC, 8B expiry."""
+    """Ticket wire format: 1B version, 4B payload len, payload, 64B Ed25519 sig, 8B expiry."""
     from qiita_control_plane.auth.tickets import sign_ticket
 
     ticket = sign_ticket(
         table="test_table",
         filter={"x": [1]},
-        secret=b"dev-secret",
+        secret=_TEST_SEED,
         expiry_epoch=9999999999,
     )
 
-    # Version byte
-    assert ticket[0] == 1
+    # Version byte — v2 is the Ed25519 wire format.
+    assert ticket[0] == 2
 
     # Payload length (big-endian uint32)
     payload_len = struct.unpack(">I", ticket[1:5])[0]
@@ -69,18 +73,18 @@ def test_sign_ticket_wire_format():
     assert payload["table"] == "test_table"
     assert payload["filter"] == {"x": [1]}
 
-    # HMAC is 32 bytes
-    hmac_start = 5 + payload_len
-    hmac_bytes = ticket[hmac_start : hmac_start + 32]
-    assert len(hmac_bytes) == 32
+    # Signature is 64 bytes (Ed25519)
+    sig_start = 5 + payload_len
+    sig_bytes = ticket[sig_start : sig_start + 64]
+    assert len(sig_bytes) == 64
 
     # Expiry is big-endian uint64
-    expiry_start = hmac_start + 32
+    expiry_start = sig_start + 64
     expiry = struct.unpack(">Q", ticket[expiry_start : expiry_start + 8])[0]
     assert expiry == 9999999999
 
     # Total length check
-    assert len(ticket) == 1 + 4 + payload_len + 32 + 8
+    assert len(ticket) == 1 + 4 + payload_len + 64 + 8
 
 
 def test_sign_ticket_includes_expiry_in_future():
@@ -90,11 +94,11 @@ def test_sign_ticket_includes_expiry_in_future():
     ticket = sign_ticket(
         table="test",
         filter={"x": [1]},
-        secret=b"dev-secret",
+        secret=_TEST_SEED,
     )
 
     payload_len = struct.unpack(">I", ticket[1:5])[0]
-    expiry_start = 1 + 4 + payload_len + 32
+    expiry_start = 1 + 4 + payload_len + 64
     expiry = struct.unpack(">Q", ticket[expiry_start : expiry_start + 8])[0]
     assert expiry > time.time()
 
@@ -106,7 +110,7 @@ def test_sign_ticket_canonical_json():
     ticket = sign_ticket(
         table="test",
         filter={"z": [1], "a": [2]},
-        secret=b"dev-secret",
+        secret=_TEST_SEED,
         expiry_epoch=1000000,
     )
 
@@ -127,9 +131,9 @@ def test_sign_ticket_rejects_nonpositive_ttl():
     from qiita_control_plane.auth.tickets import sign_ticket
 
     with pytest.raises(ValueError, match="positive"):
-        sign_ticket(table="test", filter={"x": [1]}, secret=b"dev-secret", ttl_seconds=0)
+        sign_ticket(table="test", filter={"x": [1]}, secret=_TEST_SEED, ttl_seconds=0)
     with pytest.raises(ValueError, match="positive"):
-        sign_ticket(table="test", filter={"x": [1]}, secret=b"dev-secret", ttl_seconds=-1)
+        sign_ticket(table="test", filter={"x": [1]}, secret=_TEST_SEED, ttl_seconds=-1)
 
 
 def test_sign_ticket_rejects_empty_filter():
@@ -141,6 +145,6 @@ def test_sign_ticket_rejects_empty_filter():
     from qiita_control_plane.auth.tickets import sign_ticket
 
     with pytest.raises(ValueError, match="non-empty filter"):
-        sign_ticket(table="test", filter={}, secret=b"dev-secret")
+        sign_ticket(table="test", filter={}, secret=_TEST_SEED)
     with pytest.raises(ValueError, match="non-empty filter"):
-        sign_ticket(table="test", filter={"prep_sample_idx": []}, secret=b"dev-secret")
+        sign_ticket(table="test", filter={"prep_sample_idx": []}, secret=_TEST_SEED)

@@ -168,7 +168,7 @@ async def _run_block_action(
         workspace,
         {"kind": "block", "block_idx": block_idx},
         work_ticket_idx=work_ticket_idx,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
 
@@ -357,7 +357,7 @@ async def _export_ticket_or_status(pool, data_plane, *, prep_sample_idx, mask_id
                 prep_sample_idx=prep_sample_idx, mask_idx=mask_idx
             ),
             pool=pool,
-            hmac_secret=data_plane["secret"],
+            signing_key=data_plane["secret"],
             _role=None,
             _scope=None,
         )

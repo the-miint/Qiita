@@ -28,6 +28,43 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   grep -q '^PATH_PERSISTENT=' /etc/qiita/data-plane.env || echo 'MISSING: set PATH_PERSISTENT in /etc/qiita/data-plane.env'
   ```
+- **`LOGIN_COOKIE_SECRET_KEY` now required for the control plane.** The login/handoff
+  cookie is split off `HMAC_SECRET_KEY` onto its own key; `from_env()` fails fast
+  without it, so the CP will refuse to start. Generate a **fresh, different** value
+  (do not reuse `HMAC_SECRET_KEY`) and set it in `/etc/qiita/control-plane.env`
+  before the CP restart. Control-plane only — the data plane does not get this key. (#262)
+  ```bash
+  grep -q '^LOGIN_COOKIE_SECRET_KEY=' /etc/qiita/control-plane.env \
+    || sudo bash -c 'printf "LOGIN_COOKIE_SECRET_KEY=%s\n" "$(openssl rand -base64 32)" >> /etc/qiita/control-plane.env'
+  ```
+- **Flight tickets move to Ed25519; `HMAC_SECRET_KEY` is retired.** Generate ONE
+  Ed25519 keypair: the control plane gets the PRIVATE seed
+  (`FLIGHT_TICKET_SIGNING_KEY`), the data plane gets the matching PUBLIC key
+  (`FLIGHT_TICKET_PUBLIC_KEY`). Both are `from_env()` fail-fast. Set both **before**
+  the restart, remove `HMAC_SECRET_KEY` from both env files, and **restart the
+  control plane and data plane together — they are a matched set with no partial
+  compatibility.** The DP holds one verifying key and hard-rejects v1 (HMAC)
+  tickets, and with HMAC gone from both sides there is no dual-accept — so a
+  half-completed swap is a *total* Flight outage, not a blip (HTTP routes are
+  unaffected). In-flight Flight work in the window does **not** uniformly
+  self-heal: a `step:` (SLURM) transient Flight error is retried, but an `action:`
+  (DoAction) rejection is classified permanent and needs manual redrive. Keep the
+  window short by restarting both together. `make preflight` checks the keypair
+  (derives the CP seed's public key via the **CP venv** interpreter and compares
+  to the DP's) — but if that interpreter lacks `cryptography` it reports `skip`,
+  not a green pass, so the **bucket-5 live DoGet is the definitive gate**. (#263)
+  ```bash
+  # Back up both env files first — the sed below drops HMAC_SECRET_KEY in place,
+  # so keep a copy to roll back to the previous (HMAC) build if the swap misfires:
+  sudo cp -a /etc/qiita/control-plane.env /etc/qiita/control-plane.env.pre-ed25519.bak
+  sudo cp -a /etc/qiita/data-plane.env    /etc/qiita/data-plane.env.pre-ed25519.bak
+  # Generate the keypair once (capture both values):
+  python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
+  # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):
+  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env; printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
+  # DP: add the public key, drop HMAC_SECRET_KEY (substitute <PUBLIC>):
+  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env; printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n" "<PUBLIC>" >> /etc/qiita/data-plane.env'
+  ```
 
 ### 2. One-time host setup
 
@@ -105,6 +142,16 @@ _None yet._
   # expect: bam-to-parquet|1.0.0|prep_sample
   ```
 
+- Confirm the deploy re-rendered nginx with the hardened Flight edge
+  (`activate.sh` re-installs `qiita.conf` + `nginx -t` + `systemctl reload nginx`,
+  so no manual step — this just asserts the reload carried the new directives): (#261)
+
+  ```bash
+  sudo nginx -T 2>/dev/null | grep -A20 'location /arrow.flight.protocol.FlightService/' \
+    | grep -E 'client_max_body_size|grpc_read_timeout|limit_conn'
+  # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
+  ```
+
 ### Notes (no host action)
 
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
@@ -135,6 +182,22 @@ _None yet._
   needs apptainer + network on the build host; the two-gate idempotency is now
   per-image, so a later change to one tool rebuilds only its SIF. Beyond the
   bucket-2 CheckM DB, no new env var, scope, or group. (#255)
+- **Data-plane public-edge hardening — auto-applied, no manual step.** The Arrow
+  Flight service is publicly reachable through nginx on 443 (by design). This
+  tightens that edge and is picked up automatically by the deploy:
+  `activate.sh` re-renders/installs `deploy/nginx/qiita.conf`, runs `nginx -t`,
+  and `systemctl reload nginx`, so the new Flight-`location` directives go live on
+  the restart — `client_max_body_size 0` (a DoPut streams a whole reference through
+  one client-streaming RPC, so the whole-body cap and the DP's per-message decode
+  ceiling measure different quantities; the 1 MB default 413'd reference-load
+  uploads and any finite cap would 413 a multi-GiB reference), `grpc_read_timeout` /
+  `grpc_send_timeout` 3600s (the 60s default cut off large masked-read exports
+  before the first batch), and a new per-client `limit_conn qiita_flight_conn 64`
+  to bound connection floods. The data plane also now refuses an empty-filter
+  `read_masked` DoGet (defense-in-depth; via the binary restart), and the CLI
+  `--data-plane-url` help now points at the public `grpc+tls://<host>:443` form
+  (the `grpc://<host>:50051` example is the firewalled on-host port). No new env
+  var, host dir, scope, migration, or SIF. (#261)
 
 ---
 

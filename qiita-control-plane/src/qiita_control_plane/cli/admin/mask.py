@@ -82,14 +82,14 @@ async def _count_non_failed_missing_mask_idx(
 ) -> int:
     """Count non-failed tickets for these action(s) that have a NULL mask_idx.
 
-    This is the backfill-completeness gate. The shared-mask guard
+    This is the mask-idx coverage gate. The shared-mask guard
     (_mask_shared_with_non_failed) keys on `mask_idx = $1 AND state <> 'failed'`,
-    so a non-failed ticket that genuinely shares a mask but whose mask_idx was
-    never backfilled (still NULL) is INVISIBLE to the guard — we could then
-    delete a mask a COMPLETED result depends on, silently dropping its read_mask
-    rows. While ANY such ticket exists, the guard is unsound, so --execute must
-    refuse. (Tickets in a *failed* state with NULL mask_idx are fine here: they
-    are not the ones the guard protects — they land in skipped_no_mask_idx.)"""
+    so a non-failed ticket that genuinely shares a mask but whose mask_idx is
+    still NULL is INVISIBLE to the guard — we could then delete a mask a
+    COMPLETED result depends on, silently dropping its read_mask rows. While ANY
+    such ticket exists, the guard is unsound, so --execute must refuse. (Tickets
+    in a *failed* state with NULL mask_idx are fine here: they are not the ones
+    the guard protects — they land in skipped_no_mask_idx.)"""
     return await pool.fetchval(
         "SELECT COUNT(*) FROM qiita.work_ticket"
         " WHERE action_id = ANY($1::text[])"
@@ -106,8 +106,8 @@ async def _mask_shared_with_non_failed(pool: asyncpg.Pool, mask_idx: int) -> lis
     many tickets across runs, including COMPLETED ones. Deleting a mask a
     non-failed ticket depends on would silently drop a live result's read_mask
     rows — so if this returns a non-empty list, we SKIP the mask entirely.
-    Relies on backfill-mask-idx having populated mask_idx on non-failed tickets
-    too (else they read NULL and the guard misses them)."""
+    Relies on mask_idx being populated on non-failed tickets (tickets predating
+    mask_idx tracking read NULL and the guard misses them)."""
     rows = await pool.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
         " WHERE mask_idx = $1 AND state <> 'failed'"

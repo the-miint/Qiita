@@ -2,7 +2,7 @@
 # Read-only config/secret preflight for an established qiita-miint host.
 #
 # Validates cross-file consistency that otherwise fails silently at runtime
-# (PATH_SCRATCH drift, HMAC_SECRET_KEY mismatch between CP and DP, missing /
+# (PATH_SCRATCH drift, Flight signing keypair mismatch (CP seed vs DP public key), missing /
 # mis-permed token files) and prints NON-SECRET fingerprints so an operator can
 # confirm matches without reading the 0440/0400 files. Run BEFORE a restart so
 # a bad config aborts the deploy instead of 500ing (or silently mis-staging)
@@ -81,21 +81,72 @@ else
     fi
 fi
 
-# --- HMAC_SECRET_KEY matches CP <-> DP (CO has no HMAC) ----------------------
+# --- Flight ticket signing keypair (CP signs w/ private seed, DP verifies w/ public key) ---
 if [ -r "$CP_ENV" ] && [ -r "$DP_ENV" ]; then
-    cp_hmac=$(read_env_var "$CP_ENV" HMAC_SECRET_KEY)
-    dp_hmac=$(read_env_var "$DP_ENV" HMAC_SECRET_KEY)
-    cp_fp=$(fingerprint "$cp_hmac")
-    dp_fp=$(fingerprint "$dp_hmac")
-    if [ -z "$cp_hmac" ] || [ -z "$dp_hmac" ]; then
-        fail "hmac-match" "HMAC_SECRET_KEY missing (CP=${cp_fp}, DP=${dp_fp}) — both required"
-    elif [ "$cp_hmac" = "$dp_hmac" ]; then
-        pass "hmac-match" "CP == DP (sha256:${cp_fp})"
+    cp_seed=$(read_env_var "$CP_ENV" FLIGHT_TICKET_SIGNING_KEY)
+    dp_pub=$(read_env_var "$DP_ENV" FLIGHT_TICKET_PUBLIC_KEY)
+    cp_fp=$(fingerprint "$cp_seed")
+    dp_fp=$(fingerprint "$dp_pub")
+    seed_len=$(printf '%s' "$cp_seed" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    pub_len=$(printf '%s' "$dp_pub" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    if [ -z "$cp_seed" ] || [ -z "$dp_pub" ]; then
+        fail "flight-keypair" "FLIGHT_TICKET_SIGNING_KEY (CP=${cp_fp}) / FLIGHT_TICKET_PUBLIC_KEY (DP=${dp_fp}) — both required"
+    elif [ "$seed_len" != "32" ] || [ "$pub_len" != "32" ]; then
+        fail "flight-keypair" "keys must decode to 32 bytes (Ed25519); CP seed=${seed_len}B, DP pub=${pub_len}B"
     else
-        fail "hmac-match" "CP (sha256:${cp_fp}) != DP (sha256:${dp_fp}) — Flight tickets will fail to verify"
+        # Derive the public key from the CP seed and confirm it matches the DP's
+        # public key. This needs `cryptography`, which ships in the CP venv — so
+        # invoke that interpreter explicitly rather than a bare `python3` that may
+        # lack it (a bare-python3 ImportError previously degraded this to a green
+        # `pass`; a check that cannot run must say so — skip, never pass). Prefer
+        # the operator's checkout venv (this script lives in <checkout>/deploy/,
+        # matching key-rotation.md's Prerequisites and reachable as the operator
+        # who runs `make preflight`), then the deployed service venv, honoring an
+        # explicit CP_PY override. The DP only checks the public key's
+        # curve-validity at boot (it never sees the CP seed), so the bucket-5 live
+        # DoGet remains the definitive gate.
+        pf_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+        cp_py=""
+        for cand in \
+            "${CP_PY:-}" \
+            "$pf_dir/../qiita-control-plane/.venv/bin/python" \
+            "/opt/qiita/control-plane/.venv/bin/python"; do
+            if [ -n "$cand" ] && [ -x "$cand" ]; then cp_py="$cand"; break; fi
+        done
+        derived=""
+        if [ -n "$cp_py" ]; then
+            derived=$(printf '%s' "$cp_seed" | "$cp_py" -c '
+import sys, base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+seed = base64.b64decode(sys.stdin.read())
+print(base64.b64encode(Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()).decode())
+' 2>/dev/null) || derived=""
+        fi
+        if [ -n "$derived" ] && [ "$derived" = "$dp_pub" ]; then
+            pass "flight-keypair" "DP public key matches CP signing seed (pub sha256:${dp_fp})"
+        elif [ -n "$derived" ]; then
+            fail "flight-keypair" "DP FLIGHT_TICKET_PUBLIC_KEY is not the public key of CP FLIGHT_TICKET_SIGNING_KEY — Flight tickets will fail to verify"
+        else
+            skip "flight-keypair" "correspondence NOT verified — no CP venv with cryptography found (tried CP_PY, <checkout>/qiita-control-plane/.venv, /opt/qiita/control-plane/.venv; set CP_PY to override). Both keys present + 32B each (CP sha256:${cp_fp}, DP sha256:${dp_fp}); the bucket-5 live DoGet is the real gate."
+        fi
     fi
 else
-    skip "hmac-match" "control-plane.env and/or data-plane.env absent (first deploy)"
+    skip "flight-keypair" "control-plane.env and/or data-plane.env absent (first deploy)"
+fi
+
+# --- Login cookie key present on CP + distinct from the Flight signing key ---
+if [ -r "$CP_ENV" ]; then
+    cookie=$(read_env_var "$CP_ENV" LOGIN_COOKIE_SECRET_KEY)
+    signing=$(read_env_var "$CP_ENV" FLIGHT_TICKET_SIGNING_KEY)
+    if [ -z "$cookie" ]; then
+        fail "login-cookie-key" "LOGIN_COOKIE_SECRET_KEY missing on CP — control plane will not boot"
+    elif [ "$cookie" = "$signing" ]; then
+        fail "login-cookie-key" "LOGIN_COOKIE_SECRET_KEY equals the Flight signing key — must be a distinct secret"
+    else
+        pass "login-cookie-key" "present and distinct from the Flight signing key (sha256:$(fingerprint "$cookie"))"
+    fi
+else
+    skip "login-cookie-key" "control-plane.env absent (first deploy)"
 fi
 
 # --- Token files present + correctly permed ---------------------------------

@@ -420,7 +420,7 @@ async def begin_login(
     if cli == 1:
         cookie_payload["port"] = port
 
-    cookie_value = sign_login_cookie(cookie_payload, settings.hmac_secret_key)
+    cookie_value = sign_login_cookie(cookie_payload, settings.login_cookie_secret_key)
 
     redirect_uri = f"{settings.qiita_endpoint_url.rstrip('/')}{URL_AUTH_HANDOFF}"
     authrocket_url = build_authrocket_login_url(
@@ -542,7 +542,7 @@ async def handoff(
         try:
             cookie_payload = verify_login_cookie(
                 cookie,
-                settings.hmac_secret_key,
+                settings.login_cookie_secret_key,
                 max_age_seconds=settings.auth_handoff_freshness_seconds,
             )
         except CookieInvalid as exc:

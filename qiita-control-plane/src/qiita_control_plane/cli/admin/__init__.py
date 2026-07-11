@@ -41,12 +41,6 @@ from .. import _common
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
-from .backfill import (
-    _backfill_mask_idx,
-    _decode_hmac_secret,
-    _handle_work_ticket_backfill_mask_idx,
-    _parse_optional_adapter_ref,
-)
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
@@ -161,24 +155,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="failure_step_name (required iff --stage=step_run)",
     )
     p_force_fail.set_defaults(handler=_handle_ticket_force_fail)
-
-    p_work_ticket = sub.add_parser("work-ticket", help="Work-ticket maintenance operations")
-    p_work_ticket_sub = p_work_ticket.add_subparsers(dest="work_ticket_cmd", required=True)
-    p_backfill = p_work_ticket_sub.add_parser(
-        "backfill-mask-idx",
-        help=(
-            "One-time idempotent backfill of work_ticket.mask_idx for existing"
-            " read-mask / fastq-to-parquet tickets. Re-derives each ticket's mask"
-            " params hash and LOOKS IT UP in mask_definition (never mints). Dry-run"
-            " by default; pass --apply to write."
-        ),
-    )
-    p_backfill.add_argument(
-        "--apply",
-        action="store_true",
-        help="Write the populated mask_idx values (default: dry-run, report only).",
-    )
-    p_backfill.set_defaults(handler=_handle_work_ticket_backfill_mask_idx)
 
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
@@ -345,7 +321,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-plane-url",
         required=True,
         dest="data_plane_url",
-        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051).",
+        help=(
+            "gRPC URL of the data plane. From off the deploy host use the public "
+            "TLS edge (e.g. grpc+tls://qiita.example.com:443); grpc://<host>:50051 "
+            "is the direct/on-host form and is not reachable off-host."
+        ),
     )
     p_export.set_defaults(handler=_handle_masked_read_export)
 
@@ -439,18 +419,20 @@ async def _purge_failed(
             f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
         ) from exc
     try:
-        # Backfill-completeness gate (computed up front so dry-run reports it and
+        # Mask-idx coverage gate (computed up front so dry-run reports it and
         # --execute can refuse on it before any destructive work). The shared-mask
         # guard is only sound once every NON-failed ticket carries its mask_idx;
         # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
         # the mask could be wrongly deleted out from under a live result.
-        backfill_incomplete = await _count_non_failed_missing_mask_idx(pool, action_ids=action_ids)
+        non_failed_missing_mask_idx = await _count_non_failed_missing_mask_idx(
+            pool, action_ids=action_ids
+        )
 
         candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
 
         # Classify candidates up front so the dry-run report and the execute
         # path see the same buckets. A candidate is:
-        #   - skipped_no_mask_idx: mask_idx is NULL (backfill never matched it —
+        #   - skipped_no_mask_idx: mask_idx is NULL (never populated —
         #     can't safely purge a mask we can't name; resubmit alone would
         #     duplicate the existing read_mask rows). Report, never touch.
         #   - skipped_wrong_kind: not prep_sample-scoped (defensive; the two
@@ -500,7 +482,7 @@ async def _purge_failed(
             "executed": execute,
             "with_tickets": with_tickets,
             "action_ids": list(action_ids),
-            "backfill_incomplete": backfill_incomplete,
+            "non_failed_missing_mask_idx": non_failed_missing_mask_idx,
             "candidates": len(candidates),
             "eligible": [
                 {k: e[k] for k in ("work_ticket_idx", "mask_idx", "prep_sample_idx")}
@@ -519,14 +501,17 @@ async def _purge_failed(
 
         # Refuse to do any destructive work while the shared-mask guard is unsound
         # (some non-failed ticket still has a NULL mask_idx, invisible to the
-        # guard). Fail loudly with the count and the exact fix-up command.
-        if backfill_incomplete:
+        # guard). Fail loudly with the count and how to investigate.
+        if non_failed_missing_mask_idx:
             raise RuntimeError(
-                f"backfill incomplete: {backfill_incomplete} non-failed work_ticket(s)"
-                f" for {list(action_ids)} have mask_idx IS NULL, so the shared-mask"
-                " guard cannot see them and a shared mask could be wrongly deleted."
-                " Run `qiita-admin work-ticket backfill-mask-idx --apply` first, then"
-                " re-run this command."
+                f"mask-idx coverage incomplete: {non_failed_missing_mask_idx} non-failed"
+                f" work_ticket(s) for {list(action_ids)} have mask_idx IS NULL, so the"
+                " shared-mask guard cannot see them and a shared mask could be wrongly"
+                " deleted. A non-failed masking ticket should always carry its mask_idx"
+                " (minted at submit time); the one-time backfill that populated"
+                " pre-tracking tickets has been retired. Investigate why these are"
+                " unmasked (a submit-path regression, or a pre-tracking ticket that"
+                " backfill never reached) and set their mask_idx before re-running."
             )
 
         # --execute: process each eligible candidate in isolation. Mask deletes
@@ -652,19 +637,21 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
     mode = "EXECUTED" if report["executed"] else "DRY-RUN (no writes; pass --execute to commit)"
     print(f"mask purge-failed [{mode}]")
     print(f"  actions:    {report['action_ids']}")
-    if report["backfill_incomplete"]:
+    if report["non_failed_missing_mask_idx"]:
         # Prominent banner so the operator sees this BEFORE attempting --execute
-        # (which refuses outright while backfill is incomplete).
+        # (which refuses outright while mask-idx coverage is incomplete).
         print(
-            f"  *** BACKFILL INCOMPLETE: {report['backfill_incomplete']} non-failed"
-            f" work_ticket(s) for {report['action_ids']} have mask_idx IS NULL."
+            f"  *** MASK-IDX COVERAGE INCOMPLETE:"
+            f" {report['non_failed_missing_mask_idx']} non-failed work_ticket(s)"
+            f" for {report['action_ids']} have mask_idx IS NULL."
         )
         print(
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
         )
         print(
-            "      Run `qiita-admin work-ticket backfill-mask-idx --apply` first."
-            " --execute will REFUSE until this is 0."
+            "      A non-failed masking ticket should always carry its mask_idx; the"
+            " one-time backfill has been retired. Investigate and set their mask_idx"
+            " before proceeding. --execute will REFUSE until this is 0."
         )
     print(f"  candidates: {report['candidates']}")
     print(f"  eligible:   {len(report['eligible'])}")
@@ -682,7 +669,7 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
             )
     if report["skipped_no_mask_idx"]:
         print(
-            f"  skipped (mask_idx IS NULL — run backfill-mask-idx first):"
+            f"  skipped (mask_idx IS NULL — predates mask tracking):"
             f" {report['skipped_no_mask_idx']}"
         )
     if report["skipped_wrong_kind"]:
@@ -730,7 +717,7 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
             # A non-empty failures list is an operator-actionable signal.
             return 1
     else:
-        # Mirror the backfill command's "verify before you commit" caveat.
+        # "Verify before you commit" caveat for the destructive --execute path.
         print(
             "  Before running --execute: eyeball the eligible list above and"
             " confirm the skipped-shared masks are genuinely shared (a non-failed"
@@ -771,13 +758,11 @@ __all__ = [
     "_VALID_ROLE_VALUES",
     "_WAIT_POLL_INTERVAL_SECONDS",
     "_WAIT_TIMEOUT_SECONDS",
-    "_backfill_mask_idx",
     "_build_parser",
     "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
     "_count_non_failed_missing_mask_idx",
-    "_decode_hmac_secret",
     "_export_stem",
     "_force_fail_ticket",
     "_handle_actions_sync",
@@ -791,11 +776,9 @@ __all__ = [
     "_handle_ticket_force_fail",
     "_handle_token_revoke_all",
     "_handle_whoami",
-    "_handle_work_ticket_backfill_mask_idx",
     "_mask_delete_via_route",
     "_mask_shared_with_non_failed",
     "_parquet_row_count",
-    "_parse_optional_adapter_ref",
     "_peek_paired",
     "_poll_ticket_to_terminal",
     "_purge_failed",

@@ -34,6 +34,19 @@ the `no-changelog` label).
   wiring it into `(smrt_cell, barcode)` BAM disambiguation (and moving the
   pool-item-id off the bare barcode) is a follow-up. Verified against
   kl-run-preflight's own `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
+- **Seed water/marine metadata for early data entry** — the `GSC MIxS water`
+  checklist (ERC000024, under the ENA default); the `depth_m` and
+  `host_taxon_id` biosample global fields (the latter terminology-bound to NCBI
+  Taxonomy, required); the `seawater metagenome`, `estuary metagenome`, and
+  `Homo sapiens` NCBI taxa; and eight marine/aquatic ENVO environmental-context
+  terms. (#267)
+
+- **Key-rotation runbook** (`docs/runbooks/key-rotation.md`) — restart-based
+  rotation for the Ed25519 Flight signing keypair and the login-cookie secret,
+  with a `make preflight` keypair check before the coordinated CP+DP restart.
+  `first-deploy.md` provisioning and `auth.md` updated to match the keypair
+  model. (#265)
+
 - **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked
   reads, selected by a required `mask_idx`: the runner's
@@ -702,6 +715,44 @@ the `no-changelog` label).
   result bcl-convert now GETs the pool roster and creates only the missing samples,
   so a re-run after a partial failure reuses existing rows instead of 409ing on the
   first already-created sample. (#260)
+- **Data-plane public-edge hardening.** The Arrow Flight service is reachable
+  from the internet through nginx on 443 (by design — clients connect directly
+  through nginx). Tightened that edge: the nginx Flight `location` now sets
+  `client_max_body_size 0` (a DoPut streams an entire reference through one
+  client-streaming RPC, so nginx's whole-body cap and the data plane's
+  per-message decode ceiling measure different quantities — nginx's 1 MB default
+  would 413 a reference-load upload, and any finite cap would still 413 a
+  multi-GiB reference even with every gRPC message under the DP ceiling), bumps
+  `grpc_read_timeout`/`grpc_send_timeout` to 3600s (the 60s default cut off large
+  DoGet exports before the first batch materialized), and caps concurrent Flight
+  connections per client (`limit_conn qiita_flight_conn 64`) to blunt connection
+  floods. The data plane's `build_query` now refuses an empty filter on the
+  `read_masked` view (which would `SELECT *` every sample's pass-reads across all
+  studies) as defense-in-depth; the reference_* tables still allow an unfiltered
+  read by design. CLI `--data-plane-url` help now shows the public
+  `grpc+tls://<host>:443` form — the old `grpc://<host>:50051` example is the
+  on-host/direct port and is not reachable off the deploy host. (#261)
+
+- **Login-cookie secret split off the Flight-ticket secret.** The `/auth/login`
+  → `/auth/handoff` cookie now signs with a dedicated `LOGIN_COOKIE_SECRET_KEY`
+  (new required control-plane env var) instead of reusing `HMAC_SECRET_KEY`. The
+  two were the same key, so one leak forged both Flight tickets and login
+  cookies; they are now independent. Control-plane only — the data plane never
+  sees the cookie key. Operator note: at the restart, login cookies signed with
+  the old key fail verification — a clean 401 (`CookieInvalid`), not a 500 — so
+  users mid-handoff in the ≤5-minute cookie window (`Max-Age` 300s) simply
+  re-login once. No dual-verify or coordinated cutover needed. (#262)
+
+- **Flight tickets are now Ed25519-signed (asymmetric), not HMAC-SHA256.** The
+  control plane signs with an Ed25519 private seed (`FLIGHT_TICKET_SIGNING_KEY`);
+  the publicly-reachable data plane holds only the matching public key
+  (`FLIGHT_TICKET_PUBLIC_KEY`) and verifies — so a data-plane host/env compromise
+  can no longer forge tickets (previously the symmetric `HMAC_SECRET_KEY` on the
+  DP could both verify and forge). Ticket wire version bumps to 2 (64-byte
+  signature); the DP accepts only v2. `HMAC_SECRET_KEY` is removed from both
+  services (the cookie moved to `LOGIN_COOKIE_SECRET_KEY`, tickets to the
+  keypair). End-user CLIs are unchanged — tickets are minted server-side. (#263)
+
 - **DuckLake catalog parquet write-options aligned with our register-time format.**
   Set `parquet_compression='zstd'` + `parquet_version=2` as DuckLake catalog-global
   options (DuckLake's defaults are snappy / v1) and `parquet_row_group_size=16384`
@@ -1312,6 +1363,13 @@ the `no-changelog` label).
 
 ### Removed
 
+- **`qiita-admin work-ticket backfill-mask-idx` retired.** The one-time mask_idx
+  backfill (for tickets predating the column) has run in production; the CLI
+  command — the only ticket signer outside the control-plane web process, which
+  read the raw signing key from the environment — and its `backfill_work_ticket_mask_idx`
+  runner helper are removed. `mask purge-failed`'s NULL-mask_idx safety guard is
+  unchanged; only its guidance text (which named the removed command) is
+  reworded. (#263)
 - Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag

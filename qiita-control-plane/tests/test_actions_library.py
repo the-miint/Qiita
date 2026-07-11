@@ -54,7 +54,7 @@ async def test_delete_pool_reads_data_empty_set_short_circuits():
 
     result = await lib.delete_pool_reads_data(
         prep_sample_idxs=[],
-        hmac_secret=b"\x00" * 32,
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unreachable:1",
     )
     assert result == {}
@@ -68,7 +68,7 @@ async def test_delete_read_mask_block_data_empty_members_short_circuits():
     rows = await lib.delete_read_mask_block_data(
         mask_idx=7,
         members=[],
-        hmac_secret=b"\x00" * 32,
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unreachable:1",
     )
     assert rows == 0

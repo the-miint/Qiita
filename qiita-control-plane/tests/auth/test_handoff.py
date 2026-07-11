@@ -88,6 +88,23 @@ def test_cookie_rejects_malformed():
         verify_login_cookie("a.!!", secret, max_age_seconds=300)
 
 
+def test_sign_rejects_empty_secret():
+    """An empty login-cookie secret must never sign. `hmac.new(b"", ...)` would
+    otherwise sign happily under an empty key, defeating the point of a
+    dedicated cookie key whose leak must not forge cookies. The guard lives in
+    the helper so it holds regardless of how Settings was constructed."""
+    with pytest.raises(ValueError, match="empty"):
+        sign_login_cookie({"state": "abc", "timestamp_ms": 1_700_000_000_000}, b"")
+
+
+def test_verify_rejects_empty_secret():
+    """Symmetric with signing: an empty secret must never validate a
+    signature."""
+    cookie = sign_login_cookie({"state": "abc", "timestamp_ms": 1_700_000_000_000}, _secret())
+    with pytest.raises(ValueError, match="empty"):
+        verify_login_cookie(cookie, b"", max_age_seconds=300)
+
+
 def test_cookie_rejects_payload_without_timestamp():
     secret = _secret()
     # Use sign helper to produce a valid signature over a payload that
