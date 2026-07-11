@@ -153,17 +153,20 @@ def _read_pacbio_preflight_rows(
                 "SELECT project_name, human_filtering FROM project"
             ).fetchall()
         }
-        infos = get_pacbio_sample_info(conn)
-    except sqlite3.DatabaseError as exc:
+        # The accessor's ValueError is meaning-specific (a missing biosample /
+        # bioproject accession, or a control/project invariant violation) and
+        # carries a clear per-sample message, so it is caught SEPARATELY from the
+        # generic-preflight errors below (a multi-run blob from get_single_run_idx,
+        # or a metadata-query shape drift) and surfaced verbatim.
+        try:
+            infos = get_pacbio_sample_info(conn)
+        except ValueError as exc:
+            parser.error(f"--preflight-blob {preflight_blob}: {exc}")
+    except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
             " verify the file is a kl-run-preflight PacBio SQLite"
         )
-    except ValueError as exc:
-        # The accessor raises with a clear per-sample message on a missing
-        # biosample / bioproject accession — surface it verbatim; the operator
-        # populates the accessions upstream and re-submits.
-        parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()
 
@@ -187,7 +190,17 @@ def _read_pacbio_preflight_rows(
     parsed: list[_PacbioPreflightRow] = []
     for info in infos:
         pbs = info.kind_row
-        sample_name, project_name = meta_by_idx.get(info.sample_idx, (str(info.sample_idx), None))
+        # The accessor's sample_idx set is a subset of the view (same run, do_not_use
+        # excluded), so a miss cannot happen for a well-formed preflight — fail loud
+        # rather than coin a fake sample_name + silently default human_filtering.
+        meta = meta_by_idx.get(info.sample_idx)
+        if meta is None:
+            parser.error(
+                f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
+                " is absent from the run_pacbio_sample view — the preflight is"
+                " internally inconsistent"
+            )
+        sample_name, project_name = meta
         if not pbs.barcode_id:
             parser.error(
                 f"--preflight-blob {preflight_blob}: sample {sample_name!r} carries no"
@@ -199,7 +212,11 @@ def _read_pacbio_preflight_rows(
             biosample_accession=info.biosample_accession,
             primary_project_accession=info.primary_bioproject_accession,
             secondary_project_accessions=list(info.secondary_bioproject_accessions),
-            human_filtering=filtering_by_project.get(project_name, False),
+            # project_name is always a real project here (the view resolves it,
+            # incl. a control's plate primary), so the default is unreachable —
+            # but keep it the privacy-SAFE direction (filter), matching the schema
+            # (project.human_filtering NOT NULL DEFAULT 1).
+            human_filtering=filtering_by_project.get(project_name, True),
             # sheet_type is a RUN-level property (a run is one protocol), read once
             # from the legacy format above and stamped on every row — there is no
             # per-sample sheet_type.

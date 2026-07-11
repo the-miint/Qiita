@@ -159,7 +159,7 @@ def test_validate_protocol_allows_untwisted_without_adapter():
 
 
 # ---------------------------------------------------------------------------
-# _read_pacbio_preflight_rows — the provisional seam, against a REAL preflight
+# _read_pacbio_preflight_rows — the preflight reader, against a REAL preflight
 # ---------------------------------------------------------------------------
 
 
@@ -193,11 +193,15 @@ def test_read_preflight_rows_case5(tmp_path):
     The project accession is the ENA **bioproject** (what the study lookup keys
     on), and smrt_cell rides through from the reader when the preflight records it."""
     db = _build_case5_preflight(tmp_path, populate_accessions=True)
-    # Record a SMRT cell on sample.1 only, to prove it threads onto the row.
     conn = sqlite3.connect(db)
+    # Record a SMRT cell on sample.1 only, to prove it threads onto the row.
     conn.execute(
         "UPDATE pacbio_sample SET smrt_cell_well_sample_id = '1_A01' WHERE barcode_id = 'bc3011'"
     )
+    # Flip the project's human_filtering (fixture default False) so the assertion
+    # proves the row reads the PROJECT flag — including the control (sample.3),
+    # which inherits it via the view's plate-primary resolution — not a constant.
+    conn.execute("UPDATE project SET human_filtering = 1")
     conn.commit()
     conn.close()
 
@@ -205,6 +209,7 @@ def test_read_preflight_rows_case5(tmp_path):
     assert [r.sample_name for r in rows] == ["sample.1", "sample.2", "sample.3"]
     assert [r.barcode for r in rows] == ["bc3011", "bc0112", "bc9992"]
     assert [r.smrt_cell for r in rows] == ["1_A01", None, None]
+    assert [r.human_filtering for r in rows] == [True, True, True]
     for r in rows:
         assert r.biosample_accession == f"BIO_{r.sample_name}"
         assert r.primary_project_accession == "PRJNA99999"  # control resolves to plate primary
