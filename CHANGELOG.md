@@ -941,6 +941,19 @@ the `no-changelog` label).
   column (study: `ena_study_accession` or `bioproject_accession`; biosample:
   `biosample_accession` or `ena_sample_accession`) (#91)
 
+### Fixed
+
+- **SynDNA spike-in count was structurally zero in case 5.** The chain ran
+  `lima -> qc -> host_filter -> syndna`, but a case-5 spike-in
+  (`syndna_is_twisted == False`) carries no Twist adaptor, so lima marked it
+  `twist_no_adaptor` first — and every later step (including syndna) only
+  re-classifies still-`pass` rows, so syndna never saw it. Reordered to
+  `syndna -> lima -> qc -> host_filter`: syndna marks the spike-ins on the raw
+  reads before lima can drop them, lima then processes only the biological reads
+  (which all carry the adaptor), and a single `partial_mask` binding threads the
+  verdict through so a `spikein_syndna` mark is never overwritten. A real-miint
+  case-5 chain test reproduces the bug and pins the fix. (#270)
+
 ### Changed
 
 - **The read-mask `biological` count predicate is now a whitelist.** It was

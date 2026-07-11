@@ -241,7 +241,7 @@ def test_qc_smoke_incoming_mask_trims_are_cumulative_from_raw(
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path),
-        adapter_mask=adapter_mask,
+        partial_mask=adapter_mask,
         instrument_model="Illumina MiSeq",  # not 2-color: no polyG
         prep_sample_idx=5,
         work_ticket_idx=1,
@@ -280,7 +280,7 @@ def test_qc_smoke_incoming_mask_filter_read_sees_the_trimmed_insert(
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path),
-        adapter_mask=adapter_mask,
+        partial_mask=adapter_mask,
         instrument_model="Illumina MiSeq",
         prep_sample_idx=5,
         work_ticket_idx=1,
@@ -318,7 +318,7 @@ def test_qc_smoke_incoming_non_pass_row_is_carried_verbatim(
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path),
-        adapter_mask=adapter_mask,
+        partial_mask=adapter_mask,
         instrument_model="Illumina MiSeq",
         prep_sample_idx=5,
         work_ticket_idx=1,
@@ -348,7 +348,7 @@ def test_qc_smoke_unbound_incoming_mask_is_unchanged(tmp_path, write_reads_q, wr
     without = qc.Inputs(reads=write_reads_q(tmp_path / "a.parquet", rows), **common)
     with_identity = qc.Inputs(
         reads=write_reads_q(tmp_path / "b.parquet", rows),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "identity.parquet", [(50, ReadMaskReason.PASS.value, 0, 0)]
         ),
         **common,
@@ -376,7 +376,7 @@ def test_qc_smoke_incoming_mask_consuming_the_whole_read_is_qc_too_short(
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path),
-        adapter_mask=adapter_mask,
+        partial_mask=adapter_mask,
         instrument_model="Illumina MiSeq",
         prep_sample_idx=5,
         work_ticket_idx=1,

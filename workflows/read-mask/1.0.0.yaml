@@ -119,17 +119,43 @@ context_schema:
       minimum: 1
 
 steps:
-  # ---- Long-read adapter removal (lima), gated on `lima_enabled` -------------
+  # ---- SynDNA spike-in marking, gated on `syndna_enabled` -------------------
   #
-  # Runs FIRST, before QC: lima needs the intact adaptor, and QC's length filter
-  # must judge the INSERT, not the adaptored read. All three entries carry the
-  # same `when:` so they skip together (as host-reference-add's builder + its
-  # register-index action do).
+  # Runs FIRST, on the RAW reads. In case 5 (syndna_is_twisted == False) the
+  # spike-ins are added AFTER Twist amplification, so they carry no Twist adaptor.
+  # If lima ran first it would drop them as `twist_no_adaptor`, and every later
+  # step (including syndna) only re-classifies still-`pass` rows — so the spike-in
+  # count would be STRUCTURALLY zero. Marking them here, before lima can touch
+  # anything, fixes that. Emits a PARTIAL mask (the 6-column qc_mask shape) under
+  # the `partial_mask` binding threaded through the pre-host chain.
   #
   # WARNING: `when:` is DEFAULT-ON — `bool(action_context.get(key, True))`. An
-  # action_context that omits `lima_enabled` RUNS these steps. Every producer
+  # action_context that omits `syndna_enabled` RUNS this step. Every producer
   # writes it explicitly, and `context_schema.required` enforces it on the REST
   # route (block_planner INSERTs directly and so bypasses that check).
+  - step: syndna
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.syndna
+    when: syndna_enabled
+    inputs: [reads, syndna_rype_path]
+    outputs: [partial_mask]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT4H
+
+  # ---- Long-read adapter removal (lima), gated on `lima_enabled` -------------
+  #
+  # Runs before QC: lima needs the intact adaptor, and QC's length filter must
+  # judge the INSERT, not the adaptored read. All three entries carry the same
+  # `when:` so they skip together (as host-reference-add's builder + its
+  # register-index action do).
+  #
+  # `partial_mask` is the OPTIONAL upstream mask (syndna's, when it ran): the lima
+  # chain processes only its still-`pass` reads and carries its non-`pass` rows
+  # (the spike-ins) through unchanged — a `spikein_syndna` verdict is never
+  # overwritten by `twist_no_adaptor`. When syndna is off, lima runs on all raw
+  # reads and produces `partial_mask` itself.
   #
   # Serializing the reads to FASTQ is an on-disk hand-off to a container binary
   # (CLAUDE.local.md: called out, not silently entrenched). It cannot be streamed:
@@ -140,6 +166,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.lima_export
     when: lima_enabled
     inputs: [reads]
+    optional_inputs: [partial_mask]
     # `lima_args` is resolved by the control plane from the client's
     # `lima_preset`; it is never client-supplied (it would otherwise let a caller
     # forge mask identity and pass arbitrary flags to a container).
@@ -167,13 +194,16 @@ steps:
       walltime: PT4H
 
   # lima's clipped FASTQ -> a partial read mask, via miint's `infer_trim`. Reads
-  # lima dropped become `twist_no_adaptor`. Emits the `adapter_mask` qc consumes.
+  # lima dropped become `twist_no_adaptor`; carried spike-ins keep `spikein_syndna`.
+  # Overwrites `partial_mask` (self-shadow — _bind_step_inputs reads it before
+  # bound.update, so consuming the binding it also produces is safe).
   - step: lima_mask
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.lima_mask
     when: lima_enabled
     inputs: [reads, lima_out_fastq]
-    outputs: [adapter_mask]
+    optional_inputs: [partial_mask]
+    outputs: [partial_mask]
     baseline_resources:
       cpu: 4
       # infer_trim materializes both sequence sets and substring-searches per row,
@@ -187,15 +217,16 @@ steps:
   # is materialized by the runner before the loop. `instrument_model` rides
   # through `params:` to gate polyG.
   #
-  # `adapter_mask` is OPTIONAL: bound only when the lima chain ran. When bound, QC
-  # re-classifies only its still-`pass` rows (on the trimmed insert) and carries
-  # every non-`pass` row through verbatim, emitting trims cumulative from the RAW
-  # read. Unbound, QC is the first step and behaves exactly as before.
+  # `partial_mask` is OPTIONAL: bound when syndna and/or lima ran (last writer
+  # wins, so QC sees whichever ran latest). When bound, QC re-classifies only its
+  # still-`pass` rows (on the trimmed insert) and carries every non-`pass` row
+  # (spike-ins, twist_no_adaptor) through verbatim, emitting trims cumulative from
+  # the RAW read. Unbound, QC is the first step and behaves exactly as before.
   - step: qc
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.qc
     inputs: [reads, adapter_parquet]
-    optional_inputs: [adapter_mask]
+    optional_inputs: [partial_mask]
     params: {instrument_model: instrument_model}
     outputs: [qc_mask]
     baseline_resources:
@@ -205,12 +236,15 @@ steps:
       # action_ceiling walltime below (the runner's walltime floor escalation).
       walltime: PT4H
 
-  # Merge host hits into the qc_mask and emit the final read_mask. Consumes the
-  # full `reads` (host classify runs on the trimmed QC-pass subset) and `qc_mask`.
+  # Merge host hits into the qc_mask and emit the FINAL read_mask — the sole final
+  # emitter (spike-ins/adaptor verdicts are already in qc_mask via the carry chain,
+  # so host_filter's `ELSE q.reason` preserves them). Consumes the full `reads`
+  # (host classify runs on the trimmed QC-pass subset) and `qc_mask`.
   # `host_rype_path` / `host_minimap2_path` are bound by the runner ONLY when
   # host_filter_enabled (optional_inputs). `mask_idx` is threaded via `params:`
   # — its presence signals the runner to mint the mask before the loop and binds
-  # the value into the step.
+  # the value into the step. persist-read-metrics / register-files consume its
+  # read_mask / read_mask_staging_dir.
   - step: host_filter
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.host_filter
@@ -219,32 +253,6 @@ steps:
     params: {mask_idx: mask_idx}
     # `read_mask` is the final mask path; `read_mask_staging_dir` is the
     # workspace the register-mask step loads into the DuckLake `read_mask` table.
-    outputs: [read_mask, read_mask_staging_dir]
-    baseline_resources:
-      cpu: 4
-      mem_gb: 32
-      walltime: PT4H
-
-  # ---- SynDNA spike-in marking, gated on `syndna_enabled` -------------------
-  #
-  # Runs LAST: spike-ins are synthetic and do not align to the host, so host
-  # filtering never removes them; counting them in the QC'd, host-depleted space
-  # is the correct denominator for the downstream total-cells calculation.
-  #
-  # DELIBERATE SHADOWING: this step declares the SAME output names host_filter
-  # does, so when it runs its bindings overwrite host_filter's (bound.update is
-  # last-writer-wins) and persist-read-metrics + register-files consume the
-  # EXTENDED mask. When `syndna_enabled` is false the step is skipped and
-  # host_filter's bindings stand. Distinct names would break the skipped case —
-  # register-files takes a single input binding.
-  #
-  # `read_mask` is both an input and an output here: _bind_step_inputs reads
-  # `bound` BEFORE bound.update(outputs), so the self-shadow is safe.
-  - step: syndna
-    step_type: singleton
-    module: qiita_compute_orchestrator.jobs.syndna
-    when: syndna_enabled
-    inputs: [reads, read_mask, syndna_rype_path]
     outputs: [read_mask, read_mask_staging_dir]
     baseline_resources:
       cpu: 4

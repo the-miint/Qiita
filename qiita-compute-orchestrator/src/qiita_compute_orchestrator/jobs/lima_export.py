@@ -34,6 +34,7 @@ import json
 from pathlib import Path
 
 from pydantic import BaseModel
+from qiita_common.models import ReadMaskReason
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -42,6 +43,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._partial_mask import assert_covers_reads, assert_single_end
 
 YAML_STEP_NAME = "lima_export"
 
@@ -64,22 +66,16 @@ class Inputs(BaseModel):
 
     reads: Path
     lima_args: str
+    # OPTIONAL upstream partial mask (today: syndna's). When bound, only its
+    # still-`pass` reads are exported to lima — the spike-ins it already marked
+    # never reach lima, so lima cannot mis-drop them as `twist_no_adaptor`. Unbound
+    # -> every raw read is exported (lima runs first).
+    partial_mask: Path | None = None
     prep_sample_idx: int | None = None
     work_ticket_idx: int
 
 
-def _assert_single_end(conn, reads_sql: str, reads: Path) -> None:
-    """Long reads are single-end. A PE read set would silently lose its mate
-    through the SE-only FASTQ projection below (and the downstream mask has no
-    `left_trim2`/`right_trim2` to carry it), so reject it at the boundary."""
-    (pe_rows,) = conn.execute(
-        f"SELECT count(*) FROM read_parquet('{reads_sql}') WHERE sequence2 IS NOT NULL"
-    ).fetchone()
-    if pe_rows:
-        raise ValueError(
-            f"reads ({reads}) contain {pe_rows} paired-end row(s); the lima adapter "
-            "chain is single-end only (long reads)"
-        )
+_INCOMING = "lima_export_incoming"
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -87,6 +83,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     if not inputs.lima_args.strip():
         raise ValueError("lima_args is empty; the control plane must resolve it from lima_preset")
+    if inputs.partial_mask is not None and not inputs.partial_mask.exists():
+        raise FileNotFoundError(f"partial_mask not found: {inputs.partial_mask}")
 
     workspace.mkdir(parents=True, exist_ok=True)
     lima_in_fastq = workspace / "lima_in.fastq"
@@ -104,14 +102,28 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
-            _assert_single_end(conn, reads_sql, inputs.reads)
+            assert_single_end(conn, reads_sql, "reads", inputs.reads)
+            # The source of reads to export: all of them, or — when an upstream
+            # mask is bound — only its still-`pass` reads (spike-ins excluded).
+            if inputs.partial_mask is None:
+                source = f"read_parquet('{reads_sql}')"
+            else:
+                mask_sql = validate_parquet_path(inputs.partial_mask)
+                conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
+                assert_covers_reads(conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask)
+                conn.execute(
+                    f"CREATE VIEW lima_export_pass AS "
+                    f"SELECT r.* FROM read_parquet('{reads_sql}') r JOIN {_INCOMING} m "
+                    f"USING (sequence_idx) WHERE m.reason = '{ReadMaskReason.PASS.value}'"
+                )
+                source = "lima_export_pass"
             # `sequence_idx` becomes the FASTQ record name. The CAST is REQUIRED:
             # miint's FASTQ writer takes the record name from a VARCHAR `read_id`
             # column and raises an INTERNAL error (invalidating the connection) on
             # a BIGINT. ORDER BY keeps the output deterministic.
             conn.execute(
                 "COPY (SELECT CAST(sequence_idx AS VARCHAR) AS read_id, sequence1, qual1 "
-                f"      FROM read_parquet('{reads_sql}') ORDER BY sequence_idx) "
+                f"      FROM {source} ORDER BY sequence_idx) "
                 f"TO '{out_sql}' (FORMAT FASTQ)"
             )
         lima_config.write_text(json.dumps({"args": inputs.lima_args}) + "\n")

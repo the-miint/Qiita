@@ -430,10 +430,10 @@ def test_qc_missing_adapter_mask_raises(tmp_path, write_reads):
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=tmp_path / "nope.parquet",
+        partial_mask=tmp_path / "nope.parquet",
         work_ticket_idx=1,
     )
-    with pytest.raises(FileNotFoundError, match="adapter_mask not found"):
+    with pytest.raises(FileNotFoundError, match="partial_mask not found"):
         asyncio.run(qc.execute(inputs, tmp_path / "ws"))
 
 
@@ -446,7 +446,7 @@ def test_qc_incoming_mask_rejects_paired_end(tmp_path, write_reads, write_partia
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "m.parquet", [(1, ReadMaskReason.PASS.value, 0, 0)]
         ),
         work_ticket_idx=1,
@@ -466,7 +466,7 @@ def test_qc_incoming_mask_must_cover_every_read(tmp_path, write_reads, write_par
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "m.parquet", [(1, ReadMaskReason.PASS.value, 0, 0)]
         ),
         work_ticket_idx=1,
@@ -484,7 +484,7 @@ def test_qc_incoming_mask_rejects_overlong_trims(tmp_path, write_reads, write_pa
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "m.parquet", [(1, ReadMaskReason.PASS.value, 3, 3)]
         ),
         work_ticket_idx=1,
@@ -512,7 +512,7 @@ def test_qc_carry_branch_passes_non_pass_rows_through(
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "m.parquet",
             [(1, ReadMaskReason.PASS.value, 0, 0), (2, ReadMaskReason.QC_TOO_MANY_N.value, 4, 6)],
         ),
@@ -541,7 +541,7 @@ def test_qc_incoming_mask_rejects_duplicate_sequence_idx(tmp_path, write_reads, 
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "m.parquet", [(1, _PASS, 0, 0), (1, _PASS, 0, 0)]
         ),
         work_ticket_idx=1,
@@ -560,7 +560,7 @@ def test_qc_incoming_mask_rejects_unmatched_read(tmp_path, write_reads, write_pa
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(
+        partial_mask=write_partial_mask(
             tmp_path / "m.parquet", [(1, _PASS, 0, 0), (3, _PASS, 0, 0)]
         ),
         work_ticket_idx=1,
@@ -585,7 +585,7 @@ def test_qc_incoming_mask_rejects_trims_longer_than_the_qual_array(
     inputs = qc.Inputs(
         reads=reads,
         adapter_parquet=_adapter_parquet(tmp_path, _AD),
-        adapter_mask=write_partial_mask(tmp_path / "m.parquet", [(1, _PASS, 2, 2)]),
+        partial_mask=write_partial_mask(tmp_path / "m.parquet", [(1, _PASS, 2, 2)]),
         work_ticket_idx=1,
     )
     with pytest.raises(ValueError, match="exceeds the read length"):

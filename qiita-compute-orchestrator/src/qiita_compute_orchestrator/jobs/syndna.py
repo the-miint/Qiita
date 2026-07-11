@@ -1,28 +1,37 @@
-"""Native job: mark SynDNA spike-in reads, extending the read mask.
+"""Native job: mark SynDNA spike-in reads. FIRST step of the read-mask chain.
 
-`(read.parquet, read_mask.parquet) -> read_mask.parquet`.
-Runs LAST in the read-mask chain, AFTER host_filter. Structurally an adaptation of
-`host_filter`: classify the still-`pass` reads against a rype index, then merge the
-hits into the incoming mask with a reason that falls through to `ELSE m.reason`.
+`read.parquet -> syndna_mask.parquet`. Emits a PARTIAL mask (the 6-column
+`(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)` shape
+qc / lima_mask emit), NOT the final `read_mask`.
 
-**Why last.** Spike-ins are synthetic and do not align to the host, so host
-filtering never removes them. Counting them in the QC'd, host-depleted space is the
-correct denominator for the downstream total-cells calculation.
+**Why first — and this is a bug fix.** In case 5 (`syndna_is_twisted == False`)
+the SynDNA spike-ins are added AFTER Twist amplification, so they carry no Twist
+adaptor. If lima ran first it would find no adaptor on a spike-in read and mark it
+`twist_no_adaptor`; every later step (including syndna) only re-classifies rows
+still `pass`, so syndna would never see the spike-in and its count would be
+STRUCTURALLY zero. Running syndna first — on the RAW reads, before lima can drop
+anything — marks the spike-ins up front. lima then processes only the still-`pass`
+(biological) reads, which all legitimately carry the adaptor, so `twist_no_adaptor`
+becomes a correct "artifactual" signal.
 
-**Why `spikein_syndna` is not biological.** A spike-in is added in the lab; it is
-not a molecule from the sample. It gets its own reason (so `read_masked`, which
-serves only `pass`, excludes it) and its own count bucket, disjoint from
-`biological`. Its rows are RETAINED in `read_mask` — the counts survive.
+The mask threads forward as a single `partial_mask` binding: syndna emits it, the
+lima chain and qc each consume it (only rows still `pass` are re-classified; every
+non-`pass` row is carried verbatim via `ELSE reason`), and `host_filter` folds it
+into the final `read_mask`. So a `spikein_syndna` mark set here survives untouched
+to the end — no step overwrites an earlier verdict.
 
-**Per-spike-in counts are NOT emitted here.** The question this step answers is
-boolean — "is this read a spike-in?" — so it shares `host_filter`'s classify seam
-(`_rype.run_rype_classify`). Attributing each read to a specific spike-in needs a
-durable per-`(prep_sample, feature_idx)` table and a register step, neither of
-which exists yet; emitting an unregistered parquet into an ephemeral workspace
-would spare nothing. Nothing is lost in the meantime: `read_mask` retains every
-spike-in read's `sequence_idx`, so a later step can re-classify exactly those rows
-against the syndna reference. `build_rype_index --bucket-per-feature` exists so the
-index is already built for that day and needs no rebuild.
+**Classifies the RAW read.** As the first step there is no incoming mask and no
+trimming yet, so rype sees `sequence1` directly. Trims are all zero (SynDNA does
+not trim); the mate-trim columns follow the read_mask convention (NULL for
+single-end, 0 for paired) so both-mates counting stays correct downstream.
+
+`spikein_syndna` is not biological — a spike-in is added in the lab. It is
+excluded from `read_masked` (which serves only `pass`) and gets its own count
+bucket, with its rows RETAINED in `read_mask` so the counts survive.
+
+Shares `host_filter`'s classify seam (`_rype.run_rype_classify` — DISTINCT,
+BIGINT accumulator for rype's build-dependent id type): the question is the same
+boolean "does this read match the index?".
 """
 
 from __future__ import annotations
@@ -60,41 +69,25 @@ _DUCKDB_THREADS = 4
 # data shows biological reads matching the spike-in index.
 _RYPE_THRESHOLD = 0.0
 
-# In-DuckDB relation names. The incoming mask is a VIEW (both the query view and
-# the final COPY read it); the hit set is a TABLE (rype's `read_id` output type is
+# In-DuckDB relation names. The reads are a VIEW (both the query and the final COPY
+# read them); the hit set is a TABLE (rype's `read_id` output type is
 # build-dependent, so a pre-declared BIGINT column coerces it on insert — see
 # `_rype.run_rype_classify`).
-_MASK = "syndna_mask"
+_READS = "syndna_reads"
 _QUERY = "syndna_query"
 _HITS = "syndna_hits"
-
-# A still-`pass` read's trimmed sequence — the same substr math the read_masked
-# view applies. `r` is the read alias, `m` the mask alias. Single-end only
-# (spike-ins ride the long-read protocols), but sequence2 is carried so a future
-# short-read absquant needs no change here: rype reads it when present.
-_TRIM_SEQ1 = (
-    "substr(r.sequence1, m.left_trim1 + 1, length(r.sequence1) - m.left_trim1 - m.right_trim1)"
-)
-_TRIM_SEQ2 = (
-    "CASE WHEN r.sequence2 IS NULL THEN NULL ELSE "
-    "substr(r.sequence2, m.left_trim2 + 1, "
-    "length(r.sequence2) - m.left_trim2 - m.right_trim2) END"
-)
 
 
 class Inputs(BaseModel):
     """Typed input contract for syndna.
 
-    `read_mask` is host_filter's output (the 8-column mask carrying `mask_idx` and
-    `prep_sample_idx`); this step extends it rather than re-deriving it.
-    `syndna_rype_path` is the spike-in reference's `.ryxdi`, bound by the runner
-    only when `syndna_enabled` — and the step itself only runs under that same
-    gate, so it is REQUIRED here rather than optional: an unbound index would mean
-    the gate and the binding disagree.
+    First step of the chain, so it takes only the raw `reads` and the spike-in
+    reference. `syndna_rype_path` is the `.ryxdi`, bound by the runner only when
+    `syndna_enabled` — and the step runs under that same gate, so it is REQUIRED
+    (an unbound index would mean the gate and the binding disagree).
     """
 
     reads: Path
-    read_mask: Path
     syndna_rype_path: Path
     prep_sample_idx: int | None = None
     work_ticket_idx: int
@@ -113,20 +106,13 @@ def _validate_rype_index(path: Path) -> None:
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.reads.exists():
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
-    if not inputs.read_mask.exists():
-        raise FileNotFoundError(f"read_mask parquet not found: {inputs.read_mask}")
     _validate_rype_index(inputs.syndna_rype_path)
 
     workspace.mkdir(parents=True, exist_ok=True)
-    # `register-files` globs EVERY *.parquet in the staging dir it is handed, so the
-    # emitted mask gets its own subdir — nothing else may land beside it.
-    staging_dir = workspace / "read_mask"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    read_mask = staging_dir / "read_mask.parquet"
+    partial_mask = workspace / "syndna_mask.parquet"
 
     reads_sql = validate_parquet_path(inputs.reads)
-    mask_sql = validate_parquet_path(inputs.read_mask)
-    out_sql = validate_parquet_path(read_mask)
+    out_sql = validate_parquet_path(partial_mask)
 
     success = False
     try:
@@ -134,42 +120,40 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
-            conn.execute(f"CREATE VIEW {_MASK} AS SELECT * FROM read_parquet('{mask_sql}')")
-            # Classify ONLY the still-`pass` reads, on their trimmed sequence. A read
-            # already marked qc_*/host_*/twist_no_adaptor keeps that verdict: the
-            # earlier step's reason is never overwritten (see the CASE below).
+            # No incoming mask and no trimming yet: rype classifies the raw read.
+            conn.execute(f"CREATE VIEW {_READS} AS SELECT * FROM read_parquet('{reads_sql}')")
             conn.execute(
                 f"CREATE VIEW {_QUERY} AS "
-                "SELECT r.sequence_idx AS read_id, "
-                f"{_TRIM_SEQ1} AS sequence1, {_TRIM_SEQ2} AS sequence2 "
-                f"FROM read_parquet('{reads_sql}') r "
-                f"JOIN {_MASK} m USING (sequence_idx) "
-                f"WHERE m.reason = '{ReadMaskReason.PASS.value}'"
+                f"SELECT sequence_idx AS read_id, sequence1, sequence2 FROM {_READS}"
             )
             conn.execute(f"CREATE TABLE {_HITS} (sequence_idx BIGINT)")
             _run_rype_classify(
                 conn, inputs.syndna_rype_path, _QUERY, _HITS, threshold=_RYPE_THRESHOLD
             )
 
-            # Extend the mask. `ELSE m.reason` is the fall-through every step in the
-            # chain shares — a spike-in hit can only ever override `pass`, because
-            # the query view saw nothing else.
+            # Emit the partial mask: one row per read, spike-in hits marked, all
+            # else `pass`. Trims are zero (SynDNA does not trim); mate-trim columns
+            # follow the read_mask convention (NULL single-end, 0 paired) so the
+            # both-mates count(right_trim2) stays correct downstream.
             conn.execute(
-                "COPY (SELECT m.mask_idx, m.prep_sample_idx, m.sequence_idx, "
+                "COPY (SELECT r.sequence_idx, "
                 f"        CASE WHEN h.sequence_idx IS NOT NULL "
                 f"             THEN '{ReadMaskReason.SPIKEIN_SYNDNA.value}' "
-                "             ELSE m.reason END AS reason, "
-                "        m.left_trim1, m.right_trim1, m.left_trim2, m.right_trim2 "
-                f"      FROM {_MASK} m LEFT JOIN {_HITS} h USING (sequence_idx) "
-                "      ORDER BY mask_idx, prep_sample_idx, sequence_idx) "
+                f"             ELSE '{ReadMaskReason.PASS.value}' END AS reason, "
+                "        0::UINTEGER AS left_trim1, 0::UINTEGER AS right_trim1, "
+                "        CASE WHEN r.sequence2 IS NULL THEN NULL ELSE 0 END::UINTEGER "
+                "          AS left_trim2, "
+                "        CASE WHEN r.sequence2 IS NULL THEN NULL ELSE 0 END::UINTEGER "
+                "          AS right_trim2 "
+                f"      FROM {_READS} r LEFT JOIN {_HITS} h USING (sequence_idx) "
+                "      ORDER BY sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
         success = True
     finally:
         if not success:
-            read_mask.unlink(missing_ok=True)
+            partial_mask.unlink(missing_ok=True)
 
-    # Same binding names host_filter emits: when syndna runs it SHADOWS them, so
-    # persist-read-metrics and register-files consume the extended mask; when it is
-    # skipped, host_filter's bindings stand.
-    return {"read_mask": read_mask, "read_mask_staging_dir": staging_dir}
+    # The partial mask threaded forward to the lima chain / qc under one binding
+    # (see the module docstring). NOT the final read_mask — host_filter emits that.
+    return {"partial_mask": partial_mask}

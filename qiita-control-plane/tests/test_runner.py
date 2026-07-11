@@ -4244,19 +4244,19 @@ async def test_runner_local_passthrough_threads_paths(
     ]
 
 
-# --- deliberate output shadowing (read-mask: host_filter <- syndna) -----------
+# --- deliberate output shadowing (read-mask: lima_mask self-shadows partial_mask) ---
 #
-# `syndna` declares the SAME output names `host_filter` does, so when it runs its
-# bindings overwrite host_filter's (bound.update is last-writer-wins) and the
-# downstream persist-read-metrics + register-files consume the EXTENDED mask; when
-# `syndna_enabled` is false it is skipped and host_filter's bindings stand.
-# Distinct names would break the skipped case — register-files takes ONE input.
+# The read-mask chain threads a `partial_mask` binding through syndna -> lima -> qc.
+# `lima_mask` (when lima_enabled) both CONSUMES `partial_mask` (syndna's) and
+# PRODUCES it, so its output overwrites the incoming binding (bound.update is
+# last-writer-wins) and qc reads whichever ran latest; when lima is skipped,
+# syndna's binding stands. This self-shadow is safe because _bind_step_inputs reads
+# `bound` BEFORE bound.update(outputs).
 #
-# The shape below mirrors that contract without dragging in read-mask's reads /
-# adapters / mask-mint machinery: `first` always runs, `second` is `when:`-gated
-# and shadows it, `consumer` reads the shadowed binding. A future reorder or
-# rename would otherwise silently persist the pre-syndna mask (spike-ins vanish)
-# with nothing red.
+# The shape below exercises that mechanism generically, without read-mask's reads /
+# adapters / rype machinery: `first` always runs, `second` is `when:`-gated and both
+# reads and overwrites the binding, `consumer` reads whichever value stands. A
+# regression in the read/update ordering would otherwise miscount silently.
 
 _SHADOW_STEPS = [
     {
@@ -4273,7 +4273,7 @@ _SHADOW_STEPS = [
         "name": "second",
         "step_type": "singleton",
         "module": "qiita_compute_orchestrator.jobs.build_minimap2_index",
-        # Reads the binding it also writes — the self-shadow syndna relies on.
+        # Reads the binding it also writes — the self-shadow lima_mask relies on.
         "inputs": ["shared_out"],
         "when": "second_enabled",
         "outputs": ["shared_out"],

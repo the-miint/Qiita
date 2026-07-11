@@ -893,20 +893,20 @@ def test_load_actions_read_mask_audience_is_admin_only():
     }
 
 
-def test_read_mask_yaml_shadowing_and_ordering_contract():
+def test_read_mask_yaml_ordering_and_partial_mask_contract():
     """Pin the structural contract the read-mask chain depends on.
 
-    `syndna` DELIBERATELY declares the same output names `host_filter` does, so
-    when it runs its bindings shadow host_filter's (bound.update is
-    last-writer-wins) and the trailing entries consume the EXTENDED mask; when
-    `syndna_enabled` is false it is skipped and host_filter's bindings stand.
-    Distinct names would break the skipped case — register-files takes exactly ONE
-    input binding.
+    ORDER is load-bearing: `syndna` runs FIRST (on the raw reads), before lima can
+    drop an un-adaptered spike-in as `twist_no_adaptor`. The `partial_mask` binding
+    then threads syndna -> lima -> qc, each consuming it optionally and the
+    producers overwriting it (last-writer-wins), so qc sees whichever ran latest.
+    `host_filter` is the SOLE final emitter (`read_mask` / `read_mask_staging_dir`),
+    and its `ELSE q.reason` carries the spike-in verdicts to the end.
 
-    Nothing about that is enforced by the runner, so a rename or a reorder would
-    silently persist the PRE-syndna mask (every spike-in reverts to `pass`) with
-    no test red. The behavioral half lives in test_runner.py's shadowing tests;
-    this is the structural half, read off the shipped YAML.
+    A reorder or a binding rename would silently miscount (a spike-in reverting to
+    `pass`, or vanishing as `twist_no_adaptor`) with no runtime error — this is the
+    structural guard, read off the shipped YAML; the behavioral half is in
+    test_runner.py's shadowing tests and the jobs' real-miint chain tests.
     """
     from pathlib import Path
 
@@ -914,37 +914,35 @@ def test_read_mask_yaml_shadowing_and_ordering_contract():
 
     repo_root = Path(__file__).resolve().parents[2]
     rm = {a.action_id: a for a in load_actions(repo_root / "workflows")}["read-mask"]
-    names = [e.name for e in rm.steps]
+    by_name = {e.name: e for e in rm.steps}
 
-    # lima trio BEFORE qc (lima needs the intact adaptor; QC must judge the
-    # insert); syndna AFTER host_filter (spike-ins survive host depletion);
-    # persist-read-metrics BEFORE register-files (which MOVES the parquet out).
-    assert names == [
+    assert [e.name for e in rm.steps] == [
+        "syndna",
         "lima_export",
         "lima",
         "lima_mask",
         "qc",
         "host_filter",
-        "syndna",
         "persist-read-metrics",
         "register-files",
     ]
 
-    by_name = {e.name: e for e in rm.steps}
-    host_filter, syndna = by_name["host_filter"], by_name["syndna"]
+    # The partial-mask thread: syndna produces it; lima_export/lima_mask/qc consume
+    # it optionally; lima_mask overwrites it (the self-shadow — reads the binding it
+    # also writes, safe because _bind_step_inputs reads `bound` before updating it).
+    assert by_name["syndna"].outputs == ["partial_mask"]
+    assert "partial_mask" in by_name["lima_export"].optional_inputs
+    assert "partial_mask" in by_name["lima_mask"].optional_inputs
+    assert by_name["lima_mask"].outputs == ["partial_mask"]
+    assert "partial_mask" in by_name["qc"].optional_inputs
 
-    # The shadow: identical output names, syndna second.
-    assert syndna.outputs == host_filter.outputs == ["read_mask", "read_mask_staging_dir"]
-    # The self-shadow: syndna reads the binding it also writes.
-    assert "read_mask" in syndna.inputs
-    # ...and the consumers take exactly one binding each, which is why distinct
-    # names cannot work for the skipped case.
+    # host_filter is the SOLE final emitter; the tail consumes its bindings.
+    assert by_name["host_filter"].outputs == ["read_mask", "read_mask_staging_dir"]
     assert by_name["persist-read-metrics"].inputs == ["read_mask"]
     assert by_name["register-files"].inputs == ["read_mask_staging_dir"]
 
-    # The gates: the lima trio skips together; syndna has its own.
+    # The gates: the lima trio skips together; syndna has its own; qc/host_filter
+    # are ALWAYS present (host optionality is via optional_inputs).
     assert [by_name[n].when for n in ("lima_export", "lima", "lima_mask")] == ["lima_enabled"] * 3
-    assert syndna.when == "syndna_enabled"
-    # qc and host_filter are ALWAYS present (host optionality is via optional_inputs).
-    assert by_name["qc"].when is None and host_filter.when is None
-    assert "adapter_mask" in by_name["qc"].optional_inputs
+    assert by_name["syndna"].when == "syndna_enabled"
+    assert by_name["qc"].when is None and by_name["host_filter"].when is None

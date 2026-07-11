@@ -1,9 +1,9 @@
 """Native job: turn lima's clipped FASTQ into a partial read mask.
 
-`(read.parquet, lima_out.fastq) -> adapter_mask.parquet`. Last entry of the
-long-read adapter chain (`lima_export -> lima -> lima_mask`); its output is the
-optional `adapter_mask` the `qc` step consumes, which then extends the trims
-cumulatively (see jobs/qc.py).
+`(read.parquet, lima_out.fastq [, partial_mask]) -> partial_mask`. Last entry of the
+long-read adapter chain (`lima_export -> lima -> lima_mask`); it emits the
+`partial_mask` binding qc consumes (or host_filter, further down the chain),
+which then extends the trims cumulatively (see jobs/qc.py).
 
 **Trims come from miint's `infer_trim`, not from parsing lima.** The macro takes
 the original and the clipped relations, joins them on `sequence_index`, locates
@@ -48,6 +48,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._partial_mask import assert_covers_reads
 
 YAML_STEP_NAME = "lima_mask"
 
@@ -62,19 +63,36 @@ _DUCKDB_THREADS = 4
 # In-DuckDB relation names.
 _ORIG = "lima_orig"
 _QCD = "lima_qcd"
+_INCOMING = "lima_mask_incoming"
+
+
+def _carry_select(incoming_view: str) -> str:
+    """The incoming mask's non-`pass` rows, verbatim — the spike-ins syndna marked.
+    They were never sent to lima, so infer_trim never sees them; carrying them here
+    (with `ELSE reason` semantics) is what keeps a `spikein_syndna` verdict from
+    being overwritten by `twist_no_adaptor`."""
+    return (
+        "SELECT sequence_idx, reason, "
+        "left_trim1::UINTEGER AS left_trim1, right_trim1::UINTEGER AS right_trim1, "
+        "left_trim2::UINTEGER AS left_trim2, right_trim2::UINTEGER AS right_trim2 "
+        f"FROM {incoming_view} WHERE reason <> '{ReadMaskReason.PASS.value}'"
+    )
 
 
 class Inputs(BaseModel):
     """Typed input contract for lima_mask.
 
     `reads` is the raw `read.parquet` lima_export exported; `lima_out_fastq` is
-    lima's clipped output. `prep_sample_idx` is accepted but unused — the mask keys
-    on the globally-unique `sequence_idx`, so a BLOCK-scoped ticket (which flows no
-    such scalar) validates against the same shape.
+    lima's clipped output. `partial_mask` is the OPTIONAL upstream mask (today:
+    syndna's) — when bound, only its `pass` reads went to lima, and its non-`pass`
+    rows (the spike-ins) are carried through unchanged. `prep_sample_idx` is
+    accepted but unused — the mask keys on the globally-unique `sequence_idx`, so a
+    BLOCK-scoped ticket (which flows no such scalar) validates against the same shape.
     """
 
     reads: Path
     lima_out_fastq: Path
+    partial_mask: Path | None = None
     prep_sample_idx: int | None = None
     work_ticket_idx: int
 
@@ -109,13 +127,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     if not inputs.lima_out_fastq.exists():
         raise FileNotFoundError(f"lima_out_fastq not found: {inputs.lima_out_fastq}")
+    if inputs.partial_mask is not None and not inputs.partial_mask.exists():
+        raise FileNotFoundError(f"partial_mask not found: {inputs.partial_mask}")
 
     workspace.mkdir(parents=True, exist_ok=True)
-    adapter_mask = workspace / "adapter_mask.parquet"
+    partial_mask = workspace / "partial_mask.parquet"
 
     reads_sql = validate_parquet_path(inputs.reads)
     lima_sql = validate_parquet_path(inputs.lima_out_fastq)
-    out_sql = validate_parquet_path(adapter_mask)
+    out_sql = validate_parquet_path(partial_mask)
 
     success = False
     try:
@@ -126,15 +146,34 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
+            # infer_trim's ORIGINALS are exactly the reads lima_export sent to lima:
+            # every raw read, or — when an upstream mask is bound — only its `pass`
+            # reads (the spike-ins were never exported). A spike-in must NOT reach
+            # infer_trim: absent from lima's output, it would come back NULL/NULL and
+            # be mislabelled twist_no_adaptor. Its row is carried verbatim instead.
+            carry_select: str | None = None
+            if inputs.partial_mask is None:
+                conn.execute(
+                    f"CREATE VIEW {_ORIG} AS "
+                    "SELECT sequence_idx AS sequence_index, sequence1 AS sequence "
+                    f"FROM read_parquet('{reads_sql}')"
+                )
+            else:
+                mask_sql = validate_parquet_path(inputs.partial_mask)
+                conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
+                assert_covers_reads(conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask)
+                conn.execute(
+                    f"CREATE VIEW {_ORIG} AS "
+                    "SELECT r.sequence_idx AS sequence_index, r.sequence1 AS sequence "
+                    f"FROM read_parquet('{reads_sql}') r JOIN {_INCOMING} m USING (sequence_idx) "
+                    f"WHERE m.reason = '{ReadMaskReason.PASS.value}'"
+                )
+                carry_select = _carry_select(_INCOMING)
+
             # infer_trim requires both relations to expose `sequence_index` +
             # `sequence`. On the clipped side the key is the round-tripped FASTQ
             # record NAME (`read_id`), never read_fastx's positional
             # `sequence_index`.
-            conn.execute(
-                f"CREATE VIEW {_ORIG} AS "
-                "SELECT sequence_idx AS sequence_index, sequence1 AS sequence "
-                f"FROM read_parquet('{reads_sql}')"
-            )
             if is_empty_sequence_file(inputs.lima_out_fastq):
                 # lima clipped nothing through: every read failed adapter detection.
                 # A legitimate all-`twist_no_adaptor` mask — but `read_fastx` raises
@@ -152,25 +191,32 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"FROM read_fastx('{lima_sql}')"
                 )
             _assert_lima_reads_are_known(conn, inputs.lima_out_fastq)
-            # One row per ORIGINAL read. `infer_trim` returns NULL/NULL for a read
-            # lima omitted -> twist_no_adaptor with zero trims (nothing was clipped;
-            # the whole read is masked out regardless). PacBio is single-end, so the
-            # mate trims are NULL, matching the qc_mask shape qc consumes.
+            # One row per ORIGINAL (pass) read. `infer_trim` returns NULL/NULL for a
+            # read lima omitted -> twist_no_adaptor with zero trims. Single-end, so
+            # the mate trims are NULL, matching the partial-mask shape qc consumes.
+            # The carry branch (when there is one) adds the incoming non-pass rows —
+            # the spike-ins — unchanged.
             no_adaptor = ReadMaskReason.TWIST_NO_ADAPTOR.value
-            conn.execute(
-                "COPY (SELECT sequence_index AS sequence_idx, "
+            infer_select = (
+                "SELECT sequence_index AS sequence_idx, "
                 f"        CASE WHEN trimmed_5p IS NULL THEN '{no_adaptor}' "
                 f"             ELSE '{ReadMaskReason.PASS.value}' END AS reason, "
                 "        coalesce(trimmed_5p, 0)::UINTEGER AS left_trim1, "
                 "        coalesce(trimmed_3p, 0)::UINTEGER AS right_trim1, "
                 "        NULL::UINTEGER AS left_trim2, "
                 "        NULL::UINTEGER AS right_trim2 "
-                f"      FROM infer_trim({_ORIG}, {_QCD}) ORDER BY sequence_idx) "
-                f"TO '{out_sql}' ({PARQUET_OPTS})"
+                f"FROM infer_trim({_ORIG}, {_QCD})"
+            )
+            branches = [infer_select] if carry_select is None else [infer_select, carry_select]
+            union_sql = " UNION ALL ".join(f"({b})" for b in branches)
+            conn.execute(
+                f"COPY ({union_sql} ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
             )
         success = True
     finally:
         if not success:
-            adapter_mask.unlink(missing_ok=True)
+            partial_mask.unlink(missing_ok=True)
 
-    return {"adapter_mask": adapter_mask}
+    # Same `partial_mask` binding syndna emits, so qc consumes whichever ran last
+    # (last-writer-wins on the binding).
+    return {"partial_mask": partial_mask}

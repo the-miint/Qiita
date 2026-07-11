@@ -140,7 +140,7 @@ def test_mask_trims_are_relative_to_the_raw_read(tmp_path):
     raw = _LEAD + _INSERT + _TRAIL
     reads = _reads(tmp_path, [(11, raw)])
     lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT)])
-    rows = _mask_rows(_mask(tmp_path, reads, lima_out)["adapter_mask"])
+    rows = _mask_rows(_mask(tmp_path, reads, lima_out)["partial_mask"])
     assert rows == [(11, ReadMaskReason.PASS.value, len(_LEAD), len(_TRAIL), None, None)]
     left, right = rows[0][2], rows[0][3]
     assert raw[left : len(raw) - right] == _INSERT
@@ -150,7 +150,7 @@ def test_mask_marks_reads_lima_dropped_as_twist_no_adaptor(tmp_path):
     """A HiFi read with no Twist adaptor is artifactual, not a library molecule."""
     reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
     lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT)])
-    rows = _mask_rows(_mask(tmp_path, reads, lima_out)["adapter_mask"])
+    rows = _mask_rows(_mask(tmp_path, reads, lima_out)["partial_mask"])
     assert rows[0][1] == ReadMaskReason.PASS.value
     assert rows[1] == (22, ReadMaskReason.TWIST_NO_ADAPTOR.value, 0, 0, None, None)
 
@@ -161,7 +161,7 @@ def test_mask_handles_an_empty_lima_output(tmp_path):
     reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
     empty = tmp_path / "empty.fastq"
     empty.write_text("")
-    rows = _mask_rows(_mask(tmp_path, reads, empty)["adapter_mask"])
+    rows = _mask_rows(_mask(tmp_path, reads, empty)["partial_mask"])
     assert [r[1] for r in rows] == [ReadMaskReason.TWIST_NO_ADAPTOR.value] * 2
     assert all(r[2] == 0 and r[3] == 0 for r in rows)
 
@@ -172,8 +172,8 @@ def test_mask_tolerates_limas_appended_bam_tags(tmp_path):
     reads = _reads(tmp_path, [(11, _INSERT)])
     with_tags = _write_lima_output(tmp_path / "a.fastq", [(11, _INSERT)], tags=True)
     without = _write_lima_output(tmp_path / "b.fastq", [(11, _INSERT)], tags=False)
-    assert _mask_rows(_mask(tmp_path, reads, with_tags)["adapter_mask"]) == _mask_rows(
-        _mask(tmp_path / "x", reads, without)["adapter_mask"]
+    assert _mask_rows(_mask(tmp_path, reads, with_tags)["partial_mask"]) == _mask_rows(
+        _mask(tmp_path / "x", reads, without)["partial_mask"]
     )
 
 

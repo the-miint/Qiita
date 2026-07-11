@@ -85,27 +85,6 @@ def _write_reads(path: Path, rows: list[tuple[int, str]]) -> Path:
     return path
 
 
-def _write_mask(path: Path, sequence_idxs: list[int]) -> Path:
-    values = ", ".join(
-        "(CAST(? AS BIGINT), CAST(5 AS BIGINT), CAST(? AS BIGINT), CAST(? AS VARCHAR), "
-        "CAST(0 AS UINTEGER), CAST(0 AS UINTEGER), "
-        "CAST(NULL AS UINTEGER), CAST(NULL AS UINTEGER))"
-        for _ in sequence_idxs
-    )
-    params: list = []
-    for sidx in sequence_idxs:
-        params.extend([_MASK_IDX, sidx, _PASS])
-    with duckdb.connect(":memory:") as conn:
-        conn.execute(
-            f"COPY (SELECT * FROM (VALUES {values}) AS t("
-            "mask_idx, prep_sample_idx, sequence_idx, reason, "
-            "left_trim1, right_trim1, left_trim2, right_trim2)) "
-            f"TO '{path}' (FORMAT PARQUET)",
-            params,
-        )
-    return path
-
-
 def test_syndna_smoke_marks_spikeins_from_a_real_per_feature_index(tmp_path):
     from qiita_compute_orchestrator.jobs import syndna
 
@@ -113,22 +92,21 @@ def test_syndna_smoke_marks_spikeins_from_a_real_per_feature_index(tmp_path):
         tmp_path / "reads.parquet",
         [(1, _READ_A), (2, _READ_B), (3, _BIOLOGICAL)],
     )
-    mask = _write_mask(tmp_path / "mask.parquet", [1, 2, 3])
     index = _build_syndna_index(tmp_path)
 
     out = asyncio.run(
         syndna.execute(
-            syndna.Inputs(reads=reads, read_mask=mask, syndna_rype_path=index, work_ticket_idx=1),
+            syndna.Inputs(reads=reads, syndna_rype_path=index, work_ticket_idx=1),
             tmp_path / "ws",
         )
     )
 
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(
-            f"SELECT sequence_idx, reason FROM read_parquet('{out['read_mask']}') "
+            f"SELECT sequence_idx, reason FROM read_parquet('{out['partial_mask']}') "
             "ORDER BY sequence_idx"
         ).fetchall()
-    # Both spike-in reads flagged; the biological read untouched.
+    # Both spike-in reads flagged on the RAW reads; the biological read is `pass`.
     assert rows == [(1, _SPIKEIN), (2, _SPIKEIN), (3, _PASS)]
 
 
@@ -137,16 +115,15 @@ def test_syndna_smoke_no_spikeins_leaves_the_mask_untouched(tmp_path):
     from qiita_compute_orchestrator.jobs import syndna
 
     reads = _write_reads(tmp_path / "reads.parquet", [(1, _BIOLOGICAL)])
-    mask = _write_mask(tmp_path / "mask.parquet", [1])
     index = _build_syndna_index(tmp_path)
 
     out = asyncio.run(
         syndna.execute(
-            syndna.Inputs(reads=reads, read_mask=mask, syndna_rype_path=index, work_ticket_idx=1),
+            syndna.Inputs(reads=reads, syndna_rype_path=index, work_ticket_idx=1),
             tmp_path / "ws",
         )
     )
     with duckdb.connect(":memory:") as conn:
         assert conn.execute(
-            f"SELECT reason FROM read_parquet('{out['read_mask']}')"
+            f"SELECT reason FROM read_parquet('{out['partial_mask']}')"
         ).fetchall() == [(_PASS,)]

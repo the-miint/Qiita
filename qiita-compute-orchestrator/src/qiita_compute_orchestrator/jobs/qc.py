@@ -10,9 +10,9 @@ Runs BEFORE `host_filter` in the bcl-convert pipeline (`fastq` -> `qc` ->
 `host_filter`); `host_filter` merges its host hits into this partial mask and
 emits the final `read_mask`.
 
-**Optional incoming mask (`adapter_mask`).** A mask-emitting step may precede QC
-— today only the long-read lima adapter chain, which strips the Twist adaptor
-before QC's length/quality filter sees the insert. When `adapter_mask` is bound,
+**Optional incoming mask (`partial_mask`).** A mask-emitting step may precede QC
+— the SynDNA spike-in step and/or the long-read lima adapter chain (which strips
+the Twist adaptor before QC's length/quality filter sees the insert). When bound,
 QC consumes it exactly as `host_filter` consumes `qc_mask`: only rows still
 `reason='pass'` are re-classified (each on its ALREADY-TRIMMED substring), and
 every non-`pass` row is carried through verbatim, reason and trims intact. When
@@ -93,6 +93,11 @@ from ..miint import (
     resolve_duckdb_memory_gb,
 )
 from . import JobPlan, JobResourcePlan
+from ._partial_mask import (
+    assert_covers_reads,
+    assert_single_end,
+    assert_trims_within_read,
+)
 
 YAML_STEP_NAME = "qc"
 
@@ -138,7 +143,7 @@ _TWO_COLOR_MODEL_SUBSTRINGS = ("nextseq", "novaseq", "miniseq")
 _SE = "qc_se"
 _PE = "qc_pe"
 
-# View over the optional incoming partial mask (`adapter_mask`). Its non-`pass`
+# View over the optional incoming partial mask (`partial_mask`). Its non-`pass`
 # rows bypass QC entirely and are UNION ALL'd into the COPY verbatim (the carry
 # branch); its `pass` rows drive the trimmed `_SE` source view.
 _INCOMING = "qc_incoming_mask"
@@ -147,7 +152,7 @@ _INCOMING = "qc_incoming_mask"
 # the insert. substr takes a 1-based start + a LENGTH; the qual array takes a
 # 1-based INCLUSIVE slice. The two must stay in lockstep or filter_read judges a
 # sequence against another read's phred values. `r` is the read alias, `m` the
-# incoming-mask alias. Guarded by `_assert_trims_within_read` — DuckDB's substr
+# incoming-mask alias. Guarded by `_partial_mask.assert_trims_within_read` — DuckDB's substr
 # with a NEGATIVE length walks BACKWARDS and returns bases (while the qual slice
 # yields []), so an over-trimmed row would desync the two rather than error.
 _INCOMING_SEQ1 = (
@@ -182,12 +187,12 @@ class Inputs(BaseModel):
     it is forwarded from qiita.sequencing_run per sample. `work_ticket_idx` is the
     framework-injected scope scalar.
 
-    `adapter_mask` is the OPTIONAL partial mask of a mask-emitting step that ran
-    before QC (today: the lima adapter chain). Same 6-column shape this job emits.
+    `partial_mask` is the OPTIONAL partial mask of a step that ran before QC
+    (syndna and/or the lima chain). Same 6-column shape this job emits.
     Unbound -> QC is the first step, unchanged. Bound -> QC re-classifies only its
     `pass` rows, on the trimmed insert, emitting cumulative-from-raw trims; its
     non-`pass` rows are carried through untouched. Single-end only (see
-    `_assert_single_end_for_incoming_mask`).
+    `_partial_mask.assert_single_end`).
 
     `prep_sample_idx` is OPTIONAL and unused: the qc_mask keys on sequence_idx
     only (globally unique), so QC never needs the owner. A PREP_SAMPLE-scoped
@@ -198,7 +203,7 @@ class Inputs(BaseModel):
 
     reads: Path
     adapter_parquet: Path
-    adapter_mask: Path | None = None
+    partial_mask: Path | None = None
     instrument_model: str | None = None
     prep_sample_idx: int | None = None
     work_ticket_idx: int
@@ -361,7 +366,7 @@ def _qc_pe_select(
 
     Unlike the SE seam this takes no incoming trims: the only mask-emitting step
     that can precede QC is the long-read adapter chain, and long reads are
-    single-end. `_assert_single_end_for_incoming_mask` rejects the combination at
+    single-end. `_partial_mask.assert_single_end` rejects the combination at
     the boundary rather than leaving untested PE-plus-incoming-mask math here."""
     adapter_layer = (
         "SELECT sequence_idx, "
@@ -445,96 +450,13 @@ def _qc_carry_select(incoming_view: str) -> str:
     )
 
 
-def _assert_single_end_for_incoming_mask(
-    conn: duckdb.DuckDBPyConnection, reads_sql: str, adapter_mask: Path
-) -> None:
-    """Reject a paired-end read set when an incoming mask is bound.
-
-    The SE seam is the only one that folds incoming trims back in; PE would need
-    per-mate `in_left2`/`in_right2` math that nothing produces today. Fail loudly
-    at the boundary instead of shipping an untested path."""
-    (pe_rows,) = conn.execute(
-        f"SELECT count(*) FROM read_parquet('{reads_sql}') WHERE sequence2 IS NOT NULL"
-    ).fetchone()
-    if pe_rows:
-        raise ValueError(
-            f"adapter_mask is bound ({adapter_mask}) but reads contain {pe_rows} paired-end "
-            "row(s); an incoming mask is single-end only (long reads)"
-        )
-
-
-def _assert_incoming_mask_covers_reads(
-    conn: duckdb.DuckDBPyConnection, reads_sql: str, incoming_view: str, adapter_mask: Path
-) -> None:
-    """The incoming mask must carry exactly one row per read — a bijection.
-
-    The SE source view INNER JOINs the two, so an unmatched read is silently
-    DROPPED from the emitted qc_mask (and `persist_read_metrics` then reports a
-    `raw` total smaller than the sample really has), while a duplicated
-    `sequence_idx` fans the join out and double-counts. Equal row counts alone
-    catch neither: reads {1,2} against a mask {1,1} counts 2 == 2, drops read 2,
-    and emits read 1 twice. So assert all three legs — no unmatched read, no
-    duplicate mask key, equal cardinality — which together force a bijection."""
-    (n_reads,) = conn.execute(f"SELECT count(*) FROM read_parquet('{reads_sql}')").fetchone()
-    n_mask, n_mask_distinct = conn.execute(
-        f"SELECT count(*), count(DISTINCT sequence_idx) FROM {incoming_view}"
-    ).fetchone()
-    (unmatched,) = conn.execute(
-        f"SELECT count(*) FROM read_parquet('{reads_sql}') r "
-        f"ANTI JOIN {incoming_view} m USING (sequence_idx)"
-    ).fetchone()
-    if n_mask != n_mask_distinct:
-        raise ValueError(
-            f"adapter_mask ({adapter_mask}) has {n_mask - n_mask_distinct} duplicate "
-            "sequence_idx row(s); an incoming mask must carry exactly one row per read"
-        )
-    if unmatched or n_reads != n_mask:
-        raise ValueError(
-            f"adapter_mask ({adapter_mask}) has {n_mask} row(s) covering "
-            f"{n_reads - unmatched} of {n_reads} read(s); "
-            "an incoming mask must carry exactly one row per read"
-        )
-
-
-def _assert_trims_within_read(
-    conn: duckdb.DuckDBPyConnection, reads_sql: str, incoming_view: str, adapter_mask: Path
-) -> None:
-    """Reject an incoming `pass` row whose trims exceed its read's length.
-
-    `infer_trim` cannot produce this (the kept sequence is a substring of the
-    original), but a hand-staged mask can. It must not pass silently: DuckDB's
-    `substr` with a negative length walks BACKWARDS and returns bases, while the
-    qual list-slice returns `[]` — so `filter_read` would judge a sequence
-    against an empty phred array instead of erroring.
-
-    `left + right == length` is PERMITTED (strict `>`): both slices come out empty
-    and the read is `qc_too_short`, which is the truthful verdict.
-
-    Checked against BOTH lengths. The sequence slice bounds on `length(sequence1)`
-    and the qual slice on `length(qual1)`; the DuckLake `read` table makes those
-    equal by construction, but a guard that trusts one to speak for the other is
-    exactly how the two silently desync."""
-    (bad,) = conn.execute(
-        f"SELECT count(*) FROM read_parquet('{reads_sql}') r JOIN {incoming_view} m "
-        "USING (sequence_idx) "
-        f"WHERE m.reason = '{ReadMaskReason.PASS.value}' "
-        "AND (m.left_trim1 + m.right_trim1 > length(r.sequence1) "
-        "  OR m.left_trim1 + m.right_trim1 > length(r.qual1))"
-    ).fetchone()
-    if bad:
-        raise ValueError(
-            f"adapter_mask ({adapter_mask}) has {bad} pass row(s) whose "
-            "left_trim1 + right_trim1 exceeds the read length"
-        )
-
-
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.reads.exists():
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     if not inputs.adapter_parquet.exists():
         raise FileNotFoundError(f"adapter_parquet not found: {inputs.adapter_parquet}")
-    if inputs.adapter_mask is not None and not inputs.adapter_mask.exists():
-        raise FileNotFoundError(f"adapter_mask not found: {inputs.adapter_mask}")
+    if inputs.partial_mask is not None and not inputs.partial_mask.exists():
+        raise FileNotFoundError(f"partial_mask not found: {inputs.partial_mask}")
 
     apply_polyg = _is_two_color(inputs.instrument_model)
 
@@ -570,7 +492,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # one code path: with no incoming mask they are literal zeros and
             # `sequence1`/`qual1` are the raw columns; with one, they are the
             # incoming trims and the seq/qual are sliced by them in lockstep.
-            if inputs.adapter_mask is None:
+            if inputs.partial_mask is None:
                 carry_select: str | None = None
                 conn.execute(
                     f"CREATE VIEW {_SE} AS "
@@ -579,13 +501,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"FROM read_parquet('{reads_sql}') WHERE sequence2 IS NULL"
                 )
             else:
-                mask_sql = validate_parquet_path(inputs.adapter_mask)
+                mask_sql = validate_parquet_path(inputs.partial_mask)
                 conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
                 # Boundary guards, cheapest first. All three are fail-fast: a
                 # malformed incoming mask corrupts trims or read counts silently.
-                _assert_single_end_for_incoming_mask(conn, reads_sql, inputs.adapter_mask)
-                _assert_incoming_mask_covers_reads(conn, reads_sql, _INCOMING, inputs.adapter_mask)
-                _assert_trims_within_read(conn, reads_sql, _INCOMING, inputs.adapter_mask)
+                assert_single_end(conn, reads_sql, "partial_mask", inputs.partial_mask)
+                assert_covers_reads(conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask)
+                assert_trims_within_read(
+                    conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask
+                )
                 # Only still-`pass` rows are re-classified, on the trimmed insert.
                 conn.execute(
                     f"CREATE VIEW {_SE} AS "
