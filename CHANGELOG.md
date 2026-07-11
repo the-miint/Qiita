@@ -22,13 +22,17 @@ the `no-changelog` label).
   (one uBAM per barcode) — FANS OUT one existing `bam-to-parquet` ticket per
   sample rather than a single pool-scoped demux ticket (no new job or workflow).
   Each sample's BAM is located under `{run_folder}/{smrt_cell}/hifi_reads/` by its
-  barcode; a barcode reused across SMRT cells within a run fails loud (it cannot
-  be disambiguated until the preflight carries a SMRT-cell column) rather than
-  silently binding the wrong cell's reads. The PacBio preflight reader is a
-  PROVISIONAL in-CLI seam (`_read_pacbio_preflight_rows`) reading the
-  `pacbio_sample` table directly — `kl-run-preflight` ships no
-  `get_pacbio_sample_info` yet — isolated so it swaps to the upstream accessor
-  (which will also supply the SMRT cell) in one place. Verified against
+  barcode; a barcode reused across SMRT cells within a run fails loud rather than
+  silently binding the wrong cell's reads. Per-sample facts (biosample + ENA
+  bioproject accessions, barcode, twist/syndna columns, and the SMRT cell) come
+  from kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of the
+  Illumina reader; run-preflight pin bumped to the merged PR that adds it) —
+  `sample_name` + the project's `human_filtering` intent are read from the
+  canonical `run_pacbio_sample` view. Studies resolve on the **bioproject**
+  accession like the Illumina path (the earlier draft keyed on the QiitaID, which
+  the study lookup route cannot match). The SMRT cell now rides onto each row;
+  wiring it into `(smrt_cell, barcode)` BAM disambiguation (and moving the
+  pool-item-id off the bare barcode) is a follow-up. Verified against
   kl-run-preflight's own `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
 - **`long-read-assembly` workflow — per-sample PacBio HiFi assembly → MAG
   recovery** (a port of qp-pacbio pipeline B). Runs on a prep_sample's masked

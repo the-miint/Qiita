@@ -3,9 +3,9 @@
 Three surfaces, all pure-unit (no Postgres):
   * `_index_run_bams` / `_resolve_sample_bams` — the BAM glob + (barcode)
     disambiguation, exercised against a synthetic run folder on disk.
-  * `_read_pacbio_preflight_rows` — the PROVISIONAL preflight seam, exercised
-    end-to-end against a REAL kl-run-preflight SQLite built from the pinned
-    case-5 fixture (good_pacbio_absquantv11.csv) via run_preflight itself.
+  * `_read_pacbio_preflight_rows` — the preflight reader (kl-run-preflight's
+    `get_pacbio_sample_info`), exercised end-to-end against a REAL kl-run-preflight
+    SQLite built from the pinned case-5 fixture (good_pacbio_absquantv11.csv).
   * `_handle_submit_pacbio_ingest` — the full submit flow, HTTP mocked, asserting
     the run/pool/sample setup and the per-sample bam-to-parquet fan-out.
 """
@@ -167,15 +167,12 @@ def _build_case5_preflight(tmp_path: Path, *, populate_accessions: bool) -> Path
     """Build a real kl-run-preflight SQLite from the pinned case-5 fixture.
 
     Uses run_preflight's own CSV loader so the seam is exercised against the true
-    schema. biosample_accession is NULL in the fixture (populated upstream in
-    production); optionally set it here via plain sqlite (run_preflight's
-    save_db_file is avoided — it blocks in this harness).
-
-    NOTE: the provisional `_PACBIO_SAMPLE_JOIN` is coupled to run-preflight's
-    pacbio_sample/prepped_sample/input_sample/project schema. This test therefore
-    guards that coupling — a run-preflight pin bump that renames those tables/
-    columns will fail HERE (loudly) rather than silently at runtime, until the seam
-    is replaced by the upstream get_pacbio_sample_info reader."""
+    schema and the real `get_pacbio_sample_info` reader. The fixture leaves the
+    biosample + project **bioproject** accessions NULL (populated upstream in
+    production); `get_pacbio_sample_info` REQUIRES both and raises otherwise, so
+    when `populate_accessions` we set them via plain sqlite (run_preflight's
+    save_db_file is avoided — it blocks in this harness). biosample -> BIO_<name>;
+    the single project's bioproject -> PRJNA<external_project_id>."""
     from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
 
     db = tmp_path / "case5.db"
@@ -183,6 +180,7 @@ def _build_case5_preflight(tmp_path: Path, *, populate_accessions: bool) -> Path
     if populate_accessions:
         conn = sqlite3.connect(db)
         conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
+        conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
         conn.commit()
         conn.close()
     return db
@@ -190,15 +188,27 @@ def _build_case5_preflight(tmp_path: Path, *, populate_accessions: bool) -> Path
 
 def test_read_preflight_rows_case5(tmp_path):
     """The seam returns one row per sample for the real case-5 sheet, including
-    the control blank (sample.3, whose NULL own-project falls back to the plate
-    primary). twist filled + syndna_is_twisted False is the case-5 signature."""
+    the control blank (sample.3, which the reader resolves to the plate primary
+    bioproject). twist filled + syndna_is_twisted False is the case-5 signature.
+    The project accession is the ENA **bioproject** (what the study lookup keys
+    on), and smrt_cell rides through from the reader when the preflight records it."""
     db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    # Record a SMRT cell on sample.1 only, to prove it threads onto the row.
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE pacbio_sample SET smrt_cell_well_sample_id = '1_A01' WHERE barcode_id = 'bc3011'"
+    )
+    conn.commit()
+    conn.close()
+
     rows = _read_pacbio_preflight_rows(db, _RaisingParser())
     assert [r.sample_name for r in rows] == ["sample.1", "sample.2", "sample.3"]
     assert [r.barcode for r in rows] == ["bc3011", "bc0112", "bc9992"]
+    assert [r.smrt_cell for r in rows] == ["1_A01", None, None]
     for r in rows:
         assert r.biosample_accession == f"BIO_{r.sample_name}"
-        assert r.primary_project_accession == "99999"  # control resolves to plate primary
+        assert r.primary_project_accession == "PRJNA99999"  # control resolves to plate primary
+        assert r.secondary_project_accessions == []
         assert r.sheet_type == "pacbio_absquant"
         assert r.twist_adaptor_id  # case 5: filled
         assert r.syndna_is_twisted is False
@@ -217,11 +227,11 @@ def test_read_preflight_rows_rejects_barcode_reused_across_samples(tmp_path):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
-def test_read_preflight_rows_fails_on_missing_biosample_accession(tmp_path):
-    """A sample with no biosample_accession (not yet populated upstream) is an
-    operator-actionable fail-fast, matching the Illumina reader."""
+def test_read_preflight_rows_fails_on_missing_accession(tmp_path):
+    """Unpopulated biosample / bioproject accessions are an operator-actionable
+    fail-fast: `get_pacbio_sample_info` raises and the CLI surfaces its message."""
     db = _build_case5_preflight(tmp_path, populate_accessions=False)
-    with pytest.raises(_RaisingParser.Error, match="no.*biosample_accession"):
+    with pytest.raises(_RaisingParser.Error, match="missing required accession"):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
@@ -267,8 +277,8 @@ def _stub_submit_flow(
                     "missing": [],
                 },
             )
-        if url.endswith("/lookup-by-accession"):  # study
-            return resp(200, {"resolved": {"99999": 900}, "missing": []})
+        if url.endswith("/lookup-by-accession"):  # study, keyed on the bioproject accession
+            return resp(200, {"resolved": {"PRJNA99999": 900}, "missing": []})
         if url.endswith("/sequenced-pool"):
             return resp(201, {"sequenced_pool_idx": 50})
         if url.rstrip("/").endswith("/sequencing-run"):

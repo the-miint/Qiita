@@ -13,20 +13,17 @@ rather than as a single BCL run bcl-convert demuxes in-workflow:
      instead of submitting a single pool-scoped ticket.
   2. The command must map each sample to its BAM file on disk. PacBio's HiFi
      demux writes `{run_folder}/{smartcell_well}/hifi_reads/{movie}.hifi_reads.{barcode}.bam`
-     (plus a per-cell `*.unassigned.bam`). Today the preflight carries no SMRT-cell
-     column, so we key the BAM index on the barcode alone and FAIL LOUD if a
-     barcode appears under more than one SMRT cell (barcode reuse across cells is
-     real and cannot be disambiguated without the cell). When the preflight grows a
-     SMRT-cell field, `_index_run_bams` keys on `(smartcell, barcode)` and the
-     collision guard falls away — see `_index_run_bams`.
+     (plus a per-cell `*.unassigned.bam`). We key the BAM index on the barcode and
+     FAIL LOUD if a barcode appears under more than one SMRT cell — barcode reuse
+     across cells is real and cannot be disambiguated by barcode alone. The
+     preflight now records the SMRT cell per sample (`smrt_cell`, from the reader),
+     so a follow-up can key resolution on `(smrt_cell, barcode)` and drop that
+     collision guard (it also implies moving the pool-item-id off the bare barcode
+     — see `_index_run_bams`).
 
-PROVISIONAL preflight read: `kl-run-preflight` exposes a public reader for
-Illumina samples (`get_illumina_sample_info`) but NOT for PacBio — confirmed
-absent on the pinned build AND on `main`. `_read_pacbio_preflight_rows` therefore
-reads the `pacbio_sample` table with a direct join that mirrors the Illumina
-reader's shape. It is isolated as the single swap point: when
-`get_pacbio_sample_info` ships upstream, only that function changes. See its
-docstring.
+Preflight read: per-sample PacBio facts come from kl-run-preflight's
+`get_pacbio_sample_info` (the analogue of the Illumina `get_illumina_sample_info`
+that `pool._read_preflight_rows` uses) — see `_read_pacbio_preflight_rows`.
 """
 
 from __future__ import annotations
@@ -81,14 +78,14 @@ class _PacbioPreflightRow(NamedTuple):
     the PacBio-specific `barcode` (used to locate the sample's BAM and as the
     pool-item-id) and the three protocol-determining columns
     (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`) the read-mask
-    submission later derives the mask chain from. `secondary_project_accessions`
-    is a list for parity with the Illumina row; PacBio control/secondary-study
-    resolution is not yet wired, so it is always empty today (see
-    `_read_pacbio_preflight_rows`).
+    submission later derives the mask chain from. The project accessions are
+    ENA **bioproject** accessions (what the study lookup route resolves), matching
+    the Illumina row; `secondary_project_accessions` is populated for controls.
 
-    `smrt_cell` is RESERVED for the announced upstream reader: once populated it
-    lets BAM resolution key on `(smrt_cell, barcode)` instead of failing on
-    barcode reuse across cells. It defaults None until then (barcode-only path)."""
+    `smrt_cell` is the sample's SMRT-cell well (`smrt_cell_well_sample_id`, form
+    `1_A01`), when the preflight records it: BAM resolution keys on
+    `(smrt_cell, barcode)` when present, else falls back to barcode-only with the
+    cross-cell collision guard."""
 
     sample_name: str
     barcode: str
@@ -99,51 +96,9 @@ class _PacbioPreflightRow(NamedTuple):
     sheet_type: str
     twist_adaptor_id: str | None
     syndna_is_twisted: bool | None
-    # Reserved for the upstream reader; unused until then (default keeps every
-    # current constructor + the barcode-only resolution path unchanged).
+    # The SMRT-cell well from the preflight (None when it records none — then BAM
+    # resolution falls back to barcode-only).
     smrt_cell: str | None = None
-
-
-# The verified pacbio_sample join. pacbio_sample keys on prepped_sample_idx;
-# prepped_sample -> compression_sample carries the run scope (cs.run_idx) and the
-# link out to input_sample (sample_name + biosample_accession + plate + project).
-# This is the same table graph get_illumina_sample_info walks, minus the
-# run_illumina_sample entry point PacBio has no analogue for.
-#
-# The project is COALESCE(own project, plate primary): a standard sample owns its
-# project (input_sample.project_idx); a control (blank/positive) has a NULL
-# project_idx and inherits the plate's primary_project_idx — the same fallback
-# get_illumina_sample_info applies. Without it, every control row would resolve to
-# a NULL accession and fail-fast. Verified against kl-run-preflight's own
-# good_pacbio_absquantv11.csv fixture (which carries a control blank).
-_PACBIO_SAMPLE_JOIN = """
-    SELECT
-        COALESCE(prs.sample_name, ins.sample_name) AS sample_name,
-        pbs.barcode_id,
-        pbs.twist_adaptor_id,
-        pbs.syndna_is_twisted,
-        ins.biosample_accession,
-        COALESCE(own_proj.external_project_id, primary_proj.external_project_id)
-            AS external_project_id,
-        COALESCE(own_proj.human_filtering, primary_proj.human_filtering)
-            AS human_filtering
-    FROM pacbio_sample pbs
-    JOIN prepped_sample prs
-        ON prs.prepped_sample_idx = pbs.prepped_sample_idx
-    JOIN compression_sample cs
-        ON prs.compression_sample_idx = cs.compression_sample_idx
-    JOIN input_sample ins
-        ON cs.input_sample_idx = ins.input_sample_idx
-    JOIN input_plate ip
-        ON ins.input_plate_idx = ip.input_plate_idx
-    JOIN project primary_proj
-        ON ip.primary_project_idx = primary_proj.project_idx
-    LEFT JOIN project own_proj
-        ON ins.project_idx = own_proj.project_idx
-    WHERE cs.run_idx = ?
-      AND ins.do_not_use = 0
-    ORDER BY sample_name
-"""
 
 
 def _read_pacbio_preflight_rows(
@@ -151,21 +106,22 @@ def _read_pacbio_preflight_rows(
 ) -> list[_PacbioPreflightRow]:
     """Open the preflight SQLite and return one `_PacbioPreflightRow` per PacBio sample.
 
-    PROVISIONAL — the single swap point for the missing upstream reader.
-    `kl-run-preflight` ships no `get_pacbio_sample_info` (verified absent on the
-    pinned SHA and on `main`; cf. the Illumina `get_illumina_sample_info` that
-    `pool._read_preflight_rows` uses), so this reads the `pacbio_sample` table
-    directly via `_PACBIO_SAMPLE_JOIN` + the library's `get_single_run_idx` /
-    `get_run_legacy_format`. When that reader lands, replace this body with a call
-    to it (dropping `_PACBIO_SAMPLE_JOIN`) — the rest of the flow depends only on
-    the `_PacbioPreflightRow` contract, so nothing else changes.
+    Reads via kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of
+    `get_illumina_sample_info` that `pool._read_preflight_rows` uses): per sample it
+    returns the biosample + primary/secondary **bioproject** accessions and a
+    `PacbioSampleRow` (barcode, twist, syndna, smrt_cell, movie_context). It
+    validates + raises on any missing required accession, and resolves a control's
+    project to the plate primary itself, so this wrapper adds no accession SQL. The
+    two facts the accessor omits — `sample_name` and the project's `human_filtering`
+    intent — come from the canonical `run_pacbio_sample` view + the `project` table
+    (the same shape the Illumina reader uses).
 
-    Operator-actionable errors (not a SQLite, an empty sample set, a row missing
-    biosample_accession / primary_project_accession, or an impossible protocol
-    combo) raise via `parser.error` so the CLI surfaces one stderr line and exits
-    2 before any network call — matching `_read_preflight_rows`.
+    Operator-actionable errors (not a SQLite, a non-PacBio sheet, an empty sample
+    set, a missing accession, or an impossible protocol combo) raise via
+    `parser.error` so the CLI surfaces one stderr line and exits 2 before any
+    network call — matching `_read_preflight_rows`.
     """
-    from run_preflight import open_db_file  # noqa: PLC0415
+    from run_preflight import get_pacbio_sample_info, open_db_file  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
 
     try:
@@ -181,12 +137,33 @@ def _read_pacbio_preflight_rows(
                 " verify the file is a kl-run-preflight SQLite"
             )
         sheet_type = legacy_format[1]
-        raw_rows = conn.execute(_PACBIO_SAMPLE_JOIN, (run_idx,)).fetchall()
-    except (sqlite3.DatabaseError, ValueError) as exc:
+        # sample_name + effective project_name per pacbio_sample (the accessor
+        # returns neither): the canonical run-scoped view carries both.
+        meta_by_idx = {
+            idx: (name, project)
+            for idx, name, project in conn.execute(
+                "SELECT pacbio_sample_idx, sample_name, project_name"
+                " FROM run_pacbio_sample WHERE run_idx = ?",
+                (run_idx,),
+            ).fetchall()
+        }
+        filtering_by_project = {
+            name: bool(flag)
+            for name, flag in conn.execute(
+                "SELECT project_name, human_filtering FROM project"
+            ).fetchall()
+        }
+        infos = get_pacbio_sample_info(conn)
+    except sqlite3.DatabaseError as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
             " verify the file is a kl-run-preflight PacBio SQLite"
         )
+    except ValueError as exc:
+        # The accessor raises with a clear per-sample message on a missing
+        # biosample / bioproject accession — surface it verbatim; the operator
+        # populates the accessions upstream and re-submits.
+        parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()
 
@@ -201,56 +178,36 @@ def _read_pacbio_preflight_rows(
             " submit-pacbio-ingest requires a PacBio preflight"
         )
 
-    if not raw_rows:
+    if not infos:
         parser.error(
             f"--preflight-blob {preflight_blob} contains no pacbio_sample rows;"
             " a PacBio ingest needs at least one demultiplexed sample"
         )
 
     parsed: list[_PacbioPreflightRow] = []
-    for (
-        sample_name,
-        barcode_id,
-        twist_adaptor_id,
-        syndna_is_twisted,
-        biosample_accession,
-        external_project_id,
-        human_filtering,
-    ) in raw_rows:
-        if not barcode_id:
+    for info in infos:
+        pbs = info.kind_row
+        sample_name, project_name = meta_by_idx.get(info.sample_idx, (str(info.sample_idx), None))
+        if not pbs.barcode_id:
             parser.error(
                 f"--preflight-blob {preflight_blob}: sample {sample_name!r} carries no"
                 " barcode_id; a PacBio sample cannot be located on disk without it"
             )
-        if not biosample_accession:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: sample {sample_name!r} carries no"
-                " biosample_accession; populate upstream before re-submitting"
-            )
-        if not external_project_id:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: sample {sample_name!r} maps to no"
-                " project with an external accession; verify the file is a"
-                " kl-run-preflight SQLite"
-            )
-        # syndna_is_twisted is stored as 0/1/NULL; human_filtering as 0/1.
-        twisted = None if syndna_is_twisted is None else bool(syndna_is_twisted)
         row = _PacbioPreflightRow(
             sample_name=sample_name,
-            barcode=barcode_id,
-            biosample_accession=biosample_accession,
-            primary_project_accession=external_project_id,
-            # Control/secondary-study resolution is not yet wired for PacBio
-            # (the synthetic fixture has none); populate when the upstream reader
-            # lands. Empty keeps parity with the Illumina row shape.
-            secondary_project_accessions=[],
-            human_filtering=bool(human_filtering),
+            barcode=pbs.barcode_id,
+            biosample_accession=info.biosample_accession,
+            primary_project_accession=info.primary_bioproject_accession,
+            secondary_project_accessions=list(info.secondary_bioproject_accessions),
+            human_filtering=filtering_by_project.get(project_name, False),
             # sheet_type is a RUN-level property (a run is one protocol), read once
             # from the legacy format above and stamped on every row — there is no
             # per-sample sheet_type.
             sheet_type=sheet_type,
-            twist_adaptor_id=twist_adaptor_id or None,
-            syndna_is_twisted=twisted,
+            twist_adaptor_id=pbs.twist_adaptor_id or None,
+            # Already coerced to bool | None by the accessor.
+            syndna_is_twisted=pbs.syndna_is_twisted,
+            smrt_cell=pbs.smrt_cell_well_sample_id,
         )
         _validate_pacbio_protocol(row, preflight_blob, parser)
         parsed.append(row)
