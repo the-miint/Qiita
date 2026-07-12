@@ -41,6 +41,7 @@ reading `$QIITA_INPUT_PATH/params.json`, writing outputs and
 
 from __future__ import annotations
 
+import shlex
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -79,13 +80,21 @@ def _build_script(
     /opt/qiita or arbitrary host paths beyond what the bind mounts
     expose. Bind mounts for QIITA_INPUT_PATH and QIITA_OUTPUT_PATH are
     set up by the caller via apptainer_extra_args; this function just
-    formats the script."""
-    extra = " ".join(apptainer_extra_args or [])
+    formats the script.
+
+    Every arg is shell-quoted: they are interpolated into a bash script, and
+    several carry values that originate in workflow YAML (a `--bind` path, an
+    `--env NAME=<path>` from a step's `derived_inputs`). Unquoted, a `;` or a
+    space in any of them would terminate the `apptainer exec` and run whatever
+    followed. Quoting here covers every arg at the one place they become shell
+    text, rather than trusting each producer to sanitize its own.
+    """
+    extra = " ".join(shlex.quote(a) for a in (apptainer_extra_args or []))
     if extra:
         extra = f" {extra}"
-    cmd = f"apptainer exec --containall{extra} {container}"
+    cmd = f"apptainer exec --containall{extra} {shlex.quote(container)}"
     if entrypoint:
-        cmd = f"{cmd} {entrypoint}"
+        cmd = f"{cmd} {shlex.quote(entrypoint)}"
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
@@ -143,6 +152,8 @@ def build_job_submit_payload(
     attempt: int = 0,
     extra_env: dict[str, str] | None = None,
     extra_bind_dirs: list[Path] | None = None,
+    ro_bind_dirs: list[Path] | None = None,
+    container_env: dict[str, str] | None = None,
     native_python: str = "python",
     qos: str = "",
 ) -> dict[str, Any]:
@@ -198,6 +209,18 @@ def build_job_submit_payload(
             future per-step overrides; kept as a flat name => value map
             (slurmrestd's `environment` field is a list of "KEY=VAL"
             strings, which we serialize from this dict).
+        extra_bind_dirs: additional host directories to bind into the
+            container (identity-mapped, `host:host`). Container steps only.
+        ro_bind_dirs: same, but mounted `:ro` — the derived-artifact dirs a
+            step's `derived_inputs` names. Read-only because these are shared,
+            operator-provisioned reference data the step only reads.
+        container_env: env vars forwarded INTO the container via
+            `--env`, distinct from `extra_env` (which sets the SLURM job's
+            environment). `--containall` means the job env does not cross
+            into the container, so a var the entrypoint must read belongs
+            here. Carries a step's resolved `derived_inputs`; the paths it
+            names must also appear in `ro_bind_dirs` or they won't
+            resolve inside the container. Container steps only.
 
     Returns:
         A dict ready to pass directly to slurmrestd's job/submit
@@ -290,6 +313,19 @@ def build_job_submit_payload(
         ]
         for bind_dir in extra_bind_dirs or ():
             apptainer_args.extend(("--bind", f"{bind_dir}:{bind_dir}"))
+        # Derived artifacts are operator-provisioned reference data the step only
+        # READS, and one copy is shared by every concurrent job (CheckM's single
+        # 1.4 GB DB). `:ro` is what makes that safe — a writable mount would let
+        # one misbehaving container corrupt the copy every other job depends on.
+        for bind_dir in ro_bind_dirs or ():
+            apptainer_args.extend(("--bind", f"{bind_dir}:{bind_dir}:ro"))
+        # `container_env` carries the step's resolved `derived_inputs`
+        # (env_var_name -> absolute host path under PATH_DERIVED). The paths are
+        # already bound above, so they resolve identically inside the container;
+        # this forwards the names the entrypoint reads (e.g. QIITA_CHECKM_DB).
+        # Sorted for deterministic payloads.
+        for env_name, value in sorted((container_env or {}).items()):
+            apptainer_args.extend(("--env", f"{env_name}={value}"))
         script = _build_script(
             container=container,
             entrypoint=entrypoint,

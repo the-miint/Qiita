@@ -58,8 +58,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   # so keep a copy to roll back to the previous (HMAC) build if the swap misfires:
   sudo cp -a /etc/qiita/control-plane.env /etc/qiita/control-plane.env.pre-ed25519.bak
   sudo cp -a /etc/qiita/data-plane.env    /etc/qiita/data-plane.env.pre-ed25519.bak
-  # Generate the keypair once (capture both values):
-  python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
+  # Generate the keypair once (capture both values). Run it with the CP venv's
+  # interpreter, NOT the system python3: `private_bytes_raw()` needs cryptography
+  # >= 38, and a host python3 can easily be older (the qiita-miint host ships
+  # 37.0.1, where this dies with AttributeError). The CP venv is also the
+  # interpreter `make preflight` uses for its keypair check.
+  /opt/qiita/control-plane/.venv/bin/python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
   # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):
   sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env; printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
   # DP: add the public key, drop HMAC_SECRET_KEY (substitute <PUBLIC>):
@@ -69,24 +73,35 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 2. One-time host setup
 
 - **CheckM reference database for `long-read-assembly`.** The workflow's `checkm`
-  step needs CheckM's ~1.4 GB reference data, which is deliberately NOT baked into
-  the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
-  time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
-  `/opt/checkm_data`), so the DB dir must be bind-mounted there (or
-  `QIITA_CHECKM_DB` set to its in-container path). (#255)
+  step needs CheckM's ~1.4 GB reference data (a ~275 MiB download), which is
+  deliberately NOT baked into the SIF. Stage it once under `PATH_DERIVED`, at
+  exactly `$PATH_DERIVED/checkm_data` — the workflow's `derived_inputs` names that
+  path, so the bind + `QIITA_CHECKM_DB` are wired automatically and there is
+  nothing further to configure. (#255, #273)
   ```bash
-  # verify the tarball against CheckM's published checksum before extracting.
-  sudo -u qiita-orch bash -c 'mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data" \
-    && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
-    && tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
+  # PATH_DERIVED lives in compute-orchestrator.env, NOT in qiita-orch's shell, so
+  # pass it explicitly — an unset one would expand to "" and mkdir /checkm_data.
+  # Substitute your host's value.
+  sudo -u qiita-orch env PATH_DERIVED=/path/to/derived bash -c '
+    set -euo pipefail
+    mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data"
+    curl -fLO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz
+    # md5 -c, not a bare md5sum: a printed hash exits 0 and `set -e` would sail
+    # straight into the tar. This ABORTS on a mismatch.
+    echo "631012fa598c43fdeb88c619ad282c4d  checkm_data_2015_01_16.tar.gz" | md5sum -c -
+    tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
   ```
-  REQUIRED before the first `long-read-assembly` run: the `checkm` step now **fails
-  loud** (non-zero exit) when the DB is absent or misconfigured — it no longer
-  degrades to an empty `checkm_dir` — so a MAG-producing sample's ticket cannot
-  COMPLETE until the DB is staged AND the container can see it (bind-mount it to
-  `CHECKM_DATA_PATH`, or set `QIITA_CHECKM_DB` to its in-container path). Wiring the
-  bind into the container step is part of this setup (the orchestrator binds only
-  declared step inputs today). assemble/binning/bin_refine are unaffected.
+  The expected md5 (`631012fa…`) is the one the Ecogenomics group publishes for
+  this tarball on Zenodo ([10.5281/zenodo.7401544](https://zenodo.org/doi/10.5281/zenodo.7401544)),
+  and it matches what `data.ace.uq.edu.au` currently serves. Note what that does
+  and does not buy you: `data.ace.uq.edu.au` publishes no checksum of its own, so
+  this is a cross-check against a second mirror by the same group — it catches a
+  corrupted or truncated download, not a compromised upstream.
+
+  REQUIRED before the first `long-read-assembly` run: the `checkm` step **fails
+  loud** (exit 78) when the DB is absent — it does not degrade to an empty
+  `checkm_dir` — so a MAG-producing sample's ticket cannot COMPLETE until the DB
+  is staged. assemble/binning/bin_refine are unaffected.
 
 ### 3. Migrations
 
@@ -154,6 +169,14 @@ _None yet._
 
 ### Notes (no host action)
 
+- **`long-read-assembly` can actually run now.** Container dispatch was gated to
+  `reference`/`sequenced_pool`-scoped tickets, so every container step of this
+  `prep_sample`-scoped workflow failed `CONTRACT_VIOLATION` at submit — it had
+  never completed a run. If anyone tried it on the previous build and saw
+  "requires a scope_target with kind in ['reference', 'sequenced_pool']", that is
+  the provenance; simply resubmit after this deploy. No host action — the fix is
+  code, and the workflow YAML re-syncs via `qiita-admin actions sync` inside
+  `activate.sh`. (#273)
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
 - **Invitation handoff no longer mints a PAT directly.** Accepting an AuthRocket invitation now redirects the user to `/auth/login` (the cookie-anchored flow) instead of displaying a PAT; users complete one normal login after accepting. No host action. (#241)
 - **Removed inert SLURM env vars (compute-orchestrator).** `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` are no longer read — they never enforced anything (the CP owns the poll loop; SLURM `--time` enforces walltime). Safe to leave or drop from `/etc/qiita/compute-orchestrator.env`. (#241)

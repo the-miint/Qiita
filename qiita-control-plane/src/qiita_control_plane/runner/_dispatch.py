@@ -796,6 +796,7 @@ async def _adopt_or_submit(
                 module=entry.module,
                 entrypoint=entry.entrypoint,
                 baseline_resources=baseline,
+                derived_inputs=entry.derived_inputs,
             )
             break
         except BackendFailure as exc:

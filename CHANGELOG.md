@@ -36,6 +36,18 @@ the `no-changelog` label).
   The SMRT cell rides onto each row; keying `(smrt_cell, barcode)` BAM
   disambiguation off it is a follow-up. Verified against kl-run-preflight's own
   `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
+- **`derived_inputs` on container workflow steps** — the container-side mirror
+  of the native-only `params`. A step declares `derived_inputs: {ENV_VAR:
+  <path relative to PATH_DERIVED>}`; the orchestrator joins each value against
+  its own `PATH_DERIVED`, bind-mounts the result, and forwards the absolute path
+  under that env var name. This is the only way an operator-provisioned artifact
+  too large to bake into a SIF (CheckM's ~1.4 GB DB) can reach a container:
+  apptainer runs `--containall`, so an unforwarded host env var is invisible
+  inside it. Values stay **relative** on the wire — the control plane never names
+  a compute-node absolute path — and both the wire validator and the backend
+  reject an absolute path or a `..` escape, so a workflow cannot name an
+  arbitrary host directory for the orchestrator to bind in. (#273)
+
 - **Seed water/marine metadata for early data entry** — the `GSC MIxS water`
   checklist (ERC000024, under the ENA default); the `depth_m` and
   `host_taxon_id` biosample global fields (the latter terminology-bound to NCBI
@@ -1385,6 +1397,32 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **`long-read-assembly` could never complete a run**, for two independent
+  reasons. Container dispatch was gated to `{reference, sequenced_pool}`-scoped
+  tickets, so all four of its `prep_sample`-scoped container steps (assemble /
+  binning / bin_refine / checkm) failed `CONTRACT_VIOLATION` at submit;
+  `prep_sample` is now admitted, which costs nothing else because the dispatch
+  path already treated `scope_target` opaquely. And the `checkm` step never
+  declared its operator-staged reference DB, so no bind was computed and
+  `checkm.sh` fell back to an `/opt/checkm_data` absent from the SIF (exit 78) no
+  matter how correctly the DB was staged; it now rides the new `derived_inputs`
+  field. A pin test (`test_workflow_container_scope_pin`) walks every workflow
+  YAML and fails `make test` when a workflow declares container steps under a
+  kind the backends won't dispatch — both bugs only surfaced on a live submit,
+  and this is the static check that catches the next one at CI. The operator
+  steps this shipped with were also unrunnable as written; `DEPLOY_CHECKLIST.md`
+  is corrected (an unset `$PATH_DERIVED` that would have `mkdir`ed `/checkm_data`
+  at the filesystem root, an md5 that only printed instead of verifying, and an
+  Ed25519 keygen one-liner that needs cryptography >= 38 but ran under a system
+  `python3` that can be older). (#273)
+- **Apptainer arguments are shell-quoted.** The `apptainer exec` line is
+  interpolated into a bash script, and its `--bind` paths, `--env` values, image
+  path and entrypoint all originate in workflow YAML. Unquoted, a `;` or a space
+  in any of them would terminate the command and run whatever followed. Every arg
+  is now `shlex.quote`d at the one place they become shell text. Derived-artifact
+  binds are also mounted `:ro` — one shared copy (CheckM's 1.4 GB DB) is read by
+  every concurrent job, and a writable mount let one container corrupt it for all
+  of them. (#273)
 - The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)

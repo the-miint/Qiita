@@ -41,6 +41,7 @@ class _RecordedCall:
     module: str | None
     entrypoint: str | None
     baseline_resources: Any
+    derived_inputs: dict[str, str]
 
 
 class _RecordingBackend(ComputeBackend):
@@ -67,6 +68,7 @@ class _RecordingBackend(ComputeBackend):
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandle:
         self.calls.append(
             _RecordedCall(
@@ -79,6 +81,7 @@ class _RecordingBackend(ComputeBackend):
                 module=module,
                 entrypoint=entrypoint,
                 baseline_resources=baseline_resources,
+                derived_inputs=dict(derived_inputs or {}),
             )
         )
         return LocalStepHandle(
@@ -658,3 +661,52 @@ def test_step_plan_degenerate_hint_degrades_not_500(http_client, cp_to_co_token,
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"cpu": None, "mem_gb": None, "walltime_seconds": None}
+
+
+def test_step_submit_forwards_derived_inputs(http_client, cp_to_co_token, tmp_path):
+    """`derived_inputs` survives the CP->CO wire hop and reaches the backend.
+    It rides as a RELATIVE path — the CP never names a compute-node absolute
+    path; the orchestrator joins it against its own PATH_DERIVED at submit."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_SUBMIT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "checkm",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 7},
+            "work_ticket_idx": 99,
+            "container": REFERENCE_HASH_CONTAINER,
+            "derived_inputs": {"QIITA_CHECKM_DB": "checkm_data"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert backend.calls[-1].derived_inputs == {"QIITA_CHECKM_DB": "checkm_data"}
+
+
+def test_step_submit_rejects_absolute_derived_input(http_client, cp_to_co_token, tmp_path):
+    """The wire validator refuses an absolute derived_inputs path — otherwise a
+    workflow could name any host directory for the orchestrator to bind into a
+    container. 422 at the boundary, never reaching the backend."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+
+    client, backend = http_client
+    before = len(backend.calls)
+    resp = client.post(
+        URL_STEP_SUBMIT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "checkm",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 7},
+            "work_ticket_idx": 99,
+            "container": REFERENCE_HASH_CONTAINER,
+            "derived_inputs": {"QIITA_CHECKM_DB": "/etc"},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert len(backend.calls) == before

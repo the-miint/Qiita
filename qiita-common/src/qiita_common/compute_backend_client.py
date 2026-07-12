@@ -134,6 +134,7 @@ class ComputeBackendClient:
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandleWire:
         """Submit a step and return its handle immediately (does NOT block
         on completion). The caller persists the handle's fields and polls
@@ -149,6 +150,7 @@ class ComputeBackendClient:
             module=module,
             entrypoint=entrypoint,
             baseline_resources=baseline_resources,
+            derived_inputs=derived_inputs or {},
         )
         resp = await self._post(URL_STEP_SUBMIT, body, step_name=step_name)
         self._raise_if_step_no_data(resp)
