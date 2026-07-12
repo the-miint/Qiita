@@ -230,6 +230,21 @@ def test_read_preflight_rows_case5(tmp_path):
         assert r.syndna_is_twisted is False
 
 
+def test_read_preflight_rows_accepts_barcode_shared_across_samples(tmp_path):
+    """The reader does NOT reject a barcode shared by two samples at parse —
+    pacbio_sample_idx is the identity now, so the reader returns both rows. The
+    ambiguity is a BAM-resolution concern (see the _resolve_sample_bams tests), so
+    the guard genuinely MOVED rather than vanished."""
+    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE pacbio_sample SET barcode_id = 'bc3011' WHERE barcode_id = 'bc0112'")
+    conn.commit()
+    conn.close()
+    rows = _read_pacbio_preflight_rows(db, _RaisingParser())  # no raise
+    assert [r.pacbio_sample_idx for r in rows] == [1, 2, 3]  # distinct identities
+    assert [r.barcode for r in rows].count("bc3011") == 2  # the shared barcode
+
+
 def test_read_preflight_rows_fails_on_missing_accession(tmp_path):
     """Unpopulated biosample / bioproject accessions are an operator-actionable
     fail-fast: `get_pacbio_sample_info` raises and the CLI surfaces its message."""

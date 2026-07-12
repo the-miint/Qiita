@@ -346,8 +346,9 @@ def _provision_run_pool_roster(
     fail-fast on the biosample/study accessions, POST the run, POST the pool, and
     populate the per-sample roster — is identical, so it lives here once. The
     caller parameterizes the per-row `pool_item_id` (Illumina: illumina_sample_idx;
-    PacBio: barcode) and the `row_label`/`row_noun` for the missing-accession
-    report, and builds its own summary + ticket tail from the returned roster.
+    PacBio: pacbio_sample_idx) and the `row_label`/`row_noun` for the
+    missing-accession report, and builds its own summary + ticket tail from the
+    returned roster.
 
     Roster creation is CREATE-MISSING, not blind-create: it GETs the pool roster
     first and reuses samples already present, POSTing only the absent ones. So a

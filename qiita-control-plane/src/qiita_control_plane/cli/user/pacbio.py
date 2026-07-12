@@ -18,8 +18,8 @@ rather than as a single BCL run bcl-convert demuxes in-workflow:
      across cells is real and cannot be disambiguated by barcode alone. The
      preflight now records the SMRT cell per sample (`smrt_cell`, from the reader),
      so a follow-up can key resolution on `(smrt_cell, barcode)` and drop that
-     collision guard (it also implies moving the pool-item-id off the bare barcode
-     — see `_index_run_bams`).
+     collision guard — see `_index_run_bams`. (The sample identity / pool-item-id
+     is `pacbio_sample_idx`, never the barcode; the barcode is only the BAM key.)
 
 Preflight read: per-sample PacBio facts come from kl-run-preflight's
 `get_pacbio_sample_info` (the analogue of the Illumina `get_illumina_sample_info`
@@ -495,6 +495,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                     # not failed. Skip without contributing to the non-zero exit.
                     skipped.append(
                         {
+                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
                             "prep_sample_idx": entry["prep_sample_idx"],
                             "barcode": entry["barcode"],
                             "reason": exc.response.text[:500],
@@ -503,6 +504,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                     continue
                 failures.append(
                     {
+                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
                         "prep_sample_idx": entry["prep_sample_idx"],
                         "barcode": entry["barcode"],
                         "status_code": exc.response.status_code,
@@ -513,6 +515,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             except httpx.HTTPError as exc:
                 failures.append(
                     {
+                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
                         "prep_sample_idx": entry["prep_sample_idx"],
                         "barcode": entry["barcode"],
                         "status_code": None,
