@@ -13,6 +13,20 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The four `long-read-assembly` SIFs could not build at all.** Their `%test`
+  runs `micromamba`, but `apptainer build` executes `%test` inside the FINISHED
+  image — a read-only filesystem — with `HOME=/root`, a path that lives in that
+  image. libmamba tries to create a cache/proc dir under `$HOME` and hard-aborts
+  (`filesystem error: ... /root/.cache/mamba/proc`), failing the build. Nothing had
+  ever built these images (the workflow merged but was never deployed), so this
+  surfaced as an aborted deploy — correctly, before any restart, via
+  `build-sifs.sh`'s refuse-on-unbuildable-image guard. `%test` now points `HOME` at
+  the writable `/tmp`. Run time was never affected: the SLURM payload passes
+  `--home <workspace>`, which is writable, so the tests still exercise the real
+  `micromamba run` path the entrypoints use rather than dodging it. (#275)
+
 ### Added
 
 - **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio

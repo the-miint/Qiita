@@ -169,6 +169,15 @@ _None yet._
 
 ### Notes (no host action)
 
+- **The four `long-read-assembly` SIFs build now.** They never had: `%test` runs
+  `micromamba`, and `apptainer build` runs `%test` inside the finished, read-only
+  image with `HOME=/root`, so libmamba could not create its cache dir and aborted.
+  Nothing had built these images before (the workflow merged but was never
+  deployed), so the first deploy that tried aborted on it — correctly, before any
+  restart. No host action: the SIFs auto-rebuild during the deploy
+  (`activate.sh` -> `build-sifs.sh`), and the content-hash gate sees the changed
+  def. Expect the first deploy after this to spend real time on four conda solves.
+  (#275)
 - **`long-read-assembly` can actually run now.** Container dispatch was gated to
   `reference`/`sequenced_pool`-scoped tickets, so every container step of this
   `prep_sample`-scoped workflow failed `CONTRACT_VIOLATION` at submit — it had

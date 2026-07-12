@@ -47,6 +47,15 @@ From: mambaorg/micromamba:1.5.8
 
 %test
     set -e
+    # `apptainer build` runs %test inside the FINISHED image — a read-only
+    # filesystem — with HOME=/root, a path that lives in that image. libmamba
+    # creates a cache/proc dir under $HOME and hard-aborts when it cannot, which
+    # failed the very first build of these images. At RUN time this never bites:
+    # the SLURM payload passes `--home <workspace>`, which is writable. Point HOME
+    # at the bind-mounted, writable /tmp so the test still exercises the same
+    # `micromamba run` path the entrypoint uses, rather than dodging it.
+    export HOME=/tmp
+    export XDG_CACHE_HOME=/tmp/.cache
     micromamba env list | grep -q metawrap
     micromamba run -n metawrap metawrap --version >/dev/null 2>&1 || micromamba run -n metawrap metawrap -h >/dev/null
     # Base utilities + the shipped manifest writer.
