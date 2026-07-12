@@ -15,6 +15,27 @@ the `no-changelog` label).
 
 ### Added
 
+- **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
+  analogue of `submit-bcl-convert`: it reads a kl-run-preflight blob, stands up
+  the `sequencing_run` (platform `pacbio_smrt`) / `sequenced_pool` (blob attached)
+  / `sequenced_sample` roster, and — because PacBio arrives already demultiplexed
+  (one uBAM per barcode) — FANS OUT one existing `bam-to-parquet` ticket per
+  sample rather than a single pool-scoped demux ticket (no new job or workflow).
+  Each sample's identity (and `sequenced_pool_item_id`) is its `pacbio_sample_idx`,
+  the parallel of `illumina_sample_idx`; the barcode only LOCATES the sample's BAM
+  under `{run_folder}/{smrt_cell}/hifi_reads/` (it is not unique across all PacBio
+  protocols), and a barcode reused across SMRT cells fails loud rather than
+  silently binding the wrong cell's reads. Per-sample facts (biosample + ENA
+  bioproject accessions, barcode, twist/syndna columns, and the SMRT cell) come
+  from kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of the
+  Illumina reader; run-preflight pin bumped to the merged PR that adds it); the
+  project's `human_filtering` intent is read from the canonical `run_pacbio_sample`
+  view (tracked for removal in #271, with the `sheet_type` dependency in #272).
+  Studies resolve on the **bioproject** accession like the Illumina path (the
+  earlier draft keyed on the QiitaID, which the study lookup route cannot match).
+  The SMRT cell rides onto each row; keying `(smrt_cell, barcode)` BAM
+  disambiguation off it is a follow-up. Verified against kl-run-preflight's own
+  `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
 - **Seed water/marine metadata for early data entry** — the `GSC MIxS water`
   checklist (ERC000024, under the ENA default); the `depth_m` and
   `host_taxon_id` biosample global fields (the latter terminology-bound to NCBI
@@ -690,6 +711,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- **`submit-bcl-convert` re-run is now convergent (create-missing roster).** The
+  run → pool → sequenced-sample provisioning is unified with `submit-pacbio-ingest`
+  in one shared `_provision_run_pool_roster` (was duplicated between the two). As a
+  result bcl-convert now GETs the pool roster and creates only the missing samples,
+  so a re-run after a partial failure reuses existing rows instead of 409ing on the
+  first already-created sample. (#260)
 - **Data-plane public-edge hardening.** The Arrow Flight service is reachable
   from the internet through nginx on 443 (by design — clients connect directly
   through nginx). Tightened that edge: the nginx Flight `location` now sets
