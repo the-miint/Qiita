@@ -1397,24 +1397,24 @@ the `no-changelog` label).
 
 ### Fixed
 
-- **Container steps under a `prep_sample`-scoped ticket could never run.**
-  `assert_container_scope_supported` gated container dispatch to
-  `{reference, sequenced_pool}`, so every container step of `long-read-assembly`
-  (assemble / binning / bin_refine / checkm) — all `prep_sample`-scoped — failed
-  `CONTRACT_VIOLATION` at submit. The workflow could not complete a single run.
-  `prep_sample` is now admitted; the dispatch path already treated
-  `scope_target` opaquely (it rides into `params.json` verbatim, and nothing
-  reads a kind-specific scalar), so nothing else changed. A new pin test
-  (`test_workflow_container_scope_pin`) walks every workflow YAML and fails
-  `make test` if a workflow declares container steps under a kind the backends
-  won't dispatch — the static check that would have caught this at CI instead of
-  at first submit, and which any future `prep_sample` container step (e.g. a
-  read-mask `lima` step) now rides for free. (#273)
-- **CheckM's reference DB was invisible inside its container.** The `checkm`
-  step never declared the operator-staged DB, so no bind was computed for it and
-  `checkm.sh` fell back to an `/opt/checkm_data` that isn't in the SIF — exiting
-  78 no matter how correctly the DB was staged under `PATH_DERIVED`. It now rides
-  the new `derived_inputs` field. (#273)
+- **`long-read-assembly` could never complete a run**, for two independent
+  reasons. Container dispatch was gated to `{reference, sequenced_pool}`-scoped
+  tickets, so all four of its `prep_sample`-scoped container steps (assemble /
+  binning / bin_refine / checkm) failed `CONTRACT_VIOLATION` at submit;
+  `prep_sample` is now admitted, which costs nothing else because the dispatch
+  path already treated `scope_target` opaquely. And the `checkm` step never
+  declared its operator-staged reference DB, so no bind was computed and
+  `checkm.sh` fell back to an `/opt/checkm_data` absent from the SIF (exit 78) no
+  matter how correctly the DB was staged; it now rides the new `derived_inputs`
+  field. A pin test (`test_workflow_container_scope_pin`) walks every workflow
+  YAML and fails `make test` when a workflow declares container steps under a
+  kind the backends won't dispatch — both bugs only surfaced on a live submit,
+  and this is the static check that catches the next one at CI. The operator
+  steps this shipped with were also unrunnable as written; `DEPLOY_CHECKLIST.md`
+  is corrected (an unset `$PATH_DERIVED` that would have `mkdir`ed `/checkm_data`
+  at the filesystem root, an md5 that only printed instead of verifying, and an
+  Ed25519 keygen one-liner that needs cryptography >= 38 but ran under a system
+  `python3` that can be older). (#273)
 - **Apptainer arguments are shell-quoted.** The `apptainer exec` line is
   interpolated into a bash script, and its `--bind` paths, `--env` values, image
   path and entrypoint all originate in workflow YAML. Unquoted, a `;` or a space
@@ -1423,15 +1423,6 @@ the `no-changelog` label).
   binds are also mounted `:ro` — one shared copy (CheckM's 1.4 GB DB) is read by
   every concurrent job, and a writable mount let one container corrupt it for all
   of them. (#273)
-- **Two `DEPLOY_CHECKLIST.md` commands that fail as written.** The Ed25519 keygen
-  one-liner called `private_bytes_raw()` under the system `python3` (needs
-  cryptography >= 38; a host can easily be older, and ours is — it dies with
-  `AttributeError` mid-deploy) — it now runs under the CP venv interpreter. The
-  CheckM staging command expanded `$PATH_DERIVED` in a `sudo -u qiita-orch` shell
-  where it is unset, so `mkdir -p "$PATH_DERIVED/checkm_data"` would have created
-  `/checkm_data` at the filesystem root; it is now passed explicitly, and the
-  tarball's md5 is checked with `md5sum -c` (a bare `md5sum` only prints, exits 0,
-  and `set -e` sailed straight into the `tar`). (#273)
 - The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)
