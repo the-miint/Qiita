@@ -1379,3 +1379,33 @@ async def test_derived_input_value_cannot_inject_shell(jwt_path, baseline, tmp_p
     db = derived / "evil; touch pwned"
     assert f"{db}:{db}:ro" in tokens
     assert f"QIITA_CHECKM_DB={db}" in tokens
+
+
+@pytest.mark.asyncio
+async def test_container_tmpdir_points_at_the_workspace_not_the_tmpfs(jwt_path, baseline, tmp_path):
+    """`apptainer exec --containall` mounts a tmpfs /tmp — 64 MiB on the live
+    deploy, per the host's `sessiondir max size` — and scrubs the environment, so
+    an entrypoint's bare `mktemp -d` lands on a tiny in-memory disk. A step that
+    stages real work through it (an assembly, a decompressed FASTQ) dies partway
+    through, and the bytes it does write are charged to the job's cgroup memory.
+
+    Forward TMPDIR to the per-job workspace: real disk, already bound via --home.
+    The directory must exist before submit, since nothing inside the container can
+    create it under the read-only image root."""
+    transport, captured = _capture_submit()
+    backend = _make_backend(transport, jwt_path)
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "assemble",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/assemble:1.0.0",
+        baseline_resources=baseline,
+    )
+
+    assert f"TMPDIR={tmp_path}/tmp" in shlex.split(captured["payload"]["script"])
+    assert (tmp_path / "tmp").is_dir(), "workspace tmp/ must exist before the job starts"

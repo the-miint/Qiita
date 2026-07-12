@@ -169,6 +169,19 @@ _None yet._
 
 ### Notes (no host action)
 
+- **The four `long-read-assembly` SIFs build and run now.** They never had — three
+  separate defects, none previously exercised (the workflow merged but was never
+  deployed, so its `%test` had never executed once). The first deploy that tried
+  aborted on it, correctly and before any restart. No host action: the SIFs
+  auto-rebuild during the deploy (`activate.sh` -> `build-sifs.sh`) and the
+  content-hash gate sees the changed defs.
+
+  Expect that rebuild to spend real time on four conda solves — **unless** the
+  images were already built out-of-band from this same commit, in which case
+  `build-sif.sh`'s two-gate check finds a matching `.buildhash` and skips them. A
+  skip there means "already built from identical inputs", not "not tested". If you
+  do build any SIF by hand, `chown qiita-orch` it: `build-sifs.sh` chowns only the
+  images it builds itself. (#275)
 - **`long-read-assembly` can actually run now.** Container dispatch was gated to
   `reference`/`sequenced_pool`-scoped tickets, so every container step of this
   `prep_sample`-scoped workflow failed `CONTRACT_VIOLATION` at submit — it had
