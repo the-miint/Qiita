@@ -8,12 +8,12 @@ You are closing out a deploy: moving the consolidated `## Pending deploy` block 
 
 - **Date**: use today's date from the session context (currentDate), `YYYY-MM-DD`.
 - **Deployed commit**: the commit the operator reported running on the host (redeploy.md step 7). **Take it from `$ARGUMENTS`.** Do **not** default to the local checkout's `git rev-parse HEAD` — `main` may have advanced past what was deployed, and stamping the wrong SHA corrupts the history record. If `$ARGUMENTS` is empty, ask the user for the operator-reported deployed SHA rather than guessing.
-- Confirm with the user that the deploy actually succeeded (bucket-5 checks passed) before archiving — don't archive a deploy that aborted.
+- Confirm with the user that the deploy actually succeeded (bucket-5 checks passed) before archiving — don't archive a deploy that aborted. If the checklist has a bucket 6 (post-verify cleanup), confirm that ran too; an unarchived bucket 6 is the one part of a 'finished' deploy that is easy to forget.
 
 ## 2. Move the block
 
 Edit `DEPLOY_CHECKLIST.md`:
-1. Take the entire current `## Pending deploy` body (buckets 1–5 + Notes) and move it under `## Deployed history` as a new newest-on-top subsection:
+1. Take the entire current `## Pending deploy` body (every bucket + Notes) and move it under `## Deployed history` as a new newest-on-top subsection:
    ```
    ### Deployed YYYY-MM-DD — <short SHA>
    <the archived buckets, verbatim>

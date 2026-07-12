@@ -11,9 +11,58 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→6 in order; buckets 1–3 must precede the bucket-4 restart, and bucket 6 (irreversible cleanup — anything that burns the rollback path) must not run until bucket 5 is green. Each step carries its source `(#N)` tag.
+
+_Nothing pending — the last deploy is archived below. Each PR folds its operator steps into the buckets here as it merges (`/deploy-note`)._
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+### 2. One-time host setup
+
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### 6. After the deploy verifies green
+
+Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
+secret, deleting a replaced data dir. Never put this in bucket 1: until
+verification passes, the OLD build's config is the rollback path.
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-07-12 — 56ce7d4
+
+Rolled out 13 PRs (the host had been on 89440a5 since 2026-06-29). Notable deviation from the
+bucket-1 text below, made deliberately: `HMAC_SECRET_KEY` was scrubbed from both env files AFTER
+the deploy verified green, NOT before the restart. The new build never reads it, so removing it
+early buys nothing while it both strands the old build (which boots on it) and discards the
+rollback path during the riskiest part of the deploy. That ordering is being folded into the
+checklist itself as a post-verify bucket 6.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
 - **Email notification (control-plane).** To turn on work-ticket terminal-digest emails, set `SMTP_*` in `/etc/qiita/control-plane.env` before the restart; leaving `SMTP_HOST` unset keeps the no-op transport (no mail). None are secrets (relay is no-auth, IP-allowlisted, validated end-to-end). Optional `NOTIFY_*` knobs keep their defaults if unset. (#238)
   ```bash
@@ -70,7 +119,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env; printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n" "<PUBLIC>" >> /etc/qiita/data-plane.env'
   ```
 
-### 2. One-time host setup
+#### 2. One-time host setup
 
 - **CheckM reference database for `long-read-assembly`.** The workflow's `checkm`
   step needs CheckM's ~1.4 GB reference data (a ~275 MiB download), which is
@@ -103,7 +152,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `checkm_dir` — so a MAG-producing sample's ticket cannot COMPLETE until the DB
   is staged. assemble/binning/bin_refine are unaffected.
 
-### 3. Migrations
+#### 3. Migrations
 
 - **Email-notification schema.** `make migrate` applies both migrations: `..._email_notification.sql` (adds `work_ticket.notified_at` / `notify_attempts`, creates `qiita.email_receipt`, backfills existing terminal tickets as already-notified) and `..._work_ticket_notified_idx.sql` (a `CREATE INDEX CONCURRENTLY` — runs outside a txn; if interrupted, drop the leftover `INVALID` index and re-run). No out-of-band steps. (#238)
 - **CLI-login plaintext-PAT scrub.** `make migrate` applies `..._cli_login_code_scrub_plaintext.sql`: drops the `NOT NULL` on `cli_login_code.plaintext_pat` and nulls it on already-consumed/expired rows (reclaims plaintext tokens left at rest). No out-of-band steps. (#241)
@@ -124,11 +173,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `make migrate`, no backfill or out-of-band setup. (The four DuckLake assembly
   tables are auto-created at data-plane startup — see the note below.) (#255)
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 - Confirm the `read-mask-block/1.0.0` workflow synced into `qiita.action` (the block
   runner path — synced by `qiita-admin actions sync` inside `activate.sh`, covered by
@@ -167,7 +216,7 @@ _None yet._
   # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
   ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - **The four `long-read-assembly` SIFs build and run now.** They never had — three
   separate defects, none previously exercised (the workflow merged but was never
@@ -234,12 +283,6 @@ _None yet._
   `--data-plane-url` help now points at the public `grpc+tls://<host>:443` form
   (the `grpc://<host>:50051` example is the firewalled on-host port). No new env
   var, host dir, scope, migration, or SIF. (#261)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-29 — 89440a5
 

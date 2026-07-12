@@ -13,6 +13,20 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+### Changed
+
+- **Deploy checklist: archived the 2026-07-12 deploy (`56ce7d4`, 13 PRs) and added a
+  post-verify bucket 6.** `HMAC_SECRET_KEY` retirement moves into it. Bucket 1
+  previously told the operator to delete it *before* the restart, which buys
+  nothing — the new build never reads it (both config loaders look up named vars,
+  so an unknown one is inert) — while it strands the still-running OLD build (which
+  boots on it) and discards the rollback path during the riskiest part of the
+  deploy. Bucket 6 is now the home for any irreversible cleanup that burns the way
+  back: it runs only once bucket 5 is green and needs no restart of its own. The
+  archived block records that this deploy already followed that order. `redeploy.md`
+  (source of truth for bucket order), `/deploy-note` and `/deploy-archive` updated
+  to match. (#276)
+
 ### Fixed
 
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
