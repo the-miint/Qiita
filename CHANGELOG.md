@@ -15,38 +15,39 @@ the `no-changelog` label).
 
 ### Fixed
 
-- **The four `long-read-assembly` SIFs could not build at all.** Their `%test`
-  runs `micromamba`, but `apptainer build` executes `%test` inside the FINISHED
-  image — a read-only filesystem — with `HOME=/root`, a path that lives in that
-  image. libmamba tries to create a cache/proc dir under `$HOME` and hard-aborts
-  (`filesystem error: ... /root/.cache/mamba/proc`), failing the build. Nothing had
-  ever built these images (the workflow merged but was never deployed), so this
-  surfaced as an aborted deploy — correctly, before any restart, via
-  `build-sifs.sh`'s refuse-on-unbuildable-image guard. `%test` now points `HOME` at
-  the writable `/tmp`. Run time was never affected: the SLURM payload passes
-  `--home <workspace>`, which is writable, so the tests still exercise the real
-  `micromamba run` path the entrypoints use rather than dodging it.
+- **Container steps had no usable `TMPDIR`, so a step doing real work would die
+  partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
+  by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the
+  environment — so `TMPDIR` was unset and an entrypoint's bare `mktemp -d` landed
+  on a 64 MiB in-memory disk. Every `long-read-assembly` entrypoint stages its
+  working set there (hifiasm_meta's assembly, the decompressed reads FASTQ,
+  DAS_Tool/CheckM working dirs), and what did fit was charged to the job's cgroup
+  memory — silently eating the allocation its own resource sizing assumed. The
+  payload now forwards `TMPDIR=<workspace>/tmp`: real disk, already bound via
+  `--home`, cleaned up with the workspace. Container steps only; a native step has
+  ordinary node-local `/tmp`. (`bcl-convert`, the one container workflow that has
+  actually run in production, never hit this — it uses no `mktemp`.) (#275)
+- **The four `long-read-assembly` SIFs could not build, and could not have run.**
+  Three defects, none previously exercised — the workflow merged but was never
+  deployed, so its `%test` had never once executed:
+  - `apptainer build` runs `%test` inside the finished, read-only image with
+    `HOME=/root`, so libmamba could not create its cache dir and hard-aborted.
+    `%test` now sets a writable `HOME`, as the SLURM payload does at run time.
+  - `checkm`'s `%test` invoked CheckM without `CHECKM_DATA_PATH`, so its
+    `DBManager` fell through to writing `DATA_CONFIG` inside site-packages —
+    another write into the read-only image. `checkm.sh` always sets that variable,
+    so the test was exercising a state production never reaches.
+  - **Runtime-fatal:** the images shipped no Python, but `_lib.sh` runs `python3
+    manifest_writer.py` to emit `manifest.json` — which every step must write and
+    the backend verifies before registering output. Every step would have finished
+    its full tool run and died on its final line. `python=3.11` is now in each
+    base env, pinned, with a lockstep grep guard on `_lib.sh` — both mirroring
+    `bcl-convert`, which got this right.
 
-  The `checkm` image had a second, independent instance of the same class: its
-  `%test` invoked `checkm` WITHOUT `CHECKM_DATA_PATH`, so CheckM's `DBManager`
-  fell through to appending to a `DATA_CONFIG` file inside site-packages — another
-  write into the read-only image. `checkm.sh` always exports that variable before
-  invoking CheckM, so the test was exercising a configuration production never
-  uses; it now sets it the same way.
-
-  With those two out of the way the `%test` reached a **runtime-fatal** third bug:
-  the images ship no Python. `_lib.sh`'s `qiita_finish` runs `python3
-  /opt/qiita/manifest_writer.py` to emit `manifest.json` — which EVERY step must
-  write, and which the backend verifies before registering any output — but the
-  micromamba base image has no Python and none of the four defs installed one.
-  Every step of this workflow would have died at its final line, after doing all
-  of its real work. (`bcl-convert`, which has actually been deployed, installs
-  `python3.11` explicitly for exactly this reason; `long-read-assembly` copied the
-  pattern and dropped it.) `python` is now in each image's base env.
-
-  All three fixes keep `%test` faithful to the real entrypoint path rather than
-  working around it — which is what turned the build into the thing that caught
-  the runtime bug. (#275)
+  The build aborted the deploy rather than restarting into a broken state, via
+  `build-sifs.sh`'s refuse-on-unbuildable-image guard. All four images have since
+  been built and smoke-tested on the deploy host under production apptainer flags.
+  (#275)
 
 ### Added
 

@@ -398,10 +398,26 @@ class SlurmBackend(ComputeBackend):
         #   <workspace>/input/   contains params.json (mounted as $QIITA_INPUT_PATH)
         #   <workspace>/output/  receives manifest.json + outputs (mounted as $QIITA_OUTPUT_PATH)
         #   <workspace>/logs/    SLURM stdout / stderr land here
+        #   <workspace>/tmp/     the container's TMPDIR (see below)
         input_path = workspace / "input"
         output_path = workspace / "output"
         logs_path = workspace / "logs"
-        for d in (input_path, output_path, logs_path):
+        # `apptainer exec --containall` gives the container a *tmpfs* /tmp sized by
+        # the host's `sessiondir max size` — 64 MiB on the live deploy — and scrubs
+        # the environment, so TMPDIR is unset and a bare `mktemp -d` lands there.
+        # An entrypoint that stages real work through mktemp (an assembly, a
+        # decompressed FASTQ) then dies on a 64 MiB in-memory disk, and what it does
+        # write counts against the job's cgroup memory, silently eating the
+        # allocation its own resource sizing assumed it had. Point TMPDIR at the
+        # per-job workspace instead: it is real disk on the shared filesystem, it is
+        # already bound into the container (via --home), and it is cleaned up with
+        # the rest of the workspace.
+        #
+        # Container steps only. A native step runs on the compute node with no
+        # container, where /tmp is ordinary node-local disk — deliberately left
+        # alone (DuckDB's spill dir resolves against it).
+        tmp_path = workspace / "tmp"
+        for d in (input_path, output_path, logs_path, tmp_path):
             d.mkdir(parents=True, exist_ok=True)
         # params.json is the channel for workflow-specific data — never the
         # slurmrestd submit body, which is visible in `scontrol show job`

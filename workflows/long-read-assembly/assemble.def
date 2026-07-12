@@ -43,7 +43,9 @@ From: mambaorg/micromamba:1.5.8
     # step must write one (the backend verifies it before registering outputs).
     # The micromamba base image ships no Python, so without this every step of
     # this workflow dies at its final line — after doing all its real work.
-    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python
+    # PINNED, like bcl-convert's python3.11: unpinned, a later rebuild silently
+    # moves the interpreter major version under manifest_writer.py.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python=3.11
 
     # One env for this tool. Channels bioconda + conda-forge; versions pinned
     # loosely here and tightened after the first Linux build resolves the solve.
@@ -61,18 +63,29 @@ From: mambaorg/micromamba:1.5.8
     set -e
     # `apptainer build` runs %test inside the FINISHED image — a read-only
     # filesystem — with HOME=/root, a path that lives in that image. libmamba
-    # creates a cache/proc dir under $HOME and hard-aborts when it cannot, which
-    # failed the very first build of these images. At RUN time this never bites:
-    # the SLURM payload passes `--home <workspace>`, which is writable. Point HOME
-    # at the bind-mounted, writable /tmp so the test still exercises the same
-    # `micromamba run` path the entrypoint uses, rather than dodging it.
-    export HOME=/tmp
-    export XDG_CACHE_HOME=/tmp/.cache
+    # creates a cache dir under $HOME and hard-aborts when it cannot, which failed
+    # the very first build of these images. At RUN time this never bites: the SLURM
+    # payload passes `--home <workspace>`, a writable dir. So give the test a
+    # writable HOME too — and ONLY that, because HOME is the only thing production
+    # sets. (Setting XDG_CACHE_HOME as well would be a config no job ever runs
+    # under, and would hide it if HOME alone ever stopped being sufficient.) A
+    # fresh mktemp dir rather than bare /tmp: private, and it does not leave
+    # root-owned litter on the build host.
+    export HOME="$(mktemp -d)"
     micromamba env list | grep -q assemble
     micromamba run -n assemble hifiasm_meta --version
-    # Base utilities + the shipped manifest writer.
+    # Base utilities the entrypoints actually invoke — assert each one, since the
+    # whole point of this %test is to fail the BUILD on a missing runtime dep
+    # rather than at the end of a long job.
     jq --version
+    gawk --version >/dev/null
+    find --version >/dev/null
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Lockstep guard (mirrors bcl-convert): if _lib.sh's manifest line ever stops
+    # matching what %post installs, fail the BUILD. This bug class — an entrypoint
+    # reaching for an interpreter the image lacks — is what killed every step of
+    # this workflow at its final line.
+    grep -q 'python3 /opt/qiita/manifest_writer\.py' /opt/qiita/_lib.sh
     # Guard the entrypoint stays wired to its env.
     grep -q 'micromamba run -n assemble hifiasm_meta' /opt/qiita/assemble.sh
 

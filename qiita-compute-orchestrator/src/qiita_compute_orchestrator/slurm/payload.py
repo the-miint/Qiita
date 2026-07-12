@@ -297,6 +297,14 @@ def build_job_submit_payload(
         # `$QIITA_OUTPUT_PATH`, so without this it exits 64 ("QIITA_INPUT_PATH
         # not set"). Only the contract vars are forwarded; native-only env
         # (CO→CP token, miint dirs) is deliberately not exposed to containers.
+        #
+        # TMPDIR is forwarded for a related reason: `--containall` also mounts a
+        # *tmpfs* /tmp, sized by the host's `sessiondir max size` (64 MiB on the
+        # live deploy). With the env scrubbed, TMPDIR is unset, so an entrypoint's
+        # bare `mktemp -d` lands on that tiny in-memory disk — and a step that
+        # stages real work through it (an assembly, a decompressed FASTQ) dies
+        # partway through, having also charged those bytes to the job's cgroup
+        # memory. Point it at the workspace: real disk, already bound via --home.
         apptainer_args = [
             "--home",
             f"{workspace}:{workspace}",
@@ -306,6 +314,8 @@ def build_job_submit_payload(
             f"QIITA_OUTPUT_PATH={output_path}",
             "--env",
             f"QIITA_WORK_TICKET_IDX={work_ticket_idx}",
+            "--env",
+            f"TMPDIR={workspace}/tmp",
             "--bind",
             f"{input_path}:{input_path}",
             "--bind",
