@@ -32,9 +32,21 @@ the `no-changelog` label).
   fell through to appending to a `DATA_CONFIG` file inside site-packages — another
   write into the read-only image. `checkm.sh` always exports that variable before
   invoking CheckM, so the test was exercising a configuration production never
-  uses; it now sets it the same way. Both fixes keep `%test` faithful to the real
-  entrypoint path rather than working around it, so a future regression fails the
-  BUILD instead of a MAG-producing ticket. (#275)
+  uses; it now sets it the same way.
+
+  With those two out of the way the `%test` reached a **runtime-fatal** third bug:
+  the images ship no Python. `_lib.sh`'s `qiita_finish` runs `python3
+  /opt/qiita/manifest_writer.py` to emit `manifest.json` — which EVERY step must
+  write, and which the backend verifies before registering any output — but the
+  micromamba base image has no Python and none of the four defs installed one.
+  Every step of this workflow would have died at its final line, after doing all
+  of its real work. (`bcl-convert`, which has actually been deployed, installs
+  `python3.11` explicitly for exactly this reason; `long-read-assembly` copied the
+  pattern and dropped it.) `python` is now in each image's base env.
+
+  All three fixes keep `%test` faithful to the real entrypoint path rather than
+  working around it — which is what turned the build into the thing that caught
+  the runtime bug. (#275)
 
 ### Added
 

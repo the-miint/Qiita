@@ -38,7 +38,12 @@ From: mambaorg/micromamba:1.5.8
     export MAMBA_ROOT_PREFIX=/opt/conda
     # jq (params.json), gawk, pigz (fast (de)compress), procps, findutils — the
     # base utilities the entrypoint relies on outside the tool env.
-    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+    # `python` is REQUIRED, not a nicety: _lib.sh's qiita_finish runs
+    # `python3 /opt/qiita/manifest_writer.py` to emit manifest.json, and EVERY
+    # step must write one (the backend verifies it before registering outputs).
+    # The micromamba base image ships no Python, so without this every step of
+    # this workflow dies at its final line — after doing all its real work.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python
 
     # One env for this tool. Channels bioconda + conda-forge; versions pinned
     # loosely here and tightened after the first Linux build resolves the solve.
