@@ -49,6 +49,7 @@ class LocalComputeBackendClient:
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandleWire:
         handle = await self._backend.submit_step(
             step_name,
@@ -61,6 +62,10 @@ class LocalComputeBackendClient:
             module=module,
             entrypoint=entrypoint,
             baseline_resources=baseline_resources,
+            # Forwarded, not dropped: this shim stands in for the real HTTP hop
+            # to a real backend, so swallowing it here would hide a plumbing
+            # break that production would hit.
+            derived_inputs=derived_inputs,
         )
         return _handle_to_wire(handle)
 
