@@ -11,7 +11,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→6 in order; buckets 1–3 must precede the bucket-4 restart, and bucket 6 (irreversible cleanup — anything that burns the rollback path) must not run until bucket 5 is green. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -40,34 +40,56 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - **Flight tickets move to Ed25519; `HMAC_SECRET_KEY` is retired.** Generate ONE
   Ed25519 keypair: the control plane gets the PRIVATE seed
   (`FLIGHT_TICKET_SIGNING_KEY`), the data plane gets the matching PUBLIC key
-  (`FLIGHT_TICKET_PUBLIC_KEY`). Both are `from_env()` fail-fast. Set both **before**
-  the restart, remove `HMAC_SECRET_KEY` from both env files, and **restart the
-  control plane and data plane together — they are a matched set with no partial
-  compatibility.** The DP holds one verifying key and hard-rejects v1 (HMAC)
-  tickets, and with HMAC gone from both sides there is no dual-accept — so a
-  half-completed swap is a *total* Flight outage, not a blip (HTTP routes are
-  unaffected). In-flight Flight work in the window does **not** uniformly
-  self-heal: a `step:` (SLURM) transient Flight error is retried, but an `action:`
-  (DoAction) rejection is classified permanent and needs manual redrive. Keep the
-  window short by restarting both together. `make preflight` checks the keypair
-  (derives the CP seed's public key via the **CP venv** interpreter and compares
-  to the DP's) — but if that interpreter lacks `cryptography` it reports `skip`,
-  not a green pass, so the **bucket-5 live DoGet is the definitive gate**. (#263)
+  (`FLIGHT_TICKET_PUBLIC_KEY`). Both are `from_env()` fail-fast, so set both
+  **before** the restart, and **restart the control plane and data plane together
+  — they are a matched set with no partial compatibility.** The DP holds one
+  verifying key and hard-rejects v1 (HMAC) tickets, and the new build reads no
+  HMAC at all, so there is no dual-accept — a half-completed swap is a *total*
+  Flight outage, not a blip (HTTP routes are unaffected). In-flight Flight work in
+  the window does **not** uniformly self-heal: a `step:` (SLURM) transient Flight
+  error is retried, but an `action:` (DoAction) rejection is classified permanent
+  and needs manual redrive. Keep the window short by restarting both together.
+
+  **Leave `HMAC_SECRET_KEY` in place here — it is scrubbed AFTER the deploy
+  verifies (bucket 6), not now.** The new build never reads it (both config
+  loaders look up named vars, so an unknown one is inert), so removing it early
+  buys nothing — while it *does* open a window in which the still-running OLD
+  build cannot restart, and it discards the rollback path during the riskiest part
+  of the deploy. Conversely, ADDING the two new keys is safe at any time, even
+  days ahead of the window: they are inert until a restart.
+
+  `make preflight` checks the keypair (derives the CP seed's public key via the
+  **CP venv** interpreter and compares to the DP's) — but if that interpreter
+  lacks `cryptography` it reports `skip`, not a green pass, so the **bucket-5 live
+  DoGet is the definitive gate**. (#263)
   ```bash
-  # Back up both env files first — the sed below drops HMAC_SECRET_KEY in place,
-  # so keep a copy to roll back to the previous (HMAC) build if the swap misfires:
+  # Back up both env files first — bucket 6 edits them in place, so keep a copy to
+  # roll back to the previous (HMAC) build if the swap misfires:
   sudo cp -a /etc/qiita/control-plane.env /etc/qiita/control-plane.env.pre-ed25519.bak
   sudo cp -a /etc/qiita/data-plane.env    /etc/qiita/data-plane.env.pre-ed25519.bak
   # Generate the keypair once (capture both values). Run it with the CP venv's
   # interpreter, NOT the system python3: `private_bytes_raw()` needs cryptography
-  # >= 38, and a host python3 can easily be older (the qiita-miint host ships
-  # 37.0.1, where this dies with AttributeError). The CP venv is also the
-  # interpreter `make preflight` uses for its keypair check.
+  # >= 38 and a host python3 can easily be older, where this dies with
+  # AttributeError. The CP venv is also the interpreter `make preflight` uses.
   /opt/qiita/control-plane/.venv/bin/python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
-  # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):
-  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env; printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
-  # DP: add the public key, drop HMAC_SECRET_KEY (substitute <PUBLIC>):
-  sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env; printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n" "<PUBLIC>" >> /etc/qiita/data-plane.env'
+  # CP gets the signing seed, DP the public key. HMAC_SECRET_KEY stays put.
+  sudo bash -c 'printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
+  sudo bash -c 'printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n"  "<PUBLIC>"  >> /etc/qiita/data-plane.env'
+  ```
+  Prove the two halves correspond BEFORE the restart. A mismatch is a total Flight
+  outage, and it is far cheaper to catch here than from a failing DoGet:
+  ```bash
+  sudo bash -c '
+  seed=$(grep -E "^FLIGHT_TICKET_SIGNING_KEY=" /etc/qiita/control-plane.env | cut -d= -f2-)
+  pub=$(grep -E "^FLIGHT_TICKET_PUBLIC_KEY=" /etc/qiita/data-plane.env | cut -d= -f2-)
+  CP_SEED="$seed" DP_PUB="$pub" /opt/qiita/control-plane/.venv/bin/python - <<PY
+  import base64, os, sys
+  from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+  seed = base64.b64decode(os.environ["CP_SEED"])
+  pub = base64.b64decode(os.environ["DP_PUB"])
+  derived = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()
+  sys.exit(0 if derived == pub else "MISMATCH — regenerate the pair; do NOT deploy")
+  PY'
   ```
 
 ### 2. One-time host setup
@@ -166,6 +188,28 @@ _None yet._
     | grep -E 'client_max_body_size|grpc_read_timeout|limit_conn'
   # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
   ```
+
+### 6. After the deploy verifies green
+
+- **Retire `HMAC_SECRET_KEY`.** Only now, once bucket 5 is green. The new build
+  never reads it, so it has been inert since the restart — this step retires a
+  dead secret at rest and needs **no restart of its own**. Deferring it to here is
+  deliberate: until the deploy proves itself, `HMAC_SECRET_KEY` is what the
+  previous build boots on, and it is the rollback path. Removing it back in bucket
+  1 would buy nothing and would strand you if the swap misfired. (#263)
+  ```bash
+  # Refuse to scrub unless the new build is actually up — otherwise you would be
+  # destroying the rollback path for a deploy that has not proven itself.
+  systemctl is-active qiita-control-plane qiita-data-plane@50051 qiita-compute-orchestrator
+  sudo bash -c '
+    grep -qE "^FLIGHT_TICKET_SIGNING_KEY=" /etc/qiita/control-plane.env \
+      && grep -qE "^FLIGHT_TICKET_PUBLIC_KEY=" /etc/qiita/data-plane.env \
+      || { echo "Ed25519 keys missing — NOT scrubbing HMAC"; exit 1; }
+    sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env
+    sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env'
+  ```
+  The `*.pre-ed25519.bak` backups from bucket 1 still hold the old secret. Delete
+  them once you are confident in the deploy.
 
 ### Notes (no host action)
 

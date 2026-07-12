@@ -13,6 +13,22 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+### Changed
+
+- **The deploy checklist grows a bucket 6, "after the deploy verifies green," and
+  `HMAC_SECRET_KEY` retirement moves into it.** Bucket 1 previously told the
+  operator to delete `HMAC_SECRET_KEY` from both env files *before* the restart.
+  That buys nothing — the new build never reads it (both config loaders look up
+  named vars, so an unknown one is inert) — while it opens a window in which the
+  still-running OLD build cannot restart, and it discards the rollback path during
+  the riskiest part of the deploy. Bucket 6 is now the home for any irreversible
+  cleanup that burns the way back: it runs only once bucket 5 is green, and needs
+  no restart of its own. Adding the Ed25519 keys stays in bucket 1 (they are inert
+  until a restart, so they can be staged days ahead), and bucket 1 now also proves
+  the keypair corresponds before the restart rather than discovering a mismatch
+  from a failing DoGet. `redeploy.md`, `/deploy-note` and `/deploy-archive` updated
+  to match. (#274)
+
 ### Added
 
 - **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
