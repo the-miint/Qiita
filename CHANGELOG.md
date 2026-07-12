@@ -25,7 +25,16 @@ the `no-changelog` label).
   `build-sifs.sh`'s refuse-on-unbuildable-image guard. `%test` now points `HOME` at
   the writable `/tmp`. Run time was never affected: the SLURM payload passes
   `--home <workspace>`, which is writable, so the tests still exercise the real
-  `micromamba run` path the entrypoints use rather than dodging it. (#275)
+  `micromamba run` path the entrypoints use rather than dodging it.
+
+  The `checkm` image had a second, independent instance of the same class: its
+  `%test` invoked `checkm` WITHOUT `CHECKM_DATA_PATH`, so CheckM's `DBManager`
+  fell through to appending to a `DATA_CONFIG` file inside site-packages — another
+  write into the read-only image. `checkm.sh` always exports that variable before
+  invoking CheckM, so the test was exercising a configuration production never
+  uses; it now sets it the same way. Both fixes keep `%test` faithful to the real
+  entrypoint path rather than working around it, so a future regression fails the
+  BUILD instead of a MAG-producing ticket. (#275)
 
 ### Added
 

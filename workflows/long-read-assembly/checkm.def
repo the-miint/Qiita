@@ -41,6 +41,13 @@ From: mambaorg/micromamba:1.5.8
     # One env for this tool. Channels bioconda + conda-forge; versions pinned
     # loosely here and tightened after the first Linux build resolves the solve.
     #  - checkm: CheckM + its external binaries (pplacer, hmmer, prodigal).
+    #
+    # Expect a loud, HARMLESS error from checkm-genome's conda post-link script:
+    # it tries to `wget` the ~1.4 GB reference DB into the env and fails because
+    # wget is not installed. That failure is DESIRABLE and non-fatal — the DB is
+    # deliberately not baked in (it is bind-mounted at run time; see the header).
+    # Do NOT "fix" it by adding wget: that would silently balloon the image by
+    # 1.4 GB and defeat the bind-mount design.
     micromamba create -y -n checkm -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/checkm.sh
@@ -60,6 +67,23 @@ From: mambaorg/micromamba:1.5.8
     export HOME=/tmp
     export XDG_CACHE_HOME=/tmp/.cache
     micromamba env list | grep -q checkm
+    # CHECKM_DATA_PATH must be set BEFORE CheckM is imported, exactly as
+    # checkm.sh does it at run time. Without it, CheckM's DBManager falls through
+    # to `setRoot()` and appends to a DATA_CONFIG file INSIDE site-packages — a
+    # write into the image itself, which is read-only both here and at run time:
+    #
+    #   OSError: [Errno 30] Read-only file system:
+    #     '/opt/conda/envs/checkm/lib/python3.11/site-packages/checkm/DATA_CONFIG'
+    #
+    # (CheckM's own handler for that is `except (IOError, e)`, which raises
+    # NameError, so the real error only surfaces as a traceback.) With the var set,
+    # it takes the data root from the environment and never writes. Testing `checkm`
+    # WITHOUT it would exercise a configuration production never uses — the point
+    # here is to fail the BUILD if that assumption ever stops holding, rather than
+    # a MAG-producing ticket at run time. The dir need only exist for this import;
+    # the real ~1.4 GB DB is bind-mounted at run time.
+    export CHECKM_DATA_PATH=/tmp/checkm_data
+    mkdir -p "${CHECKM_DATA_PATH}"
     micromamba run -n checkm checkm -h >/dev/null
     # Base utilities + the shipped manifest writer.
     jq --version
