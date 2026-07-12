@@ -36,6 +36,18 @@ the `no-changelog` label).
   The SMRT cell rides onto each row; keying `(smrt_cell, barcode)` BAM
   disambiguation off it is a follow-up. Verified against kl-run-preflight's own
   `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
+- **`derived_inputs` on container workflow steps** — the container-side mirror
+  of the native-only `params`. A step declares `derived_inputs: {ENV_VAR:
+  <path relative to PATH_DERIVED>}`; the orchestrator joins each value against
+  its own `PATH_DERIVED`, bind-mounts the result, and forwards the absolute path
+  under that env var name. This is the only way an operator-provisioned artifact
+  too large to bake into a SIF (CheckM's ~1.4 GB DB) can reach a container:
+  apptainer runs `--containall`, so an unforwarded host env var is invisible
+  inside it. Values stay **relative** on the wire — the control plane never names
+  a compute-node absolute path — and both the wire validator and the backend
+  reject an absolute path or a `..` escape, so a workflow cannot name an
+  arbitrary host directory for the orchestrator to bind in. (#273)
+
 - **Seed water/marine metadata for early data entry** — the `GSC MIxS water`
   checklist (ERC000024, under the ENA default); the `depth_m` and
   `host_taxon_id` biosample global fields (the latter terminology-bound to NCBI
@@ -1385,6 +1397,23 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **Container steps under a `prep_sample`-scoped ticket could never run.**
+  `assert_container_scope_supported` gated container dispatch to
+  `{reference, sequenced_pool}`, so every container step of `long-read-assembly`
+  (assemble / binning / bin_refine / checkm) and the read-mask `lima` step —
+  both `prep_sample`-scoped — failed `CONTRACT_VIOLATION` at submit. Neither
+  workflow could complete a single run. `prep_sample` is now admitted; the
+  dispatch path already treated `scope_target` opaquely (it rides into
+  `params.json` verbatim, and nothing reads a kind-specific scalar), so nothing
+  else changed. A new pin test (`test_workflow_container_scope_pin`) walks every
+  workflow YAML and fails `make test` if a workflow declares container steps
+  under a kind the backends won't dispatch — the static check that would have
+  caught this at CI instead of at first submit. (#273)
+- **CheckM's reference DB was invisible inside its container.** The `checkm`
+  step never declared the operator-staged DB, so no bind was computed for it and
+  `checkm.sh` fell back to an `/opt/checkm_data` that isn't in the SIF — exiting
+  78 no matter how correctly the DB was staged under `PATH_DERIVED`. It now rides
+  the new `derived_inputs` field. (#273)
 - The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)

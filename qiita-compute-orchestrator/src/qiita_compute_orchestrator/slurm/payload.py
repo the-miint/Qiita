@@ -143,6 +143,7 @@ def build_job_submit_payload(
     attempt: int = 0,
     extra_env: dict[str, str] | None = None,
     extra_bind_dirs: list[Path] | None = None,
+    container_env: dict[str, str] | None = None,
     native_python: str = "python",
     qos: str = "",
 ) -> dict[str, Any]:
@@ -198,6 +199,15 @@ def build_job_submit_payload(
             future per-step overrides; kept as a flat name => value map
             (slurmrestd's `environment` field is a list of "KEY=VAL"
             strings, which we serialize from this dict).
+        extra_bind_dirs: additional host directories to bind into the
+            container (identity-mapped, `host:host`). Container steps only.
+        container_env: env vars forwarded INTO the container via
+            `--env`, distinct from `extra_env` (which sets the SLURM job's
+            environment). `--containall` means the job env does not cross
+            into the container, so a var the entrypoint must read belongs
+            here. Carries a step's resolved `derived_inputs`; the paths it
+            names must also appear in `extra_bind_dirs` or they won't
+            resolve inside the container. Container steps only.
 
     Returns:
         A dict ready to pass directly to slurmrestd's job/submit
@@ -290,6 +300,13 @@ def build_job_submit_payload(
         ]
         for bind_dir in extra_bind_dirs or ():
             apptainer_args.extend(("--bind", f"{bind_dir}:{bind_dir}"))
+        # `container_env` carries the step's resolved `derived_inputs`
+        # (env_var_name -> absolute host path under PATH_DERIVED). The paths are
+        # already bound above via extra_bind_dirs, so they resolve identically
+        # inside the container; this forwards the names the entrypoint reads
+        # (e.g. QIITA_CHECKM_DB). Sorted for deterministic payloads.
+        for env_name, value in sorted((container_env or {}).items()):
+            apptainer_args.extend(("--env", f"{env_name}={value}"))
         script = _build_script(
             container=container,
             entrypoint=entrypoint,

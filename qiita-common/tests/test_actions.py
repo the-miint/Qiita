@@ -578,3 +578,74 @@ def test_native_module_prefix_constant_value():
     from qiita_common.actions import NATIVE_MODULE_PREFIX
 
     assert NATIVE_MODULE_PREFIX == "qiita_compute_orchestrator.jobs."
+
+
+# ---------------------------------------------------------------------------
+# derived_inputs (container-only PATH_DERIVED artifacts)
+# ---------------------------------------------------------------------------
+
+
+def test_workflow_step_derived_inputs_on_container_ok():
+    """The happy path: a container step names an operator-provisioned artifact
+    under PATH_DERIVED, keyed by the env var its entrypoint reads."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"QIITA_CHECKM_DB": "checkm_data"}
+    a = ActionDefinition(**kwargs)
+    assert a.steps[0].derived_inputs == {"QIITA_CHECKM_DB": "checkm_data"}
+
+
+def test_workflow_step_rejects_derived_inputs_on_native_step():
+    """`derived_inputs` is a bind + env-forward into a container. A native step
+    runs in the orchestrator's own env and reads PATH_DERIVED from its settings,
+    so declaring it there is a contract error, not a no-op."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0] = {
+        "step": "fastq",
+        "step_type": StepType.SINGLETON,
+        "module": FASTQ_TO_PARQUET_MODULE,
+        "derived_inputs": {"QIITA_CHECKM_DB": "checkm_data"},
+        "baseline_resources": {"cpu": 4, "mem_gb": 8, "walltime": "PT1H"},
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "derived_inputs" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_absolute_derived_input():
+    """Values are relative to the orchestrator's PATH_DERIVED. An absolute path
+    would let a workflow name any host directory for the orchestrator to bind
+    into a container."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"QIITA_CHECKM_DB": "/etc"}
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "relative" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_traversing_derived_input():
+    """Same containment rule, via `..` rather than a leading slash."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"QIITA_CHECKM_DB": "../../etc"}
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "traverse" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_non_env_name_derived_input_key():
+    """The key is interpolated into an `--env K=V` apptainer argument, so a
+    stray `=` or space would corrupt the argument rather than fail."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"not a var": "checkm_data"}
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "env var name" in str(exc_info.value)

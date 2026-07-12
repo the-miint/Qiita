@@ -209,6 +209,7 @@ async def submit_step(
             module=body.module,
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,
+            derived_inputs=body.derived_inputs,
         )
     except StepNoData as exc:
         # LocalBackend runs the native job to completion at submit time, so an

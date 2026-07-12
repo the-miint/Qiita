@@ -10,6 +10,7 @@ from qiita_common.models._base import (
     ComputeTarget,
     StepStatus,
     _normalize_scope_target,
+    check_derived_inputs,
     check_exactly_one_runtime,
 )
 
@@ -65,6 +66,11 @@ class StepSubmitRequest(BaseModel):
     module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
+    # Mirrors WorkflowStep.derived_inputs: env_var_name -> path relative to the
+    # ORCHESTRATOR's PATH_DERIVED. Values stay relative on the wire — the CP
+    # doesn't know (and must not name) compute-node absolute paths; the
+    # orchestrator joins them against its own PATH_DERIVED at submit.
+    derived_inputs: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("scope_target", mode="after")
     @classmethod
@@ -77,6 +83,11 @@ class StepSubmitRequest(BaseModel):
             container=self.container,
             module=self.module,
             entrypoint=self.entrypoint,
+            owner="StepSubmitRequest",
+        )
+        check_derived_inputs(
+            self.derived_inputs,
+            container=self.container,
             owner="StepSubmitRequest",
         )
         return self

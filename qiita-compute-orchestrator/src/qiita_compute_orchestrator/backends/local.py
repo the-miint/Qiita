@@ -46,6 +46,9 @@ class LocalBackend(ComputeBackend):
         module: str | None = None,
         entrypoint: str | None = None,  # noqa: ARG002 — LocalBackend ignores entrypoint
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
+        # Container-only (bind + env into apptainer), and LocalBackend rejects
+        # container steps below — so it can only ever arrive empty here.
+        derived_inputs: dict[str, str] | None = None,  # noqa: ARG002 — protocol parity
     ) -> StepHandle:
         """Run the native module in-process to completion and return a
         terminal StepHandle (compute_target=local, no SLURM job id, the

@@ -40,6 +40,7 @@ from qiita_common.models import (
     ProcessingKind,
     ScopeTargetKind,
     StepType,
+    check_derived_inputs,
     check_exactly_one_runtime,
 )
 
@@ -244,6 +245,20 @@ class WorkflowStep(BaseModel):
     # same-named knobs without colliding in action_context. Native steps only —
     # container inputs are bind-mount paths, never scalars.
     params: dict[str, str] = Field(default_factory=dict)
+    # Read-only host artifacts under PATH_DERIVED that a container step needs
+    # at run time, keyed env_var_name -> path relative to PATH_DERIVED (e.g.
+    # {"QIITA_CHECKM_DB": "checkm_data"}). The orchestrator joins each value
+    # against its own PATH_DERIVED, bind-mounts the result into the container,
+    # and forwards the absolute path under the env var name. This is the
+    # container-side mirror of `params` (native-only scalars): a container gets
+    # only what is explicitly bound + forwarded (apptainer runs `--containall`,
+    # so the host env does NOT cross the boundary), and PATH_DERIVED is the
+    # orchestrator's to resolve — the control plane never learns compute-node
+    # paths. Use it for operator-provisioned reference data that is too large to
+    # bake into the SIF (CheckM's DB); ticket-scoped data flows through `inputs`.
+    # Container steps only — a native step reads PATH_DERIVED from its own
+    # settings and needs no bind.
+    derived_inputs: dict[str, str] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
@@ -264,6 +279,11 @@ class WorkflowStep(BaseModel):
             container=self.container,
             module=self.module,
             entrypoint=self.entrypoint,
+            owner="WorkflowStep",
+        )
+        check_derived_inputs(
+            self.derived_inputs,
+            container=self.container,
             owner="WorkflowStep",
         )
         return self

@@ -117,7 +117,11 @@ class FoundJob:
 
 
 _CONTAINER_SUPPORTED_SCOPES: frozenset[str] = frozenset(
-    {ScopeTargetKind.REFERENCE.value, ScopeTargetKind.SEQUENCED_POOL.value}
+    {
+        ScopeTargetKind.REFERENCE.value,
+        ScopeTargetKind.SEQUENCED_POOL.value,
+        ScopeTargetKind.PREP_SAMPLE.value,
+    }
 )
 
 
@@ -125,10 +129,12 @@ def assert_container_scope_supported(*, step_name: str, scope_target: dict[str, 
     """Reject a container step whose work_ticket's scope_target isn't one
     the backends know how to dispatch.
 
-    Container steps today are referenced by two scope_target.kinds:
+    Container steps today are referenced by three scope_target.kinds:
 
       * REFERENCE — every reference-add container step (hash, load).
       * SEQUENCED_POOL — the bcl-convert workflow's container step.
+      * PREP_SAMPLE — long-read-assembly's assemble/binning/bin_refine/checkm,
+        and the read-mask lima step.
 
     Submitting a container step against any other kind is a
     workflow-authoring error, not a data error — surface it as
@@ -136,6 +142,13 @@ def assert_container_scope_supported(*, step_name: str, scope_target: dict[str, 
     downstream path that would extract the wrong scalar. Shared between
     LocalBackend and SlurmBackend so the two implementations cannot
     drift in either the predicate or the error wording.
+
+    This is an allowlist, so a workflow that introduces a container step
+    under a NEW scope kind is rejected at submit until the kind is added
+    here — the failure is loud and names the kind, but it is a failure. The
+    dispatch path itself treats `scope_target` opaquely (it rides into
+    params.json verbatim; nothing here reads a kind-specific scalar), so
+    admitting a kind costs nothing beyond this list.
 
     Raises BackendFailure(CONTRACT_VIOLATION) on an unsupported kind.
     Returns None otherwise; callers consume the kind-appropriate
@@ -183,6 +196,7 @@ class ComputeBackend(ABC):
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandle:
         """Submit the step and return immediately with a `StepHandle` —
         do NOT block until completion. For SLURM this `sbatch`es the job

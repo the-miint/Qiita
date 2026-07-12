@@ -45,6 +45,7 @@ from qiita_common.models._base import (
     SequencedPoolScopeTarget,
     StepStatus,
     StudyPrepScopeTarget,
+    check_derived_inputs,
     check_exactly_one_runtime,
 )
 from qiita_common.models.auth import (
@@ -243,6 +244,7 @@ __all__ = [
     "SequencedPoolScopeTarget",
     "StepStatus",
     "StudyPrepScopeTarget",
+    "check_derived_inputs",
     "check_exactly_one_runtime",
     # Health.
     "HealthResponse",

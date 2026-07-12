@@ -239,12 +239,17 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, tmp_path):
-    """Mirror of LocalBackend's container-path scope gate (S4):
-    SlurmBackend container steps are gated on a closed set of supported
-    scope kinds (today: reference + sequenced_pool). A prep_sample-scoped
-    or study_prep-scoped ticket dispatched to a container step would
-    silently produce wrong params.json; the gate 422s at submit time
-    instead."""
+    """Mirror of LocalBackend's container-path scope gate (S4): SlurmBackend
+    container steps are gated on a closed set of supported scope kinds
+    (reference, sequenced_pool, prep_sample). A kind outside that set is a
+    workflow-authoring error, and the gate fails it at submit rather than
+    dispatching a step no backend is known to handle.
+
+    `block` stands in for "some kind not on the list" — no workflow runs a
+    container under a block-scoped ticket today. If one ever does, admit the
+    kind in _CONTAINER_SUPPORTED_SCOPES (the dispatch path treats scope_target
+    opaquely) and repoint this test; test_workflow_container_scope_pin catches
+    the mismatch statically either way."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
@@ -253,7 +258,7 @@ async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, 
             "hash",
             {},
             tmp_path,
-            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            scope_target={"kind": "block", "block_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
             entrypoint=None,
@@ -261,9 +266,7 @@ async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, 
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert "requires a scope_target with kind in" in ei.value.reason
-    assert "reference" in ei.value.reason
-    assert "sequenced_pool" in ei.value.reason
-    assert "prep_sample" in ei.value.reason
+    assert "block" in ei.value.reason
 
 
 @pytest.mark.asyncio
@@ -1207,3 +1210,107 @@ async def test_find_jobs_by_name_classifies_slurmrestd_error(jwt_path):
         await backend.find_jobs_by_name("qiita-wt1-hash-a0")
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
     assert ei.value.transient is True
+
+
+# ============================================================================
+# derived_inputs — operator-provisioned PATH_DERIVED artifacts into containers
+# ============================================================================
+
+
+def _capture_submit() -> tuple[httpx.MockTransport, dict]:
+    """MockTransport that records the /job/submit payload and then reports the
+    job COMPLETED, so a full trio run can assert on what was submitted."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    return httpx.MockTransport(handler), captured
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_bind_and_forward_env_into_container(jwt_path, baseline, tmp_path):
+    """A container step's `derived_inputs` is joined against PATH_DERIVED, bound
+    into the container, and forwarded as `--env NAME=<abs>`. This is what makes
+    an operator-staged artifact (CheckM's DB) visible inside the SIF at all:
+    apptainer runs `--containall`, so an unforwarded host env var is invisible.
+    """
+    transport, captured = _capture_submit()
+    derived = tmp_path / "derived"
+    (derived / "checkm_data").mkdir(parents=True)
+    backend = _make_backend(transport, jwt_path, path_derived=str(derived))
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "checkm",
+        {"refined_bins_dir": tmp_path / "bins"},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/checkm:1.0.0",
+        entrypoint="/opt/qiita/checkm.sh",
+        baseline_resources=baseline,
+        derived_inputs={"QIITA_CHECKM_DB": "checkm_data"},
+    )
+
+    script = captured["payload"]["script"]
+    db = derived / "checkm_data"
+    assert f"--bind {db}:{db}" in script
+    assert f"--env QIITA_CHECKM_DB={db}" in script
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_without_path_derived_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """PATH_DERIVED unset + a step that declares derived_inputs = a
+    misconfigured orchestrator. Fail loudly at submit rather than binding a
+    path rooted at "" and letting apptainer produce a cryptic error."""
+    transport, _ = _capture_submit()
+    backend = _make_backend(transport, jwt_path, path_derived="")
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "checkm",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/checkm:1.0.0",
+            baseline_resources=baseline,
+            derived_inputs={"QIITA_CHECKM_DB": "checkm_data"},
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "PATH_DERIVED" in (ei.value.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_escaping_path_derived_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """A `..` that slipped past the wire validator must not reach apptainer:
+    the backend is the last gate before a host path is bind-mounted into a
+    container, so it re-checks containment itself."""
+    transport, _ = _capture_submit()
+    backend = _make_backend(transport, jwt_path, path_derived=str(tmp_path / "derived"))
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "checkm",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/checkm:1.0.0",
+            baseline_resources=baseline,
+            derived_inputs={"QIITA_CHECKM_DB": "../../etc"},
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "outside" in (ei.value.reason or "")
