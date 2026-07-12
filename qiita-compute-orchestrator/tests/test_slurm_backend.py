@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 from pathlib import Path
 
 import httpx
@@ -239,17 +240,16 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, tmp_path):
-    """Mirror of LocalBackend's container-path scope gate (S4): SlurmBackend
-    container steps are gated on a closed set of supported scope kinds
-    (reference, sequenced_pool, prep_sample). A kind outside that set is a
-    workflow-authoring error, and the gate fails it at submit rather than
-    dispatching a step no backend is known to handle.
+    """Container steps are gated on a closed set of scope kinds (reference,
+    sequenced_pool, prep_sample). A kind outside that set is a workflow-authoring
+    error, and the gate fails it at submit rather than dispatching a step no
+    backend is known to handle.
 
     `block` stands in for "some kind not on the list" — no workflow runs a
-    container under a block-scoped ticket today. If one ever does, admit the
-    kind in _CONTAINER_SUPPORTED_SCOPES (the dispatch path treats scope_target
-    opaquely) and repoint this test; test_workflow_container_scope_pin catches
-    the mismatch statically either way."""
+    container under a block-scoped ticket today. If one ever does, admit the kind
+    in the allowlist (the dispatch path treats scope_target opaquely) and repoint
+    this test; the workflow-scope pin test catches the mismatch statically either
+    way."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
@@ -1262,8 +1262,9 @@ async def test_derived_inputs_bind_and_forward_env_into_container(jwt_path, base
 
     script = captured["payload"]["script"]
     db = derived / "checkm_data"
-    assert f"--bind {db}:{db}" in script
-    assert f"--env QIITA_CHECKM_DB={db}" in script
+    # Read-only: one shared DB copy, many concurrent jobs.
+    assert f"{db}:{db}:ro" in shlex.split(script)
+    assert f"QIITA_CHECKM_DB={db}" in shlex.split(script)
 
 
 @pytest.mark.asyncio
@@ -1295,9 +1296,10 @@ async def test_derived_inputs_without_path_derived_is_contract_violation(
 async def test_derived_inputs_escaping_path_derived_is_contract_violation(
     jwt_path, baseline, tmp_path
 ):
-    """A `..` that slipped past the wire validator must not reach apptainer:
-    the backend is the last gate before a host path is bind-mounted into a
-    container, so it re-checks containment itself."""
+    """A `..` that slipped past the wire validator must not reach apptainer: the
+    backend is the last gate before a host path is bind-mounted into a container,
+    so it re-runs the full shared contract itself rather than trusting the
+    wire."""
     transport, _ = _capture_submit()
     backend = _make_backend(transport, jwt_path, path_derived=str(tmp_path / "derived"))
 
@@ -1313,4 +1315,67 @@ async def test_derived_inputs_escaping_path_derived_is_contract_violation(
             derived_inputs={"QIITA_CHECKM_DB": "../../etc"},
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
-    assert "outside" in (ei.value.reason or "")
+    assert "traverse above PATH_DERIVED" in (ei.value.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_naming_the_derived_root_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """A bare "." passes the relative/no-`..` checks but resolves to PATH_DERIVED
+    itself — binding the WHOLE derived root (every SIF under images/) into the
+    container. Least privilege: a derived input must name something strictly
+    under the root."""
+    transport, _ = _capture_submit()
+    backend = _make_backend(transport, jwt_path, path_derived=str(tmp_path / "derived"))
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "checkm",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/checkm:1.0.0",
+            baseline_resources=baseline,
+            derived_inputs={"QIITA_CHECKM_DB": "."},
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "strictly under PATH_DERIVED" in (ei.value.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_derived_input_value_cannot_inject_shell(jwt_path, baseline, tmp_path):
+    """The apptainer args are interpolated into a bash script. A derived_inputs
+    VALUE carrying shell metacharacters must not be able to terminate the
+    `apptainer exec` and run something else — every arg is shlex-quoted, so the
+    `;` survives as literal text inside a quoted argument."""
+    transport, captured = _capture_submit()
+    derived = tmp_path / "derived"
+    (derived / "evil; touch pwned").mkdir(parents=True)
+    backend = _make_backend(transport, jwt_path, path_derived=str(derived))
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "checkm",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/checkm:1.0.0",
+        baseline_resources=baseline,
+        derived_inputs={"QIITA_CHECKM_DB": "evil; touch pwned"},
+    )
+
+    script = captured["payload"]["script"]
+    cmd_line = next(ln for ln in script.splitlines() if ln.startswith("apptainer "))
+
+    # Parse the line the way the shell would. If the `;` were unquoted it would
+    # be a command separator and `touch`/`pwned` would surface as their own
+    # tokens; quoted, the whole bind stays a single argv entry.
+    tokens = shlex.split(cmd_line)
+    assert "touch" not in tokens
+    db = derived / "evil; touch pwned"
+    assert f"{db}:{db}:ro" in tokens
+    assert f"QIITA_CHECKM_DB={db}" in tokens

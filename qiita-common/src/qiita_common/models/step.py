@@ -66,10 +66,7 @@ class StepSubmitRequest(BaseModel):
     module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
-    # Mirrors WorkflowStep.derived_inputs: env_var_name -> path relative to the
-    # ORCHESTRATOR's PATH_DERIVED. Values stay relative on the wire — the CP
-    # doesn't know (and must not name) compute-node absolute paths; the
-    # orchestrator joins them against its own PATH_DERIVED at submit.
+    # Mirrors WorkflowStep.derived_inputs (see there for the contract).
     derived_inputs: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("scope_target", mode="after")

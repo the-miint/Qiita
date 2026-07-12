@@ -4,9 +4,10 @@
 `scope_target.kind` is not in `_CONTAINER_SUPPORTED_SCOPES`. That check runs at
 SUBMIT — on the compute path, against a live ticket — so a workflow whose
 `target_kind` is outside the allowlist parses fine, syncs into `qiita.action`
-fine, and only dies when someone actually runs it. Two workflows shipped that
-way (long-read-assembly's four container steps and read-mask's lima step, both
-`prep_sample`) and neither was caught until a real submit.
+fine, and only dies when someone actually runs it. long-read-assembly shipped
+that way: all four of its container steps are `prep_sample`-scoped, which the
+allowlist did not admit, so the workflow could never complete a single run and
+nothing caught it until a real submit.
 
 This walks the on-disk YAML and asserts the pairing statically, so the gap
 closes at `make test` instead of at first run.

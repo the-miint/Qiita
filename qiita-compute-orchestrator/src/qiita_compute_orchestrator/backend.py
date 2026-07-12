@@ -129,24 +129,22 @@ def assert_container_scope_supported(*, step_name: str, scope_target: dict[str, 
     """Reject a container step whose work_ticket's scope_target isn't one
     the backends know how to dispatch.
 
-    Container steps today are referenced by three scope_target.kinds:
-
-      * REFERENCE — every reference-add container step (hash, load).
-      * SEQUENCED_POOL — the bcl-convert workflow's container step.
-      * PREP_SAMPLE — long-read-assembly's assemble/binning/bin_refine/checkm,
-        and the read-mask lima step.
-
-    Submitting a container step against any other kind is a
+    Submitting a container step against an unlisted kind is a
     workflow-authoring error, not a data error — surface it as
-    CONTRACT_VIOLATION so the runner doesn't quietly fall through to a
-    downstream path that would extract the wrong scalar. Shared between
-    LocalBackend and SlurmBackend so the two implementations cannot
-    drift in either the predicate or the error wording.
+    CONTRACT_VIOLATION rather than dispatching a step no backend is known
+    to handle.
 
     This is an allowlist, so a workflow that introduces a container step
     under a NEW scope kind is rejected at submit until the kind is added
-    here — the failure is loud and names the kind, but it is a failure. The
-    dispatch path itself treats `scope_target` opaquely (it rides into
+    here — the failure is loud and names the kind, but it is a failure, and
+    it surfaces only on the compute path against a live ticket. That is how
+    long-read-assembly shipped unrunnable: every one of its container steps
+    is prep_sample-scoped, which this list did not admit.
+    `test_workflow_container_scope_pin` now pins each workflow's container
+    steps against this set at `make test` so the next such gap fails in CI
+    instead of at someone's first submit.
+
+    The dispatch path itself treats `scope_target` opaquely (it rides into
     params.json verbatim; nothing here reads a kind-specific scalar), so
     admitting a kind costs nothing beyond this list.
 

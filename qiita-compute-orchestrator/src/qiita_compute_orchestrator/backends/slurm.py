@@ -34,6 +34,7 @@ from qiita_common.models import (
     StepBaselineResources,
     StepStatus,
     WorkTicketFailureStage,
+    check_derived_inputs,
 )
 
 from ..backend import (
@@ -277,14 +278,18 @@ class SlurmBackend(ComputeBackend):
     ) -> dict[str, Path]:
         """Join each YAML-declared `derived_inputs` value against this
         orchestrator's ``PATH_DERIVED``, yielding env_var_name -> absolute
-        host path. The caller binds each path into the container and forwards
-        it under its env var name.
+        host path. The caller binds each path into the container (read-only)
+        and forwards it under its env var name.
 
-        The relative-path contract (no absolute, no ``..``) is enforced by the
-        wire validator upstream; it is re-checked here because a resolved path
-        that escaped the derived root would be bind-mounted into a container —
-        so this is the last gate before a host path crosses that boundary, and
-        a direct caller (a test, programmatic submission) skips the wire.
+        This is the LAST gate before a YAML-authored string becomes a host path
+        bind-mounted into a container, and a direct caller (a test, programmatic
+        submission) skips the wire — so it re-runs the full shared
+        `check_derived_inputs` contract rather than a subset of it, then adds
+        the two checks that need the resolved root:
+
+          * the joined path stays under PATH_DERIVED, and
+          * it is not PATH_DERIVED itself (a bare `.` would bind the whole
+            derived root — every SIF under images/ — into the container).
 
         Existence is NOT checked, for the same reason as `_resolve_input_binds`:
         the orchestrator's filesystem view can differ from the compute nodes'.
@@ -303,6 +308,16 @@ class SlurmBackend(ComputeBackend):
                     " — the orchestrator cannot resolve the derived-artifact root"
                 ),
             )
+        try:
+            check_derived_inputs(derived_inputs, container="present", owner="submit_step")
+        except ValueError as exc:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=str(exc),
+            ) from exc
+
         root = Path(self._path_derived)
         resolved: dict[str, Path] = {}
         for env_name, rel in derived_inputs.items():
@@ -313,14 +328,15 @@ class SlurmBackend(ComputeBackend):
             # (like _resolve_input_binds) we bind the path as written rather
             # than chasing a link to somewhere the author didn't name.
             path = Path(os.path.normpath(root / rel))
-            if not path.is_relative_to(root):
+            if not path.is_relative_to(root) or path == root:
                 raise BackendFailure(
                     kind=FailureKind.CONTRACT_VIOLATION,
                     stage=WorkTicketFailureStage.STEP_RUN,
                     step_name=step_name,
                     reason=(
-                        f"derived_inputs[{env_name!r}]={rel!r} resolves outside"
-                        f" PATH_DERIVED ({root})"
+                        f"derived_inputs[{env_name!r}]={rel!r} must name a path"
+                        f" strictly under PATH_DERIVED ({root}); it resolves to"
+                        f" {path}"
                     ),
                 )
             resolved[env_name] = path
@@ -453,17 +469,21 @@ class SlurmBackend(ComputeBackend):
         # apptainer's host-mounted view. Native steps don't need extra
         # binds — the launcher runs outside any container.
         extra_bind_dirs: list[Path] | None = None
+        ro_bind_dirs: list[Path] | None = None
         container_env: dict[str, str] | None = None
         if container is not None:
             extra_bind_dirs = self._resolve_input_binds(inputs, step_name=name)
             # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
-            # reference DB, too large to bake into the SIF). Bind each one and
-            # forward its absolute path under the declared env var — apptainer
-            # runs `--containall`, so an unforwarded host env var is invisible
-            # inside the container.
+            # reference DB, too large to bake into the SIF). Bind each one
+            # read-only and forward its absolute path under the declared env var
+            # — apptainer runs `--containall`, so an unforwarded host env var is
+            # invisible inside the container.
             derived = self._resolve_derived_inputs(derived_inputs or {}, step_name=name)
             if derived:
-                extra_bind_dirs = sorted({*extra_bind_dirs, *derived.values()})
+                # Same directory-granularity rule as _resolve_input_binds: bind a
+                # directory itself, but a FILE's parent (apptainer's --bind is
+                # directory-granular). The env var still names the file.
+                ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
                 container_env = {k: str(v) for k, v in derived.items()}
 
         payload = build_job_submit_payload(
@@ -484,6 +504,7 @@ class SlurmBackend(ComputeBackend):
             attempt=attempt,
             extra_env=extra_env or None,
             extra_bind_dirs=extra_bind_dirs,
+            ro_bind_dirs=ro_bind_dirs,
             container_env=container_env,
             qos=self._qos,
         )

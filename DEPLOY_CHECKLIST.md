@@ -86,13 +86,17 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     set -euo pipefail
     mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data"
     curl -fLO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz
-    md5sum checkm_data_2015_01_16.tar.gz   # expect 631012fa598c43fdeb88c619ad282c4d
+    # md5 -c, not a bare md5sum: a printed hash exits 0 and `set -e` would sail
+    # straight into the tar. This ABORTS on a mismatch.
+    echo "631012fa598c43fdeb88c619ad282c4d  checkm_data_2015_01_16.tar.gz" | md5sum -c -
     tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
   ```
-  The tarball's md5 is `631012fa598c43fdeb88c619ad282c4d` (per the Ecogenomics
-  Zenodo deposit, [10.5281/zenodo.7401544](https://zenodo.org/doi/10.5281/zenodo.7401544);
-  the `data.ace.uq.edu.au` directory publishes no checksum of its own). Verify
-  before extracting.
+  The expected md5 (`631012fa…`) is the one the Ecogenomics group publishes for
+  this tarball on Zenodo ([10.5281/zenodo.7401544](https://zenodo.org/doi/10.5281/zenodo.7401544)),
+  and it matches what `data.ace.uq.edu.au` currently serves. Note what that does
+  and does not buy you: `data.ace.uq.edu.au` publishes no checksum of its own, so
+  this is a cross-check against a second mirror by the same group — it catches a
+  corrupted or truncated download, not a compromised upstream.
 
   REQUIRED before the first `long-read-assembly` run: the `checkm` step **fails
   loud** (exit 78) when the DB is absent — it does not degrade to an empty
@@ -165,14 +169,14 @@ _None yet._
 
 ### Notes (no host action)
 
-- **`long-read-assembly` and the read-mask `lima` step can actually run now.**
-  Container dispatch was gated to `reference`/`sequenced_pool`-scoped tickets, so
-  every container step of these two `prep_sample`-scoped workflows failed
-  `CONTRACT_VIOLATION` at submit — they had never completed a run. If anyone tried
-  one on the previous build and saw "requires a scope_target with kind in
-  ['reference', 'sequenced_pool']", that is the provenance; simply resubmit after
-  this deploy. No host action — the fix is code, and the workflow YAML re-syncs via
-  `qiita-admin actions sync` inside `activate.sh`. (#273)
+- **`long-read-assembly` can actually run now.** Container dispatch was gated to
+  `reference`/`sequenced_pool`-scoped tickets, so every container step of this
+  `prep_sample`-scoped workflow failed `CONTRACT_VIOLATION` at submit — it had
+  never completed a run. If anyone tried it on the previous build and saw
+  "requires a scope_target with kind in ['reference', 'sequenced_pool']", that is
+  the provenance; simply resubmit after this deploy. No host action — the fix is
+  code, and the workflow YAML re-syncs via `qiita-admin actions sync` inside
+  `activate.sh`. (#273)
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
 - **Invitation handoff no longer mints a PAT directly.** Accepting an AuthRocket invitation now redirects the user to `/auth/login` (the cookie-anchored flow) instead of displaying a PAT; users complete one normal login after accepting. No host action. (#241)
 - **Removed inert SLURM env vars (compute-orchestrator).** `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` are no longer read — they never enforced anything (the CP owns the poll loop; SLURM `--time` enforces walltime). Safe to leave or drop from `/etc/qiita/compute-orchestrator.env`. (#241)
