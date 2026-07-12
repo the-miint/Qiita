@@ -73,21 +73,22 @@ _HIFI_READS_DIR = "hifi_reads"
 class _PacbioPreflightRow(NamedTuple):
     """One PacBio sample pulled from the kl-run-preflight SQLite.
 
-    Mirrors `pool._PreflightRow` for the fields the submit flow shares
-    (biosample / project accessions + the intake `human_filtering` intent), plus
-    the PacBio-specific `barcode` (used to locate the sample's BAM and as the
-    pool-item-id) and the three protocol-determining columns
-    (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`) the read-mask
-    submission later derives the mask chain from. The project accessions are
-    ENA **bioproject** accessions (what the study lookup route resolves), matching
-    the Illumina row; `secondary_project_accessions` is populated for controls.
+    `pacbio_sample_idx` is the sample's UNIQUE identifier within the preflight —
+    the PacBio parallel of `illumina_sample_idx`, and the value used as the
+    `sequenced_pool_item_id`. It is the only safe unique key: `sample_name` is a
+    legacy, PII-bearing field that may be blank, and `biosample_accession` is not
+    unique within a preflight (replicates share one). `barcode` is carried only to
+    LOCATE the sample's BAM on disk — it is NOT unique across all PacBio protocols
+    and is never used as an identity/pool-item-id.
 
-    `smrt_cell` is the sample's SMRT-cell well (`smrt_cell_well_sample_id`, form
-    `1_A01`), when the preflight records it: BAM resolution keys on
-    `(smrt_cell, barcode)` when present, else falls back to barcode-only with the
-    cross-cell collision guard."""
+    The project accessions are ENA **bioproject** accessions (what the study lookup
+    route resolves), matching the Illumina row; `secondary_project_accessions` is
+    populated for controls. The three protocol columns (`sheet_type`,
+    `twist_adaptor_id`, `syndna_is_twisted`) feed the read-mask mask-chain
+    derivation. `smrt_cell` is the SMRT-cell well (`smrt_cell_well_sample_id`, form
+    `1_A01`) when the preflight records it (else None)."""
 
-    sample_name: str
+    pacbio_sample_idx: int
     barcode: str
     biosample_accession: str
     primary_project_accession: str
@@ -96,8 +97,7 @@ class _PacbioPreflightRow(NamedTuple):
     sheet_type: str
     twist_adaptor_id: str | None
     syndna_is_twisted: bool | None
-    # The SMRT-cell well from the preflight (None when it records none — then BAM
-    # resolution falls back to barcode-only).
+    # The SMRT-cell well from the preflight (None when it records none).
     smrt_cell: str | None = None
 
 
@@ -111,10 +111,12 @@ def _read_pacbio_preflight_rows(
     returns the biosample + primary/secondary **bioproject** accessions and a
     `PacbioSampleRow` (barcode, twist, syndna, smrt_cell, movie_context). It
     validates + raises on any missing required accession, and resolves a control's
-    project to the plate primary itself, so this wrapper adds no accession SQL. The
-    two facts the accessor omits — `sample_name` and the project's `human_filtering`
-    intent — come from the canonical `run_pacbio_sample` view + the `project` table
-    (the same shape the Illumina reader uses).
+    project to the plate primary itself, so this wrapper adds no accession SQL.
+    The `pacbio_sample_idx` it returns is the sample's unique id (used as the
+    pool-item-id). The one intake fact the accessor omits — the project's
+    `human_filtering` flag — is read from the canonical `run_pacbio_sample` view +
+    the `project` table. (Reading the run-preflight schema directly here is a known
+    smell — the reader should own it; a dedicated accessor is the follow-up.)
 
     Operator-actionable errors (not a SQLite, a non-PacBio sheet, an empty sample
     set, a missing accession, or an impossible protocol combo) raise via
@@ -137,13 +139,12 @@ def _read_pacbio_preflight_rows(
                 " verify the file is a kl-run-preflight SQLite"
             )
         sheet_type = legacy_format[1]
-        # sample_name + effective project_name per pacbio_sample (the accessor
-        # returns neither): the canonical run-scoped view carries both.
-        meta_by_idx = {
-            idx: (name, project)
-            for idx, name, project in conn.execute(
-                "SELECT pacbio_sample_idx, sample_name, project_name"
-                " FROM run_pacbio_sample WHERE run_idx = ?",
+        # Effective project_name per pacbio_sample (the accessor omits it): the
+        # canonical run-scoped view resolves it (incl. a control's plate primary).
+        project_by_idx = {
+            idx: project
+            for idx, project in conn.execute(
+                "SELECT pacbio_sample_idx, project_name FROM run_pacbio_sample WHERE run_idx = ?",
                 (run_idx,),
             ).fetchall()
         }
@@ -192,22 +193,22 @@ def _read_pacbio_preflight_rows(
         pbs = info.kind_row
         # The accessor's sample_idx set is a subset of the view (same run, do_not_use
         # excluded), so a miss cannot happen for a well-formed preflight — fail loud
-        # rather than coin a fake sample_name + silently default human_filtering.
-        meta = meta_by_idx.get(info.sample_idx)
-        if meta is None:
+        # rather than silently default the project.
+        if info.sample_idx not in project_by_idx:
             parser.error(
                 f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
                 " is absent from the run_pacbio_sample view — the preflight is"
                 " internally inconsistent"
             )
-        sample_name, project_name = meta
+        project_name = project_by_idx[info.sample_idx]
         if not pbs.barcode_id:
             parser.error(
-                f"--preflight-blob {preflight_blob}: sample {sample_name!r} carries no"
-                " barcode_id; a PacBio sample cannot be located on disk without it"
+                f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
+                " carries no barcode_id; a PacBio sample cannot be located on disk"
+                " without it"
             )
         row = _PacbioPreflightRow(
-            sample_name=sample_name,
+            pacbio_sample_idx=info.sample_idx,
             barcode=pbs.barcode_id,
             biosample_accession=info.biosample_accession,
             primary_project_accession=info.primary_bioproject_accession,
@@ -228,22 +229,6 @@ def _read_pacbio_preflight_rows(
         )
         _validate_pacbio_protocol(row, preflight_blob, parser)
         parsed.append(row)
-
-    # Barcode must be unique across samples: it is this flow's pool-item-id AND the
-    # key both `_resolve_sample_bams` and the create-missing roster loop dedup on,
-    # so two rows sharing a barcode would silently collapse into one sample (the
-    # second overwriting the first, its reads dropped). A run demuxes each sample
-    # to a distinct barcode, so a duplicate is a corrupt preflight — fail loud.
-    by_barcode: dict[str, list[str]] = {}
-    for row in parsed:
-        by_barcode.setdefault(row.barcode, []).append(row.sample_name)
-    collisions = {bc: names for bc, names in by_barcode.items() if len(names) > 1}
-    if collisions:
-        detail = "; ".join(f"{bc}: {', '.join(names)}" for bc, names in sorted(collisions.items()))
-        parser.error(
-            f"--preflight-blob {preflight_blob}: barcode reused across samples ({detail});"
-            " each sample in a run must carry a distinct barcode"
-        )
     return parsed
 
 
@@ -264,15 +249,15 @@ def _validate_pacbio_protocol(
     """
     if row.syndna_is_twisted is True and not row.twist_adaptor_id:
         parser.error(
-            f"--preflight-blob {preflight_blob}: sample {row.sample_name!r} marks its"
-            " syndna twisted with no twist_adaptor_id; syndna can only be twisted"
-            " when a twist adapter was attached"
+            f"--preflight-blob {preflight_blob}: pacbio_sample_idx {row.pacbio_sample_idx}"
+            " marks its syndna twisted with no twist_adaptor_id; syndna can only be"
+            " twisted when a twist adapter was attached"
         )
     if row.syndna_is_twisted is True and row.sheet_type == _SHEET_TYPE_METAG:
         parser.error(
-            f"--preflight-blob {preflight_blob}: sample {row.sample_name!r} marks its"
-            f" syndna twisted on a {_SHEET_TYPE_METAG!r} sheet, which quantifies no"
-            " syndna; only the absquant protocol carries syndna"
+            f"--preflight-blob {preflight_blob}: pacbio_sample_idx {row.pacbio_sample_idx}"
+            f" marks its syndna twisted on a {_SHEET_TYPE_METAG!r} sheet, which"
+            " quantifies no syndna; only the absquant protocol carries syndna"
         )
 
 
@@ -290,12 +275,12 @@ def _index_run_bams(run_folder: Path) -> tuple[dict[str, Path], set[str]]:
     under more than one SMRT cell. A duplicated barcode is left OUT of `index` and
     is a hard error at resolution time — barcode reuse across SMRT cells within a
     run is real (e.g. bc2083 under both 1_B01 and 1_C01) and cannot be
-    disambiguated while the preflight carries no SMRT-cell column. This is the
-    graceful-degradation rule: unique barcodes just resolve; a collision on a
-    barcode a sample actually needs fails loud rather than silently binding the
-    wrong cell's reads. (When the preflight grows a SMRT-cell field, key on
-    `(smartcell, barcode)` — derivable from the well subdirectory or the movie
-    name's `s#` token — and this collision set becomes empty.)
+    disambiguated without the SMRT cell. This is the graceful-degradation rule:
+    unique barcodes just resolve; a collision on a barcode a sample actually needs
+    fails loud rather than silently binding the wrong cell's reads. (The preflight
+    now carries a SMRT-cell field; once it is populated, key on `(smrt_cell, barcode)`
+    — matching the well subdirectory or the movie name's `s#` token — and this
+    collision set becomes empty.)
     """
     index: dict[str, Path] = {}
     duplicated: set[str] = set()
@@ -324,24 +309,36 @@ def _resolve_sample_bams(
 ) -> dict[str, Path]:
     """Resolve every sample's absolute BAM path before any network call.
 
-    Returns barcode -> absolute BAM path. Fails via `parser.error` (exit 2) on an
-    empty run folder, a sample whose barcode has no BAM, or a barcode that
-    collides across SMRT cells (see `_index_run_bams`) — so the operator gets one
-    actionable error instead of N FAILED `bam-to-parquet` tickets.
+    Returns barcode -> absolute BAM path. Barcode is the sample's BAM-locating key
+    (NOT its identity — that is `pacbio_sample_idx`), and it is not guaranteed
+    unique across PacBio protocols, so a barcode shared by two samples, or one that
+    maps to BAMs in more than one SMRT cell, is AMBIGUOUS: without the SMRT cell we
+    cannot bind each sample to its own reads, so it is a hard error (not a silent
+    wrong-BAM bind). Fails via `parser.error` (exit 2) on an empty run folder, a
+    sample whose barcode has no BAM, or either ambiguity — one actionable error
+    instead of N FAILED `bam-to-parquet` tickets.
     """
     index, duplicated = _index_run_bams(run_folder)
     if not index and not duplicated:
         parser.error(
             f"--run-folder {run_folder} contains no HiFi BAMs (expected */hifi_reads/*.bam)"
         )
+    # A barcode two samples both claim can't be split between them without the SMRT
+    # cell — treat it like a cross-cell collision (ambiguous), not a silent shared BAM.
+    barcode_rows: dict[str, list[int]] = {}
+    for row in rows:
+        barcode_rows.setdefault(row.barcode, []).append(row.pacbio_sample_idx)
+    shared = {bc for bc, idxs in barcode_rows.items() if len(idxs) > 1}
+
     resolved: dict[str, Path] = {}
     missing: list[str] = []
     ambiguous: list[str] = []
     for row in rows:
-        if row.barcode in duplicated:
-            ambiguous.append(f"{row.sample_name} ({row.barcode})")
+        label = f"pacbio_sample_idx {row.pacbio_sample_idx} ({row.barcode})"
+        if row.barcode in duplicated or row.barcode in shared:
+            ambiguous.append(label)
         elif row.barcode not in index:
-            missing.append(f"{row.sample_name} ({row.barcode})")
+            missing.append(label)
         else:
             # .absolute(), not .resolve(): the orchestrator binds the BAM's parent
             # dir by its given absolute path, so dereferencing symlinks here could
@@ -349,9 +346,9 @@ def _resolve_sample_bams(
             resolved[row.barcode] = index[row.barcode].absolute()
     if ambiguous:
         parser.error(
-            f"--run-folder {run_folder}: barcode reuse across SMRT cells for"
-            f" {len(ambiguous)} sample(s) cannot be disambiguated without SMRT-cell"
-            f" information: {', '.join(ambiguous)}"
+            f"--run-folder {run_folder}: barcode(s) reused across samples or SMRT"
+            f" cells for {len(ambiguous)} sample(s) cannot be disambiguated without"
+            f" SMRT-cell information: {', '.join(ambiguous)}"
         )
     if missing:
         parser.error(
@@ -379,10 +376,11 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        server-side re-read parser exists yet: human_filtering is echoed in this
        command's summary for operator reference only and is not forwarded onward.
     4. GET the pool roster and create only the MISSING sequenced-samples
-       (`sequenced_pool_item_id = barcode`, the PacBio demux identifier — the
-       analogue of bcl-convert's illumina_sample_idx). The composer 409s on a
-       duplicate (pool, item_id), so create-missing (not blind-POST) is what makes
-       a retry converge instead of aborting on the first already-created sample.
+       (`sequenced_pool_item_id = pacbio_sample_idx`, the sample's unique preflight
+       id — the exact analogue of bcl-convert's illumina_sample_idx; the barcode is
+       NOT used here, it is not unique across PacBio protocols). The composer 409s
+       on a duplicate (pool, item_id), so create-missing (not blind-POST) is what
+       makes a retry converge instead of aborting on the first already-created sample.
     5. Fan out one `bam-to-parquet` ticket per sample (scope prep_sample,
        action_context {bam_path, expect_unaligned: true}). Per-sample resilient:
        one sample's ticket failure is recorded and the fan-out continues. A 409
@@ -427,8 +425,9 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
 
     def _run(token: str) -> dict:
         # Shared run → pool → roster provisioning (create-missing; fails fast on an
-        # unresolved accession). PacBio keys the pool-item-id on the barcode (unique
-        # within a pool by the same no-barcode-reuse rule the BAM index enforces).
+        # unresolved accession). PacBio keys the pool-item-id on pacbio_sample_idx —
+        # the sample's unique preflight id (the barcode is only the BAM-locating key
+        # and is not unique across protocols).
         provision = _provision_run_pool_roster(
             args.base_url,
             token,
@@ -436,15 +435,15 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             run_body=run_body,
             pool_body=pool_body,
             prep_protocol_idx=args.prep_protocol_idx,
-            pool_item_id=lambda row: row.barcode,
-            row_label=lambda row: f"sample {row.sample_name}",
+            pool_item_id=lambda row: str(row.pacbio_sample_idx),
+            row_label=lambda row: f"pacbio_sample_idx {row.pacbio_sample_idx}",
             row_noun="sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
         per_sample = [
             {
-                "sample_name": s.row.sample_name,
+                "pacbio_sample_idx": s.row.pacbio_sample_idx,
                 "barcode": s.row.barcode,
                 "bam_path": str(bam_by_barcode[s.row.barcode]),
                 "biosample_idx": s.biosample_idx,

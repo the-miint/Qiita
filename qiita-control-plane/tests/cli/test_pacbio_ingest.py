@@ -76,11 +76,11 @@ def test_index_run_bams_quarantines_barcode_reused_across_cells(tmp_path):
     assert duplicated == {"bc1"}
 
 
-def _row(barcode: str, sample_name: str = "s"):
+def _row(barcode: str, idx: int = 1):
     from qiita_control_plane.cli.user import _PacbioPreflightRow
 
     return _PacbioPreflightRow(
-        sample_name=sample_name,
+        pacbio_sample_idx=idx,
         barcode=barcode,
         biosample_accession="BIO",
         primary_project_accession="99999",
@@ -102,14 +102,23 @@ def test_resolve_sample_bams_happy_path(tmp_path):
 def test_resolve_sample_bams_errors_on_missing(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     with pytest.raises(_RaisingParser.Error, match="no HiFi BAM found"):
-        _resolve_sample_bams([_row("bcX", "missing_one")], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _RaisingParser())
 
 
-def test_resolve_sample_bams_errors_on_ambiguous(tmp_path):
+def test_resolve_sample_bams_errors_on_cross_cell_barcode(tmp_path):
+    """A barcode with BAMs in two SMRT cells can't be bound without the cell."""
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc1")
-    with pytest.raises(_RaisingParser.Error, match="barcode reuse across SMRT cells"):
-        _resolve_sample_bams([_row("bc1", "dup_one")], tmp_path, _RaisingParser())
+    with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
+        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _RaisingParser())
+
+
+def test_resolve_sample_bams_errors_on_two_samples_sharing_a_barcode(tmp_path):
+    """Two distinct samples claiming the same barcode can't be split between the
+    BAM(s) without the SMRT cell — ambiguous, not a silent shared BAM."""
+    _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
+    with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
+        _resolve_sample_bams([_row("bc1", 1), _row("bc1", 2)], tmp_path, _RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_empty_run_folder(tmp_path):
@@ -126,7 +135,7 @@ def test_validate_protocol_rejects_twisted_without_adapter():
     from qiita_control_plane.cli.user import _PacbioPreflightRow
 
     row = _PacbioPreflightRow(
-        sample_name="s",
+        pacbio_sample_idx=1,
         barcode="bc",
         biosample_accession="B",
         primary_project_accession="9",
@@ -145,7 +154,7 @@ def test_validate_protocol_allows_untwisted_without_adapter():
     from qiita_control_plane.cli.user import _PacbioPreflightRow
 
     row = _PacbioPreflightRow(
-        sample_name="s",
+        pacbio_sample_idx=1,
         barcode="bc",
         biosample_accession="B",
         primary_project_accession="9",
@@ -206,30 +215,19 @@ def test_read_preflight_rows_case5(tmp_path):
     conn.close()
 
     rows = _read_pacbio_preflight_rows(db, _RaisingParser())
-    assert [r.sample_name for r in rows] == ["sample.1", "sample.2", "sample.3"]
+    # pacbio_sample_idx is the unique identity (ordered by the accessor); barcode is
+    # only the BAM-locating key.
+    assert [r.pacbio_sample_idx for r in rows] == [1, 2, 3]
     assert [r.barcode for r in rows] == ["bc3011", "bc0112", "bc9992"]
+    assert [r.biosample_accession for r in rows] == ["BIO_sample.1", "BIO_sample.2", "BIO_sample.3"]
     assert [r.smrt_cell for r in rows] == ["1_A01", None, None]
     assert [r.human_filtering for r in rows] == [True, True, True]
     for r in rows:
-        assert r.biosample_accession == f"BIO_{r.sample_name}"
         assert r.primary_project_accession == "PRJNA99999"  # control resolves to plate primary
         assert r.secondary_project_accessions == []
         assert r.sheet_type == "pacbio_absquant"
         assert r.twist_adaptor_id  # case 5: filled
         assert r.syndna_is_twisted is False
-
-
-def test_read_preflight_rows_rejects_barcode_reused_across_samples(tmp_path):
-    """Two samples sharing a barcode would collapse into one (barcode is the
-    pool-item-id and the resolve/roster dedup key), so it's a hard error."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
-    conn = sqlite3.connect(db)
-    # Force sample.2's barcode to equal sample.1's (bc3011).
-    conn.execute("UPDATE pacbio_sample SET barcode_id = 'bc3011' WHERE barcode_id = 'bc0112'")
-    conn.commit()
-    conn.close()
-    with pytest.raises(_RaisingParser.Error, match="barcode reused across samples"):
-        _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
 def test_read_preflight_rows_fails_on_missing_accession(tmp_path):
@@ -385,18 +383,15 @@ def test_submit_pacbio_ingest_fans_out_bam_to_parquet(monkeypatch, tmp_path):
         if r["method"] == "POST" and r["url"].rstrip("/").endswith("/sequencing-run")
     )
     assert run_post["json"]["platform"] == "pacbio_smrt"
-    # Each sequenced-sample is created with its barcode as the pool-item-id.
+    # Each sequenced-sample is created with its pacbio_sample_idx as the
+    # pool-item-id (NOT the barcode); the fixture's samples are idx 1/2/3.
     sample_posts = [
         r
         for r in captured["requests"]
         if r["method"] == "POST" and r["url"].endswith("/sequenced-sample")
     ]
     assert len(sample_posts) == 3
-    assert sorted(r["json"]["sequenced_pool_item_id"] for r in sample_posts) == [
-        "bc0112",
-        "bc3011",
-        "bc9992",
-    ]
+    assert sorted(r["json"]["sequenced_pool_item_id"] for r in sample_posts) == ["1", "2", "3"]
 
 
 def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(monkeypatch, tmp_path):
@@ -503,9 +498,14 @@ def test_submit_pacbio_ingest_retry_reuses_existing_roster(monkeypatch, tmp_path
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
 
+    # Pool-item-id is str(pacbio_sample_idx) — the fixture's samples are idx 1/2/3.
     existing = [
-        {"sequenced_pool_item_id": bc, "prep_sample_idx": 300 + i, "sequenced_sample_idx": 400 + i}
-        for i, bc in enumerate(("bc3011", "bc0112", "bc9992"))
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
     ]
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured, existing_samples=existing)
@@ -540,9 +540,10 @@ def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(monkeypatch
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
 
-    # bc3011 resolves to biosample_idx 11 (BIO_sample.1) in the stub, but the
-    # roster claims it maps to a different biosample — a divergent re-run.
-    existing = [{"sequenced_pool_item_id": "bc3011", "prep_sample_idx": 300, "biosample_idx": 999}]
+    # pacbio_sample_idx 1 (barcode bc3011) resolves to biosample_idx 11 (BIO_sample.1)
+    # in the stub, but the roster claims it maps to a different biosample — a
+    # divergent re-run (pool-item-id is str(pacbio_sample_idx) = "1").
+    existing = [{"sequenced_pool_item_id": "1", "prep_sample_idx": 300, "biosample_idx": 999}]
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured, existing_samples=existing)
     with pytest.raises(SystemExit) as ei:
@@ -561,8 +562,12 @@ def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(monkeypatch, tmp_pa
         _make_bam(run, "1_A01", "m84_s1", bc)
 
     existing = [
-        {"sequenced_pool_item_id": bc, "prep_sample_idx": 300 + i, "sequenced_sample_idx": 400 + i}
-        for i, bc in enumerate(("bc3011", "bc0112", "bc9992"))
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
     ]
     captured: dict = {}
     _stub_submit_flow(
@@ -592,7 +597,7 @@ def test_validate_protocol_rejects_twisted_on_metag():
     from qiita_control_plane.cli.user import _PacbioPreflightRow
 
     row = _PacbioPreflightRow(
-        sample_name="s",
+        pacbio_sample_idx=1,
         barcode="bc",
         biosample_accession="B",
         primary_project_accession="9",
