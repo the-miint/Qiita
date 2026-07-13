@@ -25,6 +25,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     ComputeTarget,
     ReferenceStatus,
     StepProgressState,
@@ -2341,9 +2342,13 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
         return idx
 
     try:
-        for s in ("pending", "queued", "processing"):
+        # Drive the loops off the shared constant rather than a hand-written tuple:
+        # a new WorkTicketState joins the derived non-terminal set automatically,
+        # and this test must move with it instead of quietly ignoring it.
+        for s in NON_TERMINAL_WORK_TICKET_STATES:
             seeded[s] = await _seed(s)
         completed_idx = await _seed("completed")
+        no_data_idx = await _seed("no_data")
         failed_idx = await _seed("failed", failed=True)
 
         scheduled: list[tuple[int, dict]] = []
@@ -2358,15 +2363,16 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
         count = await dispatch.reconcile_inflight_tickets(app)
 
         scheduled_idxs = {idx for idx, _ in scheduled}
-        # All three non-terminal tickets scheduled for resume.
-        for s in ("pending", "queued", "processing"):
+        # Every non-terminal ticket scheduled for resume.
+        for s in NON_TERMINAL_WORK_TICKET_STATES:
             assert seeded[s] in scheduled_idxs
         assert all(kw == {"resume": True} for idx, kw in scheduled if idx in seeded.values())
-        # Terminal tickets are never scheduled.
+        # No terminal ticket is scheduled — all THREE of them, no_data included.
         assert completed_idx not in scheduled_idxs
+        assert no_data_idx not in scheduled_idxs
         assert failed_idx not in scheduled_idxs
-        # Count covers at least our three (earlier tests may leave orphans).
-        assert count >= 3
+        # Count covers at least ours (earlier tests may leave orphans).
+        assert count >= len(NON_TERMINAL_WORK_TICKET_STATES)
     finally:
         if created_idxs:
             await postgres_pool.execute(

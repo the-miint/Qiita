@@ -20,7 +20,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import BCL_CONVERT_ACTION_ID, READ_MASK_ACTION_ID
-from qiita_common.models import Platform
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, Platform
 
 
 class PayloadMismatch(Exception):
@@ -468,17 +468,16 @@ async def fetch_sequenced_pool_completion(
     gesture mints against), NOT pinned to a version: the submitter chooses the
     read-mask version, and "this sample got masked" holds regardless of which
     version produced it (consistent with the read-metric / QC rollups, which read
-    persisted columns irrespective of the writing version). The inlined state
-    literals are pinned to qiita_common.models.WorkTicketState ('completed' /
-    'pending' / 'queued' / 'processing' / 'no_data' / 'failed' — its full closed
-    set); keep them in lockstep if that enum changes. Retired samples are
-    excluded (`ps.retired IS NOT TRUE`) to match the other pool rollups' sample
-    set."""
+    persisted columns irrespective of the writing version). The in-flight set is
+    bound from NON_TERMINAL_WORK_TICKET_STATES; it appears only inside a bool_or
+    in the target list, never in a WHERE, so no partial-index predicate depends
+    on its spelling. Retired samples are excluded (`ps.retired IS NOT TRUE`) to match the other pool
+    rollups' sample set."""
     return await pool_or_conn.fetchrow(
         "WITH sample_state AS ("
         "  SELECT ss.prep_sample_idx,"
         "    bool_or(wt.state = 'completed') AS has_completed,"
-        "    bool_or(wt.state IN ('pending', 'queued', 'processing')) AS has_inflight,"
+        "    bool_or(wt.state = ANY($3::qiita.work_ticket_state[])) AS has_inflight,"
         "    bool_or(wt.state = 'no_data') AS has_no_data,"
         "    bool_or(wt.state = 'failed') AS has_failed,"
         "    count(wt.work_ticket_idx) AS ticket_count"
@@ -504,6 +503,7 @@ async def fetch_sequenced_pool_completion(
         " FROM sample_state",
         sequenced_pool_idx,
         READ_MASK_ACTION_ID,
+        list(NON_TERMINAL_WORK_TICKET_STATES),
     )
 
 
@@ -521,12 +521,13 @@ async def fetch_sequenced_pool_demux_state(
     falling back to 'not_submitted' when the pool has no bcl-convert ticket at
     all. Matched on the bare BCL_CONVERT_ACTION_ID (version-agnostic — "did this
     pool's demux finish?" holds regardless of which version produced it). The
-    state literals are pinned to qiita_common.models.WorkTicketState; keep them
-    in lockstep if that enum changes."""
+    in-flight set is bound from NON_TERMINAL_WORK_TICKET_STATES; it appears only
+    inside a bool_or in the target list, never in a WHERE, so no partial-index
+    predicate depends on its spelling."""
     row = await pool_or_conn.fetchrow(
         "SELECT"
         "  bool_or(state = 'completed') AS has_completed,"
-        "  bool_or(state IN ('pending', 'queued', 'processing')) AS has_in_flight,"
+        "  bool_or(state = ANY($3::qiita.work_ticket_state[])) AS has_in_flight,"
         "  bool_or(state = 'no_data') AS has_no_data,"
         "  bool_or(state = 'failed') AS has_failed,"
         "  count(*) AS ticket_count"
@@ -534,6 +535,7 @@ async def fetch_sequenced_pool_demux_state(
         " WHERE sequenced_pool_idx = $1 AND action_id = $2",
         sequenced_pool_idx,
         BCL_CONVERT_ACTION_ID,
+        list(NON_TERMINAL_WORK_TICKET_STATES),
     )
     if row["has_completed"]:
         return "completed"

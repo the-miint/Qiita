@@ -61,6 +61,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     ReferenceStatus,
     ScopeTargetKind,
     StepProgressState,
@@ -81,7 +82,7 @@ from ..actions.reference import (
 from ..auth.guards import require_caller_has_admin_on_all_studies
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
-from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES, schedule_dispatch
+from ..dispatch import schedule_dispatch
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 
@@ -92,6 +93,16 @@ _log = logging.getLogger(__name__)
 _STEP_LOGS_DEFAULT_TAIL_LINES = 200
 _STEP_LOGS_MAX_TAIL_LINES = 5000
 _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
+
+# /run applies to exactly two states: a PENDING ticket that was never dispatched,
+# and a FAILED one being redriven in place. Everything else is refused. Expressed
+# as the complement of that pair rather than listed out, so a new WorkTicketState
+# defaults to REFUSED — the safe direction. Listing the refused states positively
+# would silently make a new state runnable.
+_RUN_APPLICABLE_STATES = frozenset({WorkTicketState.PENDING.value, WorkTicketState.FAILED.value})
+_RUN_NOT_APPLICABLE_STATES = tuple(
+    state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
+)
 
 router = APIRouter(prefix=PATH_WORK_TICKET_PREFIX, tags=["work-ticket"])
 
@@ -1207,12 +1218,7 @@ async def run_work_ticket(
     _check_scopes(principal, action["scopes"])
 
     current_state = row["state"]
-    if current_state in (
-        WorkTicketState.QUEUED.value,
-        WorkTicketState.PROCESSING.value,
-        WorkTicketState.COMPLETED.value,
-        WorkTicketState.NO_DATA.value,
-    ):
+    if current_state in _RUN_NOT_APPLICABLE_STATES:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
