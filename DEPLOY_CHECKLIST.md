@@ -24,7 +24,7 @@ _None yet._
   climbs into that headroom). If the partition's `MaxMemPerNode` or `MaxTime` is
   below the ceiling, an escalated step is rejected by SLURM rather than queued.
   Check and, if either is short, raise the partition limits or lower the ceiling in
-  the YAML before deploying: (#TBD)
+  the YAML before deploying: (#285)
   ```bash
   scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
   ```
@@ -42,7 +42,7 @@ _None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via t
 
 - **`bam-to-parquet` picked up the new resources.** `activate.sh`'s `qiita-admin
   actions sync` is what carries the raised baseline/ceiling into `qiita.action`; a
-  stale row means every HiFi sample still OOMs: (#TBD)
+  stale row means every HiFi sample still OOMs: (#285)
   ```bash
   psql "$DATABASE_URL" -c "
     SELECT action_id, version, steps
@@ -52,7 +52,7 @@ _None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via t
   sequenced_pool 25016 — 24 of 26 OOM-killed). No cleanup is needed first: each
   failed attempt minted a `sequence_range` before dying, and the new build reads
   that range back and reuses it instead of 409ing on it. `ticket run` resets a
-  FAILED ticket and re-dispatches it in place: (#TBD)
+  FAILED ticket and re-dispatches it in place: (#285)
   ```bash
   for i in $(seq 4805 4830); do qiita ticket run "$i" || true; done   # already-COMPLETED ones no-op
   ```

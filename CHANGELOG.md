@@ -123,7 +123,7 @@ the `no-changelog` label).
   in `sequence_range_retry` and all three jobs use it (409 → read back → validate
   width against the read count → reuse). Both halves were needed: without the
   read-back the escalation cannot land, and without the memory it has nothing to
-  land on.
+  land on. (#285)
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
   partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
   by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the
