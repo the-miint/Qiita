@@ -5,29 +5,43 @@ on:
   # gates showing up as "Skipped" on a meaningless push-event run).
   push:
     branches: [main]
+  # `labeled` is here so adding the `ci-macos` label re-runs CI with the macOS
+  # matrix (see the config job) — the default types don't fire on a label change.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Which OSes the matrix jobs fan out over, decided per event. macOS runners
-  # are ~6-15× slower than Ubuntu for this suite and dominate PR wall-clock,
-  # while the deploy target is Linux — so PRs run Ubuntu-only for fast feedback
-  # and macOS coverage runs on every push to main (post-merge). Emitted as a
-  # JSON array string for `fromJSON` in each matrix below.
+  # Which OSes the matrix jobs fan out over. macOS runners are ~6-15× slower than
+  # Ubuntu for this suite and dominate PR wall-clock, while the deploy target is
+  # Linux — so PRs run Ubuntu-only for fast feedback and macOS coverage runs on
+  # every push to main (post-merge).
+  #
+  # The gap that leaves: a defect only macOS can see is found AFTER merge, with
+  # main already red. The test DB is isolated per xdist WORKER, so a test leaking
+  # rows into the shared DB only collides with an innocent test when the runner's
+  # core count co-locates them on one worker — which is precisely a bug the Ubuntu
+  # matrix cannot see. Label a PR `ci-macos` to fan out over macOS BEFORE merging;
+  # use it for anything touching shared test fixtures or cross-test DB state.
+  #
+  # Emitted as a JSON array string for `fromJSON` in each matrix below.
   config:
     runs-on: ubuntu-latest
     outputs:
       os: ${{ steps.os.outputs.os }}
     steps:
       - id: os
+        env:
+          WANT_MACOS: ${{ github.event_name != 'pull_request'
+            || contains(github.event.pull_request.labels.*.name, 'ci-macos') }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
-          else
+          if [ "$WANT_MACOS" = "true" ]; then
             echo 'os=["ubuntu-latest", "macos-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
           fi
 
   lint-python:

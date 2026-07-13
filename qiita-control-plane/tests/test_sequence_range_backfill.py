@@ -73,22 +73,57 @@ async def sample(postgres_pool):
         postgres_pool, owner_idx=principal_idx
     )
     # work_ticket FKs (action_id, action_version) → qiita.action. The test DB has no
-    # synced workflows, so register the two loader actions the backfill keys on.
+    # synced workflows, so register the loader actions the backfill keys on. The
+    # VERSION is unique to this fixture: these are stepless stubs, and parking one on
+    # a real (action_id, '1.0.0') would both shadow that action for anyone who later
+    # submits against it and make the teardown below ambiguous — under ON CONFLICT the
+    # fixture cannot know whether the row it would delete is the one it inserted.
+    version = f"0.0.0-{suffix}"
     for action_id in ("bam-to-parquet", "fastq-to-parquet"):
-        await postgres_pool.execute(
-            "INSERT INTO qiita.action"
-            " (action_id, version, target_kind, scopes, audience, steps,"
-            "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling)"
-            " VALUES ($1, '1.0.0', 'prep_sample', '{}', '{}'::jsonb, '[]'::jsonb,"
-            "         1, 1, '1 hour'::interval)"
-            " ON CONFLICT DO NOTHING",
-            action_id,
-        )
-    yield {"pool": postgres_pool, "principal_idx": principal_idx, "prep_sample_idx": ps_idx}
+        await _seed_action(postgres_pool, action_id, version, "prep_sample")
+    yield {
+        "pool": postgres_pool,
+        "principal_idx": principal_idx,
+        "prep_sample_idx": ps_idx,
+        "version": version,
+    }
+
+    # The rows another test could TRIP OVER. (The principal, biosample, prep_sample and
+    # pool rows survive: every count in the suite is idx-scoped, so nothing acts on
+    # them.) The tickets are the load-bearing half — seeded terminal with `notified_at
+    # IS NULL`, which is exactly the notify sweeper's owed-set predicate, and the
+    # sweeper scans the whole database, so a leaked one gets emailed about and fails an
+    # innocent test elsewhere. The DB is isolated per xdist WORKER, not per test.
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE originator_principal_idx = $1", principal_idx
+    )
+    # sequence_range.minted_by_work_ticket_idx has no FK, so the DELETE above would
+    # otherwise leave ranges pointing at tickets that no longer exist.
+    await postgres_pool.execute(
+        "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = $1", ps_idx
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = ANY($1::text[]) AND version = $2",
+        ["bam-to-parquet", "fastq-to-parquet", "bcl-convert"],
+        version,
+    )
+
+
+async def _seed_action(pool, action_id: str, version: str, target_kind: str) -> None:
+    """A stepless `qiita.action` row, purely to satisfy work_ticket's FK."""
+    await pool.execute(
+        "INSERT INTO qiita.action"
+        " (action_id, version, target_kind, scopes, audience, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling)"
+        " VALUES ($1, $2, $3, '{}', '{}'::jsonb, '[]'::jsonb, 1, 1, '1 hour'::interval)",
+        action_id,
+        version,
+        target_kind,
+    )
 
 
 async def _loader_ticket(
-    pool, *, prep_sample_idx, principal_idx, action_id, created_at, state="completed"
+    pool, *, prep_sample_idx, principal_idx, action_id, created_at, version, state="completed"
 ):
     """A prep_sample-scoped loader ticket with an explicit created_at.
 
@@ -99,10 +134,11 @@ async def _loader_ticket(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx, scope_target_kind,"
         "  prep_sample_idx, state, created_at)"
-        " VALUES ($1, '1.0.0', $2, 'prep_sample', $3,"
-        "         $4::qiita.work_ticket_state, $5)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4,"
+        "         $5::qiita.work_ticket_state, $6)"
         " RETURNING work_ticket_idx",
         action_id,
+        version,
         principal_idx,
         prep_sample_idx,
         state,
@@ -110,7 +146,7 @@ async def _loader_ticket(
     )
 
 
-async def _pool_ingest(pool, *, prep_sample_idx, principal_idx, created_at):
+async def _pool_ingest(pool, *, prep_sample_idx, principal_idx, created_at, version):
     """Put the sample in a sequenced_pool and give that pool a bcl-convert ticket —
     the POOL-shaped minter (ingest_reads mints one range per sample in the pool).
     Returns (work_ticket_idx, sequenced_pool_idx)."""
@@ -120,21 +156,15 @@ async def _pool_ingest(pool, *, prep_sample_idx, principal_idx, created_at):
         owner_idx=principal_idx,
         sequenced_pool_item_id=f"item-{secrets.token_hex(3)}",
     )
-    await pool.execute(
-        "INSERT INTO qiita.action"
-        " (action_id, version, target_kind, scopes, audience, steps,"
-        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling)"
-        " VALUES ('bcl-convert', '1.0.0', 'sequenced_pool', '{}', '{}'::jsonb,"
-        "         '[]'::jsonb, 1, 1, '1 hour'::interval)"
-        " ON CONFLICT DO NOTHING"
-    )
+    await _seed_action(pool, "bcl-convert", version, "sequenced_pool")
     wt = await pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx, scope_target_kind,"
         "  sequenced_pool_idx, state, created_at)"
-        " VALUES ('bcl-convert', '1.0.0', $1, 'sequenced_pool', $2,"
-        "         'completed'::qiita.work_ticket_state, $3)"
+        " VALUES ('bcl-convert', $1, $2, 'sequenced_pool', $3,"
+        "         'completed'::qiita.work_ticket_state, $4)"
         " RETURNING work_ticket_idx",
+        version,
         principal_idx,
         pool_idx,
         created_at,
@@ -159,8 +189,10 @@ async def _range_at(pool, *, prep_sample_idx, principal_idx, created_at):
 async def test_backfill_attributes_a_range_its_ticket_minted(sample):
     """The ordinary case: the ticket was created, then its step minted the range."""
     pool, ps, pr = sample["pool"], sample["prep_sample_idx"], sample["principal_idx"]
+    version = sample["version"]
     wt = await _loader_ticket(
         pool,
+        version=version,
         prep_sample_idx=ps,
         principal_idx=pr,
         action_id="bam-to-parquet",
@@ -189,11 +221,13 @@ async def test_backfill_refuses_a_ticket_that_only_collided_with_the_range(sampl
     The range PREDATES the ticket, so it must stay unattributed.
     """
     pool, ps, pr = sample["pool"], sample["prep_sample_idx"], sample["principal_idx"]
+    version = sample["version"]
     # The range was minted first (by the pool ingest, which we don't model here).
     await _range_at(pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(9, 0))
     # ... and the stray per-sample loader came later and 409'd.
     await _loader_ticket(
         pool,
+        version=version,
         prep_sample_idx=ps,
         principal_idx=pr,
         action_id="fastq-to-parquet",
@@ -215,9 +249,11 @@ async def test_backfill_refuses_a_ticket_that_only_collided_with_the_range(sampl
 async def test_backfill_leaves_ambiguous_attribution_null(sample):
     """Two candidate minters → cannot attribute → NULL → fails closed."""
     pool, ps, pr = sample["pool"], sample["prep_sample_idx"], sample["principal_idx"]
+    version = sample["version"]
     for created in (_at(10, 0), _at(10, 1)):
         await _loader_ticket(
             pool,
+            version=version,
             prep_sample_idx=ps,
             principal_idx=pr,
             action_id="bam-to-parquet",
@@ -247,10 +283,12 @@ async def test_backfill_refuses_when_a_pool_ingest_also_could_have_minted(sample
     Both shapes are candidates, so the count is 2 → ambiguous → NULL → fails closed.
     """
     pool, ps, pr = sample["pool"], sample["prep_sample_idx"], sample["principal_idx"]
+    version = sample["version"]
 
     # A stray per-sample loader, created first (it 409'd and failed, or never ran).
     await _loader_ticket(
         pool,
+        version=version,
         prep_sample_idx=ps,
         principal_idx=pr,
         action_id="fastq-to-parquet",
@@ -259,7 +297,7 @@ async def test_backfill_refuses_when_a_pool_ingest_also_could_have_minted(sample
     # The pool ticket that actually minted the range, and the sample's membership in
     # that pool (the join the pool-shape candidate walks).
     pool_ticket, _pool_idx = await _pool_ingest(
-        pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(9)
+        pool, version=version, prep_sample_idx=ps, principal_idx=pr, created_at=_at(9)
     )
     # The range was minted by the POOL ingest — after both tickets exist.
     await _range_at(pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(10))
