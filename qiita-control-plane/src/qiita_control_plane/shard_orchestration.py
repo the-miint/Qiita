@@ -29,8 +29,8 @@ from typing import Any
 
 import asyncpg
 from qiita_common.models import (
-    HOST_FILTER_INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_BOWTIE2,
+    INDEX_TYPE_MINIMAP2,
     ReferenceStatus,
 )
 
@@ -50,7 +50,7 @@ BUILD_SHARD_INDEX_ACTION_VERSION = "1.0.0"
 # the ONE whole-reference `rype_router` the parent reference-add builds, so the
 # per-shard analysis indexes are minimap2 + bowtie2 only.
 SHARD_BUILD_INDEX_TYPES: dict[str, str] = {
-    "build_minimap2": HOST_FILTER_INDEX_TYPE_MINIMAP2,
+    "build_minimap2": INDEX_TYPE_MINIMAP2,
     "build_bowtie2": INDEX_TYPE_BOWTIE2,
 }
 

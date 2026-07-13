@@ -30,14 +30,13 @@ os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
 
 import asyncpg  # noqa: E402
 import pytest  # noqa: E402
-from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
-
 from _pg_env import (
     LIB_PATH_ENV,
     ducklake_catalog_connstr,
     find_duckdb_lib_dir,
 )
+from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
 from qiita_control_plane.testing.jwks import jwks_harness  # noqa: F401
 from qiita_control_plane.testing.postgres import (  # noqa: F401
     _run_db_migrations,
@@ -67,8 +66,10 @@ def _stage_miint_extension():
     """Stage miint once into the per-suite extension dir so the LOAD-only job
     paths (`open_miint_conn`) work — the integration mirror of the deploy stage.
     Plain INSTALL (not the deploy's FORCE) so the stable temp dir caches across
-    runs. Kept in step with qiita-compute-orchestrator/tests/conftest.py's
-    identical fixture."""
+    runs. Also installs the GPL-boundary tool host once, mirroring the deploy's
+    `stage_miint_extension` (bowtie2 alignment runs behind it), so the sharded-
+    alignment smoke finds it pre-installed as a native job does. Kept in step with
+    qiita-compute-orchestrator/tests/conftest.py's identical fixture."""
     import duckdb
     from qiita_common.duckdb_miint import (
         miint_connect_config,
@@ -79,6 +80,7 @@ def _stage_miint_extension():
     with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
+        conn.execute("SELECT install_gpl_boundary()")
 
 
 POSTGRES_URL = resolve_postgres_url()
@@ -254,7 +256,9 @@ def data_plane(signing_key, tmp_path_factory):
         "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
         # The data plane verifies with the PUBLIC key derived from the signing seed.
         "FLIGHT_TICKET_PUBLIC_KEY": base64.b64encode(
-            Ed25519PrivateKey.from_private_bytes(signing_key).public_key().public_bytes_raw()
+            Ed25519PrivateKey.from_private_bytes(signing_key)
+            .public_key()
+            .public_bytes_raw()
         ).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "PATH_PERSISTENT": str(persistent_base),

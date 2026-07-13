@@ -140,14 +140,15 @@ async def _write_genome_associations(
     if not feat_idxs:
         return
 
-    # Dedupe to one row per (source, source_id) before the upsert. A genome maps
-    # to many features (a multi-contig assembly; the qiita case: one sample →
-    # one assembly → many contigs, all sharing one source_id), so the same
-    # (source, source_id) recurs across the batch — and Postgres refuses to let
-    # one INSERT ... ON CONFLICT DO UPDATE touch the same conflict target twice
-    # ("cannot affect row a second time"). The dict keeps the last
-    # prep_sample_idx per key (consistent for valid input — a genome has one
-    # origin, already vetted by _validate_genome_map).
+    # Dedupe to one row per (source, source_id) before the upsert. A genome (a
+    # binned MAG or a circular isolate) maps to many features — its contigs — all
+    # sharing that genome's source_id, and a single sample's assembly can yield MANY
+    # such genomes (each bin its own (source, source_id)). So a given (source,
+    # source_id) recurs across the batch once per contig of that genome, and
+    # Postgres refuses to let one INSERT ... ON CONFLICT DO UPDATE touch the same
+    # conflict target twice ("cannot affect row a second time"). The dict keeps the
+    # last prep_sample_idx per key (consistent for valid input — a genome has one
+    # origin sample, already vetted by _validate_genome_map).
     genome_prep = {
         (s, sid): prep for s, sid, prep in zip(sources, source_ids, prep_sample_idxs, strict=True)
     }

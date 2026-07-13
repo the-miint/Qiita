@@ -11,6 +11,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INDEX_TYPE_BOWTIE2,
+    INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_RYPE_ROUTER,
     ReferenceStatus,
 )
@@ -274,7 +275,7 @@ async def _resolve_host_filter_legacy(
 # `reference_index.index_type` string, and the number of `fs_path` parents to
 # climb to reach the shared shard-root directory (the path convention above).
 _SHARD_ALIGNER: dict[str, tuple[str, int]] = {
-    "minimap2": (HOST_FILTER_INDEX_TYPE_MINIMAP2, 0),
+    "minimap2": (INDEX_TYPE_MINIMAP2, 0),
     "bowtie2": (INDEX_TYPE_BOWTIE2, 1),
 }
 

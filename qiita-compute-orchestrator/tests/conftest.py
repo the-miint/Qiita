@@ -29,6 +29,9 @@ def _stage_miint_extension():
     temp extension dir (`setup_miint_test_env` above) so LOAD-only callers find
     it. Plain INSTALL (not the deploy's FORCE) so the stable temp dir caches
     across runs — first run downloads from the mirror, later runs are instant.
+    Also installs the GPL-boundary tool host once, mirroring what the deploy's
+    `stage_miint_extension` does (bowtie2 alignment and friends run behind it), so
+    real-miint smokes find it pre-installed exactly as a native job does at runtime.
     Kept in step with the integration conftest's identical fixture."""
     import duckdb
     from qiita_common.duckdb_miint import (
@@ -40,6 +43,7 @@ def _stage_miint_extension():
     with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
+        conn.execute("SELECT install_gpl_boundary()")
 
 
 @pytest.fixture

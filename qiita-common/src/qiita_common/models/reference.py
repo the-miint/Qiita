@@ -210,22 +210,29 @@ class PrepProtocolResponse(BaseModel):
     created_at: AwareDatetime
 
 
+# The minimap2 `.mmi` subject index. DUAL-PURPOSE: the second host-filter pass AND a
+# per-shard analysis-alignment index the sharded aligner consumes. Use this neutral
+# name in the analysis-reference (sharding / alignment) context;
+# HOST_FILTER_INDEX_TYPE_MINIMAP2 below is the SAME value, aliased for the
+# host-filter context so that code reads in host-filter terms.
+INDEX_TYPE_MINIMAP2 = "minimap2"
+
 # The two search-index types a host reference must carry to host-filter: a rype
 # `.ryxdi` minimizer index (first pass) and a minimap2 `.mmi` (second pass). Shared
 # so the runner's "must carry both" gate (_resolve_host_filter_indexes) and the
 # CLI's submit-host-filter-pool pre-check resolve the same pair instead of pinning
 # the literals independently and drifting.
 HOST_FILTER_INDEX_TYPE_RYPE = "rype"
-HOST_FILTER_INDEX_TYPE_MINIMAP2 = "minimap2"
+HOST_FILTER_INDEX_TYPE_MINIMAP2 = INDEX_TYPE_MINIMAP2
 HOST_FILTER_REQUIRED_INDEX_TYPES = frozenset(
     {HOST_FILTER_INDEX_TYPE_RYPE, HOST_FILTER_INDEX_TYPE_MINIMAP2}
 )
 
-# The bowtie2 subject index (`.bt2` set), an ANALYSIS-alignment index the eventual
-# sharded aligner consumes. Unlike rype/minimap2 (dual-purpose: host-filter AND
-# analysis), bowtie2 is analysis-only, so it is deliberately NOT in
-# HOST_FILTER_REQUIRED_INDEX_TYPES. Mirrors the `reference_index.index_type` CHECK
-# allow-list (plain TEXT+CHECK, no Postgres ENUM twin — see CLAUDE.md "Enum parity").
+# The bowtie2 subject index (`.bt2` set), an ANALYSIS-alignment index the sharded
+# aligner consumes. bowtie2 is analysis-only (unlike dual-purpose rype/minimap2), so
+# it is deliberately NOT in HOST_FILTER_REQUIRED_INDEX_TYPES. Mirrors the
+# `reference_index.index_type` CHECK allow-list (plain TEXT+CHECK, no Postgres ENUM
+# twin — see CLAUDE.md "Enum parity").
 INDEX_TYPE_BOWTIE2 = "bowtie2"
 
 # The whole-reference rype ROUTER `.ryxdi` (C1): a single multi-bucket rype index
