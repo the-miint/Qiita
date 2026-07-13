@@ -118,11 +118,12 @@ steps:
   # shard_index: true. MUST follow register-files — a shard build streams its
   # chunks from DuckLake, and register-files is what MOVES the staging chunks in.
   # plan-shards assigns reference_membership.shard_id, transitions
-  # loading → indexing, and fans out one build-shard-index ticket per shard
-  # (N = 0 for a reference with no genomes is a no-op). The action keeps
-  # success_status: active for the unsharded path; the runner's finalize skips
-  # that patch while a sharded fan-out is in progress (the reference is
-  # `indexing`), leaving `indexing → active` to each shard's terminal
+  # loading → indexing, and fans out one build-shard-index ticket per shard.
+  # A shard_index: true reference with N = 0 shardable features (no genomes / no
+  # genome map) FAILS the ticket rather than finalizing an unroutable `active`
+  # reference. The action keeps success_status: active for the unsharded path; the
+  # runner's finalize skips that patch while a sharded fan-out is in progress (the
+  # reference is `indexing`), leaving `indexing → active` to each shard's terminal
   # finalize-shard. No inputs/outputs: reference_idx is the scope target.
   - action: plan-shards
     when: shard_index
@@ -132,8 +133,10 @@ steps:
   # Whole-reference routing index (gated on the same fan-out as plan-shards).
   # plan-shards sets `router_pending: true` ONLY when it fanned out (N > 0 shards)
   # and stages the `shard_mapping` Parquet these steps consume; for an unsharded
-  # or no-genome (N == 0) reference it sets `router_pending: false` so all three
-  # entries skip and the reference goes `active` inline. Runs in the PARENT ticket
+  # reference (no `shard_index`) it sets `router_pending: false` so all three
+  # entries skip and the reference goes `active` inline. (A `shard_index: true`
+  # reference with N == 0 shardable features fails the ticket in plan-shards, so it
+  # never reaches these steps.) Runs in the PARENT ticket
   # AFTER plan-shards (needs reference_membership.shard_id) and in parallel with
   # the per-shard build children. build_routing_index builds the ONE
   # whole-reference multi-bucket rype ROUTER (one bucket per shard) that routes a

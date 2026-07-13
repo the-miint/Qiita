@@ -3306,10 +3306,15 @@ async def test_plan_shards_arm_stages_router_on_fanout(
         )
 
 
-async def test_plan_shards_arm_no_router_on_zero_shards(
+async def test_plan_shards_arm_raises_on_zero_shards_when_requested(
     postgres_pool, reference_idx, tmp_path, monkeypatch
 ):
-    """N == 0 (no-genome reference): router_pending False, no shard_mapping."""
+    """An EXPLICIT shard_index=true request that yields N == 0 shardable features
+    (no genomes / no genome map) FAILS the ticket rather than finalizing an
+    unroutable, terminal `active` reference with no router. The `when: shard_index`
+    gate + the opt-in guard mean this branch is only ever reached for a caller who
+    explicitly asked to shard, so the request is an error, not a silent no-op — the
+    operator supplies genomes and redrives (`failed → pending`)."""
     from qiita_common.actions import WorkflowAction
 
     from qiita_control_plane import runner, shard_orchestration
@@ -3321,18 +3326,18 @@ async def test_plan_shards_arm_no_router_on_zero_shards(
         return 0
 
     monkeypatch.setattr(shard_orchestration, "plan_shards", fake_noop)
-    out = await runner._run_action_primitive(
-        postgres_pool,
-        entry,
-        {"shard_index": True},
-        tmp_path,
-        ref_scope,
-        work_ticket_idx=1,
-        signing_key=b"x" * 32,
-        data_plane_url="grpc://unused:1",
-        dispatch_cb=lambda _idx: None,
-    )
-    assert out == {"router_pending": False}
+    with pytest.raises(RuntimeError, match="no genome-bearing features to shard"):
+        await runner._run_action_primitive(
+            postgres_pool,
+            entry,
+            {"shard_index": True},
+            tmp_path,
+            ref_scope,
+            work_ticket_idx=1,
+            signing_key=b"x" * 32,
+            data_plane_url="grpc://unused:1",
+            dispatch_cb=lambda _idx: None,
+        )
 
 
 async def test_reconstruct_plan_shards_outputs_rederives_from_db(

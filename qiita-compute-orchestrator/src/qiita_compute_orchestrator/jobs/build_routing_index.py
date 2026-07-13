@@ -190,142 +190,153 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     )
 
     chunks_parquet = workspace / "router_chunks.parquet"
-    with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
-        apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
-        # Stream the WHOLE reference (feature_idx=None) and persist the chunks to a
-        # workspace Parquet — the COPY drains the Flight stream (so the client
-        # closes before the long rype build) and lands the chunks where rype's
-        # separate connection can re-scan them. Chunked-Parquet write settings keep
-        # the row layout narrow on genome-scale contigs (same as the ingest write).
-        async with open_reference_chunk_stream(
-            conn, reference_idx=inputs.reference_idx, feature_idx=None
-        ) as rel:
+    # Validate the COPY target ONCE and reuse it for both the write and the re-scan
+    # (DuckDB rejects bound params inside COPY / CREATE VIEW, so the path is inlined;
+    # validate_parquet_path enforces the fail-fast escaping contract on both).
+    chunks_sql = validate_parquet_path(chunks_parquet)
+    try:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
+            apply_duckdb_settings(
+                conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS
+            )
+            # Stream the WHOLE reference (feature_idx=None) and persist the chunks to
+            # a workspace Parquet — the COPY drains the Flight stream (so the client
+            # closes before the long rype build) and lands the chunks where rype's
+            # separate connection can re-scan them. Chunked-Parquet write settings
+            # keep the row layout narrow on genome-scale contigs (same as ingest).
+            async with open_reference_chunk_stream(
+                conn, reference_idx=inputs.reference_idx, feature_idx=None
+            ) as rel:
+                conn.execute(
+                    f"COPY (SELECT feature_idx, chunk_index, chunk_data FROM {rel}) "
+                    f"TO '{chunks_sql}' ({PARQUET_OPTS_CHUNKED})"
+                )
+
+            # Multi-bucket mapping straight from the staged Parquet: one bucket per
+            # shard (`bucket_name = str(shard_id)`), each feature at most once. Cast
+            # to the exact rype mapping_table types. Built BEFORE the chunk corpus
+            # view so the corpus can be scoped to exactly the mapped feature set.
+            mapping_sql = validate_parquet_path(inputs.shard_mapping)
             conn.execute(
-                f"COPY (SELECT feature_idx, chunk_index, chunk_data FROM {rel}) "
-                f"TO '{chunks_parquet}' ({PARQUET_OPTS_CHUNKED})"
+                f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
+                "SELECT CAST(feature_idx AS BIGINT) AS feature_idx, "
+                "CAST(bucket_name AS VARCHAR) AS bucket_name "
+                f"FROM read_parquet('{mapping_sql}')"
             )
-
-        # Non-temp VIEW over the persisted chunks so rype's separate bind/execute
-        # connection resolves it by name and windows over the on-disk Parquet
-        # (never materialised into an in-memory table). Same shape build_rype_index
-        # host mode uses. `validate_parquet_path` enforces the fail-fast escaping
-        # contract on the inlined path (DuckDB rejects params inside CREATE VIEW).
-        chunks_sql = validate_parquet_path(chunks_parquet)
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
-            "SELECT feature_idx, chunk_index, chunk_data "
-            f"FROM read_parquet('{chunks_sql}')"
-        )
-        num_features = conn.execute(
-            f"SELECT count(DISTINCT feature_idx) FROM {_CHUNK_VIEW}"
-        ).fetchone()[0]
-        if num_features == 0:
-            # No chunks streamed — nothing to route. This job only runs where a
-            # router is required, so an empty stream is a fail-fast, not a silent
-            # empty router.
-            raise ValueError(
-                f"reference {inputs.reference_idx} streamed no sequence chunks: "
-                "nothing to build a routing index from"
+            # Mapping integrity (fail-fast, per the repo's "silent failures are bugs"
+            # ethos): this job takes the mapping on faith from an external staging
+            # step (the runner), unlike build_rype_index which derives its own from
+            # the chunks — so validate what that roster is contractually required to
+            # be.
+            num_mapped, non_null_features, num_features_mapped, num_buckets, non_null_buckets = (
+                conn.execute(
+                    f"SELECT count(*), count(feature_idx), count(DISTINCT feature_idx), "
+                    f"count(DISTINCT bucket_name), count(bucket_name) FROM {_MAPPING_TABLE}"
+                ).fetchone()
             )
+            if num_mapped == 0:
+                raise ValueError(
+                    f"shard_mapping ({inputs.shard_mapping}) is empty: "
+                    "nothing maps features to shards, so there is no router to build"
+                )
+            if non_null_features != num_mapped or non_null_buckets != num_mapped:
+                raise ValueError(
+                    f"shard_mapping ({inputs.shard_mapping}) has NULL feature_idx or "
+                    "bucket_name rows — every row must map a feature to a shard bucket"
+                )
+            if num_features_mapped != num_mapped:
+                raise ValueError(
+                    f"shard_mapping ({inputs.shard_mapping}) maps a feature_idx to more "
+                    "than one shard: each feature belongs to exactly one shard "
+                    f"({num_mapped} rows, {num_features_mapped} distinct features)"
+                )
 
-        # Multi-bucket mapping straight from the staged Parquet: one bucket per
-        # shard (`bucket_name = str(shard_id)`), each feature at most once. Cast to
-        # the exact rype mapping_table types.
-        mapping_sql = validate_parquet_path(inputs.shard_mapping)
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
-            "SELECT CAST(feature_idx AS BIGINT) AS feature_idx, "
-            "CAST(bucket_name AS VARCHAR) AS bucket_name "
-            f"FROM read_parquet('{mapping_sql}')"
-        )
-        # Mapping integrity (fail-fast, per the repo's "silent failures are bugs"
-        # ethos): this job takes the mapping on faith from an external staging step
-        # (the runner), unlike build_rype_index which derives its own from the
-        # chunks — so validate what that roster is contractually required to be.
-        num_mapped, non_null_features, num_features_mapped, num_buckets, non_null_buckets = (
+            # The rype corpus is the MAPPED feature set only. The stream is
+            # whole-reference (every member), but a reference may legitimately have
+            # no-genome members (16S / deferred / a genome map that covers only a
+            # subset of contigs) that plan_shards leaves with shard_id NULL and thus
+            # OUT of shard_mapping. Those features live in no shard, so routing a read
+            # to them is meaningless — scope the corpus to the mapped set (a semi-join
+            # against the mapping) rather than rejecting the whole build. This is what
+            # makes a partial genome map a SUPPORTED input instead of a hard failure
+            # that only surfaces AFTER the per-shard fan-out has committed hours of
+            # index builds.
             conn.execute(
-                f"SELECT count(*), count(feature_idx), count(DISTINCT feature_idx), "
-                f"count(DISTINCT bucket_name), count(bucket_name) FROM {_MAPPING_TABLE}"
-            ).fetchone()
-        )
-        if num_mapped == 0:
-            raise ValueError(
-                f"shard_mapping ({inputs.shard_mapping}) is empty: "
-                "nothing maps features to shards, so there is no router to build"
+                f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
+                "SELECT feature_idx, chunk_index, chunk_data "
+                f"FROM read_parquet('{chunks_sql}') "
+                f"WHERE feature_idx IN (SELECT feature_idx FROM {_MAPPING_TABLE})"
             )
-        if non_null_features != num_mapped or non_null_buckets != num_mapped:
-            raise ValueError(
-                f"shard_mapping ({inputs.shard_mapping}) has NULL feature_idx or "
-                "bucket_name rows — every row must map a feature to a shard bucket"
+            num_features = conn.execute(
+                f"SELECT count(DISTINCT feature_idx) FROM {_CHUNK_VIEW}"
+            ).fetchone()[0]
+            if num_features == 0:
+                # No MAPPED feature streamed any chunks. This job only runs where a
+                # router is required, so an empty corpus is a fail-fast, not a
+                # silent empty router.
+                raise ValueError(
+                    f"reference {inputs.reference_idx}: no shard-mapped feature "
+                    "streamed any sequence chunks — nothing to build a routing "
+                    "index from"
+                )
+            # A mapped feature with NO streamed chunks is still a real error: a
+            # bucket over a feature that is not in the reference. (The reverse — a
+            # streamed feature absent from the mapping — is the legitimate no-genome
+            # case the scoping above absorbs, no longer an error.) Every mapped
+            # feature is distinct (checked above), so the count of mapped features
+            # that DID stream chunks (num_features) subtracted from the distinct
+            # mapped roster is exactly the unchunked-mapping count.
+            unchunked_mappings = num_features_mapped - num_features
+            if unchunked_mappings:
+                raise ValueError(
+                    f"reference {inputs.reference_idx}: shard_mapping "
+                    f"({inputs.shard_mapping}) maps {unchunked_mappings} feature(s) "
+                    "with no streamed chunks — a bucket over features that are not "
+                    "in the reference"
+                )
+
+            status = _run_rype_index_create(
+                conn,
+                _CHUNK_VIEW,
+                str(router_dir),
+                _MAPPING_TABLE,
+                k=inputs.k,
+                w=inputs.w,
+                max_memory=rype_max_memory_gb * 1024**3,
             )
-        if num_features_mapped != num_mapped:
-            raise ValueError(
-                f"shard_mapping ({inputs.shard_mapping}) maps a feature_idx to more "
-                "than one shard: each feature belongs to exactly one shard "
-                f"({num_mapped} rows, {num_features_mapped} distinct features)"
+        if status != "ok":
+            raise RuntimeError(
+                f"rype_index_create returned status {status!r} (expected 'ok') for the "
+                f"router of reference {inputs.reference_idx} → {router_dir}"
             )
 
-        # Feature sets must AGREE: a streamed feature with no bucket would route
-        # nowhere (or to an unnamed bucket), and a mapped feature with no chunks is
-        # a bucket over nothing — both silently broken routers. Requiring an exact
-        # match is the correct fail-fast; when a later milestone introduces
-        # features that legitimately have no shard (NULL-shard 16S/no-genome), the
-        # producer must scope the stream and the mapping to the same set (or make a
-        # deliberate exclusion), and this guard forces that decision loudly rather
-        # than shipping a half-routed reference.
-        unmapped_chunks, unchunked_mappings = conn.execute(
-            f"SELECT "
-            f"(SELECT count(*) FROM (SELECT DISTINCT feature_idx FROM {_CHUNK_VIEW}) c "
-            f" LEFT JOIN {_MAPPING_TABLE} m USING (feature_idx) WHERE m.feature_idx IS NULL), "
-            f"(SELECT count(*) FROM {_MAPPING_TABLE} m "
-            f" LEFT JOIN (SELECT DISTINCT feature_idx FROM {_CHUNK_VIEW}) c USING (feature_idx) "
-            f" WHERE c.feature_idx IS NULL)"
-        ).fetchone()
-        if unmapped_chunks:
-            raise ValueError(
-                f"reference {inputs.reference_idx}: {unmapped_chunks} streamed feature(s) "
-                f"are absent from shard_mapping ({inputs.shard_mapping}) — they would route "
-                "to no shard; the stream and mapping must cover the same feature set"
-            )
-        if unchunked_mappings:
-            raise ValueError(
-                f"reference {inputs.reference_idx}: shard_mapping ({inputs.shard_mapping}) "
-                f"maps {unchunked_mappings} feature(s) with no streamed chunks — a bucket "
-                "over features that are not in the reference"
-            )
-
-        status = _run_rype_index_create(
-            conn,
-            _CHUNK_VIEW,
-            str(router_dir),
-            _MAPPING_TABLE,
-            k=inputs.k,
-            w=inputs.w,
-            max_memory=rype_max_memory_gb * 1024**3,
-        )
-    if status != "ok":
-        raise RuntimeError(
-            f"rype_index_create returned status {status!r} (expected 'ok') for the "
-            f"router of reference {inputs.reference_idx} → {router_dir}"
-        )
-
-    params = {
-        "k": inputs.k,
-        "w": inputs.w,
-        "source": "stream",
-        "feature_count": num_features,
-        "shard_count": num_buckets,
-    }
-    meta_path = workspace / "routing_index_meta.json"
-    # No `shard_id` key — the router is whole-reference, so register-index reads
-    # meta.get("shard_id") -> None -> a NULL shard_id row (matching the host
-    # rype/minimap2 rows). Only the in-tree meta JSON is a step output; the
-    # `.ryxdi` lives under PATH_DERIVED (outside the workspace) so it CANNOT be a
-    # declared output — register-index reads its location from meta `fs_path`.
-    meta = {
-        "index_type": INDEX_TYPE_RYPE_ROUTER,
-        "fs_path": str(router_dir),
-        "params": params,
-    }
-    meta_path.write_text(json.dumps(meta))
-    return {"routing_index_meta": meta_path}
+        params = {
+            "k": inputs.k,
+            "w": inputs.w,
+            "source": "stream",
+            # feature_count is the ROUTED feature set (mapped features with chunks),
+            # not the whole reference — no-genome members are not in the router.
+            "feature_count": num_features,
+            "shard_count": num_buckets,
+        }
+        meta_path = workspace / "routing_index_meta.json"
+        # No `shard_id` key — the router is whole-reference, so register-index reads
+        # meta.get("shard_id") -> None -> a NULL shard_id row (matching the host
+        # rype/minimap2 rows). Only the in-tree meta JSON is a step output; the
+        # `.ryxdi` lives under PATH_DERIVED (outside the workspace) so it CANNOT be a
+        # declared output — register-index reads its location from meta `fs_path`.
+        meta = {
+            "index_type": INDEX_TYPE_RYPE_ROUTER,
+            "fs_path": str(router_dir),
+            "params": params,
+        }
+        meta_path.write_text(json.dumps(meta))
+        return {"routing_index_meta": meta_path}
+    finally:
+        # router_chunks.parquet is a whole-reference dump (tens of GB at GG2 scale),
+        # NOT a declared output and consumed only within this call (rype re-scans it
+        # via _CHUNK_VIEW above). Remove it unconditionally so it does not leak into
+        # shared PATH_SCRATCH per build AND per retry attempt — the same "no space in
+        # /tmp" hazard the duckdb_tmp_dir guard exists for. missing_ok covers a
+        # failure before the COPY created it.
+        chunks_parquet.unlink(missing_ok=True)

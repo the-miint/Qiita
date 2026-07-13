@@ -57,6 +57,7 @@ from ._dispatch import (
     _shard_fanout_owns_finalize,
 )
 from ._mask import (
+    ALIGNMENT_IDX_BINDING,
     MASK_IDX_BINDING,
     _mint_read_mask,
     _persist_mask_idx,
@@ -314,7 +315,26 @@ async def run_workflow(
                 # so it stages the raw `read` table. mask_idx is pre-resolved at
                 # plan time on both paths (the align planner sets it to the samples'
                 # completed mask; the block-mask planner to the partition mask).
-                if work_ticket.get("alignment_idx") is not None:
+                #
+                # Discriminate on the action_context alignment_idx (the value the
+                # rest of the run already trusts — _reconstruct reads
+                # bound[ALIGNMENT_IDX_BINDING]), NOT the work_ticket.alignment_idx
+                # COLUMN: that column is ON DELETE SET NULL, so a mid-flight
+                # DELETE /alignment-definition NULLs it while action_context still
+                # carries the idx. Trusting the column would silently fall to the
+                # raw-reads branch and realign non-host-depleted, un-QC'd reads. Fail
+                # loud on any disagreement (the delete case) instead.
+                context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
+                if context_alignment_idx is not None:
+                    if work_ticket.get("alignment_idx") != context_alignment_idx:
+                        raise _submission_bad_input(
+                            "align block ticket action_context alignment_idx "
+                            f"{context_alignment_idx} disagrees with "
+                            "work_ticket.alignment_idx "
+                            f"{work_ticket.get('alignment_idx')!r} — the alignment "
+                            "definition was likely deleted mid-flight (the column is "
+                            "ON DELETE SET NULL); refusing to silently realign raw reads"
+                        )
                     align_mask_idx = work_ticket["mask_idx"]
                     if align_mask_idx is None:
                         raise _submission_bad_input(

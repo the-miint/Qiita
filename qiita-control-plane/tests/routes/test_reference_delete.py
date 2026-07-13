@@ -224,6 +224,50 @@ async def test_delete_reference_orphan_vs_shared_features(client, postgres_pool)
         )
 
 
+async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
+    client, postgres_pool
+):
+    """An alignment definition that aligns against the reference blocks its delete
+    UNCONDITIONALLY — even with force. Align-block tickets leave work_ticket.
+    reference_idx NULL, so the work-ticket gate cannot see them; the reference↔
+    alignment link lives only in alignment_definition.params. Force must not bypass
+    it, because neither the cascade nor the data plane cleans the DuckLake
+    `alignment` rows the definition owns (keyed on feature_idx this delete would
+    orphan). The operator must DELETE /alignment-definition first."""
+    ref_idx = await _create_ref(client, f"del-align-{uuid.uuid4()}")
+    align_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.alignment_definition (params_hash, params, created_by_idx)"
+        " VALUES ($1, $2::jsonb, (SELECT MIN(idx) FROM qiita.principal))"
+        " RETURNING alignment_idx",
+        b"\x00" * 32,
+        json.dumps(
+            {"reference_idx": ref_idx, "aligner": "bowtie2", "mask_idx": 1, "shard_ids": [0]}
+        ),
+    )
+    try:
+        # Blocked without force.
+        r1 = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+        assert r1.status_code == 409, r1.text
+        assert "alignment definition" in r1.json()["detail"]
+        # Blocked EVEN WITH force.
+        r2 = await client.delete(
+            URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params={"force": "true"}
+        )
+        assert r2.status_code == 409, r2.text
+        assert "alignment definition" in r2.json()["detail"]
+        # The reference survives untouched.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", ref_idx
+            )
+            == 1
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_idx
+        )
+
+
 async def test_delete_reference_blocked_by_inflight_ticket(client, postgres_pool):
     """An in-flight work ticket blocks the delete even with force=true."""
     ref_idx = await _create_ref(client, f"del-inflight-{uuid.uuid4()}")

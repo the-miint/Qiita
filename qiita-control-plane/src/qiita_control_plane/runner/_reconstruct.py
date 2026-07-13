@@ -441,13 +441,25 @@ async def _run_action_primitive(
             action_context=shard_context,
             dispatch_cb=dispatch_cb,
         )
-        # N == 0 (no-genome reference) → no fan-out, no router: router_pending
-        # False leaves the reference to go `active` inline (the parent's finalize
-        # patches it). N > 0 → stage the shard→bucket mapping the whole-reference
-        # rype_router build consumes (from the assignment plan_and_submit_shards
-        # just wrote) and flip router_pending True so the router build entries run.
+        # N == 0 here means an EXPLICIT shard_index=true request (the :416 guard
+        # already returned for the absent/false case) produced zero shard-bearing
+        # features — a reference with no genomes / no genome map. Finalizing that to
+        # a terminal `active` reference with no router is the wrong outcome: the
+        # first align-plan 409s ("no rype_router built"), and ACTIVE is terminal so
+        # remediation would be delete + full re-ingest. Fail loud instead — the
+        # workflow's `failure_status: failed` applies and `failed → pending` is a
+        # legal redrive edge, so the operator supplies genomes / a genome map and
+        # re-runs. Server-side because a direct POST /work-ticket bypasses the CLI.
+        # N > 0 → stage the shard→bucket mapping the whole-reference rype_router
+        # build consumes (from the assignment plan_and_submit_shards just wrote) and
+        # flip router_pending True so the router build entries run.
         if summary.get("shards", 0) <= 0:
-            return {ROUTER_PENDING_BINDING: False}
+            raise RuntimeError(
+                f"plan-shards: reference {scope_target['reference_idx']} was requested "
+                "with shard_index=true but has no genome-bearing features to shard "
+                "(N=0); refusing to finalize an unroutable `active` reference. Supply "
+                "genomes / a genome map and redrive, or omit shard_index."
+            )
         mapping_path = await _stage_shard_mapping(
             pool,
             scope_target["reference_idx"],

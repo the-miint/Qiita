@@ -13,6 +13,13 @@ dependencies = [
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.
     "duckdb>=1.5.4",
+    # The sharded reference-index build steps (build_routing_index,
+    # build_minimap2_index, build_bowtie2_index) are `module:` (native) steps that
+    # stream reference chunks from the data plane over Arrow Flight via
+    # `data_plane_client.py` (`import pyarrow.flight`). Native steps may only use
+    # deps that ship here, so pyarrow is declared directly — not relied upon as a
+    # transitive of qiita-common. The control plane pins the same floor.
+    "pyarrow>=19",
     # bcl_convert_prep imports `save_bclconvert_v1_csv` from
     # run_preflight at execute() time. SHA pin is required so a
     # re-vendor of the upstream is explicit. To bump: read the

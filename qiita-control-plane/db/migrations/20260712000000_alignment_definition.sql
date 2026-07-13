@@ -11,12 +11,19 @@
 -- params-hash dedup discipline qiita.mask_definition uses — its Python and
 -- Postgres twins are the model for this table.
 --
--- The shard-set is baked into the params hash deliberately (the growth
--- foundation): a reference grown with new shards has a different DISTINCT
--- reference_membership.shard_id set, so a growth align run over only the new
--- shards mints a NEW alignment_idx and prior rows are reused by UNION. No
--- reshuffle path exists (shard assignment is append-only), so a shard-set is
--- stable for a given reference generation.
+-- The sorted DISTINCT reference_membership.shard_id set is part of the params
+-- hash, so two configs differing only in which shards exist resolve to different
+-- alignment_idx. ACCURACY / SCOPE: growing a reference is NOT supported today, so
+-- this is deliberately NOT a working "growth foundation" yet — and two properties
+-- would have to change first. (1) The shard COUNT is fixed at _SHARD_COUNT (1000),
+-- so any reference with >= 1000 genome-bearing features has shard set [0..999]
+-- regardless of size; the shard-set alone does not distinguish a grown reference.
+-- (2) Shard assignment is NOT append-only: plan_shards is clear-first and
+-- re-plan-safe (tile_by_lineage re-cuts the whole tape and write_shard_assignment
+-- NULLs+re-stamps every membership row and clears the prior per-shard index rows),
+-- so a re-plan can MOVE features across shards. Real growth support is deferred;
+-- when it lands, the identity must key on something generation-stable (a plan
+-- generation or the actual routed feature set), not this fixed-count shard-set.
 --
 -- alignment is keyed by alignment_idx, NOT by the processing_idx /
 -- processed_prep_sample_idx hierarchy — that formal hierarchy is deferred; a
@@ -51,8 +58,9 @@ COMMENT ON TABLE qiita.alignment_definition IS
     'CP-minted sharded-alignment config identity. alignment_idx tags the data '
     'plane''s alignment rows; deduplicated on params_hash (SHA-256 of the '
     'canonical config JSON) so the same reference + aligner + mask + shard-set '
-    'resolve to the same alignment_idx fleet-wide. The shard-set is baked into '
-    'the hash (the growth foundation). Mint via qiita.mint_alignment_definition '
+    'resolve to the same alignment_idx fleet-wide. The sorted shard-set is part of '
+    'the hash (growth is not yet supported — see the migration comment for why this '
+    'is not yet a growth foundation). Mint via qiita.mint_alignment_definition '
     '(idempotent upsert on params_hash). Twin discipline mirrors '
     'qiita.mask_definition.';
 

@@ -95,9 +95,11 @@ async def plan_and_submit_shards(
     per shard.
 
     Runs `plan_shards` (assignment onto `reference_membership.shard_id`) → N. If
-    N == 0 (a reference with no genomes — nothing to shard), it is a no-op: no
-    transition, no fan-out, and the parent reference-add workflow's finalize
-    applies `active`. If N > 0 it transitions the reference `loading -> indexing`
+    N == 0 (a reference explicitly asked to shard but with no genomes / no genome
+    map — nothing to shard) it returns a zero-shard summary WITHOUT transitioning
+    or fanning out; the plan-shards runner arm treats a zero-shard result as an
+    error and fails the ticket, since an unroutable `active` reference must never
+    be finalized. If N > 0 it transitions the reference `loading -> indexing`
     and, in one transaction, INSERTs one PENDING build `work_ticket` per shard
     (scope `reference`, carrying `shard_id=k` and the index-selection
     `action_context` copied from the parent), then dispatches each fresh ticket

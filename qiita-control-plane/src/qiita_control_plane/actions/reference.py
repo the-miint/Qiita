@@ -41,15 +41,39 @@ _WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 
 class ReferenceDeleteBlocked(Exception):
-    """Raised when a reference cannot be deleted because work tickets
-    reference it. `in_flight` always blocks; `terminal` blocks only when the
-    caller did not pass force=True."""
+    """Raised when a reference cannot be deleted. `alignment_definitions` blocks
+    UNCONDITIONALLY (even with force); `in_flight` work tickets always block;
+    `terminal` work tickets block only when the caller did not pass force=True."""
 
-    def __init__(self, *, reference_idx: int, in_flight: int, terminal: int) -> None:
+    def __init__(
+        self,
+        *,
+        reference_idx: int,
+        in_flight: int,
+        terminal: int,
+        alignment_definitions: int = 0,
+    ) -> None:
         self.reference_idx = reference_idx
         self.in_flight = in_flight
         self.terminal = terminal
-        if in_flight:
+        self.alignment_definitions = alignment_definitions
+        # Alignment definitions are the force-proof reason and the one the operator
+        # most needs to act on, so it is reported first when present. A reference
+        # delete cascades neither `alignment_definition` nor the DuckLake `alignment`
+        # rows it owns (those are keyed on `feature_idx`, which this delete would
+        # orphan-GC in both stores), and the data plane's delete_reference does not
+        # touch `alignment` — so force cannot make this delete safe. The
+        # DELETE /alignment-definition/{idx} route DOES purge the lake rows and
+        # cascade its gates, so send the operator there first.
+        if alignment_definitions:
+            reason = (
+                f"{alignment_definitions} alignment definition(s) align against it; "
+                "force cannot be used because it cannot clean the DuckLake "
+                "`alignment` rows they own (keyed on feature_idx this delete would "
+                "orphan). Delete each via DELETE /alignment-definition/{idx} first "
+                "(that route purges the lake rows and cascades its gates), then retry"
+            )
+        elif in_flight:
             reason = (
                 f"{in_flight} in-flight work ticket(s) "
                 f"({'/'.join(_WORK_TICKET_IN_FLIGHT_STATES)}) reference it; "
@@ -84,7 +108,8 @@ async def assert_reference_deletable(
 
     Returns the reference's current status on success. Raises
     ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
-    tickets reference it (in-flight always; terminal unless force). Run this
+    tickets reference it (in-flight always; terminal unless force) or if any
+    alignment definition aligns against it (always, even with force). Run this
     *before* any destructive step so a blocked delete touches nothing."""
     status = await conn.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -99,11 +124,27 @@ async def assert_reference_deletable(
     counts = {r["state"]: r["n"] for r in rows}
     in_flight = sum(counts.get(s, 0) for s in _WORK_TICKET_IN_FLIGHT_STATES)
     terminal = sum(counts.get(s, 0) for s in _WORK_TICKET_TERMINAL_STATES)
-    if in_flight or (terminal and not force):
+    # Align-block work tickets are block-scoped and leave work_ticket.reference_idx
+    # NULL, so the gate above cannot see them — the reference↔alignment link lives
+    # only in alignment_definition.params (JSON `reference_idx`, an int; there is no
+    # FK). Gate on that row directly: it is the durable record that an alignment was
+    # built against this reference, and it outlives the (transient) work tickets.
+    # This blocks EVEN WITH force, because neither the Postgres cascade nor the data
+    # plane's delete_reference touches the DuckLake `alignment` rows those
+    # definitions own (keyed on feature_idx this delete would orphan-GC in both
+    # stores) — so no force can make the delete safe. DELETE /alignment-definition
+    # first purges the lake rows and cascades the gates.
+    alignment_definitions = await conn.fetchval(
+        "SELECT count(*) FROM qiita.alignment_definition"
+        " WHERE (params->>'reference_idx')::bigint = $1",
+        reference_idx,
+    )
+    if alignment_definitions or in_flight or (terminal and not force):
         raise ReferenceDeleteBlocked(
             reference_idx=reference_idx,
             in_flight=in_flight,
             terminal=terminal,
+            alignment_definitions=alignment_definitions,
         )
     return status
 

@@ -476,6 +476,17 @@ async def write_shard_assignment(
     instead of carrying a stale shard_id from the prior plan — the persisted
     assignment always reflects exactly the passed `shards`.
 
+    In the SAME transaction it also DELETEs this reference's per-shard
+    `reference_index` rows (`shard_id IS NOT NULL`). Those rows are keyed on
+    (reference_idx, index_type, fs_path) with a generation-independent fs_path, so
+    a re-plan that reshuffles the lineage tiling would otherwise leave STALE
+    prior-generation index rows on the books — and finalize_shard's completeness
+    gate counts them, so a stale count could flip the reference `active` with the
+    CURRENT generation's shards still unbuilt. Clearing them here re-scopes the
+    gate to the current generation; the fanned-out build children re-register their
+    rows as they actually complete. The whole-reference `rype_router` row
+    (shard_id NULL) is owned by the parent's build_routing_index and is untouched.
+
     Idempotent and replay-safe: clear-then-set over one transaction, so
     re-running the same assignment sets the same values without error. Scoped to
     `reference_idx`, so a feature shared across references (same feature_idx) is
@@ -489,6 +500,14 @@ async def write_shard_assignment(
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
             "UPDATE qiita.reference_membership SET shard_id = NULL WHERE reference_idx = $1",
+            reference_idx,
+        )
+        # Generation-scope the completeness gate: drop this reference's per-shard
+        # index rows so finalize_shard cannot mistake a stale prior-generation
+        # count for the current one (see the docstring). Router row (shard_id NULL)
+        # is left for the parent's build_routing_index to own.
+        await conn.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1 AND shard_id IS NOT NULL",
             reference_idx,
         )
         # Flatten to a (feature_idx, shard_id) pair stream and apply one
@@ -687,12 +706,16 @@ async def plan_shards(
         None, _do_get_reference_taxonomy, data_plane_url, ticket, taxonomy_parquet
     )
 
+    # Validate the inlined read paths (fail-fast escaping contract), consistent
+    # with every other read_parquet/COPY target in the codebase.
+    member_sql = validate_parquet_path(member_parquet)
+    taxonomy_sql = validate_parquet_path(taxonomy_parquet)
     with duckdb.connect(":memory:") as con:
         con.execute(
             "CREATE TABLE member_genome AS"
-            f" SELECT feature_idx, genome_idx FROM read_parquet('{member_parquet}')"
+            f" SELECT feature_idx, genome_idx FROM read_parquet('{member_sql}')"
         )
-        con.execute(f"CREATE TABLE taxonomy AS SELECT * FROM read_parquet('{taxonomy_parquet}')")
+        con.execute(f"CREATE TABLE taxonomy AS SELECT * FROM read_parquet('{taxonomy_sql}')")
         feature_shards = _compute_shards(con, num_shards=num_shards)
 
     await write_shard_assignment(pool, reference_idx, feature_shards)

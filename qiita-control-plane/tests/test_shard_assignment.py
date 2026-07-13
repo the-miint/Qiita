@@ -129,6 +129,43 @@ async def test_write_shard_assignment_clears_dropped_features_on_replan(postgres
         await _cleanup(postgres_pool, idx)
 
 
+async def test_write_shard_assignment_clears_prior_shard_index_rows(postgres_pool):
+    """A re-plan invalidates the reference's per-shard reference_index rows in the
+    SAME transaction, so finalize_shard's completeness gate can't mistake a stale
+    prior-generation index count for the current one (flipping the reference active
+    with the current generation's shards unbuilt). The whole-reference rype_router
+    row (shard_id NULL) is left untouched — the parent's build_routing_index owns
+    it."""
+    idx = await _make_reference(postgres_pool, "shard-assign-index-invalidate")
+    try:
+        f0, f1 = await _add_features(postgres_pool, idx, _hashes("a5000000", 2))
+        await write_shard_assignment(postgres_pool, idx, [[f0], [f1]])
+        # Simulate the fanned-out children having each registered a per-shard index
+        # row, plus the parent's whole-reference router row (shard_id NULL).
+        await postgres_pool.executemany(
+            "INSERT INTO qiita.reference_index"
+            " (reference_idx, index_type, fs_path, params, shard_id)"
+            " VALUES ($1, $2, $3, '{}'::jsonb, $4)",
+            [
+                (idx, "minimap2", f"/tmp/ref/{idx}/minimap2-shards/0.mmi", 0),
+                (idx, "minimap2", f"/tmp/ref/{idx}/minimap2-shards/1.mmi", 1),
+                (idx, "rype_router", f"/tmp/ref/{idx}/rype-router.ryxdi", None),
+            ],
+        )
+        # Re-plan → the per-shard rows are cleared; only the router row survives.
+        await write_shard_assignment(postgres_pool, idx, [[f0], [f1]])
+        rows = await postgres_pool.fetch(
+            "SELECT index_type, shard_id FROM qiita.reference_index WHERE reference_idx = $1",
+            idx,
+        )
+        assert [(r["index_type"], r["shard_id"]) for r in rows] == [("rype_router", None)]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await _cleanup(postgres_pool, idx)
+
+
 async def test_write_shard_assignment_scoped_to_reference(postgres_pool):
     """A feature shared across two references (same sequence_hash) gets its shard
     assignment written only for the target reference's membership row."""

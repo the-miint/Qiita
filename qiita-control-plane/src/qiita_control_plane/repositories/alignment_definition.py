@@ -33,10 +33,13 @@ async def mint_alignment_definition(
     Deduplicates on the canonical-JSON SHA-256 of `params` — the dedup key is
     the config blob, so the same config resolves to the same `alignment_idx`
     fleet-wide. `params` is the canonical alignment config:
-    `{reference_idx, aligner, mask_idx, shard_ids: sorted[int]}`. Baking the
-    reference's current shard-set into the hash is the growth foundation: a
-    grown reference (different DISTINCT reference_membership.shard_id set) mints
-    a NEW alignment_idx over only its new shards.
+    `{reference_idx, aligner, mask_idx, shard_ids: sorted[int]}`. The sorted
+    shard-set is part of the hash, but growing a reference is NOT supported today
+    and this is not yet a working growth foundation: the shard COUNT is fixed at
+    _SHARD_COUNT so the set is [0..N-1] regardless of reference size, and shard
+    assignment is re-plan-safe (not append-only), so the set is not a stable
+    growth discriminator. See the 20260712000000_alignment_definition migration
+    comment for the properties real growth support would need.
 
     Returns the qiita.alignment_definition row as an asyncpg.Record. Raises
     asyncpg.ForeignKeyViolationError when principal_idx does not exist.

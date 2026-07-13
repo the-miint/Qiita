@@ -316,7 +316,7 @@ def test_build_routing_index_empty_stream_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(build_routing_index, "_run_rype_index_create", fake_build)
 
     inputs = build_routing_index.Inputs(reference_idx=1, work_ticket_idx=1, shard_mapping=mapping)
-    with pytest.raises(ValueError, match="no sequence chunks"):
+    with pytest.raises(ValueError, match="streamed any sequence chunks"):
         asyncio.run(build_routing_index.execute(inputs, tmp_path / "ws"))
 
 
@@ -324,13 +324,15 @@ def _boom_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memo
     raise AssertionError("rype build reached despite a mapping-integrity failure")
 
 
-def test_build_routing_index_unmapped_streamed_feature_raises(tmp_path, monkeypatch):
-    """A streamed feature absent from shard_mapping would route nowhere — fail-fast
-    before building a half-routed router (the deferred-16S / stale-roster hazard)."""
+def test_build_routing_index_no_genome_feature_excluded_from_router(tmp_path, monkeypatch):
+    """A streamed feature ABSENT from shard_mapping is a legitimate no-genome member
+    (a partial genome map / deferred 16S leaves it shard_id NULL). The router corpus
+    is scoped to the MAPPED set and builds over only those features, rather than
+    hard-failing AFTER the per-shard fan-out has already committed its index builds."""
     from qiita_compute_orchestrator.jobs import build_routing_index
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
-    # Stream has 100, 200, 300; mapping omits 300.
+    # Stream has 100, 200, 300; mapping omits 300 (a no-genome member).
     stream_parquet = _write_chunks_parquet(
         tmp_path / "stream.parquet", [(100, 0, "ACGT"), (200, 0, "TTTT"), (300, 0, "GGGG")]
     )
@@ -340,11 +342,32 @@ def test_build_routing_index_unmapped_streamed_feature_raises(tmp_path, monkeypa
         "open_reference_chunk_stream",
         _fake_stream_from_parquet(stream_parquet, {}),
     )
-    monkeypatch.setattr(build_routing_index, "_run_rype_index_create", _boom_build)
 
+    captured: dict = {}
+
+    def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
+        captured["chunk_features"] = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT feature_idx FROM {chunk_table} ORDER BY feature_idx"
+            ).fetchall()
+        ]
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        return "ok"
+
+    monkeypatch.setattr(build_routing_index, "_run_rype_index_create", fake_build)
+
+    ws = tmp_path / "ws"
     inputs = build_routing_index.Inputs(reference_idx=1, work_ticket_idx=1, shard_mapping=mapping)
-    with pytest.raises(ValueError, match="absent from shard_mapping"):
-        asyncio.run(build_routing_index.execute(inputs, tmp_path / "ws"))
+    out = asyncio.run(build_routing_index.execute(inputs, ws))
+
+    # The router corpus is scoped to the mapped set — the no-genome feature 300 is
+    # excluded, not a fatal error.
+    assert captured["chunk_features"] == [100, 200]
+    meta = json.loads(Path(out["routing_index_meta"]).read_text())
+    assert meta["params"]["feature_count"] == 2
+    # The whole-reference chunk dump is cleaned up (not leaked into shared scratch).
+    assert not (ws / "router_chunks.parquet").exists()
 
 
 def test_build_routing_index_unchunked_mapped_feature_raises(tmp_path, monkeypatch):

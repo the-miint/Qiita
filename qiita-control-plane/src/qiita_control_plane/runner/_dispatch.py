@@ -102,11 +102,12 @@ async def _shard_fanout_owns_finalize(
     re-`_patch_resource_status(active)`, an illegal `active → active` transition
     that fails the whole (successful) ticket.
 
-    A sharded reference with no genomes stays `loading` (N = 0, no fan-out) →
-    this returns False → the parent patches `active` inline (nothing to shard).
-    An unsharded reference-add (no `shard_index`) also returns False → patches
-    `active` unchanged. `bound` carries the action_context (resume-safe: reseeded
-    from the persisted ticket context), so this is correct across a CP restart."""
+    An unsharded reference-add (no `shard_index`) returns False → the parent
+    patches `active` unchanged. (A `shard_index=true` request that yields N == 0 no
+    longer reaches finalize at all — plan-shards fails the ticket rather than
+    finalize an unroutable `active` reference, so there is no live N == 0 sharded
+    path here.) `bound` carries the action_context (resume-safe: reseeded from the
+    persisted ticket context), so this is correct across a CP restart."""
     if not bound.get("shard_index"):
         return False
     if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:

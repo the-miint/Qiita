@@ -400,6 +400,41 @@ def test_align_sharded_low_identity_alignment_filtered(tmp_path, monkeypatch):
     assert rows == [(555, 10, 1, 100, None, 0, 1, 41, 60, "40=", None, 0)]
 
 
+def test_align_sharded_minimap2_identity_floor_is_0_90(tmp_path, monkeypatch):
+    """minimap2 (long-read) uses a 0.90 identity floor, NOT bowtie2's 0.99. A 0.95
+    placement is KEPT (it would be dropped under 0.99) and a 0.85 one is dropped —
+    pinning the per-aligner floor for the more-divergent long-read population."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    reads = _write_reads_parquet(
+        tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)]
+    )
+    router, shard_dir = _make_indexes(tmp_path)
+    _install_stubs(
+        align_sharded,
+        monkeypatch,
+        routing={1: ["0"], 2: ["0"]},
+        alignments={
+            1: [_se_hit(100, cigar="38=2X")],  # identity 0.95 -> kept at the 0.90 floor
+            2: [_se_hit(200, cigar="34=6X")],  # identity 0.85 -> dropped
+        },
+    )
+
+    inputs = align_sharded.Inputs(
+        reads=reads,
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+    _cols, rows = _read_alignment(Path(out["alignment"]))
+    # Read 1 (0.95) survives, read 2 (0.85) is filtered — the 0.90 minimap2 floor.
+    assert [r[2] for r in rows] == [1]
+
+
 def test_align_sharded_bowtie2_low_identity_pair_dropped_as_unit(tmp_path, monkeypatch):
     """A bowtie2 concordant pair whose POOLED identity is below threshold drops BOTH
     mates (never orphans one), while a high-identity pair on the same block is kept

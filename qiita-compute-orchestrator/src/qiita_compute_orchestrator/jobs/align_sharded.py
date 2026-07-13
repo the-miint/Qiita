@@ -48,8 +48,11 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      VARCHAR `reference`/`mate_reference`, whose identity `feature_idx` /
      `mate_feature_idx` already carry.
   4. Stream a sorted `COPY` to `alignment.parquet`, keeping only HIGH-IDENTITY
-     placements (`cigar_sequence_identity >= _MIN_SEQUENCE_IDENTITY`, from the =/X
-     CIGAR that bowtie2 `xeq` emits) so noisy off-target hits don't bloat storage.
+     placements (`cigar_sequence_identity` >= a per-aligner floor —
+     `_MIN_SEQUENCE_IDENTITY_BOWTIE2` 0.99 for short reads,
+     `_MIN_SEQUENCE_IDENTITY_MINIMAP2` 0.90 for long reads — scored from the =/X
+     CIGAR that bowtie2 `xeq` / minimap2 `eqx` emit) so noisy off-target hits don't
+     bloat storage.
      For bowtie2 (paired-end) the two mates of a concordant placement are POOLED and
      scored as a unit, so a pair is kept or dropped together and a mate is never
      orphaned; for minimap2 (long-read, single-end) each alignment is scored on its
@@ -137,11 +140,20 @@ _DUCKDB_THREADS = 4
 # whole-reference baseline oracle can later pin this threshold by test.
 _ROUTING_THRESHOLD = 0.1
 
-# minimap2 preset for the sharded align. `map-hifi` is the long-read (PacBio HiFi /
-# Nanopore) preset: the CP routes long-read platforms to minimap2 and short-read
-# (Illumina) platforms to bowtie2 (chosen at align-plan from sequencing_run.platform),
-# so a minimap2 align is always long-read here. Matches the preset the per-shard `.mmi`
-# was built with (build_minimap2_index).
+# minimap2 preset for the sharded align. `map-hifi` is the long-read (PacBio HiFi)
+# preset: the CP routes long-read platforms to minimap2 and short-read (Illumina)
+# platforms to bowtie2 (chosen at align-plan from sequencing_run.platform), so a
+# minimap2 align is always long-read here. (Oxford Nanopore also maps to minimap2 in
+# the platform table but is not used today.)
+#
+# ACCURACY: this is NOT enforced to match the per-shard `.mmi`'s BUILD preset. The
+# build preset is pinned to map-hifi only in the CLI (cli/reference_load.py); the
+# workflow YAMLs still expose the full preset enum and a direct POST could build a
+# shard `.mmi` under a different preset (build_minimap2_index defaults to `sr`).
+# That mismatch is not a correctness hazard — verified against real miint, minimap2
+# takes k/w from the `.mmi` and scoring from this align-time preset, so a preset
+# mismatch changes only index density, not the alignments produced — so we do NOT
+# assert equality here; the align-time preset is simply always map-hifi.
 _MINIMAP2_PRESET = "map-hifi"
 
 # Secondary-alignment cap for the minimap2 sharded align. Set arbitrarily HIGH
@@ -153,14 +165,26 @@ _MINIMAP2_PRESET = "map-hifi"
 # that comes from routing, not from this cap.
 _MINIMAP2_MAX_SECONDARY = 100
 
-# Minimum sequence identity a surviving alignment must clear. The aligners emit ALL
-# concordant placements (bowtie2 `report_all`), and this filter keeps only high-
-# identity, specific hits — dropping noisy off-target alignments to bound stored data.
-# Identity is computed from the =/X CIGAR (bowtie2 `xeq := true`) via miint's
-# `cigar_sequence_identity`. For bowtie2 (paired-end) the two mates of a concordant
-# placement are POOLED and judged as a unit (see the COPY), so a pair is kept or
-# dropped together and a mate is never orphaned.
-_MIN_SEQUENCE_IDENTITY = 0.99
+# Minimum sequence identity a surviving alignment must clear, PER ALIGNER. The
+# aligners emit ALL concordant placements (bowtie2 `report_all`, minimap2
+# `max_secondary := 100`); this filter keeps only high-identity, specific hits,
+# dropping noisy off-target alignments to bound stored data. Identity is computed
+# from the =/X CIGAR (bowtie2 `xeq := true` / minimap2 `eqx := true`) via miint's
+# `cigar_sequence_identity`. The floor is aligner-specific because the read
+# populations are:
+#   * bowtie2 (short-read Illumina) → 0.99. A short read that is a true hit matches
+#     nearly end-to-end, so a tight floor is the right specificity target. The two
+#     mates of a concordant PE placement are POOLED and judged as a unit (see the
+#     COPY), so a pair is kept or dropped together and a mate is never orphaned.
+#   * minimap2 (long-read, PacBio HiFi) → 0.90. Long reads carry more per-read
+#     divergence (indels + chemistry error over a much longer template), so the
+#     short-read 0.99 floor would discard legitimate long-read hits. Judged per
+#     record (single-end long reads, no mate to pool).
+# We route only Illumina→bowtie2 and PacBio HiFi→minimap2 today; ONT is declared
+# alignable (routes to minimap2) but is NOT used, and the 0.90 minimap2 floor keeps
+# an ONT block from silently dropping every read were it ever enabled.
+_MIN_SEQUENCE_IDENTITY_BOWTIE2 = 0.99
+_MIN_SEQUENCE_IDENTITY_MINIMAP2 = 0.90
 
 # The bowtie2 align-time parameter set (the "modified SHOGUN" configuration): collect
 # ALL concordant paired-end placements (`report_all`, replacing the historical `-k 16`
@@ -484,8 +508,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # The high-identity filter, applied as the COPY's QUALIFY so it runs
             # over the joined rows just before the sort. Both forms score identity
-            # from the =/X CIGAR via `cigar_sequence_identity`; they differ only in
-            # how a read's placement is grouped:
+            # from the =/X CIGAR via `cigar_sequence_identity`; they differ in the
+            # identity FLOOR (bowtie2 0.99, minimap2 0.90 — see the module constants)
+            # and in how a read's placement is grouped:
             #   * bowtie2 (paired-end): POOL the two mates of each concordant
             #     placement and judge the pair as a unit, so a pair is kept or
             #     dropped together and a mate is never orphaned. The two mates store
@@ -502,8 +527,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "LEAST(a.position, a.mate_position), "
                     "GREATEST(a.position, a.mate_position)"
                 )
+                min_identity = _MIN_SEQUENCE_IDENTITY_BOWTIE2
             else:
                 identity_partition = "a.read_id, a.reference, a.position"
+                min_identity = _MIN_SEQUENCE_IDENTITY_MINIMAP2
 
             # Stream a sorted COPY. Prepend the CP-minted `alignment_idx` as the
             # LEADING column (a constant for this align run — the block ticket
@@ -538,7 +565,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"JOIN {_READ_META} rm ON rm.sequence_idx = a.read_id "
                 "QUALIFY cigar_sequence_identity("
                 f"string_agg(a.cigar, '') OVER (PARTITION BY {identity_partition})"
-                f") >= {_MIN_SEQUENCE_IDENTITY} "
+                f") >= {min_identity} "
                 "ORDER BY alignment_idx, rm.prep_sample_idx, a.read_id, feature_idx, "
                 "a.position, a.flags) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"

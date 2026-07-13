@@ -20,11 +20,13 @@ the `no-changelog` label).
   (Illumina → bowtie2, PacBio HiFi / Nanopore → minimap2) at align-plan rather than
   chosen by the caller (`AlignPlanRequest` drops `aligner`; an unsupported platform
   is refused 422); bowtie2 runs the modified-SHOGUN parameter set (all concordant
-  placements via `report_all`) and a pooled `cigar_sequence_identity ≥ 0.99` filter
-  keeps only high-identity pairs (kept/dropped as a unit, never orphaning a mate),
+  placements via `report_all`) and a pooled `cigar_sequence_identity` filter keeps
+  only high-identity pairs (kept/dropped as a unit, never orphaning a mate),
   minimap2 uses `map-hifi` + `eqx` + `max_secondary := 100` (its analogue of
   `report_all` — dropping the arg falls back to a finite default that truncates
-  multi-mapping reads); the DuckLake `alignment` table drops the raw
+  multi-mapping reads). The identity floor is per-aligner: bowtie2 0.99 (short
+  reads match nearly end-to-end), minimap2 0.90 (long reads carry more per-read
+  divergence); the DuckLake `alignment` table drops the raw
   `reference`/`mate_reference` VARCHARs (`feature_idx`/`mate_feature_idx` carry the
   identity). A sharded reference's per-shard `.mmi` is now always built with the
   fixed `map-hifi` preset (not tunable on load). The GPL boundary is installed once
@@ -86,6 +88,34 @@ the `no-changelog` label).
   to match. (#276)
 
 ### Fixed
+
+- **Sharded-alignment review — silent-wrong-data and pre-flight-failure fixes (#268).**
+  A second review pass surfaced latent defects in the (never-yet-run) sharded path,
+  fixed here:
+  - `pyarrow` is now an explicit `qiita-compute-orchestrator` dependency — the sharded
+    index-build steps import `pyarrow.flight`, so without it the first `reference-add`
+    / `build-shard-index` ticket died `ModuleNotFoundError`.
+  - Deleting an alignment definition mid-flight no longer silently realigns RAW
+    (non-host-depleted, un-QC'd) reads: the align/mask discriminator now reads the
+    trusted `action_context` alignment_idx and fails loud when it disagrees with the
+    `ON DELETE SET NULL` `work_ticket.alignment_idx` column.
+  - Deleting a reference that any alignment definition aligns against is refused, even
+    with `force` — the cascade cannot clean the DuckLake `alignment` rows it owns
+    (keyed on orphaned `feature_idx`); the operator deletes the alignment definition
+    first.
+  - `finalize_shard` no longer flips a reference to `active` with the current shard
+    generation unbuilt: a re-plan invalidates the reference's per-shard
+    `reference_index` rows in the same transaction, re-scoping the completeness gate
+    to the current generation.
+  - `build_routing_index` scopes the rype corpus to the shard-mapped feature set
+    instead of hard-failing after the fan-out when a reference has no-genome members —
+    a partial genome map is a supported input, not a post-fan-out failure.
+  - `shard_index=true` on a reference with no shardable features now fails the ticket
+    (redrivable `failed → pending`) instead of finalizing a terminal, unroutable
+    `active` reference.
+  - The minimap2 identity floor is 0.90 (was sharing bowtie2's 0.99), so long-read
+    placements are no longer silently discarded; `build_routing_index` also cleans up
+    its multi-GB `router_chunks.parquet` intermediate instead of leaking it. (#268)
 
 - **A DB-tier test leaked terminal work tickets, reddening `main` on macOS.**
   `test_sequence_range_backfill`'s fixture seeded `work_ticket` rows and never removed
@@ -216,7 +246,7 @@ the `no-changelog` label).
   native job into a runnable `align` workflow: an operator submits an align run
   for a sequenced-pool against an ACTIVE sharded reference + an aligner, the CP
   mints an `alignment_idx` (deduped on the align config — reference + aligner +
-  mask + the reference's sorted shard-set, the growth foundation), tiles the
+  mask + the reference's sorted shard-set; growth is not yet supported), tiles the
   pool's already-MASKED samples into blocks, fans out one `align` block ticket
   per block, each streams that block's masked reads (new Rust
   `export_read_masked_block` DoAction over the `read_masked` view), runs
