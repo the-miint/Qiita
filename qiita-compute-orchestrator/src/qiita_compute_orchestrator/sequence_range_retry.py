@@ -40,7 +40,11 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import WorkTicketFailureStage, WorkTicketState
+from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    WorkTicketFailureStage,
+    WorkTicketState,
+)
 
 from .sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
@@ -54,6 +58,21 @@ from .sequence_range import (
 # missing prep_sample can't self-heal). Tests zero the backoff to avoid sleeps.
 CP_RETRY_MAX_ATTEMPTS = 3
 CP_RETRY_BACKOFF_BASE_S = 0.5
+
+# The states a minting ticket may be in for its range to be REUSABLE. An ALLOWLIST,
+# not a denylist ("everything except completed"), because the failure mode is silent:
+# reusing a range whose reads are already registered duplicates them in DuckLake,
+# which has no uniqueness and no way to notice afterwards. A denylist would let a
+# work_ticket_state added later fall through to the permissive path by default —
+# fail-open, the shape we invert elsewhere for the same reason.
+#
+# Derived from the canonical terminal/non-terminal split rather than spelled out, so
+# it cannot become another hand-maintained copy of it. Reuse is legitimate only while
+# the minting ticket is still IN FLIGHT (its reads cannot be registered yet). Every
+# terminal state refuses — `completed` because the reads ARE registered, `failed` /
+# `no_data` because a job still running under a ticket that has already terminated is
+# a stale attempt (an orphaned SLURM job outliving the one that finished it).
+_REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
 
 
 def _is_transient_status(status: int) -> bool:
@@ -246,22 +265,33 @@ async def mint_or_reuse_sequence_range(
                     "for a whole pool, `qiita delete-sequenced-pool`) and resubmit"
                 ),
             ) from exc
-        if existing.minted_by_work_ticket_state == WorkTicketState.COMPLETED.value:
-            # Ownership is necessary but NOT sufficient. If the minting ticket already
-            # COMPLETED, its reads are registered in the lake — so even THIS ticket
-            # must not write over that range. Reachable if a stale attempt of a ticket
-            # outlives the attempt that finished it (an orphaned SLURM job that was
-            # never reaped), which would otherwise pass the ownership check.
+        if existing.minted_by_work_ticket_state not in _REUSABLE_MINTER_STATES:
+            # Ownership is necessary but NOT sufficient — the minting ticket must also
+            # still be IN FLIGHT. A terminal minter means this attempt is stale: the
+            # ticket already finished (an orphaned SLURM job outliving the attempt that
+            # completed it), and if it COMPLETED then its reads are registered, so even
+            # its own attempt must not re-write the range.
+            state = existing.minted_by_work_ticket_state
+            # The recovery differs by state, so name it rather than just refusing:
+            # a COMPLETED minter's reads are registered (re-ingest means deleting them
+            # first); a failed/no_data one is simply not running any more, and the
+            # operator's redrive is what makes this ticket's own range reusable again.
+            recovery = (
+                "its reads are already registered — to re-ingest, DELETE the "
+                "prep_sample (its sequence_range goes with it) and resubmit"
+                if state == WorkTicketState.COMPLETED.value
+                else f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
+                "which returns it to flight and makes its own range reusable"
+            )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
                     f"prep_sample {prep_sample_idx}'s sequence_range was minted by "
-                    f"work_ticket {work_ticket_idx}, which has already COMPLETED — its "
-                    "reads are registered. This attempt is stale (an orphaned job "
-                    "outliving the one that finished the ticket); refusing to re-write "
-                    "the range, which would duplicate the sample's reads"
+                    f"work_ticket {work_ticket_idx}, which is no longer in flight "
+                    f"(state={state!r}) — this attempt is stale. Refusing to re-write "
+                    f"the range, which could duplicate the sample's reads. {recovery}"
                 ),
             ) from exc
         recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1

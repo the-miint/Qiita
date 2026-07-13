@@ -27,6 +27,7 @@ import asyncio
 import duckdb
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
@@ -233,7 +234,9 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1005,  # 6 indices for a 2-read BAM
-            minted_by_work_ticket_idx=1,  # ours, so the width check is what fires
+            minted_by_work_ticket_idx=1,  # ours...
+            minted_by_work_ticket_state="processing",  # ...and still in flight, so the
+            # width check is what fires — not the ownership or in-flight gate.
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -349,31 +352,41 @@ def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
     assert not (tmp_path / "ws" / "read").exists()
 
 
-def test_execute_refuses_a_range_whose_ticket_already_completed(monkeypatch, tmp_path):
-    """Ownership is necessary but NOT sufficient: even MY OWN ticket's range must not
-    be re-written once that ticket has COMPLETED.
+@pytest.mark.parametrize("terminal_state", list(TERMINAL_WORK_TICKET_STATES))
+def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
+    terminal_state, monkeypatch, tmp_path
+):
+    """Ownership is necessary but NOT sufficient: MY OWN ticket's range must not be
+    re-written once that ticket has left flight.
 
-    A completed ticket's reads are registered in the lake. If a stale attempt outlives
-    the attempt that finished the ticket (an orphaned SLURM job that was never reaped),
-    it would reach the mint, 409, read back a range whose minter matches its own idx,
-    and — on the ownership check alone — happily reuse it and rewrite the output. The
-    ticket state is what closes that.
+    The gate is an ALLOWLIST — reuse is legitimate only while the minting ticket is
+    still in flight — not a denylist of `completed`. That matters because the failure
+    mode is silent: reusing a range whose reads are already registered duplicates them
+    in DuckLake, which has no uniqueness. A denylist would let a work_ticket_state
+    added later fall through to the reuse path by default — fail-open — and this
+    parametrisation is what pins it: it walks EVERY terminal state, so a new one is
+    covered the day it is added.
+
+    Reachable if a stale attempt outlives the attempt that finished the ticket (an
+    orphaned SLURM job never reaped): it reaches the mint, 409s, reads back a range
+    whose minter matches its own idx, and on an ownership check alone would happily
+    reuse it and rewrite the output.
     """
 
     async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
-    async def _mine_but_completed(*, http, prep_sample_idx):
+    async def _mine_but_terminal(*, http, prep_sample_idx):
         return MintedSequenceRange(
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1001,
             minted_by_work_ticket_idx=1,  # ours — ownership alone would allow reuse
-            minted_by_work_ticket_state="completed",  # ...but the reads are registered
+            minted_by_work_ticket_state=terminal_state,  # ...but it is no longer running
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
-    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _mine_but_completed)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _mine_but_terminal)
 
     sam = tmp_path / "in.sam"
     _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
@@ -382,7 +395,8 @@ def test_execute_refuses_a_range_whose_ticket_already_completed(monkeypatch, tmp
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "already COMPLETED" in ei.value.reason
+    assert "no longer in flight" in ei.value.reason
+    assert terminal_state in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -433,3 +447,39 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
             bounds.append((lo, hi))
     for (_, prev_hi), (next_lo, _) in zip(bounds, bounds[1:], strict=False):
         assert prev_hi < next_lo, f"parts overlap: {bounds}"
+
+
+def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path):
+    """Minter idx matches ours, but its state is absent — refuse.
+
+    The read-back LEFT JOINs the minting ticket precisely so a range whose ticket row
+    is gone still comes back; the repo comment there says the caller must read a
+    missing state as "cannot prove this is safe to reuse". This gate is the only thing
+    that makes that true, and `minted_by_work_ticket_idx` carries no FK, so a dangling
+    idx is reachable. Fail closed.
+    """
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _mine_but_stateless(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=1,  # ours — the ownership check passes
+            minted_by_work_ticket_state=None,  # ...but the ticket row is gone
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _mine_but_stateless)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "no longer in flight" in ei.value.reason
+    assert not (tmp_path / "ws" / "read").exists()

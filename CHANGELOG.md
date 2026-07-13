@@ -138,8 +138,14 @@ the `no-changelog` label).
   apart: the submit-time disallow-without-delete gate blocks only NON-terminal
   tickets, so a COMPLETED sample can be resubmitted. `qiita.sequence_range` now
   records `minted_by_work_ticket_idx`, and a reads job reuses a range only when it
-  matches its own ticket; a different (or unknown/NULL) minter fails permanently
-  with a delete-first message. Without this the read-back would have *removed* the
+  matches its own ticket AND that ticket is still in flight (a `completed` minter's
+  reads are registered, so even its own stale attempt must not re-write the range).
+  That gate is an ALLOWLIST of in-flight states, derived from the canonical
+  terminal/non-terminal split (#286) — a denylist would let a `work_ticket_state`
+  added later fall through to the reuse path by default, the same fail-open shape
+  #264 inverts for the Flight empty-filter guard. A different, terminal, or
+  unknown/NULL minter fails permanently with a delete-first message. Without this the
+  read-back would have *removed* the
   accidental guard the one-shot mint was providing. (#285)
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
   partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
@@ -377,7 +383,8 @@ the `no-changelog` label).
   exactly one copy lands and the reconcile count-assertion holds. New Rust
   `DeleteReadMaskBlockPayload`/`verify_delete_read_mask_block` + `delete_read_mask_block`;
   control-plane `delete_read_mask_block_data` DoAction wrapper + `delete_read_mask_block`
-  library primitive + runner block-scope dispatch arm; `LibraryPrimitive.DELETE_READ_MASK_BLOCK`.
+  library primitive + runner block-scope dispatch arm;
+  `LibraryPrimitive.DELETE_READ_MASK_BLOCK`.
   End-to-end coverage in `tests/integration/test_read_mask_block_e2e.py` (split-sample
   per-sample reconcile + export gate, and the delete-then-register no-duplicate
   guarantee against a live data plane). No new env var, migration, or scope; the
@@ -457,7 +464,8 @@ the `no-changelog` label).
   host/QC reads are never exported. The data-plane DoGet now streams its result
   set instead of buffering it whole. (#192)
 - `qiita run-preflight update-lane` — wet_lab_admin+ correction of a stored run
-  preflight's lane assignment. New `POST /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight/update-lane`
+  preflight's lane assignment. New `POST /api/v1/sequencing-run/{R}/sequenced-
+  pool/{P}/preflight/update-lane`
   route loads the pool's run-preflight SQLite blob, applies `run_preflight.update_lane`
   (bulk `from_lane` → `to_lane` reassignment on the illumina/tellseq sample table,
   one `change_log` audit row per reassigned sample), and writes the blob back — all
@@ -1428,7 +1436,8 @@ the `no-changelog` label).
 - Pruned the seeded `prep_sample_global_field` registry to the two fields
   actually in use: removed the seven fields (`alias`,
   `library_name`, `library_strategy`, `library_source`, `library_selection`,
-  `library_layout`, `library_construction_protocol`) , all of which but alias should come from sequenced_pool, and made the retained
+  `library_layout`, `library_construction_protocol`) , all of which but alias should
+  come from sequenced_pool, and made the retained
   `title` and `design_description` optional (migration
   `20260616000002_prune_prep_sample_global_fields`) (#98)
 - The `qiita.sequenced_pool.idx` identity sequence now starts at 25000,

@@ -474,7 +474,9 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + _MINIMAL_FASTQ_READS,  # one too many
-            minted_by_work_ticket_idx=1,  # ours, so the width check is what fires
+            minted_by_work_ticket_idx=1,  # ours...
+            minted_by_work_ticket_state="processing",  # ...and still in flight, so the
+            # width check is what fires — not the ownership or in-flight gate.
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)

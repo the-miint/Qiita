@@ -215,3 +215,21 @@ async def test_get_raises_http_error_on_5xx():
         with pytest.raises(httpx.HTTPStatusError) as ei:
             await get_sequence_range(http=http, prep_sample_idx=42)
     assert ei.value.response.status_code == 500
+
+
+def test_reusable_minter_states_are_derived_from_the_canonical_split():
+    """The reuse allowlist is DERIVED from the terminal/non-terminal split, not
+    hand-rolled. Five hand-maintained copies of that split were recently deleted after
+    a state fell through every one of them; this asserts we did not add a sixth."""
+    from qiita_common.models import (
+        NON_TERMINAL_WORK_TICKET_STATES,
+        TERMINAL_WORK_TICKET_STATES,
+    )
+
+    from qiita_compute_orchestrator import sequence_range_retry
+
+    assert sequence_range_retry._REUSABLE_MINTER_STATES == frozenset(
+        NON_TERMINAL_WORK_TICKET_STATES
+    )
+    for terminal in TERMINAL_WORK_TICKET_STATES:
+        assert terminal not in sequence_range_retry._REUSABLE_MINTER_STATES
