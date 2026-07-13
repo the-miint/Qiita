@@ -276,17 +276,19 @@ async def test_get_reference_index_returns_rows(client, postgres_pool):
 
 
 async def test_get_reference_index_returns_shard_id(client, postgres_pool):
-    """A sharded analysis index surfaces one flat row per shard, each carrying
-    its `shard_id`; an unsharded row carries `shard_id: null`. Grouping into
-    "one logical index with N shards" is a later concern."""
+    """A sharded analysis reference surfaces its ONE whole-reference rype ROUTER
+    (`shard_id: null` — RYpe holds every shard as a bucket in a single index, there
+    is NO per-shard rype index) plus one flat row PER SHARD for each ALIGNER index
+    (minimap2 / bowtie2), each carrying its `shard_id`. Grouping into "one logical
+    index with N shards" is a later concern."""
     r = await _create_ref(client, "test-index-shards")
     idx = r.json()["reference_idx"]
     await postgres_pool.execute(
         "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
         " VALUES"
-        "   ($1, 'rype', '/srv/x/whole.ryxdi', '{}'::jsonb, NULL),"
-        "   ($1, 'rype', '/srv/x/shards/0/index.ryxdi', '{}'::jsonb, 0),"
-        "   ($1, 'rype', '/srv/x/shards/1/index.ryxdi', '{}'::jsonb, 1)",
+        "   ($1, 'rype_router', '/srv/x/rype-router.ryxdi', '{}'::jsonb, NULL),"
+        "   ($1, 'minimap2', '/srv/x/minimap2-shards/0.mmi', '{}'::jsonb, 0),"
+        "   ($1, 'minimap2', '/srv/x/minimap2-shards/1.mmi', '{}'::jsonb, 1)",
         idx,
     )
     resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=idx))
@@ -295,9 +297,9 @@ async def test_get_reference_index_returns_shard_id(client, postgres_pool):
     assert len(body) == 3
     shard_by_path = {row["fs_path"]: row["shard_id"] for row in body}
     assert shard_by_path == {
-        "/srv/x/whole.ryxdi": None,
-        "/srv/x/shards/0/index.ryxdi": 0,
-        "/srv/x/shards/1/index.ryxdi": 1,
+        "/srv/x/rype-router.ryxdi": None,
+        "/srv/x/minimap2-shards/0.mmi": 0,
+        "/srv/x/minimap2-shards/1.mmi": 1,
     }
 
 

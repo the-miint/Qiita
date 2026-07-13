@@ -723,10 +723,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="shard_index",
         help=(
-            "Build per-shard ANALYSIS indexes (rype + minimap2 + bowtie2) on a plain"
-            " reference: after ingest, plan-shards fans out one build per lineage-sorted"
-            " shard (loading -> indexing -> active). Requires --taxonomy; mutually"
-            " exclusive with --host."
+            "Build per-shard ANALYSIS aligner indexes (minimap2 + bowtie2) on a plain"
+            " reference, plus the ONE whole-reference rype router: after ingest,"
+            " plan-shards fans out one build per lineage-sorted shard (loading ->"
+            " indexing -> active). Requires --taxonomy; mutually exclusive with --host."
         ),
     )
     # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local
@@ -765,8 +765,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # whole-reference router, not a per-shard rype); minimap2 knobs to --host OR
     # --shard-index; --no-bowtie2-index to --shard-index only. Default builds
     # every applicable index; the opt-out flags skip one (the entry point rejects
-    # building none). --minimap2-preset tunes the builder; omitted, it uses the
-    # builder's default (preset=sr).
+    # building none). --minimap2-preset tunes the HOST builder only; a sharded
+    # reference's per-shard .mmi is always built with the fixed map-hifi preset.
     p_reference_load.add_argument(
         "--no-rype-index",
         action="store_true",
@@ -800,7 +800,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument(
         "--minimap2-preset",
         choices=("sr", "map-ont", "map-pb", "map-hifi", "asm5", "asm10", "asm20"),
-        help="With --host/--shard-index: minimap2 preset baked into the .mmi index (default sr).",
+        help=(
+            "With --host only: minimap2 preset baked into the host .mmi index (default"
+            " sr). Not allowed with --shard-index (per-shard .mmi is fixed at map-hifi)."
+        ),
     )
     p_reference_load.add_argument(
         "--data-plane-url",

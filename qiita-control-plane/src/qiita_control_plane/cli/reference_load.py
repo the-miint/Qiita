@@ -121,6 +121,12 @@ _LOCAL_REFERENCE_ADD_ACTION_ID = "local-reference-add"
 _LOCAL_HOST_REFERENCE_ADD_ACTION_ID = "local-host-reference-add"
 _REFERENCE_ADD_ACTION_VERSION = "1.0.0"
 
+# The minimap2 preset a sharded ANALYSIS reference's per-shard `.mmi` is built with:
+# always `map-hifi` (the long-read align preset align_sharded uses), fixed on load —
+# not submitter-tunable. (Host references still default to the 'sr' build preset and
+# accept --minimap2-preset.)
+_SHARD_MINIMAP2_PRESET = "map-hifi"
+
 
 @dataclass(frozen=True, slots=True)
 class UploadResult:
@@ -525,9 +531,11 @@ async def do_reference_load(
 
     Index selection / params: `build_rype` (host-filter rype) and `rype_w` apply
     to `host` ONLY — a sharded reference builds no per-shard rype (its routing is
-    the auto-built whole-reference router). `build_minimap2` / `minimap2_preset`
-    apply to `host` OR `shard_index` (minimap2 is built in both). `build_bowtie2`
-    is analysis-only, so it applies to `shard_index` only. Each buildable index
+    the auto-built whole-reference router). `build_minimap2` applies to `host` OR
+    `shard_index` (minimap2 is built in both), but `minimap2_preset` applies to
+    `host` ONLY: a sharded reference's per-shard `.mmi` is always built with the
+    fixed `map-hifi` preset (not submitter-tunable on load). `build_bowtie2` is
+    analysis-only, so it applies to `shard_index` only. Each buildable index
     defaults True; at least one applicable index must be built. Selection is
     initial-build-time only — adding an index type to an already-active reference
     is unsupported (the status FSM is terminal at `active`)."""
@@ -578,10 +586,16 @@ async def do_reference_load(
             " index; a sharded reference's routing index is built automatically, and a"
             " plain reference builds no index)"
         )
-    if (not build_minimap2 or minimap2_preset is not None) and not (host or shard_index):
+    if not build_minimap2 and not (host or shard_index):
         raise ValueError(
-            "--no-minimap2-index / --minimap2-preset apply only with --host or"
-            " --shard-index (a plain reference builds no index)"
+            "--no-minimap2-index applies only with --host or --shard-index"
+            " (a plain reference builds no index)"
+        )
+    if minimap2_preset is not None and not host:
+        raise ValueError(
+            "--minimap2-preset applies only with --host: a sharded reference's"
+            f" per-shard minimap2 index is always built with the {_SHARD_MINIMAP2_PRESET!r}"
+            " preset (fixed on load), and a plain reference builds no index"
         )
     # At least one applicable index must be built. The workflow's context_schema
     # `not` backstop rejects the all-off case server-side too; checking here fails
@@ -762,8 +776,10 @@ async def do_reference_load(
         action_context["shard_index"] = True
         action_context["build_minimap2"] = build_minimap2
         action_context["build_bowtie2"] = build_bowtie2
-        if minimap2_preset is not None:
-            action_context["minimap2_preset"] = minimap2_preset
+        # The per-shard minimap2 index is ALWAYS built with the map-hifi preset —
+        # the long-read align preset align_sharded uses — and is NOT submitter-tunable
+        # on load (validation above rejects --minimap2-preset with --shard-index).
+        action_context["minimap2_preset"] = _SHARD_MINIMAP2_PRESET
 
     # Select the action by ingest mode (local vs remote) and host-ness. Host
     # references run the *-host-reference-add workflow (the base steps plus the
