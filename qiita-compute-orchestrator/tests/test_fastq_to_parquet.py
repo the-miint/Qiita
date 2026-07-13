@@ -30,7 +30,6 @@ import duckdb
 import pytest
 from qiita_common.backend_failure import StepNoData
 
-import qiita_compute_orchestrator.sequence_range_retry as retry_module
 from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.fastq_to_parquet import (
     YAML_STEP_NAME,
@@ -598,7 +597,7 @@ def test_execute_maps_401_to_contract_violation(monkeypatch, tmp_path):
 @pytest.fixture
 def no_backoff(monkeypatch):
     """Zero the CP-callback retry backoff so the retry tests don't sleep."""
-    monkeypatch.setattr(retry_module, "CP_RETRY_BACKOFF_BASE_S", 0)
+    monkeypatch.setattr(sequence_range_retry, "CP_RETRY_BACKOFF_BASE_S", 0)
 
 
 def _status_error(status: int):
@@ -631,7 +630,9 @@ def test_execute_maps_exhausted_5xx_to_control_plane_unreachable(monkeypatch, no
             tmp_path / "ws",
         )
 
-    assert len(calls) == retry_module.CP_RETRY_MAX_ATTEMPTS  # retried, not failed on attempt 1
+    assert (
+        len(calls) == sequence_range_retry.CP_RETRY_MAX_ATTEMPTS
+    )  # retried, not failed on attempt 1
     assert ei.value.kind is FailureKind.CONTROL_PLANE_UNREACHABLE
     assert ei.value.transient is True
     assert ei.value.step_name == YAML_STEP_NAME

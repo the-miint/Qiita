@@ -30,6 +30,7 @@ import duckdb
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
+import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.bam_to_parquet import YAML_STEP_NAME, Inputs, execute
 from qiita_compute_orchestrator.sequence_range import (
@@ -208,7 +209,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     attempt into a permanent failure on the retry: it masked the OOM behind a mint
     conflict and defeated the runner's OOM memory escalation, which can only pay
     off if the escalated attempt gets past the mint. This is the exact sequence
-    that failed 23 of 26 samples on the first real PacBio run.
+    that failed nearly every sample on the first real PacBio run.
     """
 
     async def _conflict(*, http, prep_sample_idx, count):
@@ -288,3 +289,31 @@ def test_plan_downsizes_a_small_bam_and_never_upsizes_a_large_one(tmp_path):
     os.truncate(big, 12 * 1024**3)  # sparse — no bytes actually written
     big_plan = plan(Inputs(bam_path=big, prep_sample_idx=1, work_ticket_idx=1))
     assert big_plan.resources.mem_gb >= baseline_mem_gb
+
+
+def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp_path):
+    """DuckDB's memory_limit is sized from the REAL cgroup, not a literal.
+
+    This is the fix that makes the runner's OOM memory-escalation able to help at
+    all: while the limit was hardcoded, doubling the SLURM allocation left DuckDB
+    capped at the same in-process value, so the escalated attempt re-OOM'd
+    identically. Assert the wiring directly — a regression that re-hardcodes it
+    would otherwise keep every other test in this file green.
+    """
+    seen: list[int] = []
+    real_apply = bam_module.apply_duckdb_settings
+
+    def _spy(conn, duckdb_tmp, *, memory_gb, threads):
+        seen.append(memory_gb)
+        return real_apply(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
+
+    monkeypatch.setattr(bam_module, "apply_duckdb_settings", _spy)
+    # 64 GB cgroup, minus duckdb_headroom_gb(threads=2) == 3.
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", str(64 * 1024))
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII")])
+    _run(Inputs(bam_path=sam, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
+
+    assert seen, "apply_duckdb_settings was never called"
+    assert set(seen) == {61}, f"expected the cgroup-derived limit on every connection, got {seen}"

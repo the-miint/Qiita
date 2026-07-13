@@ -158,7 +158,8 @@ async def test_mint_sequence_range_second_attempt_raises_already_exists(
                 http=http, prep_sample_idx=e2e_prep_sample, count=4
             )
     assert ei.value.prep_sample_idx == e2e_prep_sample
-    # The new recovery hint surfaces (replaces the previous "delete
-    # the prep_sample" framing that contradicted the recovery runbook).
-    assert "pre_minted_range" in str(ei.value)
-    assert "fastq-to-parquet-retry-recovery.md" in str(ei.value)
+    # The message is a DIAGNOSTIC, not operator instructions: a reads job pairs the
+    # mint with a read-back (mint_or_reuse_sequence_range) and recovers from this
+    # 409 transparently, so it names that as the recovery rather than prescribing
+    # an operator action.
+    assert "mint_or_reuse_sequence_range" in str(ei.value)

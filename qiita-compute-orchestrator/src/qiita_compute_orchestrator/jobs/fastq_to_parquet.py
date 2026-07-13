@@ -139,6 +139,12 @@ YAML_STEP_NAME = "fastq"
 # safely above ~2.4 GB resident per thread (2048 STANDARD_VECTOR_SIZE
 # × 60 default Parquet row_group_size × ~20 KB avg long-read record
 # incl. quality); 7 GB is comfortably above that.
+#
+# NOT yet sized from the real cgroup (unlike bam_to_parquet), so the runner's OOM
+# escalation cannot reach DuckDB here: an escalated retry re-OOMs at this same
+# limit. Converting requires raising the Illumina baseline across every
+# fastq-to-parquet version to hold the effective limit at 7 GB, which changes the
+# cluster footprint of the main production path — deliberately out of scope here.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 

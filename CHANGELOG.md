@@ -101,32 +101,29 @@ the `no-changelog` label).
   the way `"completed/failed"` did. (#286)
 
 - **`bam-to-parquet` could not ingest a real PacBio HiFi sample: 24 of 26 failed on
-  the first production run.** The job was memory-sized for Illumina — an 8 GB SLURM
-  baseline and a *hardcoded* 7 GB DuckDB `memory_limit` — while its blocking
-  operator is a sorted `COPY` over the full read payload. A HiFi read is ~15-25 kB
-  of seq+qual against Illumina's ~150 bp, so a routine 2M-read sample is tens of GB
-  to sort; only the two control-sized samples in the pool (11k and 44k reads) fit.
-  The DuckDB limit being a literal also made the runner's OOM memory-escalation
-  structurally incapable of helping: doubling the cgroup left DuckDB capped at 7 GB
-  regardless. The job now sizes its `memory_limit` from the real cgroup
-  (`resolve_duckdb_memory_gb`, as nine other jobs already did), the workflow
-  baseline is long-read-sized (32 GB / PT4H) with ceiling headroom for escalation
-  to climb into (96 GB / PT12H), and a new `plan()` sizes memory + walltime from the
-  BAM's `st_size` so a control-sized BAM does not reserve the long-read envelope.
-- **`bam_to_parquet` / `fastq_to_parquet` never read back a minted-but-unwritten
-  `sequence_range`, so every runner retry 409'd and masked the real failure.** Both
-  jobs mint the range and *then* do the heavy durable write — exactly the window an
-  OOM/walltime kill lands in. The runner re-runs the whole module on such a
-  (transient) failure, the re-mint hit the one-shot contract, and the step died
-  *permanently* with `already has a sequence_range` — hiding the OOM that actually
-  killed the first attempt, and defeating the OOM escalation (the escalated attempt
-  could never get past the mint to benefit). `ingest_reads` already handled this;
-  its private helper is now the shared `mint_or_reuse_sequence_range` in
-  `sequence_range_retry`, and all three jobs use it: a 409 reads the existing range
-  back, validates its width against the attempt's read count, and reuses it. This is
-  what makes the step idempotent across retries, and it makes
-  `sequence_range_retry`'s own docstring claim ("the mint is idempotent on retry")
-  true for the first time.
+  the first production run.** Two compounding defects, both fixed here.
+  *Sizing:* the job was memory-sized for Illumina — an 8 GB SLURM baseline and a
+  *hardcoded* 7 GB DuckDB `memory_limit` — while its blocking operator is a sorted
+  `COPY` over the full read payload. A HiFi read is ~15-25 kB of seq+qual against
+  Illumina's ~150 bp, so a routine 2M-read sample is tens of GB to sort; only the
+  two control-sized samples in the pool (11k and 44k reads) fit. The job now sizes
+  `memory_limit` from the real cgroup (`resolve_duckdb_memory_gb`, as nine other
+  jobs already did), the workflow baseline is long-read-sized (32 GB / PT4H) with
+  ceiling headroom for escalation to climb into (96 GB / PT12H), and a new `plan()`
+  sizes memory + walltime from the BAM's `st_size` so a control-sized BAM does not
+  reserve the long-read envelope.
+  *Retry:* `bam_to_parquet` and `fastq_to_parquet` mint a `sequence_range` and
+  *then* do the heavy durable write — exactly the window an OOM/walltime kill lands
+  in — but never read an orphaned range back. The runner re-runs the whole module on
+  such a (transient) failure, the re-mint hit the one-shot contract, and the step
+  died *permanently* with `already has a sequence_range`: hiding the OOM that
+  actually killed the first attempt, and defeating the OOM escalation, which can
+  only pay off if the escalated attempt gets past the mint. `ingest_reads` already
+  handled this; its private helper is now the shared `mint_or_reuse_sequence_range`
+  in `sequence_range_retry` and all three jobs use it (409 → read back → validate
+  width against the read count → reuse). Both halves were needed: without the
+  read-back the escalation cannot land, and without the memory it has nothing to
+  land on.
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
   partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
   by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the

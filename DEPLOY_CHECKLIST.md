@@ -19,7 +19,15 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- **Confirm SLURM will grant `bam-to-parquet`'s new envelope.** Its baseline rises to
+  `mem_gb: 32 / PT4H` and its ceiling to `mem_gb: 96 / PT12H` (the OOM escalation
+  climbs into that headroom). If the partition's `MaxMemPerNode` or `MaxTime` is
+  below the ceiling, an escalated step is rejected by SLURM rather than queued.
+  Check and, if either is short, raise the partition limits or lower the ceiling in
+  the YAML before deploying: (#TBD)
+  ```bash
+  scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
+  ```
 
 ### 3. Migrations
 
@@ -27,11 +35,30 @@ _None yet._
 
 ### 4. Deploy
 
-_None yet._
+_None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via the
+`qiita-admin actions sync` that `activate.sh` already runs._
 
 ### 5. Verify
 
-_None yet._
+- **`bam-to-parquet` picked up the new resources.** `activate.sh`'s `qiita-admin
+  actions sync` is what carries the raised baseline/ceiling into `qiita.action`; a
+  stale row means every HiFi sample still OOMs: (#TBD)
+  ```bash
+  psql "$DATABASE_URL" -c "
+    SELECT action_id, version, steps
+    FROM qiita.action WHERE action_id = 'bam-to-parquet';"   # baseline mem_gb 32, ceiling 96
+  ```
+- **Re-run the PacBio samples stranded by the old build** (sequencing_run 18 /
+  sequenced_pool 25016 — 24 of 26 OOM-killed). No cleanup is needed first: each
+  failed attempt minted a `sequence_range` before dying, and the new build reads
+  that range back and reuses it instead of 409ing on it. `ticket run` resets a
+  FAILED ticket and re-dispatches it in place: (#TBD)
+  ```bash
+  for i in $(seq 4805 4830); do qiita ticket run "$i" || true; done   # already-COMPLETED ones no-op
+  ```
+  Do **not** recover with `submit-pacbio-ingest --force` — that re-ingests and
+  duplicates reads in the lake (DuckLake has no uniqueness). Do **not** delete the
+  `sequence_range` rows — reusing them is exactly what makes the retry converge.
 
 ### 6. After the deploy verifies green
 

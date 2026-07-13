@@ -1,5 +1,22 @@
 # fastq_to_parquet retry recovery
 
+> **SUPERSEDED — you almost certainly do not need this page.** The scenario it
+> describes (a step minted its sequence-range, then died before the durable write)
+> is now recovered **automatically**: every reads job pairs the mint with a
+> read-back (`mint_or_reuse_sequence_range`), so a retry reuses the orphaned range
+> instead of 409ing on it. The runner's own retry does this without you, and a
+> ticket that ended FAILED is recovered by `qiita ticket run <idx>` — nothing to
+> read out of the DB, nothing to resubmit by hand.
+>
+> Do **not** follow the DELETE-prep_sample path below to clear an orphaned range:
+> the range is what the retry reuses, and deleting it is destructive for no gain.
+>
+> The rest of this page is retained for the case where a retry genuinely cannot
+> reuse the range — the read-back finds a range whose width does not match the
+> input's read count (BAD_INPUT, "must match the prior mint count exactly"), which
+> means the input file changed between attempts. That is the only surviving manual
+> case, and it is a data-integrity problem, not a retry problem.
+
 > Recovery path for a failed `fastq_to_parquet` work_ticket where the
 > sequence-range was already minted by the failed attempt. Avoids
 > destroying the prep_sample (the heavy-handed alternative).

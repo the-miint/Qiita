@@ -10,14 +10,14 @@ A native job mints a globally-unique bigint range per prep_sample via
 prep_sample. Two helpers cover the two recovery shapes:
 
 - `mint_sequence_range` — POST; raises `SequenceRangeAlreadyExists` on
-  409. The `fastq_to_parquet` job maps that to a permanent
-  `BackendFailure` (its recovery is the operator-supplied
-  `pre_minted_range`; see docs/runbooks/fastq-to-parquet-retry-recovery.md).
+  409.
 - `get_sequence_range` — GET; reads an existing range back, or None on
-  404. The `ingest_reads` job uses it for *transparent* retry: a pool
-  step that minted a sample's range then crashed before the durable
-  write reuses the existing range on the next attempt instead of
-  failing. This is what lets the runner's OOM memory-escalation pay off
+  404.
+
+Every reads job pairs the two through `mint_or_reuse_sequence_range`
+(sequence_range_retry): a step that minted a sample's range then crashed
+before the durable write reuses the existing range on the next attempt
+instead of failing. This is what lets the runner's OOM memory-escalation pay off
   on an oversized sample — the escalated retry reuses the range rather
   than dying on the one-shot mint contract.
 
@@ -68,21 +68,23 @@ class MintedSequenceRange:
 
 class SequenceRangeAlreadyExists(Exception):
     """Raised when the CP returns 409 from POST /sequence-range — the
-    prep_sample already has a sequence_range from a prior (likely
-    failed) attempt. Callers map this to a permanent BackendFailure
-    with operator-recovery instructions; the helper itself does not."""
+    prep_sample already has a sequence_range from a prior (likely failed)
+    attempt.
+
+    This is NOT a failure for a reads job: `mint_or_reuse_sequence_range`
+    catches it, reads the existing range back, and reuses it, which is what
+    makes the step idempotent across runner retries. The message below is
+    therefore a diagnostic, not operator instructions — it surfaces only to a
+    caller that does not pair the mint with the read-back."""
 
     def __init__(self, prep_sample_idx: int, count: int):
         super().__init__(
             f"prep_sample {prep_sample_idx} already has a sequence_range "
             f"(attempted mint with count={count}, typically from a "
-            "previous failed attempt). Recover by resubmitting the "
-            "work_ticket with `pre_minted_range` populated from the "
-            "existing qiita.sequence_range row — see "
-            "docs/runbooks/fastq-to-parquet-retry-recovery.md. "
-            "Deleting the prep_sample also works (CASCADE removes the "
-            "range) but is destructive; the pre_minted_range path is "
-            "preferred."
+            "previous failed attempt of the same step). A reads job recovers "
+            "from this transparently by reading the existing range back "
+            "(mint_or_reuse_sequence_range); seeing this raised means the "
+            "caller did not."
         )
         self.prep_sample_idx = prep_sample_idx
         self.count = count
@@ -109,11 +111,12 @@ class PreMintedRange(BaseModel):
     """Operator-supplied recovery range for a retried read-ingest work_ticket
     (the `fastq_to_parquet` and `bam_to_parquet` native jobs both accept it).
 
-    Set only when a prior attempt failed transiently AFTER it had already minted
-    a sequence-range — the prep_sample's `qiita.sequence_range` row exists and a
-    fresh mint would 409. The operator (or runner-side automation) reads the
-    existing range, resubmits the work_ticket with this field populated, and the
-    job skips the mint call.
+    LARGELY SUPERSEDED: a transient failure after the mint is now recovered
+    automatically — `mint_or_reuse_sequence_range` reads the orphaned range back
+    and reuses it, so a plain re-run converges with no operator action and no
+    populated field. This hook remains only as an explicit override, and nothing
+    can currently set it (it is absent from every workflow's `context_schema`, and
+    the step binder drops unknown action_context keys).
 
     The two indices are inclusive on both ends and must match the input's read
     count exactly: `sequence_idx_stop - sequence_idx_start + 1 == count_of_reads`.
@@ -121,8 +124,7 @@ class PreMintedRange(BaseModel):
 
     Lives here (not in a job module) because it is the recovery twin of
     `MintedSequenceRange` and both read-ingest jobs consume it — neither should
-    import it out of the other. See
-    docs/runbooks/fastq-to-parquet-retry-recovery.md for the full operator flow.
+    import it out of the other.
     """
 
     sequence_idx_start: int = Field(gt=0)
@@ -173,10 +175,11 @@ async def get_sequence_range(
     """GET /api/v1/sequence-range/{prep_sample_idx}; return the existing
     range or None if the prep_sample has none yet (404).
 
-    Used by `ingest_reads` to read back a range a prior, crashed attempt
-    already minted, so the retry reuses it instead of re-minting (which
-    would 409). The CP route accepts the `sequence_range:mint` scope the
-    compute SA holds, so no `prep_sample:read` grant is needed.
+    Used by `mint_or_reuse_sequence_range` to read back a range a prior,
+    crashed attempt already minted, so the retry reuses it instead of
+    re-minting (which would 409). The CP route accepts the
+    `sequence_range:mint` scope the compute SA holds, so no `prep_sample:read`
+    grant is needed.
 
     `http` is the authed httpx client (Bearer with the compute SA PAT,
     base_url = the CP), same as `mint_sequence_range`.

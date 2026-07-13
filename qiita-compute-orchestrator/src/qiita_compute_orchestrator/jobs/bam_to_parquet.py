@@ -43,7 +43,6 @@ path (`PreMintedRange`) relies on the read count being stable across attempts.
 from __future__ import annotations
 
 import math
-from datetime import timedelta
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -75,8 +74,9 @@ YAML_STEP_NAME = "bam"
 # `resolve_duckdb_memory_gb`, not a literal: a hardcoded cap silently ignores both
 # the per-run `--mem-gb` override and the runner's OOM memory escalation, so an
 # escalated retry would re-OOM at the same in-process limit no matter how much
-# SLURM granted it. `_DUCKDB_FALLBACK_MEMORY_GB` applies only off SLURM (local
-# backend / tests), where it tracks the YAML baseline minus headroom.
+# SLURM granted it. `_DUCKDB_MEMORY_GB` is the OFF-SLURM fallback only (local
+# backend / tests), where there is no cgroup to read; it is NOT the YAML baseline
+# minus headroom, and deliberately stays small so a dev box isn't asked for 29 GB.
 #
 # A BAM record is far heavier than a FASTQ read: a PacBio HiFi / ONT uBAM record
 # carries per-base modification (MM/ML) and kinetics (ipd/pw) aux tags that htslib
@@ -85,21 +85,31 @@ YAML_STEP_NAME = "bam"
 # The blocking operator is the final sorted COPY, whose payload is the full
 # seq+qual: a 2M-read HiFi sample is tens of GB to sort. That is why the YAML
 # baseline is long-read-sized rather than inherited from fastq_to_parquet.
-_DUCKDB_FALLBACK_MEMORY_GB = 7
+_DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
 # plan() memory model. The dominant cost scales with the BAM's on-disk size (the
 # sorted COPY's payload is the decompressed seq+qual it carries), so we size from
 # `st_size` — a stat(), no scan, per job_resource_plan's "must stay cheap" rule.
-# The multiplier is deliberately generous: plan() can only ever LOWER the step
-# below its YAML baseline (the CP composes it down-only), so an over-estimate is a
-# no-op that leaves the baseline in place, while an under-estimate would starve a
-# real sample. Its whole job is to stop a control-sized BAM from reserving the
-# long-read baseline. Refine against real MaxRSS telemetry.
-_PLAN_BASE_MEM_GB = 4
+#
+# The FLOOR matters more than the slope. plan() is down-only (the CP applies a hint
+# only below baseline), so an over-estimate is a harmless no-op — but an
+# under-estimate silently starves a sample the baseline would have carried. And the
+# floor is not what DuckDB gets: `duckdb_headroom_gb(2)` = 3 GB comes off the top,
+# so a planned N GB leaves DuckDB N-3. The base is therefore pinned so the smallest
+# BAM still leaves DuckDB the 7 GB that the pre-existing baseline gave it — the
+# envelope the only two samples that survived the first PacBio run actually ran in.
+# Sizing memory linearly in input size is the exception to `docs/writing-a-job.md`'s
+# streaming-job rule, and deliberate: the sorted COPY is a BLOCKING operator whose
+# payload is the whole file, not a per-row transform.
+#
+# Only memory is planned. A walltime hint is also down-only, and any coefficient
+# that lowers walltime for a mid-sized HiFi BAM would burn one of the ticket's three
+# shared retries on a TIMEOUT before the step ever runs at a sane envelope — the
+# sample class this exists to unbreak. The baseline walltime is not scarce; leave it.
+# Refine the slope against real (st_size, MaxRSS) telemetry.
+_PLAN_BASE_MEM_GB = 10
 _PLAN_MEM_GB_PER_BAM_GB = 4.0
-_PLAN_BASE_WALLTIME_SECONDS = 900
-_PLAN_WALLTIME_SECONDS_PER_BAM_GB = 600.0
 
 
 class Inputs(BaseModel):
@@ -124,7 +134,7 @@ class Inputs(BaseModel):
 
 
 def plan(inputs: Inputs) -> JobPlan:
-    """Size memory + walltime from the BAM's on-disk size (a stat(), never a scan).
+    """Size memory from the BAM's on-disk size (a stat(), never a scan).
 
     Runs in the ORCHESTRATOR process at submit time, so it must stay cheap — see
     `job_resource_plan`. The YAML baseline is sized for a real long-read sample
@@ -132,17 +142,14 @@ def plan(inputs: Inputs) -> JobPlan:
     BAM does not reserve that whole envelope and sit in the SLURM queue behind it.
 
     Down-only by construction: the CP applies a hint only when it is BELOW the
-    baseline (and leaves an axis alone when baseline == ceiling), so this can
-    never raise a step's allocation — escalation remains the only up-sizing path.
-    An over-estimate is therefore a no-op, which is why the coefficients lean
-    generous.
+    baseline (and leaves an axis alone when baseline == ceiling), so this can never
+    raise a step's allocation — escalation remains the only up-sizing path. An
+    over-estimate is therefore a no-op, which is why the slope leans generous and
+    the base is pinned to the envelope a small BAM is known to run in.
     """
     bam_gb = inputs.bam_path.stat().st_size / (1024**3)
     mem_gb = _PLAN_BASE_MEM_GB + math.ceil(_PLAN_MEM_GB_PER_BAM_GB * bam_gb)
-    walltime = timedelta(
-        seconds=_PLAN_BASE_WALLTIME_SECONDS + math.ceil(_PLAN_WALLTIME_SECONDS_PER_BAM_GB * bam_gb)
-    )
-    return JobPlan(resources=JobResourcePlan(mem_gb=mem_gb, walltime=walltime))
+    return JobPlan(resources=JobResourcePlan(mem_gb=mem_gb))
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -167,7 +174,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # Track the real cgroup, so a `--mem-gb` override and the runner's OOM
     # escalation both actually reach DuckDB's memory_limit (a literal here would
     # cap the escalated retry at the same limit that OOM'd the first attempt).
-    memory_gb = resolve_duckdb_memory_gb(_DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS)
+    memory_gb = resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS)
 
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
