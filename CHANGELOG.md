@@ -77,7 +77,7 @@ the `no-changelog` label).
   principals and an unrelated assertion counted five. The DB is isolated per xdist
   *worker*, not per test, so this only fired when the runner's core count co-located the
   two files. The fixture now cleans up after itself, and an autouse tripwire fails the
-  test that leaks an owed ticket rather than the innocent one that trips over it.
+  test that leaks an owed ticket rather than the innocent one that trips over it. (#291)
 
 - **`no_data` work tickets were invisible to the reference and sequenced-pool delete
   gates, and to the reference-load CLI's watch loop.** `WorkTicketState` has three
