@@ -23,7 +23,9 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-band setup — plain `ALTER TABLE`s.
+
+- `20260713000000_sequenced_sample_spikein_read_count.sql` — adds `sequenced_sample.spikein_read_count_r1r2` (a spike-in is added in the lab, so it is disjoint from `biological`). (#270)
 
 ### 4. Deploy
 
@@ -31,7 +33,14 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `read-mask` **1.0.0** is present in the `qiita.action` list printed by `make verify-deploy` — the workflow YAML is edited in place (new `syndna` + lima steps) and re-synced by `qiita-admin actions sync` inside `activate.sh`, not migrated. (#270)
+- The new `lima` image built and carries the pinned version (the read-mask identity hash pins `lima 2.13.0`, so a drifted binary would silently change where the adapter clip lands):
+  ```bash
+  cd /tmp && sudo -u qiita-orch apptainer exec --no-home \
+      "${PATH_DERIVED}/images/lima-2.13.0.sif" micromamba run -n lima lima --version
+  # expect: lima 2.13.0
+  ```
+  (#270)
 
 ### 6. After the deploy verifies green
 
@@ -43,7 +52,9 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- The `read-mask` **`lima` SIF auto-rebuilds during the deploy** (`activate.sh` → `build-sifs.sh` → `scripts/build-sif.sh read-mask lima`), picking up the new `lima.def` / `lima.sh` / vendored Twist adapter FASTA via the build-inputs content hash. Nothing to stage: lima comes from bioconda in `%post` and the adapter FASTA is in-repo, so the spec declares no `SOURCES`. The first build is not free — budget a few minutes in bucket 4. (#270)
+- **A SynDNA spike-in reference needs a minimap2 (`.mmi`) index**, not a rype one, before the first PacBio absquant read-mask submission — `qiita submit-host-filter-pool --syndna-reference-idx` refuses a reference without one. Load it with `qiita reference load --host --no-rype-index --minimap2-preset map-hifi` (the spike-in inserts are the subject sequences). No action if no absquant pool is being masked yet. (#270)
+- The pool `sequenced-sample` roster gains three PacBio fields (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the pool's stored pre-flight blob. Additive, and `null` for an Illumina pool — no client is required to read them. (#270)
 
 ---
 
