@@ -45,9 +45,10 @@ but adds an identity floor and a primary-only predicate, neither of which host
 filtering needs: host depletion is deliberately aggressive (any alignment = host),
 whereas a spike-in call is a claim about a read's ORIGIN: a false positive silently
 removes a genuine biological read from `biological`, and would corrupt the per-insert
-coverage-depth quantification that consumes the same classifier. Both predicates, and
-the one filter deliberately NOT applied (a coverage floor — an assay decision rather
-than an engineering one), are documented at the constants.
+coverage-depth quantification that consumes the same classifier. Both predicates, what
+the primary-only rule costs in the other direction, and the one filter deliberately NOT
+applied (a coverage floor), are argued at the constants — including the open questions
+that are the assay owner's rather than ours.
 """
 
 from __future__ import annotations
@@ -109,7 +110,7 @@ _MM2_PRESET = "map-hifi"
 #     gap_compressed 0.9994  -> above it, counted
 # so one structural deletion flips the call. Whether a real spike-in molecule is
 # expected to carry such an event — and therefore which method the assay wants — is
-# with the assay owner alongside the two filters below.
+# with the assay owner alongside the open questions below.
 _IDENTITY_METHOD = "blast"
 _MIN_IDENTITY = 0.95
 
@@ -125,13 +126,33 @@ _MIN_IDENTITY = 0.95
 # supplementary segment marks the whole read: exactly the local-alignment false positive
 # a chimeric or repeat-containing HiFi read produces.
 #
-# coverm does the same, verified rather than assumed (coverm 0.8.0, `contig --methods
-# count`): a read whose ONLY alignment to a contig is supplementary contributes 0 to that
-# contig's count, while the byte-identical alignment with the flag cleared contributes 1.
-# Its `--exclude-supplementary` flag does not change this — it governs `filter`, which
-# thresholds records rather than counting reads. So this is what "a faithful port of the
-# assay's coverm spec" actually requires.
+# Measured against coverm rather than assumed (coverm 0.8.0, `contig --methods count`): a
+# read whose ONLY alignment to a contig is supplementary contributes 0 to that contig's
+# count, while the byte-identical alignment with the flag cleared contributes 1. Its
+# `--exclude-supplementary` flag does not change that — it governs `filter`, which
+# thresholds records rather than counting reads. Note what the probe does and does not
+# establish: coverm's `count` is a per-contig quantification and this predicate is a
+# per-read origin boolean over the union of inserts, so they are not the same question —
+# what was measured is that coverm does not credit a reference on a supplementary
+# alignment, which is the behaviour being ported.
 #
+# THE COST, which is a real trade and not free: the rule is now "the read's BEST
+# alignment is a spike-in at >= _MIN_IDENTITY", not "ANY alignment is". A read whose
+# primary falls below the floor but which carries a high-identity supplementary segment
+# is now `pass` — i.e. it lands in `biological`. If that read is a spike-in chimera it is
+# lab-added sequence, so we have both undercounted the spike-in and put it in the
+# biological set. HiFi chimera rates are low, so this is very likely the right side of
+# the trade, but two questions are with the assay owner alongside the coverage floor:
+# whether the inserts share backbone/flanking sequence with each other (which would make
+# a spurious longer chain to the WRONG insert systematic rather than incidental), and
+# whether a chimeric read carrying spike-in sequence is meant to be `biological` at all.
+#
+# `_PRIMARY_ONLY` exists as a constant, though nothing reads it, because the control
+# plane folds it into the read-mask identity (`runner/_mask.py::_resolved_syndna`,
+# pinned by `test_syndna_pins.py`): it is part of the effective filter, so a mask built
+# under a different rule must not silently collapse onto one built under this rule.
+_PRIMARY_ONLY = True
+
 # =============================================================================
 # What is DELIBERATELY not filtered — pending the assay owner
 # =============================================================================
@@ -206,14 +227,18 @@ def _run_align_minimap2(
       * PRIMARY alignments only, so one short high-identity supplementary segment
         cannot mark a whole read.
 
-    Both predicates use miint's own functions rather than arithmetic over the cigar or
-    bit math on `flags` — `alignment_seq_identity` (see `_IDENTITY_METHOD`) and
-    `alignment_is_primary` / `alignment_is_unmapped`. `alignment_is_primary` is false for
-    secondary AND supplementary records but TRUE for an unmapped one, so the unmapped
-    predicate is a separate conjunct, not redundant. (A non-matching read emits no
-    alignment row at all, so that one is belt-and-braces.) `max_secondary := 0` stops
-    minimap2 emitting secondaries in the first place, and DISTINCT collapses any
-    remaining per-read rows to one `sequence_idx`.
+    Both rules — and what the second one costs — are argued at the constants; this is
+    only where they are applied. Both use miint's own functions rather than arithmetic
+    over the cigar or bit math on `flags`: `alignment_seq_identity` and
+    `alignment_is_primary` / `alignment_is_unmapped`.
+
+    The two flag predicates are NOT redundant with each other: `alignment_is_primary`
+    means "neither secondary nor supplementary" and is TRUE for an unmapped read, so it
+    does not imply mappedness. (In practice a non-matching read emits no alignment row at
+    all, so the unmapped conjunct never fires — it is there so the predicate says what it
+    means rather than relying on that.) `max_secondary := 0` stops minimap2 emitting
+    secondaries in the first place, and DISTINCT collapses any remaining per-read rows to
+    one `sequence_idx`.
 
     Isolated as a seam so unit tests stub the real aligner.
     """

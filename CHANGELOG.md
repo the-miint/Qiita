@@ -205,11 +205,20 @@ the `no-changelog` label).
     them `twist_no_adaptor`, and because every later step only re-classifies rows
     still `pass`, the spike-in count would be **structurally zero**. Marking them
     up front also makes `twist_no_adaptor` a correct "artifactual" signal on the
-    reads that remain. A read is a spike-in when it ALIGNS to the SynDNA reference
-    (minimap2, `map-hifi`) at ≥ 0.95 identity, computed by miint's
+    reads that remain. A read is a spike-in when it has a **PRIMARY** alignment to the
+    SynDNA reference (minimap2, `map-hifi`) at ≥ 0.95 identity, computed by miint's
     `alignment_seq_identity` — an identity floor host filtering does not need, because
     a spike-in call is a claim about a read's ORIGIN: a false positive silently removes
-    a genuine biological read from `biological`. Spike-in reads are RETAINED in
+    a genuine biological read from `biological`. The primary-only rule is there for the
+    same reason: identity is scored per alignment ROW and then DISTINCT'd to a read, so
+    without it a single short high-identity SUPPLEMENTARY segment marks a whole read —
+    the local-alignment false positive a chimeric HiFi read produces. coverm does not
+    credit a reference on a supplementary alignment either (measured, coverm 0.8.0), so
+    excluding them is what porting its spec requires. Both rules, plus the coverage floor
+    deliberately NOT applied and the open questions that belong to the assay owner, are
+    argued at the job's constants; both are folded into the read-mask identity, so a
+    change to either re-mints rather than silently reusing a mask built under the old
+    rule. Spike-in reads are RETAINED in
     `read_mask` (their `sequence_idx` survives), so a later per-insert quantification
     needs no re-ingest. Two notes on `spikein_read_count_r1r2`: because a non-`pass`
     verdict is carried verbatim through the rest of the chain it is a **raw-space**
@@ -240,16 +249,6 @@ the `no-changelog` label).
   gates are client-supplied, so a submission can still ask for the long-read chain over a
   paired-end read set. `lima_mask`'s check on lima's own output also remains — lima is an external
   container binary, and `infer_trim` would absorb a broken contract silently. (#270)
-- **`syndna` counts a read as a spike-in only on a PRIMARY alignment.** Identity is scored per
-  alignment ROW and then DISTINCT'd to a read, so a single short high-identity SUPPLEMENTARY
-  segment previously marked a whole read — the local-alignment false positive a chimeric or
-  repeat-containing HiFi read produces, which both removes a genuine read from `biological` and
-  inflates the spike-in count. coverm does not count supplementary alignments either, established
-  by probe rather than assumed (coverm 0.8.0, `contig --methods count`: a read whose only alignment
-  to a contig is supplementary contributes 0, while the byte-identical alignment with the flag
-  cleared contributes 1), so excluding them is what "a faithful port of the assay's coverm spec"
-  requires. The predicate uses miint's own `alignment_is_primary` / `alignment_is_unmapped` rather
-  than hand-rolled bit math on `flags`. (#270)
 
 - **`qiita submit-host-filter-pool --syndna-reference-idx`**, and per-sample gate
   derivation for PacBio pools: `lima_enabled`, `syndna_enabled`, and per-sample

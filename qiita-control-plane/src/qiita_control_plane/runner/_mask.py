@@ -90,6 +90,12 @@ _SYNDNA_MM2_PRESET = "map-hifi"
 # spike-in under one and not the other. A change here must re-mint.
 _SYNDNA_IDENTITY_METHOD = "blast"
 _SYNDNA_MIN_IDENTITY = 0.95
+# Whether a read may be called a spike-in on a NON-primary (supplementary) alignment.
+# Also part of the effective filter, and a bigger lever than it sounds: it turns the rule
+# from "ANY alignment >= min_identity" into "the read's BEST alignment >= min_identity",
+# so the same read can be a spike-in under one and not the other. A change here must
+# re-mint, which is why it is hashed and not merely a comment in the job.
+_SYNDNA_PRIMARY_ONLY = True
 
 
 def _workflow_needs_mask(steps: list[Any]) -> bool:
@@ -157,11 +163,12 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
     here, since every producer writes the flag and the refs together.)
 
     NESTED, mirroring `resolved_lima` / `resolved_qc`: the reference alone does not
-    describe the filter. A read is a spike-in when it ALIGNS to the reference at
-    >= `min_identity` under `preset`, so both are part of the effective filter and
-    both belong in the identity. The threshold in particular is expected to move
-    once it is confirmed against real data with the assay owner — when it does,
-    masks MUST re-mint rather than silently reuse one built at the old cutoff.
+    describe the filter. A read is a spike-in when it has a PRIMARY alignment to the
+    reference at >= `min_identity` under `preset` — so the preset, the identity method,
+    the threshold, AND the primary-only rule are all part of the effective filter, and
+    all belong in the identity. The threshold in particular is expected to move once it
+    is confirmed against real data with the assay owner — when it does, masks MUST
+    re-mint rather than silently reuse one built at the old cutoff.
 
     Only the reference idx is client-chosen; the aligner, preset, and threshold are
     control-plane constants mirroring `jobs/syndna.py` (kept here, not imported —
@@ -176,6 +183,7 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
         "preset": _SYNDNA_MM2_PRESET,
         "identity_method": _SYNDNA_IDENTITY_METHOD,
         "min_identity": _SYNDNA_MIN_IDENTITY,
+        "primary_only": _SYNDNA_PRIMARY_ONLY,
     }
 
 

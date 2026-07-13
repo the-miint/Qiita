@@ -12,6 +12,14 @@ Builds a real `.mmi` from two synthetic spike-in inserts and runs the actual
     about a read's ORIGIN, and a false positive silently removes a genuine biological
     read from `biological`. Without this case the threshold could be deleted and every
     test would still pass;
+  - **the primary-only predicate is load-bearing.** A read whose only at-or-above-floor
+    alignment is SUPPLEMENTARY is NOT a spike-in — the local-alignment false positive a
+    chimeric read produces, and what coverm's read counts do too. Delete
+    `alignment_is_primary` from the seam and the chimera test fails;
+  - **that chimera test cannot pass vacuously.** A separate guard asserts against the
+    RAW aligner that the fixture really does elicit a below-floor primary AND an
+    at-or-above-floor supplementary, so a minimap2 / miint bump that stops emitting the
+    supplementary record fails loudly instead of leaving the predicate untested;
   - `read_id` round-trips BIGINT through `align_minimap2` into the job's accumulator;
   - a biological read matching no spike-in emits no alignment at all and is left alone.
 
@@ -27,6 +35,8 @@ from pathlib import Path
 import duckdb
 from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
 from qiita_common.models import ReadMaskReason
+
+from qiita_compute_orchestrator.miint import open_miint_conn
 
 _PASS = ReadMaskReason.PASS.value
 _SPIKEIN = ReadMaskReason.SPIKEIN_SYNDNA.value
@@ -173,22 +183,22 @@ def test_syndna_smoke_the_chimera_really_does_produce_a_high_identity_supplement
     )
 
     index = _build_syndna_index(tmp_path)
-    conn = duckdb.connect(":memory:", config=miint_connect_config())
-    conn.execute(miint_install_sql())
-    conn.execute("LOAD miint;")
-    conn.execute(
-        "CREATE TABLE q AS SELECT * FROM (VALUES (CAST(1 AS BIGINT), CAST(? AS VARCHAR)))"
-        " AS t(read_id, sequence1)",
-        [_READ_CHIMERA],
-    )
-    rows = conn.execute(
-        "SELECT alignment_is_primary(flags), alignment_is_supplementary(flags), "
-        "       alignment_seq_identity(cigar, tag_nm, tag_md, ?) "
-        "FROM align_minimap2('q', index_path := ?, preset := ?, max_secondary := 0) "
-        "WHERE NOT alignment_is_unmapped(flags)",
-        [_IDENTITY_METHOD, str(index), _MM2_PRESET],
-    ).fetchall()
-    conn.close()
+    # The job's own connection helper, deliberately: this test's whole value is that it
+    # probes the SAME miint the job loads. A hand-rolled connect() could drift from
+    # `open_miint_conn` (settings, extension resolution) and quietly probe a different one.
+    with open_miint_conn() as conn:
+        conn.execute(
+            "CREATE TABLE q AS SELECT * FROM (VALUES (CAST(1 AS BIGINT), CAST(? AS VARCHAR)))"
+            " AS t(read_id, sequence1)",
+            [_READ_CHIMERA],
+        )
+        rows = conn.execute(
+            "SELECT alignment_is_primary(flags), alignment_is_supplementary(flags), "
+            "       alignment_seq_identity(cigar, tag_nm, tag_md, ?) "
+            "FROM align_minimap2('q', index_path := ?, preset := ?, max_secondary := 0) "
+            "WHERE NOT alignment_is_unmapped(flags)",
+            [_IDENTITY_METHOD, str(index), _MM2_PRESET],
+        ).fetchall()
 
     primary = [ident for is_primary, _, ident in rows if is_primary]
     supplementary = [ident for _, is_supp, ident in rows if is_supp]
@@ -205,9 +215,9 @@ def test_syndna_smoke_high_identity_supplementary_alignment_is_not_a_spikein(tmp
     at-or-above-threshold alignment is SUPPLEMENTARY, so the read is NOT a spike-in.
 
     Scoring identity per row and DISTINCT-ing to a read would mark it — a short local
-    alignment is enough to claim a whole 2.6 kb read came from a spike-in. coverm does
-    not do that (verified against coverm 0.8.0: a read whose only alignment to a contig
-    is supplementary contributes 0 to that contig's read count), and neither do we.
+    alignment is enough to claim a whole read came from a spike-in. coverm does not do
+    that (measured against coverm 0.8.0: a read whose only alignment to a contig is
+    supplementary contributes 0 to that contig's read count), and neither do we.
     Delete `alignment_is_primary` from the seam and this is the test that fails.
     """
     reads = _write_reads(tmp_path / "reads.parquet", [(1, _READ_EXACT_A), (2, _READ_CHIMERA)])

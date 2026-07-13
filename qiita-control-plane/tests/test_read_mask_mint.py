@@ -387,10 +387,15 @@ def test_resolved_syndna_is_gated_on_enabled():
 
 
 def test_resolved_syndna_carries_the_effective_alignment_config():
-    """The reference alone does not describe the filter: a read is a spike-in when it
-    ALIGNS at >= min_identity under a preset. Both belong in the identity, so that
-    moving the threshold (expected, once it is confirmed against real data) RE-MINTS
-    rather than silently reusing a mask built at the old cutoff."""
+    """The reference alone does not describe the filter: a read is a spike-in when it has
+    a PRIMARY alignment at >= min_identity under a preset. Every one of those belongs in
+    the identity, so that changing any of them RE-MINTS rather than silently reusing a
+    mask built under the old rule.
+
+    Asserted as a WHOLE-DICT equality, deliberately: a new knob added to the filter must
+    fail here until it is folded into the hash. `primary_only` was added exactly because
+    this equality did NOT fail when the predicate changed — the numbers were pinned but
+    the semantics were not."""
     r = runner._mask._resolved_syndna({"syndna_enabled": True, "syndna_reference_idx": 57})
     assert r == {
         "reference_idx": 57,
@@ -398,6 +403,7 @@ def test_resolved_syndna_carries_the_effective_alignment_config():
         "preset": "map-hifi",
         "identity_method": "blast",
         "min_identity": 0.95,
+        "primary_only": True,
     }
 
 
