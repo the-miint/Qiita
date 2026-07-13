@@ -108,7 +108,12 @@ def test_export_writes_sequence_idx_as_the_record_name(tmp_path):
     reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
     out = _export(tmp_path, reads)
     names = [ln[1:] for ln in out["lima_in_fastq"].read_text().splitlines() if ln.startswith("@")]
-    assert names == ["11", "22"]  # sequence_idx, not read_id ("r11"/"r22")
+    # sequence_idx, not read_id ("r11"/"r22"). SORTED, not compared in emission order:
+    # the FASTQ is written unsorted on purpose (a blocking sort over sequence1+qual1
+    # would spill tens of GB), and no consumer reads record order — lima_mask recovers
+    # the key from the record NAME. Asserting the order here would re-impose a contract
+    # the job deliberately does not offer.
+    assert sorted(names) == ["11", "22"]
 
 
 def test_export_writes_the_cp_resolved_args_to_a_file(tmp_path):

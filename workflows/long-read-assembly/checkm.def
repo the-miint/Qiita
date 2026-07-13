@@ -23,7 +23,7 @@ From: mambaorg/micromamba:1.5.8
     # (build-sif.sh mirrors the repo layout so this relative path resolves).
     ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
     # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
-    _lib.sh /opt/qiita/_lib.sh
+    ../_shared/_lib.sh /opt/qiita/_lib.sh
     # This image's per-step entrypoint.
     checkm.sh /opt/qiita/checkm.sh
 

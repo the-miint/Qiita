@@ -1,5 +1,14 @@
 #!/bin/bash
-# Shared helpers for the long-read-assembly per-step entrypoints. Each step
+# Shared helpers for EVERY workflow's container entrypoints (long-read-assembly's four
+# steps and read-mask's lima). It lived in two byte-identical copies, one per workflow,
+# which made "keep the two in lockstep" a load-bearing comment rather than a fact.
+#
+# Living under _shared/ means the SIF builder hashes it into EVERY image's
+# build-inputs digest (`qiita_sif_build_inputs_hash*` in deploy/_common.sh hash the whole
+# shared dir, exactly as they do manifest_writer.py). So editing this file rebuilds every
+# image — including bcl-convert, which does not source it. That is the accepted cost: an
+# occasional redundant rebuild is cheaper than two copies of an executable library that
+# silently drift. Each step
 # sources this, reads its inputs from params.json, runs its tool writing under
 # $QIITA_OUTPUT_PATH, then calls qiita_finish to emit the manifest and apply the
 # 0440 (files) / 0550 (dirs) mode contract the data-plane verifier requires.

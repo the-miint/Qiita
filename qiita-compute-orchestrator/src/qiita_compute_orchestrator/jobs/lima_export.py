@@ -47,9 +47,9 @@ from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "lima_export"
 
-# Off-SLURM fallback cap; under SLURM the real cap is sized to the cgroup. This
-# step streams a projection of the reads parquet straight to FASTQ, so its peak
-# footprint is ~flat in read count.
+# Off-SLURM fallback cap; under SLURM the real cap is sized to the cgroup. This step
+# STREAMS a projection of the reads parquet straight to FASTQ — no sort, no accumulator
+# (see the COPY) — so its peak footprint really is ~flat in read count.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
@@ -118,11 +118,23 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 source = "lima_export_pass"
             # `sequence_idx` becomes the FASTQ record name. The CAST is REQUIRED:
             # miint's FASTQ writer takes the record name from a VARCHAR `read_id`
-            # column and raises an INTERNAL error (invalidating the connection) on
-            # a BIGINT. ORDER BY keeps the output deterministic.
+            # column and raises an INTERNAL error (invalidating the connection) on a
+            # BIGINT (reported upstream as duckdb-miint #145).
+            #
+            # DELIBERATELY NOT SORTED. Record order is not a contract: `lima_mask`
+            # recovers each read's key from the record NAME (not its position), and
+            # lima's `--neighbors` keys on the ADAPTER FASTA's order, not the reads'.
+            # Nothing downstream reads it, and unlike qc / host_filter this output is a
+            # container input, not a Parquet registered into DuckLake — so the
+            # lake-friendly sorted-`sequence_idx` argument does not apply either.
+            #
+            # An ORDER BY here would be a BLOCKING sort over the widest payload in the
+            # chain (`sequence1` + `qual1`: ~20 kB x 2 x millions of HiFi rows), spilling
+            # tens of GB to the shared filesystem under `mem_gb: 8` to buy an ordering
+            # nothing consumes. Streaming keeps the peak footprint flat in read count.
             conn.execute(
                 "COPY (SELECT CAST(sequence_idx AS VARCHAR) AS read_id, sequence1, qual1 "
-                f"      FROM {source} ORDER BY sequence_idx) "
+                f"      FROM {source}) "
                 f"TO '{out_sql}' (FORMAT FASTQ)"
             )
         lima_config.write_text(json.dumps({"args": inputs.lima_args}) + "\n")
