@@ -42,9 +42,10 @@ path (`PreMintedRange`) relies on the read count being stable across attempts.
 
 from __future__ import annotations
 
+import math
+from datetime import timedelta
 from pathlib import Path
 
-import httpx
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
@@ -58,14 +59,11 @@ from ..miint import (
     duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
+    resolve_duckdb_memory_gb,
 )
-from ..sequence_range import (
-    PreMintedRange,
-    PrepSampleNotEligibleForSequenceRange,
-    SequenceRangeAlreadyExists,
-    mint_sequence_range,
-)
-from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
+from ..sequence_range import PreMintedRange
+from ..sequence_range_retry import mint_or_reuse_sequence_range
+from . import JobPlan, JobResourcePlan
 
 # YAML step name this module implements. Hard-coded because execute() raises
 # BackendFailures itself (which need a step_name); the integration smoke asserts
@@ -73,20 +71,35 @@ from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
 # `- step: bam` YAML entry fails loudly.
 YAML_STEP_NAME = "bam"
 
-# DuckDB resource caps, mirroring fastq_to_parquet's rationale: the YAML
-# allocation (workflows/bam-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
-# SLURM cgroup; DuckDB's caps sit just below (`mem_gb - 1` leaves ~1 GB for
-# Python/miint/OS overhead). 7 GB matches fastq_to_parquet's cap, but note a BAM
-# record is heavier than a FASTQ read: a PacBio HiFi / ONT uBAM record carries
-# per-base modification (MM/ML) and kinetics (ipd/pw) aux tags that htslib
-# materializes with the whole record BEFORE read_sequences_sam projects them away
-# — so peak parse memory reflects the tagged record, not the ~20 KB seq+qual this
-# job keeps. The pipeline is the read_sequences_sam parse, a footer count +
-# `count(DISTINCT read_id)` aggregate, and a sorted COPY — all spill to duckdb_tmp
-# under the cap. Revisit against a real kinetics-laden uBAM MaxRSS if the parse
-# dominates.
-_DUCKDB_MEMORY_GB = 7
+# DuckDB resource caps. The limit is sized from the REAL SLURM cgroup via
+# `resolve_duckdb_memory_gb`, not a literal: a hardcoded cap silently ignores both
+# the per-run `--mem-gb` override and the runner's OOM memory escalation, so an
+# escalated retry would re-OOM at the same in-process limit no matter how much
+# SLURM granted it. `_DUCKDB_FALLBACK_MEMORY_GB` applies only off SLURM (local
+# backend / tests), where it tracks the YAML baseline minus headroom.
+#
+# A BAM record is far heavier than a FASTQ read: a PacBio HiFi / ONT uBAM record
+# carries per-base modification (MM/ML) and kinetics (ipd/pw) aux tags that htslib
+# materializes with the whole record BEFORE read_sequences_sam projects them away,
+# and the reads themselves are ~15-25 kB of seq+qual against Illumina's ~150 bp.
+# The blocking operator is the final sorted COPY, whose payload is the full
+# seq+qual: a 2M-read HiFi sample is tens of GB to sort. That is why the YAML
+# baseline is long-read-sized rather than inherited from fastq_to_parquet.
+_DUCKDB_FALLBACK_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
+
+# plan() memory model. The dominant cost scales with the BAM's on-disk size (the
+# sorted COPY's payload is the decompressed seq+qual it carries), so we size from
+# `st_size` — a stat(), no scan, per job_resource_plan's "must stay cheap" rule.
+# The multiplier is deliberately generous: plan() can only ever LOWER the step
+# below its YAML baseline (the CP composes it down-only), so an over-estimate is a
+# no-op that leaves the baseline in place, while an under-estimate would starve a
+# real sample. Its whole job is to stop a control-sized BAM from reserving the
+# long-read baseline. Refine against real MaxRSS telemetry.
+_PLAN_BASE_MEM_GB = 4
+_PLAN_MEM_GB_PER_BAM_GB = 4.0
+_PLAN_BASE_WALLTIME_SECONDS = 900
+_PLAN_WALLTIME_SECONDS_PER_BAM_GB = 600.0
 
 
 class Inputs(BaseModel):
@@ -110,6 +123,28 @@ class Inputs(BaseModel):
     pre_minted_range: PreMintedRange | None = None
 
 
+def plan(inputs: Inputs) -> JobPlan:
+    """Size memory + walltime from the BAM's on-disk size (a stat(), never a scan).
+
+    Runs in the ORCHESTRATOR process at submit time, so it must stay cheap — see
+    `job_resource_plan`. The YAML baseline is sized for a real long-read sample
+    (millions of HiFi reads, tens of GB to sort); this exists so a control-sized
+    BAM does not reserve that whole envelope and sit in the SLURM queue behind it.
+
+    Down-only by construction: the CP applies a hint only when it is BELOW the
+    baseline (and leaves an axis alone when baseline == ceiling), so this can
+    never raise a step's allocation — escalation remains the only up-sizing path.
+    An over-estimate is therefore a no-op, which is why the coefficients lean
+    generous.
+    """
+    bam_gb = inputs.bam_path.stat().st_size / (1024**3)
+    mem_gb = _PLAN_BASE_MEM_GB + math.ceil(_PLAN_MEM_GB_PER_BAM_GB * bam_gb)
+    walltime = timedelta(
+        seconds=_PLAN_BASE_WALLTIME_SECONDS + math.ceil(_PLAN_WALLTIME_SECONDS_PER_BAM_GB * bam_gb)
+    )
+    return JobPlan(resources=JobResourcePlan(mem_gb=mem_gb, walltime=walltime))
+
+
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """B-staged-Parquet pipeline. See module docstring for the full description."""
     if not inputs.bam_path.exists():
@@ -129,6 +164,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ),
         )
 
+    # Track the real cgroup, so a `--mem-gb` override and the runner's OOM
+    # escalation both actually reach DuckDB's memory_limit (a literal here would
+    # cap the escalated retry at the same limit that OOM'd the first attempt).
+    memory_gb = resolve_duckdb_memory_gb(_DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS)
+
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
     # Output basename is the DuckLake table name: a downstream register-files step
@@ -141,7 +181,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
 
@@ -162,7 +202,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
             count, distinct_read_ids = conn.execute(
@@ -197,9 +237,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
         # Mint a sequence_idx range from the CP — unless the work_ticket carries a
-        # `pre_minted_range` (E-operator recovery). Same typed-exception → explicit
-        # BackendFailure mapping as fastq_to_parquet (the framework dispatcher only
-        # wraps bare NotImplementedError/FileNotFoundError/ValueError).
+        # `pre_minted_range` (E-operator recovery). A 409 is NOT a failure here:
+        # `mint_or_reuse_sequence_range` reads back the range a prior crashed
+        # attempt left and reuses it, so an OOM-escalated retry completes instead of
+        # dying on the one-shot mint contract (and instead of masking the OOM that
+        # actually killed the first attempt behind a mint conflict).
         if inputs.pre_minted_range is not None:
             recovery = inputs.pre_minted_range
             recovered_count = recovery.sequence_idx_stop - recovery.sequence_idx_start + 1
@@ -217,32 +259,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 )
             sequence_idx_start = recovery.sequence_idx_start
         else:
-            try:
-                async with make_cp_client() as http:
-                    rng = await cp_call_with_retry(
-                        lambda: mint_sequence_range(
-                            http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
-                        )
-                    )
-            except SequenceRangeAlreadyExists as exc:
-                raise BackendFailure(
-                    kind=FailureKind.UNKNOWN_PERMANENT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=str(exc),
-                ) from exc
-            except PrepSampleNotEligibleForSequenceRange as exc:
-                raise BackendFailure(
-                    kind=FailureKind.BAD_INPUT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=str(exc),
-                ) from exc
-            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
-                raise cp_call_failure(
-                    inputs.prep_sample_idx, exc, step_name=YAML_STEP_NAME
-                ) from exc
-            sequence_idx_start = rng.sequence_idx_start
+            async with make_cp_client() as http:
+                sequence_idx_start = await mint_or_reuse_sequence_range(
+                    http, inputs.prep_sample_idx, count, step_name=YAML_STEP_NAME
+                )
 
         # Rewrite intermediate -> final with sequence_idx assigned and physically
         # sorted on disk. sequence_idx = read_sequences_sam's per-file 1-based
@@ -254,7 +274,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
             conn.execute(

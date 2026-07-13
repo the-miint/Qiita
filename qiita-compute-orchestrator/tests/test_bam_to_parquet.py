@@ -24,14 +24,19 @@ the team mirror.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import duckdb
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
-import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
+from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.bam_to_parquet import YAML_STEP_NAME, Inputs, execute
-from qiita_compute_orchestrator.sequence_range import MintedSequenceRange, PreMintedRange
+from qiita_compute_orchestrator.sequence_range import (
+    MintedSequenceRange,
+    PreMintedRange,
+    SequenceRangeAlreadyExists,
+)
 
 # Minimal SAM columns: QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL.
 # Unmapped (FLAG 4) records model a long-read uBAM; RNAME='*' needs no @SQ header.
@@ -71,7 +76,7 @@ def fake_mint(monkeypatch):
             sequence_idx_stop=1000 + count - 1,
         )
 
-    monkeypatch.setattr(bam_module, "mint_sequence_range", _fake)
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _fake)
     return calls
 
 
@@ -192,3 +197,94 @@ def test_pre_minted_range_matching_count_skips_mint(fake_mint, tmp_path):
     assert fake_mint == []  # HTTP mint skipped
     seqs = [r[1] for r in _read_parquet(tmp_path / "ws" / "read.parquet")]
     assert seqs == [500, 501]
+
+
+def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
+    """A 409 on mint is RECOVERED, not fatal: the range a prior attempt minted
+    before dying is read back and reused, and the step completes.
+
+    This is what makes the step idempotent across runner retries. The prior
+    behaviour — 409 -> UNKNOWN_PERMANENT — is what turned an OOM-killed first
+    attempt into a permanent failure on the retry: it masked the OOM behind a mint
+    conflict and defeated the runner's OOM memory escalation, which can only pay
+    off if the escalated attempt gets past the mint. This is the exact sequence
+    that failed 23 of 26 samples on the first real PacBio run.
+    """
+
+    async def _conflict(*, http, prep_sample_idx, count):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _existing(*, http, prep_sample_idx):
+        # The range the OOM-killed attempt minted: same count, so reusable.
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _existing)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    # Reused the crashed attempt's range rather than consuming a fresh one.
+    seqs = [r[1] for r in _read_parquet(tmp_path / "ws" / "read.parquet")]
+    assert seqs == [1000, 1001]
+
+
+def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp_path):
+    """A read-back range whose width doesn't match this attempt's read count must
+    NOT be reused — the written sequence_idx values would mismatch
+    qiita.sequence_range at registration."""
+
+    async def _conflict(*, http, prep_sample_idx, count):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _wrong_size(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1005,  # 6 indices for a 2-read BAM
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _wrong_size)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.BAD_INPUT
+    assert ei.value.step_name == YAML_STEP_NAME
+    assert "must match the prior mint count exactly" in ei.value.reason
+
+
+def test_plan_downsizes_a_small_bam_and_never_upsizes_a_large_one(tmp_path):
+    """plan() sizes from the BAM's st_size (a stat, no scan).
+
+    It exists to keep a control-sized BAM off the long-read baseline. It can only
+    ever LOWER a step (the CP composes hints down-only), so the assertion that
+    matters is directional: a tiny BAM plans well under the YAML baseline, and a
+    real HiFi-sized BAM plans at or above it (where the hint becomes a no-op and
+    the baseline stands).
+    """
+    from qiita_compute_orchestrator.jobs.bam_to_parquet import plan
+
+    baseline_mem_gb = 32  # workflows/bam-to-parquet/1.0.0.yaml
+
+    small = tmp_path / "control.bam"
+    small.write_bytes(b"\0" * 1024)
+    small_plan = plan(Inputs(bam_path=small, prep_sample_idx=1, work_ticket_idx=1))
+    assert small_plan.resources.mem_gb < baseline_mem_gb
+
+    # A HiFi sample is many GB on disk; plan must not try to shrink it.
+    big = tmp_path / "hifi.bam"
+    big.touch()
+    os.truncate(big, 12 * 1024**3)  # sparse — no bytes actually written
+    big_plan = plan(Inputs(bam_path=big, prep_sample_idx=1, work_ticket_idx=1))
+    assert big_plan.resources.mem_gb >= baseline_mem_gb
