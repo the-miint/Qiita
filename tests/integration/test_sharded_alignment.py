@@ -37,6 +37,7 @@ patch.
 
 import asyncio
 import json
+import random
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -62,15 +63,30 @@ _REF_IDX = 8
 # The CP-minted alignment-config identity stamped as the leading column of every
 # output row (mask-style identity; keys the DuckLake `alignment` table).
 _ALIGN_IDX = 71
+
+
 # Each feature = a DISTINCT region + a region SHARED by both features. A read from
 # a distinct region aligns to exactly one feature (one shard); a read from the
 # shared region aligns END-TO-END to BOTH features — so it routes to both shards
 # and yields two distinct-feature rows (the multiplicity/no-dedup case) for the
-# end-to-end aligner (bowtie2) AND the soft-clip aligner (minimap2). Sequence-
-# diverse 25-mers (not low-complexity), tiled to ~650 bp each (>> k=64).
-_DISTINCT_A = "GATTACAGGCCTAGCATCGTTACGA" * 26  # feature 100 only
-_DISTINCT_B = "TTCAGCATTGCACGTATCCTGGAAC" * 26  # feature 200 only
-_SHARED = "ACGTGGCCAATTCGATTACGCATGA" * 26  # in BOTH features
+# end-to-end aligner (bowtie2) AND the soft-clip aligner (minimap2).
+#
+# The regions are pseudo-random (fixed seed => reproducible) and therefore
+# internally NON-repetitive — this is load-bearing. Each read must have exactly ONE
+# alignment position per feature; a PERIODIC sequence (a single k-mer tiled) makes a
+# read match at every period offset, which (a) gives minimap2 spurious within-feature
+# multiplicity and (b) makes bowtie2 under the modified-SHOGUN param set
+# (no_exact_upfront / no_1mm_upfront + repetitive-seed masking) drop the read
+# entirely — both break the exact per-feature counts asserted below. ~650 bp per
+# region (>> rype k=64).
+def _diverse(n: int, seed: int) -> str:
+    rng = random.Random(seed)
+    return "".join(rng.choice("ACGT") for _ in range(n))
+
+
+_DISTINCT_A = _diverse(650, 1)  # feature 100 only
+_DISTINCT_B = _diverse(650, 2)  # feature 200 only
+_SHARED = _diverse(650, 3)  # in BOTH features
 _A = _DISTINCT_A + _SHARED  # feature 100 -> shard 0
 _B = _DISTINCT_B + _SHARED  # feature 200 -> shard 1
 _FEATURES = {100: _A, 200: _B}
@@ -329,9 +345,16 @@ def test_sharded_alignment_end_to_end(
     # ---- PAIRED-END batch (uniform: every sequence2 is non-NULL) ----------------
     # 5 = a proper fr pair, both mates in feature 100's distinct region (mate2 is
     # the reverse-complement of a downstream segment). prep_sample 20.
+    #
+    # Mate length (240 bp) and fragment span (~495 bp) are BOTH load-bearing and
+    # bracketed by the two aligners: minimap2's `map-hifi` (long-read) preset does
+    # not align a pair of short (150 bp) mates at all, so mates must be long enough
+    # for it; bowtie2's default max-insert is 500 bp and `no_discordant` drops
+    # anything over it, so the fragment must stay under 500. `_A[:240]` +
+    # `_revcomp(_A[255:495])` clears both.
     pe_reads = _write_reads(
         tmp_path / f"reads_pe_{aligner}.parquet",
-        [(20, 5, _A[:150], _revcomp(_A[300:450]))],
+        [(20, 5, _A[:240], _revcomp(_A[255:495]))],
     )
     pe_out = _align(pe_reads)
     by_read_pe, prep_of_pe = _features_by_read(pe_out)
