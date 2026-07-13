@@ -86,7 +86,12 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
-from ..preflight import PacbioProtocol, pacbio_protocol_from_blob
+from ..preflight import (
+    PacbioProtocol,
+    open_blob,
+    pacbio_human_filtering_by_sample_idx,
+    pacbio_protocol_by_sample_idx,
+)
 from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataUnknownFieldsError,
@@ -386,12 +391,22 @@ def _human_filtering_by_item_id(blob: bytes) -> dict[str, bool]:
     }
 
 
-def _pacbio_facts_by_item_id(blob: bytes) -> dict[str, PacbioProtocol]:
-    """Map each PacBio sample's barcode (== its ``sequenced_pool_item_id``) to its
-    protocol facts. ``{}`` for a non-PacBio blob, so the caller can try both
-    readers without branching. See ``qiita_control_plane.preflight`` — the join
-    lives there so the CLI and this route cannot drift."""
-    return pacbio_protocol_from_blob(blob)
+def _pacbio_facts_by_item_id(blob: bytes) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
+    """Return ``(human_filtering, protocol_facts)`` for a PacBio blob, both keyed on
+    ``str(pacbio_sample_idx)`` — which IS the ``sequenced_pool_item_id`` the PacBio
+    composer assigns (the barcode is only the BAM-locating key). ``({}, {})`` for a
+    non-PacBio blob, so the caller can probe both platforms without branching.
+
+    Two readers, one blob open. They are separate in ``qiita_control_plane.preflight``
+    on purpose: ``human_filtering`` is host-filtering POLICY whose source is moving to
+    sample metadata, while the protocol facts stay pre-flight-sourced. When that lands,
+    the ``pacbio_human_filtering_by_sample_idx`` call below is what gets deleted.
+    """
+    with open_blob(blob) as conn:
+        protocol = pacbio_protocol_by_sample_idx(conn)
+        if not protocol:
+            return {}, {}
+        return pacbio_human_filtering_by_sample_idx(conn), protocol
 
 
 async def _pool_sample_facts_by_item_id(
@@ -402,15 +417,23 @@ async def _pool_sample_facts_by_item_id(
 ) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
     """Return ``(human_filtering_by_item_id, pacbio_facts_by_item_id)`` for a pool.
 
-    PLATFORM-AWARE. The Illumina map keys on ``str(illumina_sample_idx)``; the
-    PacBio map keys on the barcode. A pool is one or the other (a pre-flight
-    carries a single run-level ``sheet_type``), so exactly one map is populated —
-    but both are returned so the roster route stays branch-free.
+    PLATFORM-AWARE, and the SINGLE seam where the roster sources its per-sample
+    intake facts. Both maps key on the pool's ``sequenced_pool_item_id``:
+    ``str(illumina_sample_idx)`` for Illumina, ``str(pacbio_sample_idx)`` for PacBio.
+    A pool is one or the other (a pre-flight carries a single run-level
+    ``sheet_type``), so at most one platform's facts are populated — but both are
+    returned so the roster route itself stays branch-free.
 
-    For PacBio, ``human_filtering`` comes from the SAME join as the protocol
-    fields: the Illumina reader walks ``run_illumina_sample``, which PacBio has no
-    analogue for, and would return ``{}`` — leaving every PacBio sample's intent
-    null and aborting ``submit-host-filter-pool`` before it starts.
+    For PacBio, ``human_filtering`` needs its own reader: the Illumina one walks
+    ``run_illumina_sample``, which PacBio has no analogue for, and would return
+    ``{}`` — leaving every PacBio sample's intent null and aborting
+    ``submit-host-filter-pool`` before it starts.
+
+    THIS is the function the sample-metadata migration repoints: when
+    ``human_filtering`` stops coming from the blob, both readers below lose their
+    first return value and it comes from sample metadata instead. The roster still
+    carries the field and the CLI still reads it off the roster row, so nothing
+    downstream changes.
 
     Degrades to ``({}, {})`` on an unparseable blob (see the warning below).
     """
@@ -425,18 +448,14 @@ async def _pool_sample_facts_by_item_id(
     # The PacBio read is a PROBE: a blob it cannot parse is simply not PacBio, and
     # must not take the Illumina reader down with it. One `try` around both would do
     # exactly that — every Illumina pool's intents would go null the moment the
-    # PacBio join raised. Only the Illumina failure warns, because by then the blob
+    # PacBio read raised. Only the Illumina failure warns, because by then the blob
     # has failed BOTH readers.
     try:
-        pacbio = _pacbio_facts_by_item_id(blob)
+        pacbio_filtering, pacbio = _pacbio_facts_by_item_id(blob)
     except sqlite3.DatabaseError, ValueError:
-        pacbio = {}
+        pacbio_filtering, pacbio = {}, {}
     if pacbio:
-        return {
-            barcode: facts.human_filtering
-            for barcode, facts in pacbio.items()
-            if facts.human_filtering is not None
-        }, pacbio
+        return pacbio_filtering, pacbio
     try:
         return _human_filtering_by_item_id(blob), {}
     except (sqlite3.DatabaseError, ValueError) as exc:

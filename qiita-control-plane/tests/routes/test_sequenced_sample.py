@@ -3227,28 +3227,38 @@ async def test_list_run_samples_missing_scope_403(ctx, no_prep_sample_read_clien
     assert "prep_sample:read" in resp.json()["detail"]
 
 
-async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, tmp_path):
+async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, build_case5_preflight):
     """A PacBio pool's roster carries sheet_type / twist_adaptor_id /
     syndna_is_twisted AND human_filtering, all derived from the stored blob.
 
-    This is the keying that matters: the PacBio composer uses the BARCODE as the
-    sequenced_pool_item_id, so the barcode-keyed map from the pre-flight lines up
-    with the roster. The Illumina reader keys on illumina_sample_idx and walks
-    run_illumina_sample — which PacBio has no analogue for — so without the
-    platform-aware split every PacBio sample's human_filtering would be null and
-    submit-host-filter-pool would abort before it started.
+    This is the keying that matters: the PacBio composer uses `pacbio_sample_idx`
+    as the sequenced_pool_item_id (NOT the barcode — that only locates the BAM on
+    disk and is not unique across PacBio protocols), so the sample-idx-keyed map
+    from the pre-flight lines up with the roster. The Illumina reader keys on
+    illumina_sample_idx and walks run_illumina_sample — which PacBio has no
+    analogue for — so without the platform-aware split every PacBio sample's
+    human_filtering would be null and submit-host-filter-pool would abort before it
+    started.
+
+    human_filtering comes from its OWN reader, not from `PacbioProtocol`: it is
+    host-filtering policy whose source is moving to sample metadata, and keeping it
+    unfused is what makes that migration an excision.
     """
-    from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
+    from qiita_control_plane.preflight import (
+        pacbio_human_filtering_from_blob,
+        pacbio_protocol_from_blob,
+    )
 
-    from qiita_control_plane.preflight import pacbio_protocol_from_blob
-
-    csv = Path(__file__).parent.parent / "cli" / "data" / "good_pacbio_absquantv11.csv"
-    db = tmp_path / "case5.db"
-    migrate_legacy_csv_to_db_file(str(csv), str(db))
-    blob = db.read_bytes()
+    # The SAME builder the ingest-CLI and preflight-reader tests use, so this route
+    # is exercised against exactly the bytes those pin. Accessions are populated:
+    # `get_pacbio_sample_info` requires them, and a real stored blob always has them
+    # (ingest would have refused it otherwise).
+    blob = build_case5_preflight().read_bytes()
     facts = pacbio_protocol_from_blob(blob)
+    filtering = pacbio_human_filtering_from_blob(blob)
     assert facts, "fixture produced no PacBio rows"
-    barcode = sorted(facts)[0]
+    item_id = sorted(facts)[0]
+    assert item_id.isdigit(), f"pool-item-id must be pacbio_sample_idx, got {item_id!r}"
 
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-pacbio")
     # Swap the placeholder bytes for the real PacBio pre-flight.
@@ -3264,7 +3274,8 @@ async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, tmp_path):
     bs = await _seed_biosample_linked_to_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
     )
-    # The pool-item-id IS the barcode — that is what makes the roster join work.
+    # The pool-item-id IS str(pacbio_sample_idx) — that is what makes the roster join
+    # work; submit-pacbio-ingest assigns exactly this.
     resp = await _post_sequenced_sample(
         ctx["wet"],
         ctx,
@@ -3273,7 +3284,7 @@ async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, tmp_path):
         biosample_idx=bs,
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        sequenced_pool_item_id=barcode,
+        sequenced_pool_item_id=item_id,
         primary_study_idx=study_idx,
     )
     assert resp.status_code == 201, resp.text
@@ -3285,10 +3296,10 @@ async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, tmp_path):
     )
     assert listed.status_code == 200, listed.text
     (sample,) = listed.json()["samples"]
-    expected = facts[barcode]
+    expected = facts[item_id]
     assert sample["sheet_type"] == expected.sheet_type == "pacbio_absquant"
     assert sample["twist_adaptor_id"] == expected.twist_adaptor_id
     assert sample["syndna_is_twisted"] is False
-    # ...and human_filtering comes from the SAME join, not the Illumina reader.
-    assert sample["human_filtering"] == expected.human_filtering
+    # ...and human_filtering comes from the PacBio reader, not the Illumina one.
+    assert sample["human_filtering"] == filtering[item_id]
     assert sample["human_filtering"] is not None
