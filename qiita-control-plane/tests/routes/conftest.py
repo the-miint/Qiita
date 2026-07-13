@@ -25,6 +25,43 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 
+
+@pytest.fixture(autouse=True)
+def _route_settings():
+    """Stash a route-sufficient Settings on the app before every route test.
+
+    `qiita_control_plane.main.app` is a module-level SINGLETON, and the route
+    fixtures below only ever set `app.state.pool` — never `app.state.settings`. Any
+    route whose dependencies read Settings (e.g. `create_upload` →
+    `get_flight_signing_key`) therefore only worked when some *other* test module on
+    the same xdist worker had already stashed Settings on the shared app and leaked
+    it (`test_landing.py` does exactly that). Under `pytest -n auto --dist worksteal`
+    the worker assignment shifts with the test set, so that leak is load-bearing and
+    invisible: add tests anywhere in the suite and a route test can start 500ing with
+    "Settings not initialised" for reasons entirely unrelated to it.
+
+    This makes the route tests own their Settings instead of inheriting one by
+    accident. Save/restore the prior value so we don't leak in turn.
+    """
+    from qiita_control_plane.config import Settings
+    from qiita_control_plane.main import app
+
+    had_prior = hasattr(app.state, "settings")
+    prior = getattr(app.state, "settings", None)
+    app.state.settings = Settings(
+        database_url="unused",
+        flight_signing_key=b"\x00" * 32,
+        data_plane_url="unused",
+    )
+    try:
+        yield
+    finally:
+        if had_prior:
+            app.state.settings = prior
+        else:
+            del app.state.settings
+
+
 # ---------------------------------------------------------------------------
 # Three-role AsyncClient triple
 # ---------------------------------------------------------------------------

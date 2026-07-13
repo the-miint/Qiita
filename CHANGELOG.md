@@ -102,16 +102,23 @@ the `no-changelog` label).
 
 - **`bam-to-parquet` could not ingest a real PacBio HiFi sample: 24 of 26 failed on
   the first production run.** Two compounding defects, both fixed here.
-  *Sizing:* the job was memory-sized for Illumina — an 8 GB SLURM baseline and a
-  *hardcoded* 7 GB DuckDB `memory_limit` — while its blocking operator is a sorted
-  `COPY` over the full read payload. A HiFi read is ~15-25 kB of seq+qual against
-  Illumina's ~150 bp, so a routine 2M-read sample is tens of GB to sort; only the
-  two control-sized samples in the pool (11k and 44k reads) fit. The job now sizes
-  `memory_limit` from the real cgroup (`resolve_duckdb_memory_gb`, as nine other
-  jobs already did), the workflow baseline is long-read-sized (32 GB / PT4H) with
-  ceiling headroom for escalation to climb into (96 GB / PT12H), and a new `plan()`
-  sizes memory + walltime from the BAM's `st_size` so a control-sized BAM does not
-  reserve the long-read envelope.
+  *The write:* the job wrote its reads with one `COPY … ORDER BY sequence_idx` — a
+  BLOCKING sort over the full seq+qual payload. A HiFi read is ~15-25 kB against
+  Illumina's ~150 bp, so a routine 2M-read sample is tens of GB to sort, against a
+  *hardcoded* 7 GB DuckDB `memory_limit`; only the two control-sized samples in the
+  pool (11k and 44k reads) fit. That sort was never needed: `PARQUET_OPTS` does not
+  produce a globally sorted file anyway (row groups land in thread-finish order) —
+  what it buys is per-row-group clustering on the sort key, for DuckLake pruning. And
+  the data is already monotone (`sequence_idx = sequence_index + start - 1`). The job
+  now writes `read/part_*.parquet` in bounded monotone batches (~1 GiB of payload
+  each), so every part's row groups carry a tight, disjoint `sequence_idx` window —
+  the same pruning, with peak memory flat in the batch instead of the sample. The
+  multi-file table shape is the one `reference_load`/`hash_sequences` already use, for
+  exactly this reason. `memory_limit` is now sized from the real cgroup
+  (`resolve_duckdb_memory_gb`, as nine other jobs already did) so `--mem-gb` and the
+  OOM escalation can actually reach it, and the workflow allocation is modest
+  (12 GB / PT4H, ceiling 32 GB / PT12H) rather than the 32/96 GB an unbatched sort
+  would have demanded.
   *Retry:* `bam_to_parquet` and `fastq_to_parquet` mint a `sequence_range` and
   *then* do the heavy durable write — exactly the window an OOM/walltime kill lands
   in — but never read an orphaned range back. The runner re-runs the whole module on

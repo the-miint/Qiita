@@ -6,7 +6,7 @@ hand-written SAM files — `read_sequences_sam` reads SAM/BAM/CRAM, so a text SA
 a zero-dependency fixture (no pysam, no binary BAM to check in).
 
 Covers:
-  - happy path: reads become read.parquet rows with sequence_idx from the minted
+  - happy path: reads become read/part_*.parquet rows with sequence_idx from the minted
     range (read_sequences_sam's sequence_index + start - 1), qual decoded to
     UTINYINT[], sequence2/qual2 NULL;
   - a caller declaring expect_unaligned=False → BAD_INPUT (aligned unsupported);
@@ -23,7 +23,6 @@ the team mirror.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import duckdb
 import pytest
@@ -80,11 +79,14 @@ def fake_mint(monkeypatch):
 
 
 def _read_parquet(path) -> list[tuple]:
+    """Read the reads back. `path` may be a single parquet or the `read/` parts dir —
+    the output is a DIRECTORY of part_*.parquet (see _write_read_parts)."""
+    target = f"{path}/*.parquet" if path.is_dir() else str(path)
     with duckdb.connect(":memory:") as conn:
         return conn.execute(
             "SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, "
             "sequence2, qual2 FROM read_parquet(?) ORDER BY sequence_idx",
-            [str(path)],
+            [target],
         ).fetchall()
 
 
@@ -106,14 +108,15 @@ def test_execute_writes_read_parquet(fake_mint, tmp_path):
         tmp_path / "ws",
     )
     assert outputs["read_staging_dir"] == tmp_path / "ws"
-    read_pq = tmp_path / "ws" / "read.parquet"
-    assert read_pq.exists()
+    read_dir = tmp_path / "ws" / "read"
+    assert read_dir.is_dir()
+    assert sorted(p.name for p in read_dir.glob("*.parquet")) == ["part_00000.parquet"]
     # The intermediate must be gone before return (manifest walker cleanliness).
     assert not (tmp_path / "ws" / "_intermediate_reads.parquet").exists()
 
     assert fake_mint == [(42, 2)]
 
-    rows = _read_parquet(read_pq)
+    rows = _read_parquet(read_dir)
     assert rows == [
         (42, 1000, "r1", "ACGT", [40, 40, 40, 40], None, None),
         (42, 1001, "r2", "TTTT", [30, 30, 30, 30], None, None),
@@ -129,7 +132,7 @@ def test_header_only_sam_raises_stepnodata(fake_mint, tmp_path):
         _run(Inputs(bam_path=sam, prep_sample_idx=1, work_ticket_idx=1), tmp_path / "ws")
     assert exc.value.step_name == YAML_STEP_NAME
     assert fake_mint == []
-    assert not (tmp_path / "ws" / "read.parquet").exists()
+    assert not (tmp_path / "ws" / "read").exists()
 
 
 def test_expect_unaligned_false_rejected_as_bad_input(fake_mint, tmp_path):
@@ -165,7 +168,7 @@ def test_duplicate_qname_rejected_as_bad_input(fake_mint, tmp_path):
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert exc.value.step_name == YAML_STEP_NAME
     assert fake_mint == []  # rejected before the mint
-    assert not (tmp_path / "ws" / "read.parquet").exists()
+    assert not (tmp_path / "ws" / "read").exists()
 
 
 def test_missing_input_raises_filenotfound(fake_mint, tmp_path):
@@ -213,7 +216,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     # Reused the crashed attempt's range rather than consuming a fresh one.
-    seqs = [r[1] for r in _read_parquet(tmp_path / "ws" / "read.parquet")]
+    seqs = [r[1] for r in _read_parquet(tmp_path / "ws" / "read")]
     assert seqs == [1000, 1001]
 
 
@@ -245,32 +248,6 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert ei.value.step_name == YAML_STEP_NAME
     assert "must match the prior mint count exactly" in ei.value.reason
-
-
-def test_plan_downsizes_a_small_bam_and_never_upsizes_a_large_one(tmp_path):
-    """plan() sizes from the BAM's st_size (a stat, no scan).
-
-    It exists to keep a control-sized BAM off the long-read baseline. It can only
-    ever LOWER a step (the CP composes hints down-only), so the assertion that
-    matters is directional: a tiny BAM plans well under the YAML baseline, and a
-    real HiFi-sized BAM plans at or above it (where the hint becomes a no-op and
-    the baseline stands).
-    """
-    from qiita_compute_orchestrator.jobs.bam_to_parquet import plan
-
-    baseline_mem_gb = 32  # workflows/bam-to-parquet/1.0.0.yaml
-
-    small = tmp_path / "control.bam"
-    small.write_bytes(b"\0" * 1024)
-    small_plan = plan(Inputs(bam_path=small, prep_sample_idx=1, work_ticket_idx=1))
-    assert small_plan.resources.mem_gb < baseline_mem_gb
-
-    # A HiFi sample is many GB on disk; plan must not try to shrink it.
-    big = tmp_path / "hifi.bam"
-    big.touch()
-    os.truncate(big, 12 * 1024**3)  # sparse — no bytes actually written
-    big_plan = plan(Inputs(bam_path=big, prep_sample_idx=1, work_ticket_idx=1))
-    assert big_plan.resources.mem_gb >= baseline_mem_gb
 
 
 def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp_path):
@@ -339,7 +316,7 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
     assert "work_ticket 999" in ei.value.reason
     assert "already loaded" in ei.value.reason
     # Nothing was written: the refusal happens before the durable rewrite.
-    assert not (tmp_path / "ws" / "read.parquet").exists()
+    assert not (tmp_path / "ws" / "read").exists()
 
 
 def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
@@ -369,7 +346,7 @@ def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "unknown work_ticket" in ei.value.reason
-    assert not (tmp_path / "ws" / "read.parquet").exists()
+    assert not (tmp_path / "ws" / "read").exists()
 
 
 def test_execute_refuses_a_range_whose_ticket_already_completed(monkeypatch, tmp_path):
@@ -406,4 +383,53 @@ def test_execute_refuses_a_range_whose_ticket_already_completed(monkeypatch, tmp
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "already COMPLETED" in ei.value.reason
-    assert not (tmp_path / "ws" / "read.parquet").exists()
+    assert not (tmp_path / "ws" / "read").exists()
+
+
+def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tmp_path):
+    """The batched write must reproduce EXACTLY what the global sort used to give.
+
+    The old form was one `COPY ... ORDER BY sequence_idx`, a blocking sort over the
+    whole seq+qual payload — tens of GB for a HiFi sample, and where the first real
+    PacBio run OOM'd. What that sort actually bought was not a globally sorted file
+    (PARQUET_OPTS writes row groups in thread-finish order regardless) but tight
+    per-row-group min/max on sequence_idx, for DuckLake pruning.
+
+    Batching gets the same thing for free, because the data is already monotone:
+    sequence_idx = sequence_index + start - 1. So this pins the properties pruning
+    depends on:
+
+      1. every read is written exactly once, with the minted sequence_idx values;
+      2. the parts partition the range — part N's max < part N+1's min — so each
+         part's row groups carry a tight, disjoint window.
+
+    Forcing a tiny per-part budget makes several parts out of a handful of reads.
+    """
+    monkeypatch.setattr(bam_module, "_ROWS_PER_PART_TARGET_BYTES", 1)  # ~1 read per part
+
+    reads = [_sam_record(f"r{i}", "ACGT", "IIII") for i in range(1, 8)]
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, reads)
+
+    _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    read_dir = tmp_path / "ws" / "read"
+    parts = sorted(read_dir.glob("*.parquet"))
+    assert len(parts) > 1, "the budget should have forced a multi-part write"
+
+    # 1. every read exactly once, sequence_idx contiguous from the minted start
+    rows = _read_parquet(read_dir)
+    assert [r[2] for r in rows] == [f"r{i}" for i in range(1, 8)]
+    assert [r[1] for r in rows] == list(range(1000, 1007))
+
+    # 2. the parts are monotone and disjoint — what row-group pruning reads
+    bounds = []
+    with duckdb.connect(":memory:") as conn:
+        for part in parts:
+            lo, hi = conn.execute(
+                "SELECT min(sequence_idx), max(sequence_idx) FROM read_parquet(?)",
+                [str(part)],
+            ).fetchone()
+            bounds.append((lo, hi))
+    for (_, prev_hi), (next_lo, _) in zip(bounds, bounds[1:], strict=False):
+        assert prev_hi < next_lo, f"parts overlap: {bounds}"

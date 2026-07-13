@@ -43,7 +43,6 @@ count is stable across attempts.
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -62,7 +61,6 @@ from ..miint import (
     resolve_duckdb_memory_gb,
 )
 from ..sequence_range_retry import mint_or_reuse_sequence_range
-from . import JobPlan, JobResourcePlan
 
 # YAML step name this module implements. Hard-coded because execute() raises
 # BackendFailures itself (which need a step_name); the integration smoke asserts
@@ -92,28 +90,18 @@ YAML_STEP_NAME = "bam"
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
-# plan() memory model. The dominant cost scales with the BAM's on-disk size (the
-# sorted COPY's payload is the decompressed seq+qual it carries), so we size from
-# `st_size` — a stat(), no scan, per job_resource_plan's "must stay cheap" rule.
+# Target UNCOMPRESSED payload per output part (see _write_read_parts). This is what
+# bounds peak memory: the only blocking operator left is the per-part ORDER BY, which
+# sorts at most this much. 1 GiB keeps a part comfortably inside the DuckDB limit
+# even at the off-SLURM fallback, while staying far above the 64 MB row-group target
+# so each part still holds many row groups.
 #
-# The FLOOR matters more than the slope. plan() is down-only (the CP applies a hint
-# only below baseline), so an over-estimate is a harmless no-op — but an
-# under-estimate silently starves a sample the baseline would have carried. And the
-# floor is not what DuckDB gets: `duckdb_headroom_gb(2)` = 3 GB comes off the top,
-# so a planned N GB leaves DuckDB N-3. The base is therefore pinned so the smallest
-# BAM still leaves DuckDB the 7 GB that the pre-existing baseline gave it — the
-# envelope the only two samples that survived the first PacBio run actually ran in.
-# Sizing memory linearly in input size is the exception to `docs/writing-a-job.md`'s
-# streaming-job rule, and deliberate: the sorted COPY is a BLOCKING operator whose
-# payload is the whole file, not a per-row transform.
-#
-# Only memory is planned. A walltime hint is also down-only, and any coefficient
-# that lowers walltime for a mid-sized HiFi BAM would burn one of the ticket's three
-# shared retries on a TIMEOUT before the step ever runs at a sane envelope — the
-# sample class this exists to unbreak. The baseline walltime is not scarce; leave it.
-# Refine the slope against real (st_size, MaxRSS) telemetry.
-_PLAN_BASE_MEM_GB = 10
-_PLAN_MEM_GB_PER_BAM_GB = 4.0
+# There is deliberately NO plan(). Memory no longer scales with the input — it is
+# flat in the batch size — so there is nothing for a down-only sizing hint to
+# usefully lower, and a walltime hint risks burning one of the ticket's three shared
+# retries on a TIMEOUT. The job is now a streaming job, in the sense
+# docs/writing-a-job.md means it.
+_ROWS_PER_PART_TARGET_BYTES = 1024**3
 
 
 class Inputs(BaseModel):
@@ -135,23 +123,88 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-def plan(inputs: Inputs) -> JobPlan:
-    """Size memory from the BAM's on-disk size (a stat(), never a scan).
+def _write_read_parts(
+    conn,
+    *,
+    intermediate: Path,
+    read_dir: Path,
+    prep_sample_idx: int,
+    sequence_idx_start: int,
+    count: int,
+) -> int:
+    """Write the final reads as `read/part_*.parquet`, in bounded monotone batches.
 
-    Runs in the ORCHESTRATOR process at submit time, so it must stay cheap — see
-    `job_resource_plan`. The YAML baseline is sized for a real long-read sample
-    (millions of HiFi reads, tens of GB to sort); this exists so a control-sized
-    BAM does not reserve that whole envelope and sit in the SLURM queue behind it.
+    Returns the number of parts written.
 
-    Down-only by construction: the CP applies a hint only when it is BELOW the
-    baseline (and leaves an axis alone when baseline == ceiling), so this can never
-    raise a step's allocation — escalation remains the only up-sizing path. An
-    over-estimate is therefore a no-op, which is why the slope leans generous and
-    the base is pinned to the envelope a small BAM is known to run in.
+    WHY NOT ONE SORTED COPY. The obvious form —
+
+        COPY (SELECT ... FROM read_parquet(intermediate) ORDER BY sequence_idx)
+        TO 'read.parquet'
+
+    — is a BLOCKING sort over the full seq+qual payload. For a PacBio HiFi sample
+    (~15-25 kB per read, millions of reads) that is tens of GB, and it is exactly
+    where the first real PacBio run died. Paying for it with a bigger allocation
+    would be paying for work we do not need to do.
+
+    What the ORDER BY actually buys is NOT a globally sorted file — `PARQUET_OPTS`
+    says so explicitly: with `preserve_insertion_order=false` (which
+    `ROW_GROUP_SIZE_BYTES` requires) "row groups land in thread-finish order". What
+    it buys is that each row group stays CLUSTERED on the sort key, giving tight
+    per-group min/max, which is what DuckLake pruning and Parquet predicate pushdown
+    actually read.
+
+    Clustering does not need a global sort, because the data is already monotone:
+    `sequence_idx = sequence_index + start - 1`, and `sequence_index` is
+    read_sequences_sam's per-file 1-based ordinal. So we slice on `sequence_index`
+    and write one part per slice. Every row in part N has a sequence_idx strictly
+    below every row in part N+1, so each part's row groups carry a tight, disjoint
+    min/max — the same pruning the global sort produced. The ORDER BY inside a part
+    then sorts at most `_ROWS_PER_PART_TARGET_BYTES` worth of payload, so peak memory
+    is bounded by the batch, not by the sample.
+
+    The multi-file table shape is not new: `register-files` maps a top-level subdir
+    of `part_*.parquet` to the table named after the directory, which is what
+    reference_load and hash_sequences already do — and for this same reason (a
+    single-file sort+write of a large payload OOMs DuckDB).
     """
-    bam_gb = inputs.bam_path.stat().st_size / (1024**3)
-    mem_gb = _PLAN_BASE_MEM_GB + math.ceil(_PLAN_MEM_GB_PER_BAM_GB * bam_gb)
-    return JobPlan(resources=JobResourcePlan(mem_gb=mem_gb))
+    # Size the batch from the intermediate's UNCOMPRESSED payload, read from the
+    # Parquet footer (parquet_metadata is metadata-only — no data scan). Row count
+    # alone would be a poor proxy: HiFi reads are ~100x an Illumina read.
+    uncompressed_bytes = (
+        conn.execute(
+            "SELECT coalesce(sum(total_uncompressed_size), 0) FROM parquet_metadata(?)",
+            [str(intermediate)],
+        ).fetchone()[0]
+        or 0
+    )
+    bytes_per_row = max(1, uncompressed_bytes // max(1, count))
+    rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
+
+    # Created here, not up front: a run that fails before this point (bad input, a
+    # duplicate QNAME, a refused mint) must leave NO output directory behind for the
+    # launcher's manifest walker to find.
+    read_dir.mkdir(parents=True, exist_ok=True)
+
+    parts = 0
+    for lo in range(1, count + 1, rows_per_part):
+        hi = min(lo + rows_per_part - 1, count)
+        part = validate_parquet_path(read_dir / f"part_{parts:05d}.parquet")
+        conn.execute(
+            "COPY ( SELECT "
+            "  ?::BIGINT AS prep_sample_idx,"
+            "  sequence_index + ? - 1 AS sequence_idx,"
+            "  read_id, sequence1, qual1, sequence2, qual2 "
+            "FROM read_parquet(?) "
+            "WHERE sequence_index BETWEEN ? AND ? "
+            # Bounded: at most one batch's payload, not the whole sample. Still
+            # explicit — preserve_insertion_order=false means DuckDB is free to emit
+            # a batch's rows out of order, and the clustering is the point.
+            "ORDER BY sequence_idx ) "
+            f"TO '{part}' ({PARQUET_OPTS})",
+            [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
+        )
+        parts += 1
+    return parts
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -180,10 +233,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
-    # Output basename is the DuckLake table name: a downstream register-files step
-    # maps `read.parquet` -> the `read` table.
-    out_path = workspace / "read.parquet"
-    out = validate_parquet_path(out_path)
+    # `read` is a DIRECTORY of part_*.parquet rather than a single read.parquet: the
+    # final write is batched (see _write_read_parts). register-files already maps a
+    # top-level subdir of parts to the table named after the directory — the same
+    # multi-file form reference_load/hash_sequences use, and for the same reason.
+    read_dir = workspace / "read"
 
     try:
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
@@ -260,12 +314,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 step_name=YAML_STEP_NAME,
             )
 
-        # Rewrite intermediate -> final with sequence_idx assigned and physically
-        # sorted on disk. sequence_idx = read_sequences_sam's per-file 1-based
-        # sequence_index + start - 1 (deterministic by construction — file order IS
-        # the assignment order, exactly like fastq_to_parquet). No miint here — a
-        # plain read_parquet carries the columns through. prep_sample_idx is a
-        # per-run constant (the `read` table's scope/prune column).
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_conn() as conn:
             apply_duckdb_settings(
                 conn,
@@ -273,22 +321,20 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
-            conn.execute(
-                "COPY ( SELECT "
-                "  ?::BIGINT AS prep_sample_idx,"
-                "  sequence_index + ? - 1 AS sequence_idx,"
-                "  read_id, sequence1, qual1, sequence2, qual2 "
-                "FROM read_parquet(?) "
-                "ORDER BY sequence_idx ) "
-                f"TO '{out}' ({PARQUET_OPTS})",
-                [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
+            _write_read_parts(
+                conn,
+                intermediate=intermediate,
+                read_dir=read_dir,
+                prep_sample_idx=inputs.prep_sample_idx,
+                sequence_idx_start=sequence_idx_start,
+                count=count,
             )
     finally:
         # Clean up the intermediate BEFORE returning so the SLURM launcher's
-        # manifest walker (which runs after execute()) sees only read.parquet.
+        # manifest walker (which runs after execute()) sees only the read/ parts.
         intermediate.unlink(missing_ok=True)
 
-    # The workspace holds only read.parquet (intermediate unlinked above), exposed
-    # as read_staging_dir so a register-files step loads it into the DuckLake
-    # `read` table.
+    # The workspace holds only read/part_*.parquet (intermediate unlinked above),
+    # exposed as read_staging_dir so a register-files step loads the parts into the
+    # DuckLake `read` table.
     return {"read_staging_dir": workspace}

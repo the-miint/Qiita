@@ -70,16 +70,18 @@ steps:
     # `read_staging_dir` is the workspace holding read.parquet, which the
     # register-files step below loads into the DuckLake `read` table.
     outputs: [read_staging_dir]
-    # Long-read-sized, NOT inherited from fastq-to-parquet. A PacBio HiFi read is
-    # ~15-25 kB of seq+qual against Illumina's ~150 bp, and the blocking operator is
-    # the final sorted COPY over that payload — so a routine multi-million-read HiFi
-    # sample is tens of GB to sort, and an Illumina-shaped 8 GB baseline OOM-kills
-    # everything but a control. The job sizes DuckDB's memory_limit from this
-    # allocation (resolve_duckdb_memory_gb), and plan() lowers it again for a small
-    # BAM, so a control does not reserve the whole envelope.
+    # Memory does NOT scale with the sample. The job writes the reads as bounded
+    # monotone parts (read/part_*.parquet) instead of one globally sorted file, so
+    # the only blocking operator is a per-part ORDER BY over ~1 GiB of payload. A
+    # 2M-read HiFi sample and a 10k-read control therefore need the same envelope;
+    # what scales is WALLTIME, which is why that is the axis with headroom.
+    #
+    # (The earlier single-file sorted COPY was tens of GB for a HiFi sample and
+    # OOM-killed 24 of 26 samples on the first real PacBio run. Batching removes the
+    # cost rather than paying for it with an allocation.)
     baseline_resources:
       cpu: 2
-      mem_gb: 32
+      mem_gb: 12
       walltime: PT4H
 
   # Load the full reads into the DuckLake `read` table (register-files maps the
@@ -92,8 +94,9 @@ steps:
 # only pays off now that the job (a) reads its real cgroup instead of a hardcoded
 # DuckDB limit and (b) reuses a minted-but-unwritten sequence_range on retry —
 # before both, an escalated attempt re-OOM'd at the same in-process limit, or died
-# on the one-shot mint. The baseline is the estimate; this is the room to be wrong.
+# on the one-shot mint. Memory headroom is modest because peak memory is bounded by
+# the part budget; the walltime headroom is the one that matters for a long sample.
 action_ceiling:
   cpu: 4
-  mem_gb: 96
+  mem_gb: 32
   walltime: PT12H

@@ -40,7 +40,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import WorkTicketFailureStage
+from qiita_common.models import WorkTicketFailureStage, WorkTicketState
 
 from .sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
@@ -54,11 +54,6 @@ from .sequence_range import (
 # missing prep_sample can't self-heal). Tests zero the backoff to avoid sleeps.
 CP_RETRY_MAX_ATTEMPTS = 3
 CP_RETRY_BACKOFF_BASE_S = 0.5
-
-# qiita.work_ticket_state's terminal success value. A range whose minting ticket sits
-# in this state has its reads REGISTERED, so the range must never be re-written — not
-# even by that same ticket. Mirrors WorkTicketState.COMPLETED (qiita_common.models).
-_COMPLETED_STATE = "completed"
 
 
 def _is_transient_status(status: int) -> bool:
@@ -251,7 +246,7 @@ async def mint_or_reuse_sequence_range(
                     "for a whole pool, `qiita delete-sequenced-pool`) and resubmit"
                 ),
             ) from exc
-        if existing.minted_by_work_ticket_state == _COMPLETED_STATE:
+        if existing.minted_by_work_ticket_state == WorkTicketState.COMPLETED.value:
             # Ownership is necessary but NOT sufficient. If the minting ticket already
             # COMPLETED, its reads are registered in the lake — so even THIS ticket
             # must not write over that range. Reachable if a stale attempt of a ticket

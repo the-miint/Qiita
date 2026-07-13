@@ -19,12 +19,13 @@ _None yet._
 
 ### 2. One-time host setup
 
-- **Confirm SLURM will grant `bam-to-parquet`'s new envelope.** Its baseline rises to
-  `mem_gb: 32 / PT4H` and its ceiling to `mem_gb: 96 / PT12H` (the OOM escalation
-  climbs into that headroom). If the partition's `MaxMemPerNode` or `MaxTime` is
-  below the ceiling, an escalated step is rejected by SLURM rather than queued.
-  Check and, if either is short, raise the partition limits or lower the ceiling in
-  the YAML before deploying: (#285)
+- **Confirm SLURM will grant `bam-to-parquet`'s envelope.** Its baseline rises to
+  `mem_gb: 12 / PT4H` and its ceiling to `mem_gb: 32 / PT12H` (the OOM/timeout
+  escalation climbs into that headroom). Memory stays modest because the job now
+  writes its reads in bounded batches rather than one globally sorted file — what
+  grows with a long sample is WALLTIME, not memory. If the partition's
+  `MaxMemPerNode` or `MaxTime` is below the ceiling, an escalated step is rejected by
+  SLURM rather than queued: (#285)
   ```bash
   scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
   ```
