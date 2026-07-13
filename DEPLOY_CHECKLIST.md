@@ -33,16 +33,6 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ./scripts/install-orchestrator-token.sh /etc/qiita/co-to-cp.token <<<"$NEW_TOKEN"
   sudo systemctl restart qiita-compute-orchestrator
   ```
-- **Confirm SLURM will grant `bam-to-parquet`'s envelope.** Its baseline rises to
-  `mem_gb: 12 / PT4H` and its ceiling to `mem_gb: 32 / PT12H` (the OOM/timeout
-  escalation climbs into that headroom). Memory stays modest because the job now
-  writes its reads in bounded batches rather than one globally sorted file — what
-  grows with a long sample is WALLTIME, not memory. If the partition's
-  `MaxMemPerNode` or `MaxTime` is below the ceiling, an escalated step is rejected by
-  SLURM rather than queued: (#285)
-  ```bash
-  scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
-  ```
 
 ### 3. Migrations
 
@@ -56,6 +46,69 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   - `20260712000000_alignment_definition.sql` — `alignment_definition` (params-hash align identity).
   - `20260712010000_alignment_sample.sql` — the per-`(alignment_idx, prep_sample)` completion gate.
   - `20260712020000_work_ticket_alignment_idx.sql` — `work_ticket.alignment_idx` arm (ON DELETE SET NULL, no backfill).
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+- Confirm the two new sharded-reference workflows synced into `qiita.action` (synced by `qiita-admin actions sync` inside `activate.sh`, covered by `make verify-deploy`'s `qiita.action` list; this asserts the specific new actions). The modified `reference-add/1.0.0` + `local-reference-add/1.0.0` re-sync in place — no new action_id to assert. (#268)
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id IN ('align','build-shard-index') ORDER BY action_id"
+  # expect: align|1.0.0|block  and  build-shard-index|1.0.0|reference
+  ```
+- Confirm the compute service account's live token now carries `ticket:doget` (the bucket-2 grant), so sharded builds can mint the reference-chunk DoGet ticket: (#268)
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT sa.name, t.scopes FROM qiita.service_account sa JOIN qiita.api_token t ON t.principal_idx = sa.principal_idx WHERE t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now()) ORDER BY sa.name"
+  # expect the compute account's active token scopes to include ticket:doget (and sequence_range:mint)
+  ```
+
+### 6. After the deploy verifies green
+
+Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
+secret, deleting a replaced data dir. Never put this in bucket 1: until
+verification passes, the OLD build's config is the rollback path.
+
+- **Revoke the old compute service account's tokens.** Once bucket 5 confirms the new `compute-rot-2026-07-13` token works (sharded builds can DoGet), revoke every token on the *prior* compute principal so the narrower-scoped token is no longer accepted. Do NOT do this before bucket 5 is green — the old token is the rollback path if the new one misfires. Use its `principal_idx` (the one whose token file you replaced), per [`orchestrator-token-rotation.md`](docs/runbooks/orchestrator-token-rotation.md). (#268)
+  ```bash
+  curl -X POST "$CONTROL_PLANE_URL/api/v1/admin/principal/<OLD_COMPUTE_PRINCIPAL_IDX>/revoke-all-tokens" \
+      -H "Authorization: Bearer qk_<ADMIN_PAT>"
+  ```
+
+### Notes (no host action)
+
+- **Reference sharding + sharded alignment are opt-in and inert until an operator runs them.** Sharded indexing is enabled per reference by a `shard_index` context flag on `reference-add` / `local-reference-add` (absent ⇒ byte-identical to today's whole-reference `loading → active`, no build); the alignment consumer (`align/1.0.0`, `POST …/sequenced-pool/{P}/align-plan`, `DELETE /alignment-definition/{idx}`) needs a sharded, ACTIVE reference plus completed masks to do anything. Existing reference and read-mask flows are unchanged. (#268)
+- **The DuckLake `alignment` table is created automatically at data-plane startup** by `ensure_alignment_tables` (idempotent, runs every DP boot) — **no data-plane action**. It is a sink (not in `ALLOWED_TABLES`); there is no Flight read-side yet. (#268)
+- **New scope `alignment_definition:delete` is granted automatically to `system_admin`** via `ROLE_IMPLIED_SCOPES` (the disallow-without-delete escape hatch for alignments) — no host action, never granted to service accounts. (#268)
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-07-13 — 7b30e69
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
+- **Confirm SLURM will grant `bam-to-parquet`'s envelope.** Its baseline rises to
+  `mem_gb: 12 / PT4H` and its ceiling to `mem_gb: 32 / PT12H` (the OOM/timeout
+  escalation climbs into that headroom). Memory stays modest because the job now
+  writes its reads in bounded batches rather than one globally sorted file — what
+  grows with a long sample is WALLTIME, not memory. If the partition's
+  `MaxMemPerNode` or `MaxTime` is below the ceiling, an escalated step is rejected by
+  SLURM rather than queued: (#285)
+  ```bash
+  scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
+  ```
+
+#### 3. Migrations
+
 - **`20260713000000_sequence_range_minted_by_work_ticket.sql`** — plain `make migrate`,
   no out-of-band steps. Adds the nullable `qiita.sequence_range.minted_by_work_ticket_idx`
   (no FK — it is an identity token compared for equality), replaces
@@ -74,23 +127,13 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   once the new build is up — but keep the gap short, and prefer running this when no
   reads ingest is mid-flight. (#285)
 
-### 4. Deploy
+#### 4. Deploy
 
-_None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via the
+_None — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via the
 `qiita-admin actions sync` that `activate.sh` already runs._
 
-### 5. Verify
+#### 5. Verify
 
-- Confirm the two new sharded-reference workflows synced into `qiita.action` (synced by `qiita-admin actions sync` inside `activate.sh`, covered by `make verify-deploy`'s `qiita.action` list; this asserts the specific new actions). The modified `reference-add/1.0.0` + `local-reference-add/1.0.0` re-sync in place — no new action_id to assert. (#268)
-  ```bash
-  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id IN ('align','build-shard-index') ORDER BY action_id"
-  # expect: align|1.0.0|block  and  build-shard-index|1.0.0|reference
-  ```
-- Confirm the compute service account's live token now carries `ticket:doget` (the bucket-2 grant), so sharded builds can mint the reference-chunk DoGet ticket: (#268)
-  ```bash
-  psql "$DATABASE_URL" -tAc "SELECT sa.name, t.scopes FROM qiita.service_account sa JOIN qiita.api_token t ON t.principal_idx = sa.principal_idx WHERE t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now()) ORDER BY sa.name"
-  # expect the compute account's active token scopes to include ticket:doget (and sequence_range:mint)
-  ```
 - **The backfill attributed the stranded PacBio ranges** (without which their retries
   fail closed as "already loaded"), and attributed nothing it shouldn't have — no range
   may be credited to a ticket created after it: (#285)
@@ -126,30 +169,13 @@ _None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via t
   duplicates reads in the lake (DuckLake has no uniqueness). Do **not** delete the
   `sequence_range` rows — reusing them is exactly what makes the retry converge.
 
-### 6. After the deploy verifies green
+#### 6. After the deploy verifies green
 
-Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
-secret, deleting a replaced data dir. Never put this in bucket 1: until
-verification passes, the OLD build's config is the rollback path.
+_None._
 
-- **Revoke the old compute service account's tokens.** Once bucket 5 confirms the new `compute-rot-2026-07-13` token works (sharded builds can DoGet), revoke every token on the *prior* compute principal so the narrower-scoped token is no longer accepted. Do NOT do this before bucket 5 is green — the old token is the rollback path if the new one misfires. Use its `principal_idx` (the one whose token file you replaced), per [`orchestrator-token-rotation.md`](docs/runbooks/orchestrator-token-rotation.md). (#268)
-  ```bash
-  curl -X POST "$CONTROL_PLANE_URL/api/v1/admin/principal/<OLD_COMPUTE_PRINCIPAL_IDX>/revoke-all-tokens" \
-      -H "Authorization: Bearer qk_<ADMIN_PAT>"
-  ```
+#### Notes (no host action)
 
-### Notes (no host action)
-
-- **Reference sharding + sharded alignment are opt-in and inert until an operator runs them.** Sharded indexing is enabled per reference by a `shard_index` context flag on `reference-add` / `local-reference-add` (absent ⇒ byte-identical to today's whole-reference `loading → active`, no build); the alignment consumer (`align/1.0.0`, `POST …/sequenced-pool/{P}/align-plan`, `DELETE /alignment-definition/{idx}`) needs a sharded, ACTIVE reference plus completed masks to do anything. Existing reference and read-mask flows are unchanged. (#268)
-- **The DuckLake `alignment` table is created automatically at data-plane startup** by `ensure_alignment_tables` (idempotent, runs every DP boot) — **no data-plane action**. It is a sink (not in `ALLOWED_TABLES`); there is no Flight read-side yet. (#268)
-- **New scope `alignment_definition:delete` is granted automatically to `system_admin`** via `ROLE_IMPLIED_SCOPES` (the disallow-without-delete escape hatch for alignments) — no host action, never granted to service accounts. (#268)
 - **`DELETE /reference/{idx}` and `DELETE /sequenced-pool/{idx}` now 409 on a `no_data` work ticket (previously 200).** Terminal tickets are meant to block an unforced delete; the gates' terminal set was hand-written as `("completed", "failed")` and predated `no_data`, so such a ticket matched neither the in-flight nor the terminal arm and was invisible — the delete succeeded unforced and the state-blind cascade purged the tickets anyway. Operator impact: a pool that used to delete cleanly may now need `?force=true` — `no_data` is the *expected* outcome for an empty well, so an all-blank plate (or one whose reads were entirely masked out) is exactly the case that changes. The 409 `detail` now names the terminal states rather than the stale `completed/failed` pair. No host action. (#286)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-07-12 — 56ce7d4
 
