@@ -38,15 +38,16 @@ than after a full alignment pass (see `_partial_mask.assert_single_end`).
 excluded from `read_masked` (which serves only `pass`) and gets its own count
 bucket, with its rows RETAINED in `read_mask` so the counts survive.
 
-**Alignment, not k-mer classification.** A read is a spike-in when it ALIGNS to a
-SynDNA insert at >= `_MIN_IDENTITY` identity. This mirrors `host_filter`'s minimap2
-arm (same `align_minimap2` seam, same `max_secondary := 0`) but adds an identity
-floor, which host filtering does not need: host depletion is deliberately aggressive
-(any alignment = host), whereas a spike-in call is a claim about a read's ORIGIN: a
-false positive silently removes a genuine biological read from `biological`, and
-would corrupt the per-insert coverage-depth quantification that consumes the same
-classifier. What is deliberately NOT filtered, and why that is an assay decision
-rather than an engineering one, is documented at the constants.
+**Alignment, not k-mer classification.** A read is a spike-in when it has a PRIMARY
+alignment to a SynDNA insert at >= `_MIN_IDENTITY` identity. This mirrors
+`host_filter`'s minimap2 arm (same `align_minimap2` seam, same `max_secondary := 0`)
+but adds an identity floor and a primary-only predicate, neither of which host
+filtering needs: host depletion is deliberately aggressive (any alignment = host),
+whereas a spike-in call is a claim about a read's ORIGIN: a false positive silently
+removes a genuine biological read from `biological`, and would corrupt the per-insert
+coverage-depth quantification that consumes the same classifier. Both predicates, and
+the one filter deliberately NOT applied (a coverage floor — an assay decision rather
+than an engineering one), are documented at the constants.
 """
 
 from __future__ import annotations
@@ -113,35 +114,42 @@ _IDENTITY_METHOD = "blast"
 _MIN_IDENTITY = 0.95
 
 # =============================================================================
+# PRIMARY alignments only — matching coverm
+# =============================================================================
+#
+# A read counts as a spike-in only on a PRIMARY alignment: `alignment_is_primary` is
+# false for both SECONDARY (0x100) and SUPPLEMENTARY (0x800) records. `max_secondary :=
+# 0` already stops minimap2 emitting secondaries, so in practice this is what excludes
+# SUPPLEMENTARY ones — and that exclusion is load-bearing, not cosmetic. Identity is
+# scored per ROW and then DISTINCT'd to a read, so without it one short high-identity
+# supplementary segment marks the whole read: exactly the local-alignment false positive
+# a chimeric or repeat-containing HiFi read produces.
+#
+# coverm does the same, verified rather than assumed (coverm 0.8.0, `contig --methods
+# count`): a read whose ONLY alignment to a contig is supplementary contributes 0 to that
+# contig's count, while the byte-identical alignment with the flag cleared contributes 1.
+# Its `--exclude-supplementary` flag does not change this — it governs `filter`, which
+# thresholds records rather than counting reads. So this is what "a faithful port of the
+# assay's coverm spec" actually requires.
+#
+# =============================================================================
 # What is DELIBERATELY not filtered — pending the assay owner
 # =============================================================================
 #
-# This is a faithful port of the assay's coverm spec and NOTHING MORE. Two plausible
-# extra filters are deliberately absent, because each would change which reads count
-# as spike-ins, and that is an assay decision rather than an engineering one:
+# NO COVERAGE FLOOR (coverm's `--min-read-aligned-percent 0.0`). Tempting, because
+# without it a long read whose short stretch happens to match an insert is counted. But
+# it CANNOT simply be added: the index carries the bare INSERTS, so a read spanning the
+# insert -> plasmid-backbone junction aligns only over its insert portion and comes back
+# soft-clipped, with low query coverage. That read is a REAL spike-in, not a chimera — a
+# coverage floor would drop true spike-in molecules.
 #
-#   * NO COVERAGE FLOOR (coverm's `--min-read-aligned-percent 0.0`). Tempting, because
-#     without it a long read whose short stretch happens to match an insert is counted.
-#     But it CANNOT simply be added: the index carries the bare INSERTS, so a read
-#     spanning the insert -> plasmid-backbone junction aligns only over its insert
-#     portion and comes back soft-clipped, with low query coverage. That read is a REAL
-#     spike-in, not a chimera — a coverage floor would drop true spike-in molecules.
-#   * NO SUPPLEMENTARY-ALIGNMENT EXCLUSION. `max_secondary := 0` drops SECONDARY (0x100)
-#     records but not SUPPLEMENTARY (0x800) ones, and identity is scored per row then
-#     DISTINCT'd, so one short supplementary segment can mark a whole read. Whether
-#     coverm excludes them is not something we have established.
-#
-# Both errors are costly in both directions — a misclassified read is removed from
+# The error is costly in both directions — a misclassified read is removed from
 # `biological` AND will corrupt the per-insert coverage depth that consumes the same
-# classifier — so neither default is safe to guess at. Discriminating a boundary-spanning
-# read from an incidental one needs
-# the alignment scored INSIDE the insert's window (miint's `alignment_slice` over a
-# plasmid-level reference), which needs per-insert coordinates we do not store yet.
-# Both are with the assay owner; until they answer, this matches the coverm spec exactly.
-
-# A non-matching read emits no alignment row at all, so this is belt-and-braces (a `*`
-# cigar would score NULL identity and drop out regardless).
-_SAM_UNMAPPED = 0x4
+# classifier — so the default is not safe to guess at. Discriminating a boundary-spanning
+# read from an incidental one needs the alignment scored INSIDE the insert's window
+# (miint's `alignment_slice` over a plasmid-level reference), which needs per-insert
+# coordinates we do not store yet. It is with the assay owner; until they answer, this
+# matches the coverm spec exactly.
 
 # In-DuckDB relation names. The reads are a VIEW (both the query and the final COPY
 # read them); the hit set is a TABLE, pre-declared BIGINT so `read_id` coerces on
@@ -190,22 +198,31 @@ def _run_align_minimap2(
     """Seam around miint's `align_minimap2`. Appends the DISTINCT spike-in
     `sequence_idx` set into the pre-created `dest_table`.
 
-    Differs from `host_filter._run_align_minimap2` in exactly one way: an IDENTITY
-    FLOOR. Host filtering takes any alignment as host — aggressive depletion is the
-    safe direction there. A spike-in call is a QUANTITATIVE claim, so an incidental
-    low-identity alignment must not count.
+    Differs from `host_filter._run_align_minimap2` in two ways, both because a spike-in
+    call is a QUANTITATIVE claim where host filtering is a deliberately aggressive
+    depletion (any alignment = host, and the safe direction there is to over-remove):
 
-    Identity comes from miint's `alignment_seq_identity`, NOT from arithmetic over the
-    cigar — see `_IDENTITY_METHOD`. `max_secondary := 0` drops secondary alignments and
-    DISTINCT collapses any remaining per-read rows to one `sequence_idx`. What is
-    deliberately NOT filtered (coverage, supplementary alignments) is documented above
-    the constants. Isolated as a seam so unit tests stub the real aligner.
+      * an IDENTITY FLOOR, so an incidental low-identity alignment does not count;
+      * PRIMARY alignments only, so one short high-identity supplementary segment
+        cannot mark a whole read.
+
+    Both predicates use miint's own functions rather than arithmetic over the cigar or
+    bit math on `flags` — `alignment_seq_identity` (see `_IDENTITY_METHOD`) and
+    `alignment_is_primary` / `alignment_is_unmapped`. `alignment_is_primary` is false for
+    secondary AND supplementary records but TRUE for an unmapped one, so the unmapped
+    predicate is a separate conjunct, not redundant. (A non-matching read emits no
+    alignment row at all, so that one is belt-and-braces.) `max_secondary := 0` stops
+    minimap2 emitting secondaries in the first place, and DISTINCT collapses any
+    remaining per-read rows to one `sequence_idx`.
+
+    Isolated as a seam so unit tests stub the real aligner.
     """
     conn.execute(
         f"INSERT INTO {dest_table} "
         "SELECT DISTINCT read_id AS sequence_idx "
         "FROM align_minimap2(?, index_path := ?, preset := ?, max_secondary := 0) "
-        f"WHERE (flags & {_SAM_UNMAPPED}) = 0 "
+        "WHERE alignment_is_primary(flags) "
+        "AND NOT alignment_is_unmapped(flags) "
         "AND alignment_seq_identity(cigar, tag_nm, tag_md, ?) >= ?",
         [query_table, str(index_path), preset, _IDENTITY_METHOD, min_identity],
     )

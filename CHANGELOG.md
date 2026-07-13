@@ -240,6 +240,16 @@ the `no-changelog` label).
   gates are client-supplied, so a submission can still ask for the long-read chain over a
   paired-end read set. `lima_mask`'s check on lima's own output also remains — lima is an external
   container binary, and `infer_trim` would absorb a broken contract silently. (#270)
+- **`syndna` counts a read as a spike-in only on a PRIMARY alignment.** Identity is scored per
+  alignment ROW and then DISTINCT'd to a read, so a single short high-identity SUPPLEMENTARY
+  segment previously marked a whole read — the local-alignment false positive a chimeric or
+  repeat-containing HiFi read produces, which both removes a genuine read from `biological` and
+  inflates the spike-in count. coverm does not count supplementary alignments either, established
+  by probe rather than assumed (coverm 0.8.0, `contig --methods count`: a read whose only alignment
+  to a contig is supplementary contributes 0, while the byte-identical alignment with the flag
+  cleared contributes 1), so excluding them is what "a faithful port of the assay's coverm spec"
+  requires. The predicate uses miint's own `alignment_is_primary` / `alignment_is_unmapped` rather
+  than hand-rolled bit math on `flags`. (#270)
 
 - **`qiita submit-host-filter-pool --syndna-reference-idx`**, and per-sample gate
   derivation for PacBio pools: `lima_enabled`, `syndna_enabled`, and per-sample

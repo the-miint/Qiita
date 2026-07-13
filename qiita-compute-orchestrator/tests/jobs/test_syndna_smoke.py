@@ -59,6 +59,14 @@ _READ_EXACT_A = _SPIKEIN_A  # identity 1.00  -> spike-in
 _READ_NEAR_B = _mutate(_RNG, _SPIKEIN_B, 20)  # identity ~0.99 -> spike-in
 _READ_FAR_A = _mutate(_RNG, _SPIKEIN_A, 200)  # identity ~0.90 -> ALIGNS, but NOT a spike-in
 
+# A chimera: a long, LOW-identity stretch of spike-in A followed by a short but PERFECT
+# stretch of spike-in B. minimap2 chains these into two separate alignments and — the
+# long one scoring higher — makes A the PRIMARY (identity ~0.90, below the floor) and B a
+# SUPPLEMENTARY (identity 1.00, above it). That is the local-alignment false positive:
+# scoring identity per row and DISTINCT-ing to a read would mark this read a spike-in on
+# the strength of its supplementary segment alone.
+_READ_CHIMERA = _READ_FAR_A + _SPIKEIN_B[:600]
+
 
 def _build_syndna_index(tmp_path: Path) -> Path:
     """A real minimap2 `.mmi` over the spike-in inserts, built with the same preset
@@ -147,3 +155,61 @@ def test_syndna_smoke_no_spikeins_leaves_the_mask_untouched(tmp_path):
     reads = _write_reads(tmp_path / "reads.parquet", [(1, _BIOLOGICAL)])
     out = _run(tmp_path, reads, _build_syndna_index(tmp_path))
     assert _reasons(out) == [(1, _PASS)]
+
+
+def test_syndna_smoke_the_chimera_really_does_produce_a_high_identity_supplementary(tmp_path):
+    """Guards the test below from passing vacuously.
+
+    Asserts against the RAW aligner (no job, no predicate) that `_READ_CHIMERA` actually
+    elicits what it is supposed to: a PRIMARY alignment BELOW `_MIN_IDENTITY` and a
+    SUPPLEMENTARY one AT OR ABOVE it. If a minimap2 or miint bump ever stops emitting
+    that supplementary record, this fails loudly — rather than leaving the false-positive
+    test green for the wrong reason.
+    """
+    from qiita_compute_orchestrator.jobs.syndna import (
+        _IDENTITY_METHOD,
+        _MIN_IDENTITY,
+        _MM2_PRESET,
+    )
+
+    index = _build_syndna_index(tmp_path)
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_install_sql())
+    conn.execute("LOAD miint;")
+    conn.execute(
+        "CREATE TABLE q AS SELECT * FROM (VALUES (CAST(1 AS BIGINT), CAST(? AS VARCHAR)))"
+        " AS t(read_id, sequence1)",
+        [_READ_CHIMERA],
+    )
+    rows = conn.execute(
+        "SELECT alignment_is_primary(flags), alignment_is_supplementary(flags), "
+        "       alignment_seq_identity(cigar, tag_nm, tag_md, ?) "
+        "FROM align_minimap2('q', index_path := ?, preset := ?, max_secondary := 0) "
+        "WHERE NOT alignment_is_unmapped(flags)",
+        [_IDENTITY_METHOD, str(index), _MM2_PRESET],
+    ).fetchall()
+    conn.close()
+
+    primary = [ident for is_primary, _, ident in rows if is_primary]
+    supplementary = [ident for _, is_supp, ident in rows if is_supp]
+    assert primary, f"expected a primary alignment, got {rows}"
+    assert supplementary, f"expected a supplementary alignment, got {rows}"
+    assert all(i < _MIN_IDENTITY for i in primary), f"primary should be below the floor: {rows}"
+    assert any(i >= _MIN_IDENTITY for i in supplementary), (
+        f"supplementary should be at/above the floor: {rows}"
+    )
+
+
+def test_syndna_smoke_high_identity_supplementary_alignment_is_not_a_spikein(tmp_path):
+    """THE supplementary test, and a behaviour change: `_READ_CHIMERA`'s only
+    at-or-above-threshold alignment is SUPPLEMENTARY, so the read is NOT a spike-in.
+
+    Scoring identity per row and DISTINCT-ing to a read would mark it — a short local
+    alignment is enough to claim a whole 2.6 kb read came from a spike-in. coverm does
+    not do that (verified against coverm 0.8.0: a read whose only alignment to a contig
+    is supplementary contributes 0 to that contig's read count), and neither do we.
+    Delete `alignment_is_primary` from the seam and this is the test that fails.
+    """
+    reads = _write_reads(tmp_path / "reads.parquet", [(1, _READ_EXACT_A), (2, _READ_CHIMERA)])
+    out = _run(tmp_path, reads, _build_syndna_index(tmp_path))
+    assert _reasons(out) == [(1, _SPIKEIN), (2, _PASS)]
