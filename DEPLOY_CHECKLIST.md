@@ -19,6 +19,46 @@ _None yet._
 
 ### 2. One-time host setup
 
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### 6. After the deploy verifies green
+
+Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
+secret, deleting a replaced data dir. Never put this in bucket 1: until
+verification passes, the OLD build's config is the rollback path.
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-07-13 — 7b30e69
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
 - **Confirm SLURM will grant `bam-to-parquet`'s envelope.** Its baseline rises to
   `mem_gb: 12 / PT4H` and its ceiling to `mem_gb: 32 / PT12H` (the OOM/timeout
   escalation climbs into that headroom). Memory stays modest because the job now
@@ -30,7 +70,7 @@ _None yet._
   scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
   ```
 
-### 3. Migrations
+#### 3. Migrations
 
 - **`20260713000000_sequence_range_minted_by_work_ticket.sql`** — plain `make migrate`,
   no out-of-band steps. Adds the nullable `qiita.sequence_range.minted_by_work_ticket_idx`
@@ -50,12 +90,12 @@ _None yet._
   once the new build is up — but keep the gap short, and prefer running this when no
   reads ingest is mid-flight. (#285)
 
-### 4. Deploy
+#### 4. Deploy
 
-_None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via the
+_None — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via the
 `qiita-admin actions sync` that `activate.sh` already runs._
 
-### 5. Verify
+#### 5. Verify
 
 - **The backfill attributed the stranded PacBio ranges** (without which their retries
   fail closed as "already loaded"), and attributed nothing it shouldn't have — no range
@@ -92,23 +132,13 @@ _None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via t
   duplicates reads in the lake (DuckLake has no uniqueness). Do **not** delete the
   `sequence_range` rows — reusing them is exactly what makes the retry converge.
 
-### 6. After the deploy verifies green
+#### 6. After the deploy verifies green
 
-Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
-secret, deleting a replaced data dir. Never put this in bucket 1: until
-verification passes, the OLD build's config is the rollback path.
+_None._
 
-_None yet._
-
-### Notes (no host action)
+#### Notes (no host action)
 
 - **`DELETE /reference/{idx}` and `DELETE /sequenced-pool/{idx}` now 409 on a `no_data` work ticket (previously 200).** Terminal tickets are meant to block an unforced delete; the gates' terminal set was hand-written as `("completed", "failed")` and predated `no_data`, so such a ticket matched neither the in-flight nor the terminal arm and was invisible — the delete succeeded unforced and the state-blind cascade purged the tickets anyway. Operator impact: a pool that used to delete cleanly may now need `?force=true` — `no_data` is the *expected* outcome for an empty well, so an all-blank plate (or one whose reads were entirely masked out) is exactly the case that changes. The 409 `detail` now names the terminal states rather than the stale `completed/failed` pair. No host action. (#286)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-07-12 — 56ce7d4
 
