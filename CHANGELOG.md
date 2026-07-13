@@ -78,6 +78,10 @@ the `no-changelog` label).
   *worker*, not per test, so this only fired when the runner's core count co-located the
   two files. The fixture now cleans up after itself, and an autouse tripwire fails the
   test that leaks an owed ticket rather than the innocent one that trips over it. (#291)
+- **CI can now run the macOS matrix on a PR, before merge.** macOS coverage ran only on
+  push to `main`, so a defect only it can see — like the one above — was found with
+  `main` already red. Label a PR `ci-macos` to fan the matrix out over macOS too; use it
+  for anything touching shared test fixtures or cross-test DB state. (#291)
 
 - **`no_data` work tickets were invisible to the reference and sequenced-pool delete
   gates, and to the reference-load CLI's watch loop.** `WorkTicketState` has three
