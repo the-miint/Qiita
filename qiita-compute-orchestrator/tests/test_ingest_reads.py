@@ -273,6 +273,7 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
             sequence_idx_start=5000,
             sequence_idx_stop=5001,
             minted_by_work_ticket_idx=_WORK_TICKET_IDX,
+            minted_by_work_ticket_state="processing",  # still in flight
         )
 
     monkeypatch.setattr(retry_module, "get_sequence_range", _existing)
@@ -300,6 +301,7 @@ def test_reuse_count_mismatch_fails_bad_input(monkeypatch, tmp_path):
             sequence_idx_start=5000,
             sequence_idx_stop=5004,
             minted_by_work_ticket_idx=_WORK_TICKET_IDX,
+            minted_by_work_ticket_state="processing",  # still in flight
         )
 
     monkeypatch.setattr(retry_module, "get_sequence_range", _existing)
@@ -512,6 +514,7 @@ def test_transient_error_on_reuse_readback_self_heals(monkeypatch, no_backoff, t
             sequence_idx_start=5000,
             sequence_idx_stop=5001,
             minted_by_work_ticket_idx=_WORK_TICKET_IDX,
+            minted_by_work_ticket_state="processing",  # still in flight
         )
 
     monkeypatch.setattr(retry_module, "get_sequence_range", _flaky_get)

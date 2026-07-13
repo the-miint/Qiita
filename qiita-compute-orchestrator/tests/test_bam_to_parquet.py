@@ -201,6 +201,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
             sequence_idx_start=1000,
             sequence_idx_stop=1001,
             minted_by_work_ticket_idx=1,
+            minted_by_work_ticket_state="processing",  # still in flight
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -368,4 +369,41 @@ def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "unknown work_ticket" in ei.value.reason
+    assert not (tmp_path / "ws" / "read.parquet").exists()
+
+
+def test_execute_refuses_a_range_whose_ticket_already_completed(monkeypatch, tmp_path):
+    """Ownership is necessary but NOT sufficient: even MY OWN ticket's range must not
+    be re-written once that ticket has COMPLETED.
+
+    A completed ticket's reads are registered in the lake. If a stale attempt outlives
+    the attempt that finished the ticket (an orphaned SLURM job that was never reaped),
+    it would reach the mint, 409, read back a range whose minter matches its own idx,
+    and — on the ownership check alone — happily reuse it and rewrite the output. The
+    ticket state is what closes that.
+    """
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _mine_but_completed(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=1,  # ours — ownership alone would allow reuse
+            minted_by_work_ticket_state="completed",  # ...but the reads are registered
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _mine_but_completed)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "already COMPLETED" in ei.value.reason
     assert not (tmp_path / "ws" / "read.parquet").exists()

@@ -52,6 +52,11 @@ def _record_to_response(row: asyncpg.Record) -> SequenceRange:
         sequence_idx_start=row["sequence_idx_start"],
         sequence_idx_stop=row["sequence_idx_stop"],
         minted_by_work_ticket_idx=row["minted_by_work_ticket_idx"],
+        # Only the read-back joins the minting ticket; the mint's own RETURNING row
+        # has no state column (and needs none — the minter is the caller, running).
+        minted_by_work_ticket_state=(
+            row["minted_by_work_ticket_state"] if "minted_by_work_ticket_state" in row else None
+        ),
         created_at=row["created_at"],
     )
 

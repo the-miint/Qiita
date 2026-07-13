@@ -55,6 +55,11 @@ from .sequence_range import (
 CP_RETRY_MAX_ATTEMPTS = 3
 CP_RETRY_BACKOFF_BASE_S = 0.5
 
+# qiita.work_ticket_state's terminal success value. A range whose minting ticket sits
+# in this state has its reads REGISTERED, so the range must never be re-written — not
+# even by that same ticket. Mirrors WorkTicketState.COMPLETED (qiita_common.models).
+_COMPLETED_STATE = "completed"
+
 
 def _is_transient_status(status: int) -> bool:
     """True for an HTTP status from the CP callback that a retry can self-heal:
@@ -160,8 +165,9 @@ async def mint_or_reuse_sequence_range(
     escalation: the escalated attempt can never get far enough to benefit.
 
     So a 409 is not automatically an error — but it is only SAFE to reuse the
-    existing range when that range belongs to a prior attempt of THIS work_ticket.
-    The two cases the 409 conflates are:
+    existing range when it belongs to a prior attempt of THIS work_ticket **and that
+    ticket has not COMPLETED** (a completed ticket's reads are registered, so even its
+    own stale attempt must not re-write the range). The cases the 409 conflates are:
 
       - a prior ATTEMPT of this ticket minted then crashed → the reads are NOT in
         the lake, the range is orphaned, reuse is correct and is what makes the
@@ -243,6 +249,24 @@ async def mint_or_reuse_sequence_range(
                     "(DuckLake has no uniqueness). To re-ingest deliberately, DELETE the "
                     "prep_sample (its sequence_range goes with it via ON DELETE CASCADE; "
                     "for a whole pool, `qiita delete-sequenced-pool`) and resubmit"
+                ),
+            ) from exc
+        if existing.minted_by_work_ticket_state == _COMPLETED_STATE:
+            # Ownership is necessary but NOT sufficient. If the minting ticket already
+            # COMPLETED, its reads are registered in the lake — so even THIS ticket
+            # must not write over that range. Reachable if a stale attempt of a ticket
+            # outlives the attempt that finished it (an orphaned SLURM job that was
+            # never reaped), which would otherwise pass the ownership check.
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    f"prep_sample {prep_sample_idx}'s sequence_range was minted by "
+                    f"work_ticket {work_ticket_idx}, which has already COMPLETED — its "
+                    "reads are registered. This attempt is stale (an orphaned job "
+                    "outliving the one that finished the ticket); refusing to re-write "
+                    "the range, which would duplicate the sample's reads"
                 ),
             ) from exc
         recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1

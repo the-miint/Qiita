@@ -78,13 +78,17 @@ YAML_STEP_NAME = "bam"
 # backend / tests), where there is no cgroup to read; it is NOT the YAML baseline
 # minus headroom, and deliberately stays small so a dev box isn't asked for 29 GB.
 #
-# A BAM record is far heavier than a FASTQ read: a PacBio HiFi / ONT uBAM record
-# carries per-base modification (MM/ML) and kinetics (ipd/pw) aux tags that htslib
-# materializes with the whole record BEFORE read_sequences_sam projects them away,
-# and the reads themselves are ~15-25 kB of seq+qual against Illumina's ~150 bp.
-# The blocking operator is the final sorted COPY, whose payload is the full
-# seq+qual: a 2M-read HiFi sample is tens of GB to sort. That is why the YAML
-# baseline is long-read-sized rather than inherited from fastq_to_parquet.
+# What actually needs the memory is the final sorted COPY — a BLOCKING operator over
+# the full seq+qual payload. A PacBio HiFi read is ~15-25 kB of seq+qual against
+# Illumina's ~150 bp, so a routine 2M-read sample is tens of GB to sort. That is
+# where the first real PacBio run died (`Out of buffer` inside the COPY), and it is
+# why the YAML baseline is long-read-sized rather than inherited from
+# fastq_to_parquet.
+#
+# The PARSE is not the problem: read_sequences_sam streams, and miint projects the
+# aux tags (MM/ML, ipd/pw) away rather than materialising them into the pipeline.
+# An earlier version of this comment blamed htslib's per-record tag handling for
+# peak memory; nothing observed supports that, and the failure was in the sort.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 

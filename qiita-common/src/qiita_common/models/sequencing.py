@@ -730,12 +730,19 @@ class SequenceRange(BaseModel):
     registered and reuse would duplicate them. NULL = provenance unknown (minted
     before the column existed, or not unambiguously attributable at backfill), and
     callers treat NULL as not-mine — fail closed.
+
+    `minted_by_work_ticket_state` is that ticket's current state, joined on the
+    read-back (NULL on the mint's own response, and NULL when the minter is unknown
+    or its row is gone). Ownership alone is not sufficient to reuse a range: if the
+    minting ticket already COMPLETED, its reads are registered in the lake, so even
+    the same ticket must not re-mint over them. Callers refuse on `completed`.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequence_idx_start: Annotated[int, Field(gt=0)]
     sequence_idx_stop: Annotated[int, Field(gt=0)]
     minted_by_work_ticket_idx: int | None = None
+    minted_by_work_ticket_state: str | None = None
     created_at: AwareDatetime
 
 

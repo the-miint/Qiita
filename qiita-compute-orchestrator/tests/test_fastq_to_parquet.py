@@ -436,6 +436,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + _MINIMAL_FASTQ_READS - 1,
             minted_by_work_ticket_idx=1,
+            minted_by_work_ticket_state="processing",  # still in flight
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)

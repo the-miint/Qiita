@@ -78,10 +78,16 @@ async def fetch_sequence_range_by_prep_sample_idx(
     an open transaction or stands alone.
     """
     return await pool_or_conn.fetchrow(
-        "SELECT idx, prep_sample_idx, processing_kind,"
-        "       sequence_idx_start, sequence_idx_stop,"
-        "       created_by_idx, created_at, minted_by_work_ticket_idx"
-        "  FROM qiita.sequence_range"
-        " WHERE prep_sample_idx = $1",
+        # LEFT JOIN, not INNER: a range whose minting ticket was deleted (or was
+        # never attributed) must still come back — the caller reads a missing/absent
+        # state as "cannot prove this is safe to reuse" and fails closed.
+        "SELECT sr.idx, sr.prep_sample_idx, sr.processing_kind,"
+        "       sr.sequence_idx_start, sr.sequence_idx_stop,"
+        "       sr.created_by_idx, sr.created_at, sr.minted_by_work_ticket_idx,"
+        "       wt.state::text AS minted_by_work_ticket_state"
+        "  FROM qiita.sequence_range sr"
+        "  LEFT JOIN qiita.work_ticket wt"
+        "    ON wt.work_ticket_idx = sr.minted_by_work_ticket_idx"
+        " WHERE sr.prep_sample_idx = $1",
         prep_sample_idx,
     )

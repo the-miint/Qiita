@@ -41,6 +41,7 @@ def _wire_range_json(
     start: int = 1000,
     stop: int = 1099,
     minted_by_work_ticket_idx: int | None = 7,
+    minted_by_work_ticket_state: str | None = None,
 ) -> str:
     """The CP's SequenceRange wire JSON — shared by the mint (201) and the
     read-back (200) handlers so the two payload shapes can't drift apart."""
@@ -50,6 +51,7 @@ def _wire_range_json(
             "sequence_idx_start": start,
             "sequence_idx_stop": stop,
             "minted_by_work_ticket_idx": minted_by_work_ticket_idx,
+            "minted_by_work_ticket_state": minted_by_work_ticket_state,
             "created_at": "2026-05-15T00:00:00+00:00",
         }
     )

@@ -64,12 +64,17 @@ class MintedSequenceRange:
     that lets `mint_or_reuse_sequence_range` tell a retry of ITS OWN step (safe to
     reuse the orphaned range) from a different ticket re-ingesting an already-loaded
     sample (reuse would double the reads). None = provenance unknown; treated as
-    not-mine."""
+    not-mine.
+
+    `minted_by_work_ticket_state` is that ticket's state (read-back only). Ownership
+    alone does not license reuse: if the minting ticket already COMPLETED, its reads
+    are registered, so even the SAME ticket must not write over them."""
 
     prep_sample_idx: int
     sequence_idx_start: int
     sequence_idx_stop: int
     minted_by_work_ticket_idx: int | None = None
+    minted_by_work_ticket_state: str | None = None
 
 
 class SequenceRangeAlreadyExists(Exception):
@@ -155,6 +160,7 @@ async def mint_sequence_range(
         sequence_idx_start=body["sequence_idx_start"],
         sequence_idx_stop=body["sequence_idx_stop"],
         minted_by_work_ticket_idx=body["minted_by_work_ticket_idx"],
+        minted_by_work_ticket_state=body["minted_by_work_ticket_state"],
     )
 
 
@@ -189,4 +195,5 @@ async def get_sequence_range(
         sequence_idx_start=body["sequence_idx_start"],
         sequence_idx_stop=body["sequence_idx_stop"],
         minted_by_work_ticket_idx=body["minted_by_work_ticket_idx"],
+        minted_by_work_ticket_state=body["minted_by_work_ticket_state"],
     )
