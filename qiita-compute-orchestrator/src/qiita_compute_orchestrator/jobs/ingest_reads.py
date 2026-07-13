@@ -69,7 +69,6 @@ import shutil
 from pathlib import Path
 
 import duckdb
-import httpx
 from pydantic import BaseModel
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
@@ -88,13 +87,7 @@ from ..miint import (
     open_miint_conn,
     slurm_alloc_gb,
 )
-from ..sequence_range import (
-    PrepSampleNotEligibleForSequenceRange,
-    SequenceRangeAlreadyExists,
-    get_sequence_range,
-    mint_sequence_range,
-)
-from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
+from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 # YAML step name this module implements. Hard-coded because execute()
 # raises BackendFailures itself (which need a step_name); the integration
@@ -197,83 +190,6 @@ def _match_fastq(convert_dir: Path, pool_item_id: str, read_tag: str) -> Path | 
         f"{len(matches)} {read_tag} FASTQs matched {pool_item_id} (lane-split runs "
         f"are not supported): {', '.join(m.name for m in matches)}"
     )
-
-
-async def _mint_or_reuse_range(http: httpx.AsyncClient, prep_sample_idx: int, count: int) -> int:
-    """Mint a sequence range for one sample, or reuse the existing one.
-
-    The caller invokes this only when the sample's durable read.parquet is
-    ABSENT, so a 409 means a prior attempt minted the range then crashed
-    before the durable write (typically OOM-killed mid-write). Instead of
-    failing and demanding operator recovery, read the existing range back
-    and reuse its start — so an OOM-escalated retry completes transparently
-    rather than dying on the one-shot mint contract. Returns the inclusive
-    range start. Maps the typed mint exceptions to BackendFailures (the
-    dispatcher only wraps bare NotImplementedError/FileNotFoundError/
-    ValueError).
-
-    Both CP calls (mint and reuse read-back) are wrapped in `cp_call_with_retry`
-    (shared with `fastq_to_parquet` via `sequence_range_retry`), so a transient
-    5xx / transport blip on one of a pool's many per-sample callbacks self-heals
-    rather than failing the step. An exhausted-retry transient error maps via
-    `cp_call_failure` to CONTROL_PLANE_UNREACHABLE (retriable) so the runner
-    re-dispatches the idempotent step."""
-    try:
-        rng = await cp_call_with_retry(
-            lambda: mint_sequence_range(http=http, prep_sample_idx=prep_sample_idx, count=count)
-        )
-        return rng.sequence_idx_start
-    except SequenceRangeAlreadyExists as exc:
-        # Reuse the range a prior crashed attempt left. The GET is gated on
-        # the same `sequence_range:mint` scope the SA already holds.
-        try:
-            existing = await cp_call_with_retry(
-                lambda: get_sequence_range(http=http, prep_sample_idx=prep_sample_idx)
-            )
-        except (httpx.HTTPStatusError, httpx.TransportError) as get_exc:
-            raise cp_call_failure(prep_sample_idx, get_exc, step_name=YAML_STEP_NAME) from get_exc
-        if existing is None:
-            # 409 on mint but 404 on read-back: the range vanished between the
-            # two calls (an operator deleted the prep_sample / range mid-retry).
-            # A fresh resubmit will re-mint cleanly, but THIS attempt can't run
-            # against a moving target.
-            raise BackendFailure(
-                kind=FailureKind.UNKNOWN_PERMANENT,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=YAML_STEP_NAME,
-                reason=(
-                    f"prep_sample {prep_sample_idx} sequence_range 409'd on mint but "
-                    "404'd on read-back — concurrent deletion during retry; resubmit"
-                ),
-            ) from exc
-        recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1
-        if recovered_count != count:
-            # The existing range was minted against a different read count than
-            # this attempt's FASTQ — reusing it would write sequence_idx values
-            # that mismatch qiita.sequence_range at registration. Deterministic
-            # demux makes this unreachable in practice; fail loudly if it isn't.
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=YAML_STEP_NAME,
-                reason=(
-                    f"prep_sample {prep_sample_idx} has an existing sequence_range covering "
-                    f"{recovered_count} indices "
-                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}) but its "
-                    f"FASTQ now has {count} reads — the range must match the prior mint "
-                    "count exactly; delete the prep_sample to re-mint"
-                ),
-            ) from exc
-        return existing.sequence_idx_start
-    except PrepSampleNotEligibleForSequenceRange as exc:
-        raise BackendFailure(
-            kind=FailureKind.BAD_INPUT,
-            stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=YAML_STEP_NAME,
-            reason=str(exc),
-        ) from exc
-    except (httpx.HTTPStatusError, httpx.TransportError) as exc:
-        raise cp_call_failure(prep_sample_idx, exc, step_name=YAML_STEP_NAME) from exc
 
 
 def _stage_intermediate_reads(
@@ -427,7 +343,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 count = await asyncio.to_thread(
                     _stage_intermediate_reads, r1, r2, intermediate, sample_tmp, memory_gb, threads
                 )
-                sequence_idx_start = await _mint_or_reuse_range(http, prep_sample_idx, count)
+                sequence_idx_start = await mint_or_reuse_sequence_range(
+                    http, prep_sample_idx, count, step_name=YAML_STEP_NAME
+                )
                 await asyncio.to_thread(
                     _write_sorted_reads,
                     intermediate,

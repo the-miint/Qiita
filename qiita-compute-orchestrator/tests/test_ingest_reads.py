@@ -66,7 +66,7 @@ def fake_mint(monkeypatch):
             sequence_idx_stop=base + count - 1,
         )
 
-    monkeypatch.setattr(ingest_module, "mint_sequence_range", _fake)
+    monkeypatch.setattr(retry_module, "mint_sequence_range", _fake)
     return calls
 
 
@@ -250,7 +250,7 @@ def _patch_conflicting_mint(monkeypatch):
     async def _conflict(*, http, prep_sample_idx, count):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
-    monkeypatch.setattr(ingest_module, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(retry_module, "mint_sequence_range", _conflict)
 
 
 def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
@@ -268,7 +268,7 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
             prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5001
         )
 
-    monkeypatch.setattr(ingest_module, "get_sequence_range", _existing)
+    monkeypatch.setattr(retry_module, "get_sequence_range", _existing)
 
     _run(inputs, tmp_path / "ws")
 
@@ -292,7 +292,7 @@ def test_reuse_count_mismatch_fails_bad_input(monkeypatch, tmp_path):
             prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5004
         )
 
-    monkeypatch.setattr(ingest_module, "get_sequence_range", _existing)
+    monkeypatch.setattr(retry_module, "get_sequence_range", _existing)
 
     with pytest.raises(BackendFailure) as exc:
         _run(inputs, tmp_path / "ws")
@@ -310,7 +310,7 @@ def test_reuse_missing_range_fails_permanent(monkeypatch, tmp_path):
     async def _gone(*, http, prep_sample_idx):
         return None
 
-    monkeypatch.setattr(ingest_module, "get_sequence_range", _gone)
+    monkeypatch.setattr(retry_module, "get_sequence_range", _gone)
 
     with pytest.raises(BackendFailure) as exc:
         _run(inputs, tmp_path / "ws")
@@ -357,7 +357,7 @@ def _flaky_mint(monkeypatch, errors):
             sequence_idx_stop=7000 + count - 1,
         )
 
-    monkeypatch.setattr(ingest_module, "mint_sequence_range", _mint)
+    monkeypatch.setattr(retry_module, "mint_sequence_range", _mint)
     return calls
 
 
@@ -369,7 +369,7 @@ def _always_failing_mint(monkeypatch, exc):
         calls.append(prep_sample_idx)
         raise exc
 
-    monkeypatch.setattr(ingest_module, "mint_sequence_range", _mint)
+    monkeypatch.setattr(retry_module, "mint_sequence_range", _mint)
     return calls
 
 
@@ -472,7 +472,7 @@ def test_transient_error_on_reuse_readback_is_retriable(monkeypatch, no_backoff,
         get_calls.append(prep_sample_idx)
         raise _status_error(502)
 
-    monkeypatch.setattr(ingest_module, "get_sequence_range", _flaky_get)
+    monkeypatch.setattr(retry_module, "get_sequence_range", _flaky_get)
 
     with pytest.raises(BackendFailure) as exc:
         _run(inputs, tmp_path / "ws")
@@ -501,7 +501,7 @@ def test_transient_error_on_reuse_readback_self_heals(monkeypatch, no_backoff, t
             prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5001
         )
 
-    monkeypatch.setattr(ingest_module, "get_sequence_range", _flaky_get)
+    monkeypatch.setattr(retry_module, "get_sequence_range", _flaky_get)
 
     _run(inputs, tmp_path / "ws")
 

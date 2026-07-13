@@ -20,14 +20,17 @@ jobs so they can't diverge:
     CO→CP direction. 401/403 → CONTRACT_VIOLATION (a deploy misconfig a retry
     can't fix); any other 4xx → UNKNOWN_PERMANENT.
 
+  - `mint_or_reuse_sequence_range` is the one mint entry point every reads job
+    calls. It makes the mint idempotent across runner retries by reading an
+    orphaned range back instead of dying on the one-shot mint contract.
+
 Kept separate from `sequence_range.py`, which is deliberately transport-agnostic
 (it raises typed exceptions / returns None and never reaches for BackendFailure)
 — the BackendFailure mapping is a job-level concern and lives here. The typed
 409 / 404 mint exceptions (`SequenceRangeAlreadyExists`,
 `PrepSampleNotEligibleForSequenceRange`) are NOT httpx errors, so they pass
-straight through `cp_call_with_retry` for each job to handle its own way
-(`ingest_reads` reuses the orphaned range; `fastq_to_parquet` fails with
-operator-recovery instructions).
+straight through `cp_call_with_retry` into `mint_or_reuse_sequence_range`, which
+handles them uniformly for every job.
 """
 
 from __future__ import annotations
@@ -38,6 +41,13 @@ from collections.abc import Awaitable, Callable
 import httpx
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
+
+from .sequence_range import (
+    PrepSampleNotEligibleForSequenceRange,
+    SequenceRangeAlreadyExists,
+    get_sequence_range,
+    mint_sequence_range,
+)
 
 # Attempts and exponential backoff for a transient CP sequence-range callback.
 # 401/403 and any non-5xx 4xx are NOT retried (a token/scope misconfig or a
@@ -127,3 +137,98 @@ def cp_call_failure(
         step_name=step_name,
         reason=f"CP sequence-range call for prep_sample {prep_sample_idx} failed with {detail}",
     )
+
+
+async def mint_or_reuse_sequence_range(
+    http: httpx.AsyncClient,
+    prep_sample_idx: int,
+    count: int,
+    *,
+    step_name: str,
+) -> int:
+    """Mint a sequence range for one sample, or reuse the one an earlier attempt left.
+
+    Returns the inclusive range start.
+
+    A reads job mints the range and THEN does its heavy durable write, so the
+    window between the two is exactly where an OOM / walltime kill lands. The
+    runner re-runs the whole step module on such a (transient) failure, which
+    re-reaches this call — and the mint is one-shot, so a naive re-mint 409s and
+    the retry dies. Worse, it dies *permanently*, masking the real failure (the
+    OOM) behind a mint conflict, and it defeats the runner's OOM memory
+    escalation: the escalated attempt can never get far enough to benefit.
+
+    So a 409 is not an error here: it means "a prior attempt of THIS step already
+    minted my range". Read it back and reuse its start, and the escalated retry
+    completes transparently. This is what makes the step idempotent across
+    retries, and it is why the module docstring can claim the mint is
+    retry-safe.
+
+    Callers must only invoke this when the sample's durable output is ABSENT — a
+    completed sample must not be re-ingested (DuckLake has no uniqueness, so the
+    reads would double). `ingest_reads` checks for the durable read.parquet;
+    `bam_to_parquet` / `fastq_to_parquet` are per-sample tickets whose
+    disallow-without-delete gate is enforced by the CP at submit time.
+
+    Maps the typed mint exceptions to BackendFailures (the framework dispatcher
+    only wraps bare NotImplementedError / FileNotFoundError / ValueError). Both
+    CP calls go through `cp_call_with_retry`, so a transient blip on one of a
+    pool's many per-sample callbacks self-heals instead of failing the step.
+    """
+    try:
+        rng = await cp_call_with_retry(
+            lambda: mint_sequence_range(http=http, prep_sample_idx=prep_sample_idx, count=count)
+        )
+        return rng.sequence_idx_start
+    except SequenceRangeAlreadyExists as exc:
+        # Reuse the range a prior crashed attempt left. The GET is gated on the
+        # same `sequence_range:mint` scope the SA already holds.
+        try:
+            existing = await cp_call_with_retry(
+                lambda: get_sequence_range(http=http, prep_sample_idx=prep_sample_idx)
+            )
+        except (httpx.HTTPStatusError, httpx.TransportError) as get_exc:
+            raise cp_call_failure(prep_sample_idx, get_exc, step_name=step_name) from get_exc
+        if existing is None:
+            # 409 on mint but 404 on read-back: the range vanished between the two
+            # calls (an operator deleted the prep_sample / range mid-retry). A fresh
+            # resubmit will re-mint cleanly, but THIS attempt can't run against a
+            # moving target.
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    f"prep_sample {prep_sample_idx} sequence_range 409'd on mint but "
+                    "404'd on read-back — concurrent deletion during retry; resubmit"
+                ),
+            ) from exc
+        recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1
+        if recovered_count != count:
+            # The existing range was minted against a different read count than this
+            # attempt's input — reusing it would write sequence_idx values that
+            # mismatch qiita.sequence_range at registration. The input is immutable
+            # between submit and execution, so this is unreachable in practice; fail
+            # loudly if it isn't.
+            raise BackendFailure(
+                kind=FailureKind.BAD_INPUT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    f"prep_sample {prep_sample_idx} has an existing sequence_range covering "
+                    f"{recovered_count} indices "
+                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}) but its "
+                    f"input now has {count} reads — the range must match the prior mint "
+                    "count exactly; delete the prep_sample to re-mint"
+                ),
+            ) from exc
+        return existing.sequence_idx_start
+    except PrepSampleNotEligibleForSequenceRange as exc:
+        raise BackendFailure(
+            kind=FailureKind.BAD_INPUT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=str(exc),
+        ) from exc
+    except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+        raise cp_call_failure(prep_sample_idx, exc, step_name=step_name) from exc

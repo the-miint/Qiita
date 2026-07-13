@@ -103,7 +103,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import httpx
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
@@ -120,13 +119,8 @@ from ..miint import (
     open_miint_conn,
 )
 from ..read_count import write_read_count
-from ..sequence_range import (
-    PreMintedRange,
-    PrepSampleNotEligibleForSequenceRange,
-    SequenceRangeAlreadyExists,
-    mint_sequence_range,
-)
-from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
+from ..sequence_range import PreMintedRange
+from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 # YAML step name this module implements. Hard-coded here because
 # execute() raises BackendFailures itself (the dispatcher only wraps
@@ -300,53 +294,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 )
             sequence_idx_start = recovery.sequence_idx_start
         else:
-            try:
-                async with make_cp_client() as http:
-                    # A transient 5xx / transport blip on this callback self-heals
-                    # via the in-job retry rather than failing the step; the typed
-                    # 409 / 404 mint exceptions pass straight through to the arms
-                    # below (this job has no reuse path — a 409 is operator-recovery).
-                    rng = await cp_call_with_retry(
-                        lambda: mint_sequence_range(
-                            http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
-                        )
-                    )
-            except SequenceRangeAlreadyExists as exc:
-                # Mid-step failure left a range on a previous attempt;
-                # this attempt's POST 409s. Operator can either DELETE
-                # the prep_sample (CASCADE removes the range and starts
-                # over) or — preferred — resubmit with `pre_minted_range`
-                # set to the existing row's (start, stop). See
-                # docs/runbooks/fastq-to-parquet-retry-recovery.md.
-                raise BackendFailure(
-                    kind=FailureKind.UNKNOWN_PERMANENT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=str(exc),
-                ) from exc
-            except PrepSampleNotEligibleForSequenceRange as exc:
-                # The prep_sample doesn't exist or isn't sequenced. The
-                # submit route checks processing_kind already, so this
-                # only surfaces if the prep_sample was deleted between
-                # submission and step execution. BAD_INPUT because the
-                # work_ticket's scope_target points at something that
-                # no longer exists.
-                raise BackendFailure(
-                    kind=FailureKind.BAD_INPUT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=str(exc),
-                ) from exc
-            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
-                # An exhausted-retry transient 5xx / transport error →
-                # retriable CONTROL_PLANE_UNREACHABLE (the runner re-dispatches
-                # the idempotent step); 401/403 → CONTRACT_VIOLATION (SA PAT
-                # misconfig); other 4xx → UNKNOWN_PERMANENT. Shared with
-                # ingest_reads via `sequence_range_retry`.
-                raise cp_call_failure(
-                    inputs.prep_sample_idx, exc, step_name=YAML_STEP_NAME
-                ) from exc
-            sequence_idx_start = rng.sequence_idx_start
+            # A 409 is NOT a failure: `mint_or_reuse_sequence_range` reads back the
+            # range a prior crashed attempt left and reuses it, so an OOM-escalated
+            # retry completes instead of dying on the one-shot mint contract (and
+            # instead of masking the failure that actually killed the first attempt
+            # behind a mint conflict). Shared with ingest_reads / bam_to_parquet.
+            async with make_cp_client() as http:
+                sequence_idx_start = await mint_or_reuse_sequence_range(
+                    http, inputs.prep_sample_idx, count, step_name=YAML_STEP_NAME
+                )
 
         # Rewrite intermediate -> final with sequence_idx assigned and
         # physically sorted on disk.
