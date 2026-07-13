@@ -11,9 +11,58 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→6 in order; buckets 1–3 must precede the bucket-4 restart, and bucket 6 (irreversible cleanup — anything that burns the rollback path) must not run until bucket 5 is green. Each step carries its source `(#N)` tag.
+
+_Nothing pending — the last deploy is archived below. Each PR folds its operator steps into the buckets here as it merges (`/deploy-note`)._
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+### 2. One-time host setup
+
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### 6. After the deploy verifies green
+
+Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
+secret, deleting a replaced data dir. Never put this in bucket 1: until
+verification passes, the OLD build's config is the rollback path.
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-07-12 — 56ce7d4
+
+Rolled out 13 PRs (the host had been on 89440a5 since 2026-06-29). Notable deviation from the
+bucket-1 text below, made deliberately: `HMAC_SECRET_KEY` was scrubbed from both env files AFTER
+the deploy verified green, NOT before the restart. The new build never reads it, so removing it
+early buys nothing while it both strands the old build (which boots on it) and discards the
+rollback path during the riskiest part of the deploy. That ordering is being folded into the
+checklist itself as a post-verify bucket 6.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
 - **Email notification (control-plane).** To turn on work-ticket terminal-digest emails, set `SMTP_*` in `/etc/qiita/control-plane.env` before the restart; leaving `SMTP_HOST` unset keeps the no-op transport (no mail). None are secrets (relay is no-auth, IP-allowlisted, validated end-to-end). Optional `NOTIFY_*` knobs keep their defaults if unset. (#238)
   ```bash
@@ -58,66 +107,52 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   # so keep a copy to roll back to the previous (HMAC) build if the swap misfires:
   sudo cp -a /etc/qiita/control-plane.env /etc/qiita/control-plane.env.pre-ed25519.bak
   sudo cp -a /etc/qiita/data-plane.env    /etc/qiita/data-plane.env.pre-ed25519.bak
-  # Generate the keypair once (capture both values):
-  python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
+  # Generate the keypair once (capture both values). Run it with the CP venv's
+  # interpreter, NOT the system python3: `private_bytes_raw()` needs cryptography
+  # >= 38, and a host python3 can easily be older (the qiita-miint host ships
+  # 37.0.1, where this dies with AttributeError). The CP venv is also the
+  # interpreter `make preflight` uses for its keypair check.
+  /opt/qiita/control-plane/.venv/bin/python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING', base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC', base64.b64encode(k.public_key().public_bytes_raw()).decode())"
   # CP: add the signing seed, drop HMAC_SECRET_KEY (substitute <SIGNING>):
   sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/control-plane.env; printf "FLIGHT_TICKET_SIGNING_KEY=%s\n" "<SIGNING>" >> /etc/qiita/control-plane.env'
   # DP: add the public key, drop HMAC_SECRET_KEY (substitute <PUBLIC>):
   sudo bash -c 'sed -i "/^HMAC_SECRET_KEY=/d" /etc/qiita/data-plane.env; printf "FLIGHT_TICKET_PUBLIC_KEY=%s\n" "<PUBLIC>" >> /etc/qiita/data-plane.env'
   ```
 
-- **`DATA_PLANE_URL` for the compute orchestrator.** Native reference-index build
-  jobs stream reference sequence chunks from the data plane over Arrow Flight; the
-  orchestrator propagates `DATA_PLANE_URL` into the SLURM job env so the compute
-  node DoGets against the right gRPC origin. **Not** `from_env()` fail-fast — a
-  missing value falls back to `grpc://localhost:50051` (the unit still boots), but
-  a compute node cannot reach a localhost data plane, so set it to the
-  nginx-fronted gRPC origin (same host the data plane's own `DATA_PLANE_URL`
-  names) before the restart. (#268)
-  ```bash
-  sudo bash -c 'echo "DATA_PLANE_URL=grpc://qiita-miint.ucsd.edu:50051" >> /etc/qiita/compute-orchestrator.env'
-  ```
-
-### 2. One-time host setup
+#### 2. One-time host setup
 
 - **CheckM reference database for `long-read-assembly`.** The workflow's `checkm`
-  step needs CheckM's ~1.4 GB reference data, which is deliberately NOT baked into
-  the SIF. Stage it once under `PATH_DERIVED` and make the container see it at run
-  time — the `checkm.sh` entrypoint reads `CHECKM_DATA_PATH` (default
-  `/opt/checkm_data`), so the DB dir must be bind-mounted there (or
-  `QIITA_CHECKM_DB` set to its in-container path). (#255)
+  step needs CheckM's ~1.4 GB reference data (a ~275 MiB download), which is
+  deliberately NOT baked into the SIF. Stage it once under `PATH_DERIVED`, at
+  exactly `$PATH_DERIVED/checkm_data` — the workflow's `derived_inputs` names that
+  path, so the bind + `QIITA_CHECKM_DB` are wired automatically and there is
+  nothing further to configure. (#255, #273)
   ```bash
-  # verify the tarball against CheckM's published checksum before extracting.
-  sudo -u qiita-orch bash -c 'mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data" \
-    && curl -LO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz \
-    && tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
+  # PATH_DERIVED lives in compute-orchestrator.env, NOT in qiita-orch's shell, so
+  # pass it explicitly — an unset one would expand to "" and mkdir /checkm_data.
+  # Substitute your host's value.
+  sudo -u qiita-orch env PATH_DERIVED=/path/to/derived bash -c '
+    set -euo pipefail
+    mkdir -p "$PATH_DERIVED/checkm_data" && cd "$PATH_DERIVED/checkm_data"
+    curl -fLO https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz
+    # md5 -c, not a bare md5sum: a printed hash exits 0 and `set -e` would sail
+    # straight into the tar. This ABORTS on a mismatch.
+    echo "631012fa598c43fdeb88c619ad282c4d  checkm_data_2015_01_16.tar.gz" | md5sum -c -
+    tar xzf checkm_data_2015_01_16.tar.gz && rm checkm_data_2015_01_16.tar.gz'
   ```
-  REQUIRED before the first `long-read-assembly` run: the `checkm` step now **fails
-  loud** (non-zero exit) when the DB is absent or misconfigured — it no longer
-  degrades to an empty `checkm_dir` — so a MAG-producing sample's ticket cannot
-  COMPLETE until the DB is staged AND the container can see it (bind-mount it to
-  `CHECKM_DATA_PATH`, or set `QIITA_CHECKM_DB` to its in-container path). Wiring the
-  bind into the container step is part of this setup (the orchestrator binds only
-  declared step inputs today). assemble/binning/bin_refine are unaffected.
+  The expected md5 (`631012fa…`) is the one the Ecogenomics group publishes for
+  this tarball on Zenodo ([10.5281/zenodo.7401544](https://zenodo.org/doi/10.5281/zenodo.7401544)),
+  and it matches what `data.ace.uq.edu.au` currently serves. Note what that does
+  and does not buy you: `data.ace.uq.edu.au` publishes no checksum of its own, so
+  this is a cross-check against a second mirror by the same group — it catches a
+  corrupted or truncated download, not a compromised upstream.
 
-- **Grant `ticket:doget` to the `compute` service account.** The orchestrator's
-  reference-chunk streaming makes a CO→CP call to mint a `feature_idx`-scoped DoGet
-  ticket, which needs the `ticket:doget` scope (within `SERVICE_ACCOUNT_SCOPE_CEILING`;
-  the `compute` SA currently holds only `sequence_range:mint`). Scopes ride the PAT,
-  so re-mint the `compute` SA token with the expanded set `["sequence_range:mint",
-  "ticket:doget"]` and swap the token file — the "mint new, swap file, revoke old"
-  flow in [`docs/runbooks/orchestrator-token-rotation.md`](docs/runbooks/orchestrator-token-rotation.md),
-  with the expanded scope list from
-  [`docs/runbooks/compute-service-account-provisioning.md`](docs/runbooks/compute-service-account-provisioning.md#scope-grant).
-  **Least-privilege alternative:** if you prefer to keep `sequence_range:mint` (a
-  `sequence_idx`-domain mint) isolated from the reference read scope, provision a
-  separate service account holding only `ticket:doget` and point the reference
-  build path at its token instead — see the provisioning runbook's "Why a separate
-  principal". Extending `compute` is simplest; `ticket:doget` is a read scope (it
-  signs a ticket to read reference chunks), not cross-domain minting authority.
-  (#268)
+  REQUIRED before the first `long-read-assembly` run: the `checkm` step **fails
+  loud** (exit 78) when the DB is absent — it does not degrade to an empty
+  `checkm_dir` — so a MAG-producing sample's ticket cannot COMPLETE until the DB
+  is staged. assemble/binning/bin_refine are unaffected.
 
-### 3. Migrations
+#### 3. Migrations
 
 - **Email-notification schema.** `make migrate` applies both migrations: `..._email_notification.sql` (adds `work_ticket.notified_at` / `notify_attempts`, creates `qiita.email_receipt`, backfills existing terminal tickets as already-notified) and `..._work_ticket_notified_idx.sql` (a `CREATE INDEX CONCURRENTLY` — runs outside a txn; if interrupted, drop the leftover `INVALID` index and re-run). No out-of-band steps. (#238)
 - **CLI-login plaintext-PAT scrub.** `make migrate` applies `..._cli_login_code_scrub_plaintext.sql`: drops the `NOT NULL` on `cli_login_code.plaintext_pat` and nulls it on already-consumed/expired rows (reclaims plaintext tokens left at rest). No out-of-band steps. (#241)
@@ -138,55 +173,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `make migrate`, no backfill or out-of-band setup. (The four DuckLake assembly
   tables are auto-created at data-plane startup — see the note below.) (#255)
 
-- **genome_source controlled vocabulary + qiita-origin sample.** `make migrate` applies
-  `20260706000000_genome_source_and_origin_sample.sql` (adds nullable `qiita.genome.prep_sample_idx`
-  FK to `qiita.prep_sample`, a `source` vocabulary CHECK, and a biconditional origin CHECK). Both
-  new CHECKs validate **existing** `qiita.genome` rows, so **before** migrating confirm none would
-  violate them: (#268)
-  ```bash
-  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.genome WHERE source NOT IN ('genbank','refseq')"
-  # expect: 0 — any out-of-vocab source must be fixed first, and any pre-existing source='qiita'
-  # row needs its prep_sample_idx backfilled (the new biconditional CHECK requires it).
-  ```
-- **Per-shard `reference_index.shard_id`.** `make migrate` applies
-  `20260707010000_reference_index_shard_id.sql` (adds a nullable
-  `qiita.reference_index.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
-  no backfill or out-of-band steps. (#268)
-- **Shard planner `reference_membership.shard_id`.** `make migrate` applies
-  `20260708000000_reference_membership_shard_id.sql` (adds a nullable
-  `qiita.reference_membership.shard_id INTEGER` + a `>= 0` CHECK). Additive; existing rows read NULL,
-  no backfill or out-of-band steps. (#268)
-- **bowtie2 `reference_index.index_type`.** `make migrate` applies
-  `20260709000000_reference_index_bowtie2_type.sql` (extends the
-  `reference_index_index_type_check` allow-list to `rype`/`minimap2`/`bowtie2`).
-  Additive CHECK; no `'bowtie2'` rows exist yet (the shard builders are unwired), no
-  out-of-band steps. (#268)
-- **`work_ticket.shard_id` sharded-fan-out discriminant.** `make migrate` applies
-  `20260710000000_work_ticket_shard_id.sql` (adds a nullable `qiita.work_ticket.shard_id
-  INTEGER` + a reference-scope-only CHECK, re-partitions
-  `work_ticket_one_in_flight_per_reference` with `AND shard_id IS NULL`, and adds
-  `work_ticket_one_in_flight_per_shard`). Additive; existing tickets read NULL and are
-  unaffected, no backfill or out-of-band steps. (#268)
-- **`rype_router` `reference_index.index_type`.** `make migrate` applies
-  `20260711000000_reference_index_rype_router_type.sql` (extends the
-  `reference_index_index_type_check` allow-list to
-  `rype`/`minimap2`/`bowtie2`/`rype_router`). Additive CHECK expansion; the sharded
-  reference-add path starts inserting `rype_router` rows (the whole-reference router),
-  no out-of-band steps. (#268)
-- **Sharded-alignment identity + gate (C2b).** `make migrate` applies three additive
-  migrations, no backfill: `20260712000000_alignment_definition.sql` (the
-  `qiita.alignment_definition` params-hash identity table + `mint_alignment_definition`,
-  plain `BYTEA`/CHECK — no Postgres ENUM), `20260712010000_alignment_sample.sql` (the
-  per-`(alignment_idx, prep_sample)` completion gate, twin of `mask_sample`, FK
-  `alignment_idx` ON DELETE CASCADE), and `20260712020000_work_ticket_alignment_idx.sql`
-  (a nullable `qiita.work_ticket.alignment_idx` FK ON DELETE SET NULL + partial index).
-  Existing rows read NULL; no out-of-band steps. (#268)
-
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 - Confirm the `read-mask-block/1.0.0` workflow synced into `qiita.action` (the block
   runner path — synced by `qiita-admin actions sync` inside `activate.sh`, covered by
@@ -225,36 +216,29 @@ _None yet._
   # expect: client_max_body_size 0; grpc_read_timeout 3600s; limit_conn qiita_flight_conn 64;
   ```
 
-- Confirm the new `build-shard-index/1.0.0` workflow synced into `qiita.action` (the
-  sharded-index fan-out target — one build-shard-index ticket per shard, now minimap2 +
-  bowtie2 only; synced by `qiita-admin actions sync` inside `activate.sh`). The extended
-  `reference-add` / `local-reference-add` (the opt-in `shard_index` flag **and** the new
-  whole-reference `rype_router` build tail — `build_routing_index` → `register-index` →
-  `finalize-shard`, run by the parent after `plan-shards`) re-sync in place with no
-  separate check. No new env var, host directory, scope, group, or SIF (the shard +
-  router builders reuse the existing native rype/minimap2/bowtie2 job modules — no
-  container; the `compute` SA's `ticket:doget` grant above already covers the per-shard
-  and whole-reference streaming). Inert until a submitter opts in with `--shard-index`;
-  a sharded reference then reaches `active` only once every per-shard index AND the
-  `rype_router` row are registered. (#268)
+#### Notes (no host action)
 
-  ```bash
-  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='build-shard-index'"
-  # expect: build-shard-index|1.0.0|reference
-  ```
-- Confirm the new `align/1.0.0` workflow synced into `qiita.action` (the C2b
-  sharded-alignment consumer — `POST …/sequenced-pool/{P}/align-plan` fans out one
-  `align` block ticket per block; synced by `qiita-admin actions sync` inside
-  `activate.sh`). Inert until a submitter runs an align plan against an ACTIVE
-  sharded reference. (#268)
+- **The four `long-read-assembly` SIFs build and run now.** They never had — three
+  separate defects, none previously exercised (the workflow merged but was never
+  deployed, so its `%test` had never executed once). The first deploy that tried
+  aborted on it, correctly and before any restart. No host action: the SIFs
+  auto-rebuild during the deploy (`activate.sh` -> `build-sifs.sh`) and the
+  content-hash gate sees the changed defs.
 
-  ```bash
-  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='align'"
-  # expect: align|1.0.0|block
-  ```
-
-### Notes (no host action)
-
+  Expect that rebuild to spend real time on four conda solves — **unless** the
+  images were already built out-of-band from this same commit, in which case
+  `build-sif.sh`'s two-gate check finds a matching `.buildhash` and skips them. A
+  skip there means "already built from identical inputs", not "not tested". If you
+  do build any SIF by hand, `chown qiita-orch` it: `build-sifs.sh` chowns only the
+  images it builds itself. (#275)
+- **`long-read-assembly` can actually run now.** Container dispatch was gated to
+  `reference`/`sequenced_pool`-scoped tickets, so every container step of this
+  `prep_sample`-scoped workflow failed `CONTRACT_VIOLATION` at submit — it had
+  never completed a run. If anyone tried it on the previous build and saw
+  "requires a scope_target with kind in ['reference', 'sequenced_pool']", that is
+  the provenance; simply resubmit after this deploy. No host action — the fix is
+  code, and the workflow YAML re-syncs via `qiita-admin actions sync` inside
+  `activate.sh`. (#273)
 - **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
 - **Invitation handoff no longer mints a PAT directly.** Accepting an AuthRocket invitation now redirects the user to `/auth/login` (the cookie-anchored flow) instead of displaying a PAT; users complete one normal login after accepting. No host action. (#241)
 - **Removed inert SLURM env vars (compute-orchestrator).** `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` are no longer read — they never enforced anything (the CP owns the poll loop; SLURM `--time` enforces walltime). Safe to leave or drop from `/etc/qiita/compute-orchestrator.env`. (#241)
@@ -299,47 +283,6 @@ _None yet._
   `--data-plane-url` help now points at the public `grpc+tls://<host>:443` form
   (the `grpc://<host>:50051` example is the firewalled on-host port). No new env
   var, host dir, scope, migration, or SIF. (#261)
-
----
-
-- **`reference_taxonomy` row semantics changed (reference ingest).** After this
-  deploys, a newly-ingested reference gets one `reference_taxonomy` row per feature —
-  a feature with no supplied taxonomy is stored as an all-NULL-rank ("unclassified")
-  row instead of being dropped, so the table is 1-1 with the reference's features and
-  its row count equals the feature count. Coverage gaps / stray `feature_id`s / duplicate
-  supplied rows now log loud `WARNING`s in the SLURM job log rather than failing. No host
-  action, no migration; **already-ingested references are NOT backfilled** — only new
-  ingests get the 1-1-at-rest shape, so analysts querying `reference_taxonomy` across a
-  mix of old and new references will see both shapes. (#268)
-- **Sharded-reference alignment consumer (C2b) is inert until an operator runs it.**
-  The `align/1.0.0` workflow, the `alignment_definition`/`alignment_sample` tables,
-  the nullable `work_ticket.alignment_idx`, and `POST …/sequenced-pool/{P}/align-plan`
-  add nothing to the existing read-mask / reference paths. The submit route reuses the
-  existing `prep_sample:write` scope at `wet_lab_admin+` — **no new submit scope**. A
-  **data-plane restart** picks up the compiled-in additions — the new DuckLake
-  `alignment` table (ensured at startup; NOT Flight-readable — a sink this milestone),
-  the `export_read_masked_block` DoAction (masked-read block export), and the
-  `delete_alignment` / `delete_alignment_block` DoActions — so the normal bucket-4
-  binary restart is the only action; no new env var, host dir, group, or SIF. The
-  disallow-without-delete escape hatch adds a new system_admin-only scope
-  `alignment_definition:delete` (role-implied in `auth/scopes.py`, like
-  `mask_definition:delete`) gating `DELETE /alignment-definition/{alignment_idx}` — **an
-  existing system_admin PAT does not carry it until re-minted** (`qiita-admin login` or a
-  fresh PAT); no grant step. (#268)
-- **New sharded-index observability endpoint (control-plane).**
-  `GET /api/v1/reference/{idx}/shard-index-status` returns a sharded reference's
-  `expected_shards` (N), per-`index_type` `registered_shards`, and `failed_shard_tickets`
-  — the diagnostic for a reference wedged in `indexing` on a permanently-failed shard
-  (remediation: an operator redrives the FAILED build-shard-index ticket; its
-  finalize-shard re-counts and, as the last observer, flips `active`). Scoped to
-  `reference:read` (universal), additive, no new env var / migration / scope / sync.
-  Reads all-zero / empty for an unsharded reference. (#268)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-29 — 89440a5
 

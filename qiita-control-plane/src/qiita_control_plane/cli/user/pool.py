@@ -189,20 +189,49 @@ def _read_preflight_rows(
     return parsed
 
 
+def _dedup_accessions(preflight_rows: list[Any]) -> tuple[list[str], list[str]]:
+    """One-pass order-preserving dedup of the biosample + study accessions across
+    `preflight_rows`, so the lookup routes' `missing` echo is deterministic; the
+    study side pools each row's primary + secondaries so controls land their full
+    set. Returns (unique_biosample_accessions, unique_study_accessions).
+
+    Row-shape-agnostic: works on any preflight row exposing `biosample_accession`,
+    `primary_project_accession`, and `secondary_project_accessions` — shared by the
+    Illumina (`_PreflightRow`) and PacBio (`_PacbioPreflightRow`) submit flows."""
+    unique_biosamples: list[str] = []
+    unique_studies: list[str] = []
+    seen_biosample: set[str] = set()
+    seen_study: set[str] = set()
+    for row in preflight_rows:
+        if row.biosample_accession not in seen_biosample:
+            seen_biosample.add(row.biosample_accession)
+            unique_biosamples.append(row.biosample_accession)
+        for study_accession in (row.primary_project_accession, *row.secondary_project_accessions):
+            if study_accession not in seen_study:
+                seen_study.add(study_accession)
+                unique_studies.append(study_accession)
+    return unique_biosamples, unique_studies
+
+
 def _build_missing_section(
     *,
     label: str,
     missing: list[str],
-    preflight_rows: list[_PreflightRow],
-    row_accessions: Callable[[_PreflightRow], list[str]],
+    preflight_rows: list[Any],
+    row_accessions: Callable[[Any], list[str]],
+    row_label: Callable[[Any], str],
+    row_noun: str,
 ) -> str | None:
     """Build one labeled section naming every preflight row that carries
     a missing accession in this class. Returns None if `missing` is empty.
 
     `row_accessions` extracts the row's accessions in the relevant class
-    (one for biosamples, primary + secondaries for studies). The header
-    counts distinct missing accessions and the rows affected, so the
-    per-row bullet count is no longer ambiguous against the dedup count.
+    (one for biosamples, primary + secondaries for studies). `row_label`
+    renders a row's per-bullet identifier (e.g. `illumina_sample_idx=5` or
+    `sample sample.1`) and `row_noun` names the row kind in the header, so the
+    Illumina and PacBio flows share this with their own row shapes. The header
+    counts distinct missing accessions and the rows affected, so the per-row
+    bullet count is no longer ambiguous against the dedup count.
     """
     if not missing:
         return None
@@ -211,27 +240,29 @@ def _build_missing_section(
     for row in preflight_rows:
         row_misses = [a for a in row_accessions(row) if a in missing_set]
         if row_misses:
-            bullets.append(
-                f"  - {', '.join(row_misses)} (illumina_sample_idx={row.illumina_sample_idx})"
-            )
+            bullets.append(f"  - {', '.join(row_misses)} ({row_label(row)})")
     acc_plural = "s" if len(missing) != 1 else ""
     rows_plural = "s" if len(bullets) != 1 else ""
     return (
         f"{len(missing)} distinct preflight {label} accession{acc_plural}"
-        f" not found in qiita, affecting {len(bullets)} illumina_sample row{rows_plural}:\n"
+        f" not found in qiita, affecting {len(bullets)} {row_noun} row{rows_plural}:\n"
         + "\n".join(bullets)
     )
 
 
 def _print_missing_accession_error(
-    preflight_rows: list[_PreflightRow],
+    preflight_rows: list[Any],
     missing_biosamples: list[str],
     missing_studies: list[str],
+    *,
+    row_label: Callable[[Any], str],
+    row_noun: str,
 ) -> None:
     """Emit one combined stderr block naming every offending preflight row.
 
-    Each present class (biosample, study) gets its own header + bullet
-    list, built by `_build_missing_section`.
+    Each present class (biosample, study) gets its own header + bullet list, built
+    by `_build_missing_section`. `row_label` / `row_noun` are threaded through so
+    the Illumina and PacBio flows reuse this with their own row identifiers.
     """
     sections = [
         s
@@ -241,6 +272,8 @@ def _print_missing_accession_error(
                 missing=missing_biosamples,
                 preflight_rows=preflight_rows,
                 row_accessions=lambda row: [row.biosample_accession],
+                row_label=row_label,
+                row_noun=row_noun,
             ),
             _build_missing_section(
                 label="study",
@@ -250,6 +283,8 @@ def _print_missing_accession_error(
                     row.primary_project_accession,
                     *row.secondary_project_accessions,
                 ],
+                row_label=row_label,
+                row_noun=row_noun,
             ),
         )
         if s is not None
@@ -257,6 +292,215 @@ def _print_missing_accession_error(
     print(
         "error: " + "\n".join(sections) + "\nimport the missing record(s) and re-run.",
         file=sys.stderr,
+    )
+
+
+class _ProvisionedSample(NamedTuple):
+    """One sample the shared provisioner resolved/created in the pool roster.
+
+    `row` is the caller's own preflight row (Illumina `_PreflightRow` or PacBio
+    `_PacbioPreflightRow`), so each bundled gesture builds its platform-specific
+    summary + work-ticket tail from it. `reused` is True when the sample already
+    existed in the pool (a convergent re-run) rather than being created now."""
+
+    row: Any
+    pool_item_id: str
+    biosample_idx: int
+    primary_study_idx: int
+    secondary_study_idxs: list[int]
+    prep_sample_idx: int
+    sequenced_sample_idx: int | None
+    reused: bool
+
+
+class _RunPoolProvision(NamedTuple):
+    """Result of `_provision_run_pool_roster`: the run + pool ids/statuses and the
+    resolved per-sample roster the caller fans a work-ticket tail out over."""
+
+    sequencing_run_idx: int
+    sequenced_pool_idx: int
+    run_status: int
+    pool_status: int
+    owner_idx: int
+    samples: list[_ProvisionedSample]
+
+
+def _provision_run_pool_roster(
+    base_url: str,
+    token: str,
+    *,
+    preflight_rows: list[Any],
+    run_body: dict[str, Any],
+    pool_body: dict[str, Any],
+    prep_protocol_idx: int,
+    pool_item_id: Callable[[Any], str],
+    row_label: Callable[[Any], str],
+    row_noun: str,
+) -> _RunPoolProvision:
+    """Shared run → pool → sequenced-sample provisioning for the bundled submit
+    gestures (`submit-bcl-convert`, `submit-pacbio-ingest`).
+
+    The two platforms differ only in how they read the preflight, how they build
+    `run_body` (platform + instrument source), and what work ticket(s) they submit
+    afterwards. Everything in between — resolve the caller's principal, resolve +
+    fail-fast on the biosample/study accessions, POST the run, POST the pool, and
+    populate the per-sample roster — is identical, so it lives here once. The
+    caller parameterizes the per-row `pool_item_id` (Illumina: illumina_sample_idx;
+    PacBio: pacbio_sample_idx) and the `row_label`/`row_noun` for the
+    missing-accession report, and builds its own summary + ticket tail from the
+    returned roster.
+
+    Roster creation is CREATE-MISSING, not blind-create: it GETs the pool roster
+    first and reuses samples already present, POSTing only the absent ones. So a
+    re-run after a partial failure converges (reuses the run + pool + existing
+    samples) instead of 409ing on the first already-created sample. On a fresh pool
+    the roster is empty and every sample is created.
+
+    Raises SystemExit(1) (after printing one combined block to stderr) if any
+    biosample or study accession is unresolved — before the run/pool are created,
+    so a fixable preflight leaves nothing behind."""
+    # Resolve the caller's principal_idx once for the per-sample owner_idx — the
+    # composer requires it and the route does not auto-fill it server-side.
+    owner_idx = _common.whoami(base_url, token)["principal_idx"]
+
+    # Resolve every accession before any side effect; both lookups always run so
+    # the operator sees biosample + study misses in a single round trip.
+    unique_biosamples, unique_studies = _dedup_accessions(preflight_rows)
+    resolved_biosamples, missing_biosamples = _lookup_accessions(
+        base_url,
+        token,
+        f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
+        unique_biosamples,
+        BiosampleLookupByAccessionRequest,
+    )
+    resolved_studies, missing_studies = _lookup_accessions(
+        base_url,
+        token,
+        f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
+        unique_studies,
+        StudyLookupByAccessionRequest,
+    )
+    if missing_biosamples or missing_studies:
+        _print_missing_accession_error(
+            preflight_rows,
+            missing_biosamples,
+            missing_studies,
+            row_label=row_label,
+            row_noun=row_noun,
+        )
+        raise SystemExit(1)
+
+    run_resp, run_status = _common.call_with_status(
+        "POST", base_url, token, PATH_SEQUENCING_RUN_PREFIX, json=run_body
+    )
+    sequencing_run_idx = run_resp["sequencing_run_idx"]
+    pool_resp, pool_status = _common.call_with_status(
+        "POST",
+        base_url,
+        token,
+        f"{PATH_SEQUENCING_RUN_PREFIX}"
+        f"{PATH_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx)}",
+        json=pool_body,
+    )
+    sequenced_pool_idx = pool_resp["sequenced_pool_idx"]
+
+    # Create-missing: the composer 409s on a duplicate (pool, item_id), so GET the
+    # existing roster and reuse those rows, POSTing only the samples not yet
+    # present. This is what makes a retry converge instead of aborting on the first
+    # already-created sample.
+    roster_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+        sequencing_run_idx=sequencing_run_idx, sequenced_pool_idx=sequenced_pool_idx
+    )
+    roster = _common.call("GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{roster_path}")
+    existing_by_item_id = {s["sequenced_pool_item_id"]: s for s in roster.get("samples", [])}
+    sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
+        sequencing_run_idx=sequencing_run_idx, sequenced_pool_idx=sequenced_pool_idx
+    )
+
+    samples: list[_ProvisionedSample] = []
+    for row in preflight_rows:
+        item_id = pool_item_id(row)
+        biosample_idx = resolved_biosamples[row.biosample_accession]
+        primary_study_idx = resolved_studies[row.primary_project_accession]
+        secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
+        existing = existing_by_item_id.get(item_id)
+        if existing is not None:
+            # Reuse is convergent, NOT a silent overwrite: a re-run cannot change an
+            # existing sample's identity. Guard the one identity field the roster
+            # exposes — biosample_idx — so a re-run pointing an item_id at a
+            # different biosample fails loud instead of pretending the correction
+            # landed. (The roster does not carry primary/secondary study_idx or
+            # prep_protocol_idx, so those cannot be reconciled here; reuse trusts
+            # the existing row for them — correcting them needs a pool-sample delete
+            # + re-create, not a re-run.)
+            existing_biosample_idx = existing.get("biosample_idx")
+            if existing_biosample_idx is not None and existing_biosample_idx != biosample_idx:
+                print(
+                    f"error: pool item {item_id!r} already exists in sequenced_pool"
+                    f" {sequenced_pool_idx} with biosample_idx={existing_biosample_idx}, but this"
+                    f" submission resolves it to biosample_idx={biosample_idx}. A re-run cannot"
+                    " change an existing sample's biosample — delete the pool sample (or fix the"
+                    " preflight) and re-run.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            prep_sample_idx = existing["prep_sample_idx"]
+            sequenced_sample_idx = existing.get("sequenced_sample_idx")
+            reused = True
+        else:
+            sample_body = SequencedSampleCreateRequest(
+                biosample_idx=biosample_idx,
+                owner_idx=owner_idx,
+                prep_protocol_idx=prep_protocol_idx,
+                sequenced_pool_item_id=item_id,
+                primary_study_idx=primary_study_idx,
+                secondary_study_idxs=secondary_study_idxs,
+            ).model_dump(exclude_unset=True, mode="json")
+            try:
+                sample_resp = _common.call(
+                    "POST",
+                    base_url,
+                    token,
+                    f"{PATH_SEQUENCING_RUN_PREFIX}{sample_path}",
+                    json=sample_body,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    # The item_id is absent from the roster (which filters retired
+                    # rows) yet the composer's (pool, item_id) uniqueness — which
+                    # counts retired rows — rejects it. A create-missing re-run
+                    # can't resolve a retired-slot collision; surface it actionably
+                    # instead of letting a raw 409 abort the gesture opaquely.
+                    print(
+                        f"error: pool item {item_id!r} conflicts with an existing (possibly"
+                        f" retired) sample in sequenced_pool {sequenced_pool_idx}; resolve it"
+                        " before re-running.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1) from exc
+                raise
+            prep_sample_idx = sample_resp["prep_sample_idx"]
+            sequenced_sample_idx = sample_resp["sequenced_sample_idx"]
+            reused = False
+        samples.append(
+            _ProvisionedSample(
+                row=row,
+                pool_item_id=item_id,
+                biosample_idx=biosample_idx,
+                primary_study_idx=primary_study_idx,
+                secondary_study_idxs=secondary_study_idxs,
+                prep_sample_idx=prep_sample_idx,
+                sequenced_sample_idx=sequenced_sample_idx,
+                reused=reused,
+            )
+        )
+    return _RunPoolProvision(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        run_status=run_status,
+        pool_status=pool_status,
+        owner_idx=owner_idx,
+        samples=samples,
     )
 
 
@@ -325,22 +569,6 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # human_filtering flag is still echoed per sample below so the operator knows
     # which samples the run intended to deplete when choosing those later args.
 
-    # One-pass order-preserving dedup over preflight_rows so the lookup
-    # route's `missing` echo is deterministic; the study side pools each
-    # row's primary + secondaries so controls land their full set.
-    unique_biosample_accessions: list[str] = []
-    unique_study_accessions: list[str] = []
-    seen_biosample: set[str] = set()
-    seen_study: set[str] = set()
-    for row in preflight_rows:
-        if row.biosample_accession not in seen_biosample:
-            seen_biosample.add(row.biosample_accession)
-            unique_biosample_accessions.append(row.biosample_accession)
-        for study_accession in (row.primary_project_accession, *row.secondary_project_accessions):
-            if study_accession not in seen_study:
-                seen_study.add(study_accession)
-                unique_study_accessions.append(study_accession)
-
     run_body = SequencingRunCreateRequest(
         instrument_run_id=instrument_run_id,
         platform=Platform.ILLUMINA,
@@ -352,101 +580,38 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict:
-        # Resolve the caller's principal_idx via whoami once for the
-        # per-sample owner_idx — composer requires it, route does not
-        # auto-fill it server-side.
-        owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
-
-        # Step 2.5: resolve every accession before any side effect. Both
-        # lookups always run so the operator sees biosample + study
-        # misses in a single round trip; a non-empty miss on either side
-        # is the fail-fast path — print the combined block and exit 1
-        # with no sequencing_run / sequenced_pool created.
-        resolved_biosamples, missing_biosamples = _lookup_accessions(
+        # Shared run → pool → roster provisioning (create-missing; fails fast on an
+        # unresolved accession). Illumina keys the pool-item-id on illumina_sample_idx.
+        provision = _provision_run_pool_roster(
             args.base_url,
             token,
-            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
-            unique_biosample_accessions,
-            BiosampleLookupByAccessionRequest,
+            preflight_rows=preflight_rows,
+            run_body=run_body,
+            pool_body=pool_body,
+            prep_protocol_idx=args.prep_protocol_idx,
+            pool_item_id=lambda row: str(row.illumina_sample_idx),
+            row_label=lambda row: f"illumina_sample_idx={row.illumina_sample_idx}",
+            row_noun="illumina_sample",
         )
-        resolved_studies, missing_studies = _lookup_accessions(
-            args.base_url,
-            token,
-            f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
-            unique_study_accessions,
-            StudyLookupByAccessionRequest,
-        )
-        if missing_biosamples or missing_studies:
-            _print_missing_accession_error(preflight_rows, missing_biosamples, missing_studies)
-            raise SystemExit(1)
+        sequencing_run_idx = provision.sequencing_run_idx
+        sequenced_pool_idx = provision.sequenced_pool_idx
 
-        run_resp, run_status = _common.call_with_status(
-            "POST",
-            args.base_url,
-            token,
-            PATH_SEQUENCING_RUN_PREFIX,
-            json=run_body,
-        )
-        sequencing_run_idx = run_resp["sequencing_run_idx"]
-
-        pool_resp, pool_status = _common.call_with_status(
-            "POST",
-            args.base_url,
-            token,
-            f"{PATH_SEQUENCING_RUN_PREFIX}"
-            f"{PATH_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx)}",
-            json=pool_body,
-        )
-        sequenced_pool_idx = pool_resp["sequenced_pool_idx"]
-
-        # Step 3: one sequenced-sample POST per preflight row. The
-        # composer route runs each POST inside its own transaction, so a
-        # mid-loop failure leaves a partial pool — the operator re-runs
-        # the CLI and find-or-create on the run + pool plus
-        # ON CONFLICT on the (pool_idx, pool_item_id) uniqueness lands
-        # the rest. The composer route's own uniqueness check makes
-        # repeat POSTs of the same (pool_idx, sequenced_pool_item_id) a
-        # 409 — the CLI does NOT swallow this, so any divergence
-        # (e.g. someone re-ran with a different prep_protocol_idx)
-        # surfaces to the operator.
-        per_sample_results: list[dict] = []
-        for row in preflight_rows:
-            secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
-            sample_body = SequencedSampleCreateRequest(
-                biosample_idx=resolved_biosamples[row.biosample_accession],
-                owner_idx=owner_idx,
-                prep_protocol_idx=args.prep_protocol_idx,
-                sequenced_pool_item_id=str(row.illumina_sample_idx),
-                primary_study_idx=resolved_studies[row.primary_project_accession],
-                secondary_study_idxs=secondary_study_idxs,
-            ).model_dump(exclude_unset=True, mode="json")
-            sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
-                sequencing_run_idx=sequencing_run_idx,
-                sequenced_pool_idx=sequenced_pool_idx,
-            )
-            sample_resp = _common.call(
-                "POST",
-                args.base_url,
-                token,
-                f"{PATH_SEQUENCING_RUN_PREFIX}{sample_path}",
-                json=sample_body,
-            )
-            per_sample_results.append(
-                {
-                    "illumina_sample_idx": row.illumina_sample_idx,
-                    "biosample_accession": row.biosample_accession,
-                    "biosample_idx": resolved_biosamples[row.biosample_accession],
-                    "primary_study_idx": resolved_studies[row.primary_project_accession],
-                    "secondary_study_idxs": secondary_study_idxs,
-                    # The preflight's per-project human_filtering flag is echoed
-                    # for operator reference — it no longer pins a host reference
-                    # on the sample; host filtering is chosen at
-                    # submit-host-filter-pool time.
-                    "human_filtering": row.human_filtering,
-                    "prep_sample_idx": sample_resp["prep_sample_idx"],
-                    "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
-                }
-            )
+        per_sample_results = [
+            {
+                "illumina_sample_idx": s.row.illumina_sample_idx,
+                "biosample_accession": s.row.biosample_accession,
+                "biosample_idx": s.biosample_idx,
+                "primary_study_idx": s.primary_study_idx,
+                "secondary_study_idxs": s.secondary_study_idxs,
+                # The preflight's per-project human_filtering flag is echoed for
+                # operator reference — it no longer pins a host reference on the
+                # sample; host filtering is chosen at submit-host-filter-pool time.
+                "human_filtering": s.row.human_filtering,
+                "prep_sample_idx": s.prep_sample_idx,
+                "sequenced_sample_idx": s.sequenced_sample_idx,
+            }
+            for s in provision.samples
+        ]
 
         # Step 4: submit the bcl-convert work_ticket against the pool. The pool
         # roster (prep_sample_idx ↔ sequenced_pool_item_id) rides in
@@ -485,11 +650,11 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         return {
             "sequencing_run": {
                 "sequencing_run_idx": sequencing_run_idx,
-                "status": "created" if run_status == 201 else "reused",
+                "status": "created" if provision.run_status == 201 else "reused",
             },
             "sequenced_pool": {
                 "sequenced_pool_idx": sequenced_pool_idx,
-                "status": "created" if pool_status == 201 else "reused",
+                "status": "created" if provision.pool_status == 201 else "reused",
             },
             "sequenced_samples": per_sample_results,
             "work_ticket": ticket_resp,

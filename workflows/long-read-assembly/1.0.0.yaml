@@ -123,6 +123,12 @@ steps:
     container: long-read-assembly-checkm-1.0.0.sif
     entrypoint: /opt/qiita/checkm.sh
     inputs: [refined_bins_dir]
+    # CheckM's ~1.4 GB reference DB is operator-provisioned under PATH_DERIVED,
+    # deliberately NOT baked into the SIF. Bind it in and point checkm.sh at it:
+    # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data
+    # that does not exist in the image, so an unbound DB exits 78).
+    derived_inputs:
+      QIITA_CHECKM_DB: checkm_data
     outputs: [checkm_dir]
     baseline_resources:
       cpu: 8

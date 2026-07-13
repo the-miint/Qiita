@@ -2357,6 +2357,8 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             # sequencing-run, sequenced-pool
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
+            # pool roster GET (create-missing: fresh pool -> empty, all created)
+            (200, {"samples": []}),
             # sequenced-sample x3
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
@@ -2381,8 +2383,9 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     )
     assert rc == 0
     requests = captured["requests"]
-    # whoami + biosample-lookup + study-lookup + run + pool + 3 samples + ticket = 9 calls.
-    assert len(requests) == 9
+    # whoami + biosample-lookup + study-lookup + run + pool + roster-GET + 3 samples
+    # + ticket = 10 calls.
+    assert len(requests) == 10
 
     # Leg 1: whoami.
     assert requests[0]["method"] == "GET"
@@ -2427,7 +2430,12 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     assert pool_body["run_preflight_filename"] == "preflight.db"
     assert _b64.b64decode(pool_body["run_preflight_blob"]) == blob.read_bytes()
 
-    # Legs 6..8: one sequenced-sample composer POST per preflight row.
+    # Leg 6: GET the pool roster (create-missing) — empty here, so all 3 samples
+    # are created next.
+    assert requests[5]["method"] == "GET"
+    assert requests[5]["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample/list")
+
+    # Legs 7..9: one sequenced-sample composer POST per preflight row.
     # secondary_study_idxs preserves the row's secondary order (after
     # the model's dedup; here no row has duplicates).
     expected_per_sample = [
@@ -2438,7 +2446,7 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     for offset, (illumina, biosample_idx, primary_study, secondary_studies) in enumerate(
         expected_per_sample
     ):
-        req = requests[5 + offset]
+        req = requests[6 + offset]
         assert req["method"] == "POST"
         assert req["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample")
         assert req["json"] == {
@@ -2450,10 +2458,10 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             "secondary_study_idxs": secondary_studies,
         }
 
-    # Leg 9: POST /work-ticket.
-    assert requests[8]["method"] == "POST"
-    assert requests[8]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
-    ticket_body = requests[8]["json"]
+    # Leg 10: POST /work-ticket.
+    assert requests[9]["method"] == "POST"
+    assert requests[9]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
+    ticket_body = requests[9]["json"]
     assert ticket_body["action_id"] == "bcl-convert"
     assert ticket_body["action_version"] == "1.0.0"
     assert ticket_body["scope_target"] == {
@@ -2692,6 +2700,7 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
+            (200, {"samples": []}),  # pool roster GET (create-missing)
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
             (202, {"work_ticket_idx": 56, "state": "pending"}),
@@ -2720,8 +2729,8 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
         "accession_field": "bioproject_accession",
     }
     # Both rows still produce a sequenced-sample composer POST with the
-    # row's distinct illumina_sample_idx.
-    sample_bodies = [r["json"] for r in captured["requests"][5:7]]
+    # row's distinct illumina_sample_idx (after the run/pool/roster-GET legs).
+    sample_bodies = [r["json"] for r in captured["requests"][6:8]]
     assert sample_bodies[0]["sequenced_pool_item_id"] == "1"
     assert sample_bodies[1]["sequenced_pool_item_id"] == "2"
     # Both rows resolve to the same biosample_idx (replicate convention).
@@ -2754,6 +2763,7 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
             (200, {"sequencing_run_idx": 12}),
             (200, {"sequenced_pool_idx": 34}),
+            (200, {"samples": []}),  # pool roster GET (create-missing)
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (202, {"work_ticket_idx": 56, "state": "pending"}),
         ],
@@ -2774,6 +2784,73 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
     summary = _json.loads(capsys.readouterr().out)
     assert summary["sequencing_run"]["status"] == "reused"
     assert summary["sequenced_pool"]["status"] == "reused"
+
+
+def test_submit_bcl_convert_reuses_existing_roster_samples(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """Convergent re-run: when the pool roster already holds a sample, bcl-convert
+    creates NO sequenced-sample (create-missing) and reuses its prep_sample_idx in
+    the work-ticket sample_map. Pins the CHANGELOG 'convergent re-run' claim."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", [])])
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),
+            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
+            (200, {"resolved": {"PRJ001": 7}, "missing": []}),
+            (200, {"sequencing_run_idx": 12}),
+            (200, {"sequenced_pool_idx": 34}),
+            # roster already has item "1" (biosample_idx matches the resolved 41).
+            (
+                200,
+                {
+                    "samples": [
+                        {
+                            "sequenced_pool_item_id": "1",
+                            "prep_sample_idx": 81,
+                            "sequenced_sample_idx": 71,
+                            "biosample_idx": 41,
+                        }
+                    ]
+                },
+            ),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    # No sequenced-sample was CREATED (POST) — the existing one is reused.
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/sequenced-sample")
+    ]
+    # The work-ticket sample_map carries the reused prep_sample_idx.
+    ticket = next(r for r in captured["requests"] if r["url"].endswith("/work-ticket"))
+    assert ticket["json"]["action_context"]["sample_map"] == [
+        {"prep_sample_idx": 81, "pool_item_id": "1"}
+    ]
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequenced_samples"][0]["prep_sample_idx"] == 81
 
 
 def test_submit_bcl_convert_rejects_relative_bcl_input_dir(capsys, preflight_stub):
@@ -2976,6 +3053,7 @@ def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, 
             (200, {"resolved": {"PRJ001": 70}, "missing": []}),  # study
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
+            (200, {"samples": []}),  # pool roster GET (create-missing)
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
             (202, {"work_ticket_idx": 56, "state": "pending"}),

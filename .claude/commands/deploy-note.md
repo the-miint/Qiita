@@ -31,7 +31,7 @@ Edit `## Pending deploy` in `DEPLOY_CHECKLIST.md`. Place each item in its bucket
 - **Merge into the existing lines, don't duplicate them.** If bucket 1 already appends to `compute-orchestrator.env` (one idempotent `sudo bash -c 'grep -q … || echo "KEY=value" >> …'` per var), add your var as another such line next to them — do not start a second CO group. Same for the migration list and verify checks.
 - **Tag every line you add with `(#N)`** (the PR/branch ref) so the archive step and the operator can trace provenance.
 - **Keep it concise** — a copy-pasteable command and a half-line of why, matching the surrounding style. No prose narration of the change; the git log covers that.
-- Respect ordering: anything `from_env()` requires goes in bucket 1 (must precede the restart); migrations in bucket 3; verification in bucket 5.
+- Respect ordering: anything `from_env()` requires goes in bucket 1 (must precede the restart); migrations in bucket 3; verification in bucket 5. Irreversible cleanup that burns the rollback path (retiring a superseded secret, deleting an old data dir) goes in bucket 6 — it must not run until bucket 5 is green, because until then the OLD build's config is the way back.
 - Don't maintain any parallel PR roll-call list — the per-line `(#N)` tags are the only provenance record.
 
 ## 3. Report

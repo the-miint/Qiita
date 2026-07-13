@@ -35,6 +35,7 @@ from .. import _common
 from ._helpers import _handle_patch, _handle_read, _lane_arg
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
+from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
     _handle_pool_completion,
@@ -928,6 +929,92 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
+
+    p_submit_pacbio = sub.add_parser(
+        "submit-pacbio-ingest",
+        help=(
+            "Bundled operator gesture for PacBio HiFi ingest: mint (or reuse) a"
+            " sequencing-run row, attach a sequenced-pool with the preflight blob,"
+            " and fan out one bam-to-parquet ingest ticket per demultiplexed sample."
+        ),
+        description=(
+            "Submit PacBio HiFi ingest end-to-end. PacBio arrives already"
+            " demultiplexed (one uBAM per barcode under"
+            " {run_folder}/{smartcell}/hifi_reads/), so unlike bcl-convert there is"
+            " no in-workflow demux: each sample's BAM is located on disk by its"
+            " barcode and loaded by its own bam-to-parquet ticket. A barcode reused"
+            " across SMRT cells fails fast (the preflight now carries a SMRT-cell"
+            " field, but until it is populated the reuse cannot be disambiguated)."
+            " The run + pool are"
+            " find-or-create and the per-sample roster is create-missing, so"
+            " re-running after a partial failure converges without cleanup —"
+            " reusing what exists and retrying only the missing samples/tickets."
+        ),
+    )
+    p_submit_pacbio.add_argument(
+        "--run-folder",
+        type=Path,
+        required=True,
+        help=(
+            "Absolute path to the PacBio run folder on the shared filesystem. Must"
+            " contain per-SMRT-cell well subdirectories with"
+            " hifi_reads/*.hifi_reads.<barcode>.bam demultiplexed reads. Each"
+            " sample's resolved BAM path is passed as action_context.bam_path on its"
+            " bam-to-parquet ticket."
+        ),
+    )
+    p_submit_pacbio.add_argument(
+        "--preflight-blob",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the local kl-run-preflight SQLite file. The CLI reads it"
+            " (refuses empty), base64-encodes the bytes, and attaches the blob to"
+            " the sequenced-pool row so a later read-mask submission can re-read the"
+            " per-sample protocol columns. Same content-addressed pool find-or-create"
+            " as submit-bcl-convert."
+        ),
+    )
+    p_submit_pacbio.add_argument(
+        "--instrument-run-id",
+        required=True,
+        help=(
+            "Instrument run identifier for the sequencing-run row (PacBio has no"
+            " RunInfo.xml). The find-or-create key together with the platform."
+        ),
+    )
+    p_submit_pacbio.add_argument(
+        "--instrument-model",
+        default=None,
+        help=(
+            "Optional PacBio instrument model (e.g. 'Revio'), recorded on the"
+            " sequencing-run row. Omitted -> NULL (QC's polyG gating stays off for"
+            " long reads regardless)."
+        ),
+    )
+    p_submit_pacbio.add_argument(
+        "--prep-protocol-idx",
+        type=int,
+        required=True,
+        help=(
+            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
+            " uniformly across the pool (the preflight carries no Qiita"
+            " prep_protocol identifier), mirroring submit-bcl-convert. NOT"
+            " validated against the platform — passing a non-PacBio/short-read"
+            " protocol here silently mislabels every sample, so double-check it is"
+            " the intended long-read protocol."
+        ),
+    )
+    p_submit_pacbio.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-submit each sample's bam-to-parquet ticket even when a COMPLETED"
+            " one already exists (a re-run re-registers reads into the lake —"
+            " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
+        ),
+    )
+    p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)
 
     p_delete_pool = sub.add_parser(
         "delete-sequenced-pool",

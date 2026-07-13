@@ -8,6 +8,9 @@ needed — these read the migration file and import the Python constants.
 
 from pathlib import Path
 
+from qiita_common.models import WorkTicketState
+
+from qiita_control_plane.dispatch import NON_TERMINAL_WORK_TICKET_STATES
 from qiita_control_plane.notify.sweeper import (
     _OWED_SET_WHERE,
     _TERMINAL_STATE_LITERALS,
@@ -31,6 +34,22 @@ def test_terminal_state_literals_match_runner_source_of_truth():
     # order — assert the round-trip so a runner change is reflected here.
     assert set(_TERMINAL_STATE_LITERALS) == set(_TERMINAL_WORK_TICKET_STATES)
     assert list(_TERMINAL_STATE_LITERALS) == sorted(_TERMINAL_WORK_TICKET_STATES)
+
+
+def test_terminal_and_non_terminal_partition_every_work_ticket_state():
+    # The digest's "No other work tickets of yours are still active" is an
+    # AFFIRMATIVE claim, and it holds only if the two sets are exact complements
+    # over WorkTicketState: what the sweeper reports as finished, plus what it
+    # counts as still active, is every state a ticket can be in. Add a seventh
+    # state and forget to place it, and it falls into neither — the runner never
+    # finalizes it and the email tells the recipient nothing is in flight while
+    # their tickets sit in it. (The retriable-FAILED carve-out is a subset of
+    # the terminal side, counted separately by _HELD_COUNT_SELECT; it does not
+    # break the partition, which is over STATES.)
+    terminal = set(_TERMINAL_WORK_TICKET_STATES)
+    non_terminal = set(NON_TERMINAL_WORK_TICKET_STATES)
+    assert terminal.isdisjoint(non_terminal)
+    assert terminal | non_terminal == {s.value for s in WorkTicketState}
 
 
 def test_owed_set_predicate_carries_all_terminal_states_and_carve_out():

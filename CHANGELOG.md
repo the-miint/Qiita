@@ -13,6 +13,97 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+### Changed
+
+- **The work-ticket notification email now accounts for every ticket the recipient
+  has, not just the ones that reached a terminal state.** Notifications land
+  per-batch as tickets terminate, so during a fanout the recipient gets a stream of
+  emails each reporting a slice — and none of them said where in the batch they
+  were. "2 failed" could mean 2 of 26 still running or the tail of a batch that
+  already finished, and the only way to tell them apart was to go run
+  `qiita ticket list --active`. The digest now carries three buckets that between
+  them cover every ticket the recipient has:
+  - what just **finished** (unchanged — the owed set);
+  - what is **still active**: `23 still active (3 queued, 20 processing)`, in the
+    subject and both bodies, broken down per action when the active set spans more
+    than one. Nothing in flight is now stated outright rather than left silent —
+    that is the "everything else is done, act now" signal. The active set is
+    `NON_TERMINAL_WORK_TICKET_STATES`, the same predicate `GET /work-ticket?active=true`
+    filters on, so the email answers exactly the question that command would, and a
+    parity test pins the terminal and non-terminal sets as exact complements over
+    `WorkTicketState` (the "nothing still active" line is only true if they
+    partition the enum);
+  - what is **held for redrive**: a ticket that exhausts its infrastructure retries
+    lands in FAILED with `failure_type=retriable`, which the owed set deliberately
+    withholds from email (so a redrive-and-complete reports the *true* outcome) — but
+    it is terminal, so it was in neither half of the notification. A user whose
+    tickets all died on NODE_FAIL could get no email at all, and the new "nothing
+    still active" line would have positively asserted everything was accounted for.
+
+  Two defects surfaced while building it, fixed here. **A redrive landing inside the
+  send window was stamped away, so the ticket was never emailed again**:
+  `POST /work-ticket/{idx}/run` resets `notified_at` to NULL precisely so a redriven
+  ticket re-notifies at its true terminal state, but the sweeper's send-then-stamp
+  UPDATE guarded only on `notified_at IS NULL` — a redrive between the owed-set
+  SELECT and the stamp was clobbered, and the ticket went out reported as `failed`
+  and then went permanently silent. The stamp now re-asserts the whole owed-set
+  predicate, so a redriven ticket (back to `pending`) no longer matches and stays
+  owed. And **the plain-text digest collapsed every detail row onto one line**: the
+  optional failure-reason clause closes with a `{% endif %}` at end-of-line, which
+  Jinja's `trim_blocks` swallows along with the row's newline, so all N rows and the
+  footer behind them ran together (HTML readers were unaffected — the rows are a
+  `<table>` there). The receipt's `template_context` records the claim the email made
+  (`active_total`, `active_counts`, `active_actions`, `held_total`), rendered from
+  the same rollup rather than a second tally that could drift from it. (#283)
+
+- **Deploy checklist: archived the 2026-07-12 deploy (`56ce7d4`, 13 PRs) and added a
+  post-verify bucket 6.** `HMAC_SECRET_KEY` retirement moves into it. Bucket 1
+  previously told the operator to delete it *before* the restart, which buys
+  nothing — the new build never reads it (both config loaders look up named vars,
+  so an unknown one is inert) — while it strands the still-running OLD build (which
+  boots on it) and discards the rollback path during the riskiest part of the
+  deploy. Bucket 6 is now the home for any irreversible cleanup that burns the way
+  back: it runs only once bucket 5 is green and needs no restart of its own. The
+  archived block records that this deploy already followed that order. `redeploy.md`
+  (source of truth for bucket order), `/deploy-note` and `/deploy-archive` updated
+  to match. (#276)
+
+### Fixed
+
+- **Container steps had no usable `TMPDIR`, so a step doing real work would die
+  partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
+  by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the
+  environment — so `TMPDIR` was unset and an entrypoint's bare `mktemp -d` landed
+  on a 64 MiB in-memory disk. Every `long-read-assembly` entrypoint stages its
+  working set there (hifiasm_meta's assembly, the decompressed reads FASTQ,
+  DAS_Tool/CheckM working dirs), and what did fit was charged to the job's cgroup
+  memory — silently eating the allocation its own resource sizing assumed. The
+  payload now forwards `TMPDIR=<workspace>/tmp`: real disk, already bound via
+  `--home`, cleaned up with the workspace. Container steps only; a native step has
+  ordinary node-local `/tmp`. (`bcl-convert`, the one container workflow that has
+  actually run in production, never hit this — it uses no `mktemp`.) (#275)
+- **The four `long-read-assembly` SIFs could not build, and could not have run.**
+  Three defects, none previously exercised — the workflow merged but was never
+  deployed, so its `%test` had never once executed:
+  - `apptainer build` runs `%test` inside the finished, read-only image with
+    `HOME=/root`, so libmamba could not create its cache dir and hard-aborted.
+    `%test` now sets a writable `HOME`, as the SLURM payload does at run time.
+  - `checkm`'s `%test` invoked CheckM without `CHECKM_DATA_PATH`, so its
+    `DBManager` fell through to writing `DATA_CONFIG` inside site-packages —
+    another write into the read-only image. `checkm.sh` always sets that variable,
+    so the test was exercising a state production never reaches.
+  - **Runtime-fatal:** the images shipped no Python, but `_lib.sh` runs `python3
+    manifest_writer.py` to emit `manifest.json` — which every step must write and
+    the backend verifies before registering output. Every step would have finished
+    its full tool run and died on its final line. `python=3.11` is now in each
+    base env, pinned, with a lockstep grep guard on `_lib.sh` — both mirroring
+    `bcl-convert`, which got this right.
+
+  The build aborted the deploy rather than restarting into a broken state, via
+  `build-sifs.sh`'s refuse-on-unbuildable-image guard. All four images have since
+  been built and smoke-tested on the deploy host under production apptainer flags.
+  (#275)
+
 ### Added
 
 - **Sharded-reference alignment consumer (C2b).** Wires the C1 `align_sharded`
@@ -215,6 +306,45 @@ the `no-changelog` label).
   chunk_data)` stream into DuckDB for lazy, unbuffered reassembly. The live `compute`
   service account needs the `ticket:doget` scope (already within
   `SERVICE_ACCOUNT_SCOPE_CEILING`) to mint the ticket. (#268)
+- **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
+  analogue of `submit-bcl-convert`: it reads a kl-run-preflight blob, stands up
+  the `sequencing_run` (platform `pacbio_smrt`) / `sequenced_pool` (blob attached)
+  / `sequenced_sample` roster, and — because PacBio arrives already demultiplexed
+  (one uBAM per barcode) — FANS OUT one existing `bam-to-parquet` ticket per
+  sample rather than a single pool-scoped demux ticket (no new job or workflow).
+  Each sample's identity (and `sequenced_pool_item_id`) is its `pacbio_sample_idx`,
+  the parallel of `illumina_sample_idx`; the barcode only LOCATES the sample's BAM
+  under `{run_folder}/{smrt_cell}/hifi_reads/` (it is not unique across all PacBio
+  protocols), and a barcode reused across SMRT cells fails loud rather than
+  silently binding the wrong cell's reads. Per-sample facts (biosample + ENA
+  bioproject accessions, barcode, twist/syndna columns, and the SMRT cell) come
+  from kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of the
+  Illumina reader; run-preflight pin bumped to the merged PR that adds it); the
+  project's `human_filtering` intent is read from the canonical `run_pacbio_sample`
+  view (tracked for removal in #271, with the `sheet_type` dependency in #272).
+  Studies resolve on the **bioproject** accession like the Illumina path (the
+  earlier draft keyed on the QiitaID, which the study lookup route cannot match).
+  The SMRT cell rides onto each row; keying `(smrt_cell, barcode)` BAM
+  disambiguation off it is a follow-up. Verified against kl-run-preflight's own
+  `good_pacbio_absquantv11.csv` case-5 fixture. (#260)
+- **`derived_inputs` on container workflow steps** — the container-side mirror
+  of the native-only `params`. A step declares `derived_inputs: {ENV_VAR:
+  <path relative to PATH_DERIVED>}`; the orchestrator joins each value against
+  its own `PATH_DERIVED`, bind-mounts the result, and forwards the absolute path
+  under that env var name. This is the only way an operator-provisioned artifact
+  too large to bake into a SIF (CheckM's ~1.4 GB DB) can reach a container:
+  apptainer runs `--containall`, so an unforwarded host env var is invisible
+  inside it. Values stay **relative** on the wire — the control plane never names
+  a compute-node absolute path — and both the wire validator and the backend
+  reject an absolute path or a `..` escape, so a workflow cannot name an
+  arbitrary host directory for the orchestrator to bind in. (#273)
+
+- **Seed water/marine metadata for early data entry** — the `GSC MIxS water`
+  checklist (ERC000024, under the ENA default); the `depth_m` and
+  `host_taxon_id` biosample global fields (the latter terminology-bound to NCBI
+  Taxonomy, required); the `seawater metagenome`, `estuary metagenome`, and
+  `Homo sapiens` NCBI taxa; and eight marine/aquatic ENVO environmental-context
+  terms. (#267)
 
 - **Key-rotation runbook** (`docs/runbooks/key-rotation.md`) — restart-based
   rotation for the Ed25519 Flight signing keypair and the login-cookie secret,
@@ -923,6 +1053,12 @@ the `no-changelog` label).
   references are not backfilled — only new ingests get the 1-1-at-rest shape.
   (#268)
 
+- **`submit-bcl-convert` re-run is now convergent (create-missing roster).** The
+  run → pool → sequenced-sample provisioning is unified with `submit-pacbio-ingest`
+  in one shared `_provision_run_pool_roster` (was duplicated between the two). As a
+  result bcl-convert now GETs the pool roster and creates only the missing samples,
+  so a re-run after a partial failure reuses existing rows instead of 409ing on the
+  first already-created sample. (#260)
 - **Data-plane public-edge hardening.** The Arrow Flight service is reachable
   from the internet through nginx on 443 (by design — clients connect directly
   through nginx). Tightened that edge: the nginx Flight `location` now sets
@@ -1704,6 +1840,32 @@ the `no-changelog` label).
   DoGet filters by feature_idx), and `_CHUNK_BUDGET_PER_BATCH` drops 50k→10k to keep
   the per-part ranges narrow for pruning. (#268)
 
+- **`long-read-assembly` could never complete a run**, for two independent
+  reasons. Container dispatch was gated to `{reference, sequenced_pool}`-scoped
+  tickets, so all four of its `prep_sample`-scoped container steps (assemble /
+  binning / bin_refine / checkm) failed `CONTRACT_VIOLATION` at submit;
+  `prep_sample` is now admitted, which costs nothing else because the dispatch
+  path already treated `scope_target` opaquely. And the `checkm` step never
+  declared its operator-staged reference DB, so no bind was computed and
+  `checkm.sh` fell back to an `/opt/checkm_data` absent from the SIF (exit 78) no
+  matter how correctly the DB was staged; it now rides the new `derived_inputs`
+  field. A pin test (`test_workflow_container_scope_pin`) walks every workflow
+  YAML and fails `make test` when a workflow declares container steps under a
+  kind the backends won't dispatch — both bugs only surfaced on a live submit,
+  and this is the static check that catches the next one at CI. The operator
+  steps this shipped with were also unrunnable as written; `DEPLOY_CHECKLIST.md`
+  is corrected (an unset `$PATH_DERIVED` that would have `mkdir`ed `/checkm_data`
+  at the filesystem root, an md5 that only printed instead of verifying, and an
+  Ed25519 keygen one-liner that needs cryptography >= 38 but ran under a system
+  `python3` that can be older). (#273)
+- **Apptainer arguments are shell-quoted.** The `apptainer exec` line is
+  interpolated into a bash script, and its `--bind` paths, `--env` values, image
+  path and entrypoint all originate in workflow YAML. Unquoted, a `;` or a space
+  in any of them would terminate the command and run whatever followed. Every arg
+  is now `shlex.quote`d at the one place they become shell text. Derived-artifact
+  binds are also mounted `:ro` — one shared copy (CheckM's 1.4 GB DB) is read by
+  every concurrent job, and a writable mount let one container corrupt it for all
+  of them. (#273)
 - The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)

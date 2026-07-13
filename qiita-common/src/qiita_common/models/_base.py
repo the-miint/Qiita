@@ -7,10 +7,16 @@ base model — so the domain submodules can import FROM here without forming an
 import cycle. No submodule imports back from `models/__init__`.
 """
 
+import re
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# A `derived_inputs` key becomes an env var forwarded into the container, so it
+# must look like one. Anchored: a stray `=` or space would corrupt the
+# `--env K=V` apptainer argument it is interpolated into.
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def check_exactly_one_runtime(
@@ -27,6 +33,48 @@ def check_exactly_one_runtime(
         raise ValueError(f"{owner} must declare exactly one of 'container' or 'module'")
     if entrypoint is not None and container is None:
         raise ValueError("'entrypoint' requires 'container'")
+
+
+def check_derived_inputs(
+    derived_inputs: dict[str, str],
+    *,
+    container: str | None,
+    owner: str,
+) -> None:
+    """Shared `derived_inputs` shape check for WorkflowStep (YAML side) and
+    StepSubmitRequest (wire side). Raises ValueError when the shape is wrong.
+    Kept beside check_exactly_one_runtime so the rule can't drift between the
+    two layers.
+
+    Each value is a path RELATIVE to the orchestrator's PATH_DERIVED. It is
+    rejected here if absolute or if it escapes upward, so the joined path can
+    never land outside the derived root — the control plane must not be able to
+    name an arbitrary host path for the orchestrator to bind into a container.
+    """
+    if not derived_inputs:
+        return
+    if container is None:
+        raise ValueError(
+            f"{owner} declares 'derived_inputs' on a native step; native jobs read"
+            " PATH_DERIVED from their own settings and need no bind"
+        )
+    for name, rel in derived_inputs.items():
+        if not _ENV_NAME_RE.match(name):
+            raise ValueError(
+                f"{owner} derived_inputs key {name!r} is not a valid env var name"
+                " (^[A-Z][A-Z0-9_]*$)"
+            )
+        if not rel:
+            raise ValueError(f"{owner} derived_inputs[{name!r}] is empty")
+        if rel.startswith("/"):
+            raise ValueError(
+                f"{owner} derived_inputs[{name!r}]={rel!r} must be relative to"
+                " PATH_DERIVED, not an absolute host path"
+            )
+        if ".." in rel.split("/"):
+            raise ValueError(
+                f"{owner} derived_inputs[{name!r}]={rel!r} must not traverse above PATH_DERIVED"
+            )
 
 
 def _normalize_scope_target(v: dict[str, Any]) -> dict[str, Any]:

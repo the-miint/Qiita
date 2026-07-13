@@ -40,6 +40,7 @@ from qiita_common.models import (
     ProcessingKind,
     ScopeTargetKind,
     StepType,
+    check_derived_inputs,
     check_exactly_one_runtime,
 )
 
@@ -244,6 +245,27 @@ class WorkflowStep(BaseModel):
     # same-named knobs without colliding in action_context. Native steps only —
     # container inputs are bind-mount paths, never scalars.
     params: dict[str, str] = Field(default_factory=dict)
+    # THE canonical description of derived_inputs; other layers point here.
+    #
+    # Host artifacts under PATH_DERIVED that a container step needs at run time,
+    # keyed env_var_name -> path relative to PATH_DERIVED (e.g.
+    # {"QIITA_CHECKM_DB": "checkm_data"}). The orchestrator joins each value
+    # against its own PATH_DERIVED, bind-mounts the result READ-ONLY, and
+    # forwards the absolute path under the env var name. Both halves are load-
+    # bearing: apptainer runs `--containall`, so a bound path the container has
+    # no env var for is a path the entrypoint cannot find.
+    #
+    # The container-side mirror of `params` (native-only scalars). Use it for
+    # operator-provisioned reference data too large to bake into the SIF
+    # (CheckM's DB); ticket-scoped data flows through `inputs`. Container steps
+    # only — a native step reads PATH_DERIVED from its own settings, no bind.
+    #
+    # Values stay RELATIVE: PATH_DERIVED is the orchestrator's to resolve, so the
+    # control plane never names a compute-node path, and a workflow cannot point
+    # a bind at an arbitrary host directory. `check_derived_inputs` enforces the
+    # shape (env-var-shaped key, relative value, no `..`); the backend re-runs it
+    # and additionally refuses a value resolving to PATH_DERIVED itself.
+    derived_inputs: dict[str, str] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
@@ -264,6 +286,11 @@ class WorkflowStep(BaseModel):
             container=self.container,
             module=self.module,
             entrypoint=self.entrypoint,
+            owner="WorkflowStep",
+        )
+        check_derived_inputs(
+            self.derived_inputs,
+            container=self.container,
             owner="WorkflowStep",
         )
         return self

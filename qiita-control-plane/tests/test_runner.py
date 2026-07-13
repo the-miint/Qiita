@@ -73,6 +73,10 @@ class _LocalLikeBackendMixin:
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
+        # Container-only (bind + env-forward into apptainer). Accepted for
+        # ComputeBackendClient parity and dropped: these fakes never dispatch a
+        # real container, and `run_step` is the single customization point.
+        derived_inputs: dict[str, str] | None = None,  # noqa: ARG002
     ) -> StepHandleWire:
         outputs = await self.run_step(
             step_name=step_name,
@@ -3634,6 +3638,7 @@ class FakeSlurmBackendClient:
         module=None,
         entrypoint=None,
         baseline_resources=None,
+        derived_inputs=None,  # noqa: ARG002 — container-only; this fake dispatches none
     ):
         self.submit_calls += 1
         if self.submit_calls <= self._submit_unreachable_times:

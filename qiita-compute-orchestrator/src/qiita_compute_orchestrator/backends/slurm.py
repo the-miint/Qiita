@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from qiita_common.models import (
     StepBaselineResources,
     StepStatus,
     WorkTicketFailureStage,
+    check_derived_inputs,
 )
 
 from ..backend import (
@@ -279,6 +281,75 @@ class SlurmBackend(ComputeBackend):
         # Sorted output makes payload tests deterministic.
         return sorted(bind_dirs)
 
+    def _resolve_derived_inputs(
+        self, derived_inputs: dict[str, str], *, step_name: str
+    ) -> dict[str, Path]:
+        """Join each YAML-declared `derived_inputs` value against this
+        orchestrator's ``PATH_DERIVED``, yielding env_var_name -> absolute
+        host path. The caller binds each path into the container (read-only)
+        and forwards it under its env var name.
+
+        This is the LAST gate before a YAML-authored string becomes a host path
+        bind-mounted into a container, and a direct caller (a test, programmatic
+        submission) skips the wire — so it re-runs the full shared
+        `check_derived_inputs` contract rather than a subset of it, then adds
+        the two checks that need the resolved root:
+
+          * the joined path stays under PATH_DERIVED, and
+          * it is not PATH_DERIVED itself (a bare `.` would bind the whole
+            derived root — every SIF under images/ — into the container).
+
+        Existence is NOT checked, for the same reason as `_resolve_input_binds`:
+        the orchestrator's filesystem view can differ from the compute nodes'.
+        A genuinely missing derived artifact fails loudly inside apptainer when
+        ``--bind`` evaluates against a non-existent host directory.
+        """
+        if not derived_inputs:
+            return {}
+        if not self._path_derived:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    "step declares 'derived_inputs' but PATH_DERIVED is not set"
+                    " — the orchestrator cannot resolve the derived-artifact root"
+                ),
+            )
+        try:
+            check_derived_inputs(derived_inputs, container="present", owner="submit_step")
+        except ValueError as exc:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=str(exc),
+            ) from exc
+
+        root = Path(self._path_derived)
+        resolved: dict[str, Path] = {}
+        for env_name, rel in derived_inputs.items():
+            # normpath() COLLAPSES `..` lexically. Without it the containment
+            # check below is worthless: `is_relative_to` compares path parts
+            # verbatim, so `<root>/../../etc` "starts with" <root> and passes.
+            # Deliberately not Path.resolve() — that also follows symlinks, and
+            # (like _resolve_input_binds) we bind the path as written rather
+            # than chasing a link to somewhere the author didn't name.
+            path = Path(os.path.normpath(root / rel))
+            if not path.is_relative_to(root) or path == root:
+                raise BackendFailure(
+                    kind=FailureKind.CONTRACT_VIOLATION,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"derived_inputs[{env_name!r}]={rel!r} must name a path"
+                        f" strictly under PATH_DERIVED ({root}); it resolves to"
+                        f" {path}"
+                    ),
+                )
+            resolved[env_name] = path
+        return resolved
+
     async def submit_step(
         self,
         name: str,
@@ -292,6 +363,7 @@ class SlurmBackend(ComputeBackend):
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandle:
         """Lay out the workspace tree + params.json, submit the SLURM job,
         and return a StepHandle — without polling. Submission errors are
@@ -334,10 +406,26 @@ class SlurmBackend(ComputeBackend):
         #   <workspace>/input/   contains params.json (mounted as $QIITA_INPUT_PATH)
         #   <workspace>/output/  receives manifest.json + outputs (mounted as $QIITA_OUTPUT_PATH)
         #   <workspace>/logs/    SLURM stdout / stderr land here
+        #   <workspace>/tmp/     the container's TMPDIR (see below)
         input_path = workspace / "input"
         output_path = workspace / "output"
         logs_path = workspace / "logs"
-        for d in (input_path, output_path, logs_path):
+        # `apptainer exec --containall` gives the container a *tmpfs* /tmp sized by
+        # the host's `sessiondir max size` — 64 MiB on the live deploy — and scrubs
+        # the environment, so TMPDIR is unset and a bare `mktemp -d` lands there.
+        # An entrypoint that stages real work through mktemp (an assembly, a
+        # decompressed FASTQ) then dies on a 64 MiB in-memory disk, and what it does
+        # write counts against the job's cgroup memory, silently eating the
+        # allocation its own resource sizing assumed it had. Point TMPDIR at the
+        # per-job workspace instead: it is real disk on the shared filesystem, it is
+        # already bound into the container (via --home), and it is cleaned up with
+        # the rest of the workspace.
+        #
+        # Container steps only. A native step runs on the compute node with no
+        # container, where /tmp is ordinary node-local disk — deliberately left
+        # alone (DuckDB's spill dir resolves against it).
+        tmp_path = workspace / "tmp"
+        for d in (input_path, output_path, logs_path, tmp_path):
             d.mkdir(parents=True, exist_ok=True)
         # params.json is the channel for workflow-specific data — never the
         # slurmrestd submit body, which is visible in `scontrol show job`
@@ -407,8 +495,22 @@ class SlurmBackend(ComputeBackend):
         # apptainer's host-mounted view. Native steps don't need extra
         # binds — the launcher runs outside any container.
         extra_bind_dirs: list[Path] | None = None
+        ro_bind_dirs: list[Path] | None = None
+        container_env: dict[str, str] | None = None
         if container is not None:
             extra_bind_dirs = self._resolve_input_binds(inputs, step_name=name)
+            # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
+            # reference DB, too large to bake into the SIF). Bind each one
+            # read-only and forward its absolute path under the declared env var
+            # — apptainer runs `--containall`, so an unforwarded host env var is
+            # invisible inside the container.
+            derived = self._resolve_derived_inputs(derived_inputs or {}, step_name=name)
+            if derived:
+                # Same directory-granularity rule as _resolve_input_binds: bind a
+                # directory itself, but a FILE's parent (apptainer's --bind is
+                # directory-granular). The env var still names the file.
+                ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
+                container_env = {k: str(v) for k, v in derived.items()}
 
         payload = build_job_submit_payload(
             step_name=name,
@@ -428,6 +530,8 @@ class SlurmBackend(ComputeBackend):
             attempt=attempt,
             extra_env=extra_env or None,
             extra_bind_dirs=extra_bind_dirs,
+            ro_bind_dirs=ro_bind_dirs,
+            container_env=container_env,
             qos=self._qos,
         )
 
