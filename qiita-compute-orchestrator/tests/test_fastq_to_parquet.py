@@ -29,6 +29,7 @@ import asyncio
 import duckdb
 import pytest
 from qiita_common.backend_failure import StepNoData
+from qiita_common.models import WorkTicketState
 
 from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.fastq_to_parquet import (
@@ -436,7 +437,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + _MINIMAL_FASTQ_READS - 1,
             minted_by_work_ticket_idx=1,
-            minted_by_work_ticket_state="processing",  # still in flight
+            minted_by_work_ticket_state=WorkTicketState.PROCESSING.value,  # still in flight
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -475,8 +476,9 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + _MINIMAL_FASTQ_READS,  # one too many
             minted_by_work_ticket_idx=1,  # ours...
-            minted_by_work_ticket_state="processing",  # ...and still in flight, so the
-            # width check is what fires — not the ownership or in-flight gate.
+            # ...and still in flight, so the width check is what fires — not the
+            # ownership gate and not the in-flight gate.
+            minted_by_work_ticket_state=WorkTicketState.PROCESSING.value,
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)

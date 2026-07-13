@@ -27,7 +27,7 @@ import asyncio
 import duckdb
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
-from qiita_common.models import TERMINAL_WORK_TICKET_STATES
+from qiita_common.models import TERMINAL_WORK_TICKET_STATES, WorkTicketState
 
 import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
@@ -205,7 +205,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
             sequence_idx_start=1000,
             sequence_idx_stop=1001,
             minted_by_work_ticket_idx=1,
-            minted_by_work_ticket_state="processing",  # still in flight
+            minted_by_work_ticket_state=WorkTicketState.PROCESSING.value,  # still in flight
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -235,8 +235,9 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
             sequence_idx_start=1000,
             sequence_idx_stop=1005,  # 6 indices for a 2-read BAM
             minted_by_work_ticket_idx=1,  # ours...
-            minted_by_work_ticket_state="processing",  # ...and still in flight, so the
-            # width check is what fires — not the ownership or in-flight gate.
+            # ...and still in flight, so the width check is what fires — not the
+            # ownership gate and not the in-flight gate.
+            minted_by_work_ticket_state=WorkTicketState.PROCESSING.value,
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -399,6 +400,17 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     assert terminal_state in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
+    # The refusal must name a recovery the CP will actually ACCEPT. `/run` takes a
+    # ticket in PENDING or FAILED only, so `failed` gets the redrive and every other
+    # terminal state gets delete-then-resubmit; pointing `completed` or `no_data` at
+    # `ticket run` would send the operator to a 409.
+    if terminal_state == WorkTicketState.FAILED.value:
+        assert f"qiita ticket run {1}" in ei.value.reason
+        assert "DELETE the prep_sample" not in ei.value.reason
+    else:
+        assert "DELETE the prep_sample" in ei.value.reason
+        assert "ticket run" not in ei.value.reason
+
 
 def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tmp_path):
     """The batched write must reproduce EXACTLY what the global sort used to give.
@@ -482,4 +494,7 @@ def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path)
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "no longer in flight" in ei.value.reason
+    # No ticket row to redrive — `/run` would 404. Delete-first is the only recovery.
+    assert "DELETE the prep_sample" in ei.value.reason
+    assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

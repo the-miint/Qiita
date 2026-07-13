@@ -59,19 +59,14 @@ from .sequence_range import (
 CP_RETRY_MAX_ATTEMPTS = 3
 CP_RETRY_BACKOFF_BASE_S = 0.5
 
-# The states a minting ticket may be in for its range to be REUSABLE. An ALLOWLIST,
-# not a denylist ("everything except completed"), because the failure mode is silent:
-# reusing a range whose reads are already registered duplicates them in DuckLake,
-# which has no uniqueness and no way to notice afterwards. A denylist would let a
-# work_ticket_state added later fall through to the permissive path by default —
-# fail-open, the shape we invert elsewhere for the same reason.
-#
-# Derived from the canonical terminal/non-terminal split rather than spelled out, so
-# it cannot become another hand-maintained copy of it. Reuse is legitimate only while
-# the minting ticket is still IN FLIGHT (its reads cannot be registered yet). Every
-# terminal state refuses — `completed` because the reads ARE registered, `failed` /
-# `no_data` because a job still running under a ticket that has already terminated is
-# a stale attempt (an orphaned SLURM job outliving the one that finished it).
+# The states a minting ticket may be in for its range to be REUSABLE: an ALLOWLIST,
+# derived from the canonical split so it cannot drift into a hand-maintained copy of
+# it. Reuse is legitimate only while the minting ticket is still IN FLIGHT — a job
+# reaching the mint under a ticket that has already terminated is a stale attempt, and
+# reusing a range whose reads are registered duplicates them in DuckLake, which has no
+# uniqueness and no way to notice afterwards. A denylist ("everything except
+# completed") would let a work_ticket_state added later fall through to the permissive
+# path by default; with a silent failure mode, the default must be refusal.
 _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
 
 
@@ -272,17 +267,24 @@ async def mint_or_reuse_sequence_range(
             # completed it), and if it COMPLETED then its reads are registered, so even
             # its own attempt must not re-write the range.
             state = existing.minted_by_work_ticket_state
-            # The recovery differs by state, so name it rather than just refusing:
-            # a COMPLETED minter's reads are registered (re-ingest means deleting them
-            # first); a failed/no_data one is simply not running any more, and the
-            # operator's redrive is what makes this ticket's own range reusable again.
-            recovery = (
-                "its reads are already registered — to re-ingest, DELETE the "
-                "prep_sample (its sequence_range goes with it) and resubmit"
-                if state == WorkTicketState.COMPLETED.value
-                else f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
-                "which returns it to flight and makes its own range reusable"
-            )
+            # The recovery differs by state, so name it rather than just refusing —
+            # and only offer a redrive where the CP will actually accept one. `/run`
+            # takes a ticket in PENDING or FAILED; it 409s on `no_data` and 404s on a
+            # ticket row that is gone (state=None). So the three-way is not cosmetic:
+            # the fall-through arm exists because a fail-closed allowlist must land an
+            # UNANTICIPATED state on advice that works, not on advice that bounces.
+            if state == WorkTicketState.FAILED.value:
+                recovery = (
+                    f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
+                    "which returns it to flight and makes its own range reusable"
+                )
+            else:
+                # COMPLETED (reads registered), or a state with no in-place redrive.
+                recovery = (
+                    "there is no in-place recovery from this state — to re-ingest, "
+                    "DELETE the prep_sample (its sequence_range goes with it) and "
+                    "resubmit"
+                )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
