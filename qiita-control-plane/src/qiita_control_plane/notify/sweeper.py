@@ -14,8 +14,15 @@ Once per `NOTIFY_SWEEP_INTERVAL_SECONDS` this sweeper:
    flushes and forward progress is guaranteed);
 4. drains stale rows (older than `NOTIFY_MAX_AGE_SECONDS`) without emailing,
    gates on `qiita.user.receive_processing_emails`, dead-letters after
-   `NOTIFY_MAX_ATTEMPTS`, else renders one digest, writes a receipt, sends, and
+   `NOTIFY_MAX_ATTEMPTS`, else counts the originator's still-active and
+   held-for-redrive tickets, renders one digest, writes a receipt, sends, and
    stamps the EXACT captured id set (send-then-stamp = at-least-once).
+
+Between them those three buckets account for every ticket the recipient has —
+what just finished (the owed set), what is still coming (`_ACTIVE_COUNT_SELECT`),
+and what is stuck (`_HELD_COUNT_SELECT`). A digest that reported only the first
+left a recipient mid-fanout unable to tell "2 failed, 24 still running" from
+"2 failed, and that's the whole batch".
 
 Every step is wrapped so one bad row / recipient can't wedge the long-lived
 loop.
@@ -33,8 +40,14 @@ from typing import TYPE_CHECKING, Any
 
 from qiita_common.models import EmailReceiptStatus
 
+from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES
 from ..runner import _TERMINAL_WORK_TICKET_STATES
-from .render import WORK_TICKET_DIGEST_TEMPLATE, render_work_ticket_digest, template_sha
+from .render import (
+    WORK_TICKET_DIGEST_TEMPLATE,
+    render_work_ticket_digest,
+    summarize_active,
+    template_sha,
+)
 
 if TYPE_CHECKING:
     import asyncpg
@@ -70,6 +83,51 @@ _OWED_SET_SELECT = (
     "  FROM qiita.work_ticket"
     f" WHERE {_OWED_SET_WHERE}"
     " ORDER BY originator_principal_idx, updated_at"
+)
+
+# One originator's still-in-flight tickets, tallied per (action, state). Without
+# this the digest says only what terminalized, and a recipient mid-fanout can't
+# tell "2 failed, 24 still running" from "2 failed, and that's the batch". The
+# active set is `NON_TERMINAL_WORK_TICKET_STATES` — the SAME predicate the
+# `GET /work-ticket?active=true` route filters on, so the email answers exactly
+# the question the operator would otherwise go run `qiita ticket list --active`
+# to answer.
+#
+# Scoped to the originator, not the ticket's action or scope target: the
+# recipient's question is "where am I in *my* queue", and a digest is already
+# per-originator.
+#
+# Unlike the owed-set SELECT this has no dedicated partial index — it rides
+# `work_ticket_originator_idx` plus a heap filter, so it costs an originator's
+# LIFETIME ticket count for an answer that stays tiny. Fine at our size (a few
+# thousand tickets, one query per digest, on the sweeper's own connection); if
+# an originator's history ever makes it hurt, a partial index on
+# (originator_principal_idx) WHERE state IN (<non-terminal>) serves this and the
+# `?active=true` route both — and would want the owed set's inline-literal
+# treatment so the planner can prove implication.
+_ACTIVE_COUNT_SELECT = (
+    "SELECT action_id, action_version, state, count(*) AS n"
+    "  FROM qiita.work_ticket"
+    " WHERE originator_principal_idx = $1"
+    "   AND state = ANY($2::qiita.work_ticket_state[])"
+    " GROUP BY action_id, action_version, state"
+)
+
+# The third bucket: FAILED-with-retriable, which the owed set carves out (it is
+# withheld from email so that a redrive-and-complete reports the TRUE outcome).
+# Terminal, so it is not in the active set either — which means without this it
+# would appear in neither half of the digest, and the "nothing still active"
+# line would tell a recipient everything is accounted for while N of their
+# tickets sit dead on infra waiting for someone to redrive them. Exactly the
+# blind spot the digest exists to close. `notified_at IS NULL` is what makes it
+# the complement of the owed set's carve-out rather than all-time history.
+_HELD_COUNT_SELECT = (
+    "SELECT count(*)"
+    "  FROM qiita.work_ticket"
+    " WHERE originator_principal_idx = $1"
+    "   AND notified_at IS NULL"
+    "   AND state = 'failed'"
+    "   AND failure_type = 'retriable'"
 )
 
 
@@ -130,21 +188,66 @@ async def _insert_receipt(
 async def _stamp_notified(conn: asyncpg.Connection, ids: list[int]) -> None:
     """Stamp notified_at on the EXACT captured id set — never a predicate
     re-scan, so a sibling that terminalized during the send window is not
-    silently swept up. The `notified_at IS NULL` guard keeps it idempotent."""
+    silently swept up.
+
+    Re-asserting the full owed-set predicate (not just `notified_at IS NULL`) is
+    what makes the stamp idempotent AND redrive-safe: `POST /work-ticket/{idx}/run`
+    resets `notified_at` to NULL precisely so a redriven ticket re-notifies at its
+    true terminal state, and a redrive landing inside our send window would
+    otherwise be stamped away here — the ticket would go out reported as `failed`
+    and then never be emailed again. Under the predicate it no longer matches
+    (it's back to `pending`), so we leave it owed.
+    """
     await conn.execute(
         "UPDATE qiita.work_ticket SET notified_at = now()"
-        " WHERE work_ticket_idx = ANY($1::bigint[]) AND notified_at IS NULL",
+        f" WHERE work_ticket_idx = ANY($1::bigint[]) AND {_OWED_SET_WHERE}",
         ids,
     )
 
 
-def _digest_context(fresh_ids: list[int], tickets: list[dict[str, Any]]) -> dict[str, Any]:
+async def _active_rows(conn: asyncpg.Connection, originator: int) -> list[dict[str, Any]]:
+    """The originator's still-active tickets, tallied per (action, state).
+
+    A snapshot, deliberately: it is read after the owed set, so a ticket that
+    terminalizes in between is in neither this count nor this digest — it lands
+    in the next one. The number is a "where am I" signal, not a ledger.
+    """
+    rows = await conn.fetch(_ACTIVE_COUNT_SELECT, originator, list(NON_TERMINAL_WORK_TICKET_STATES))
+    return [dict(r) for r in rows]
+
+
+async def _held_count(conn: asyncpg.Connection, originator: int) -> int:
+    """How many of the originator's tickets are parked in retriable-FAILED —
+    withheld from email, terminal, and therefore in neither of the other two
+    buckets. See `_HELD_COUNT_SELECT`."""
+    return await conn.fetchval(_HELD_COUNT_SELECT, originator)
+
+
+def _digest_context(
+    fresh_ids: list[int],
+    tickets: list[dict[str, Any]],
+    active: dict[str, Any],
+    held_total: int,
+) -> dict[str, Any]:
     """The receipt's template_context. `work_ticket_idxs` is the top-level key a
-    `@>` containment query keys off ("did we email about ticket Y?")."""
+    `@>` containment query keys off ("did we email about ticket Y?").
+
+    `active` is the rollup `render_work_ticket_digest` rendered from, not a
+    re-tally of the same rows: the receipt is the evidence trail, so it must
+    record the claim the email actually MADE — a second, parallel rollup here
+    could drift from it.
+    """
     counts: dict[str, int] = defaultdict(int)
     for t in tickets:
         counts[t["state"]] += 1
-    return {"work_ticket_idxs": fresh_ids, "counts": dict(counts)}
+    return {
+        "work_ticket_idxs": fresh_ids,
+        "counts": dict(counts),
+        "active_total": active["total"],
+        "active_counts": active["by_state"],
+        "active_actions": active["actions"],
+        "held_total": held_total,
+    }
 
 
 async def _process_group(
@@ -205,13 +308,17 @@ async def _process_group(
         }
         for r in fresh
     ]
+    active_rows = await _active_rows(conn, originator)
+    held_total = await _held_count(conn, originator)
     rendered = render_work_ticket_digest(
         recipient=user["email"],
         tickets=tickets,
         generated_at=now,
+        active_rows=active_rows,
+        held_total=held_total,
         contact_email=settings.contact_email,
     )
-    context = _digest_context(fresh_ids, tickets)
+    context = _digest_context(fresh_ids, tickets, summarize_active(active_rows), held_total)
     sha = template_sha(WORK_TICKET_DIGEST_TEMPLATE)
 
     # Dead-letter cap: give up after NOTIFY_MAX_ATTEMPTS failed sends. Write a

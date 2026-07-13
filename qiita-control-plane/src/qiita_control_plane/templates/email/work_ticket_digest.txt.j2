@@ -2,12 +2,32 @@ Hello,
 
 {{ total }} of your qiita-miint work ticket{{ 's' if total != 1 else '' }} reached a final state:
 
-{% for state, n in counts %}  {{ n }} {{ state }}
+{% for state, n in counts %}
+  {{ n }} {{ state }}
 {% endfor %}
-Details:
-{% for t in tickets %}  - ticket {{ t.idx }}: {{ t.action_id }} {{ t.action_version }} -> {{ t.state }}{% if t.failure_reason %} ({{ t.failure_reason }}){% endif %}
-{% endfor %}{% if overflow %}  ... and {{ overflow }} more
+
+{% if active_total %}
+{{ active_total }} still active ({{ active_summary }}).
+{% for a in active_actions %}
+  {{ a.total }} {{ a.action_id }} {{ a.action_version }} ({{ a.summary }})
+{% endfor %}
+{% else %}
+No other work tickets of yours are still active.
 {% endif %}
+{% if held_total %}
+{{ held_total }} held after exhausting infrastructure retries — redrive with `qiita ticket run <idx>`.
+{% endif %}
+
+Details:
+{# `+%}` keeps the newline this row's trailing `{% endif %}` would otherwise
+   eat under trim_blocks — without it every detail row runs onto one line. #}
+{% for t in tickets %}
+  - ticket {{ t.idx }}: {{ t.action_id }} {{ t.action_version }} -> {{ t.state }}{% if t.failure_reason %} ({{ t.failure_reason }}){% endif +%}
+{% endfor %}
+{% if overflow %}
+  ... and {{ overflow }} more
+{% endif %}
+
 Generated at {{ generated_at }}.
 
 This is an automated message from qiita-miint.{% if contact_email %} Questions? Reply to this email or write to {{ contact_email }}.{% endif %}

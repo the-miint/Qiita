@@ -42,6 +42,23 @@ class _Env:
     version: str
     ref_idx: int
     principals: list[int]
+    refs: list[int]
+
+    async def ref(self) -> int:
+        """Mint an extra reference to hang a ticket off.
+
+        `work_ticket_one_in_flight_per_reference` allows only ONE non-terminal
+        ticket per (action_id, action_version, reference_idx), so seeding a
+        fanout of in-flight tickets needs a distinct scope target per ticket.
+        """
+        idx = await self.pool.fetchval(
+            "INSERT INTO qiita.reference (name, version, kind, is_host, created_by_idx)"
+            " VALUES ($1, '1.0', 'sequence_reference', true,"
+            "         (SELECT MIN(idx) FROM qiita.principal)) RETURNING reference_idx",
+            f"notify-{uuid4()}",
+        )
+        self.refs.append(idx)
+        return idx
 
     async def user(self, *, receive=True) -> int:
         pidx = await seed_user_principal(self.pool, prefix="notify", suffix=uuid4().hex[:8])
@@ -64,8 +81,14 @@ class _Env:
         )
 
     async def ticket(
-        self, *, originator: int, state: str = "completed", failure_type: str | None = None
+        self,
+        *,
+        originator: int,
+        state: str = "completed",
+        failure_type: str | None = None,
+        reference_idx: int | None = None,
     ) -> int:
+        ref_idx = self.ref_idx if reference_idx is None else reference_idx
         if state == "failed":
             return await self.pool.fetchval(
                 "INSERT INTO qiita.work_ticket"
@@ -78,7 +101,7 @@ class _Env:
                 self.action_id,
                 self.version,
                 originator,
-                self.ref_idx,
+                ref_idx,
                 failure_type or "permanent",
             )
         return await self.pool.fetchval(
@@ -90,9 +113,13 @@ class _Env:
             self.action_id,
             self.version,
             originator,
-            self.ref_idx,
+            ref_idx,
             state,
         )
+
+    async def inflight(self, *, originator: int, state: str) -> int:
+        """A non-terminal ticket on its own fresh reference (see `ref`)."""
+        return await self.ticket(originator=originator, state=state, reference_idx=await self.ref())
 
     async def set_updated_at(self, wt_idx: int, offset_seconds: float):
         return await self.pool.fetchval(
@@ -143,7 +170,7 @@ async def env(postgres_pool):
         json.dumps({"service": False, "human_roles": ["system_admin"]}),
         json.dumps([]),
     )
-    e = _Env(postgres_pool, action_id, version, ref_idx, [])
+    e = _Env(postgres_pool, action_id, version, ref_idx, [], [ref_idx])
     try:
         yield e
     finally:
@@ -152,12 +179,14 @@ async def env(postgres_pool):
                 "DELETE FROM qiita.email_receipt WHERE recipient_principal_idx = $1", pidx
             )
         await postgres_pool.execute(
-            "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", ref_idx
+            "DELETE FROM qiita.work_ticket WHERE reference_idx = ANY($1::bigint[])", e.refs
         )
         await postgres_pool.execute(
             "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
         )
-        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref_idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])", e.refs
+        )
         for pidx in e.principals:
             await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", pidx)
             await postgres_pool.execute(
@@ -423,6 +452,133 @@ async def test_retriable_failed_is_withheld(env):
     receipts = await env.receipts_for(user)
     ctx = json.loads(receipts[0]["template_context"])
     assert ctx["work_ticket_idxs"] == [permanent]
+
+
+async def test_digest_counts_still_active_tickets(env):
+    # A fanout where two tickets failed early. The digest must say how many of
+    # the originator's tickets are STILL in flight, or the recipient can't tell
+    # "2 failed, 24 running" from "2 failed, that's all".
+    user = await env.user()
+    done = [await env.ticket(originator=user, state="failed") for _ in range(2)]
+    await env.inflight(originator=user, state="queued")
+    for _ in range(3):
+        await env.inflight(originator=user, state="processing")
+    lo, hi = await env.minmax(done)
+    transport = CaptureTransport()
+
+    result = await sweep_once(env.pool, _settings(), transport, now=hi + timedelta(seconds=200))
+
+    assert result.digests_sent == 1
+    _to, rendered, _mid = transport.sent[0]
+    assert "4 still active (1 queued, 3 processing)." in rendered.text
+    assert rendered.subject.endswith("4 still active")
+    # The non-terminal tickets are counted, never stamped — they are not owed
+    # an email yet.
+    assert result.owed_rows == 2
+    # The receipt records the claim the email made.
+    ctx = json.loads((await env.receipts_for(user))[0]["template_context"])
+    assert ctx["active_total"] == 4
+    assert ctx["active_counts"] == {"queued": 1, "processing": 3}
+    assert ctx["held_total"] == 0
+    assert sorted(ctx["work_ticket_idxs"]) == sorted(done)
+
+
+async def test_digest_says_nothing_active_when_batch_is_done(env):
+    user = await env.user()
+    wt = await env.ticket(originator=user)
+    lo, hi = await env.minmax([wt])
+    transport = CaptureTransport()
+
+    await sweep_once(env.pool, _settings(), transport, now=hi + timedelta(seconds=200))
+
+    _to, rendered, _mid = transport.sent[0]
+    assert "No other work tickets of yours are still active." in rendered.text
+    ctx = json.loads((await env.receipts_for(user))[0]["template_context"])
+    assert ctx["active_total"] == 0
+
+
+async def test_active_count_is_scoped_to_the_originator(env):
+    # A busy neighbour's in-flight tickets must not inflate my count.
+    me = await env.user()
+    neighbour = await env.user()
+    mine = await env.ticket(originator=me)
+    await env.inflight(originator=me, state="processing")
+    for _ in range(5):
+        await env.inflight(originator=neighbour, state="processing")
+    lo, hi = await env.minmax([mine])
+    transport = CaptureTransport()
+
+    await sweep_once(env.pool, _settings(), transport, now=hi + timedelta(seconds=200))
+
+    assert len(transport.sent) == 1  # the neighbour has nothing terminal to report
+    _to, rendered, _mid = transport.sent[0]
+    assert "1 still active (1 processing)." in rendered.text
+
+
+async def test_digest_reports_tickets_held_for_redrive(env):
+    # A retriable-FAILED ticket is withheld from the owed set (never emailed
+    # until redriven) AND is terminal (so not in the active set). Without its own
+    # bucket it lands in neither, and the digest would tell the recipient nothing
+    # is still active while their tickets sit dead on infra.
+    user = await env.user()
+    done = await env.ticket(originator=user)
+    held = [
+        await env.ticket(originator=user, state="failed", failure_type="retriable")
+        for _ in range(2)
+    ]
+    lo, hi = await env.minmax([done])
+    transport = CaptureTransport()
+
+    result = await sweep_once(env.pool, _settings(), transport, now=hi + timedelta(seconds=200))
+
+    assert result.digests_sent == 1
+    _to, rendered, _mid = transport.sent[0]
+    assert "No other work tickets of yours are still active." in rendered.text
+    assert "2 held after exhausting infrastructure retries" in rendered.text
+    # Reporting the count must not stamp them — they stay owed for a redrive.
+    for wt in held:
+        assert await env.notified_at(wt) is None
+    ctx = json.loads((await env.receipts_for(user))[0]["template_context"])
+    assert ctx["held_total"] == 2
+    assert ctx["work_ticket_idxs"] == [done]
+
+
+async def test_redrive_during_send_window_is_not_stamped(env):
+    # `POST /work-ticket/{idx}/run` resets notified_at to NULL precisely so a
+    # redriven ticket re-notifies at its TRUE terminal state. A redrive landing
+    # inside our send window must not be stamped away by the captured-id UPDATE
+    # — the stamp re-asserts the full owed-set predicate, and a redriven ticket
+    # (back to `pending`) no longer matches it.
+    user = await env.user()
+    wt = await env.ticket(originator=user, state="failed")
+    lo, hi = await env.minmax([wt])
+
+    class _RedrivingTransport:
+        name = "capture"
+
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, *, to: str, rendered: RenderedEmail) -> str:
+            # The operator redrives the very ticket we are emailing about.
+            await env.pool.execute(
+                "UPDATE qiita.work_ticket"
+                " SET state = 'pending'::qiita.work_ticket_state, failure_type = NULL,"
+                "     failure_stage = NULL, failure_reason = NULL,"
+                "     notified_at = NULL, notify_attempts = 0"
+                " WHERE work_ticket_idx = $1",
+                wt,
+            )
+            self.sent.append((to, rendered, "<redrive>"))
+            return "<redrive>"
+
+    transport = _RedrivingTransport()
+    await sweep_once(env.pool, _settings(), transport, now=hi + timedelta(seconds=200))
+
+    assert len(transport.sent) == 1
+    # Still owed: the redrive's reset survived, so the ticket re-notifies when it
+    # next terminalizes instead of being silently marked as already-emailed.
+    assert await env.notified_at(wt) is None
 
 
 async def test_receipt_row_correctness(env):
