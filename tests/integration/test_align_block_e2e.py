@@ -71,12 +71,10 @@ _ALIGNMENT_PARQUET_DDL = """
     feature_idx      BIGINT NOT NULL,
     mate_feature_idx BIGINT,
     flags            USMALLINT,
-    reference        VARCHAR,
     position         BIGINT,
     stop_position    BIGINT,
     mapq             UTINYINT,
     cigar            VARCHAR,
-    mate_reference   VARCHAR,
     mate_position    BIGINT,
     template_length  BIGINT,
     tag_as           BIGINT,
@@ -112,8 +110,8 @@ def _write_alignment_parquet(
     staging_dir: Path, *, alignment_idx: int, members: list[tuple[int, int, int]]
 ) -> Path:
     """Materialize a block's `alignment.parquet` under `staging_dir` in
-    align_sharded's output shape (the 25-column DuckLake `alignment` schema) and
-    return the path. For each member `(prep_sample_idx, seq_start, seq_stop)`, emit
+    align_sharded's output shape (the DuckLake `alignment` schema) and return the
+    path. For each member `(prep_sample_idx, seq_start, seq_stop)`, emit
     `_ROWS_PER_READ` rows per sequence_idx in [seq_start, seq_stop] — one per
     _FEATURE_IDS entry — so the block carries read multiplicity."""
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +121,7 @@ def _write_alignment_parquet(
         for seq_idx in range(seq_start, seq_stop + 1):
             for feature_idx in _FEATURE_IDS:
                 # (alignment_idx, prep_sample_idx, sequence_idx, feature_idx,
-                #  mate_feature_idx, flags, reference, position) + NULL tail.
+                #  mate_feature_idx, flags, position) + NULL tail.
                 rows.append(
                     (
                         alignment_idx,
@@ -132,7 +130,6 @@ def _write_alignment_parquet(
                         feature_idx,
                         None,  # mate_feature_idx
                         0,  # flags
-                        str(feature_idx),  # reference (raw VARCHAR subject id)
                         100,  # position
                     )
                 )
@@ -140,7 +137,7 @@ def _write_alignment_parquet(
         conn.execute(f"CREATE TABLE a ({_ALIGNMENT_PARQUET_DDL})")
         conn.executemany(
             "INSERT INTO a (alignment_idx, prep_sample_idx, sequence_idx, feature_idx,"
-            " mate_feature_idx, flags, reference, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " mate_feature_idx, flags, position) VALUES (?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         conn.execute(

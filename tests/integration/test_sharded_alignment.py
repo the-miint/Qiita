@@ -1,10 +1,11 @@
-"""Integration smoke: the full C1 sharded-alignment path against real miint.
+"""Integration smoke: the full sharded-alignment path against real miint.
 
-Builds, over a tiny 2-shard reference and the LIVE data plane, everything C1
-produces — the whole-reference rype ROUTER (`build_routing_index`) and the
-per-shard minimap2 + bowtie2 indexes (`build_{minimap2,bowtie2}_index` in shard
-mode, the revised `derived_store` layout) — then drives `align_sharded` over
-crafted reads and asserts the routing + alignment behaviour end to end.
+Builds, over a tiny 2-shard reference and the LIVE data plane, everything the
+sharded-alignment path produces — the whole-reference rype ROUTER
+(`build_routing_index`) and the per-shard minimap2 + bowtie2 indexes
+(`build_{minimap2,bowtie2}_index` in shard mode, the `derived_store` layout) — then
+drives `align_sharded` over crafted reads and asserts the routing + alignment
+behaviour end to end.
 
 A read set is uniformly single-end OR paired-end by construction, so the two modes
 are exercised as SEPARATE, uniform batches (never mixed — a mix is invalid input
@@ -240,12 +241,14 @@ def _features_by_read(alignment_path):
 
 
 def _mate_rows(alignment_path, sequence_idx):
-    """Rows for one read as (feature_idx, mate_feature_idx, mate_reference,
-    template_length), ordered by position — the mate columns that must survive so a
-    PE pair's rows are an explicit pair, not two unrelated single-end rows."""
+    """Rows for one read as (feature_idx, mate_feature_idx, template_length),
+    ordered by position — the mate columns that must survive so a PE pair's rows are
+    an explicit pair, not two unrelated single-end rows. The raw VARCHAR
+    `mate_reference` is dropped from the output; `mate_feature_idx` (decoded from it)
+    carries the mate's identity."""
     with duckdb.connect(":memory:") as conn:
         return conn.execute(
-            "SELECT feature_idx, mate_feature_idx, mate_reference, template_length "
+            "SELECT feature_idx, mate_feature_idx, template_length "
             f"FROM read_parquet('{alignment_path}') WHERE sequence_idx = ? "
             "ORDER BY position, flags",
             [sequence_idx],
@@ -344,10 +347,10 @@ def test_sharded_alignment_end_to_end(
     # decoded mate_feature_idx must be 100 on both.
     mate_rows = _mate_rows(pe_out, 5)
     assert len(mate_rows) == 2, f"expected 2 mate rows, got {mate_rows}"
-    for feature_idx, mate_feature_idx, mate_reference, template_length in mate_rows:
+    for feature_idx, mate_feature_idx, template_length in mate_rows:
         assert feature_idx == 100
         assert mate_feature_idx == 100, (
-            f"mate not resolved to feature 100: {mate_reference!r}"
+            f"mate not resolved to feature 100: {mate_rows!r}"
         )
         assert template_length != 0, "proper pair must carry a template_length"
 

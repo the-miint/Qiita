@@ -331,13 +331,15 @@ class AlignPlanRequest(BaseModel):
     alignment entrypoint (the align analog of `block-mask-plan`).
 
     Aligns the pool's HOST-DEPLETED, QC-passed reads (the completed read-mask the
-    block-mask-plan produced) against a sharded `reference_idx` with `aligner`. The
-    host references identify WHICH mask the reads were depleted under — the same
-    `(host_rype_reference_idx[, host_minimap2_reference_idx])` shape block-mask-plan
-    takes — so the planner can LOOK UP each sample's already-minted mask_idx (it
-    never mints a mask). A pool QC-only masked (no host filtering) is aligned by
-    omitting both host refs. minimap2 is the optional second host stage and never
-    rides without rype.
+    block-mask-plan produced) against a sharded `reference_idx`. The aligner is NOT
+    a caller choice — the server derives it from the run's sequencing platform
+    (short-read Illumina → bowtie2, long-read PacBio HiFi / Nanopore → minimap2) and
+    reports it in the response. The host references identify WHICH mask the reads
+    were depleted under — the same `(host_rype_reference_idx[,
+    host_minimap2_reference_idx])` shape block-mask-plan takes — so the planner can
+    LOOK UP each sample's already-minted mask_idx (it never mints a mask). A pool
+    QC-only masked (no host filtering) is aligned by omitting both host refs.
+    minimap2 is the optional second host stage and never rides without rype.
 
     `only_missing` drops samples already carrying a completion gate for their
     resolved alignment, so an interrupted plan re-runs only the gap; off by default
@@ -345,7 +347,6 @@ class AlignPlanRequest(BaseModel):
     sample is already gated — DELETE the alignment first or pass only_missing)."""
 
     reference_idx: Annotated[int, Field(gt=0)]
-    aligner: Literal["minimap2", "bowtie2"]
     host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
     host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
     only_missing: bool = False

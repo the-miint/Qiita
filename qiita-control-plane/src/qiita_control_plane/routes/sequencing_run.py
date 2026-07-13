@@ -822,7 +822,6 @@ async def submit_align_plan(
             sequencing_run_idx=sequencing_run_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             reference_idx=body.reference_idx,
-            aligner=body.aligner,
             host_rype_reference_idx=body.host_rype_reference_idx,
             host_minimap2_reference_idx=body.host_minimap2_reference_idx,
             only_missing=body.only_missing,
@@ -833,6 +832,12 @@ async def submit_align_plan(
         )
     except align_planner.AlignReferenceNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except align_planner.AlignUnsupportedPlatform as exc:
+        # The run's platform has no defined sharded aligner (only Illumina / PacBio
+        # HiFi / Nanopore are alignable) — a request the server can't process.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
     except align_planner.AlignReferenceNotReady as exc:
         # Reference exists but is not ACTIVE + sharded — the operator must build /
         # shard it (or wait for it to go active) before aligning against it.

@@ -78,6 +78,38 @@ class AlignReferenceNotReady(RuntimeError):
     operator must build/shard the reference (or wait for it to go active) first."""
 
 
+class AlignUnsupportedPlatform(RuntimeError):
+    """The pool's sequencing platform has no defined sharded aligner. The route maps
+    this to 422 — alignment is only supported for the platforms in
+    `_ALIGNER_BY_PLATFORM` (short-read Illumina → bowtie2, long-read PacBio HiFi /
+    Nanopore → minimap2); an exotic platform fails loud rather than defaulting."""
+
+
+# Sharded aligner by sequencing platform: short reads align with bowtie2, long reads
+# with minimap2. The CP resolves the aligner from `sequencing_run.platform` at
+# align-plan time (it is NOT a caller choice), so the aligner always matches the read
+# chemistry. Only the platforms with a defined mapping are alignable via the sharded
+# path; anything else raises AlignUnsupportedPlatform rather than guessing.
+_ALIGNER_BY_PLATFORM: dict[str, str] = {
+    "illumina": "bowtie2",
+    "pacbio_smrt": "minimap2",
+    "oxford_nanopore": "minimap2",
+}
+
+
+def _aligner_for_platform(platform: str) -> str:
+    """Map a `qiita.platform` value to its sharded aligner, or raise
+    AlignUnsupportedPlatform for a platform with no defined mapping (fail-loud)."""
+    try:
+        return _ALIGNER_BY_PLATFORM[platform]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_ALIGNER_BY_PLATFORM))
+        raise AlignUnsupportedPlatform(
+            f"no sharded aligner defined for platform {platform!r}; sharded alignment "
+            f"supports only: {supported}"
+        ) from exc
+
+
 class AlignResubmitError(RuntimeError):
     """One or more requested samples already carry an `alignment_sample` gate for
     their resolved `alignment_idx`, so a fresh (`only_missing=False`) plan is
@@ -113,7 +145,6 @@ async def plan_and_submit_alignments(
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
     reference_idx: int,
-    aligner: str,
     host_rype_reference_idx: int | None,
     host_minimap2_reference_idx: int | None,
     only_missing: bool,
@@ -145,6 +176,19 @@ async def plan_and_submit_alignments(
     loud). Samples that can't be planned are reported (not raised) in the
     `samples_skipped_*` counts.
     """
+    # The aligner is derived from the run's PLATFORM (short-read Illumina → bowtie2,
+    # long-read PacBio HiFi / Nanopore → minimap2), NOT chosen by the caller, so it
+    # always matches the read chemistry. instrument_model is part of the mask
+    # identity (gates QC polyG); read both in one row. `platform` is NOT NULL in the
+    # schema, so a missing row would surface as an AttributeError on `.` below (the
+    # run existence is fronted by the route's `require_sequencing_run_exists`).
+    run_row = await pool.fetchrow(
+        "SELECT platform, instrument_model FROM qiita.sequencing_run WHERE idx = $1",
+        sequencing_run_idx,
+    )
+    aligner = _aligner_for_platform(run_row["platform"])
+    instrument_model = run_row["instrument_model"]
+
     # Assert ACTIVE + sharded (fail-fast; the route maps the typed errors to 4xx).
     # We don't need the resolved paths here — the runner resolves them per block at
     # dispatch — only the readiness guarantee before we mint anything.
@@ -162,17 +206,10 @@ async def plan_and_submit_alignments(
 
     # The reference's current shard-set, baked into the alignment identity
     # (`mint_alignment_definition`) so a grown reference mints a NEW alignment_idx
-    # over only its new shards (the growth foundation, Decision 3). Non-empty by
-    # construction here: the caller already asserted a per-shard index is built,
-    # which is only registered after the shard assignment stamped these rows.
+    # over only its new shards (the growth foundation). Non-empty by construction
+    # here: the caller already asserted a per-shard index is built, which is only
+    # registered after the shard assignment stamped these rows.
     shard_ids = await reference_shard_ids(pool, reference_idx)
-
-    # instrument_model is part of the mask identity (gates QC polyG); read it once
-    # from the run so the mask LOOKUP reconstructs the same params.
-    instrument_model = await pool.fetchval(
-        "SELECT instrument_model FROM qiita.sequencing_run WHERE idx = $1",
-        sequencing_run_idx,
-    )
 
     all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
 

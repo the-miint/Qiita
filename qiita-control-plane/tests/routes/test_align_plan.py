@@ -53,8 +53,10 @@ async def _seed_align_action(db, *, enabled: bool = True):
 
 async def _seed_active_sharded_reference(db, owner, suffix) -> int:
     """An ACTIVE sharded reference: a reference row + a rype_router (shard_id NULL) +
-    per-shard minimap2 index rows + reference_membership rows carrying shard_id
-    (the shard-set the alignment identity folds in). Returns reference_idx."""
+    per-shard minimap2 AND bowtie2 index rows + reference_membership rows carrying
+    shard_id (the shard-set the alignment identity folds in). Both per-aligner index
+    sets are seeded because the CP derives the aligner from the run's platform, so
+    the reference must be ready for whichever it picks. Returns reference_idx."""
     reference_idx = await db.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
         " VALUES ($1, '1.0', 'sequence_reference', 'active', $2) RETURNING reference_idx",
@@ -68,7 +70,8 @@ async def _seed_active_sharded_reference(db, owner, suffix) -> int:
         f"/derived/references/{reference_idx}/rype-router.ryxdi",
     )
     # A feature per shard + its membership row carrying shard_id, plus the per-shard
-    # minimap2 index row the resolver requires.
+    # minimap2 AND bowtie2 index rows the resolver requires (a real active sharded
+    # reference builds both per shard).
     for shard_id in range(_N_SHARDS):
         feature_idx = await db.fetchval(
             "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid())"
@@ -84,9 +87,12 @@ async def _seed_active_sharded_reference(db, owner, suffix) -> int:
         await db.execute(
             "INSERT INTO qiita.reference_index"
             "  (reference_idx, index_type, fs_path, params, shard_id)"
-            " VALUES ($1, 'minimap2', $2, '{}'::jsonb, $3)",
+            " VALUES"
+            "   ($1, 'minimap2', $2, '{}'::jsonb, $4),"
+            "   ($1, 'bowtie2', $3, '{}'::jsonb, $4)",
             reference_idx,
             f"/derived/references/{reference_idx}/minimap2-shards/{shard_id}.mmi",
+            f"/derived/references/{reference_idx}/bowtie2-shards/{shard_id}",
             shard_id,
         )
     return reference_idx
@@ -252,7 +258,9 @@ def _url(planned):
 
 
 def _body(planned, **overrides):
-    return {"reference_idx": planned["reference_idx"], "aligner": "minimap2", **overrides}
+    # No `aligner` — the server derives it from the run's platform (illumina here →
+    # bowtie2). Only the reference + optional host refs / only_missing are supplied.
+    return {"reference_idx": planned["reference_idx"], **overrides}
 
 
 async def test_align_plan_happy_path(ctx, planned):
@@ -262,7 +270,8 @@ async def test_align_plan_happy_path(ctx, planned):
     body = resp.json()
     assert body["sequenced_pool_idx"] == planned["pool_idx"]
     assert body["reference_idx"] == planned["reference_idx"]
-    assert body["aligner"] == "minimap2"
+    # Aligner derived from the run's platform (illumina → bowtie2), not caller-chosen.
+    assert body["aligner"] == "bowtie2"
     assert body["samples_planned"] == 2
     assert body["samples_skipped_no_mask"] == 0
     assert body["samples_skipped_mask_incomplete"] == 0
@@ -290,6 +299,32 @@ async def test_align_plan_happy_path(ctx, planned):
         alignment_idx,
     )
     assert gate == 2
+
+
+async def test_align_plan_long_read_platform_selects_minimap2(ctx, planned):
+    """A long-read platform (pacbio_smrt) resolves the aligner to minimap2 — the
+    aligner is derived from the run's platform, not the caller."""
+    await _seed_align_action(planned["db"])
+    await planned["db"].execute(
+        "UPDATE qiita.sequencing_run SET platform = 'pacbio_smrt'::qiita.platform WHERE idx = $1",
+        planned["run_idx"],
+    )
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["aligner"] == "minimap2"
+
+
+async def test_align_plan_unsupported_platform_422(ctx, planned):
+    """A platform with no defined sharded aligner (ls454) is refused 422 — fail
+    loud rather than defaulting to an aligner."""
+    await _seed_align_action(planned["db"])
+    await planned["db"].execute(
+        "UPDATE qiita.sequencing_run SET platform = 'ls454'::qiita.platform WHERE idx = $1",
+        planned["run_idx"],
+    )
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 422, resp.text
+    assert "no sharded aligner" in resp.text
 
 
 async def test_align_plan_skips_uncompleted_and_unmasked(ctx, planned):

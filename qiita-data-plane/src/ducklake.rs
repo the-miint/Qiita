@@ -264,16 +264,16 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// Column order = the exact order `align_sharded`'s COPY writes (so register-files'
 /// `ducklake_add_data_files` schema-matches for free): the five CP identity columns
 /// (`alignment_idx`, `prep_sample_idx`, `sequence_idx`, `feature_idx`,
-/// `mate_feature_idx`) followed by the FULL verbatim miint aligner output
-/// `a.* EXCLUDE (read_id)` — the 20 standard SAM columns
-/// (`flags`..`template_length`) plus the eleven `tag_*` columns. That 21-column
-/// (incl. read_id) miint output was qiita-verified against the team-mirror
-/// v1.5.4 build for BOTH `align_minimap2_sharded` and `align_bowtie2_sharded`
-/// (identical schema; see docs/duckdb-miint.md). The types match miint exactly
-/// (`flags` USMALLINT, `mapq` UTINYINT, positions/lengths BIGINT) so the parquet
-/// registers without a cast; a miint SAM-schema change would need a matching
-/// migration here (coupled to the pinned DuckDB/miint version, per the version-
-/// lockstep discipline).
+/// `mate_feature_idx`) followed by the miint aligner output
+/// `a.* EXCLUDE (read_id, reference, mate_reference)` — the SAM columns MINUS the raw
+/// VARCHAR subject ids, which are dropped because `feature_idx` / `mate_feature_idx`
+/// (cast from them) already carry that identity. That miint output was qiita-verified
+/// against the team-mirror v1.5.4 build for BOTH `align_minimap2_sharded` and
+/// `align_bowtie2_sharded` (identical schema; see docs/duckdb-miint.md). The types
+/// match miint exactly (`flags` USMALLINT, `mapq` UTINYINT, positions/lengths BIGINT)
+/// so the parquet registers without a cast; a miint SAM-schema change would need a
+/// matching migration here (coupled to the pinned DuckDB/miint version, per the
+/// version-lockstep discipline).
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
@@ -289,15 +289,15 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             sequence_idx     BIGINT NOT NULL,
             feature_idx      BIGINT NOT NULL,
             mate_feature_idx BIGINT,
-            -- Verbatim miint aligner output (a.* EXCLUDE (read_id)); reference /
-            -- mate_reference are the raw VARCHAR subject ids feature_idx is cast from.
+            -- miint aligner output minus the raw VARCHAR subject ids
+            -- (reference / mate_reference): their identity is already carried by
+            -- feature_idx / mate_feature_idx (cast from them in align_sharded), so
+            -- persisting the strings too would be redundant.
             flags            USMALLINT,
-            reference        VARCHAR,
             position         BIGINT,
             stop_position    BIGINT,
             mapq             UTINYINT,
             cigar            VARCHAR,
-            mate_reference   VARCHAR,
             mate_position    BIGINT,
             template_length  BIGINT,
             tag_as           BIGINT,
@@ -637,8 +637,9 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        // 5 CP identity columns + the 20 verbatim miint columns
-        // (a.* EXCLUDE (read_id)), in align_sharded COPY order.
+        // 5 CP identity columns + the miint SAM columns MINUS the raw subject ids
+        // (a.* EXCLUDE (read_id, reference, mate_reference)), in align_sharded COPY
+        // order.
         let expected: &[(&str, &str)] = &[
             ("alignment_idx", "BIGINT"),
             ("prep_sample_idx", "BIGINT"),
@@ -646,12 +647,10 @@ mod tests {
             ("feature_idx", "BIGINT"),
             ("mate_feature_idx", "BIGINT"),
             ("flags", "USMALLINT"),
-            ("reference", "VARCHAR"),
             ("position", "BIGINT"),
             ("stop_position", "BIGINT"),
             ("mapq", "UTINYINT"),
             ("cigar", "VARCHAR"),
-            ("mate_reference", "VARCHAR"),
             ("mate_position", "BIGINT"),
             ("template_length", "BIGINT"),
             ("tag_as", "BIGINT"),
