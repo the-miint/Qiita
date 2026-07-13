@@ -87,6 +87,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **A DB-tier test leaked terminal work tickets, reddening `main` on macOS.**
+  `test_sequence_range_backfill`'s fixture seeded `work_ticket` rows and never removed
+  them; terminal with `notified_at IS NULL`, they matched the notify sweeper's owed-set
+  predicate, and the sweeper scans the whole database — so it emailed that file's
+  principals and an unrelated assertion counted five. The DB is isolated per xdist
+  *worker*, not per test, so this only fired when the runner's core count co-located the
+  two files. The fixture now cleans up after itself, and an autouse tripwire fails the
+  test that leaks an owed ticket rather than the innocent one that trips over it. (#291)
+- **CI can now run the macOS matrix on a PR, before merge.** macOS coverage ran only on
+  push to `main`, so a defect only it can see — like the one above — was found with
+  `main` already red. Label a PR `ci-macos` to fan the matrix out over macOS too; use it
+  for anything touching shared test fixtures or cross-test DB state. (#291)
+
 - **`no_data` work tickets were invisible to the reference and sequenced-pool delete
   gates, and to the reference-load CLI's watch loop.** `WorkTicketState` has three
   terminal states — `completed`, `no_data`, `failed` — but the terminal/non-terminal
