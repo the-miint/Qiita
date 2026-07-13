@@ -311,3 +311,15 @@ def test_template_sha_is_stable_hex():
     assert a == b
     assert len(a) == 64
     int(a, 16)  # hex
+
+
+def test_state_order_table_is_immutable():
+    # A module-level lookup table shared by every render: a stray write from one
+    # caller would corrupt every subsequent email. MappingProxyType makes that a
+    # TypeError at the write rather than a mystery downstream.
+    import pytest
+
+    from qiita_control_plane.notify.render import _STATE_ORDER
+
+    with pytest.raises(TypeError):
+        _STATE_ORDER["cancelled"] = 99

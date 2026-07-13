@@ -17,6 +17,7 @@ import hashlib
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from jinja2 import Environment, FileSystemLoader
@@ -44,7 +45,13 @@ MAX_DETAIL_ROWS = 50
 # read straight off the enum's declaration order. Every state list in the email
 # is sorted by it, so a reader sees the states in the order a ticket actually
 # moves through them rather than alphabetically.
-_STATE_ORDER = {state.value: i for i, state in enumerate(WorkTicketState)}
+#
+# MappingProxyType, not a bare dict: this is a module-level lookup table shared by
+# every render, so a stray write from one caller would corrupt every subsequent
+# email. The proxy makes that a TypeError at the write instead of a mystery later.
+_STATE_ORDER: Mapping[str, int] = MappingProxyType(
+    {state.value: i for i, state in enumerate(WorkTicketState)}
+)
 
 
 def _autoescape(template_name: str | None) -> bool:
