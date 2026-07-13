@@ -22,7 +22,9 @@ the `no-changelog` label).
   is refused 422); bowtie2 runs the modified-SHOGUN parameter set (all concordant
   placements via `report_all`) and a pooled `cigar_sequence_identity ≥ 0.99` filter
   keeps only high-identity pairs (kept/dropped as a unit, never orphaning a mate),
-  minimap2 uses `map-hifi` + `eqx`; the DuckLake `alignment` table drops the raw
+  minimap2 uses `map-hifi` + `eqx` + `max_secondary := 100` (its analogue of
+  `report_all` — dropping the arg falls back to a finite default that truncates
+  multi-mapping reads); the DuckLake `alignment` table drops the raw
   `reference`/`mate_reference` VARCHARs (`feature_idx`/`mate_feature_idx` carry the
   identity). A sharded reference's per-shard `.mmi` is now always built with the
   fixed `map-hifi` preset (not tunable on load). The GPL boundary is installed once

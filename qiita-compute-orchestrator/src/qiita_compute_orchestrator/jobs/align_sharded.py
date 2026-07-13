@@ -33,9 +33,11 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      classify results into the same table.
   3. ONE `align_{minimap2,bowtie2}_sharded(query, shard_directory:=,
      read_to_shard:=, <params>)` call aligns each read against ONLY its routed
-     shard(s), reporting ALL concordant placements (bowtie2 `report_all`, the
-     "modified SHOGUN" set in `_BOWTIE2_ALIGN_PARAMS`; the historical `-k 16` /
-     `max_secondary := 0` primary-only collapse is gone). Its output carries all
+     shard(s), reporting ALL placements (bowtie2 `report_all`, the "modified SHOGUN"
+     set in `_BOWTIE2_ALIGN_PARAMS`; minimap2 `max_secondary := 100`, its analogue —
+     the historical `-k 16` / `max_secondary := 0` primary-only collapse is gone, and
+     dropping the arg entirely would silently fall back to a finite default). Its
+     output carries all
      standard SAM columns, INCLUDING the mate columns (`mate_reference`,
      `mate_position`, `template_length`) and the SAM `flags` that make a paired-end
      read's two mate rows an explicit pair. We ADD three typed identity columns —
@@ -141,6 +143,15 @@ _ROUTING_THRESHOLD = 0.1
 # so a minimap2 align is always long-read here. Matches the preset the per-shard `.mmi`
 # was built with (build_minimap2_index).
 _MINIMAP2_PRESET = "map-hifi"
+
+# Secondary-alignment cap for the minimap2 sharded align. Set arbitrarily HIGH
+# (not left at the miint default) so multi-mapping placements are captured rather
+# than silently truncated — dropping `max_secondary` does NOT mean "return all", it
+# falls back to a finite default. This is minimap2's analogue of bowtie2's
+# `report_all`: emit every placement and let the identity filter below prune the
+# noise. Cross-shard multiplicity (a distinct feature per shard) is unaffected —
+# that comes from routing, not from this cap.
+_MINIMAP2_MAX_SECONDARY = 100
 
 # Minimum sequence identity a surviving alignment must clear. The aligners emit ALL
 # concordant placements (bowtie2 `report_all`), and this filter keeps only high-
@@ -344,16 +355,18 @@ def _run_align_minimap2_sharded(
     `cigar_sequence_identity` returns NULL for a plain `M` CIGAR, so without `eqx`
     every minimap2 alignment would be silently dropped by the filter.
 
-    NOTE: the rest of the minimap2 (long-read) parameter set is not yet pinned by
-    the reviewer the way bowtie2's is — only the `map-hifi` preset and `eqx` are
-    fixed. Secondary handling is left at the miint default here pending that spec;
-    the high-identity filter in `execute()` still applies. Long reads are
-    single-end, so that filter is per-record for minimap2 (no mate to pool)."""
+    `max_secondary := _MINIMAP2_MAX_SECONDARY` (100) is minimap2's analogue of
+    bowtie2's `report_all`: dropping `max_secondary` does NOT return all placements,
+    it falls back to a finite miint default that would silently truncate multi-mapping
+    reads, so we set it arbitrarily high and let the identity filter prune the noise.
+    The rest of the minimap2 (long-read) parameter set beyond preset/eqx/max_secondary
+    is not yet pinned the way bowtie2's is and stays at miint defaults. Long reads are
+    single-end, so the identity filter is per-record for minimap2 (no mate to pool)."""
     conn.execute(
         f"CREATE TABLE {dest_table} AS "
         "SELECT * FROM align_minimap2_sharded(?, shard_directory := ?, "
-        "read_to_shard := ?, preset := ?, eqx := true)",
-        [query_table, str(shard_directory), read_to_shard_table, preset],
+        "read_to_shard := ?, preset := ?, eqx := true, max_secondary := ?)",
+        [query_table, str(shard_directory), read_to_shard_table, preset, _MINIMAP2_MAX_SECONDARY],
     )
 
 
