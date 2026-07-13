@@ -15,6 +15,47 @@ the `no-changelog` label).
 
 ### Changed
 
+- **The work-ticket notification email now accounts for every ticket the recipient
+  has, not just the ones that reached a terminal state.** Notifications land
+  per-batch as tickets terminate, so during a fanout the recipient gets a stream of
+  emails each reporting a slice — and none of them said where in the batch they
+  were. "2 failed" could mean 2 of 26 still running or the tail of a batch that
+  already finished, and the only way to tell them apart was to go run
+  `qiita ticket list --active`. The digest now carries three buckets that between
+  them cover every ticket the recipient has:
+  - what just **finished** (unchanged — the owed set);
+  - what is **still active**: `23 still active (3 queued, 20 processing)`, in the
+    subject and both bodies, broken down per action when the active set spans more
+    than one. Nothing in flight is now stated outright rather than left silent —
+    that is the "everything else is done, act now" signal. The active set is
+    `NON_TERMINAL_WORK_TICKET_STATES`, the same predicate `GET /work-ticket?active=true`
+    filters on, so the email answers exactly the question that command would, and a
+    parity test pins the terminal and non-terminal sets as exact complements over
+    `WorkTicketState` (the "nothing still active" line is only true if they
+    partition the enum);
+  - what is **held for redrive**: a ticket that exhausts its infrastructure retries
+    lands in FAILED with `failure_type=retriable`, which the owed set deliberately
+    withholds from email (so a redrive-and-complete reports the *true* outcome) — but
+    it is terminal, so it was in neither half of the notification. A user whose
+    tickets all died on NODE_FAIL could get no email at all, and the new "nothing
+    still active" line would have positively asserted everything was accounted for.
+
+  Two defects surfaced while building it, fixed here. **A redrive landing inside the
+  send window was stamped away, so the ticket was never emailed again**:
+  `POST /work-ticket/{idx}/run` resets `notified_at` to NULL precisely so a redriven
+  ticket re-notifies at its true terminal state, but the sweeper's send-then-stamp
+  UPDATE guarded only on `notified_at IS NULL` — a redrive between the owed-set
+  SELECT and the stamp was clobbered, and the ticket went out reported as `failed`
+  and then went permanently silent. The stamp now re-asserts the whole owed-set
+  predicate, so a redriven ticket (back to `pending`) no longer matches and stays
+  owed. And **the plain-text digest collapsed every detail row onto one line**: the
+  optional failure-reason clause closes with a `{% endif %}` at end-of-line, which
+  Jinja's `trim_blocks` swallows along with the row's newline, so all N rows and the
+  footer behind them ran together (HTML readers were unaffected — the rows are a
+  `<table>` there). The receipt's `template_context` records the claim the email made
+  (`active_total`, `active_counts`, `active_actions`, `held_total`), rendered from
+  the same rollup rather than a second tally that could drift from it. (#283)
+
 - **Deploy checklist: archived the 2026-07-12 deploy (`56ce7d4`, 13 PRs) and added a
   post-verify bucket 6.** `HMAC_SECRET_KEY` retirement moves into it. Bucket 1
   previously told the operator to delete it *before* the restart, which buys

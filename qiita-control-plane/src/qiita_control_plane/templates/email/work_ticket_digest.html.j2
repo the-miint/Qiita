@@ -11,6 +11,24 @@
       <li>{{ n }} {{ state }}</li>
       {% endfor %}
     </ul>
+    {% if active_total %}
+    <p><strong>{{ active_total }} still active</strong> ({{ active_summary }}).</p>
+    {% if active_actions %}
+    <ul>
+      {% for a in active_actions %}
+      <li>{{ a.total }} {{ a.action_id }} {{ a.action_version }} ({{ a.summary }})</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% else %}
+    <p><strong>No other work tickets of yours are still active.</strong></p>
+    {% endif %}
+    {% if held_total %}
+    <p>
+      {{ held_total }} held after exhausting infrastructure retries — redrive with
+      <code>qiita ticket run &lt;idx&gt;</code>.
+    </p>
+    {% endif %}
     <p>Details:</p>
     <table cellpadding="4" style="border-collapse: collapse;">
       <thead>
