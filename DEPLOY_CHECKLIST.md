@@ -25,7 +25,7 @@ _None yet._
 
 Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-band setup — plain `ALTER TABLE`s.
 
-- `20260713000000_sequenced_sample_spikein_read_count.sql` — adds `sequenced_sample.spikein_read_count_r1r2` (a spike-in is added in the lab, so it is disjoint from `biological`). (#270)
+- `20260713010000_sequenced_sample_spikein_read_count.sql` — adds `sequenced_sample.spikein_read_count_r1r2` (a spike-in is added in the lab, so it is disjoint from `biological`). (#270)
 
 ### 4. Deploy
 
