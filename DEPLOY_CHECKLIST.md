@@ -33,6 +33,16 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ./scripts/install-orchestrator-token.sh /etc/qiita/co-to-cp.token <<<"$NEW_TOKEN"
   sudo systemctl restart qiita-compute-orchestrator
   ```
+- **Confirm SLURM will grant `bam-to-parquet`'s envelope.** Its baseline rises to
+  `mem_gb: 12 / PT4H` and its ceiling to `mem_gb: 32 / PT12H` (the OOM/timeout
+  escalation climbs into that headroom). Memory stays modest because the job now
+  writes its reads in bounded batches rather than one globally sorted file — what
+  grows with a long sample is WALLTIME, not memory. If the partition's
+  `MaxMemPerNode` or `MaxTime` is below the ceiling, an escalated step is rejected by
+  SLURM rather than queued: (#285)
+  ```bash
+  scontrol show partition "$SLURM_PARTITION" | grep -E 'MaxMemPerNode|MaxTime|DefMemPerNode'
+  ```
 
 ### 3. Migrations
 
@@ -46,10 +56,28 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   - `20260712000000_alignment_definition.sql` — `alignment_definition` (params-hash align identity).
   - `20260712010000_alignment_sample.sql` — the per-`(alignment_idx, prep_sample)` completion gate.
   - `20260712020000_work_ticket_alignment_idx.sql` — `work_ticket.alignment_idx` arm (ON DELETE SET NULL, no backfill).
+- **`20260713000000_sequence_range_minted_by_work_ticket.sql`** — plain `make migrate`,
+  no out-of-band steps. Adds the nullable `qiita.sequence_range.minted_by_work_ticket_idx`
+  (no FK — it is an identity token compared for equality), replaces
+  `qiita.mint_sequence_range` with a 4-arg version that records it, and backfills the
+  column where the minting ticket is unambiguous — counting candidates across BOTH
+  loader shapes (the per-sample `bam-to-parquet`/`fastq-to-parquet` tickets and the
+  pool-scoped `bcl-convert` ingest), and only crediting a ticket the range postdates.
+  Rows it cannot attribute unambiguously stay NULL, which
+  reads as "not mine" and fails closed — a sample whose reads are already loaded can no
+  longer be re-ingested by reusing its range. **Must be applied before the restart**: the
+  new build's mint sends a 4th argument. **Expect a short window**: migrations are
+  applied BEFORE the restart, so between `make migrate` and the service restart the
+  still-running OLD build calls the now-absent 3-arg function and its sequence-range
+  callbacks 500. The orchestrator classifies a 500 as transient
+  (`CONTROL_PLANE_UNREACHABLE`) and retries, so an in-flight reads ticket self-heals
+  once the new build is up — but keep the gap short, and prefer running this when no
+  reads ingest is mid-flight. (#285)
 
 ### 4. Deploy
 
-_None yet._
+_None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via the
+`qiita-admin actions sync` that `activate.sh` already runs._
 
 ### 5. Verify
 
@@ -63,6 +91,40 @@ _None yet._
   psql "$DATABASE_URL" -tAc "SELECT sa.name, t.scopes FROM qiita.service_account sa JOIN qiita.api_token t ON t.principal_idx = sa.principal_idx WHERE t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now()) ORDER BY sa.name"
   # expect the compute account's active token scopes to include ticket:doget (and sequence_range:mint)
   ```
+- **The backfill attributed the stranded PacBio ranges** (without which their retries
+  fail closed as "already loaded"), and attributed nothing it shouldn't have — no range
+  may be credited to a ticket created after it: (#285)
+  ```sql
+  -- expect 24 rows (the run-18 samples), each with a non-null minter
+  SELECT sr.prep_sample_idx, sr.minted_by_work_ticket_idx
+    FROM qiita.sequence_range sr
+   WHERE sr.prep_sample_idx BETWEEN 30438 AND 30463 ORDER BY 1;
+
+  -- expect ZERO rows: a range can only be attributed to a ticket that PREDATES it
+  SELECT sr.prep_sample_idx, sr.minted_by_work_ticket_idx
+    FROM qiita.sequence_range sr
+    JOIN qiita.work_ticket wt ON wt.work_ticket_idx = sr.minted_by_work_ticket_idx
+   WHERE sr.created_at < wt.created_at;
+  ```
+- **`bam-to-parquet` picked up the new resources.** `activate.sh`'s `qiita-admin
+  actions sync` is what carries the raised baseline/ceiling into `qiita.action`; a
+  stale row means every HiFi sample still OOMs: (#285)
+  ```bash
+  psql "$DATABASE_URL" -c "
+    SELECT action_id, version, steps
+    FROM qiita.action WHERE action_id = 'bam-to-parquet';"   # baseline mem_gb 12, ceiling 32
+  ```
+- **Re-run the PacBio samples stranded by the old build** (sequencing_run 18 /
+  sequenced_pool 25016 — 24 of 26 OOM-killed). No cleanup is needed first: each
+  failed attempt minted a `sequence_range` before dying, and the new build reads
+  that range back and reuses it instead of 409ing on it. `ticket run` resets a
+  FAILED ticket and re-dispatches it in place: (#285)
+  ```bash
+  for i in $(seq 4805 4830); do qiita ticket run "$i" || true; done   # already-COMPLETED ones no-op
+  ```
+  Do **not** recover with `submit-pacbio-ingest --force` — that re-ingests and
+  duplicates reads in the lake (DuckLake has no uniqueness). Do **not** delete the
+  `sequence_range` rows — reusing them is exactly what makes the retry converge.
 
 ### 6. After the deploy verifies green
 

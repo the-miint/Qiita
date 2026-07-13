@@ -513,9 +513,13 @@ def test_step_submit_request_scope_target_rejects_invalid_shapes(
 def test_sequence_range_mint_request_accepts_valid_input():
     from qiita_common.models import SequenceRangeMintRequest
 
-    req = SequenceRangeMintRequest(prep_sample_idx=7, count=100)
+    req = SequenceRangeMintRequest(prep_sample_idx=7, count=100, work_ticket_idx=42)
     assert req.prep_sample_idx == 7
     assert req.count == 100
+    # The minting ticket is REQUIRED: it is what lets a reads job prove an orphaned
+    # range is its own before reusing it (vs. a different ticket whose reads are
+    # already loaded, where reuse would silently duplicate them).
+    assert req.work_ticket_idx == 42
 
 
 @pytest.mark.parametrize("bad_count", [0, -1, -1000])
@@ -523,7 +527,7 @@ def test_sequence_range_mint_request_rejects_nonpositive_count(bad_count):
     from qiita_common.models import SequenceRangeMintRequest
 
     with pytest.raises(ValidationError):
-        SequenceRangeMintRequest(prep_sample_idx=1, count=bad_count)
+        SequenceRangeMintRequest(prep_sample_idx=1, count=bad_count, work_ticket_idx=1)
 
 
 @pytest.mark.parametrize("bad_idx", [0, -1])
@@ -531,7 +535,7 @@ def test_sequence_range_mint_request_rejects_nonpositive_prep_sample_idx(bad_idx
     from qiita_common.models import SequenceRangeMintRequest
 
     with pytest.raises(ValidationError):
-        SequenceRangeMintRequest(prep_sample_idx=bad_idx, count=10)
+        SequenceRangeMintRequest(prep_sample_idx=bad_idx, count=10, work_ticket_idx=1)
 
 
 def test_sequence_range_mint_request_rejects_extra_fields():

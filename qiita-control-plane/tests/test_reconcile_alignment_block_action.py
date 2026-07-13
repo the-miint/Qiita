@@ -57,7 +57,11 @@ async def ab(postgres_pool):
     )
     async with postgres_pool.acquire() as conn:
         rng = await mint_sequence_range(
-            conn, prep_sample_idx=prep_sample_idx, count=_SAMPLE_READS, principal_idx=principal_idx
+            conn,
+            prep_sample_idx=prep_sample_idx,
+            count=_SAMPLE_READS,
+            principal_idx=principal_idx,
+            work_ticket_idx=None,
         )
         align = await mint_alignment_definition(
             conn,

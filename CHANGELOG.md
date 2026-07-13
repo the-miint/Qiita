@@ -115,6 +115,52 @@ the `no-changelog` label).
   the delete gates' 409 `detail` is now derived from the tuple, so it can't go stale
   the way `"completed/failed"` did. (#286)
 
+- **`bam-to-parquet` could not ingest a real PacBio HiFi sample: 24 of 26 failed on
+  the first production run.** Two compounding defects, both fixed here.
+  *The write:* the job wrote its reads with one `COPY … ORDER BY sequence_idx` — a
+  BLOCKING sort over the full seq+qual payload. A HiFi read is ~15-25 kB against
+  Illumina's ~150 bp, so a routine 2M-read sample is tens of GB to sort, against a
+  *hardcoded* 7 GB DuckDB `memory_limit`; only the two control-sized samples in the
+  pool (11k and 44k reads) fit. That sort was never needed: `PARQUET_OPTS` does not
+  produce a globally sorted file anyway (row groups land in thread-finish order) —
+  what it buys is per-row-group clustering on the sort key, for DuckLake pruning. And
+  the data is already monotone (`sequence_idx = sequence_index + start - 1`). The job
+  now writes `read/part_*.parquet` in bounded monotone batches (~1 GiB of payload
+  each), so every part's row groups carry a tight, disjoint `sequence_idx` window —
+  the same pruning, with peak memory flat in the batch instead of the sample. The
+  multi-file table shape is the one `reference_load`/`hash_sequences` already use, for
+  exactly this reason. `memory_limit` is now sized from the real cgroup
+  (`resolve_duckdb_memory_gb`, as nine other jobs already did) so `--mem-gb` and the
+  OOM escalation can actually reach it, and the workflow allocation is modest
+  (12 GB / PT4H, ceiling 32 GB / PT12H) rather than the 32/96 GB an unbatched sort
+  would have demanded.
+  *Retry:* `bam_to_parquet` and `fastq_to_parquet` mint a `sequence_range` and
+  *then* do the heavy durable write — exactly the window an OOM/walltime kill lands
+  in — but never read an orphaned range back. The runner re-runs the whole module on
+  such a (transient) failure, the re-mint hit the one-shot contract, and the step
+  died *permanently* with `already has a sequence_range`: hiding the OOM that
+  actually killed the first attempt, and defeating the OOM escalation, which can
+  only pay off if the escalated attempt gets past the mint. `ingest_reads` already
+  handled this; its private helper is now the shared `mint_or_reuse_sequence_range`
+  in `sequence_range_retry` and all three jobs use it (409 → read back → validate
+  width against the read count → reuse). Both halves were needed: without the
+  read-back the escalation cannot land, and without the memory it has nothing to
+  land on.
+  *Guard:* reusing an orphaned range is only safe when the range belongs to a prior
+  ATTEMPT OF THE SAME ticket. A *different* ticket hitting that 409 means the
+  sample's reads are already registered, and reuse would register them a second time
+  — silently, since DuckLake has no uniqueness. Nothing else could tell the two
+  apart: the submit-time disallow-without-delete gate blocks only NON-terminal
+  tickets, so a COMPLETED sample can be resubmitted. `qiita.sequence_range` now
+  records `minted_by_work_ticket_idx`, and a reads job reuses a range only when it
+  matches its own ticket AND that ticket is still in flight — a `completed` minter's
+  reads are already registered, so even its own stale attempt must not re-write the
+  range. That second gate is an ALLOWLIST of in-flight states, derived from the
+  canonical terminal/non-terminal split rather than spelled out: a denylist would let
+  a `work_ticket_state` added later fall through to the permissive path by default.
+  A different, terminal, or unknown minter fails permanently, with a recovery message
+  that differs by state. Without this the read-back would have *removed* the
+  accidental guard the one-shot mint was providing. (#285)
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
   partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
   by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the

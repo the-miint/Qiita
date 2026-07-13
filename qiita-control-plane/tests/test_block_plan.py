@@ -99,7 +99,11 @@ async def pooled(postgres_pool):
         if reads > 0:
             async with postgres_pool.acquire() as conn, conn.transaction():
                 await mint_sequence_range(
-                    conn, prep_sample_idx=ps, count=reads, principal_idx=principal_idx
+                    conn,
+                    prep_sample_idx=ps,
+                    count=reads,
+                    principal_idx=principal_idx,
+                    work_ticket_idx=None,
                 )
         return ps
 

@@ -159,7 +159,9 @@ async def planned(ctx, monkeypatch):
             owner,
         )
         async with db.acquire() as conn, conn.transaction():
-            await mint_sequence_range(conn, prep_sample_idx=ps, count=150, principal_idx=owner)
+            await mint_sequence_range(
+                conn, prep_sample_idx=ps, count=150, principal_idx=owner, work_ticket_idx=None
+            )
         # Mint the sample's read-mask with the EXACT params the align planner
         # reconstructs (adapter_set_hash None; no host refs), then flip its gate
         # COMPLETED so the planner considers it.
@@ -367,7 +369,9 @@ async def test_align_plan_skips_unmasked_sample(ctx, planned):
             owner,
         )
         async with db.acquire() as conn, conn.transaction():
-            await mint_sequence_range(conn, prep_sample_idx=ps, count=150, principal_idx=owner)
+            await mint_sequence_range(
+                conn, prep_sample_idx=ps, count=150, principal_idx=owner, work_ticket_idx=None
+            )
 
         resp = await ctx["wet"].post(_url(planned), json=_body(planned))
         assert resp.status_code == 202, resp.text
