@@ -8,7 +8,7 @@ import logging
 import asyncpg
 from qiita_common.backend_failure import FailureKind
 from qiita_common.models import (
-    WorkTicketState,
+    TERMINAL_WORK_TICKET_STATES,
 )
 
 import qiita_control_plane.runner as _runner_pkg
@@ -101,20 +101,6 @@ _POLL_DB_READ_TIMEOUT_SECONDS = 30.0
 _POLL_DB_READ_MAX_ATTEMPTS = 3
 _POLL_DB_READ_BACKOFF_SECONDS = 1.0
 
-# Work-ticket states the runner does NOT own. Once a ticket reaches one of
-# these out from under a running workflow — an operator
-# `qiita-admin ticket force-fail` flips it to FAILED — the runner must stop:
-# the in-place infra-retry/poll loops re-check this each iteration and bail via
-# WorkflowAborted instead of retrying forever against a ticket that is no
-# longer theirs.
-_TERMINAL_WORK_TICKET_STATES = frozenset(
-    {
-        WorkTicketState.COMPLETED.value,
-        WorkTicketState.NO_DATA.value,
-        WorkTicketState.FAILED.value,
-    }
-)
-
 
 class WorkflowAborted(Exception):
     """Unwind a running workflow whose ticket went terminal in the DB out from
@@ -147,6 +133,11 @@ async def _raise_if_ticket_terminal(pool: asyncpg.Pool, work_ticket_idx: int) ->
     has gone terminal in the DB — an operator force-fail/cancel — so the runner
     stops working a ticket it no longer owns. A cheap one-column read run
     once per loop iteration.
+
+    `TERMINAL_WORK_TICKET_STATES` here means "states the runner does not own": if
+    a ticket lands in one out from under a running workflow, the in-place
+    infra-retry / poll loops must stop rather than retry forever against work
+    that is no longer theirs.
 
     Resilient to a transient CP-DB hiccup: the read uses a generous per-call
     timeout (`_POLL_DB_READ_TIMEOUT_SECONDS`, overriding the pool's tighter
@@ -185,7 +176,7 @@ async def _raise_if_ticket_terminal(pool: asyncpg.Pool, work_ticket_idx: int) ->
             if attempt + 1 < _POLL_DB_READ_MAX_ATTEMPTS:
                 await asyncio.sleep(_runner_pkg._POLL_DB_READ_BACKOFF_SECONDS * (attempt + 1))
             continue
-        if state in _TERMINAL_WORK_TICKET_STATES:
+        if state in TERMINAL_WORK_TICKET_STATES:
             raise WorkflowAborted(work_ticket_idx, state)
         return
     # Every attempt hit a transient DB error — let it propagate so the catch-all

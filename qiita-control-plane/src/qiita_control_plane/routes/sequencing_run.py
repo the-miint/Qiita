@@ -754,8 +754,9 @@ async def delete_sequenced_pool(
     study link they hold — not only the run/pool the operator is thinking of.
 
     Gating: in-flight work tickets (pending/queued/processing) block the delete
-    unconditionally (409). Completed/failed work tickets, prep_samples published
-    into a study, and samples carrying an ENA accession each block it unless
+    unconditionally (409). Terminal work tickets (completed/no_data/failed),
+    prep_samples published into a study, and samples carrying an ENA accession
+    each block it unless
     `force=true`.
 
     The DuckLake purge (the `read`/`read_mask` rows the pool's bcl-convert run

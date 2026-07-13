@@ -70,6 +70,36 @@ the `no-changelog` label).
 
 ### Fixed
 
+- **`no_data` work tickets were invisible to the reference and sequenced-pool delete
+  gates, and to the reference-load CLI's watch loop.** `WorkTicketState` has three
+  terminal states — `completed`, `no_data`, `failed` — but the terminal/non-terminal
+  split was maintained by hand in five separate places, and several of them spelled
+  terminal as `("completed", "failed")`. `no_data` was added later (#176) and never
+  folded back in, so it fell through every one of them:
+  - **Sequenced-pool delete (live bug).** The gate counted a `no_data` ticket as
+    neither in-flight nor terminal, so it blocked nothing. An unforced `DELETE`
+    returned 200 and the state-blind cascade purged the tickets anyway — the exact
+    outcome the gate exists to prevent. This was not a corner case: `no_data` is the
+    *expected* result for an empty well, so an all-blank plate, or a pool whose reads
+    were entirely masked out, deleted with no 409 and no `force`.
+  - **Reference delete (latent twin).** Same hole; unreachable today only because no
+    reference workflow can produce `no_data`.
+  - **`reference-load --watch` (latent).** The poll loop stopped on `completed`/
+    `failed` only, so a `no_data` ticket would be polled to the 24 h ceiling and then
+    reported as never having reached a terminal state — which it had.
+
+  The split now has one home: `TERMINAL_WORK_TICKET_STATES` and
+  `NON_TERMINAL_WORK_TICKET_STATES` live beside the enum in
+  `qiita_common.models.work_ticket`, with the non-terminal side **derived** as the
+  complement rather than written out, so the two can never disagree and a seventh
+  state lands in exactly one of them by construction. Every consumer — the runner's
+  abort check and guarded transitions, `dispatch`, the work-ticket routes'
+  disallow-without-delete gate and `?active=true`, the notify digest, both delete
+  gates, the force-fail CLI, the pool-completion rollups' inline SQL — imports from
+  there; the five hand-maintained copies are gone. A unit test pins the partition, and
+  the delete gates' 409 `detail` is now derived from the tuple, so it can't go stale
+  the way `"completed/failed"` did. (#286)
+
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
   partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
   by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the

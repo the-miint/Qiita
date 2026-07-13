@@ -10,6 +10,7 @@ import os
 import sys
 
 import asyncpg
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
 
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 
@@ -27,9 +28,9 @@ _FAILURE_STAGES_REJECTING_STEP_NAME = ("submission", "finalize")
 _FAILURE_STAGE_CHOICES = _FAILURE_STAGES_REQUIRING_STEP_NAME + _FAILURE_STAGES_REJECTING_STEP_NAME
 
 # Tickets in these states are eligible for force-fail; anything terminal
-# (failed / completed) is rejected so the CLI doesn't silently overwrite
-# a captured failure or convert a real success into a fake failure.
-_FORCE_FAIL_ELIGIBLE_STATES = ("pending", "queued", "processing")
+# (completed / no_data / failed) is rejected so the CLI doesn't silently
+# overwrite a captured failure or convert a real outcome into a fake failure.
+_FORCE_FAIL_ELIGIBLE_STATES = NON_TERMINAL_WORK_TICKET_STATES
 
 
 def _validate_force_fail_args(stage: str, step_name: str | None) -> None:

@@ -38,10 +38,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from qiita_common.models import EmailReceiptStatus
+from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
+    EmailReceiptStatus,
+)
 
-from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES
-from ..runner import _TERMINAL_WORK_TICKET_STATES
 from .render import (
     WORK_TICKET_DIGEST_TEMPLATE,
     render_work_ticket_digest,
@@ -63,11 +65,11 @@ _log = logging.getLogger(__name__)
 _NOTIFY_SWEEP_LOCK_KEY = 4_310_290_147
 
 # Terminal-state literals shared by the owed-set SELECT and the partial index
-# (qiita_work_ticket_email_owed_idx). Built from the runner's frozenset — the
-# single source of truth — in sorted order so the SELECT predicate byte-matches
-# the migration's index predicate and the planner can use it. A parity test
-# pins the three sites together.
-_TERMINAL_STATE_LITERALS = tuple(sorted(_TERMINAL_WORK_TICKET_STATES))
+# (qiita_work_ticket_email_owed_idx). Built from the qiita_common source of truth,
+# re-sorted ALPHABETICALLY (not the lifecycle order it ships in) because the
+# migration's index predicate is written that way and the SELECT must byte-match
+# it or the planner can't use the index. A parity test pins the three sites.
+_TERMINAL_STATE_LITERALS = tuple(sorted(TERMINAL_WORK_TICKET_STATES))
 _TERMINAL_STATE_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATE_LITERALS)
 
 # The owed-set predicate. MUST byte-match the partial index predicate.

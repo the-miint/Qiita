@@ -179,6 +179,8 @@ from qiita_common.models.upload import (
 )
 from qiita_common.models.user import ORCID_PATTERN, UserCreate, UserResponse, UserUpdate
 from qiita_common.models.work_ticket import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
     BlockPlanBlock,
@@ -338,6 +340,8 @@ __all__ = [
     "WhoAmIResponse",
     "WhoAmIServiceResponse",
     # Work tickets / actions.
+    "NON_TERMINAL_WORK_TICKET_STATES",
+    "TERMINAL_WORK_TICKET_STATES",
     "FailureType",
     "ProcessingKind",
     "ResourceOverride",

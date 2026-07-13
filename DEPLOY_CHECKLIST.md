@@ -13,8 +13,6 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→6 in order; buckets 1–3 must precede the bucket-4 restart, and bucket 6 (irreversible cleanup — anything that burns the rollback path) must not run until bucket 5 is green. Each step carries its source `(#N)` tag.
 
-_Nothing pending — the last deploy is archived below. Each PR folds its operator steps into the buckets here as it merges (`/deploy-note`)._
-
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
 _None yet._
@@ -45,7 +43,7 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **`DELETE /reference/{idx}` and `DELETE /sequenced-pool/{idx}` now 409 on a `no_data` work ticket (previously 200).** Terminal tickets are meant to block an unforced delete; the gates' terminal set was hand-written as `("completed", "failed")` and predated `no_data`, so such a ticket matched neither the in-flight nor the terminal arm and was invisible — the delete succeeded unforced and the state-blind cascade purged the tickets anyway. Operator impact: a pool that used to delete cleanly may now need `?force=true` — `no_data` is the *expected* outcome for an empty well, so an all-blank plate (or one whose reads were entirely masked out) is exactly the case that changes. The 409 `detail` now names the terminal states rather than the stale `completed/failed` pair. No host action. (#286)
 
 ---
 

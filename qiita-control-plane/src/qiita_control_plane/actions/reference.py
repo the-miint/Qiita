@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncpg
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
     VALID_STATUS_TRANSITIONS,
     ReferenceResponse,
     ReferenceStatus,
@@ -30,8 +32,12 @@ class ReferenceNotFound(Exception):
 # unconditionally (a running job is reading/writing the reference's data);
 # terminal states block only without `force` (a completed test run is exactly
 # what an admin purging a test reference wants gone).
-_WORK_TICKET_IN_FLIGHT_STATES = ("pending", "queued", "processing")
-_WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
+#
+# Between them these cover EVERY state, which is the point: a state in neither
+# arm is invisible to the gate, and since the cascade below is state-blind, the
+# delete would proceed unforced and purge its tickets anyway.
+_WORK_TICKET_IN_FLIGHT_STATES = NON_TERMINAL_WORK_TICKET_STATES
+_WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 
 class ReferenceDeleteBlocked(Exception):
@@ -51,7 +57,8 @@ class ReferenceDeleteBlocked(Exception):
             )
         else:
             reason = (
-                f"{terminal} completed/failed work ticket(s) reference it; "
+                f"{terminal} terminal work ticket(s) "
+                f"({'/'.join(_WORK_TICKET_TERMINAL_STATES)}) reference it; "
                 "re-issue with force=true to delete them too"
             )
         super().__init__(f"Reference {reference_idx} cannot be deleted: {reason}")

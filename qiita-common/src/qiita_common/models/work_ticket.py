@@ -88,6 +88,36 @@ class WorkTicketState(StrEnum):
     FAILED = "failed"
 
 
+# The terminal/non-terminal split of WorkTicketState, defined once and imported
+# everywhere. A ticket is terminal once it has an OUTCOME: it succeeded
+# (COMPLETED), it legitimately produced nothing (NO_DATA), or it failed (FAILED).
+#
+# Only the terminal side is named; the non-terminal side is DERIVED as its
+# complement. That direction is deliberate and load-bearing:
+#
+#   * The two can never disagree, and a new state added to the enum lands in
+#     exactly one of them by construction rather than by someone remembering.
+#   * Unknown-state-defaults-to-non-terminal is the fail-SAFE direction for every
+#     consumer: a new state blocks deletes, keeps a watch loop polling, doesn't
+#     abort a running workflow, and isn't emailed as an outcome.
+#
+# Both are tuples in the enum's own lifecycle order, so a caller can bind them
+# straight to a `qiita.work_ticket_state[]` array or render them to a user
+# without re-shaping. NOTE: the DB does NOT inherit the derivation — the
+# `work_ticket_one_in_flight_per_*` partial indexes spell the non-terminal set out
+# in SQL, and a new enum value must be added to each by migration. A parity test
+# (test_work_ticket_state_parity.py) fails loudly until that happens.
+TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
+    WorkTicketState.COMPLETED.value,
+    WorkTicketState.NO_DATA.value,
+    WorkTicketState.FAILED.value,
+)
+
+NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = tuple(
+    state.value for state in WorkTicketState if state.value not in TERMINAL_WORK_TICKET_STATES
+)
+
+
 class FailureType(StrEnum):
     """Discriminates retriable from permanent work-ticket failures.
     Mirrored DB-side by qiita.failure_type.

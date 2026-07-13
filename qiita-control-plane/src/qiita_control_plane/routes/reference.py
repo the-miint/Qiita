@@ -237,8 +237,8 @@ async def delete_reference(
     indexes. system_admin only (`reference:delete`).
 
     Gating: work tickets in-flight (pending/queued/processing) block the delete
-    unconditionally (409); completed/failed tickets block it unless `force=true`
-    is passed. Shared features (claimed by another reference) are never deleted.
+    unconditionally (409); terminal tickets (completed/no_data/failed) block it
+    unless `force=true` is passed. Shared features (claimed by another reference) are never deleted.
 
     Ordering is data-plane → orchestrator → Postgres, chosen so the operation
     is *retriable*: every step is idempotent and the `qiita.reference` row — the

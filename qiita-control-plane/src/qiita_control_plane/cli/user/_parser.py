@@ -1009,8 +1009,9 @@ def _build_parser() -> argparse.ArgumentParser:
             " exclusive to this pool, deleting it removes those samples from"
             " EVERY study they link to, not only one. Requires system_admin"
             " (sequenced_pool:delete). In-flight work tickets block the delete"
-            " unconditionally; completed/failed tickets, published prep-samples,"
-            " and ENA-submitted samples block it unless --force is passed."
+            " unconditionally; terminal tickets (completed/no_data/failed),"
+            " published prep-samples, and ENA-submitted samples block it unless"
+            " --force is passed."
         ),
     )
     p_delete_pool.add_argument(
@@ -1029,10 +1030,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Override the soft blocks: delete even when completed/failed work"
-            " tickets reference the pool, prep-samples are published into a"
-            " study, or samples carry an ENA accession. Does NOT override"
-            " in-flight work tickets."
+            "Override the soft blocks: delete even when terminal"
+            " (completed/no_data/failed) work tickets reference the pool,"
+            " prep-samples are published into a study, or samples carry an ENA"
+            " accession. Does NOT override in-flight work tickets."
         ),
     )
     p_delete_pool.set_defaults(handler=_handle_delete_sequenced_pool)

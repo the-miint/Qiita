@@ -268,6 +268,31 @@ async def test_delete_reference_terminal_ticket_requires_force(client, postgres_
     )
 
 
+async def test_delete_reference_no_data_ticket_requires_force(client, postgres_pool):
+    """no_data is TERMINAL and must gate the delete like completed/failed.
+
+    The gate's terminal set used to be a hand-written ("completed", "failed"),
+    so a no_data ticket matched neither arm and was invisible: the delete went
+    through unforced and the state-blind cascade purged the ticket anyway. No
+    reference workflow can produce no_data today — this pins the gate for the
+    day one can, and matches the live twin in the sequenced-pool delete.
+    """
+    ref_idx = await _create_ref(client, f"del-nodata-{uuid.uuid4()}")
+    await _seed_work_ticket(postgres_pool, ref_idx, "no_data")
+
+    blocked = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"]
+    assert "force=true" in detail
+    assert "no_data" in detail
+
+    forced = await client.delete(
+        URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params={"force": "true"}
+    )
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["work_ticket_deleted"] == 1
+
+
 async def test_delete_reference_gcs_orphan_genome_keeps_shared(client, postgres_pool):
     """The genome-GC branch: a genome mapped only by orphaned features is
     deleted; a genome still mapped by a surviving reference's feature stays."""
