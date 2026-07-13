@@ -156,7 +156,7 @@ def test_syndna_missing_index_raises(tmp_path, monkeypatch):
 
 def test_syndna_empty_index_raises(tmp_path, monkeypatch):
     """A zero-byte .mmi would align nothing and silently report zero spike-ins for a
-    sample that has them — which the cell-count model would then divide by."""
+    sample that has them — every spike-in read would then be counted as biological."""
     reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGT", None)])
     _stub_hits(monkeypatch, [])
     empty = tmp_path / "empty.mmi"

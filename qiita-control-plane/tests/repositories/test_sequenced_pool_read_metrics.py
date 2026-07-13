@@ -124,7 +124,8 @@ async def test_sums_across_processed_samples(pool_ctx):
 async def test_spikein_sums_only_over_non_retired_samples(pool_ctx):
     """The spikein SUM carries the same `FILTER (WHERE ps.retired IS NOT TRUE)`
     as its three siblings — a retired sample's spike-ins must not inflate the
-    pool's denominator for the cell-count model."""
+    pool's spike-in masking total (NOT the cell-count model's input — that
+    is per-insert coverage depth)."""
     await pool_ctx["add_sample"](raw=1000, biological=900, quality_filtered=850, spikein=40)
     await pool_ctx["add_sample"](
         raw=500, biological=400, quality_filtered=300, spikein=99, retired=True

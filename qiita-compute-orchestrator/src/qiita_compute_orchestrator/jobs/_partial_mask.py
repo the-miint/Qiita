@@ -1,4 +1,4 @@
-"""Shared guard for an optional incoming partial mask.
+"""Shared guard for the read-mask chain's long-read steps.
 
 The read-mask chain threads a partial mask (`(sequence_idx, reason, left_trim1,
 right_trim1, left_trim2, right_trim2)`) through its pre-`host_filter` steps:
@@ -22,8 +22,12 @@ re-check at each consumer buys nothing a unit test does not already buy, and it
 implies a distrust of our own prior step that the code does not otherwise have.
 
 What DOES stay is the one condition our construction does not establish: the gate
-combination is CLIENT-supplied (`action_context`), so a caller can ask for an
-incoming mask on a read set the mask seams cannot serve. That is a real boundary.
+combination is CLIENT-supplied (`action_context`), so a caller can ask for the
+long-read chain over a read set its seams cannot serve. That is a real boundary.
+
+Note `assert_single_end` is called UNCONDITIONALLY by `syndna`, `lima_export` and `qc`
+— not only when a mask is bound. The whole long-read chain is single-end-only (PacBio
+HiFi), so the check is about the CHAIN, not about the mask.
 """
 
 from __future__ import annotations
@@ -36,15 +40,19 @@ import duckdb
 def assert_single_end(
     conn: duckdb.DuckDBPyConnection, reads_sql: str, field: str, path: Path
 ) -> None:
-    """Reject a paired-end read set when an incoming mask is bound.
+    """Reject a paired-end read set on a long-read-chain step.
 
     NOT defensive programming against our own steps — this guards a CLIENT-supplied
     combination. `syndna_enabled` / `lima_enabled` arrive in `action_context`, and
-    nothing cross-validates them against the pool's platform, so a submission can
-    turn the long-read chain on over a paired-end (Illumina) read set. The
-    incoming-mask seams fold trims back into `sequence1`/`qual1` only; PE would need
-    per-mate `in_left2`/`in_right2` math that nothing produces today, so those rows
-    would take the PE seam and their incoming trims would be SILENTLY DROPPED.
+    nothing cross-validates them against the pool's platform, so a submission can turn
+    the long-read chain on over a paired-end (Illumina) read set.
+
+    The chain is single-end-only throughout: lima is a HiFi tool, and the incoming-mask
+    seams fold trims back into `sequence1`/`qual1` only — PE would need per-mate
+    `in_left2`/`in_right2` math that nothing produces today, so those rows would take
+    the PE seam and their incoming trims would be SILENTLY DROPPED. `syndna` calls this
+    FIRST (it is the chain's first step), so a bad submission dies before a full
+    alignment pass rather than after it.
 
     Fail loudly at the boundary instead of shipping an untested path.
     """

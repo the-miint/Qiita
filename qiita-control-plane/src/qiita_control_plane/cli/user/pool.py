@@ -1062,6 +1062,39 @@ def _handle_submit_host_filter_pool(
         )
         instrument_model = run.get("instrument_model")
 
+        # Step 3.5: a PacBio run whose roster carries NO protocol facts means the
+        # server could not parse the pool's stored pre-flight — NOT that the pool is
+        # Illumina. Refuse, before any ticket.
+        #
+        # The direction of this check is the whole point. `is_pacbio_pool` above is
+        # derived from `any(sheet_type)`, i.e. it infers "not PacBio" from ABSENCE —
+        # so an unparseable blob silently takes the Illumina branch and writes
+        # `lima_enabled: false, syndna_enabled: false` onto every ticket. That is a
+        # case-5 pool masked with no lima and no syndna, whose spike-in count is then
+        # structurally zero: exactly what the chain's step order exists to prevent.
+        #
+        # Today that is caught only INCIDENTALLY — the same unparseable blob also nulls
+        # `human_filtering`, tripping the intent guard above. But that guard is
+        # --force-bypassable, and it EVAPORATES when `human_filtering` moves to sample
+        # metadata (it will then be populated even when the blob is unreadable). So this
+        # keys on the run's `platform` column, which is authoritative and depends on
+        # neither. --force does NOT bypass it: forcing host filtering off is a choice,
+        # masking a PacBio pool with the long-read chain silently off is not.
+        if run.get("platform") == Platform.PACBIO_SMRT.value:
+            no_facts = [s["sequenced_pool_item_id"] for s in samples if not s.get("sheet_type")]
+            if no_facts:
+                print(
+                    f"sequencing_run {args.sequencing_run_idx} is PacBio, but"
+                    f" {len(no_facts)} sample(s) carry no protocol facts on the roster"
+                    f" (e.g. {no_facts[:3]}). The pool's stored pre-flight could not be"
+                    " parsed server-side, so lima and syndna cannot be gated. Refusing:"
+                    " masking a PacBio pool with the long-read chain silently off would"
+                    " leave its spike-in count structurally zero. Check the pool's"
+                    " run_preflight_blob. (--force does not bypass this.)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
         # Step 5: one read-mask ticket per sample — always-on QC + the host
         # filtering chosen on this submission, uniform across the pool. A given
         # rype reference filters every sample against it (plus the optional

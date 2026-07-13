@@ -2,9 +2,11 @@
 --
 -- Adds a FOURTH per-sequenced_sample read count. A SynDNA spike-in is added in
 -- the lab: it is not a molecule from the sample, so it is NOT biological. It gets
--- its own bucket, disjoint from `biological`, because the downstream cell-count
--- model divides by it — a bare "reads that weren't QC failures" total would both
--- hide it and corrupt `biological`.
+-- its own bucket, disjoint from `biological`, so the read accounting BALANCES — a
+-- spike-in read leaves `biological` and has to be counted somewhere; a bare "reads
+-- that weren't QC failures" total would both hide it and corrupt `biological`.
+-- (A MASKING metric. The cell-count model consumes per-insert coverage depth, not
+-- this read count — see the COMMENT below.)
 --
 -- Like its three siblings this is a both-mates total (the `*_r1r2` convention:
 -- count(*) + count(second-mate)). PacBio HiFi — the only protocol that carries

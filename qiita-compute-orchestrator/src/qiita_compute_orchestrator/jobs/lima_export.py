@@ -9,7 +9,7 @@ binary; it reads files. The runner's `_resolve_staged_masked_reads` cannot serve
 here — it streams the `read_masked` view, which requires an already-COMPLETED mask,
 and this chain is what builds that mask. (The raw `read` table is not
 Flight-reachable at all.) So the already-bound `reads` parquet is written out as
-FASTQ. Per CLAUDE.local.md this on-disk hand-off to a container is called out, not
+FASTQ. This on-disk hand-off to a container is called out deliberately, not
 silently entrenched: both hops stay inside one ticket's workspace and nothing
 crosses a workflow boundary as a filepath.
 

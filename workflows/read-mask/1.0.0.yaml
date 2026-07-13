@@ -160,7 +160,7 @@ steps:
   # reads and produces `partial_mask` itself.
   #
   # Serializing the reads to FASTQ is an on-disk hand-off to a container binary
-  # (CLAUDE.local.md: called out, not silently entrenched). It cannot be streamed:
+  # (called out, not silently entrenched). It cannot be streamed:
   # `_resolve_staged_masked_reads` needs an already-completed mask, and this chain
   # is what builds it; the raw `read` table is not Flight-reachable.
   - step: lima_export

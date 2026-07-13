@@ -3239,6 +3239,60 @@ def _run_submit_host_filter_pool(
     return main(argv)
 
 
+def test_submit_host_filter_pool_pacbio_run_with_no_protocol_facts_aborts(monkeypatch, capsys):
+    """REGRESSION. A PacBio run whose roster carries no `sheet_type` means the server
+    could not parse the pool's stored pre-flight — NOT that the pool is Illumina.
+
+    Without this guard the submit infers "not PacBio" from the ABSENCE of sheet_type,
+    takes the Illumina branch, and writes `lima_enabled: false, syndna_enabled: false`
+    onto every ticket: a case-5 pool masked with no lima and no syndna, whose spike-in
+    count is then structurally zero. It is caught today only incidentally (the same bad
+    blob nulls human_filtering), and that backstop is --force-bypassable and disappears
+    when human_filtering moves to sample metadata. So this keys on the run's `platform`,
+    and NO ticket may be posted."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            # roster: samples carry human_filtering but NO sheet_type (blob unparseable)
+            (200, _pool_samples_body([(100, 1000, "1", False), (101, 1001, "2", False)])),
+            (200, run_body),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_submit_host_filter_pool(run=3, pool=5)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "is PacBio" in err
+    assert "could not be parsed" in err
+    # and nothing was submitted
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_pacbio_no_facts_not_bypassable_by_force(monkeypatch, capsys):
+    """--force turns host filtering off deliberately; it must NOT also let a PacBio pool
+    be masked with lima and syndna silently off."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "1", False)])),
+            (200, run_body),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_submit_host_filter_pool(run=3, pool=5, force=True)
+    assert exc.value.code == 1
+    assert "--force does not bypass this" in capsys.readouterr().err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
 def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, capsys):
     """Two samples, host-filtered against the submission's rype reference 7 →
     two read-mask/1.0.0 POSTs, each with host_filter_enabled against that

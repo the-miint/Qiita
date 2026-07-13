@@ -69,13 +69,22 @@ from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "syndna"
 
-# Unlike host_filter (whose fixed share is sized around a genome-scale rype index
-# living outside DuckDB's heap), a SynDNA `.mmi` is a handful of kb-scale inserts —
-# the footprint here is the DuckDB-side work: the alignment output plus the identity
-# / DISTINCT pass over millions of HiFi rows. So take the cgroup-aware share, as
-# lima_mask and qc do.
+# Cgroup-aware WITH a reserve, like build_minimap2_index — not host_filter's fixed share.
+#
+# The DuckDB-side work here (the alignment output plus the identity / DISTINCT pass over
+# millions of HiFi rows) does scale with the allocation, so a fixed 8 GB wastes a
+# `--mem-gb` bump. But `align_minimap2` runs minimap2 IN-PROCESS, and its memory lives
+# OUTSIDE DuckDB's heap — so DuckDB must not claim the whole cgroup. The reserve is what
+# keeps minimap2 alive; without it a bigger allocation makes DuckDB greedier and the
+# aligner gets OOM-killed.
+#
+# The reserve is sized for minimap2's ALIGNMENT buffers (per-thread chaining over ~20 kb
+# HiFi reads), NOT for the index: a SynDNA `.mmi` is a handful of kb-scale inserts, which
+# is why this is half of build_minimap2_index's 16 GB (that one builds an index over
+# genome-scale subjects).
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
+_MM2_RESERVE_GB = 8
 
 # PacBio HiFi long-read alignment mode, matching the preset the `.mmi` is built
 # with (`qiita reference load --minimap2-preset map-hifi`). SynDNA spike-ins are
@@ -219,7 +228,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
+                memory_gb=resolve_duckdb_memory_gb(
+                    _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_MM2_RESERVE_GB
+                ),
                 threads=_DUCKDB_THREADS,
             )
             # syndna is the FIRST step of the chain, so it — not lima_export or qc —
