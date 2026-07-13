@@ -36,15 +36,15 @@ input whose read_id is not unique (`count(DISTINCT read_id) != count(*)`). The
 single-end uBAM this targets has unique QNAMEs and passes.
 
 Input-immutability assumption, same as fastq_to_parquet: `bam_path` MUST NOT be
-modified between work_ticket submission and step execution — the retry-recovery
-path (`PreMintedRange`) relies on the read count being stable across attempts.
+modified between work_ticket submission and step execution — the retry path
+reuses the range a crashed attempt minted, which is only valid while the read
+count is stable across attempts.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import httpx
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
@@ -58,14 +58,9 @@ from ..miint import (
     duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
+    resolve_duckdb_memory_gb,
 )
-from ..sequence_range import (
-    PreMintedRange,
-    PrepSampleNotEligibleForSequenceRange,
-    SequenceRangeAlreadyExists,
-    mint_sequence_range,
-)
-from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
+from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 # YAML step name this module implements. Hard-coded because execute() raises
 # BackendFailures itself (which need a step_name); the integration smoke asserts
@@ -73,20 +68,33 @@ from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
 # `- step: bam` YAML entry fails loudly.
 YAML_STEP_NAME = "bam"
 
-# DuckDB resource caps, mirroring fastq_to_parquet's rationale: the YAML
-# allocation (workflows/bam-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
-# SLURM cgroup; DuckDB's caps sit just below (`mem_gb - 1` leaves ~1 GB for
-# Python/miint/OS overhead). 7 GB matches fastq_to_parquet's cap, but note a BAM
-# record is heavier than a FASTQ read: a PacBio HiFi / ONT uBAM record carries
-# per-base modification (MM/ML) and kinetics (ipd/pw) aux tags that htslib
-# materializes with the whole record BEFORE read_sequences_sam projects them away
-# — so peak parse memory reflects the tagged record, not the ~20 KB seq+qual this
-# job keeps. The pipeline is the read_sequences_sam parse, a footer count +
-# `count(DISTINCT read_id)` aggregate, and a sorted COPY — all spill to duckdb_tmp
-# under the cap. Revisit against a real kinetics-laden uBAM MaxRSS if the parse
-# dominates.
+# DuckDB resource caps. The limit is sized from the REAL SLURM cgroup via
+# `resolve_duckdb_memory_gb`, not a literal: a hardcoded cap silently ignores both
+# the per-run `--mem-gb` override and the runner's OOM memory escalation, so an
+# escalated retry would re-OOM at the same in-process limit no matter how much
+# SLURM granted it. `_DUCKDB_MEMORY_GB` is the OFF-SLURM fallback only (local
+# backend / tests), where there is no cgroup to read; it is NOT the YAML baseline
+# minus headroom, and deliberately stays small so a dev box isn't asked for 29 GB.
+#
+# Peak memory is flat in the sample: the reads are written in bounded batches (see
+# _write_read_parts), and the parse streams (read_sequences_sam projects the aux tags
+# away rather than materialising them). The one term that still scales with the input
+# is `count(DISTINCT read_id)` — a blocking hash aggregate, O(distinct read_ids). At a
+# few million HiFi reads that is small; a 20M-read ONT run is what the ceiling covers.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
+
+# Target UNCOMPRESSED payload per output part (see _write_read_parts). This is what
+# bounds peak memory: the only blocking operator left is the per-part ORDER BY, which
+# sorts at most this much. 1 GiB keeps a part comfortably inside the DuckDB limit
+# even at the off-SLURM fallback, while staying far above the 64 MB row-group target
+# so each part still holds many row groups.
+#
+# There is deliberately NO plan(). Peak memory is flat in the batch, not the input, so
+# a down-only sizing hint has nothing useful to lower; and a walltime hint risks
+# burning one of the ticket's three shared retries on a TIMEOUT. What scales with a
+# long sample is walltime, which is where the ceiling headroom sits.
+_ROWS_PER_PART_TARGET_BYTES = 1024**3
 
 
 class Inputs(BaseModel):
@@ -98,16 +106,120 @@ class Inputs(BaseModel):
     sequence-load step sets it True). Defaults True — a hand-submitted ticket that
     omits it still gets the unaligned verification. `prep_sample_idx` and
     `work_ticket_idx` are framework-injected scope scalars; `prep_sample_idx` is
-    also the key the CP's sequence-range allocator uses. `pre_minted_range` is the
-    optional E-operator recovery hook — set only on a retry where a prior attempt
-    minted then failed after the mint (see `PreMintedRange`).
+    also the key the CP's sequence-range allocator uses, and `work_ticket_idx` is
+    what proves an orphaned range belongs to THIS step before it is reused.
     """
 
     bam_path: Path
     expect_unaligned: bool = True
     prep_sample_idx: int
     work_ticket_idx: int
-    pre_minted_range: PreMintedRange | None = None
+
+
+def _write_read_parts(
+    conn,
+    *,
+    intermediate: Path,
+    read_dir: Path,
+    prep_sample_idx: int,
+    sequence_idx_start: int,
+    count: int,
+) -> int:
+    """Write the final reads as `read/part_*.parquet`, in bounded monotone batches.
+
+    Returns the number of parts written.
+
+    WHY NOT ONE SORTED COPY. The obvious form —
+
+        COPY (SELECT ... FROM read_parquet(intermediate) ORDER BY sequence_idx)
+        TO 'read.parquet'
+
+    — is a BLOCKING sort over the full seq+qual payload. For a PacBio HiFi sample
+    (~15-25 kB per read, millions of reads) that is tens of GB, and it is exactly
+    where the first real PacBio run died. Paying for it with a bigger allocation
+    would be paying for work we do not need to do.
+
+    What the ORDER BY actually buys is NOT a globally sorted file — `PARQUET_OPTS`
+    says so explicitly: with `preserve_insertion_order=false` (which
+    `ROW_GROUP_SIZE_BYTES` requires) "row groups land in thread-finish order". What
+    it buys is that each row group stays CLUSTERED on the sort key, giving tight
+    per-group min/max, which is what DuckLake pruning and Parquet predicate pushdown
+    actually read.
+
+    Clustering does not need a global sort, because the data is already monotone:
+    `sequence_idx = sequence_index + start - 1`, and `sequence_index` is
+    read_sequences_sam's per-file 1-based ordinal. So we slice on `sequence_index`
+    and write one part per slice. Every row in part N has a sequence_idx strictly
+    below every row in part N+1, so each part's row groups carry a tight, disjoint
+    min/max — the same pruning the global sort produced. The ORDER BY inside a part
+    then sorts at most `_ROWS_PER_PART_TARGET_BYTES` worth of payload, so peak memory
+    is bounded by the batch, not by the sample.
+
+    The multi-file table shape is not new: `register-files` maps a top-level subdir
+    of `part_*.parquet` to the table named after the directory, which is what
+    reference_load and hash_sequences already do — and for this same reason (a
+    single-file sort+write of a large payload OOMs DuckDB).
+    """
+    # Size the batch from the intermediate's UNCOMPRESSED payload, read from the
+    # Parquet footer (parquet_metadata is metadata-only — no data scan). Row count
+    # alone would be a poor proxy: HiFi reads are ~100x an Illumina read.
+    uncompressed_bytes = conn.execute(
+        "SELECT sum(total_uncompressed_size) FROM parquet_metadata(?)",
+        [str(intermediate)],
+    ).fetchone()[0]
+    if not uncompressed_bytes:
+        # Coalescing this to 0 would make bytes_per_row 1 and rows_per_part ~1e9 —
+        # i.e. ONE part, an unbounded sort over the whole sample. That is exactly the
+        # OOM this batching exists to remove, and it would come back silently. The
+        # footer of a non-empty Parquet always reports a size, so a missing one means
+        # something is wrong with the intermediate; say so.
+        raise ValueError(
+            f"parquet_metadata reported no uncompressed size for {intermediate} "
+            f"({count} rows) — cannot size the output batches"
+        )
+    bytes_per_row = max(1, uncompressed_bytes // count)
+    rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
+
+    # Created here, not up front: a run that fails before this point (bad input, a
+    # duplicate QNAME, a refused mint) must leave NO output directory behind for the
+    # launcher's manifest walker to find.
+    read_dir.mkdir(parents=True, exist_ok=True)
+
+    parts = 0
+    for lo in range(1, count + 1, rows_per_part):
+        hi = min(lo + rows_per_part - 1, count)
+        part = validate_parquet_path(read_dir / f"part_{parts:05d}.parquet")
+        conn.execute(
+            "COPY ( SELECT "
+            "  ?::BIGINT AS prep_sample_idx,"
+            "  sequence_index + ? - 1 AS sequence_idx,"
+            "  read_id, sequence1, qual1, sequence2, qual2 "
+            "FROM read_parquet(?) "
+            "WHERE sequence_index BETWEEN ? AND ? "
+            # Bounded: at most one batch's payload, not the whole sample. Still
+            # explicit — preserve_insertion_order=false means DuckDB is free to emit
+            # a batch's rows out of order, and the clustering is the point.
+            "ORDER BY sequence_idx ) "
+            f"TO '{part}' ({PARQUET_OPTS})",
+            [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
+        )
+        parts += 1
+
+    # The slicing above assumes `sequence_index` is DENSE 1..count (miint's per-file
+    # ordinal; pinned in tests/jobs/test_bam_to_parquet_miint_contract.py). If that
+    # ever stopped holding, the WHERE clauses would silently DROP rows and we would
+    # register a short sample — reads missing from the lake, with no error anywhere.
+    # The old single COPY had no WHERE and so could not do that. Footer-only count,
+    # no data scan.
+    written = conn.execute(
+        "SELECT count(*) FROM read_parquet(?)", [f"{read_dir}/part_*.parquet"]
+    ).fetchone()[0]
+    if written != count:
+        raise ValueError(
+            f"wrote {written} reads across {parts} part(s) but the BAM has {count} — "
+            "the sequence_index slicing dropped rows (is the ordinal still dense?)"
+        )
+    return parts
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -129,19 +241,25 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ),
         )
 
+    # Track the real cgroup, so a `--mem-gb` override and the runner's OOM
+    # escalation both actually reach DuckDB's memory_limit (a literal here would
+    # cap the escalated retry at the same limit that OOM'd the first attempt).
+    memory_gb = resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS)
+
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
-    # Output basename is the DuckLake table name: a downstream register-files step
-    # maps `read.parquet` -> the `read` table.
-    out_path = workspace / "read.parquet"
-    out = validate_parquet_path(out_path)
+    # `read` is a DIRECTORY of part_*.parquet rather than a single read.parquet: the
+    # final write is batched (see _write_read_parts). register-files already maps a
+    # top-level subdir of parts to the table named after the directory — the same
+    # multi-file form reference_load/hash_sequences use, and for the same reason.
+    read_dir = workspace / "read"
 
     try:
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
 
@@ -162,7 +280,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
             count, distinct_read_ids = conn.execute(
@@ -196,83 +314,42 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 ),
             )
 
-        # Mint a sequence_idx range from the CP — unless the work_ticket carries a
-        # `pre_minted_range` (E-operator recovery). Same typed-exception → explicit
-        # BackendFailure mapping as fastq_to_parquet (the framework dispatcher only
-        # wraps bare NotImplementedError/FileNotFoundError/ValueError).
-        if inputs.pre_minted_range is not None:
-            recovery = inputs.pre_minted_range
-            recovered_count = recovery.sequence_idx_stop - recovery.sequence_idx_start + 1
-            if recovered_count != count:
-                raise BackendFailure(
-                    kind=FailureKind.BAD_INPUT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=(
-                        f"pre_minted_range covers {recovered_count} indices "
-                        f"({recovery.sequence_idx_start}..{recovery.sequence_idx_stop}) "
-                        f"but the BAM has {count} reads — the recovery range must "
-                        f"match the prior attempt's mint count exactly"
-                    ),
-                )
-            sequence_idx_start = recovery.sequence_idx_start
-        else:
-            try:
-                async with make_cp_client() as http:
-                    rng = await cp_call_with_retry(
-                        lambda: mint_sequence_range(
-                            http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
-                        )
-                    )
-            except SequenceRangeAlreadyExists as exc:
-                raise BackendFailure(
-                    kind=FailureKind.UNKNOWN_PERMANENT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=str(exc),
-                ) from exc
-            except PrepSampleNotEligibleForSequenceRange as exc:
-                raise BackendFailure(
-                    kind=FailureKind.BAD_INPUT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=str(exc),
-                ) from exc
-            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
-                raise cp_call_failure(
-                    inputs.prep_sample_idx, exc, step_name=YAML_STEP_NAME
-                ) from exc
-            sequence_idx_start = rng.sequence_idx_start
+        # Mint the sequence_idx range from the CP. A 409 is NOT automatically a
+        # failure: `mint_or_reuse_sequence_range` reads back the existing range and
+        # reuses it IF this ticket minted it (a prior crashed attempt of this step),
+        # so an OOM-escalated retry completes instead of dying on the one-shot mint
+        # contract. A range minted by a DIFFERENT ticket means the reads are already
+        # loaded, and it refuses — reuse would register them twice.
+        async with make_cp_client() as http:
+            sequence_idx_start = await mint_or_reuse_sequence_range(
+                http,
+                inputs.prep_sample_idx,
+                count,
+                work_ticket_idx=inputs.work_ticket_idx,
+                step_name=YAML_STEP_NAME,
+            )
 
-        # Rewrite intermediate -> final with sequence_idx assigned and physically
-        # sorted on disk. sequence_idx = read_sequences_sam's per-file 1-based
-        # sequence_index + start - 1 (deterministic by construction — file order IS
-        # the assignment order, exactly like fastq_to_parquet). No miint here — a
-        # plain read_parquet carries the columns through. prep_sample_idx is a
-        # per-run constant (the `read` table's scope/prune column).
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=memory_gb,
                 threads=_DUCKDB_THREADS,
             )
-            conn.execute(
-                "COPY ( SELECT "
-                "  ?::BIGINT AS prep_sample_idx,"
-                "  sequence_index + ? - 1 AS sequence_idx,"
-                "  read_id, sequence1, qual1, sequence2, qual2 "
-                "FROM read_parquet(?) "
-                "ORDER BY sequence_idx ) "
-                f"TO '{out}' ({PARQUET_OPTS})",
-                [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
+            _write_read_parts(
+                conn,
+                intermediate=intermediate,
+                read_dir=read_dir,
+                prep_sample_idx=inputs.prep_sample_idx,
+                sequence_idx_start=sequence_idx_start,
+                count=count,
             )
     finally:
         # Clean up the intermediate BEFORE returning so the SLURM launcher's
-        # manifest walker (which runs after execute()) sees only read.parquet.
+        # manifest walker (which runs after execute()) sees only the read/ parts.
         intermediate.unlink(missing_ok=True)
 
-    # The workspace holds only read.parquet (intermediate unlinked above), exposed
-    # as read_staging_dir so a register-files step loads it into the DuckLake
-    # `read` table.
+    # The workspace holds only read/part_*.parquet (intermediate unlinked above),
+    # exposed as read_staging_dir so a register-files step loads the parts into the
+    # DuckLake `read` table.
     return {"read_staging_dir": workspace}

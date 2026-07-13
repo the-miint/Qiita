@@ -43,7 +43,9 @@ from ..repositories.sequence_range import (
 router = APIRouter(prefix=PATH_SEQUENCE_RANGE_PREFIX, tags=["sequence-range"])
 
 
-def _record_to_response(row: asyncpg.Record) -> SequenceRange:
+def _record_to_response(
+    row: asyncpg.Record, *, minted_by_work_ticket_state: str | None = None
+) -> SequenceRange:
     """Project an asyncpg.Record from sequence_range onto the response
     model. Field access is by name (not position) so a future column
     add to the table can't silently shift the projection."""
@@ -51,6 +53,12 @@ def _record_to_response(row: asyncpg.Record) -> SequenceRange:
         prep_sample_idx=row["prep_sample_idx"],
         sequence_idx_start=row["sequence_idx_start"],
         sequence_idx_stop=row["sequence_idx_stop"],
+        minted_by_work_ticket_idx=row["minted_by_work_ticket_idx"],
+        # Only the read-back joins the minting ticket; the mint's own RETURNING row
+        # has no state column (and needs none — the minter is the caller, running).
+        minted_by_work_ticket_state=(
+            row["minted_by_work_ticket_state"] if "minted_by_work_ticket_state" in row else None
+        ),
         created_at=row["created_at"],
     )
 
@@ -99,6 +107,7 @@ async def mint_sequence_range_route(
                 prep_sample_idx=body.prep_sample_idx,
                 count=body.count,
                 principal_idx=sa.principal_idx,
+                work_ticket_idx=body.work_ticket_idx,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
@@ -172,4 +181,6 @@ async def get_sequence_range_route(
             status_code=404,
             detail=f"no sequence_range for prep_sample_idx {prep_sample_idx}",
         )
-    return _record_to_response(row)
+    # This is the only path that joins the minting ticket — see
+    # fetch_sequence_range_by_prep_sample_idx.
+    return _record_to_response(row, minted_by_work_ticket_state=row["minted_by_work_ticket_state"])

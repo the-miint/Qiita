@@ -1,113 +1,79 @@
-# fastq_to_parquet retry recovery
+# Reads-ingest retry recovery (fastq_to_parquet / bam_to_parquet / ingest_reads)
 
-> Recovery path for a failed `fastq_to_parquet` work_ticket where the
-> sequence-range was already minted by the failed attempt. Avoids
-> destroying the prep_sample (the heavy-handed alternative).
+A reads job mints a `sequence_range` and **then** does its heavy durable write. The
+window between the two is exactly where an OOM or walltime kill lands, which leaves an
+orphaned range: the reads never reached the lake, but the sample's one-shot mint is
+spent.
 
-Audience: operators and `system_admin`s. The steps below read
-`qiita.work_ticket` and `qiita.sequence_range` directly and resubmit a
-work_ticket with a `pre_minted_range` the public `qiita` CLI does not
-expose — this is not an end-user `user`-role flow (contrast
-[`user-cli-quickstart.md`](user-cli-quickstart.md)).
+**This recovers itself now — there is almost nothing for an operator to do.**
 
-## When this applies
+Audience: operators and `system_admin`s.
 
-The job ran past phase 3 (CP-minted sequence_idx range) and then failed
-in phase 4 (rewrite the intermediate Parquet with the assigned
-sequence_idx values) — typical causes: disk full, OOM, DuckDB crash,
-SLURM node failure mid-write.
+## The common case: nothing to do
 
-Symptoms:
-- `qiita.work_ticket` row is in `state = FAILED`.
-- `failure_step_name = 'fastq'`, `failure_stage = 'step_run'`.
-- `failure_reason` does NOT contain "already has a sequence_range" —
-  this recovery path is for failures AFTER phase 3, not failures at
-  the mint call.
-- `qiita.sequence_range` has a row for `prep_sample_idx` (i.e., phase
-  3 succeeded before the crash).
+Every reads job pairs the mint with a read-back (`mint_or_reuse_sequence_range`). On a
+409 it reads the existing range back and, **if its own ticket minted it**, reuses it and
+carries on. So:
 
-If the failure was AT phase 3 (`SequenceRangeAlreadyExists` from a
-prior even earlier failure), there's no recovery via this path —
-follow the DELETE-prep_sample path instead.
+- The runner's in-place retry (including the OOM memory-escalation) recovers by itself.
+- A ticket that ended `FAILED` is re-driven with `qiita ticket run <idx>` — same ticket,
+  so the range is still its own, so the reuse applies.
 
-## Recovery sequence
+No DB reads, no hand-built resubmission payload. (The old `pre_minted_range` input that
+this page used to describe has been removed: it bypassed the ownership check below, and
+nothing could set it — the step binder drops unknown `action_context` keys.)
 
-1. **Identify the prep_sample_idx** from the failed work_ticket. The
-   schema (see `qiita-control-plane/db/migrations/20260504000001_work_ticket.sql`)
-   exposes scope-target scalars as nullable columns gated by
-   `scope_target_kind`; for a fastq_to_parquet ticket the kind is
-   `prep_sample` and the value lives in `prep_sample_idx`:
+## The refusal you might see, and what it means
 
-   ```sql
-   SELECT
-     work_ticket_idx,
-     prep_sample_idx,
-     failure_reason
-   FROM qiita.work_ticket
-   WHERE work_ticket_idx = $FAILED_WORK_TICKET_IDX
-     AND scope_target_kind = 'prep_sample';
-   ```
+> `prep_sample N already has a sequence_range minted by work_ticket M, not by this one
+> (work_ticket K) — its reads are already loaded, and re-ingesting would duplicate them`
 
-2. **Confirm the sequence-range row exists** for that prep_sample:
+Reuse is deliberately restricted to the **minting** ticket. A range minted by a
+*different* ticket means the sample's reads are **already registered in the lake**, and
+reusing the range would register them a second time. DuckLake has no uniqueness, so that
+duplication would be silent and permanent — hence a hard, permanent refusal.
 
-   ```sql
-   SELECT sequence_idx_start, sequence_idx_stop
-   FROM qiita.sequence_range
-   WHERE prep_sample_idx = $PREP_SAMPLE_IDX;
-   ```
+The same refusal fires when the minter is **unknown** (`minted_by_work_ticket_idx IS
+NULL` — a row the migration's backfill could not attribute unambiguously). Read it the
+same way: assume the sample is already loaded.
 
-   If this returns zero rows, the failure was at or before phase 3 —
-   this runbook does not apply; follow the DELETE-prep_sample path.
+**If you see this, the sample is already ingested. Do not force it through.** A
+deliberate re-ingest means destroying what is there first:
 
-3. **Confirm read count matches.** The orchestrator validates that the
-   recovery range covers exactly the FASTQ's read count
-   (`stop - start + 1`). If you somehow have a different FASTQ (e.g.,
-   the operator re-uploaded a corrected file), the orchestrator will
-   reject the recovery with `BAD_INPUT`. In that case, fall back to
-   the DELETE-prep_sample path so a fresh mint sizes correctly.
+- one sample → `DELETE` the `prep_sample` (its `sequence_range` goes with it via
+  `ON DELETE CASCADE`), then resubmit;
+- a whole pool → `qiita delete-sequenced-pool`, then resubmit.
 
-4. **Resubmit the work_ticket** with the recovery range populated in
-   the action inputs. The exact admin path depends on your CP's
-   retry-policy surface — minimally, the resubmission payload's
-   `inputs` block carries:
+Deleting the `prep_sample` is the **only** thing that clears a `sequence_range` — no CLI
+or route deletes one on its own.
 
-   ```json
-   {
-     "fastq_path": "/scratch/.../filename_prefix.fastq.gz",
-     "prep_sample_idx": 42,
-     "work_ticket_idx": <new_work_ticket_idx>,
-     "pre_minted_range": {
-       "sequence_idx_start": 1000,
-       "sequence_idx_stop":  1099
-     }
-   }
-   ```
+Confirm what you're about to destroy first:
 
-   Each fastq basename must start with the prep_sample's
-   `sequenced_pool_item_id` — the same filename-prefix rule the
-   `POST /work-ticket` route enforces (see
-   [`user-cli-quickstart.md`](user-cli-quickstart.md)). A paired-end
-   ticket adds `reverse_fastq_path` (e.g. `filename_prefix_R2.fastq.gz`);
-   a forward-only (single-end) ticket carries just `fastq_path`, as the
-   example above shows, and the prefix rule applies to that single read.
+```sql
+SELECT sr.prep_sample_idx,
+       sr.sequence_idx_start,
+       sr.sequence_idx_stop,
+       sr.minted_by_work_ticket_idx
+  FROM qiita.sequence_range sr
+ WHERE sr.prep_sample_idx = $PREP_SAMPLE_IDX;
+```
 
-   The orchestrator skips phase 3's HTTP mint call entirely when
-   `pre_minted_range` is set; phases 1, 2, and 4 run as on the first
-   attempt.
+## The other manual case: a width mismatch
 
-5. **Verify** on success: the Parquet at `reads.parquet` contains
-   `sequence_idx` values in `[start, stop]` and the data plane
-   registers the file into DuckLake without "sequence_idx range
-   mismatch" errors.
+> `… but its input now has N reads — the range must match the prior mint count exactly`
+
+The range's width no longer matches the input's read count, which means the **input file
+changed between attempts**. That is a data-integrity problem, not a retry problem:
+inputs are required to be immutable between work_ticket submission and step execution.
+Establish which file is correct before doing anything else; if the new file is the
+intended one, delete the prep_sample so a fresh mint sizes correctly.
 
 ## Force-failing a stuck ticket
 
-If a `pending`, `queued`, or `processing` ticket needs to be
-terminally failed (operator triage, blocked-by-unrelated-bug, etc.),
-use the `qiita-admin ticket force-fail` subcommand instead of writing
-the UPDATE statement by hand. It mirrors the
-`work_ticket_failure_step_name_consistent` CHECK constraint
-client-side and refuses to overwrite an already-terminal ticket:
+If a `pending`, `queued`, or `processing` ticket needs to be terminally failed (operator
+triage, blocked-by-unrelated-bug, etc.), use `qiita-admin ticket force-fail` rather than
+writing the UPDATE by hand. It mirrors the `work_ticket_failure_step_name_consistent`
+CHECK constraint client-side and refuses to overwrite an already-terminal ticket:
 
 ```bash
 # [admin] — DATABASE_URL sourced from /etc/qiita/control-plane.env
@@ -118,34 +84,18 @@ qiita-admin ticket force-fail \
     --reason "manual triage: stuck mid-step"
 ```
 
-`--step-name` is required when `--stage=step_run` and rejected when
-`--stage` is `submission` or `finalize`. The previous "UPDATE
-qiita.work_ticket SET state='failed' ..." pattern is no longer the
-supported recovery path.
-
-## Why not just DELETE the prep_sample and start over?
-
-That path works but destroys the prep_sample row. If anything else
-already references the sample (biosample link, metadata, another
-prep_sample sibling under the same biosample), you'd need to recreate
-all of that. The recovery range path skips the destructive step
-entirely for the common case of "phase 4 hit a transient I/O fault."
+`--step-name` is required when `--stage=step_run` and rejected when `--stage` is
+`submission` or `finalize`.
 
 ## Invariants preserved
 
-- All identifiers still minted exclusively by the CP (the recovery
-  range was minted on the original attempt; the retry reuses it).
-- `qiita.sequence_range.UNIQUE(prep_sample_idx)` stays unviolated —
-  the retry doesn't call mint.
-- Compute service-account scope-minimal at `sequence_range:mint` is
-  preserved (no new HTTP calls from the orchestrator on the retry
-  path).
-- Mint endpoint contract unchanged (still 409 on duplicate).
-
-## Future automation
-
-The runner could detect this scenario and auto-inject the
-`pre_minted_range` without operator action: query
-`qiita.sequence_range` for the prep_sample, find the existing row,
-populate the inputs block. Tracked as #40 (section (a)); this runbook
-documents the manual path that ships today.
+- All identifiers are still minted exclusively by the control plane; a retry reuses the
+  range its own attempt minted rather than allocating a new one.
+- `qiita.sequence_range.UNIQUE(prep_sample_idx)` is never violated — the reuse path does
+  not re-mint.
+- The compute service account stays scope-minimal: the read-back
+  (`GET /sequence-range/{idx}`) is deliberately gated on the same `sequence_range:mint`
+  scope the mint uses, so no `prep_sample:read` grant is needed.
+- The mint endpoint's contract is unchanged (still 409 on duplicate); what changed is
+  that the *caller* now recovers from that 409 when — and only when — the range is its
+  own.

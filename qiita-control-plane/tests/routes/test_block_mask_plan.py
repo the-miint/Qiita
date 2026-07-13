@@ -103,7 +103,13 @@ async def planned(ctx, monkeypatch):
             owner,
         )
         async with db.acquire() as conn, conn.transaction():
-            await mint_sequence_range(conn, prep_sample_idx=ps, count=150, principal_idx=owner)
+            await mint_sequence_range(
+                conn,
+                prep_sample_idx=ps,
+                count=150,
+                principal_idx=owner,
+                work_ticket_idx=None,
+            )
 
     yield {
         "db": db,

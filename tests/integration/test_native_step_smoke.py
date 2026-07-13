@@ -132,7 +132,7 @@ async def test_fastq_to_parquet_through_runner(
     (tests/test_sequence_range.py); spinning up the CP app in-process
     here would add infrastructure for one assertion that the unit
     tests already cover."""
-    from qiita_compute_orchestrator.jobs import fastq_to_parquet as fastq_module
+    from qiita_compute_orchestrator import sequence_range_retry
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
     from qiita_control_plane.runner import run_workflow
 
@@ -146,13 +146,14 @@ async def test_fastq_to_parquet_through_runner(
     # the fake ignores http (no client is constructed at all).
     mint_calls: list[tuple[int, int]] = []
 
-    async def _local_mint(*, http, prep_sample_idx, count):
+    async def _local_mint(*, http, prep_sample_idx, count, work_ticket_idx):
         mint_calls.append((prep_sample_idx, count))
         row = await postgres_pool.fetchrow(
-            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3)",
+            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3, $4)",
             prep_sample_idx,
             count,
             admin_idx,
+            work_ticket_idx,
         )
         return MintedSequenceRange(
             prep_sample_idx=row["prep_sample_idx"],
@@ -160,7 +161,9 @@ async def test_fastq_to_parquet_through_runner(
             sequence_idx_stop=row["sequence_idx_stop"],
         )
 
-    monkeypatch.setattr(fastq_module, "mint_sequence_range", _local_mint)
+    # Patch the shared mint helper, which is where every reads job now resolves
+    # mint_sequence_range from (sequence_range_retry.mint_or_reuse_sequence_range).
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _local_mint)
 
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket ("

@@ -24,6 +24,10 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 
+# The ticket the mint records as the range's minter. No FK, so any positive idx is
+# accepted at the DB layer; the value only ever gets compared for equality.
+_WORK_TICKET_IDX = 7
+
 pytestmark = pytest.mark.db
 
 
@@ -153,7 +157,11 @@ async def sa_no_mint_client(postgres_pool, compute_worker_service_account):
 async def test_post_anonymous_401(ctx):
     resp = await ctx["anon"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 10,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert resp.status_code == 401, resp.text
 
@@ -181,7 +189,11 @@ async def test_post_human_user_403_even_with_scope(ctx, postgres_pool, regular_u
     ) as user_with_mint:
         resp = await user_with_mint.post(
             URL_SEQUENCE_RANGE_PREFIX,
-            json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+            json={
+                "prep_sample_idx": ctx["prep_sample_idx"],
+                "count": 10,
+                "work_ticket_idx": _WORK_TICKET_IDX,
+            },
         )
     assert resp.status_code == 403, resp.text
     # Detail comes from require_service, NOT require_scope — proves the
@@ -192,7 +204,11 @@ async def test_post_human_user_403_even_with_scope(ctx, postgres_pool, regular_u
 async def test_post_sa_without_scope_403(ctx, sa_no_mint_client):
     resp = await sa_no_mint_client.post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 10,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert resp.status_code == 403, resp.text
     assert "sequence_range:mint" in resp.json()["detail"]
@@ -206,7 +222,11 @@ async def test_post_sa_without_scope_403(ctx, sa_no_mint_client):
 async def test_post_sa_happy_path_returns_range(ctx):
     resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 10,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert resp.status_code == 201, resp.text
     body = resp.json()
@@ -215,16 +235,21 @@ async def test_post_sa_happy_path_returns_range(ctx):
     assert body["sequence_idx_start"] >= 1
     # created_at returned as ISO-8601 string
     assert "created_at" in body and isinstance(body["created_at"], str)
+    # The minting ticket round-trips. This is the fact the reuse guard rests on: a
+    # reads job reuses an orphaned range ONLY when this matches its own ticket.
+    assert body["minted_by_work_ticket_idx"] == _WORK_TICKET_IDX
 
     # Verify the row landed in the DB.
     row = await ctx["pool"].fetchrow(
-        "SELECT sequence_idx_start, sequence_idx_stop, created_by_idx"
+        "SELECT sequence_idx_start, sequence_idx_stop, created_by_idx,"
+        "       minted_by_work_ticket_idx"
         "  FROM qiita.sequence_range WHERE prep_sample_idx = $1",
         ctx["prep_sample_idx"],
     )
     assert row["sequence_idx_start"] == body["sequence_idx_start"]
     assert row["sequence_idx_stop"] == body["sequence_idx_stop"]
     assert row["created_by_idx"] == ctx["sa_session"]["principal_idx"]
+    assert row["minted_by_work_ticket_idx"] == _WORK_TICKET_IDX
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +260,19 @@ async def test_post_sa_happy_path_returns_range(ctx):
 async def test_post_duplicate_prep_sample_idx_409(ctx):
     await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 10,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 10,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert resp.status_code == 409, resp.text
 
@@ -250,7 +283,11 @@ async def test_post_nonpositive_count_422(ctx, bad_count):
     handler runs, surfacing as 422."""
     resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": bad_count},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": bad_count,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert resp.status_code == 422, resp.text
 
@@ -270,7 +307,11 @@ async def test_post_count_above_cap_400(ctx, monkeypatch):
     )
     resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 6},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 6,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert resp.status_code == 400, resp.text
     assert "count" in resp.json()["detail"].lower()
@@ -283,7 +324,7 @@ async def test_post_unknown_prep_sample_idx_404(ctx):
     )
     resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": bogus_idx, "count": 10},
+        json={"prep_sample_idx": bogus_idx, "count": 10, "work_ticket_idx": _WORK_TICKET_IDX},
     )
     assert resp.status_code == 404, resp.text
 
@@ -328,11 +369,15 @@ async def test_post_concurrent_mints_disjoint(ctx):
     r_a, r_b = await asyncio.gather(
         ctx["sa"].post(
             URL_SEQUENCE_RANGE_PREFIX,
-            json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 100},
+            json={
+                "prep_sample_idx": ctx["prep_sample_idx"],
+                "count": 100,
+                "work_ticket_idx": _WORK_TICKET_IDX,
+            },
         ),
         ctx["sa"].post(
             URL_SEQUENCE_RANGE_PREFIX,
-            json={"prep_sample_idx": ps2, "count": 100},
+            json={"prep_sample_idx": ps2, "count": 100, "work_ticket_idx": _WORK_TICKET_IDX},
         ),
     )
     assert r_a.status_code == 201, r_a.text
@@ -364,7 +409,11 @@ async def test_get_user_with_prep_sample_read_returns_row(ctx):
     # Mint a range first via the SA.
     post_resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 5},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 5,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert post_resp.status_code == 201, post_resp.text
     minted = post_resp.json()
@@ -402,7 +451,11 @@ async def test_get_sa_with_mint_scope_returns_row(ctx):
     ingest_reads reuse path — without it, the SA would 403 here."""
     post_resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 7},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 7,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     assert post_resp.status_code == 201, post_resp.text
     minted = post_resp.json()
@@ -436,7 +489,11 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     a new prep_sample lands above the deleted range's stop (no recycle)."""
     first_resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
+        json={
+            "prep_sample_idx": ctx["prep_sample_idx"],
+            "count": 10,
+            "work_ticket_idx": _WORK_TICKET_IDX,
+        },
     )
     first = first_resp.json()
 
@@ -460,7 +517,7 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     ctx["created"]["prep_sample"].append(ps2)
     second_resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": ps2, "count": 5},
+        json={"prep_sample_idx": ps2, "count": 5, "work_ticket_idx": _WORK_TICKET_IDX},
     )
     assert second_resp.status_code == 201, second_resp.text
     second = second_resp.json()
