@@ -1383,8 +1383,8 @@ async def no_biosample_read_client(make_pat_client):
 
 
 def _assert_etag_quoted(resp) -> None:
-    """Confirm the ETag header is present and wrapped in double quotes
-    per Decision 3. Format inside the quotes is opaque-by-contract."""
+    """Confirm the ETag header is present and wrapped in double quotes.
+    Format inside the quotes is opaque-by-contract."""
     etag = resp.headers.get("ETag")
     assert etag is not None and etag.startswith('"') and etag.endswith('"')
 

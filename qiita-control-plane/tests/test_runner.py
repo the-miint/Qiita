@@ -2204,12 +2204,12 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
 
 
 # =============================================================================
-# _resolve_sharded_align_indexes  (C2a — router + per-aligner shard dir)
+# _resolve_sharded_align_indexes  (router + per-aligner shard dir)
 # =============================================================================
 #
 # Resolves (router_index_paths, shard_directory) for align_sharded against an
-# ACTIVE sharded reference. Built + tested now, UNWIRED (the align workflow is
-# C2b) — like C1's align job it ships tested but with no consumer yet.
+# ACTIVE sharded reference. Built + tested now, UNWIRED — like the align job it
+# ships tested but with no consumer yet.
 
 
 async def _activate(pool, reference_idx):
@@ -3193,7 +3193,7 @@ async def test_stage_shard_roster_dataplane_failure_is_submission(
 
 
 # =============================================================================
-# _stage_shard_mapping + plan-shards router gate (C2a)
+# _stage_shard_mapping + plan-shards router gate
 # =============================================================================
 #
 # _stage_shard_mapping exports reference_membership.shard_id (Postgres — the

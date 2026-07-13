@@ -276,11 +276,13 @@ async def test_get_reference_index_returns_rows(client, postgres_pool):
 
 
 async def test_get_reference_index_returns_shard_id(client, postgres_pool):
-    """A sharded analysis reference surfaces its ONE whole-reference rype ROUTER
-    (`shard_id: null` — RYpe holds every shard as a bucket in a single index, there
-    is NO per-shard rype index) plus one flat row PER SHARD for each ALIGNER index
-    (minimap2 / bowtie2), each carrying its `shard_id`. Grouping into "one logical
-    index with N shards" is a later concern."""
+    """A sharded analysis reference surfaces its whole-reference rype ROUTER
+    (`shard_id: null` — RYpe holds shards as BUCKETS in a multi-bucket router, so
+    routing is served by router(s), never a per-shard rype index) plus one flat row
+    PER SHARD for each ALIGNER index (minimap2 / bowtie2), each carrying its
+    `shard_id`. Today a reference has a single router (growth that adds shards in a
+    separate rype index — more routers — is a later concern, out of scope here);
+    grouping into "one logical index with N shards" is likewise a later concern."""
     r = await _create_ref(client, "test-index-shards")
     idx = r.json()["reference_idx"]
     await postgres_pool.execute(
@@ -313,7 +315,7 @@ async def test_get_reference_index_404_when_reference_absent(client, postgres_po
 
 
 # ---------------------------------------------------------------------------
-# GET /reference/{idx}/shard-index-status — sharded-build progress (B5)
+# GET /reference/{idx}/shard-index-status — sharded-build progress
 # ---------------------------------------------------------------------------
 
 _BUILD_SHARD_INDEX_ACTION_ID = "build-shard-index"
@@ -477,7 +479,7 @@ async def test_shard_index_status_tolerates_non_object_context(client, postgres_
 
 
 # ---------------------------------------------------------------------------
-# POST /reference/{idx}/ticket/doget — feature_idx-scoped ticket (B6)
+# POST /reference/{idx}/ticket/doget — feature_idx-scoped ticket
 # ---------------------------------------------------------------------------
 # The doget route is scope-gated on tickets:doget, which SYSTEM_ADMIN does NOT
 # hold (only the service-account ceiling does), so these tests drive it with the

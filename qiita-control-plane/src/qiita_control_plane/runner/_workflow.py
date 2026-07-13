@@ -245,8 +245,8 @@ async def run_workflow(
 
         # Sharded-aligner index resolution (the `align` workflow): when a step
         # lists router_index_path/shard_directory as inputs, resolve them from
-        # action_context (align_reference_idx + aligner) before the loop — the C2b
-        # consumer wiring into the C2a resolver. Same inside-try placement as the
+        # action_context (align_reference_idx + aligner) before the loop — the
+        # consumer wiring into the resolver. Same inside-try placement as the
         # host-filter resolver so a failure (unknown / non-active reference,
         # unbuilt router / per-shard index) lands in the outer FAILED handler
         # instead of leaving the ticket stuck in PROCESSING. None of these keys are

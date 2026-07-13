@@ -20,7 +20,7 @@ description: >
   Per-shard analysis indexes are minimap2 + bowtie2: by default both are built,
   and `build_*: false` in action_context skips a builder (and its register-index).
   Per-shard rype no longer exists — routing is served by the ONE whole-reference
-  `rype_router` the parent reference-add builds (C2), so a shard builds only the
+  `rype_router` the parent reference-add builds, so a shard builds only the
   aligner subject indexes. The reference is already `indexing` when this runs (the
   parent's plan-shards transitioned it), so the build steps carry no
   target_status and the action carries NO success_status — finalize-shard owns

@@ -846,7 +846,7 @@ async def finalize_shard(
     expected type has a registered row for all N shards AND the ONE
     whole-reference `rype_router` row is registered (shard_id NULL), it does the
     guarded `indexing -> active` transition so `active` guarantees a
-    fully-index-complete AND routable sharded reference (the C1 consumer needs no
+    fully-index-complete AND routable sharded reference (the consumer needs no
     coverage check). A single still-missing shard, or a missing router, leaves the
     reference honestly in `indexing` (fail-closed) — this primitive NEVER
     transitions to `failed` (the FSM's only exit from `failed` is `-> pending`, a

@@ -113,7 +113,7 @@ async def _stage_shard_roster(
     The shard's features are the cover-map (`reference_membership.shard_id`);
     their `sequence_length_bp` lives in DuckLake `reference_sequences`, reachable
     only over Flight. So we read the shard's feature_idx set from Postgres, sign
-    a `feature_idx`-scoped `reference_sequences` DoGet (the B6 subset ticket — so
+    a `feature_idx`-scoped `reference_sequences` DoGet (the subset ticket — so
     each shard transfers only its own slice, not the whole reference N times),
     and write `<workspace>/shard_roster.parquet`. Binds `shard_features` (the
     roster path) and `shard_id` so the build steps' `Inputs` resolve.

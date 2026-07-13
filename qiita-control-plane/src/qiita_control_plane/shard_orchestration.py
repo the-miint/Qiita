@@ -46,7 +46,7 @@ BUILD_SHARD_INDEX_ACTION_VERSION = "1.0.0"
 # action_context build-gate flag -> the reference_index.index_type it produces.
 # finalize_shard counts registered shards per expected type; the fan-out copies
 # these flags (+ knobs) into each shard ticket's context. Ordered so the gate
-# subset is stable. Per-shard rype is no longer built (C2): routing is served by
+# subset is stable. Per-shard rype is no longer built: routing is served by
 # the ONE whole-reference `rype_router` the parent reference-add builds, so the
 # per-shard analysis indexes are minimap2 + bowtie2 only.
 SHARD_BUILD_INDEX_TYPES: dict[str, str] = {

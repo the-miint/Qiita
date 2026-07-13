@@ -294,7 +294,7 @@ async def _resolve_sharded_align_indexes(
       LIST so a future GROWABLE reference (new shards land in a SEPARATE router
       UNIONed at classify time, no full rebuild) resolves to the SET the consumer
       classifies against without a signature change. `align_sharded`'s current
-      single-Path `router_index_path` input is a C2b consumer-side change.
+      single-Path `router_index_path` input is a consumer-side change.
     * **shard_directory** — the per-aligner root holding all shards. There is no
       `reference_index` row for the root, so it is derived from any one per-shard
       row's `fs_path` (see `_SHARD_ALIGNER`): minimap2's root is
@@ -364,7 +364,7 @@ async def _resolve_sharded_align_indexes(
 
 # Binding names the align step (`align_sharded`) declares as inputs. Their
 # presence signals the runner to resolve the sharded reference's router + shard
-# root from action_context before the step loop (the C2b consumer wiring). The
+# root from action_context before the step loop (the consumer wiring). The
 # router is bound as a SINGLE path (router_paths[0] — one router today; the
 # resolver returns a list for the deferred growth case).
 ROUTER_INDEX_PATH_BINDING = "router_index_path"
@@ -390,7 +390,7 @@ async def _resolve_sharded_align_index_bindings(
     """Resolve `router_index_path` + `shard_directory` for the `align` workflow
     from action_context (`align_reference_idx` + `aligner`), binding the FIRST
     router (`router_paths[0]`) as the single-Path `router_index_path` input
-    `align_sharded` takes. The C2b entrypoint into the C2a resolver.
+    `align_sharded` takes. The entrypoint into the resolver.
 
     `align_reference_idx` (not the reserved `reference_idx` key — block scope
     injects no scope scalar) names the ACTIVE sharded reference; `aligner`

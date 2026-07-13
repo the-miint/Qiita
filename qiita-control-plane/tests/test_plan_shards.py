@@ -1,6 +1,6 @@
 """Tests for the plan-shards assignment core.
 
-`plan_shards` turns the B2 tiler + persistence into an end-to-end shard
+`plan_shards` turns the tiler + persistence into an end-to-end shard
 assignment for one reference: stream (feature_idx, genome_idx) from Postgres,
 DoGet the reference's taxonomy from the data plane, reduce to one lineage per
 genome in DuckDB, tile lineage-sorted (`tile_by_lineage`), expand back to

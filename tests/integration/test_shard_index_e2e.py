@@ -25,7 +25,7 @@ the runner drive + DP DoGet + real streaming build. The roster DoGet in
 
 Only `build_minimap2` is enabled (bowtie2 off) to keep the real build tiny;
 finalize-shard then expects exactly {minimap2}. Because per-shard rype no longer
-exists (C2), routing is the whole-reference `rype_router` the PARENT reference-add
+exists, routing is the whole-reference `rype_router` the PARENT reference-add
 builds — this child-workflow test pre-registers that router row (standing in for
 the parent's build_routing_index) so finalize-shard's router gate is satisfied and
 the reference flips active. The per-shard minimap2/bowtie2 stream builds and the

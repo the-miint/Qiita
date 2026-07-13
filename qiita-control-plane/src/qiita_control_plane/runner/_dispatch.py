@@ -94,7 +94,7 @@ async def _shard_fanout_owns_finalize(
     Fires for a reference-scoped ticket whose action_context set `shard_index`
     AND whose reference is `indexing` (plan-shards transitioned it because N > 0)
     OR already `active`. The `active` case is essential: the parent reference-add
-    now runs its OWN terminal `finalize-shard` (the C2a router tail), and because
+    now runs its OWN terminal `finalize-shard` (the router tail), and because
     the parent's whole-reference router build is the long pole, that parent
     finalize is usually the LAST completion event — so it flips `indexing →
     active` itself, and by the time this workflow-finalize runs the reference is

@@ -35,7 +35,7 @@ def stage_subject(
     chunk rows and return its row count.
 
     `source` is any FROM-able relation operand carrying `(feature_idx,
-    chunk_index, chunk_data)` columns: a registered stream relation NAME (the B6s
+    chunk_index, chunk_data)` columns: a registered stream relation NAME (the
     `stream_reference_chunks` relation) OR a `read_parquet('…')` expression (the
     host-mode staging path). The chunks are reassembled per feature via
     `string_agg(chunk_data ORDER BY chunk_index)` (`reassemble_chunks_expr`, the

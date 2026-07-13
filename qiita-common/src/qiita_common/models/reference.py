@@ -235,7 +235,7 @@ HOST_FILTER_REQUIRED_INDEX_TYPES = frozenset(
 # twin — see CLAUDE.md "Enum parity").
 INDEX_TYPE_BOWTIE2 = "bowtie2"
 
-# The whole-reference rype ROUTER `.ryxdi` (C1): a single multi-bucket rype index
+# The whole-reference rype ROUTER `.ryxdi`: a single multi-bucket rype index
 # over the entire reference, one bucket per shard (`bucket_name = str(shard_id)`),
 # that one `rype_classify` pass turns into the `read_to_shard` table the sharded
 # aligners need. Analysis-only (like bowtie2) — NOT in
@@ -243,9 +243,10 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 # job with `shard_id` NULL (whole-reference, not per-shard).
 #
 # Admitted into the `reference_index.index_type` CHECK allow-list by
-# 20260711000000_reference_index_rype_router_type.sql: C2 builds the router in
-# the sharded reference-add path and registers the row. C1 was native-job-only
-# and passed the router path directly to the align job, so no row carried it yet.
+# 20260711000000_reference_index_rype_router_type.sql: the sharded reference-add
+# path builds the router and registers the row. Previously the router was
+# native-job-only and its path passed directly to the align job, so no row
+# carried it yet.
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
 

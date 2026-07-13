@@ -248,7 +248,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 }
 
 /// Create the DuckLake `alignment` table — the sink for the sharded-alignment
-/// consumer (C2b).
+/// consumer.
 ///
 /// One row per emitted alignment: the `align_sharded` native job aligns a block
 /// of a sample's HOST-DEPLETED reads against a sharded reference and register-files
@@ -616,7 +616,7 @@ mod tests {
     /// every DP restart) and lays down the alignment sink in the EXACT column
     /// order + types align_sharded's COPY writes, so register-files'
     /// ducklake_add_data_files schema-matches. The full column list is pinned
-    /// here so a drift from the align_sharded output (WS4) or the miint SAM
+    /// here so a drift from the align_sharded output or the miint SAM
     /// schema is caught at unit time rather than at register-files runtime.
     #[test]
     #[serial]

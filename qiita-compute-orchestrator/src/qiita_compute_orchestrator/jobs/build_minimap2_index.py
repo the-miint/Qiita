@@ -12,11 +12,11 @@ Two modes, mirroring `build_rype_index`:
 * **Shard mode** (`shard_id` + `shard_features` roster) — one shard's analysis
   subject index, built over just that shard's features. The roster's small
   `feature_idx` list rides the job input; the chunk bytes STREAM from the data
-  plane over Arrow Flight (the B6s `open_reference_chunk_stream` seam), not staging
+  plane over Arrow Flight (the `open_reference_chunk_stream` seam), not staging
   Parquet. Written to `.../minimap2-shards/{shard_id}.mmi` — the flat
   `{shard_directory}/{shard_name}.mmi` shape `align_minimap2_sharded` binds
-  (`shard_name = str(shard_id)`). This is the first builder to consume the B6s
-  stream; C1's `align_minimap2_sharded` consumes the per-shard `.mmi` set.
+  (`shard_name = str(shard_id)`). This is the first builder to consume the
+  stream; `align_minimap2_sharded` consumes the per-shard `.mmi` set.
 
 Both modes reassemble the per-feature contig into a `(read_id, sequence1)` subject
 via the shared `subject.stage_subject` (`string_agg(chunk_data ORDER BY
@@ -116,7 +116,7 @@ class Inputs(BaseModel):
     SHARD mode (both `shard_id` and `shard_features` set) builds one shard's
     subject `.mmi` over just that shard's features: `shard_features` is a
     runner-staged Parquet roster `(feature_idx BIGINT, sequence_length_bp BIGINT)`
-    whose `feature_idx` list scopes a B6s DoGet ticket, and the chunk bytes stream
+    whose `feature_idx` list scopes a DoGet ticket, and the chunk bytes stream
     from the data plane. Left unset (both None) is HOST/whole-reference mode —
     today's behavior, byte-identical.
     """

@@ -19,7 +19,7 @@ self-describing and exercises the same mapping path future multi-bucket
 This job is WHOLE-REFERENCE / host-only. The multi-bucket sharded ROUTER (one
 bucket per shard) is a separate job (`build_routing_index`); per-shard rype
 `.ryxdi` builds no longer exist — the whole-reference router replaced them for
-routing (C2).
+routing.
 
 rype build parameters default to k=64, w=20 (the function's own w default is
 50, so we pass 20 explicitly); `w` is overridable per build via the `rype_w`

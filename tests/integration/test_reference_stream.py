@@ -1,6 +1,6 @@
 """Integration test: feature_idx-scoped ticket → stream_reference_chunks → DuckDB.
 
-Proves the compute-side streaming foundation (B6s): a native build job can pull
+Proves the compute-side streaming foundation: a native build job can pull
 a shard's reference sequence chunks from the live data plane over Arrow Flight,
 scoped to a feature_idx subset, and reassemble them in DuckDB — without reading
 staging Parquet. The ticket is signed directly with the data plane's HMAC secret

@@ -1,7 +1,7 @@
 """Reference-chunk retrieval for native jobs.
 
-The two-step path a native build job (B4 aligner-subject builders, and the
-eventual B3-rype migration) uses to pull a shard's reference sequences from
+The two-step path a native build job (aligner-subject builders, and the
+eventual rype migration) uses to pull a shard's reference sequences from
 the data plane instead of reading staging Parquet:
 
 1. `fetch_reference_doget_ticket` — a CO→CP call (compute service-account PAT)
@@ -113,7 +113,7 @@ async def open_reference_chunk_stream(
     feature_idx: list[int] | None,
     relation: str = "reference_chunks",
 ) -> AsyncIterator[str]:
-    """Compose the two B6s seams into one: mint a `feature_idx`-scoped DoGet
+    """Compose the two seams into one: mint a `feature_idx`-scoped DoGet
     ticket (CO→CP) and stream that roster's `reference_sequence_chunks` rows
     (CO→DP Flight) into `conn` as `relation`, yielding the registered relation
     name for the caller to reassemble from inside the `async with` body.

@@ -78,11 +78,11 @@ def rype_router_index_path(derived_root: Path | str, reference_idx: int) -> Path
     A single multi-bucket router over the ENTIRE reference — one bucket per shard
     (``bucket_name = str(shard_id)``) — written by ``build_routing_index``. One
     ``rype_classify`` pass against it yields the ``read_to_shard`` table
-    ``align_*_sharded`` need (see C1). Distinct from the per-reference host-filter
+    ``align_*_sharded`` need. Distinct from the per-reference host-filter
     ``rype_index_path`` (a single POSITIVE bucket). Sits directly under the
     per-reference subtree so the ``DELETE /reference-artifact/{idx}`` rmtree purges
     it; ``shard_id`` is NULL on its ``reference_index`` row (whole-reference, not
-    per-shard). It replaced the per-shard routing ``.ryxdi`` removed in C2."""
+    per-shard). It replaced the per-shard routing ``.ryxdi``."""
     return reference_derived_dir(derived_root, reference_idx) / "rype-router.ryxdi"
 
 

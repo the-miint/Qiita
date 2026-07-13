@@ -257,7 +257,7 @@ def test_build_bowtie2_index_empty_reference_raises(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Shard mode (streaming via B6s) + plan()
+# Shard mode (streaming) + plan()
 # ---------------------------------------------------------------------------
 
 

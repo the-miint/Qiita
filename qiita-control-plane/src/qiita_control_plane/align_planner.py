@@ -9,7 +9,7 @@ samples + a sharded reference + an aligner, the planner:
      lookup, NEVER a mint) and requires the sample's `mask_sample` gate to be
      `completed` (align only fully-masked samples);
   2. asserts the reference is ACTIVE + sharded (router + per-aligner shard rows)
-     via the C2a resolver, failing 4xx early otherwise;
+     via the resolver, failing 4xx early otherwise;
   3. partitions the to-align samples by resolved `mask_idx` and mints one
      `alignment_idx` per partition over `{reference_idx, aligner, mask_idx,
      shard_ids}` (the mask-style identity, deduped fleet-wide);

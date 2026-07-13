@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Sharded-alignment review revisions (#268).** Reworked the sharded-alignment
+  path per review: the aligner is now derived from the run's sequencing platform
+  (Illumina → bowtie2, PacBio HiFi / Nanopore → minimap2) at align-plan rather than
+  chosen by the caller (`AlignPlanRequest` drops `aligner`; an unsupported platform
+  is refused 422); bowtie2 runs the modified-SHOGUN parameter set (all concordant
+  placements via `report_all`) and a pooled `cigar_sequence_identity ≥ 0.99` filter
+  keeps only high-identity pairs (kept/dropped as a unit, never orphaning a mate),
+  minimap2 uses `map-hifi` + `eqx`; the DuckLake `alignment` table drops the raw
+  `reference`/`mate_reference` VARCHARs (`feature_idx`/`mate_feature_idx` carry the
+  identity). A sharded reference's per-shard `.mmi` is now always built with the
+  fixed `map-hifi` preset (not tunable on load). The GPL boundary is installed once
+  at deploy (miint staging) instead of per job. Added a neutral `INDEX_TYPE_MINIMAP2`
+  constant for the analysis-reference context (the host-filter-branded alias stays).
+  (#268)
+
 - **The work-ticket notification email now accounts for every ticket the recipient
   has, not just the ones that reached a terminal state.** Notifications land
   per-batch as tickets terminate, so during a fanout the recipient gets a stream of

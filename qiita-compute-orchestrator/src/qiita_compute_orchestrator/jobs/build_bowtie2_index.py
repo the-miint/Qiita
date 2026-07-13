@@ -2,7 +2,7 @@
 
 The analysis-alignment sibling of `build_minimap2_index`. Where minimap2's `.mmi`
 is the host-filter second-pass index, bowtie2's `.bt2` set is the subject index
-C1's `align_bowtie2_sharded` reads. Two modes, identical in shape to
+`align_bowtie2_sharded` reads. Two modes, identical in shape to
 `build_minimap2_index`:
 
 * **Host / whole-reference mode** (no `shard_id`) — reassembles the whole
@@ -10,7 +10,7 @@ C1's `align_bowtie2_sharded` reads. Two modes, identical in shape to
   `{path_derived}/references/{idx}/bowtie2/index` (a PREFIX).
 * **Shard mode** (`shard_id` + `shard_features` roster) — one shard's subject
   index, built over just that shard's features, chunk bytes STREAMED from the
-  data plane over Arrow Flight (B6s), written under
+  data plane over Arrow Flight, written under
   `.../bowtie2-shards/{shard_id}/index` — the `{shard_directory}/{shard_name}/index.*`
   shape `align_bowtie2_sharded` binds (`shard_name = str(shard_id)`).
 
@@ -102,7 +102,7 @@ class Inputs(BaseModel):
     SHARD mode (both `shard_id` and `shard_features` set) builds one shard's
     subject `.bt2` set over just that shard's features: `shard_features` is a
     runner-staged Parquet roster `(feature_idx BIGINT, sequence_length_bp BIGINT)`
-    whose `feature_idx` list scopes a B6s DoGet ticket, and the chunk bytes stream
+    whose `feature_idx` list scopes a DoGet ticket, and the chunk bytes stream
     from the data plane. Left unset (both None) is HOST/whole-reference mode.
     """
 

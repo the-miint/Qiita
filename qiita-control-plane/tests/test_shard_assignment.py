@@ -2,7 +2,7 @@
 
 `write_shard_assignment` records a shard planner's output onto
 qiita.reference_membership.shard_id (one shard per feature within a reference).
-It is the DB side of milestone B2; the pure tiler lives in shard_planner.py and
+It is the DB side of shard assignment; the pure tiler lives in shard_planner.py and
 the ingest-time wiring (feed lineages, expand genome→feature) is a later
 milestone.
 """

@@ -2,7 +2,7 @@
 
 The routing index is a WHOLE-REFERENCE, MULTI-bucket rype `.ryxdi` (one bucket
 per shard) that `rype_classify` turns into the `read_to_shard` table the sharded
-aligners consume. These tests stub the two heavy seams — the B6s stream
+aligners consume. These tests stub the two heavy seams — the stream
 (`open_reference_chunk_stream`) with a local chunk Parquet, and the real rype
 build (`_run_rype_index_create`) — and assert the orchestration around them:
 
@@ -32,7 +32,7 @@ import pytest
 
 def _write_chunks_parquet(path: Path, rows: list[tuple[int, int, str]]) -> Path:
     """Write a feature-keyed chunk Parquet `(feature_idx BIGINT, chunk_index
-    INTEGER, chunk_data VARCHAR)` — the shape the B6s stream carries."""
+    INTEGER, chunk_data VARCHAR)` — the shape the stream carries."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(":memory:") as conn:
         if not rows:
@@ -86,7 +86,7 @@ def _write_mapping(path: Path, rows: list[tuple[int, str]]) -> Path:
 
 def _fake_stream_from_parquet(parquet: Path, captured: dict):
     """A fake `open_reference_chunk_stream` that registers a local chunk Parquet as
-    the streamed relation (simulating the whole-reference B6s DoGet), capturing the
+    the streamed relation (simulating the whole-reference DoGet), capturing the
     ticket scope args — mirrors the build_rype_index shard-mode test stub."""
 
     @asynccontextmanager

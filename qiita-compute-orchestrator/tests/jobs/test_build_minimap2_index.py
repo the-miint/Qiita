@@ -295,13 +295,13 @@ def test_build_minimap2_index_real_smoke(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Shard mode (streaming via B6s) + plan()
+# Shard mode (streaming) + plan()
 # ---------------------------------------------------------------------------
 
 
 def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
     """Write a shard feature roster Parquet `(feature_idx BIGINT,
-    sequence_length_bp BIGINT)` — the per-shard subset B5 will stage from
+    sequence_length_bp BIGINT)` — the per-shard subset staged from
     reference_membership.shard_id joined with the sequence lengths."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(":memory:") as conn:
@@ -327,7 +327,7 @@ def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
 
 def _fake_stream_from_parquet(parquet: Path, captured: dict):
     """Build a fake `open_reference_chunk_stream` that registers a local chunk
-    Parquet as the streamed relation (simulating the B6s DoGet), capturing the
+    Parquet as the streamed relation (simulating the DoGet), capturing the
     ticket scope args."""
 
     @asynccontextmanager

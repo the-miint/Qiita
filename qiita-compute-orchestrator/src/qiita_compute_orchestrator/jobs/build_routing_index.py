@@ -1,15 +1,15 @@
-"""Native job: build the whole-reference rype ROUTER index (C1 sharded routing).
+"""Native job: build the whole-reference rype ROUTER index (sharded routing).
 
 Where `build_rype_index` builds a POSITIVE single-bucket host index (host = any
 emitted row) and its shard-mode twin builds one per-shard `.ryxdi`, this job
 builds ONE whole-reference MULTI-bucket router: a single `.ryxdi` over every
 sharded feature, with one bucket per shard (`bucket_name = str(shard_id)`). One
 `rype_classify` pass against it emits `(read_id, bucket_name)` rows = the
-`read_to_shard` table the sharded aligners (`align_{minimap2,bowtie2}_sharded`,
-C1) need — in O(1) classify passes rather than N per-shard passes (impractical
+`read_to_shard` table the sharded aligners (`align_{minimap2,bowtie2}_sharded`)
+need — in O(1) classify passes rather than N per-shard passes (impractical
 at `_SHARD_COUNT=1000`).
 
-The router STREAMS the whole reference's chunks from the data plane (the B6s
+The router STREAMS the whole reference's chunks from the data plane (the
 `open_reference_chunk_stream` seam, whole-reference `feature_idx=None`) — it runs
 after ingest's register-files has moved staging into DuckLake, so there is no
 staging Parquet — persists them to a workspace Parquet, then builds a VIEW over
@@ -27,16 +27,16 @@ the corpus into an in-memory table).
 The shard->bucket mapping rides a runner-staged `shard_mapping` Parquet
 `(feature_idx BIGINT, bucket_name VARCHAR = str(shard_id))` (built from
 `reference_membership.shard_id`; that runner staging + the workflow wiring are
-C2 — C1's smoke feeds the mapping directly) and is passed as
+external to this job — the smoke feeds the mapping directly) and is passed as
 `rype_index_create(mapping_table:=…)`.
 
 Writes `rype_router_index_path(idx)`
 (`{PATH_DERIVED}/references/{idx}/rype-router.ryxdi`); meta
-`index_type="rype_router"`, `shard_id` omitted (whole-reference → NULL). C1 does
-NOT register a `reference_index` row for the router (its smoke passes the path
+`index_type="rype_router"`, `shard_id` omitted (whole-reference → NULL). This job
+does NOT register a `reference_index` row for the router (its smoke passes the path
 directly to the align job), so no row ever carries the `rype_router` type yet;
-C2 registers it and adds the one-line `reference_index.index_type` CHECK
-migration for the value in the same PR.
+the sharded reference-add path registers it and adds the one-line
+`reference_index.index_type` CHECK migration for the value in the same PR.
 
 miint signature (see docs/duckdb-miint.md — the single qiita-verified source):
   rype_index_create(chunk_table, output_path, [mapping_table], [k=64], [w=50],
@@ -103,7 +103,7 @@ class Inputs(BaseModel):
     `shard_mapping` is a runner-staged Parquet roster
     `(feature_idx BIGINT, bucket_name VARCHAR)` where `bucket_name = str(shard_id)`
     — one row per sharded feature, built from `reference_membership.shard_id` (the
-    runner staging is C2; C1's smoke stages it directly). It is BOTH the
+    runner stages it, and the smoke stages it directly). It is BOTH the
     `rype_index_create` mapping table AND the authoritative shard-membership set:
     the router is built over exactly these features (streamed whole-reference),
     with each routed to its shard's bucket.
@@ -240,7 +240,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         )
         # Mapping integrity (fail-fast, per the repo's "silent failures are bugs"
         # ethos): this job takes the mapping on faith from an external staging step
-        # (C2's runner), unlike build_rype_index which derives its own from the
+        # (the runner), unlike build_rype_index which derives its own from the
         # chunks — so validate what that roster is contractually required to be.
         num_mapped, non_null_features, num_features_mapped, num_buckets, non_null_buckets = (
             conn.execute(
@@ -268,7 +268,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # Feature sets must AGREE: a streamed feature with no bucket would route
         # nowhere (or to an unnamed bucket), and a mapped feature with no chunks is
         # a bucket over nothing — both silently broken routers. Requiring an exact
-        # match is the correct C1 fail-fast; when a later milestone introduces
+        # match is the correct fail-fast; when a later milestone introduces
         # features that legitimately have no shard (NULL-shard 16S/no-genome), the
         # producer must scope the stream and the mapping to the same set (or make a
         # deliberate exclusion), and this guard forces that decision loudly rather

@@ -1,7 +1,7 @@
 """Integration smoke: build the whole-reference rype ROUTER over the live DP,
 then `rype_classify` a known read and assert it routes to the expected shard.
 
-Proves the C1 routing path end to end: `build_routing_index` streams the WHOLE
+Proves the routing path end to end: `build_routing_index` streams the WHOLE
 reference's chunks from the live data plane (a whole-reference DoGet — the DP
 JOINs `reference_membership` to resolve `reference_idx` -> features), runs the
 REAL miint `rype_index_create` with a MULTI-bucket (one-bucket-per-shard) mapping

@@ -12,11 +12,12 @@ target_kind: block
 description: >
   Align a BLOCK of a sequenced pool's HOST-DEPLETED, QC-passed reads against a
   sharded reference and land the results in the DuckLake `alignment` table. The
-  consumer side of reference sharding (C2b): C1 shipped the `align_sharded`
-  native job (route each read to its shard(s) via the whole-reference rype
-  router, align against only those shards, emit a verbatim-passthrough
-  `alignment.parquet` carrying feature_idx); C2a made a sharded reference
-  index-complete + resolvable; this workflow wires them into a runnable align run.
+  consumer side of reference sharding: the `align_sharded` native job routes
+  each read to its shard(s) via the whole-reference rype router, aligns against
+  only those shards, applies a high-identity filter, and emits an
+  `alignment.parquet` carrying feature_idx (the raw VARCHAR subject ids dropped);
+  sharded references are made index-complete + resolvable; this workflow wires
+  them into a runnable align run.
 
   Like `read-mask-block` it decouples the COMPUTE unit (the block) from the
   ACCOUNTING unit (per-sample completion): the block aligns its multi-sample
@@ -31,7 +32,7 @@ description: >
   per-ticket `reads.parquet` — the bulk read bytes never transit the control
   plane), binds `mask_idx` from the work_ticket (resolved at plan time as the
   samples' completed host-depletion mask), and resolves the reference's
-  `router_index_path` + `shard_directory` from action_context (the C2a
+  `router_index_path` + `shard_directory` from action_context (the
   `_resolve_sharded_align_indexes`). This workflow never parses reads or mints a
   sequence_idx range.
 

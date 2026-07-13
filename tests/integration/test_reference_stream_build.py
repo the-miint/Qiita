@@ -1,4 +1,4 @@
-"""Integration test: B6s stream → real per-shard aligner-subject build.
+"""Integration test: stream → real per-shard aligner-subject build.
 
 Proves a shard builder (`build_minimap2_index` / `build_bowtie2_index` in shard
 mode) pulls its roster's reference sequence chunks from the live data plane over
