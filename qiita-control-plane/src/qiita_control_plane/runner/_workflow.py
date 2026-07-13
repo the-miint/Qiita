@@ -238,7 +238,7 @@ async def run_workflow(
         # of the host_*_reference_idx keys are `*_upload_idx`, so the walker above
         # left them untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
-        # Syndna's rype index, resolved (and validated ACTIVE) before the mask
+        # Syndna's minimap2 index, resolved (and validated ACTIVE) before the mask
         # mint below reads `syndna_reference_idx` into the identity hash.
         bound.update(await _resolve_syndna_index(pool, action_context=bound))
         # lima's argument string is CP-resolved from the client's `lima_preset`

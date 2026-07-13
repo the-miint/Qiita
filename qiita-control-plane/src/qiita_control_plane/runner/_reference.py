@@ -287,12 +287,12 @@ async def _resolve_host_filter_legacy(
     return bound
 
 
-# Binding name the runner stages the canonical adapter set (a Parquet) under. A
-# step that lists this in its `inputs` (the qc step) signals the runner to
-# materialize the adapter set before the step loop (see `_resolve_qc_adapters`).
 # Binding for the syndna spike-in minimap2 index (the syndna step's input).
 SYNDNA_MINIMAP2_BINDING = "syndna_minimap2_path"
 
+# Binding name the runner stages the canonical adapter set (a Parquet) under. A
+# step that lists this in its `inputs` (the qc step) signals the runner to
+# materialize the adapter set before the step loop (see `_resolve_qc_adapters`).
 QC_ADAPTER_BINDING = "adapter_parquet"
 
 # The DuckLake table holding actual sequence bytes (reference_sequences is

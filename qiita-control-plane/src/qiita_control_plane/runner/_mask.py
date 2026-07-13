@@ -85,6 +85,10 @@ _LIMA_ADAPTER_SET_MD5 = "ace7e3019407e034ee6e6fafb36f9362"
 # identity stays faithful to the filter actually applied.
 _SYNDNA_ALIGNER = "minimap2"
 _SYNDNA_MM2_PRESET = "map-hifi"
+# The identity METHOD is part of the effective filter, not a detail: `blast` charges a
+# deletion per base and `gap_compressed` charges it once, so the same read can be a
+# spike-in under one and not the other. A change here must re-mint.
+_SYNDNA_IDENTITY_METHOD = "blast"
 _SYNDNA_MIN_IDENTITY = 0.95
 
 
@@ -170,6 +174,7 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
         "reference_idx": action_context.get("syndna_reference_idx"),
         "aligner": _SYNDNA_ALIGNER,
         "preset": _SYNDNA_MM2_PRESET,
+        "identity_method": _SYNDNA_IDENTITY_METHOD,
         "min_identity": _SYNDNA_MIN_IDENTITY,
     }
 

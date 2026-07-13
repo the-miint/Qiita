@@ -141,3 +141,26 @@ def test_pacbio_protocol_raises_on_an_unreadable_blob():
 )
 def test_is_pacbio_sheet_type(sheet_type, expected):
     assert is_pacbio_sheet_type(sheet_type) is expected
+
+
+def test_an_unreadable_blob_raises_rather_than_looking_non_pacbio(build_case5_preflight):
+    """REGRESSION. `run_sheet_type` must not degrade an unreadable blob to None.
+
+    If it did, `pacbio_protocol_by_sample_idx` would return {} — indistinguishable from
+    "this blob is not PacBio" — and the consequences run all the way to the compute:
+    the roster reports sheet_type null, `submit-host-filter-pool` takes the Illumina
+    branch, and every ticket is written `lima_enabled: false, syndna_enabled: false`.
+    A case-5 pool would be masked with no lima and no syndna, and its spike-in count
+    would be structurally zero — the exact failure the chain's step order prevents,
+    reintroduced through the error path.
+
+    So: a CORRUPT blob raises, while a well-formed NON-PacBio blob still returns {}.
+    Those two must never collapse into the same answer."""
+    corrupt = build_case5_preflight().read_bytes()[:512] + b"\x00" * 64
+    with pytest.raises((sqlite3.DatabaseError, ValueError)):
+        pacbio_protocol_from_blob(corrupt)
+
+    # ...and the benign case is unchanged: a real, readable, non-PacBio sheet is {}.
+    assert (
+        pacbio_protocol_from_blob(build_case5_preflight(sheet_type="bclconvert").read_bytes()) == {}
+    )

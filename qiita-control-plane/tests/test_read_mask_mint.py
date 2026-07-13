@@ -396,6 +396,7 @@ def test_resolved_syndna_carries_the_effective_alignment_config():
         "reference_idx": 57,
         "aligner": "minimap2",
         "preset": "map-hifi",
+        "identity_method": "blast",
         "min_identity": 0.95,
     }
 

@@ -21,24 +21,32 @@ into the final `read_mask`. So a `spikein_syndna` mark set here survives untouch
 to the end — no step overwrites an earlier verdict. NOTE the consequence for the
 count: `spikein_read_count_r1r2` is therefore a RAW-space count, not a QC'd /
 host-depleted one (a spike-in read that would have failed QC is still counted).
-The cell-count model must know which space its denominator lives in.
+
+That count is a MASKING metric — it exists so the read accounting balances — and is
+NOT what the cell-count model consumes. The model needs per-insert COVERAGE DEPTH
+(aligned bases inside the insert / insert length), which is a different quantity and
+cannot be derived from a read count: this step reduces each read to a boolean and
+discards the alignment. That work is tracked separately.
 
 **Classifies the RAW read.** As the first step there is no incoming mask and no
 trimming yet, so minimap2 aligns `sequence1` directly. Trims are all zero (SynDNA
-does not trim); the mate-trim columns follow the read_mask convention (NULL for
-single-end, 0 for paired) so both-mates counting stays correct downstream.
+does not trim), and the mate-trim columns are NULL: syndna is where the read set
+first meets a long-read-only seam, so it REJECTS a paired-end set outright rather
+than after a full alignment pass (see `_partial_mask.assert_single_end`).
 
 `spikein_syndna` is not biological — a spike-in is added in the lab. It is
 excluded from `read_masked` (which serves only `pass`) and gets its own count
 bucket, with its rows RETAINED in `read_mask` so the counts survive.
 
 **Alignment, not k-mer classification.** A read is a spike-in when it ALIGNS to a
-SynDNA insert at >= `_MIN_IDENTITY` identity over the aligned region. This mirrors
-`host_filter`'s minimap2 arm (same `align_minimap2` seam, same `max_secondary := 0`)
-but adds an identity floor, which host filtering does not need: host depletion is
-deliberately aggressive (any alignment = host), whereas a spike-in hit is a
-QUANTITATIVE claim — a false positive both removes a real read from `biological`
-AND inflates the count the cell-count model divides by.
+SynDNA insert at >= `_MIN_IDENTITY` identity. This mirrors `host_filter`'s minimap2
+arm (same `align_minimap2` seam, same `max_secondary := 0`) but adds an identity
+floor, which host filtering does not need: host depletion is deliberately aggressive
+(any alignment = host), whereas a spike-in call is a claim about a read's ORIGIN: a
+false positive silently removes a genuine biological read from `biological`, and
+would corrupt the per-insert coverage-depth quantification that consumes the same
+classifier. What is deliberately NOT filtered, and why that is an assay decision
+rather than an engineering one, is documented at the constants.
 """
 
 from __future__ import annotations
@@ -55,15 +63,17 @@ from ..miint import (
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
+    resolve_duckdb_memory_gb,
 )
+from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "syndna"
 
-# DuckDB gets a FIXED modest share and is deliberately NOT allocation-aware here:
-# the minimap2 index lives OUT of DuckDB's heap, so growing DuckDB with the cgroup
-# would starve it. Same reasoning (and same numbers) as host_filter — the right
-# lever for a bigger alignment is the cgroup (YAML mem_gb), which reaches minimap2
-# directly.
+# Unlike host_filter (whose fixed share is sized around a genome-scale rype index
+# living outside DuckDB's heap), a SynDNA `.mmi` is a handful of kb-scale inserts —
+# the footprint here is the DuckDB-side work: the alignment output plus the identity
+# / DISTINCT pass over millions of HiFi rows. So take the cgroup-aware share, as
+# lima_mask and qc do.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
@@ -73,19 +83,56 @@ _DUCKDB_THREADS = 4
 # per-sample knob.
 _MM2_PRESET = "map-hifi"
 
-# Minimum identity over the ALIGNED region for a read to count as a spike-in.
+# Minimum sequence identity for a read to count as a spike-in — coverm's
+# `--min-read-percent-identity`, computed by miint's `alignment_seq_identity`.
 #
-# Identity is `1 - NM / aligned_len`, where NM (`tag_nm`) is the edit distance and
-# `aligned_len` is the query bases the alignment consumes (cigar `M`/`=`/`X`/`I`) —
-# the same quantity coverm calls `--min-read-percent-identity`. No coverage floor is
-# imposed (coverm's `--min-read-aligned-percent 0.0`), so a soft-clipped read that
-# matches an insert at high identity over its aligned part still counts.
+# Do NOT hand-roll this from the cigar. A deletion is a gap in the QUERY but is still
+# an alignment column, so a naive `1 - NM / query_len` double-counts it and can even go
+# NEGATIVE on a deletion-heavy alignment.
 #
-# The failure mode is asymmetric and worth stating: a FALSE POSITIVE both removes a
-# real read from `biological` and inflates the spike-in count that the cell-count
-# model divides by. Pinned by the unit + smoke tests; revisit with the assay owner
-# against real data.
+# `blast` is chosen because it is what coverm computes (identity derived from NM), and
+# matching the assay's existing coverm behaviour is the standing instruction. Be aware
+# what it costs, because it is not a rounding difference: BLAST charges a deletion PER
+# BASE, gap-compressed charges it ONCE. A spike-in read carrying a single 200 bp
+# deletion (cigar `899=200D901=`, NM 200) scores
+#     blast          0.9000  -> BELOW this floor, NOT counted as a spike-in
+#     gap_compressed 0.9994  -> above it, counted
+# so one structural deletion flips the call. Whether a real spike-in molecule is
+# expected to carry such an event — and therefore which method the assay wants — is
+# with the assay owner alongside the two filters below.
+_IDENTITY_METHOD = "blast"
 _MIN_IDENTITY = 0.95
+
+# =============================================================================
+# What is DELIBERATELY not filtered — pending the assay owner
+# =============================================================================
+#
+# This is a faithful port of the assay's coverm spec and NOTHING MORE. Two plausible
+# extra filters are deliberately absent, because each would change which reads count
+# as spike-ins, and that is an assay decision rather than an engineering one:
+#
+#   * NO COVERAGE FLOOR (coverm's `--min-read-aligned-percent 0.0`). Tempting, because
+#     without it a long read whose short stretch happens to match an insert is counted.
+#     But it CANNOT simply be added: the index carries the bare INSERTS, so a read
+#     spanning the insert -> plasmid-backbone junction aligns only over its insert
+#     portion and comes back soft-clipped, with low query coverage. That read is a REAL
+#     spike-in, not a chimera — a coverage floor would drop true spike-in molecules.
+#   * NO SUPPLEMENTARY-ALIGNMENT EXCLUSION. `max_secondary := 0` drops SECONDARY (0x100)
+#     records but not SUPPLEMENTARY (0x800) ones, and identity is scored per row then
+#     DISTINCT'd, so one short supplementary segment can mark a whole read. Whether
+#     coverm excludes them is not something we have established.
+#
+# Both errors are costly in both directions — a misclassified read is removed from
+# `biological` AND will corrupt the per-insert coverage depth that consumes the same
+# classifier — so neither default is safe to guess at. Discriminating a boundary-spanning
+# read from an incidental one needs
+# the alignment scored INSIDE the insert's window (miint's `alignment_slice` over a
+# plasmid-level reference), which needs per-insert coordinates we do not store yet.
+# Both are with the assay owner; until they answer, this matches the coverm spec exactly.
+
+# A non-matching read emits no alignment row at all, so this is belt-and-braces (a `*`
+# cigar would score NULL identity and drop out regardless).
+_SAM_UNMAPPED = 0x4
 
 # In-DuckDB relation names. The reads are a VIEW (both the query and the final COPY
 # read them); the hit set is a TABLE, pre-declared BIGINT so `read_id` coerces on
@@ -93,17 +140,6 @@ _MIN_IDENTITY = 0.95
 _READS = "syndna_reads"
 _QUERY = "syndna_query"
 _HITS = "syndna_hits"
-
-# Query bases the alignment consumes, from the cigar: the `M`/`=`/`X`/`I` ops (soft
-# and hard clips are excluded — they are not aligned). `align_minimap2` emits an
-# eqx-style cigar (`=`/`X` rather than a bare `M`), but `M` is accepted too so this
-# does not silently return 0 if a future build stops splitting matches.
-_ALIGNED_LEN_SQL = """
-    list_sum(list_transform(
-        list_filter(regexp_extract_all(cigar, '\\d+[MIDNSHP=X]'),
-                    t -> regexp_matches(t, '[MI=X]$')),
-        t -> CAST(regexp_extract(t, '^\\d+') AS BIGINT)))
-"""
 
 
 class Inputs(BaseModel):
@@ -125,7 +161,8 @@ def _validate_minimap2_index(path: Path) -> None:
     """A minimap2 index is a single `.mmi` FILE; reject a missing or zero-byte one.
 
     Fail fast: an empty index would silently align nothing and report zero spike-ins
-    for a sample that has them — which the cell-count model would then divide by."""
+    for a sample that has them — every spike-in read would then be counted as
+    biological."""
     if not path.exists():
         raise FileNotFoundError(f"syndna_minimap2_path not found: {path}")
     if not path.is_file() or path.stat().st_size == 0:
@@ -145,21 +182,23 @@ def _run_align_minimap2(
     `sequence_idx` set into the pre-created `dest_table`.
 
     Differs from `host_filter._run_align_minimap2` in exactly one way: an IDENTITY
-    FLOOR. host filtering takes any alignment as host (aggressive depletion is the
-    safe direction there); a spike-in hit is a quantitative claim, so a low-identity
-    incidental alignment must not count. `max_secondary := 0` drops secondaries and
-    DISTINCT collapses any remaining per-read rows to one `sequence_idx`.
+    FLOOR. Host filtering takes any alignment as host — aggressive depletion is the
+    safe direction there. A spike-in call is a QUANTITATIVE claim, so an incidental
+    low-identity alignment must not count.
 
-    `flags & 4 = 0` keeps only mapped rows (`samtools view -F 4`). Isolated as a
-    seam so unit tests stub the real aligner."""
+    Identity comes from miint's `alignment_seq_identity`, NOT from arithmetic over the
+    cigar — see `_IDENTITY_METHOD`. `max_secondary := 0` drops secondary alignments and
+    DISTINCT collapses any remaining per-read rows to one `sequence_idx`. What is
+    deliberately NOT filtered (coverage, supplementary alignments) is documented above
+    the constants. Isolated as a seam so unit tests stub the real aligner.
+    """
     conn.execute(
         f"INSERT INTO {dest_table} "
-        "SELECT DISTINCT read_id AS sequence_idx FROM ("
-        f"  SELECT read_id, 1.0 - tag_nm / NULLIF({_ALIGNED_LEN_SQL}, 0) AS identity"
-        "   FROM align_minimap2(?, index_path := ?, preset := ?, max_secondary := 0)"
-        "   WHERE flags & 4 = 0"
-        ") WHERE identity >= ?",
-        [query_table, str(index_path), preset, min_identity],
+        "SELECT DISTINCT read_id AS sequence_idx "
+        "FROM align_minimap2(?, index_path := ?, preset := ?, max_secondary := 0) "
+        f"WHERE (flags & {_SAM_UNMAPPED}) = 0 "
+        "AND alignment_seq_identity(cigar, tag_nm, tag_md, ?) >= ?",
+        [query_table, str(index_path), preset, _IDENTITY_METHOD, min_identity],
     )
 
 
@@ -178,13 +217,25 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     try:
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
-                conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
+                conn,
+                duckdb_tmp,
+                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
+                threads=_DUCKDB_THREADS,
             )
+            # syndna is the FIRST step of the chain, so it — not lima_export or qc —
+            # is where the read set first meets a long-read-only seam. Reject a
+            # paired-end set HERE rather than after a full minimap2 pass that the very
+            # next consumer would reject anyway. (The gates are client-supplied; see
+            # `_partial_mask.assert_single_end`.)
+            assert_single_end(conn, reads_sql, "reads", inputs.reads)
+
             # No incoming mask and no trimming yet: minimap2 aligns the raw read.
+            # `sequence2` is deliberately NOT selected into the query: a non-NULL
+            # sequence2 puts align_minimap2 into PAIRED-END mode, and the guard above
+            # has already established there is none.
             conn.execute(f"CREATE VIEW {_READS} AS SELECT * FROM read_parquet('{reads_sql}')")
             conn.execute(
-                f"CREATE VIEW {_QUERY} AS "
-                f"SELECT sequence_idx AS read_id, sequence1, sequence2 FROM {_READS}"
+                f"CREATE VIEW {_QUERY} AS SELECT sequence_idx AS read_id, sequence1 FROM {_READS}"
             )
             conn.execute(f"CREATE TABLE {_HITS} (sequence_idx BIGINT)")
             _run_align_minimap2(
@@ -196,20 +247,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 min_identity=_MIN_IDENTITY,
             )
 
-            # Emit the partial mask: one row per read, spike-in hits marked, all
-            # else `pass`. Trims are zero (SynDNA does not trim); mate-trim columns
-            # follow the read_mask convention (NULL single-end, 0 paired) so the
-            # both-mates count(right_trim2) stays correct downstream.
+            # Emit the partial mask: one row per read, spike-in hits marked, all else
+            # `pass`. Trims are zero (SynDNA does not trim). The mate-trim columns are
+            # NULL, not 0: the guard above establishes the read set is single-end, and
+            # the read_mask convention is NULL for a single-end read.
             conn.execute(
                 "COPY (SELECT r.sequence_idx, "
                 f"        CASE WHEN h.sequence_idx IS NOT NULL "
                 f"             THEN '{ReadMaskReason.SPIKEIN_SYNDNA.value}' "
                 f"             ELSE '{ReadMaskReason.PASS.value}' END AS reason, "
                 "        0::UINTEGER AS left_trim1, 0::UINTEGER AS right_trim1, "
-                "        CASE WHEN r.sequence2 IS NULL THEN NULL ELSE 0 END::UINTEGER "
-                "          AS left_trim2, "
-                "        CASE WHEN r.sequence2 IS NULL THEN NULL ELSE 0 END::UINTEGER "
-                "          AS right_trim2 "
+                "        NULL::UINTEGER AS left_trim2, NULL::UINTEGER AS right_trim2 "
                 f"      FROM {_READS} r LEFT JOIN {_HITS} h USING (sequence_idx) "
                 "      ORDER BY sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"

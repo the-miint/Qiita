@@ -361,7 +361,7 @@ def test_qc_smoke_unbound_incoming_mask_is_unchanged(tmp_path, write_reads_q, wr
 def test_qc_smoke_incoming_mask_consuming_the_whole_read_is_qc_too_short(
     tmp_path, write_reads_q, write_partial_mask
 ):
-    """`_assert_trims_within_read` rejects left+right > length but PERMITS
+    """The producers guarantee left+right <= length; qc PERMITS
     left+right == length (infer_trim can produce it only in the limit). The read
     then presents to QC as an empty insert with an empty phred array: the chain
     must survive and call it qc_too_short, not crash and not pass."""

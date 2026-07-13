@@ -128,18 +128,16 @@ def test_syndna_emits_a_zero_trim_partial_mask(tmp_path, monkeypatch):
     assert row == (1, _SPIKEIN, 0, 0, None, None)
 
 
-def test_syndna_paired_end_mate_trims_are_zero_not_null(tmp_path, monkeypatch):
-    """A PE read gets left_trim2/right_trim2 = 0 (not NULL), so the downstream
-    both-mates count(right_trim2) treats it as a pair. (Spike-ins are single-end
-    today, but the convention must hold for a future PE absquant.)"""
+def test_syndna_rejects_a_paired_end_read_set(tmp_path, monkeypatch):
+    """syndna is the FIRST step, so it is where the read set first meets a
+    long-read-only seam. A PE set must be rejected HERE — before a full minimap2 pass
+    that lima_export/qc would only reject at the next step anyway. The gates are
+    client-supplied, so this is reachable: nothing cross-validates `syndna_enabled`
+    against the pool's platform."""
     reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGT", "TTTT")])
     _stub_hits(monkeypatch, [])
-    out = _run(tmp_path, reads, _index(tmp_path))
-    with duckdb.connect(":memory:") as conn:
-        row = conn.execute(
-            f"SELECT left_trim2, right_trim2 FROM read_parquet('{out['partial_mask']}')"
-        ).fetchone()
-    assert row == (0, 0)
+    with pytest.raises(ValueError, match="paired-end"):
+        _run(tmp_path, reads, _index(tmp_path))
 
 
 def test_syndna_no_hits_marks_everything_pass(tmp_path, monkeypatch):

@@ -56,8 +56,11 @@ class ReadMaskReason(StrEnum):
 
     `spikein_syndna` marks a SynDNA spike-in: added in the lab, so not a molecule
     from the sample. It is excluded from `biological` and carries its OWN count
-    bucket (the cell-count model needs it), and its rows are RETAINED in `read_mask`
-    so those counts survive.
+    bucket — so the read accounting balances, since a spike-in read leaves
+    `biological` and must be accounted somewhere. Its rows are RETAINED in
+    `read_mask`, so a later per-insert quantification can re-derive exactly those
+    reads without a re-ingest. (That quantification is COVERAGE DEPTH, not this
+    count — see the SynDNA cell-count issue.)
 
     Note the biological predicate is a WHITELIST (`pass` + `host_*`), not
     `NOT LIKE 'qc_%'`: a new reason must be classified explicitly, never bucketed
@@ -90,7 +93,9 @@ class ReadMaskBucket(StrEnum):
       read, just one we deplete. `quality_filtered` is the `pass` SUBSET of this
       bucket, not a bucket of its own.
     * `SPIKEIN` — added in the lab. Disjoint from BIOLOGICAL, with its own column,
-      because the cell-count model divides by it.
+      so the accounting balances: a spike-in read leaves BIOLOGICAL and has to be
+      counted somewhere. (This is a MASKING metric. The cell-count model consumes
+      per-insert COVERAGE DEPTH, not this read count.)
     * `RAW_ONLY` — counted nowhere else. QC failures, and `twist_no_adaptor`
       (a read with no Twist adaptor is artifactual, not a library molecule).
 
@@ -124,7 +129,8 @@ def read_mask_reason_sql_list(bucket: ReadMaskBucket) -> str:
     The single source of truth for the count predicates in
     `qiita_control_plane.actions.library._read_mask_counts`. The data plane's
     `mask_metrics_counts` (Rust) MUST emit the same lists — it cannot import this,
-    so the two are kept in lockstep by the read-mask block e2e test, which asserts
+    so the two are kept in lockstep by `test_rust_reason_lists_match_the_python_bucket_map`
+    (NOT the block e2e test, whose fixture emits no `spikein_syndna` rows), which asserts
     both paths produce identical counts."""
     reasons = sorted(r.value for r, b in READ_MASK_BUCKET.items() if b is bucket)
     return ", ".join(f"'{r}'" for r in reasons)

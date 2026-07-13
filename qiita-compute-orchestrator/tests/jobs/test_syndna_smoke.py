@@ -8,10 +8,10 @@ Builds a real `.mmi` from two synthetic spike-in inserts and runs the actual
     identifies spike-in reads;
   - **the identity threshold is load-bearing.** A read that ALIGNS to a spike-in but
     below `_MIN_IDENTITY` is NOT a spike-in. This is the whole reason syndna does not
-    just reuse host_filter's "any alignment = hit" rule: a spike-in call is a
-    QUANTITATIVE claim, and a false positive both removes a real read from
-    `biological` AND inflates the count the cell-count model divides by. Without this
-    case the threshold could be deleted and every test would still pass;
+    just reuse host_filter's "any alignment = hit" rule: a spike-in call is a claim
+    about a read's ORIGIN, and a false positive silently removes a genuine biological
+    read from `biological`. Without this case the threshold could be deleted and every
+    test would still pass;
   - `read_id` round-trips BIGINT through `align_minimap2` into the job's accumulator;
   - a biological read matching no spike-in emits no alignment at all and is left alone.
 

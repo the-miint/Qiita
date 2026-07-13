@@ -1424,7 +1424,8 @@ fn count_masked_reads(
 /// absent from both lists counts toward `raw` only, which is the correct default
 /// for a QC failure or `twist_no_adaptor`, and is why the fail-open
 /// `NOT LIKE 'qc_%'` predicate was retired. Adding a reason means editing here AND
-/// the Python map; the block e2e test asserts the two paths agree.
+/// the Python map; `test_rust_reason_lists_match_the_python_bucket_map` asserts the two
+/// paths agree (NOT the block e2e test — see the note on the counts fn below).
 const BIOLOGICAL_REASONS: &str = "'host_minimap2', 'host_rype', 'pass'";
 const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 

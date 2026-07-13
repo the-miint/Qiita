@@ -48,10 +48,14 @@ ALTER TABLE qiita.sequenced_sample
 
 COMMENT ON COLUMN qiita.sequenced_sample.spikein_read_count_r1r2 IS
   'Total SynDNA spike-in reads (R1+R2), disjoint from biological_read_count_r1r2 '
-  '(a spike-in is synthetic, not a molecule from the sample). Consumed by the '
-  'downstream cell-count model. PacBio HiFi is single-end, so on those rows this '
-  'equals the read count; the _r1r2 suffix names the both-mates counting '
-  'convention shared with its siblings. NULL until processed.';
+  '(a spike-in is synthetic, not a molecule from the sample). A MASKING metric: it '
+  'exists so the per-stage read accounting balances, since spike-in reads are '
+  'removed from biological and must be accounted somewhere. It is NOT the input to '
+  'the cell-count model, which needs per-insert COVERAGE DEPTH (aligned bases / '
+  'insert length), a different quantity that cannot be derived from a read count. '
+  'PacBio HiFi is single-end, so on those rows this equals the read count; the '
+  '_r1r2 suffix names the both-mates counting convention shared with its siblings. '
+  'NULL until processed.';
 
 -- migrate:down
 ALTER TABLE qiita.sequenced_sample

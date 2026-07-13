@@ -206,15 +206,16 @@ the `no-changelog` label).
     still `pass`, the spike-in count would be **structurally zero**. Marking them
     up front also makes `twist_no_adaptor` a correct "artifactual" signal on the
     reads that remain. A read is a spike-in when it ALIGNS to the SynDNA reference
-    (minimap2, `map-hifi`) at ≥ 0.95 identity over the aligned region — an identity
-    floor host filtering does not need, because a spike-in call is a *quantitative*
-    claim: a false positive both removes a real read from `biological` and inflates
-    the count the cell-count model divides by. Spike-in reads are RETAINED in
-    `read_mask` (their `sequence_idx` survives), so attributing them to a specific
-    spike-in later needs no re-ingest. Note the consequence: because a non-`pass`
-    verdict is carried verbatim through the rest of the chain,
-    `spikein_read_count_r1r2` is a **raw-space** count, not a QC'd / host-depleted
-    one. (#270)
+    (minimap2, `map-hifi`) at ≥ 0.95 identity, computed by miint's
+    `alignment_seq_identity` — an identity floor host filtering does not need, because
+    a spike-in call is a claim about a read's ORIGIN: a false positive silently removes
+    a genuine biological read from `biological`. Spike-in reads are RETAINED in
+    `read_mask` (their `sequence_idx` survives), so a later per-insert quantification
+    needs no re-ingest. Two notes on `spikein_read_count_r1r2`: because a non-`pass`
+    verdict is carried verbatim through the rest of the chain it is a **raw-space**
+    count, not a QC'd / host-depleted one; and it is a **masking diagnostic** (it makes
+    the read accounting balance), NOT the cell-count model's input — that is per-insert
+    coverage depth, a different quantity. (#270)
   - **Adapter removal (lima)** runs before QC, so lima sees the intact adaptor and
     QC's length filter judges the insert. The Twist adapter FASTA is vendored
     into the lima image rather than loaded as a reference: lima is invoked with

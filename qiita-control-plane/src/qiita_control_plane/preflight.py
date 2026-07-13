@@ -97,21 +97,39 @@ def open_blob(blob: bytes) -> Iterator[sqlite3.Connection]:
 
 
 def run_sheet_type(conn: sqlite3.Connection) -> str | None:
-    """The pre-flight's run-level sheet_type, or None when it cannot be read.
+    """The pre-flight's run-level sheet_type; None only when the run RECORDS none.
 
     Used to route a blob to the Illumina or the PacBio reader. `get_run_legacy_format`
     takes a CURSOR (not a connection) and returns `(legacy_format_idx, sheet_type,
     version)`; `get_single_run_idx` takes the connection. Mismatching the two is an
-    AttributeError deep inside run_preflight, not a clean failure — hence the
-    explicit `.cursor()`.
+    AttributeError deep inside run_preflight, not a clean failure — hence the explicit
+    `.cursor()`.
+
+    RAISES on an unreadable or internally inconsistent blob — it does NOT degrade to
+    None. The distinction is load-bearing, and swallowing it caused a real bug: a
+    caller cannot tell "this blob says it is not PacBio" from "this blob could not be
+    read", and every caller treats the first as `{}` (no PacBio facts). A PacBio pool
+    whose blob failed to parse would therefore present as a NON-PacBio pool — the
+    roster would report `sheet_type: null`, `submit-host-filter-pool` would take the
+    Illumina branch, and every ticket would be written `lima_enabled: false,
+    syndna_enabled: false`. That is a case-5 pool masked with no lima and no syndna,
+    whose spike-in count is then structurally zero: precisely the failure this chain's
+    step order exists to prevent, reintroduced silently through the error path.
+
+    `IndexError` / `TypeError` mean run_preflight's return shape drifted under a
+    dependency bump — a broken contract, not a missing sheet type — so they are
+    re-raised as ValueError rather than mistaken for "no sheet type".
     """
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
 
     try:
         run_idx = get_single_run_idx(conn)
         row = get_run_legacy_format(conn.cursor(), run_idx)
-    except sqlite3.DatabaseError, ValueError, IndexError, TypeError:
-        return None
+    except (IndexError, TypeError) as exc:
+        raise ValueError(
+            f"run_preflight returned an unexpected shape for the run's legacy format "
+            f"({type(exc).__name__}: {exc}); the pinned run_preflight may have drifted"
+        ) from exc
     return None if row is None else row[1]
 
 
