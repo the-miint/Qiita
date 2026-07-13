@@ -255,3 +255,48 @@ def test_work_ticket_rejects_non_positive_originator():
             created_at=now,
             updated_at=now,
         )
+
+
+def test_terminal_and_non_terminal_partition_the_enum():
+    """The two sets are exact complements over WorkTicketState.
+
+    The invariant every consumer leans on: a state in neither set is invisible to
+    every gate, poll loop, and rollup that reasons about terminal-ness.
+    """
+    from qiita_common.models import (
+        NON_TERMINAL_WORK_TICKET_STATES,
+        TERMINAL_WORK_TICKET_STATES,
+        WorkTicketState,
+    )
+
+    terminal = set(TERMINAL_WORK_TICKET_STATES)
+    non_terminal = set(NON_TERMINAL_WORK_TICKET_STATES)
+    assert terminal.isdisjoint(non_terminal)
+    assert terminal | non_terminal == {s.value for s in WorkTicketState}
+
+
+def test_terminal_set_carries_all_three_terminal_states():
+    """NO_DATA is terminal — it is an outcome (an empty well), not a pending one."""
+    from qiita_common.models import TERMINAL_WORK_TICKET_STATES
+
+    assert TERMINAL_WORK_TICKET_STATES == ("completed", "no_data", "failed")
+
+
+def test_non_terminal_states_are_in_lifecycle_order():
+    """Derived from the enum's declaration order, so a caller can render it."""
+    from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
+
+    assert NON_TERMINAL_WORK_TICKET_STATES == ("pending", "queued", "processing")
+
+
+def test_membership_works_for_plain_strings():
+    """asyncpg and JSON both hand the state back as a plain str, not the enum."""
+    from qiita_common.models import (
+        NON_TERMINAL_WORK_TICKET_STATES,
+        TERMINAL_WORK_TICKET_STATES,
+    )
+
+    assert "no_data" in TERMINAL_WORK_TICKET_STATES
+    assert "processing" not in TERMINAL_WORK_TICKET_STATES
+    assert "processing" in NON_TERMINAL_WORK_TICKET_STATES
+    assert "no_data" not in NON_TERMINAL_WORK_TICKET_STATES

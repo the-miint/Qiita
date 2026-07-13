@@ -21,6 +21,11 @@ from pathlib import Path
 
 import asyncpg
 from qiita_common.api_paths import compute_reads_staging_path
+from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
+    WorkTicketState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +33,22 @@ logger = logging.getLogger(__name__)
 # unconditionally (a running job is reading/writing the pool's data); terminal
 # states block only without `force` (a completed test run is exactly what an
 # admin purging a mis-pooled preparation wants gone).
-_WORK_TICKET_IN_FLIGHT_STATES = ("pending", "queued", "processing")
-_WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
+#
+# Between them these cover EVERY state, which is the point: a state in neither
+# arm is invisible to the gate, and since the cascade below is state-blind, the
+# delete would proceed unforced and purge its tickets anyway.
+#
+# NO_DATA belongs on the terminal side even though it mints no result. What the
+# force gate protects is the ticket row — the record that this pool WAS processed
+# and came back empty — not an artifact. FAILED mints no result either and has
+# always blocked, so "has a result to lose" was never the criterion; "is terminal"
+# is. The consequence is deliberate: an all-blank plate (no_data is the expected
+# outcome for an empty well) needs an explicit `force` to delete.
+#
+# Not to be confused with _PREFLIGHT_EDIT_BLOCKING_STATES below, where excluding
+# no_data IS deliberate.
+_WORK_TICKET_IN_FLIGHT_STATES = NON_TERMINAL_WORK_TICKET_STATES
+_WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 # Work-ticket states that block a run-preflight EDIT (distinct from the delete
 # gating above). The preflight — notably its lane assignment — feeds bcl-convert
@@ -41,7 +60,13 @@ _WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
 # case the edit exists to serve (a stale preflight may be why it failed), so
 # edit-then-retry must be allowed. Note this differs from delete gating, where
 # 'failed' blocks unless forced.
-_PREFLIGHT_EDIT_BLOCKING_STATES = ("pending", "queued", "processing", "completed")
+#
+# Derived (in-flight + COMPLETED) rather than spelled out, so it tracks the enum;
+# the deliberate exclusions are the other two terminal states, no_data and failed.
+_PREFLIGHT_EDIT_BLOCKING_STATES = (
+    *NON_TERMINAL_WORK_TICKET_STATES,
+    WorkTicketState.COMPLETED.value,
+)
 
 
 class SequencedPoolNotFound(Exception):
@@ -99,7 +124,10 @@ class SequencedPoolDeleteBlocked(Exception):
         else:
             parts: list[str] = []
             if terminal:
-                parts.append(f"{terminal} completed/failed work ticket(s) reference it")
+                parts.append(
+                    f"{terminal} terminal work ticket(s) "
+                    f"({'/'.join(_WORK_TICKET_TERMINAL_STATES)}) reference it"
+                )
             if published:
                 parts.append(f"{published} prep_sample(s) are published into a study")
             if ena:

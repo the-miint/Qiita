@@ -146,6 +146,24 @@ async def _seed_pool_work_ticket(pool, pool_idx, state):
         '{"service": false, "human_roles": ["system_admin"]}',
         "[]",
     )
+    if state == "failed":
+        # work_ticket_failure_consistent: a FAILED ticket must carry the failure
+        # surface. (NO_DATA is the opposite — it must carry NULL failure_*, which
+        # the plain insert below already satisfies.)
+        await pool.execute(
+            "INSERT INTO qiita.work_ticket"
+            " (action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, sequenced_pool_idx, state,"
+            "  failure_type, failure_stage, failure_reason)"
+            " VALUES ($1, $2, (SELECT MIN(idx) FROM qiita.principal),"
+            "         'sequenced_pool', $3, 'failed'::qiita.work_ticket_state,"
+            "         'permanent'::qiita.failure_type,"
+            "         'finalize'::qiita.work_ticket_failure_stage, 'boom')",
+            action_id,
+            version,
+            pool_idx,
+        )
+        return
     await pool.execute(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
@@ -364,6 +382,58 @@ async def test_delete_pool_terminal_ticket_requires_force(
             )
             is None
         )
+    finally:
+        await _cleanup(postgres_pool, ids)
+
+
+async def test_delete_pool_no_data_ticket_requires_force(
+    admin_client, postgres_pool, human_admin_session
+):
+    """A no_data work ticket is TERMINAL and must gate the delete like any other.
+
+    It used to be invisible to the gate — counted as neither in-flight nor
+    terminal — so an all-blank plate (or a pool whose reads were entirely masked
+    out) deleted with no 409 and no force, and the state-blind cascade purged the
+    tickets anyway. no_data is the *expected* outcome for an empty well, so this
+    was the common case, not a corner one.
+    """
+    ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
+    await _seed_pool_work_ticket(postgres_pool, ids["pool_idx"], "no_data")
+    try:
+        blocked = await admin_client.delete(_url(ids))
+        assert blocked.status_code == 409
+        detail = blocked.json()["detail"]
+        assert "force=true" in detail
+        # The message names the terminal states rather than the stale
+        # "completed/failed" pair, which would have been a lie here.
+        assert "no_data" in detail
+
+        forced = await admin_client.delete(_url(ids), params={"force": "true"})
+        assert forced.status_code == 200, forced.text
+        assert forced.json()["work_ticket_deleted"] == 1
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.sequenced_pool WHERE idx = $1", ids["pool_idx"]
+            )
+            is None
+        )
+    finally:
+        await _cleanup(postgres_pool, ids)
+
+
+async def test_delete_pool_failed_ticket_requires_force(
+    admin_client, postgres_pool, human_admin_session
+):
+    """The third terminal state gates too — `completed` was the only one covered."""
+    ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
+    await _seed_pool_work_ticket(postgres_pool, ids["pool_idx"], "failed")
+    try:
+        blocked = await admin_client.delete(_url(ids))
+        assert blocked.status_code == 409
+        assert "force=true" in blocked.json()["detail"]
+
+        forced = await admin_client.delete(_url(ids), params={"force": "true"})
+        assert forced.status_code == 200, forced.text
     finally:
         await _cleanup(postgres_pool, ids)
 

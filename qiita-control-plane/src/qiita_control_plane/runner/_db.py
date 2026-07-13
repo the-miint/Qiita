@@ -10,6 +10,7 @@ from qiita_common.actions import (
     ActionDefinition,
 )
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     FailureType,
     WorkTicketFailureStage,
     WorkTicketState,
@@ -99,13 +100,10 @@ async def _fetch_action(
     )
 
 
-# The non-terminal states a work_ticket may legitimately transition FROM.
-# Shared by every guarded transition so the allowed-source set is defined once.
-_NON_TERMINAL_STATES = [
-    WorkTicketState.PENDING.value,
-    WorkTicketState.QUEUED.value,
-    WorkTicketState.PROCESSING.value,
-]
+# The non-terminal states a work_ticket may legitimately transition FROM — the
+# allowed-source set for every guarded transition. A list because asyncpg binds
+# it as a state[] array; the set itself lives beside the enum in qiita_common.
+_NON_TERMINAL_STATES = list(NON_TERMINAL_WORK_TICKET_STATES)
 
 
 async def _guarded_state_update(

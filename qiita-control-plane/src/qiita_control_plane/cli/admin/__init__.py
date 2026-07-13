@@ -36,6 +36,7 @@ from pathlib import Path
 
 import asyncpg
 import httpx
+from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 from .. import _common
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
@@ -55,7 +56,6 @@ from .mask import (
     _PURGE_FAILED_ACTION_IDS,
     _READ_MASK_PARQUET_NOT_FOUND,
     _RESUBMITTABLE_SCOPE_KIND,
-    _TERMINAL_TICKET_STATES,
     _WAIT_POLL_INTERVAL_SECONDS,
     _WAIT_TIMEOUT_SECONDS,
     _build_resubmit_body,
@@ -567,7 +567,7 @@ async def _purge_failed(
                 if wait and new_idx is not None:
                     poll_state = _poll_ticket_to_terminal(base_url, token, new_idx)
                     entry["observed_state"] = poll_state
-                    if poll_state not in _TERMINAL_TICKET_STATES:
+                    if poll_state not in TERMINAL_WORK_TICKET_STATES:
                         # The wait ceiling was hit before a terminal state; mark
                         # the entry honestly rather than asserting terminality.
                         entry["timed_out"] = True
@@ -754,7 +754,6 @@ __all__ = [
     "_READ_MASK_PARQUET_NOT_FOUND",
     "_RESUBMITTABLE_SCOPE_KIND",
     "_SAFE_ACCESSION",
-    "_TERMINAL_TICKET_STATES",
     "_VALID_ROLE_VALUES",
     "_WAIT_POLL_INTERVAL_SECONDS",
     "_WAIT_TIMEOUT_SECONDS",

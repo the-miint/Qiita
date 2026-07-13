@@ -15,6 +15,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.models import (
     ReferenceStatus,
+    WorkTicketState,
 )
 
 from .. import _common
@@ -170,14 +171,21 @@ def _handle_reference_load(args: argparse.Namespace, parser: argparse.ArgumentPa
     except (RuntimeError, ValueError, TimeoutError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    # Terminal work_ticket=failed under --watch surfaces as exit 1, not
-    # exit 0 — a CI step wrapping this CLI must distinguish a successful
-    # reference build from a failed one. The JSON body still goes to
+    # Under --watch, anything but a COMPLETED ticket surfaces as exit 1, not exit
+    # 0 — a CI step wrapping this CLI must distinguish a successful reference
+    # build from one that didn't produce a reference. The JSON body still goes to
     # stdout so the caller can see the failure_reason.
+    #
+    # Tested against COMPLETED rather than against a list of bad states: `no_data`
+    # is a terminal outcome that builds nothing, and a positive list of failures
+    # would let it — and every future state — exit 0 as a success.
+    #
+    # `state` is absent under --no-watch (we returned before the ticket reached an
+    # outcome), and that is not a failure: the caller polls it themselves.
     work_ticket = result.get("work_ticket") or {}
     final_state = work_ticket.get("state")
     print(json.dumps(_serializable(result), indent=2))
-    if final_state == "failed":
+    if final_state is not None and final_state != WorkTicketState.COMPLETED.value:
         return 1
     return 0
 

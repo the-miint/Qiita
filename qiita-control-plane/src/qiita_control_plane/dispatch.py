@@ -33,7 +33,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.models import WorkTicketState
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
 
 from .runner import run_workflow
 
@@ -42,17 +42,6 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 _log = logging.getLogger(__name__)
-
-
-# The orchestrator-managed lifecycle states. A ticket in any of these
-# is "in flight" — it has not reached a terminal outcome (COMPLETED /
-# FAILED). Used by `reconcile_inflight_tickets` to scope the startup resume
-# sweep and by the work-ticket route's disallow-without-delete check.
-NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
-    WorkTicketState.PENDING.value,
-    WorkTicketState.QUEUED.value,
-    WorkTicketState.PROCESSING.value,
-)
 
 
 async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = False) -> None:

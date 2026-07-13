@@ -1441,3 +1441,61 @@ def test_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys):
     assert rc == 1
     captured = capsys.readouterr()
     assert "exactly one of" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("final_state", "expected_rc"),
+    [
+        ("completed", 0),
+        ("failed", 1),
+        # no_data is TERMINAL and builds no reference. The watch loop now returns
+        # on it (it used to poll to the 24 h ceiling), so the exit code must call
+        # it a failure — a positive list of bad states would exit 0 here and a CI
+        # step would treat "produced nothing" as a successful build.
+        ("no_data", 1),
+        # --no-watch: we returned before the ticket reached an outcome, so there
+        # is no state to judge. Not a failure — the caller polls it themselves.
+        (None, 0),
+    ],
+)
+def test_reference_load_exit_code_is_zero_only_for_completed(
+    monkeypatch, tmp_path, final_state, expected_rc
+):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import reference_load as _ref
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+
+    async def fake_do_reference_load(**kwargs):
+        result = {"reference_idx": 1, "work_ticket_idx": 2, "upload_idxs": {}}
+        if final_state is not None:
+            result["work_ticket"] = {"work_ticket_idx": 2, "state": final_state}
+        return result
+
+    monkeypatch.setattr(_ref, "do_reference_load", fake_do_reference_load)
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+    tax = tmp_path / "t.parquet"
+    tax.write_text("x")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--name",
+            "r",
+            "--version",
+            "1.0",
+            "--fasta",
+            str(fasta),
+            "--taxonomy",
+            str(tax),
+            "--data-plane-url",
+            "grpc://localhost:0",
+            "--no-watch",
+        ]
+    )
+    assert rc == expected_rc

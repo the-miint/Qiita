@@ -14,6 +14,7 @@ from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
 )
+from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 from .. import _common
 
@@ -157,9 +158,6 @@ def _resubmit_work_ticket(base_url: str, token: str, body: dict) -> dict:
     )
 
 
-# Terminal work-ticket states the --wait poll stops on.
-_TERMINAL_TICKET_STATES = frozenset({"completed", "no_data", "failed"})
-
 # Default poll cadence + ceiling for --wait. Generous ceiling because a real
 # read-mask run is a SLURM job; the operator can Ctrl-C and re-check by hand.
 _WAIT_POLL_INTERVAL_SECONDS = 10
@@ -178,7 +176,7 @@ def _poll_ticket_to_terminal(base_url: str, token: str, work_ticket_idx: int) ->
     while time.monotonic() < deadline:
         body = _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
         state = body.get("state", "unknown")
-        if state in _TERMINAL_TICKET_STATES:
+        if state in TERMINAL_WORK_TICKET_STATES:
             return state
         time.sleep(_WAIT_POLL_INTERVAL_SECONDS)
     return state

@@ -89,14 +89,12 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import BEARER_PREFIX
 from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE, sequence_split_expr
+from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 if TYPE_CHECKING:
     import pyarrow.flight as flight
 
 _log = logging.getLogger(__name__)
-
-# Terminal work_ticket states the CLI's --watch loop stops on.
-_TERMINAL_WORK_TICKET_STATES = frozenset({"completed", "failed"})
 
 # Default poll cadence + ceiling for --watch. Two-second poll keeps the
 # CLI feeling responsive without hammering /work-ticket/{idx} on a slow
@@ -440,7 +438,12 @@ async def watch_work_ticket(
     timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Poll until terminal. Returns the final work_ticket body. Raises
-    TimeoutError after `timeout_seconds`."""
+    TimeoutError after `timeout_seconds`.
+
+    Terminal means all THREE terminal states — NO_DATA is one, so a ticket that
+    legitimately produced nothing ends the poll rather than running out the 24 h
+    ceiling and being reported as never having finished.
+    """
     import asyncio
     import time
 
@@ -453,7 +456,7 @@ async def watch_work_ticket(
         if state != last_state:
             _log.info("work_ticket %d state=%s", work_ticket_idx, state)
             last_state = state
-        if state in _TERMINAL_WORK_TICKET_STATES:
+        if state in TERMINAL_WORK_TICKET_STATES:
             return body
         if time.monotonic() >= deadline:
             raise TimeoutError(
