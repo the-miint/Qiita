@@ -699,15 +699,21 @@ class SequenceRangeMintRequest(BaseModel):
     """Body for POST /api/v1/sequence-range.
 
     Allocates `count` contiguous sequence_idx values for `prep_sample_idx`.
-    Both fields are positive integers; the route layer additionally
+    Both idx fields are positive integers; the route layer additionally
     enforces `count <= Settings.max_sequence_mint_count`. Service-account
     callers with `sequence_range:mint` only — humans never mint.
+
+    `work_ticket_idx` records WHICH ticket minted the range, which is what lets a
+    reads job tell its own crashed attempt (safe to reuse the orphaned range) from
+    a different ticket re-ingesting an already-loaded sample (must not reuse — the
+    reads would double). See qiita.sequence_range.minted_by_work_ticket_idx.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     count: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
 
 
 class SequenceRange(BaseModel):
@@ -717,11 +723,19 @@ class SequenceRange(BaseModel):
     The pair (sequence_idx_start, sequence_idx_stop) is inclusive on
     both ends — `stop - start + 1` is the count of sequence_idx values
     reserved for raw reads belonging to this prep_sample.
+
+    `minted_by_work_ticket_idx` is the ticket that minted the range. A reads job
+    reuses an existing range on a mint-409 ONLY when this matches its own ticket
+    (a retry of the same step); a different ticket means the reads are already
+    registered and reuse would duplicate them. NULL = provenance unknown (minted
+    before the column existed, or not unambiguously attributable at backfill), and
+    callers treat NULL as not-mine — fail closed.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequence_idx_start: Annotated[int, Field(gt=0)]
     sequence_idx_stop: Annotated[int, Field(gt=0)]
+    minted_by_work_ticket_idx: int | None = None
     created_at: AwareDatetime
 
 

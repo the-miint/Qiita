@@ -44,7 +44,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import httpx
-from pydantic import BaseModel, Field
 from qiita_common.api_paths import (
     URL_SEQUENCE_RANGE_BY_PREP_SAMPLE,
     URL_SEQUENCE_RANGE_PREFIX,
@@ -59,11 +58,18 @@ class MintedSequenceRange:
     native jobs actually consume (no `created_at`); if a job ever
     needs the wire's audit fields, parse the response into
     `qiita_common.models.SequenceRange` directly. Inclusive on both
-    ends: `count = stop - start + 1`."""
+    ends: `count = stop - start + 1`.
+
+    `minted_by_work_ticket_idx` is the ticket that minted the range — the field
+    that lets `mint_or_reuse_sequence_range` tell a retry of ITS OWN step (safe to
+    reuse the orphaned range) from a different ticket re-ingesting an already-loaded
+    sample (reuse would double the reads). None = provenance unknown; treated as
+    not-mine."""
 
     prep_sample_idx: int
     sequence_idx_start: int
     sequence_idx_stop: int
+    minted_by_work_ticket_idx: int | None = None
 
 
 class SequenceRangeAlreadyExists(Exception):
@@ -107,37 +113,17 @@ class PrepSampleNotEligibleForSequenceRange(Exception):
         self.prep_sample_idx = prep_sample_idx
 
 
-class PreMintedRange(BaseModel):
-    """Operator-supplied recovery range for a retried read-ingest work_ticket
-    (the `fastq_to_parquet` and `bam_to_parquet` native jobs both accept it).
-
-    LARGELY SUPERSEDED: a transient failure after the mint is now recovered
-    automatically — `mint_or_reuse_sequence_range` reads the orphaned range back
-    and reuses it, so a plain re-run converges with no operator action and no
-    populated field. This hook remains only as an explicit override, and nothing
-    can currently set it (it is absent from every workflow's `context_schema`, and
-    the step binder drops unknown action_context keys).
-
-    The two indices are inclusive on both ends and must match the input's read
-    count exactly: `sequence_idx_stop - sequence_idx_start + 1 == count_of_reads`.
-    Mismatch → BAD_INPUT.
-
-    Lives here (not in a job module) because it is the recovery twin of
-    `MintedSequenceRange` and both read-ingest jobs consume it — neither should
-    import it out of the other.
-    """
-
-    sequence_idx_start: int = Field(gt=0)
-    sequence_idx_stop: int = Field(gt=0)
-
-
 async def mint_sequence_range(
     *,
     http: httpx.AsyncClient,
     prep_sample_idx: int,
     count: int,
+    work_ticket_idx: int,
 ) -> MintedSequenceRange:
     """POST /api/v1/sequence-range and return the minted range.
+
+    `work_ticket_idx` is recorded on the range so a later read-back can prove the
+    range belongs to THIS ticket before reusing it.
 
     `http` is the authed httpx client (Bearer with the compute SA
     PAT, base_url = the CP). The caller constructs and re-uses one
@@ -152,7 +138,11 @@ async def mint_sequence_range(
     """
     resp = await http.post(
         URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": prep_sample_idx, "count": count},
+        json={
+            "prep_sample_idx": prep_sample_idx,
+            "count": count,
+            "work_ticket_idx": work_ticket_idx,
+        },
     )
     if resp.status_code == 409:
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
@@ -164,6 +154,7 @@ async def mint_sequence_range(
         prep_sample_idx=body["prep_sample_idx"],
         sequence_idx_start=body["sequence_idx_start"],
         sequence_idx_stop=body["sequence_idx_stop"],
+        minted_by_work_ticket_idx=body["minted_by_work_ticket_idx"],
     )
 
 
@@ -197,4 +188,5 @@ async def get_sequence_range(
         prep_sample_idx=body["prep_sample_idx"],
         sequence_idx_start=body["sequence_idx_start"],
         sequence_idx_stop=body["sequence_idx_stop"],
+        minted_by_work_ticket_idx=body["minted_by_work_ticket_idx"],
     )

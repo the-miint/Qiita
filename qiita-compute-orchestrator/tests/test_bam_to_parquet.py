@@ -14,7 +14,6 @@ Covers:
     → BAD_INPUT before the mint;
   - header-only (no records) is terminal NO_DATA (StepNoData);
   - missing input raises FileNotFoundError;
-  - pre_minted_range recovery (count match reuses the range).
 
 mint_sequence_range is monkey-patched so no live CP is needed. All tests need the
 miint extension available — set MIINT_EXTENSION_REPO if your host installs from
@@ -35,7 +34,6 @@ from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.bam_to_parquet import YAML_STEP_NAME, Inputs, execute
 from qiita_compute_orchestrator.sequence_range import (
     MintedSequenceRange,
-    PreMintedRange,
     SequenceRangeAlreadyExists,
 )
 
@@ -69,7 +67,7 @@ def fake_mint(monkeypatch):
     1000. Returns the list of (prep_sample_idx, count) calls."""
     calls: list[tuple[int, int]] = []
 
-    async def _fake(*, http, prep_sample_idx, count):
+    async def _fake(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append((prep_sample_idx, count))
         return MintedSequenceRange(
             prep_sample_idx=prep_sample_idx,
@@ -180,26 +178,6 @@ def test_missing_input_raises_filenotfound(fake_mint, tmp_path):
         )
 
 
-def test_pre_minted_range_matching_count_skips_mint(fake_mint, tmp_path):
-    """Recovery path: a pre_minted_range whose width matches the read count is
-    reused (no HTTP mint) and drives sequence_idx assignment."""
-    sam = tmp_path / "in.sam"
-    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
-
-    _run(
-        Inputs(
-            bam_path=sam,
-            prep_sample_idx=9,
-            work_ticket_idx=1,
-            pre_minted_range=PreMintedRange(sequence_idx_start=500, sequence_idx_stop=501),
-        ),
-        tmp_path / "ws",
-    )
-    assert fake_mint == []  # HTTP mint skipped
-    seqs = [r[1] for r in _read_parquet(tmp_path / "ws" / "read.parquet")]
-    assert seqs == [500, 501]
-
-
 def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     """A 409 on mint is RECOVERED, not fatal: the range a prior attempt minted
     before dying is read back and reused, and the step completes.
@@ -212,15 +190,17 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     that failed nearly every sample on the first real PacBio run.
     """
 
-    async def _conflict(*, http, prep_sample_idx, count):
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
     async def _existing(*, http, prep_sample_idx):
-        # The range the OOM-killed attempt minted: same count, so reusable.
+        # The range the OOM-killed attempt of THIS ticket minted: same count, and
+        # minted_by matches, so it is reusable.
         return MintedSequenceRange(
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=1,
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -241,7 +221,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
     NOT be reused — the written sequence_idx values would mismatch
     qiita.sequence_range at registration."""
 
-    async def _conflict(*, http, prep_sample_idx, count):
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
     async def _wrong_size(*, http, prep_sample_idx):
@@ -249,6 +229,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1005,  # 6 indices for a 2-read BAM
+            minted_by_work_ticket_idx=1,  # ours, so the width check is what fires
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -317,3 +298,74 @@ def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp
 
     assert seen, "apply_duckdb_settings was never called"
     assert set(seen) == {61}, f"expected the cgroup-derived limit on every connection, got {seen}"
+
+
+def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_path):
+    """A range minted by ANOTHER work_ticket must NOT be reused — the sample's reads
+    are already registered, and reusing the range would register them a second time.
+
+    This is the guard that makes the 409-reuse safe. The submit-time
+    disallow-without-delete gate only blocks NON-terminal tickets, so a COMPLETED
+    sample can be resubmitted; without this check the new ticket would mint, 409,
+    read back the old range, rewrite the identical sequence_idx values, and
+    register-files would add a SECOND DuckLake data file. DuckLake has no
+    uniqueness, so every read would silently exist twice.
+    """
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _someone_elses(*, http, prep_sample_idx):
+        # Width matches, so ONLY the ownership check can reject this.
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,  # a different ticket loaded these reads
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _someone_elses)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert ei.value.step_name == YAML_STEP_NAME
+    assert "work_ticket 999" in ei.value.reason
+    assert "already loaded" in ei.value.reason
+    # Nothing was written: the refusal happens before the durable rewrite.
+    assert not (tmp_path / "ws" / "read.parquet").exists()
+
+
+def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
+    """A NULL minted_by (a range predating the column, or one the backfill could not
+    attribute) is treated as NOT-mine: fail closed. Reusing a range we cannot prove
+    is ours risks duplicating reads that are already in the lake."""
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _unattributed(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=None,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _unattributed)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "unknown work_ticket" in ei.value.reason
+    assert not (tmp_path / "ws" / "read.parquet").exists()

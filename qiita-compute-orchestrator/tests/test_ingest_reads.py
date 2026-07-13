@@ -45,6 +45,10 @@ from qiita_compute_orchestrator.sequence_range import (
     SequenceRangeAlreadyExists,
 )
 
+# The ticket every Inputs in this file is built with. A read-back fake claims it so
+# the reuse path sees a range minted by ITS OWN ticket — the only reusable case.
+_WORK_TICKET_IDX = 1
+
 
 def _run(inputs: Inputs, workspace) -> dict:
     return asyncio.run(execute(inputs, workspace))
@@ -57,7 +61,7 @@ def fake_mint(monkeypatch):
     written sequence_idx values are visible and distinct across samples."""
     calls: list[tuple[int, int]] = []
 
-    async def _fake(*, http, prep_sample_idx, count):
+    async def _fake(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append((prep_sample_idx, count))
         base = 1000 * prep_sample_idx
         return MintedSequenceRange(
@@ -247,7 +251,7 @@ def test_all_empty_pool_is_no_data(fake_mint, tmp_path):
 def _patch_conflicting_mint(monkeypatch):
     """Make mint_sequence_range always 409 (a range already exists)."""
 
-    async def _conflict(*, http, prep_sample_idx, count):
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
     monkeypatch.setattr(retry_module, "mint_sequence_range", _conflict)
@@ -265,7 +269,10 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
     async def _existing(*, http, prep_sample_idx):
         # The range the crashed attempt minted: starts at 5000, covers 2 reads.
         return MintedSequenceRange(
-            prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5001
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=5000,
+            sequence_idx_stop=5001,
+            minted_by_work_ticket_idx=_WORK_TICKET_IDX,
         )
 
     monkeypatch.setattr(retry_module, "get_sequence_range", _existing)
@@ -289,7 +296,10 @@ def test_reuse_count_mismatch_fails_bad_input(monkeypatch, tmp_path):
     async def _existing(*, http, prep_sample_idx):
         # Covers 5 indices, but the FASTQ has 1 read.
         return MintedSequenceRange(
-            prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5004
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=5000,
+            sequence_idx_stop=5004,
+            minted_by_work_ticket_idx=_WORK_TICKET_IDX,
         )
 
     monkeypatch.setattr(retry_module, "get_sequence_range", _existing)
@@ -347,7 +357,7 @@ def _flaky_mint(monkeypatch, errors):
     attempts."""
     calls: list[int] = []
 
-    async def _mint(*, http, prep_sample_idx, count):
+    async def _mint(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append(prep_sample_idx)
         if len(calls) <= len(errors):
             raise errors[len(calls) - 1]
@@ -365,7 +375,7 @@ def _always_failing_mint(monkeypatch, exc):
     """mint always raises `exc`. Returns the per-call list."""
     calls: list[int] = []
 
-    async def _mint(*, http, prep_sample_idx, count):
+    async def _mint(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append(prep_sample_idx)
         raise exc
 
@@ -498,7 +508,10 @@ def test_transient_error_on_reuse_readback_self_heals(monkeypatch, no_backoff, t
         if len(get_calls) == 1:
             raise _status_error(503)  # one transient blip, then succeed
         return MintedSequenceRange(
-            prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5001
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=5000,
+            sequence_idx_stop=5001,
+            minted_by_work_ticket_idx=_WORK_TICKET_IDX,
         )
 
     monkeypatch.setattr(retry_module, "get_sequence_range", _flaky_get)

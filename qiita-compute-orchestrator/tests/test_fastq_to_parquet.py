@@ -65,7 +65,7 @@ def fake_mint(monkeypatch):
     so the `sequence_index + start - 1` arithmetic is visible)."""
     calls: list[tuple[int, int]] = []
 
-    async def _fake(*, http, prep_sample_idx, count):
+    async def _fake(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append((prep_sample_idx, count))
         return MintedSequenceRange(
             prep_sample_idx=prep_sample_idx,
@@ -355,64 +355,6 @@ def test_execute_raises_file_not_found(fake_mint, tmp_path):
     assert fake_mint == []
 
 
-# --- E-operator recovery path: pre_minted_range short-circuits mint ----
-
-
-def test_execute_recovery_skips_mint_and_uses_supplied_range(monkeypatch, tmp_path):
-    """When Inputs.pre_minted_range is set, phase 3 is skipped entirely:
-    no HTTP mint call is made (the patched mint would raise loudly), and
-    the output Parquet's sequence_idx column starts at the supplied
-    range's `sequence_idx_start`."""
-    from qiita_compute_orchestrator.sequence_range import PreMintedRange
-
-    _assert_mint_not_called(monkeypatch)
-
-    outputs = _run(
-        Inputs(
-            fastq_path=_three_read_fastq(tmp_path),
-            prep_sample_idx=42,
-            work_ticket_idx=1,
-            pre_minted_range=PreMintedRange(sequence_idx_start=5000, sequence_idx_stop=5002),
-        ),
-        tmp_path / "ws",
-    )
-    parquet = outputs["reads"]
-    assert parquet.exists()
-
-    rows = _read_parquet(parquet)
-    assert [r[0] for r in rows] == [5000, 5001, 5002]
-
-
-def test_execute_recovery_rejects_count_mismatch(monkeypatch, tmp_path):
-    """A pre_minted_range whose (stop - start + 1) doesn't match the
-    FASTQ's read count surfaces as BackendFailure(BAD_INPUT). A stale
-    recovery (different mint count) must fail loudly rather than write
-    a Parquet that mismatches qiita.sequence_range at registration."""
-    from qiita_common.backend_failure import BackendFailure, FailureKind
-    from qiita_common.models import WorkTicketFailureStage
-
-    from qiita_compute_orchestrator.sequence_range import PreMintedRange
-
-    _assert_mint_not_called(monkeypatch)
-
-    # 3-read FASTQ but recovery declares 5 indices — mismatch.
-    with pytest.raises(BackendFailure) as ei:
-        _run(
-            Inputs(
-                fastq_path=_three_read_fastq(tmp_path),
-                prep_sample_idx=42,
-                work_ticket_idx=1,
-                pre_minted_range=PreMintedRange(sequence_idx_start=5000, sequence_idx_stop=5004),
-            ),
-            tmp_path / "ws",
-        )
-    assert ei.value.kind is FailureKind.BAD_INPUT
-    assert ei.value.stage is WorkTicketFailureStage.STEP_RUN
-    assert ei.value.step_name == YAML_STEP_NAME
-    assert "5 indices" in ei.value.reason
-    assert "3 reads" in ei.value.reason
-
-
 # --- Mint-side failure mapping (S1-B) -------------------------------------
 #
 # The mint helper raises typed Python exceptions; the framework dispatcher
@@ -425,7 +367,7 @@ def test_execute_recovery_rejects_count_mismatch(monkeypatch, tmp_path):
 def _make_failing_mint(monkeypatch, exc):
     """Patch mint_sequence_range with a function that raises `exc`."""
 
-    async def _raise(*, http, prep_sample_idx, count):
+    async def _raise(*, http, prep_sample_idx, count, work_ticket_idx):
         raise exc
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _raise)
@@ -451,8 +393,7 @@ _THREE_READ_FASTQ_CONTENT = "@r1\nACGT\n+\n!!!!\n@r2\nTGCA\n+\n####\n@r3\nACGT\n
 
 
 def _three_read_fastq(tmp_path):
-    """A 3-read FASTQ — drives phase 2 to count=3 and gives recovery-
-    path tests a known size for the pre_minted_range round-trip."""
+    """A 3-read FASTQ — drives phase 2 to count=3."""
     fastq = tmp_path / "in.fastq"
     fastq.write_text(_THREE_READ_FASTQ_CONTENT)
     return fastq
@@ -464,7 +405,7 @@ def _assert_mint_not_called(monkeypatch):
     any invocation fails the test with a clear message instead of
     silently consuming a fresh range."""
 
-    async def _should_not_run(*, http, prep_sample_idx, count):
+    async def _should_not_run(*, http, prep_sample_idx, count, work_ticket_idx):
         raise AssertionError("mint must not be called on the recovery path")
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _should_not_run)
@@ -484,15 +425,17 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
         SequenceRangeAlreadyExists,
     )
 
-    async def _conflict(*, http, prep_sample_idx, count):
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
     async def _existing(*, http, prep_sample_idx):
-        # The range the crashed attempt minted: same count, so it is reusable.
+        # The range the crashed attempt of THIS ticket minted: same count, and
+        # minted_by matches, so it is reusable.
         return MintedSequenceRange(
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + _MINIMAL_FASTQ_READS - 1,
+            minted_by_work_ticket_idx=1,
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -522,7 +465,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
         SequenceRangeAlreadyExists,
     )
 
-    async def _conflict(*, http, prep_sample_idx, count):
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
 
     async def _wrong_size(*, http, prep_sample_idx):
@@ -530,6 +473,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + _MINIMAL_FASTQ_READS,  # one too many
+            minted_by_work_ticket_idx=1,  # ours, so the width check is what fires
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -618,7 +562,7 @@ def test_execute_maps_exhausted_5xx_to_control_plane_unreachable(monkeypatch, no
 
     calls: list[int] = []
 
-    async def _raise_503(*, http, prep_sample_idx, count):
+    async def _raise_503(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append(prep_sample_idx)
         raise _status_error(503)
 
@@ -668,7 +612,7 @@ def test_execute_transient_5xx_on_mint_self_heals(monkeypatch, no_backoff, tmp_p
     step writes its reads against the eventually-minted range — never failing."""
     calls: list[int] = []
 
-    async def _flaky(*, http, prep_sample_idx, count):
+    async def _flaky(*, http, prep_sample_idx, count, work_ticket_idx):
         calls.append(prep_sample_idx)
         if len(calls) <= 2:
             raise _status_error(502)

@@ -26,6 +26,7 @@ async def mint_sequence_range(
     prep_sample_idx: int,
     count: int,
     principal_idx: int,
+    work_ticket_idx: int | None,
 ) -> asyncpg.Record:
     """Allocate `count` contiguous sequence_idx values for prep_sample_idx.
 
@@ -35,6 +36,13 @@ async def mint_sequence_range(
     already has a range; asyncpg.ForeignKeyViolationError when
     prep_sample_idx does not exist or its processing_kind is not
     'sequenced'.
+
+    `work_ticket_idx` is recorded on the row as the range's minter — a reads job may
+    only reuse a range its OWN ticket minted. It is Optional at THIS layer (the column
+    is nullable) so non-ingest callers and fixtures can mint an unattributed range;
+    the HTTP surface requires it (`SequenceRangeMintRequest.work_ticket_idx`, gt=0), so
+    every range minted through the API carries provenance. An unattributed range reads
+    as "not mine" on the reuse path, which fails closed.
 
     No `require_transaction(conn)` guard: the qiita.mint_sequence_range
     plpgsql function body — advisory-lock acquire, nextval, setval,
@@ -51,11 +59,12 @@ async def mint_sequence_range(
     return await conn.fetchrow(
         "SELECT idx, prep_sample_idx, processing_kind,"
         "       sequence_idx_start, sequence_idx_stop,"
-        "       created_by_idx, created_at"
-        "  FROM qiita.mint_sequence_range($1, $2, $3)",
+        "       created_by_idx, created_at, minted_by_work_ticket_idx"
+        "  FROM qiita.mint_sequence_range($1, $2, $3, $4)",
         prep_sample_idx,
         count,
         principal_idx,
+        work_ticket_idx,
     )
 
 
@@ -71,7 +80,7 @@ async def fetch_sequence_range_by_prep_sample_idx(
     return await pool_or_conn.fetchrow(
         "SELECT idx, prep_sample_idx, processing_kind,"
         "       sequence_idx_start, sequence_idx_stop,"
-        "       created_by_idx, created_at"
+        "       created_by_idx, created_at, minted_by_work_ticket_idx"
         "  FROM qiita.sequence_range"
         " WHERE prep_sample_idx = $1",
         prep_sample_idx,

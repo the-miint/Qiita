@@ -123,7 +123,17 @@ the `no-changelog` label).
   in `sequence_range_retry` and all three jobs use it (409 → read back → validate
   width against the read count → reuse). Both halves were needed: without the
   read-back the escalation cannot land, and without the memory it has nothing to
-  land on. (#285)
+  land on.
+  *Guard:* reusing an orphaned range is only safe when the range belongs to a prior
+  ATTEMPT OF THE SAME ticket. A *different* ticket hitting that 409 means the
+  sample's reads are already registered, and reuse would register them a second time
+  — silently, since DuckLake has no uniqueness. Nothing else could tell the two
+  apart: the submit-time disallow-without-delete gate blocks only NON-terminal
+  tickets, so a COMPLETED sample can be resubmitted. `qiita.sequence_range` now
+  records `minted_by_work_ticket_idx`, and a reads job reuses a range only when it
+  matches its own ticket; a different (or unknown/NULL) minter fails permanently
+  with a delete-first message. Without this the read-back would have *removed* the
+  accidental guard the one-shot mint was providing. (#285)
 - **Container steps had no usable `TMPDIR`, so a step doing real work would die
   partway through.** `apptainer exec --containall` mounts a *tmpfs* `/tmp`, sized
   by the host's `sessiondir max size` (64 MiB on the live deploy), and scrubs the

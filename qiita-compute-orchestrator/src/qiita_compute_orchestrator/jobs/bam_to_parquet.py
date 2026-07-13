@@ -36,8 +36,9 @@ input whose read_id is not unique (`count(DISTINCT read_id) != count(*)`). The
 single-end uBAM this targets has unique QNAMEs and passes.
 
 Input-immutability assumption, same as fastq_to_parquet: `bam_path` MUST NOT be
-modified between work_ticket submission and step execution — the retry-recovery
-path (`PreMintedRange`) relies on the read count being stable across attempts.
+modified between work_ticket submission and step execution — the retry path
+reuses the range a crashed attempt minted, which is only valid while the read
+count is stable across attempts.
 """
 
 from __future__ import annotations
@@ -60,7 +61,6 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ..sequence_range import PreMintedRange
 from ..sequence_range_retry import mint_or_reuse_sequence_range
 from . import JobPlan, JobResourcePlan
 
@@ -121,16 +121,14 @@ class Inputs(BaseModel):
     sequence-load step sets it True). Defaults True — a hand-submitted ticket that
     omits it still gets the unaligned verification. `prep_sample_idx` and
     `work_ticket_idx` are framework-injected scope scalars; `prep_sample_idx` is
-    also the key the CP's sequence-range allocator uses. `pre_minted_range` is the
-    optional E-operator recovery hook — set only on a retry where a prior attempt
-    minted then failed after the mint (see `PreMintedRange`).
+    also the key the CP's sequence-range allocator uses, and `work_ticket_idx` is
+    what proves an orphaned range belongs to THIS step before it is reused.
     """
 
     bam_path: Path
     expect_unaligned: bool = True
     prep_sample_idx: int
     work_ticket_idx: int
-    pre_minted_range: PreMintedRange | None = None
 
 
 def plan(inputs: Inputs) -> JobPlan:
@@ -243,33 +241,20 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 ),
             )
 
-        # Mint a sequence_idx range from the CP — unless the work_ticket carries a
-        # `pre_minted_range` (E-operator recovery). A 409 is NOT a failure here:
-        # `mint_or_reuse_sequence_range` reads back the range a prior crashed
-        # attempt left and reuses it, so an OOM-escalated retry completes instead of
-        # dying on the one-shot mint contract (and instead of masking the OOM that
-        # actually killed the first attempt behind a mint conflict).
-        if inputs.pre_minted_range is not None:
-            recovery = inputs.pre_minted_range
-            recovered_count = recovery.sequence_idx_stop - recovery.sequence_idx_start + 1
-            if recovered_count != count:
-                raise BackendFailure(
-                    kind=FailureKind.BAD_INPUT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=(
-                        f"pre_minted_range covers {recovered_count} indices "
-                        f"({recovery.sequence_idx_start}..{recovery.sequence_idx_stop}) "
-                        f"but the BAM has {count} reads — the recovery range must "
-                        f"match the prior attempt's mint count exactly"
-                    ),
-                )
-            sequence_idx_start = recovery.sequence_idx_start
-        else:
-            async with make_cp_client() as http:
-                sequence_idx_start = await mint_or_reuse_sequence_range(
-                    http, inputs.prep_sample_idx, count, step_name=YAML_STEP_NAME
-                )
+        # Mint the sequence_idx range from the CP. A 409 is NOT automatically a
+        # failure: `mint_or_reuse_sequence_range` reads back the existing range and
+        # reuses it IF this ticket minted it (a prior crashed attempt of this step),
+        # so an OOM-escalated retry completes instead of dying on the one-shot mint
+        # contract. A range minted by a DIFFERENT ticket means the reads are already
+        # loaded, and it refuses — reuse would register them twice.
+        async with make_cp_client() as http:
+            sequence_idx_start = await mint_or_reuse_sequence_range(
+                http,
+                inputs.prep_sample_idx,
+                count,
+                work_ticket_idx=inputs.work_ticket_idx,
+                step_name=YAML_STEP_NAME,
+            )
 
         # Rewrite intermediate -> final with sequence_idx assigned and physically
         # sorted on disk. sequence_idx = read_sequences_sam's per-file 1-based

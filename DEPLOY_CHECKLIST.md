@@ -31,7 +31,21 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- **`20260713000000_sequence_range_minted_by_work_ticket.sql`** — plain `make migrate`,
+  no out-of-band steps. Adds the nullable `qiita.sequence_range.minted_by_work_ticket_idx`
+  (no FK — it is an identity token compared for equality), replaces
+  `qiita.mint_sequence_range` with a 4-arg version that records it, and backfills the
+  column where the minting ticket is unambiguous (exactly one `bam-to-parquet` /
+  `fastq-to-parquet` ticket for that sample). Rows it cannot attribute stay NULL, which
+  reads as "not mine" and fails closed — a sample whose reads are already loaded can no
+  longer be re-ingested by reusing its range. **Must be applied before the restart**: the
+  new build's mint sends a 4th argument. **Expect a short window**: migrations are
+  applied BEFORE the restart, so between `make migrate` and the service restart the
+  still-running OLD build calls the now-absent 3-arg function and its sequence-range
+  callbacks 500. The orchestrator classifies a 500 as transient
+  (`CONTROL_PLANE_UNREACHABLE`) and retries, so an in-flight reads ticket self-heals
+  once the new build is up — but keep the gap short, and prefer running this when no
+  reads ingest is mid-flight. (#285)
 
 ### 4. Deploy
 
@@ -40,6 +54,21 @@ _None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via t
 
 ### 5. Verify
 
+- **The backfill attributed the stranded PacBio ranges** (without which their retries
+  fail closed as "already loaded"), and attributed nothing it shouldn't have — no range
+  may be credited to a ticket created after it: (#285)
+  ```sql
+  -- expect 24 rows (the run-18 samples), each with a non-null minter
+  SELECT sr.prep_sample_idx, sr.minted_by_work_ticket_idx
+    FROM qiita.sequence_range sr
+   WHERE sr.prep_sample_idx BETWEEN 30438 AND 30463 ORDER BY 1;
+
+  -- expect ZERO rows: a range can only be attributed to a ticket that PREDATES it
+  SELECT sr.prep_sample_idx, sr.minted_by_work_ticket_idx
+    FROM qiita.sequence_range sr
+    JOIN qiita.work_ticket wt ON wt.work_ticket_idx = sr.minted_by_work_ticket_idx
+   WHERE sr.created_at < wt.created_at;
+  ```
 - **`bam-to-parquet` picked up the new resources.** `activate.sh`'s `qiita-admin
   actions sync` is what carries the raised baseline/ceiling into `qiita.action`; a
   stale row means every HiFi sample still OOMs: (#285)

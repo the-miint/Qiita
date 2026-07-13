@@ -36,7 +36,12 @@ def _client(handler) -> httpx.AsyncClient:
     )
 
 
-def _wire_range_json(prep_sample_idx: int = 42, start: int = 1000, stop: int = 1099) -> str:
+def _wire_range_json(
+    prep_sample_idx: int = 42,
+    start: int = 1000,
+    stop: int = 1099,
+    minted_by_work_ticket_idx: int | None = 7,
+) -> str:
     """The CP's SequenceRange wire JSON — shared by the mint (201) and the
     read-back (200) handlers so the two payload shapes can't drift apart."""
     return json.dumps(
@@ -44,6 +49,7 @@ def _wire_range_json(prep_sample_idx: int = 42, start: int = 1000, stop: int = 1
             "prep_sample_idx": prep_sample_idx,
             "sequence_idx_start": start,
             "sequence_idx_stop": stop,
+            "minted_by_work_ticket_idx": minted_by_work_ticket_idx,
             "created_at": "2026-05-15T00:00:00+00:00",
         }
     )
@@ -63,10 +69,15 @@ async def test_mint_returns_range_on_201():
         )
 
     async with _client(handler) as http:
-        result = await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
+        result = await mint_sequence_range(
+            http=http, prep_sample_idx=42, count=100, work_ticket_idx=7
+        )
 
     assert result == MintedSequenceRange(
-        prep_sample_idx=42, sequence_idx_start=1000, sequence_idx_stop=1099
+        prep_sample_idx=42,
+        sequence_idx_start=1000,
+        sequence_idx_stop=1099,
+        minted_by_work_ticket_idx=7,
     )
     # Verify wire shape: URL + JSON body the CP route expects.
     assert len(captured) == 1
@@ -74,7 +85,7 @@ async def test_mint_returns_range_on_201():
     assert req.url.path == URL_SEQUENCE_RANGE_PREFIX
     assert req.method == "POST"
     body = json.loads(req.content)
-    assert body == {"prep_sample_idx": 42, "count": 100}
+    assert body == {"prep_sample_idx": 42, "count": 100, "work_ticket_idx": 7}
 
 
 async def test_mint_raises_already_exists_on_409():
@@ -91,7 +102,7 @@ async def test_mint_raises_already_exists_on_409():
 
     async with _client(handler) as http:
         with pytest.raises(SequenceRangeAlreadyExists) as ei:
-            await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
+            await mint_sequence_range(http=http, prep_sample_idx=42, count=100, work_ticket_idx=7)
     assert ei.value.prep_sample_idx == 42
     assert ei.value.count == 100
     assert "already has a sequence_range" in str(ei.value)
@@ -110,7 +121,7 @@ async def test_mint_raises_not_eligible_on_404():
 
     async with _client(handler) as http:
         with pytest.raises(PrepSampleNotEligibleForSequenceRange) as ei:
-            await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
+            await mint_sequence_range(http=http, prep_sample_idx=42, count=100, work_ticket_idx=7)
     assert ei.value.prep_sample_idx == 42
 
 
@@ -124,7 +135,7 @@ async def test_mint_raises_http_error_on_5xx():
 
     async with _client(handler) as http:
         with pytest.raises(httpx.HTTPStatusError) as ei:
-            await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
+            await mint_sequence_range(http=http, prep_sample_idx=42, count=100, work_ticket_idx=7)
     assert ei.value.response.status_code == 500
 
 
@@ -139,7 +150,7 @@ async def test_mint_raises_http_error_on_401():
 
     async with _client(handler) as http:
         with pytest.raises(httpx.HTTPStatusError) as ei:
-            await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
+            await mint_sequence_range(http=http, prep_sample_idx=42, count=100, work_ticket_idx=7)
     assert ei.value.response.status_code == 401
 
 
@@ -165,7 +176,10 @@ async def test_get_returns_range_on_200():
         result = await get_sequence_range(http=http, prep_sample_idx=42)
 
     assert result == MintedSequenceRange(
-        prep_sample_idx=42, sequence_idx_start=1000, sequence_idx_stop=1099
+        prep_sample_idx=42,
+        sequence_idx_start=1000,
+        sequence_idx_stop=1099,
+        minted_by_work_ticket_idx=7,
     )
     assert len(captured) == 1
     req = captured[0]

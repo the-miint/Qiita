@@ -344,7 +344,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     _stage_intermediate_reads, r1, r2, intermediate, sample_tmp, memory_gb, threads
                 )
                 sequence_idx_start = await mint_or_reuse_sequence_range(
-                    http, prep_sample_idx, count, step_name=YAML_STEP_NAME
+                    http,
+                    prep_sample_idx,
+                    count,
+                    work_ticket_idx=inputs.work_ticket_idx,
+                    step_name=YAML_STEP_NAME,
                 )
                 await asyncio.to_thread(
                     _write_sorted_reads,

@@ -34,6 +34,10 @@ from qiita_compute_orchestrator.sequence_range import (
 from qiita_control_plane.config import Settings as CPSettings
 from qiita_control_plane.main import app as cp_app
 
+# The ticket recorded as the range's minter. No FK on the column, so any positive
+# idx is accepted; it is only ever compared for equality on the reuse path.
+_E2E_WORK_TICKET_IDX = 7
+
 
 @pytest.fixture
 async def cp_app_with_pool(postgres_pool, signing_key):
@@ -114,6 +118,7 @@ async def test_mint_sequence_range_full_path(
             http=http,
             prep_sample_idx=e2e_prep_sample,
             count=4,
+            work_ticket_idx=_E2E_WORK_TICKET_IDX,
         )
 
     # Helper returned a MintedSequenceRange with the expected geometry.
@@ -150,12 +155,20 @@ async def test_mint_sequence_range_second_attempt_raises_already_exists(
 
     async with http:
         # First call seeds the range.
-        await mint_sequence_range(http=http, prep_sample_idx=e2e_prep_sample, count=4)
+        await mint_sequence_range(
+            http=http,
+            prep_sample_idx=e2e_prep_sample,
+            count=4,
+            work_ticket_idx=_E2E_WORK_TICKET_IDX,
+        )
         # Second call hits qiita.sequence_range's UNIQUE(prep_sample_idx) →
         # CP route returns 409 → helper raises the typed exception.
         with pytest.raises(SequenceRangeAlreadyExists) as ei:
             await mint_sequence_range(
-                http=http, prep_sample_idx=e2e_prep_sample, count=4
+                http=http,
+                prep_sample_idx=e2e_prep_sample,
+                count=4,
+                work_ticket_idx=_E2E_WORK_TICKET_IDX,
             )
     assert ei.value.prep_sample_idx == e2e_prep_sample
     # The message is a DIAGNOSTIC, not operator instructions: a reads job pairs the

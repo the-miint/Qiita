@@ -144,6 +144,7 @@ async def mint_or_reuse_sequence_range(
     prep_sample_idx: int,
     count: int,
     *,
+    work_ticket_idx: int,
     step_name: str,
 ) -> int:
     """Mint a sequence range for one sample, or reuse the one an earlier attempt left.
@@ -158,17 +159,32 @@ async def mint_or_reuse_sequence_range(
     OOM) behind a mint conflict, and it defeats the runner's OOM memory
     escalation: the escalated attempt can never get far enough to benefit.
 
-    So a 409 is not an error here: it means "a prior attempt of THIS step already
-    minted my range". Read it back and reuse its start, and the escalated retry
-    completes transparently. This is what makes the step idempotent across
-    retries, and it is why the module docstring can claim the mint is
-    retry-safe.
+    So a 409 is not automatically an error — but it is only SAFE to reuse the
+    existing range when that range belongs to a prior attempt of THIS work_ticket.
+    The two cases the 409 conflates are:
 
-    Callers must only invoke this when the sample's durable output is ABSENT — a
-    completed sample must not be re-ingested (DuckLake has no uniqueness, so the
-    reads would double). `ingest_reads` checks for the durable read.parquet;
-    `bam_to_parquet` / `fastq_to_parquet` are per-sample tickets whose
-    disallow-without-delete gate is enforced by the CP at submit time.
+      - a prior ATTEMPT of this ticket minted then crashed → the reads are NOT in
+        the lake, the range is orphaned, reuse is correct and is what makes the
+        step idempotent across runner retries;
+      - a DIFFERENT ticket minted it → the sample's reads ARE already registered,
+        and reusing the range would register them a second time. DuckLake has no
+        uniqueness, so that duplication is silent and permanent.
+
+    Nothing else in the system can separate them. The submit-time
+    disallow-without-delete gate only blocks NON-terminal tickets, so a COMPLETED
+    sample can be resubmitted; and the job's output lives in a per-ticket workspace
+    it cannot see across tickets. So the range itself records its minting ticket
+    (qiita.sequence_range.minted_by_work_ticket_idx) and we compare.
+
+    A NULL `minted_by_work_ticket_idx` (a range the backfill could not attribute) is
+    treated as NOT-mine: fail closed. That is the safe reading, and it is exactly
+    disallow-without-delete.
+
+    The ownership check does NOT subsume the caller's own precondition: WITHIN one
+    ticket, ownership always matches, so a caller that can re-run after its durable
+    output already landed must still check for it (`ingest_reads` guards on the
+    durable read.parquet). Ownership separates tickets; it cannot separate a
+    completed attempt from a crashed one inside the same ticket.
 
     Maps the typed mint exceptions to BackendFailures (the framework dispatcher
     only wraps bare NotImplementedError / FileNotFoundError / ValueError). Both
@@ -177,7 +193,12 @@ async def mint_or_reuse_sequence_range(
     """
     try:
         rng = await cp_call_with_retry(
-            lambda: mint_sequence_range(http=http, prep_sample_idx=prep_sample_idx, count=count)
+            lambda: mint_sequence_range(
+                http=http,
+                prep_sample_idx=prep_sample_idx,
+                count=count,
+                work_ticket_idx=work_ticket_idx,
+            )
         )
         return rng.sequence_idx_start
     except SequenceRangeAlreadyExists as exc:
@@ -201,6 +222,27 @@ async def mint_or_reuse_sequence_range(
                 reason=(
                     f"prep_sample {prep_sample_idx} sequence_range 409'd on mint but "
                     "404'd on read-back — concurrent deletion during retry; resubmit"
+                ),
+            ) from exc
+        if existing.minted_by_work_ticket_idx != work_ticket_idx:
+            # A DIFFERENT ticket minted this range (or its provenance is unknown —
+            # NULL, which we read as not-mine). Either way the sample's reads are
+            # already registered in the lake, so reusing the range would register
+            # them a second time. DuckLake has no uniqueness: the duplication would
+            # be silent. Refuse, and tell the operator the one thing that fixes it.
+            owner = existing.minted_by_work_ticket_idx
+            owner_detail = f"work_ticket {owner}" if owner is not None else "an unknown work_ticket"
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    f"prep_sample {prep_sample_idx} already has a sequence_range minted "
+                    f"by {owner_detail}, not by this one (work_ticket {work_ticket_idx}) — "
+                    "its reads are already loaded, and re-ingesting would duplicate them "
+                    "(DuckLake has no uniqueness). To re-ingest deliberately, DELETE the "
+                    "prep_sample (its sequence_range goes with it via ON DELETE CASCADE; "
+                    "for a whole pool, `qiita delete-sequenced-pool`) and resubmit"
                 ),
             ) from exc
         recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1

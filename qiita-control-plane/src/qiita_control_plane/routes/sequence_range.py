@@ -51,6 +51,7 @@ def _record_to_response(row: asyncpg.Record) -> SequenceRange:
         prep_sample_idx=row["prep_sample_idx"],
         sequence_idx_start=row["sequence_idx_start"],
         sequence_idx_stop=row["sequence_idx_stop"],
+        minted_by_work_ticket_idx=row["minted_by_work_ticket_idx"],
         created_at=row["created_at"],
     )
 
@@ -99,6 +100,7 @@ async def mint_sequence_range_route(
                 prep_sample_idx=body.prep_sample_idx,
                 count=body.count,
                 principal_idx=sa.principal_idx,
+                work_ticket_idx=body.work_ticket_idx,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(

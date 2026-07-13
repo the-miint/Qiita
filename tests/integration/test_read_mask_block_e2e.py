@@ -223,7 +223,11 @@ async def block_pool(postgres_pool, human_admin_session):
     async with postgres_pool.acquire() as conn:
         for ps in (prep_a, prep_b):
             rng = await mint_sequence_range(
-                conn, prep_sample_idx=ps, count=_READS_PER_SAMPLE, principal_idx=owner
+                conn,
+                prep_sample_idx=ps,
+                count=_READS_PER_SAMPLE,
+                principal_idx=owner,
+                work_ticket_idx=None,
             )
             starts[ps] = rng["sequence_idx_start"]
         mask = await mint_mask_definition(

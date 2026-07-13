@@ -18,9 +18,9 @@ BAD_INPUT via the framework dispatcher.
 
 Input-immutability assumption: `fastq_path` and (when set)
 `reverse_fastq_path` MUST NOT be modified, renamed, or replaced
-between work_ticket submission and step execution. The retry
-recovery path relies on the read count being stable across attempts
-(see `PreMintedRange` and the recovery runbook); a swapped FASTQ
+between work_ticket submission and step execution. The retry path
+reuses the range a crashed attempt minted, which is only valid while
+the read count is stable across attempts; a swapped FASTQ
 whose read count differs from the original mint surfaces as
 BAD_INPUT, but a swap with the *same* count would silently produce a
 Parquet whose rows mismatch the prior attempt's assignment. Workflow
@@ -104,9 +104,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from pydantic import BaseModel
-from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.backend_failure import StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
-from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
@@ -119,7 +118,6 @@ from ..miint import (
     open_miint_conn,
 )
 from ..read_count import write_read_count
-from ..sequence_range import PreMintedRange
 from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 # YAML step name this module implements. Hard-coded here because
@@ -162,17 +160,14 @@ class Inputs(BaseModel):
     CP's sequence-range allocator uses, so it's load-bearing here
     (not just provenance as the comment used to imply).
 
-    `pre_minted_range` is the optional E-operator recovery hook: set
-    only on a retry where the prior attempt successfully minted in
-    phase 3 then failed in phase 4. See `PreMintedRange` and the
-    retry-recovery runbook for the full flow.
+    `work_ticket_idx` is what proves an orphaned range belongs to THIS
+    step before the retry path reuses it.
     """
 
     fastq_path: Path
     reverse_fastq_path: Path | None = None
     prep_sample_idx: int
     work_ticket_idx: int
-    pre_minted_range: PreMintedRange | None = None
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -263,11 +258,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "SELECT count(*) FROM read_parquet(?)", [str(intermediate)]
             ).fetchone()[0]
 
-        # Mint a sequence_idx range from the CP — unless the work_ticket
-        # carries a `pre_minted_range` (E-operator recovery path: a prior
-        # attempt already minted and failed transiently in the rewrite
-        # below; the operator resubmits with the existing range so the
-        # CP's one-shot mint contract isn't violated). count > 0 by the
+        # Mint the sequence_idx range from the CP. count > 0 by the
         # empty-input pre-check, so no zero-count special case here.
         #
         # The mint helper raises typed Python exceptions; the framework
@@ -278,37 +269,19 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # sequence_range.py) keeps the helper transport-agnostic — the
         # mapping from "how the CP responded" to "what BackendFailure
         # kind the runner should see" is workflow-policy, not protocol.
-        if inputs.pre_minted_range is not None:
-            # E-operator recovery: skip the HTTP mint entirely. Validate
-            # the supplied range covers exactly the FASTQ's read count
-            # so a stale recovery (different mint count) fails loudly
-            # rather than producing a Parquet whose sequence_idx values
-            # would mismatch qiita.sequence_range at registration.
-            recovery = inputs.pre_minted_range
-            recovered_count = recovery.sequence_idx_stop - recovery.sequence_idx_start + 1
-            if recovered_count != count:
-                raise BackendFailure(
-                    kind=FailureKind.BAD_INPUT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=(
-                        f"pre_minted_range covers {recovered_count} indices "
-                        f"({recovery.sequence_idx_start}..{recovery.sequence_idx_stop}) "
-                        f"but the FASTQ has {count} reads — the recovery range "
-                        f"must match the prior attempt's mint count exactly"
-                    ),
-                )
-            sequence_idx_start = recovery.sequence_idx_start
-        else:
-            # A 409 is NOT a failure: `mint_or_reuse_sequence_range` reads back the
-            # range a prior crashed attempt left and reuses it, so an OOM-escalated
-            # retry completes instead of dying on the one-shot mint contract (and
-            # instead of masking the failure that actually killed the first attempt
-            # behind a mint conflict). Shared with ingest_reads / bam_to_parquet.
-            async with make_cp_client() as http:
-                sequence_idx_start = await mint_or_reuse_sequence_range(
-                    http, inputs.prep_sample_idx, count, step_name=YAML_STEP_NAME
-                )
+        # A 409 is NOT a failure: `mint_or_reuse_sequence_range` reads back the
+        # range a prior crashed attempt left and reuses it, so an OOM-escalated
+        # retry completes instead of dying on the one-shot mint contract (and
+        # instead of masking the failure that actually killed the first attempt
+        # behind a mint conflict). Shared with ingest_reads / bam_to_parquet.
+        async with make_cp_client() as http:
+            sequence_idx_start = await mint_or_reuse_sequence_range(
+                http,
+                inputs.prep_sample_idx,
+                count,
+                work_ticket_idx=inputs.work_ticket_idx,
+                step_name=YAML_STEP_NAME,
+            )
 
         # Rewrite intermediate -> final with sequence_idx assigned and
         # physically sorted on disk.

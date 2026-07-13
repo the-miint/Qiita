@@ -146,13 +146,14 @@ async def test_fastq_to_parquet_through_runner(
     # the fake ignores http (no client is constructed at all).
     mint_calls: list[tuple[int, int]] = []
 
-    async def _local_mint(*, http, prep_sample_idx, count):
+    async def _local_mint(*, http, prep_sample_idx, count, work_ticket_idx):
         mint_calls.append((prep_sample_idx, count))
         row = await postgres_pool.fetchrow(
-            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3)",
+            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3, $4)",
             prep_sample_idx,
             count,
             admin_idx,
+            work_ticket_idx,
         )
         return MintedSequenceRange(
             prep_sample_idx=row["prep_sample_idx"],
