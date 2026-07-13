@@ -42,58 +42,53 @@ COMMENT ON COLUMN qiita.sequence_range.minted_by_work_ticket_idx IS
 
 -- Backfill.
 --
--- The ONLY safe inference is "this ticket minted this range", and the tell is
--- TIME: a range a ticket minted is created AFTER that ticket. A range the ticket
--- merely COLLIDED with (mint → 409 → FAILED) predates it. Without that guard the
--- backfill fails OPEN in the one direction that matters: an Illumina sample whose
--- reads were loaded by a pool `ingest_reads` ticket, then hit by a stray
--- `fastq-to-parquet` submission that 409'd and FAILED, would have its range stamped
--- with that FAILED ticket — and a later `ticket run` on it would then "recognise"
--- the range as its own, reuse it, and register the sample's reads a SECOND time.
--- `sr.created_at >= wt.created_at` excludes exactly that case.
+-- Attribute a range ONLY to a ticket that could actually have minted it. Two
+-- conditions, and both are necessary:
 --
--- Two shapes of loader ticket mint ranges, so both are attributed:
---   1. per-sample loaders (bam-to-parquet / fastq-to-parquet) — work_ticket is
---      prep_sample-scoped, so it joins on prep_sample_idx directly. This is what
---      attributes the PacBio tickets whose retries need to reuse their own range.
---   2. the pool loader (bcl-convert → ingest_reads) — work_ticket is
---      sequenced_pool-scoped and mints a range per sample in the pool, so it joins
---      through sequenced_sample. Attributing these matters: a pool ingest that
---      crashed mid-fan-out must still be able to retry and reuse the ranges it
---      already minted, which a NULL would forbid.
+--   TIME. A range a ticket minted is created AFTER that ticket. A range the ticket
+--   merely COLLIDED with (mint -> 409 -> FAILED) predates it.
 --
--- `count(*) = 1` keeps the attribution unambiguous; anything else stays NULL, which
--- reads as "not mine" and fails closed.
-UPDATE qiita.sequence_range sr
-   SET minted_by_work_ticket_idx = wt.work_ticket_idx
-  FROM qiita.work_ticket wt
- WHERE wt.prep_sample_idx = sr.prep_sample_idx
-   AND wt.action_id IN ('bam-to-parquet', 'fastq-to-parquet')
-   AND sr.created_at >= wt.created_at
-   AND (
-        SELECT count(*)
-          FROM qiita.work_ticket w2
-         WHERE w2.prep_sample_idx = sr.prep_sample_idx
-           AND w2.action_id IN ('bam-to-parquet', 'fastq-to-parquet')
-           AND sr.created_at >= w2.created_at
-       ) = 1;
+--   UNIQUENESS ACROSS BOTH LOADER SHAPES. Ranges are minted by per-sample loaders
+--   (bam-to-parquet / fastq-to-parquet, prep_sample-scoped) AND by the pool loader
+--   (bcl-convert -> ingest_reads, sequenced_pool-scoped, minting one range per sample
+--   in the pool). A sample can have candidates of both shapes, so the count MUST span
+--   both. Counting only one shape fails OPEN: an Illumina sample whose range was
+--   minted by its pool ingest, and which also carries a stray early per-sample loader
+--   ticket, would look "unambiguous" to a per-sample-only count and get credited to
+--   the stray ticket — and a later `ticket run` on it would then "recognise" the range
+--   as its own, reuse it, and register the sample's reads a SECOND time.
+--
+-- Anything with zero or multiple candidates stays NULL, which reads as "not mine" and
+-- fails closed.
+WITH candidate AS (
+    SELECT sr.idx AS sequence_range_idx, wt.work_ticket_idx
+      FROM qiita.sequence_range sr
+      JOIN qiita.work_ticket wt
+        ON wt.prep_sample_idx = sr.prep_sample_idx
+       AND wt.action_id IN ('bam-to-parquet', 'fastq-to-parquet')
+     WHERE sr.created_at >= wt.created_at
 
+    UNION ALL
+
+    SELECT sr.idx AS sequence_range_idx, wt.work_ticket_idx
+      FROM qiita.sequence_range sr
+      JOIN qiita.sequenced_sample ss
+        ON ss.prep_sample_idx = sr.prep_sample_idx
+      JOIN qiita.work_ticket wt
+        ON wt.sequenced_pool_idx = ss.sequenced_pool_idx
+       AND wt.action_id = 'bcl-convert'
+     WHERE sr.created_at >= wt.created_at
+),
+unambiguous AS (
+    SELECT sequence_range_idx, min(work_ticket_idx) AS work_ticket_idx
+      FROM candidate
+     GROUP BY sequence_range_idx
+    HAVING count(*) = 1
+)
 UPDATE qiita.sequence_range sr
-   SET minted_by_work_ticket_idx = wt.work_ticket_idx
-  FROM qiita.sequenced_sample ss
-  JOIN qiita.work_ticket wt
-    ON wt.sequenced_pool_idx = ss.sequenced_pool_idx
-   AND wt.action_id = 'bcl-convert'
- WHERE ss.prep_sample_idx = sr.prep_sample_idx
-   AND sr.minted_by_work_ticket_idx IS NULL
-   AND sr.created_at >= wt.created_at
-   AND (
-        SELECT count(*)
-          FROM qiita.work_ticket w2
-         WHERE w2.sequenced_pool_idx = ss.sequenced_pool_idx
-           AND w2.action_id = 'bcl-convert'
-           AND sr.created_at >= w2.created_at
-       ) = 1;
+   SET minted_by_work_ticket_idx = u.work_ticket_idx
+  FROM unambiguous u
+ WHERE u.sequence_range_idx = sr.idx;
 
 -- The mint function gains the ticket. Its argument list changes, so this is a DROP
 -- + CREATE rather than a CREATE OR REPLACE (a new signature would otherwise be an

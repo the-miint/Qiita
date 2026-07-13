@@ -100,3 +100,38 @@ def test_read_sequences_sam_empty_yields_zero_rows(tmp_path):
     with open_miint_conn() as conn:
         n = conn.execute("SELECT count(*) FROM read_sequences_sam(?)", [str(path)]).fetchone()[0]
     assert n == 0
+
+
+def test_sequence_index_is_dense_1_to_n(tmp_path):
+    """`sequence_index` is DENSE 1..N — no gaps, no duplicates, 1-based.
+
+    This became load-bearing when the job stopped writing one globally sorted file
+    and started slicing the intermediate into monotone parts
+    (`WHERE sequence_index BETWEEN lo AND hi` over `range(1, count + 1, ...)`). If the
+    ordinal were 0-based or gapped, those slices would silently DROP reads and the
+    sample would register short — reads missing from the lake with no error anywhere.
+    The old single COPY had no WHERE and could not do that, so nothing pinned this.
+
+    (The job also verifies the written row count against the BAM's, so a violation
+    fails loudly rather than silently; this pins the upstream contract itself.)
+    """
+    path = tmp_path / "many.sam"
+    n = 50
+    lines = ["@HD\tVN:1.6\tSO:unknown", "@SQ\tSN:chr1\tLN:1000"]
+    lines += [
+        "\t".join([f"r{i}", "4", "*", "0", "0", "*", "*", "0", "0", "ACGT", "IIII"])
+        for i in range(1, n + 1)
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with open_miint_conn() as conn:
+        lo, hi, total, distinct = conn.execute(
+            "SELECT min(sequence_index), max(sequence_index),"
+            "       count(*), count(DISTINCT sequence_index)"
+            " FROM read_sequences_sam(?)",
+            [str(path)],
+        ).fetchone()
+
+    assert (lo, hi) == (1, n), "sequence_index must be 1-based and reach N"
+    assert total == n
+    assert distinct == n, "sequence_index must be unique — the slicing partitions on it"

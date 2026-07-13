@@ -36,8 +36,10 @@ _None yet._
   no out-of-band steps. Adds the nullable `qiita.sequence_range.minted_by_work_ticket_idx`
   (no FK — it is an identity token compared for equality), replaces
   `qiita.mint_sequence_range` with a 4-arg version that records it, and backfills the
-  column where the minting ticket is unambiguous (exactly one `bam-to-parquet` /
-  `fastq-to-parquet` ticket for that sample). Rows it cannot attribute stay NULL, which
+  column where the minting ticket is unambiguous — counting candidates across BOTH
+  loader shapes (the per-sample `bam-to-parquet`/`fastq-to-parquet` tickets and the
+  pool-scoped `bcl-convert` ingest), and only crediting a ticket the range postdates.
+  Rows it cannot attribute unambiguously stay NULL, which
   reads as "not mine" and fails closed — a sample whose reads are already loaded can no
   longer be re-ingested by reusing its range. **Must be applied before the restart**: the
   new build's mint sends a 4th argument. **Expect a short window**: migrations are
@@ -76,7 +78,7 @@ _None yet — `workflows/bam-to-parquet/1.0.0.yaml` reaches `qiita.action` via t
   ```bash
   psql "$DATABASE_URL" -c "
     SELECT action_id, version, steps
-    FROM qiita.action WHERE action_id = 'bam-to-parquet';"   # baseline mem_gb 32, ceiling 96
+    FROM qiita.action WHERE action_id = 'bam-to-parquet';"   # baseline mem_gb 12, ceiling 32
   ```
 - **Re-run the PacBio samples stranded by the old build** (sequencing_run 18 /
   sequenced_pool 25016 — 24 of 26 OOM-killed). No cleanup is needed first: each

@@ -21,6 +21,7 @@ import pytest_asyncio
 
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
     seed_user_principal,
 )
 
@@ -28,20 +29,34 @@ pytestmark = pytest.mark.db
 
 # The migration's per-sample backfill, verbatim in shape. Kept here (rather than
 # re-running the migration file) so the test pins the LOGIC, not dbmate's plumbing.
-_BACKFILL_PER_SAMPLE = """
+_BACKFILL = """
+WITH candidate AS (
+    SELECT sr.idx AS sequence_range_idx, wt.work_ticket_idx
+      FROM qiita.sequence_range sr
+      JOIN qiita.work_ticket wt
+        ON wt.prep_sample_idx = sr.prep_sample_idx
+       AND wt.action_id IN ('bam-to-parquet', 'fastq-to-parquet')
+     WHERE sr.created_at >= wt.created_at
+    UNION ALL
+    SELECT sr.idx AS sequence_range_idx, wt.work_ticket_idx
+      FROM qiita.sequence_range sr
+      JOIN qiita.sequenced_sample ss
+        ON ss.prep_sample_idx = sr.prep_sample_idx
+      JOIN qiita.work_ticket wt
+        ON wt.sequenced_pool_idx = ss.sequenced_pool_idx
+       AND wt.action_id = 'bcl-convert'
+     WHERE sr.created_at >= wt.created_at
+),
+unambiguous AS (
+    SELECT sequence_range_idx, min(work_ticket_idx) AS work_ticket_idx
+      FROM candidate
+     GROUP BY sequence_range_idx
+    HAVING count(*) = 1
+)
 UPDATE qiita.sequence_range sr
-   SET minted_by_work_ticket_idx = wt.work_ticket_idx
-  FROM qiita.work_ticket wt
- WHERE wt.prep_sample_idx = sr.prep_sample_idx
-   AND wt.action_id IN ('bam-to-parquet', 'fastq-to-parquet')
-   AND sr.created_at >= wt.created_at
-   AND (
-        SELECT count(*)
-          FROM qiita.work_ticket w2
-         WHERE w2.prep_sample_idx = sr.prep_sample_idx
-           AND w2.action_id IN ('bam-to-parquet', 'fastq-to-parquet')
-           AND sr.created_at >= w2.created_at
-       ) = 1
+   SET minted_by_work_ticket_idx = u.work_ticket_idx
+  FROM unambiguous u
+ WHERE u.sequence_range_idx = sr.idx
 """
 
 
@@ -95,6 +110,38 @@ async def _loader_ticket(
     )
 
 
+async def _pool_ingest(pool, *, prep_sample_idx, principal_idx, created_at):
+    """Put the sample in a sequenced_pool and give that pool a bcl-convert ticket —
+    the POOL-shaped minter (ingest_reads mints one range per sample in the pool).
+    Returns (work_ticket_idx, sequenced_pool_idx)."""
+    _run, pool_idx, _ss = await seed_sequenced_sample_subtype(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=principal_idx,
+        sequenced_pool_item_id=f"item-{secrets.token_hex(3)}",
+    )
+    await pool.execute(
+        "INSERT INTO qiita.action"
+        " (action_id, version, target_kind, scopes, audience, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling)"
+        " VALUES ('bcl-convert', '1.0.0', 'sequenced_pool', '{}', '{}'::jsonb,"
+        "         '[]'::jsonb, 1, 1, '1 hour'::interval)"
+        " ON CONFLICT DO NOTHING"
+    )
+    wt = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  sequenced_pool_idx, state, created_at)"
+        " VALUES ('bcl-convert', '1.0.0', $1, 'sequenced_pool', $2,"
+        "         'completed'::qiita.work_ticket_state, $3)"
+        " RETURNING work_ticket_idx",
+        principal_idx,
+        pool_idx,
+        created_at,
+    )
+    return wt, pool_idx
+
+
 async def _range_at(pool, *, prep_sample_idx, principal_idx, created_at):
     """A sequence_range with an explicit created_at (bypasses the mint fn on purpose:
     these tests are about attribution, not allocation)."""
@@ -121,7 +168,7 @@ async def test_backfill_attributes_a_range_its_ticket_minted(sample):
     )
     await _range_at(pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(10, 5))
 
-    await pool.execute(_BACKFILL_PER_SAMPLE)
+    await pool.execute(_BACKFILL)
 
     owner = await pool.fetchval(
         "SELECT minted_by_work_ticket_idx FROM qiita.sequence_range WHERE prep_sample_idx = $1",
@@ -153,7 +200,7 @@ async def test_backfill_refuses_a_ticket_that_only_collided_with_the_range(sampl
         created_at=_at(11, 0),
     )
 
-    await pool.execute(_BACKFILL_PER_SAMPLE)
+    await pool.execute(_BACKFILL)
 
     owner = await pool.fetchval(
         "SELECT minted_by_work_ticket_idx FROM qiita.sequence_range WHERE prep_sample_idx = $1",
@@ -178,10 +225,52 @@ async def test_backfill_leaves_ambiguous_attribution_null(sample):
         )
     await _range_at(pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(10, 5))
 
-    await pool.execute(_BACKFILL_PER_SAMPLE)
+    await pool.execute(_BACKFILL)
 
     owner = await pool.fetchval(
         "SELECT minted_by_work_ticket_idx FROM qiita.sequence_range WHERE prep_sample_idx = $1",
         ps,
     )
     assert owner is None
+
+
+async def test_backfill_refuses_when_a_pool_ingest_also_could_have_minted(sample):
+    """The cross-shape case, and the one a per-sample-only count fails OPEN on.
+
+    The sample's reads were loaded by its POOL ingest (bcl-convert -> ingest_reads),
+    which mints a range per sample. It also carries a stray per-sample loader ticket
+    created BEFORE that — so the range postdates the stray ticket, and a count that
+    only looked at per-sample loaders would see exactly one candidate and credit it.
+    A later `ticket run` on that stray ticket would then "recognise" the range as its
+    own, reuse it, and register the sample's reads a SECOND time.
+
+    Both shapes are candidates, so the count is 2 → ambiguous → NULL → fails closed.
+    """
+    pool, ps, pr = sample["pool"], sample["prep_sample_idx"], sample["principal_idx"]
+
+    # A stray per-sample loader, created first (it 409'd and failed, or never ran).
+    await _loader_ticket(
+        pool,
+        prep_sample_idx=ps,
+        principal_idx=pr,
+        action_id="fastq-to-parquet",
+        created_at=_at(8),
+    )
+    # The pool ticket that actually minted the range, and the sample's membership in
+    # that pool (the join the pool-shape candidate walks).
+    pool_ticket, _pool_idx = await _pool_ingest(
+        pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(9)
+    )
+    # The range was minted by the POOL ingest — after both tickets exist.
+    await _range_at(pool, prep_sample_idx=ps, principal_idx=pr, created_at=_at(10))
+
+    await pool.execute(_BACKFILL)
+
+    owner = await pool.fetchval(
+        "SELECT minted_by_work_ticket_idx FROM qiita.sequence_range WHERE prep_sample_idx = $1",
+        ps,
+    )
+    assert owner is None, (
+        "two candidate minters (a stray per-sample loader and the pool ingest) must "
+        f"leave the range unattributed; got {owner} (pool ticket was {pool_ticket})"
+    )

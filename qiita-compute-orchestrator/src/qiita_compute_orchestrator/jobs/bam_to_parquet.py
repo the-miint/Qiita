@@ -76,17 +76,11 @@ YAML_STEP_NAME = "bam"
 # backend / tests), where there is no cgroup to read; it is NOT the YAML baseline
 # minus headroom, and deliberately stays small so a dev box isn't asked for 29 GB.
 #
-# What actually needs the memory is the final sorted COPY — a BLOCKING operator over
-# the full seq+qual payload. A PacBio HiFi read is ~15-25 kB of seq+qual against
-# Illumina's ~150 bp, so a routine 2M-read sample is tens of GB to sort. That is
-# where the first real PacBio run died (`Out of buffer` inside the COPY), and it is
-# why the YAML baseline is long-read-sized rather than inherited from
-# fastq_to_parquet.
-#
-# The PARSE is not the problem: read_sequences_sam streams, and miint projects the
-# aux tags (MM/ML, ipd/pw) away rather than materialising them into the pipeline.
-# An earlier version of this comment blamed htslib's per-record tag handling for
-# peak memory; nothing observed supports that, and the failure was in the sort.
+# Peak memory is flat in the sample: the reads are written in bounded batches (see
+# _write_read_parts), and the parse streams (read_sequences_sam projects the aux tags
+# away rather than materialising them). The one term that still scales with the input
+# is `count(DISTINCT read_id)` — a blocking hash aggregate, O(distinct read_ids). At a
+# few million HiFi reads that is small; a 20M-read ONT run is what the ceiling covers.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
@@ -96,11 +90,10 @@ _DUCKDB_THREADS = 2
 # even at the off-SLURM fallback, while staying far above the 64 MB row-group target
 # so each part still holds many row groups.
 #
-# There is deliberately NO plan(). Memory no longer scales with the input — it is
-# flat in the batch size — so there is nothing for a down-only sizing hint to
-# usefully lower, and a walltime hint risks burning one of the ticket's three shared
-# retries on a TIMEOUT. The job is now a streaming job, in the sense
-# docs/writing-a-job.md means it.
+# There is deliberately NO plan(). Peak memory is flat in the batch, not the input, so
+# a down-only sizing hint has nothing useful to lower; and a walltime hint risks
+# burning one of the ticket's three shared retries on a TIMEOUT. What scales with a
+# long sample is walltime, which is where the ceiling headroom sits.
 _ROWS_PER_PART_TARGET_BYTES = 1024**3
 
 
@@ -170,14 +163,21 @@ def _write_read_parts(
     # Size the batch from the intermediate's UNCOMPRESSED payload, read from the
     # Parquet footer (parquet_metadata is metadata-only — no data scan). Row count
     # alone would be a poor proxy: HiFi reads are ~100x an Illumina read.
-    uncompressed_bytes = (
-        conn.execute(
-            "SELECT coalesce(sum(total_uncompressed_size), 0) FROM parquet_metadata(?)",
-            [str(intermediate)],
-        ).fetchone()[0]
-        or 0
-    )
-    bytes_per_row = max(1, uncompressed_bytes // max(1, count))
+    uncompressed_bytes = conn.execute(
+        "SELECT sum(total_uncompressed_size) FROM parquet_metadata(?)",
+        [str(intermediate)],
+    ).fetchone()[0]
+    if not uncompressed_bytes:
+        # Coalescing this to 0 would make bytes_per_row 1 and rows_per_part ~1e9 —
+        # i.e. ONE part, an unbounded sort over the whole sample. That is exactly the
+        # OOM this batching exists to remove, and it would come back silently. The
+        # footer of a non-empty Parquet always reports a size, so a missing one means
+        # something is wrong with the intermediate; say so.
+        raise ValueError(
+            f"parquet_metadata reported no uncompressed size for {intermediate} "
+            f"({count} rows) — cannot size the output batches"
+        )
+    bytes_per_row = max(1, uncompressed_bytes // count)
     rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
 
     # Created here, not up front: a run that fails before this point (bad input, a
@@ -204,6 +204,21 @@ def _write_read_parts(
             [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
         )
         parts += 1
+
+    # The slicing above assumes `sequence_index` is DENSE 1..count (miint's per-file
+    # ordinal; pinned in tests/jobs/test_bam_to_parquet_miint_contract.py). If that
+    # ever stopped holding, the WHERE clauses would silently DROP rows and we would
+    # register a short sample — reads missing from the lake, with no error anywhere.
+    # The old single COPY had no WHERE and so could not do that. Footer-only count,
+    # no data scan.
+    written = conn.execute(
+        "SELECT count(*) FROM read_parquet(?)", [f"{read_dir}/part_*.parquet"]
+    ).fetchone()[0]
+    if written != count:
+        raise ValueError(
+            f"wrote {written} reads across {parts} part(s) but the BAM has {count} — "
+            "the sequence_index slicing dropped rows (is the ordinal still dense?)"
+        )
     return parts
 
 

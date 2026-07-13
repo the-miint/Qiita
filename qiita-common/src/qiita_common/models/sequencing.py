@@ -24,6 +24,7 @@ from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, Sys
 from qiita_common.models._base import PatchRequestModel
 from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
 from qiita_common.models.reference import Platform
+from qiita_common.models.work_ticket import WorkTicketState
 
 
 class SequencingRunCreateRequest(BaseModel):
@@ -742,7 +743,7 @@ class SequenceRange(BaseModel):
     sequence_idx_start: Annotated[int, Field(gt=0)]
     sequence_idx_stop: Annotated[int, Field(gt=0)]
     minted_by_work_ticket_idx: int | None = None
-    minted_by_work_ticket_state: str | None = None
+    minted_by_work_ticket_state: WorkTicketState | None = None
     created_at: AwareDatetime
 
 

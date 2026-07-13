@@ -43,7 +43,9 @@ from ..repositories.sequence_range import (
 router = APIRouter(prefix=PATH_SEQUENCE_RANGE_PREFIX, tags=["sequence-range"])
 
 
-def _record_to_response(row: asyncpg.Record) -> SequenceRange:
+def _record_to_response(
+    row: asyncpg.Record, *, minted_by_work_ticket_state: str | None = None
+) -> SequenceRange:
     """Project an asyncpg.Record from sequence_range onto the response
     model. Field access is by name (not position) so a future column
     add to the table can't silently shift the projection."""
@@ -179,4 +181,6 @@ async def get_sequence_range_route(
             status_code=404,
             detail=f"no sequence_range for prep_sample_idx {prep_sample_idx}",
         )
-    return _record_to_response(row)
+    # This is the only path that joins the minting ticket — see
+    # fetch_sequence_range_by_prep_sample_idx.
+    return _record_to_response(row, minted_by_work_ticket_state=row["minted_by_work_ticket_state"])

@@ -1,16 +1,16 @@
 """Bounded retry + failure classification for the CP sequence-range callback.
 
-Both native jobs that mint a per-prep_sample sequence range — `ingest_reads`
-(the bcl-convert read-storage step, which fans over every pool sample) and
-`fastq_to_parquet` — call back to the control plane's `/sequence-range` routes
+Every native job that mints a per-prep_sample sequence range — `ingest_reads` (the
+bcl-convert read-storage step, which fans over every pool sample), `fastq_to_parquet`
+and `bam_to_parquet` — calls back to the control plane's `/sequence-range` routes
 over HTTP. A *transient* blip on ONE of a pool's many per-sample callbacks (an
 HTTP 5xx from a proxy / a CP restart, or a pure transport error like a
 connection reset / read timeout) must not discard the whole multi-hour ingest:
 the mint is idempotent on retry (a minted-but-unwritten range is read back and
 reused), so re-driving the call is safe.
 
-This module is the single home for that retry + classification, shared by both
-jobs so they can't diverge:
+This module is the single home for that retry + classification, shared by all three
+so they can't diverge:
 
   - `cp_call_with_retry` retries a transient call a few times in-job, so a blip
     self-heals without ever failing the step.

@@ -138,11 +138,16 @@ YAML_STEP_NAME = "fastq"
 # × 60 default Parquet row_group_size × ~20 KB avg long-read record
 # incl. quality); 7 GB is comfortably above that.
 #
-# NOT yet sized from the real cgroup (unlike bam_to_parquet), so the runner's OOM
-# escalation cannot reach DuckDB here: an escalated retry re-OOMs at this same
-# limit. Converting requires raising the Illumina baseline across every
-# fastq-to-parquet version to hold the effective limit at 7 GB, which changes the
-# cluster footprint of the main production path — deliberately out of scope here.
+# TWO KNOWN GAPS vs bam_to_parquet, both tracked (see the issue below), both
+# deliberately not fixed in the PR that introduced this note:
+#
+#   1. This limit is NOT sized from the real cgroup, so the runner's OOM escalation
+#      cannot reach DuckDB here — an escalated retry re-OOMs at this same value.
+#   2. The final write is still ONE blocking `COPY ... ORDER BY sequence_idx` over
+#      the full seq+qual payload. bam_to_parquet now batches that into bounded
+#      monotone parts precisely because it OOM'd on real long reads. The claim above
+#      that 7 GB "covers long-read inputs" is the same claim that proved false there,
+#      and an ONT run arrives through THIS path as FASTQ.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 

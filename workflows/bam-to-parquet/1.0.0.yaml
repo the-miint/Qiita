@@ -10,7 +10,7 @@ description: >
   BAM analogue of fastq-to-parquet. It reads the file with miint's
   `read_sequences_sam`, keeps only the read payload (read_id, sequence, quality),
   mints a contiguous sequence_idx range from the control plane
-  (POST /api/v1/sequence-range), and writes read.parquet keyed by sequence_idx,
+  (POST /api/v1/sequence-range), and writes read/part_*.parquet keyed by sequence_idx,
   which a register-files step loads into the `read` table.
 
   This is a PLAIN read loader: it discards all alignment fields and every aux tag
@@ -67,8 +67,8 @@ steps:
     # `expect_unaligned` rides through `params:` (scalar → Inputs field); absent
     # from action_context, the job's default (True) applies.
     params: {expect_unaligned: expect_unaligned}
-    # `read_staging_dir` is the workspace holding read.parquet, which the
-    # register-files step below loads into the DuckLake `read` table.
+    # `read_staging_dir` is the workspace holding the `read/` parts directory, which
+    # the register-files step below loads into the DuckLake `read` table.
     outputs: [read_staging_dir]
     # Memory does NOT scale with the sample. The job writes the reads as bounded
     # monotone parts (read/part_*.parquet) instead of one globally sorted file, so
@@ -84,8 +84,9 @@ steps:
       mem_gb: 12
       walltime: PT4H
 
-  # Load the full reads into the DuckLake `read` table (register-files maps the
-  # top-level read.parquet to table = file stem).
+  # Load the full reads into the DuckLake `read` table (register-files maps a
+  # top-level subdir of part_*.parquet to table = directory name — the multi-file
+  # form, shared with reference_load / hash_sequences).
   - action: register-files
     inputs: [read_staging_dir]
     outputs: []
