@@ -53,11 +53,6 @@ context_schema:
     # Build params surfaced to the index builders via the steps' `params:`
     # (rype_w -> build_rype_index.w, minimap2_preset -> build_minimap2_index.preset).
     rype_w: {type: integer, minimum: 1}
-    # One bucket PER feature (named by feature_idx) instead of one bucket for
-    # the whole reference. Host filtering wants the single bucket (its answer
-    # is boolean); a spike-in reference wants per-feature so rype_classify's
-    # `bucket_name` names WHICH spike-in a read hit. Defaults false.
-    rype_bucket_per_feature: {type: boolean}
     minimap2_preset:
       type: string
       enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
@@ -141,9 +136,8 @@ steps:
     module: qiita_compute_orchestrator.jobs.build_rype_index
     target_status: indexing
     inputs: [reference_sequence_chunks]
-    # `rype_w` (action_context) -> build_rype_index.Inputs.w (the rype window);
-    # `rype_bucket_per_feature` -> Inputs.bucket_per_feature (spike-in indexes).
-    params: {rype_w: w, rype_bucket_per_feature: bucket_per_feature}
+    # `rype_w` (action_context) -> build_rype_index.Inputs.w (the rype window).
+    params: {rype_w: w}
     # Skipped when action_context sets build_rype: false (rype-only references
     # omit it; minimap2-only references set it false). Its register-index
     # sibling carries the same gate.

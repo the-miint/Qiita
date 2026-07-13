@@ -60,7 +60,7 @@ from ._mask import (
     _mint_read_mask,
     _persist_mask_idx,
     _resolved_lima,
-    _resolved_syndna_reference_idx,
+    _resolved_syndna,
     _workflow_needs_mask,
 )
 from ._processing import (
@@ -378,7 +378,7 @@ async def run_workflow(
                         # on their `*_enabled` flag, so a stale key cannot shift
                         # the hash of a run that did not use the feature.
                         resolved_lima=_resolved_lima(bound),
-                        syndna_reference_idx=_resolved_syndna_reference_idx(bound),
+                        resolved_syndna=_resolved_syndna(bound),
                     )
                 )
                 # Persist the minted mask_idx onto the ticket for durable

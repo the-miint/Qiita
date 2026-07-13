@@ -78,6 +78,15 @@ _LIMA_VERSION = "2.13.0"
 # file's md5, so the constant and the bytes lima sees cannot drift.
 _LIMA_ADAPTER_SET_MD5 = "ace7e3019407e034ee6e6fafb36f9362"
 
+# Resolved syndna config the mask hash covers — the effective spike-in filter the
+# syndna job applies. Mirrors the constants in `qiita_compute_orchestrator.jobs.syndna`
+# (kept here, not imported: the control plane does not depend on the orchestrator
+# package). A change to the spike-in classifier must update both, so the mask
+# identity stays faithful to the filter actually applied.
+_SYNDNA_ALIGNER = "minimap2"
+_SYNDNA_MM2_PRESET = "map-hifi"
+_SYNDNA_MIN_IDENTITY = 0.95
+
 
 def _workflow_needs_mask(steps: list[Any]) -> bool:
     """True iff some entry threads `mask_idx` through its `params:` — the signal
@@ -135,17 +144,34 @@ def _resolved_lima(action_context: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _resolved_syndna_reference_idx(action_context: Mapping[str, Any]) -> int | None:
-    """The syndna reference the mask hash carries, or None when syndna is off.
+def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The effective syndna config for the mask hash, or None when syndna is off.
 
     Gated on `syndna_enabled` for the same reason as `_resolved_lima`. (The
     `host_*_reference_idx` keys below are read UNGATED — a stale value with
     `host_filter_enabled` false would enter the hash. Pre-existing; not widened
     here, since every producer writes the flag and the refs together.)
+
+    NESTED, mirroring `resolved_lima` / `resolved_qc`: the reference alone does not
+    describe the filter. A read is a spike-in when it ALIGNS to the reference at
+    >= `min_identity` under `preset`, so both are part of the effective filter and
+    both belong in the identity. The threshold in particular is expected to move
+    once it is confirmed against real data with the assay owner — when it does,
+    masks MUST re-mint rather than silently reuse one built at the old cutoff.
+
+    Only the reference idx is client-chosen; the aligner, preset, and threshold are
+    control-plane constants mirroring `jobs/syndna.py` (kept here, not imported —
+    the control plane does not depend on the orchestrator package; a change to
+    either must update both, as with the resolved-QC constants).
     """
     if not action_context.get("syndna_enabled"):
         return None
-    return action_context.get("syndna_reference_idx")
+    return {
+        "reference_idx": action_context.get("syndna_reference_idx"),
+        "aligner": _SYNDNA_ALIGNER,
+        "preset": _SYNDNA_MM2_PRESET,
+        "min_identity": _SYNDNA_MIN_IDENTITY,
+    }
 
 
 def _build_mask_params(
@@ -158,7 +184,7 @@ def _build_mask_params(
     host_rype_reference_idx: int | None,
     host_minimap2_reference_idx: int | None,
     resolved_lima: dict[str, Any] | None,
-    syndna_reference_idx: int | None,
+    resolved_syndna: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Assemble the resolved-filter-config dict that `mint_mask_definition`
     hashes (canonical JSON → SHA-256 → `params_hash`) to mint/dedup a mask.
@@ -173,7 +199,7 @@ def _build_mask_params(
     path, so the backfill can supply it from a re-materialized adapter set without
     this helper touching the filesystem.
 
-    `resolved_lima` and `syndna_reference_idx` are what distinguish the five PacBio
+    `resolved_lima` and `resolved_syndna` are what distinguish the five PacBio
     protocols. `prep_protocol_idx` cannot: it is the operator's `--prep-protocol-idx`
     flag, stamped uniformly onto every sample in a run, so it is IDENTICAL across
     the protocols. Neither does `instrument_model` (a model string, not a run id),
@@ -192,7 +218,6 @@ def _build_mask_params(
         "filter_version": action_version,
         "host_rype_reference_idx": host_rype_reference_idx,
         "host_minimap2_reference_idx": host_minimap2_reference_idx,
-        "syndna_reference_idx": syndna_reference_idx,
         "prep_protocol_idx": prep_protocol_idx,
         "resolved_qc": {
             "instrument_model": instrument_model,
@@ -201,6 +226,7 @@ def _build_mask_params(
             "adapter_set_hash": adapter_set_hash,
         },
         "resolved_lima": resolved_lima,
+        "resolved_syndna": resolved_syndna,
     }
 
 
@@ -216,7 +242,7 @@ async def _mint_read_mask(
     host_rype_reference_idx: int | None,
     host_minimap2_reference_idx: int | None,
     resolved_lima: dict[str, Any] | None,
-    syndna_reference_idx: int | None,
+    resolved_syndna: dict[str, Any] | None,
 ) -> dict[str, int]:
     """Mint (or resolve) the `mask_idx` for this filtering config and bind it.
 
@@ -274,7 +300,7 @@ async def _mint_read_mask(
         host_rype_reference_idx=host_rype_reference_idx,
         host_minimap2_reference_idx=host_minimap2_reference_idx,
         resolved_lima=resolved_lima,
-        syndna_reference_idx=syndna_reference_idx,
+        resolved_syndna=resolved_syndna,
     )
 
     try:

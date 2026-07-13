@@ -13,19 +13,8 @@ any emitted row), and the `host_filter` step removes those reads (then minimap2
 re-checks the survivors). This is NOT rype's `-N` / `negative_index` mode. We
 still pass a named single-bucket mapping (default `reference_{reference_idx}`)
 rather than omitting the optional mapping table: it keeps the index
-self-describing.
-
-`bucket_per_feature=True` switches that mapping to one bucket PER feature, named
-by `feature_idx`, so `rype_classify`'s `bucket_name` says WHICH feature a read
-matched rather than merely that it matched something.
-
-**Nothing in the tree consumes that yet.** Host filtering does not want it (its
-answer is boolean), and the `syndna` step asks the same boolean question, so it
-uses the same DISTINCT seam. The flag exists because a rype index is built ONCE by
-an operator: a SynDNA reference built per-feature today needs no rebuild the day
-per-spike-in counts land (they need a durable per-`(prep_sample, feature_idx)`
-table, which does not exist). Deliberately staged, not dead by accident. Same
-mapping path either way; only the bucket_name expression differs.
+self-describing and exercises the same mapping path future multi-bucket
+(microbial) uses will reuse.
 
 rype build parameters default to k=64, w=20 (the function's own w default is
 50, so we pass 20 explicitly); `w` is overridable per build via the `rype_w`
@@ -137,13 +126,6 @@ class Inputs(BaseModel):
     `reference_idx` and `work_ticket_idx` are framework-injected scope scalars.
     `k` / `w` are the rype build parameters (host-filter defaults); `bucket_name`
     overrides the default single-bucket name.
-
-    `bucket_per_feature` switches the mapping from ONE bucket over every feature
-    to one bucket PER feature (named by `feature_idx`). Host filtering wants the
-    single bucket — the answer is boolean, "is this read host?" — and so, today,
-    does `syndna`. It is set on a spike-in reference so the index needs no rebuild
-    when per-spike-in counts land (see the module docstring). Mutually exclusive
-    with `bucket_name`.
     """
 
     reference_sequence_chunks: Path
@@ -152,7 +134,6 @@ class Inputs(BaseModel):
     k: int = _DEFAULT_K
     w: int = _DEFAULT_W
     bucket_name: str | None = None
-    bucket_per_feature: bool = False
 
 
 def _run_rype_index_create(
@@ -197,16 +178,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # single file too (tests / future producers).
     read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
 
-    if inputs.bucket_per_feature and inputs.bucket_name is not None:
-        raise ValueError(
-            "bucket_per_feature names each bucket by its feature_idx; bucket_name "
-            "names one bucket for the whole reference — pass at most one"
-        )
-    bucket = (
-        None
-        if inputs.bucket_per_feature
-        else (inputs.bucket_name or f"reference_{inputs.reference_idx}")
-    )
+    bucket = inputs.bucket_name or f"reference_{inputs.reference_idx}"
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
@@ -254,24 +226,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
             f"SELECT feature_idx, chunk_index, chunk_data FROM read_parquet('{read_target_sql}')"
         )
-        if bucket is None:
-            # One bucket PER feature, named by feature_idx — the canonical
-            # sequence identifier, so a downstream `rype_classify` hit reports
-            # WHICH feature it matched. No literal to escape.
-            conn.execute(
-                f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
-                "SELECT DISTINCT feature_idx, CAST(feature_idx AS VARCHAR) AS bucket_name "
-                f"FROM {_CHUNK_VIEW}"
-            )
-        else:
-            # Single-bucket mapping over every distinct feature. bucket is a
-            # controlled string; escape quotes for the inlined literal.
-            bucket_sql = bucket.replace("'", "''")
-            conn.execute(
-                f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
-                f"SELECT DISTINCT feature_idx, CAST('{bucket_sql}' AS VARCHAR) AS bucket_name "
-                f"FROM {_CHUNK_VIEW}"
-            )
+        # Single-bucket mapping over every distinct feature. bucket is a
+        # controlled string; escape quotes for the inlined literal.
+        bucket_sql = bucket.replace("'", "''")
+        conn.execute(
+            f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
+            f"SELECT DISTINCT feature_idx, CAST('{bucket_sql}' AS VARCHAR) AS bucket_name "
+            f"FROM {_CHUNK_VIEW}"
+        )
         status = _run_rype_index_create(
             conn,
             _CHUNK_VIEW,
@@ -287,14 +249,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             f"reference {inputs.reference_idx} → {index_dir}"
         )
 
-    # `bucket_name` is None in per-feature mode; the flag records WHICH mapping the
-    # index was built with, so a consumer never has to infer it from the buckets.
-    params = {
-        "k": inputs.k,
-        "w": inputs.w,
-        "bucket_name": bucket,
-        "bucket_per_feature": inputs.bucket_per_feature,
-    }
+    params = {"k": inputs.k, "w": inputs.w, "bucket_name": bucket}
     meta_path = workspace / "rype_index_meta.json"
     meta_path.write_text(
         json.dumps(

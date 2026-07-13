@@ -362,7 +362,7 @@ async def plan_and_submit_blocks(
                 # never carries either. Passed explicitly rather than defaulted so
                 # adding a block-path feature has to come here and say so.
                 resolved_lima=None,
-                syndna_reference_idx=None,
+                resolved_syndna=None,
             )
             mask_row = await mint_mask_definition(
                 conn,

@@ -480,7 +480,6 @@ async def do_reference_load(
     build_rype: bool = True,
     build_minimap2: bool = True,
     rype_w: int | None = None,
-    rype_bucket_per_feature: bool = False,
     minimap2_preset: str | None = None,
     watch: bool = True,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
@@ -543,16 +542,11 @@ async def do_reference_load(
     # index. Reject them up front (boundary-local message) rather than silently
     # dropping them server-side.
     host_index_opts_given = (
-        not build_rype
-        or not build_minimap2
-        or rype_w is not None
-        or rype_bucket_per_feature
-        or minimap2_preset is not None
+        not build_rype or not build_minimap2 or rype_w is not None or minimap2_preset is not None
     )
     if host_index_opts_given and not host:
         raise ValueError(
-            "--no-rype-index / --no-minimap2-index / --rype-w /"
-            " --rype-bucket-per-feature / --minimap2-preset apply only"
+            "--no-rype-index / --no-minimap2-index / --rype-w / --minimap2-preset apply only"
             " with --host (a non-host reference builds no host-filter index)"
         )
     # A host reference must carry at least one host-filter index. The workflow's
@@ -712,10 +706,6 @@ async def do_reference_load(
         action_context["build_minimap2"] = build_minimap2
         if rype_w is not None:
             action_context["rype_w"] = rype_w
-        # Only written when set: the builder's Inputs default (one bucket for the
-        # whole reference) is what host filtering wants.
-        if rype_bucket_per_feature:
-            action_context["rype_bucket_per_feature"] = True
         if minimap2_preset is not None:
             action_context["minimap2_preset"] = minimap2_preset
 

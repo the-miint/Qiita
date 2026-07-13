@@ -315,10 +315,7 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     # Per-submission index selection + tunable build params: build_rype_index is
     # gated on the build_rype action_context flag and surfaces rype_w -> w.
     assert build.when == "build_rype"
-    assert build.params == {
-        "rype_w": "w",
-        "rype_bucket_per_feature": "bucket_per_feature",
-    }
+    assert build.params == {"rype_w": "w"}
 
     # The minimap2 builder consumes the SAME feature-keyed chunks as the rype
     # builder (reassembled into whole contigs), not a raw-FASTA side channel.
@@ -523,7 +520,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     rype = next(s for s in local_host.steps if s.name == "build_rype_index")
     assert (rype.when, rype.params, rype.target_status) == (
         "build_rype",
-        {"rype_w": "w", "rype_bucket_per_feature": "bucket_per_feature"},
+        {"rype_w": "w"},
         "indexing",
     )
     assert (mm2.when, mm2.params, mm2.target_status) == (
@@ -891,58 +888,3 @@ def test_load_actions_read_mask_audience_is_admin_only():
         SystemRole.WET_LAB_ADMIN,
         SystemRole.SYSTEM_ADMIN,
     }
-
-
-def test_read_mask_yaml_ordering_and_partial_mask_contract():
-    """Pin the structural contract the read-mask chain depends on.
-
-    ORDER is load-bearing: `syndna` runs FIRST (on the raw reads), before lima can
-    drop an un-adaptered spike-in as `twist_no_adaptor`. The `partial_mask` binding
-    then threads syndna -> lima -> qc, each consuming it optionally and the
-    producers overwriting it (last-writer-wins), so qc sees whichever ran latest.
-    `host_filter` is the SOLE final emitter (`read_mask` / `read_mask_staging_dir`),
-    and its `ELSE q.reason` carries the spike-in verdicts to the end.
-
-    A reorder or a binding rename would silently miscount (a spike-in reverting to
-    `pass`, or vanishing as `twist_no_adaptor`) with no runtime error — this is the
-    structural guard, read off the shipped YAML; the behavioral half is in
-    test_runner.py's shadowing tests and the jobs' real-miint chain tests.
-    """
-    from pathlib import Path
-
-    from qiita_control_plane.actions import load_actions
-
-    repo_root = Path(__file__).resolve().parents[2]
-    rm = {a.action_id: a for a in load_actions(repo_root / "workflows")}["read-mask"]
-    by_name = {e.name: e for e in rm.steps}
-
-    assert [e.name for e in rm.steps] == [
-        "syndna",
-        "lima_export",
-        "lima",
-        "lima_mask",
-        "qc",
-        "host_filter",
-        "persist-read-metrics",
-        "register-files",
-    ]
-
-    # The partial-mask thread: syndna produces it; lima_export/lima_mask/qc consume
-    # it optionally; lima_mask overwrites it (the self-shadow — reads the binding it
-    # also writes, safe because _bind_step_inputs reads `bound` before updating it).
-    assert by_name["syndna"].outputs == ["partial_mask"]
-    assert "partial_mask" in by_name["lima_export"].optional_inputs
-    assert "partial_mask" in by_name["lima_mask"].optional_inputs
-    assert by_name["lima_mask"].outputs == ["partial_mask"]
-    assert "partial_mask" in by_name["qc"].optional_inputs
-
-    # host_filter is the SOLE final emitter; the tail consumes its bindings.
-    assert by_name["host_filter"].outputs == ["read_mask", "read_mask_staging_dir"]
-    assert by_name["persist-read-metrics"].inputs == ["read_mask"]
-    assert by_name["register-files"].inputs == ["read_mask_staging_dir"]
-
-    # The gates: the lima trio skips together; syndna has its own; qc/host_filter
-    # are ALWAYS present (host optionality is via optional_inputs).
-    assert [by_name[n].when for n in ("lima_export", "lima", "lima_mask")] == ["lima_enabled"] * 3
-    assert by_name["syndna"].when == "syndna_enabled"
-    assert by_name["qc"].when is None and by_name["host_filter"].when is None

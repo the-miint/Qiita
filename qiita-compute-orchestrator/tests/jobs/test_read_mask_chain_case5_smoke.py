@@ -15,13 +15,18 @@ partial-mask threading and reason preservation, which is exercised for real.
 from __future__ import annotations
 
 import asyncio
+import random
 from pathlib import Path
 
 import duckdb
 from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
 from qiita_common.models import ReadMaskReason
 
-_SPIKEIN = "ACGGTTACGATCGGATCACTGACTGCATTAGCC" * 12  # the reference sequence
+# Kilobase-scale, as real HiFi is: syndna aligns with minimap2's `map-hifi` preset,
+# which is tuned for long reads and will not align a short toy sequence. Seeded, so
+# the alignment is deterministic.
+_RNG = random.Random(20260713)
+_SPIKEIN = "".join(_RNG.choice("ACGT") for _ in range(2000))  # the reference sequence
 _BIO_INSERT = "ACTACTACTA" * 13  # 130 nt, adaptor-free, > min_length
 _ADAPTER = "AGATCGGAAGAGC"
 _FEATURE = 77
@@ -32,27 +37,23 @@ def _q(seq: str) -> list[int]:
 
 
 def _build_syndna_index(tmp_path: Path) -> Path:
+    """A real minimap2 `.mmi` over the spike-in insert, built with the same preset
+    the syndna job aligns with (`map-hifi`)."""
     conn = duckdb.connect(":memory:", config=miint_connect_config())
     conn.execute(miint_install_sql())
     conn.execute("LOAD miint;")
     conn.execute(
-        "CREATE TABLE chunks AS SELECT CAST(? AS BIGINT) feature_idx, "
-        "CAST(0 AS INTEGER) chunk_index, CAST(? AS VARCHAR) chunk_data",
+        "CREATE TABLE subjects AS SELECT CAST(? AS BIGINT) read_id, CAST(? AS VARCHAR) sequence1",
         [_FEATURE, _SPIKEIN],
     )
-    conn.execute(
-        "CREATE TABLE bmap AS SELECT DISTINCT feature_idx, "
-        "CAST(feature_idx AS VARCHAR) bucket_name FROM chunks"
-    )
-    ryxdi = tmp_path / "syndna.ryxdi"
-    status = conn.execute(
-        "SELECT status FROM rype_index_create(?, ?, mapping_table := 'bmap', "
-        "k := 64, w := 25, orient := TRUE)",
-        ["chunks", str(ryxdi)],
+    mmi = tmp_path / "syndna.mmi"
+    success = conn.execute(
+        "SELECT success FROM save_minimap2_index(?, ?, preset := ?)",
+        ["subjects", str(mmi), "map-hifi"],
     ).fetchone()[0]
-    assert status == "ok", status
+    assert success, "minimap2 index build failed"
     conn.close()
-    return ryxdi
+    return mmi
 
 
 def _write_reads(path: Path, rows: list[tuple[int, str]]) -> Path:
@@ -96,14 +97,14 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
     # read 1: biological — adaptor + insert. read 2: spike-in — a slice of the
     # reference, carrying NO Twist adaptor (the case-5 signature).
     bio_read = _BIO_INSERT + _ADAPTER
-    spike_read = _SPIKEIN[50:250]
+    spike_read = _SPIKEIN[250:1750]  # a 1.5 kb slice — HiFi-scale, aligns under map-hifi
     reads = _write_reads(tmp_path / "reads.parquet", [(1, bio_read), (2, spike_read)])
     index = _build_syndna_index(tmp_path)
 
     # syndna FIRST: marks the spike-in on the raw reads, before lima can drop it.
     partial = asyncio.run(
         syndna.execute(
-            syndna.Inputs(reads=reads, syndna_rype_path=index, work_ticket_idx=1),
+            syndna.Inputs(reads=reads, syndna_minimap2_path=index, work_ticket_idx=1),
             tmp_path / "ws_syndna",
         )
     )["partial_mask"]

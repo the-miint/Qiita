@@ -1030,14 +1030,15 @@ def _handle_submit_host_filter_pool(
                     HOST_FILTER_INDEX_TYPE_MINIMAP2,
                     "--host-minimap2-reference-idx",
                 )
-        # The syndna reference is just another rype reference — same index type,
-        # same readiness check. One actionable error instead of N FAILED tickets.
+        # The syndna reference is just another minimap2 reference — same index type
+        # as the host filter's minimap2 arm, same readiness check. One actionable
+        # error instead of N FAILED tickets.
         if args.syndna_reference_idx is not None:
             _assert_host_reference_ready(
                 args.base_url,
                 token,
                 args.syndna_reference_idx,
-                HOST_FILTER_INDEX_TYPE_RYPE,
+                HOST_FILTER_INDEX_TYPE_MINIMAP2,
                 "--syndna-reference-idx",
             )
 

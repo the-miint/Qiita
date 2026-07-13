@@ -198,8 +198,24 @@ the `no-changelog` label).
 - **PacBio case-5 read-mask chain.** The read-mask workflow gains two optional,
   `when:`-gated stages around its always-on QC and host filter, so one workflow
   serves all five PacBio protocols and Illumina unchanged:
-  `[lima_export → lima → lima_mask]? → qc → host_filter → syndna?`.
-  - **Adapter removal (lima)** runs FIRST, so lima sees the intact adaptor and
+  `syndna? → [lima_export → lima → lima_mask]? → qc → host_filter`.
+  - **SynDNA spike-in marking (syndna)** runs FIRST, on the RAW reads. In case 5
+    (`syndna_is_twisted == False`) the spike-ins are added *after* Twist
+    amplification and so carry no Twist adaptor: if lima ran first it would mask
+    them `twist_no_adaptor`, and because every later step only re-classifies rows
+    still `pass`, the spike-in count would be **structurally zero**. Marking them
+    up front also makes `twist_no_adaptor` a correct "artifactual" signal on the
+    reads that remain. A read is a spike-in when it ALIGNS to the SynDNA reference
+    (minimap2, `map-hifi`) at ≥ 0.95 identity over the aligned region — an identity
+    floor host filtering does not need, because a spike-in call is a *quantitative*
+    claim: a false positive both removes a real read from `biological` and inflates
+    the count the cell-count model divides by. Spike-in reads are RETAINED in
+    `read_mask` (their `sequence_idx` survives), so attributing them to a specific
+    spike-in later needs no re-ingest. Note the consequence: because a non-`pass`
+    verdict is carried verbatim through the rest of the chain,
+    `spikein_read_count_r1r2` is a **raw-space** count, not a QC'd / host-depleted
+    one. (#270)
+  - **Adapter removal (lima)** runs before QC, so lima sees the intact adaptor and
     QC's length filter judges the insert. The Twist adapter FASTA is vendored
     into the lima image rather than loaded as a reference: lima is invoked with
     `--neighbors`, which only keeps barcode pairs adjacent in the FASTA, and the
@@ -208,24 +224,16 @@ the `no-changelog` label).
     `(reference_idx, feature_idx)` PK). Reads with no Twist adaptor are masked
     `twist_no_adaptor`. Trims come from miint's `infer_trim`, not from parsing
     lima's output. (#270)
-  - **SynDNA spike-in marking (syndna)** runs LAST — spike-ins do not align to
-    the host, so counting them in the QC'd, host-depleted space is the correct
-    denominator for the downstream cell-count model. Spike-in reads are RETAINED
-    in `read_mask` (their `sequence_idx` survives), so attributing them to a
-    specific spike-in later needs no re-ingest. (#270)
   - `qc` gained an optional incoming partial mask, extending it with trims that
     stay **cumulative from the raw read**.
 - **`sequenced_sample.spikein_read_count_r1r2`** and a `spikein` bucket on the
   pool read-metrics rollup. A spike-in is added in the lab, so it is disjoint
   from `biological`. (#270)
-- **`build_rype_index --bucket-per-feature`** (`rype_bucket_per_feature` in
-  action_context): one rype bucket per `feature_idx` instead of one per
-  reference. Host filtering keeps the single bucket (its answer is boolean); a
-  spike-in reference is built per-feature so a future per-spike-in count needs no
-  index rebuild. (#270)
 - **`qiita submit-host-filter-pool --syndna-reference-idx`**, and per-sample gate
   derivation for PacBio pools: `lima_enabled`, `syndna_enabled`, and per-sample
-  `host_filter_enabled` are read back from the pool's stored pre-flight blob. (#270)
+  `host_filter_enabled` are read back from the pool's stored pre-flight blob. The
+  SynDNA reference carries a **minimap2 (`.mmi`)** index — the same index type the
+  host filter's minimap2 arm uses, so no new builder or index type is needed. (#270)
 - **PacBio protocol facts on the sequenced-sample roster** (`sheet_type`,
   `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the
   stored pre-flight — the same single-source-of-truth path `human_filtering`

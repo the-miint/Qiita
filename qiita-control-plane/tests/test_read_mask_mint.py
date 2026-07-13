@@ -102,7 +102,7 @@ async def test_mint_read_mask_binds_and_dedups(seeded):
         host_rype_reference_idx=None,
         host_minimap2_reference_idx=None,
         resolved_lima=None,
-        syndna_reference_idx=None,
+        resolved_syndna=None,
     )
     a = await runner._mint_read_mask(pool, instrument_model="NextSeq 550", **common)
     b = await runner._mint_read_mask(pool, instrument_model="NextSeq 550", **common)
@@ -134,7 +134,7 @@ async def test_mint_read_mask_host_ref_drives_identity(seeded):
         adapter_parquet=None,
         host_minimap2_reference_idx=None,
         resolved_lima=None,
-        syndna_reference_idx=None,
+        resolved_syndna=None,
     )
     a = await runner._mint_read_mask(pool, host_rype_reference_idx=7, **common)
     a_again = await runner._mint_read_mask(pool, host_rype_reference_idx=7, **common)
@@ -168,7 +168,7 @@ async def test_mint_read_mask_adapter_bytes_drive_identity(seeded, tmp_path):
         host_rype_reference_idx=None,
         host_minimap2_reference_idx=None,
         resolved_lima=None,
-        syndna_reference_idx=None,
+        resolved_syndna=None,
     )
     a = await runner._mint_read_mask(pool, adapter_parquet=adapters_a, **common)
     a_again = await runner._mint_read_mask(pool, adapter_parquet=adapters_a, **common)
@@ -235,7 +235,7 @@ async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
             resolved_lima=None,
-            syndna_reference_idx=None,
+            resolved_syndna=None,
         )
         mask_idx = minted[runner.MASK_IDX_BINDING]
 
@@ -299,13 +299,13 @@ async def test_mint_read_mask_requires_sequenced_sample(seeded):
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
             resolved_lima=None,
-            syndna_reference_idx=None,
+            resolved_syndna=None,
         )
 
 
 # --------------------------------------------------------------------------- lima / syndna
 #
-# `resolved_lima` + `syndna_reference_idx` are what distinguish the five PacBio
+# `resolved_lima` + `resolved_syndna` are what distinguish the five PacBio
 # protocols in the mask identity. `prep_protocol_idx` cannot: it is the operator's
 # `--prep-protocol-idx` flag, uniform across them.
 
@@ -320,7 +320,7 @@ def _params(**overrides):
         host_rype_reference_idx=None,
         host_minimap2_reference_idx=None,
         resolved_lima=None,
-        syndna_reference_idx=None,
+        resolved_syndna=None,
     )
     base.update(overrides)
     return runner._mask._build_mask_params(**base)
@@ -335,11 +335,13 @@ def test_lima_and_syndna_discriminate_pacbio_protocols():
         resolved_lima=runner._mask._resolved_lima(
             {"lima_enabled": True, "lima_preset": "ASYMMETRIC"}
         ),
-        syndna_reference_idx=57,
+        resolved_syndna=runner._mask._resolved_syndna(
+            {"syndna_enabled": True, "syndna_reference_idx": 57}
+        ),
     )
     assert case1 != case5
-    assert case1["resolved_lima"] is None and case1["syndna_reference_idx"] is None
-    assert case5["syndna_reference_idx"] == 57
+    assert case1["resolved_lima"] is None and case1["resolved_syndna"] is None
+    assert case5["resolved_syndna"]["reference_idx"] == 57
     assert case5["resolved_lima"]["preset"] == "ASYMMETRIC"
 
 
@@ -370,14 +372,48 @@ def test_resolved_lima_rejects_an_unknown_preset(preset):
         runner._mask._resolved_lima({"lima_enabled": True, "lima_preset": preset})
 
 
-def test_resolved_syndna_reference_idx_is_gated_on_enabled():
-    assert runner._mask._resolved_syndna_reference_idx({"syndna_reference_idx": 57}) is None
+def test_resolved_syndna_is_gated_on_enabled():
+    """A stale `syndna_reference_idx` left by a disabled run must not shift the hash."""
+    assert runner._mask._resolved_syndna({"syndna_reference_idx": 57}) is None
     assert (
-        runner._mask._resolved_syndna_reference_idx(
-            {"syndna_enabled": True, "syndna_reference_idx": 57}
-        )
+        runner._mask._resolved_syndna({"syndna_enabled": False, "syndna_reference_idx": 57}) is None
+    )
+    assert (
+        runner._mask._resolved_syndna({"syndna_enabled": True, "syndna_reference_idx": 57})[
+            "reference_idx"
+        ]
         == 57
     )
+
+
+def test_resolved_syndna_carries_the_effective_alignment_config():
+    """The reference alone does not describe the filter: a read is a spike-in when it
+    ALIGNS at >= min_identity under a preset. Both belong in the identity, so that
+    moving the threshold (expected, once it is confirmed against real data) RE-MINTS
+    rather than silently reusing a mask built at the old cutoff."""
+    r = runner._mask._resolved_syndna({"syndna_enabled": True, "syndna_reference_idx": 57})
+    assert r == {
+        "reference_idx": 57,
+        "aligner": "minimap2",
+        "preset": "map-hifi",
+        "min_identity": 0.95,
+    }
+
+
+def test_syndna_threshold_bump_remints_only_syndna_masks(monkeypatch):
+    """Moving the identity threshold changes the effective spike-in filter, so a
+    syndna mask must re-hash. Because `resolved_syndna` is None when syndna is off,
+    it leaves every non-syndna mask hashing exactly as before."""
+    ctx = {"syndna_enabled": True, "syndna_reference_idx": 57}
+    before_syndna = _params(resolved_syndna=runner._mask._resolved_syndna(ctx))
+    before_plain = _params()
+
+    monkeypatch.setattr(runner._mask, "_SYNDNA_MIN_IDENTITY", 0.99)
+    after_syndna = _params(resolved_syndna=runner._mask._resolved_syndna(ctx))
+    after_plain = _params()
+
+    assert before_syndna != after_syndna, "a threshold bump must re-mint a syndna mask"
+    assert before_plain == after_plain, "it must NOT disturb a non-syndna mask"
 
 
 def test_mask_params_are_canonical_json_serializable():
@@ -388,7 +424,9 @@ def test_mask_params_are_canonical_json_serializable():
             resolved_lima=runner._mask._resolved_lima(
                 {"lima_enabled": True, "lima_preset": "ASYMMETRIC"}
             ),
-            syndna_reference_idx=57,
+            resolved_syndna=runner._mask._resolved_syndna(
+                {"syndna_enabled": True, "syndna_reference_idx": 57}
+            ),
         ),
         sort_keys=True,
     )

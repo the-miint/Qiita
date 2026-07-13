@@ -74,10 +74,6 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS, apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn
 
-# Re-exported under the private name so this module's unit tests keep monkeypatching
-# `host_filter._run_rype_classify` without stubbing syndna's copy of the same seam.
-from ._rype import run_rype_classify as _run_rype_classify
-
 YAML_STEP_NAME = "host_filter"
 
 # DuckDB stages the (streamed) query VIEW, the small host-id accumulators, and
@@ -163,6 +159,31 @@ class Inputs(BaseModel):
     host_minimap2_path: Path | None = None
     prep_sample_idx: int | None = None
     work_ticket_idx: int
+
+
+def _run_rype_classify(
+    conn: duckdb.DuckDBPyConnection,
+    index_path: Path,
+    sequence_table: str,
+    dest_table: str,
+    *,
+    threshold: float,
+) -> None:
+    """Seam around miint's `rype_classify`. Appends the DISTINCT host
+    `sequence_idx` set (reads that matched the positive index) into the
+    pre-created `dest_table`. Isolated so unit tests stub the real classify.
+
+    Positional args (index path, sequence-table NAME) + `threshold` are bound as
+    `?` (INSERT...SELECT is DML, so prepared params are accepted here). DISTINCT
+    because the table-function interface does not guarantee one best-hit row per
+    read. `dest_table` is declared BIGINT, so rype's `read_id` coerces to it on
+    insert — no explicit cast."""
+    conn.execute(
+        f"INSERT INTO {dest_table} "
+        "SELECT DISTINCT read_id AS sequence_idx "
+        "FROM rype_classify(?, ?, id_column := 'read_id', threshold := ?)",
+        [str(index_path), sequence_table, threshold],
+    )
 
 
 def _run_align_minimap2(

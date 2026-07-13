@@ -100,7 +100,6 @@ async def _run_reference_load(
         build_rype=not args.no_rype_index,
         build_minimap2=not args.no_minimap2_index,
         rype_w=args.rype_w,
-        rype_bucket_per_feature=args.rype_bucket_per_feature,
         minimap2_preset=args.minimap2_preset,
         watch=not args.no_watch,
         poll_interval_seconds=args.poll_interval,

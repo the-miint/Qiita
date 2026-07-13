@@ -110,8 +110,10 @@ context_schema:
       type: string
       enum: [ASYMMETRIC, SYMMETRIC]
     # Spike-in gate. `syndna_enabled`; when true `syndna_reference_idx` (REQUIRED)
-    # names an ACTIVE reference carrying a rype index — the same index type the
-    # host filter uses, so no new builder or index type is needed.
+    # names an ACTIVE reference carrying a minimap2 (.mmi) index — the same index
+    # type the host filter's minimap2 arm uses, so no new builder or index type is
+    # needed. The spike-in inserts are the subject sequences; a read aligning to one
+    # at high identity is a spike-in.
     syndna_enabled:
       type: boolean
     syndna_reference_idx:
@@ -137,7 +139,7 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.syndna
     when: syndna_enabled
-    inputs: [reads, syndna_rype_path]
+    inputs: [reads, syndna_minimap2_path]
     outputs: [partial_mask]
     baseline_resources:
       cpu: 4

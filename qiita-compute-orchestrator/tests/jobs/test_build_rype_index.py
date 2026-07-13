@@ -121,12 +121,7 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
     meta = json.loads(Path(out["rype_index_meta"]).read_text())
     assert meta["index_type"] == "rype"
     assert meta["fs_path"] == str(expected_dir)
-    assert meta["params"] == {
-        "k": 64,
-        "w": 20,
-        "bucket_name": f"reference_{reference_idx}",
-        "bucket_per_feature": False,
-    }
+    assert meta["params"] == {"k": 64, "w": 20, "bucket_name": f"reference_{reference_idx}"}
 
 
 def test_build_rype_index_honours_bucket_name_override(tmp_path, monkeypatch):
@@ -254,12 +249,7 @@ def test_build_rype_index_real_rype_smoke(tmp_path, monkeypatch):
     parquet_files = list(index_dir.rglob("*.parquet"))
     assert parquet_files, "rype index has no Parquet content (empty/partial build)"
 
-    assert meta["params"] == {
-        "k": 64,
-        "w": 20,
-        "bucket_name": f"reference_{reference_idx}",
-        "bucket_per_feature": False,
-    }
+    assert meta["params"] == {"k": 64, "w": 20, "bucket_name": f"reference_{reference_idx}"}
 
 
 def test_build_rype_index_missing_chunks_raises(tmp_path, monkeypatch):
@@ -338,92 +328,3 @@ def test_build_rype_index_rype_memory_grows_on_oom_retry(tmp_path, monkeypatch):
     assert captured["duckdb_memory_gb"] == 8
     # rype gets (alloc - DuckDB cap - headroom) = 128 - 8 - 6 = 114 GB.
     assert captured["max_memory"] == 114 * 1024**3
-
-
-# --- per-feature buckets (spike-in references) --------------------------------
-#
-# Host filtering wants ONE bucket: its answer is boolean. A spike-in reference
-# wants one bucket PER feature, so `rype_classify`'s `bucket_name` names WHICH
-# spike-in a read hit — which is what lets the syndna step emit per-spike-in
-# counts instead of a bare total.
-
-
-def test_build_rype_index_bucket_per_feature_names_buckets_by_feature_idx(tmp_path, monkeypatch):
-    from qiita_compute_orchestrator.jobs import build_rype_index
-
-    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
-    chunks_dir = _write_chunks_dir(
-        tmp_path / "reference_sequence_chunks",
-        # feature 1 is chunked; the mapping must still emit ONE row per feature.
-        [(1, 0, "ACGT"), (1, 1, "TTTT"), (2, 0, "CCCC")],
-    )
-
-    seen: dict = {}
-
-    def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
-        seen["rows"] = conn.execute(
-            f"SELECT feature_idx, bucket_name FROM {mapping_table} ORDER BY feature_idx"
-        ).fetchall()
-        Path(output_path).mkdir(parents=True, exist_ok=True)
-        return "ok"
-
-    monkeypatch.setattr(build_rype_index, "_run_rype_index_create", fake_build)
-
-    inputs = build_rype_index.Inputs(
-        reference_sequence_chunks=chunks_dir,
-        reference_idx=3,
-        work_ticket_idx=1,
-        bucket_per_feature=True,
-    )
-    out = asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
-
-    # One bucket per DISTINCT feature, named by feature_idx.
-    assert seen["rows"] == [(1, "1"), (2, "2")]
-    meta = json.loads(Path(out["rype_index_meta"]).read_text())
-    # bucket_name is None in per-feature mode; the flag records the mapping used
-    # so a consumer never infers it from the buckets.
-    assert meta["params"]["bucket_per_feature"] is True
-    assert meta["params"]["bucket_name"] is None
-
-
-def test_build_rype_index_rejects_bucket_name_with_bucket_per_feature(tmp_path, monkeypatch):
-    """The two name the buckets differently; passing both is a contract error."""
-    from qiita_compute_orchestrator.jobs import build_rype_index
-
-    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
-    chunks_dir = _write_chunks_dir(tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT")])
-    inputs = build_rype_index.Inputs(
-        reference_sequence_chunks=chunks_dir,
-        reference_idx=3,
-        work_ticket_idx=1,
-        bucket_name="human",
-        bucket_per_feature=True,
-    )
-    with pytest.raises(ValueError, match="at most one"):
-        asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
-
-
-def test_build_rype_index_defaults_to_the_single_host_bucket(tmp_path, monkeypatch):
-    """Host filtering is unchanged: absent the flag, every feature shares one bucket."""
-    from qiita_compute_orchestrator.jobs import build_rype_index
-
-    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
-    chunks_dir = _write_chunks_dir(
-        tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT"), (2, 0, "CCCC")]
-    )
-    seen: dict = {}
-
-    def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
-        seen["buckets"] = [
-            r[0]
-            for r in conn.execute(f"SELECT DISTINCT bucket_name FROM {mapping_table}").fetchall()
-        ]
-        Path(output_path).mkdir(parents=True, exist_ok=True)
-        return "ok"
-
-    monkeypatch.setattr(build_rype_index, "_run_rype_index_create", fake_build)
-    inputs = build_rype_index.Inputs(
-        reference_sequence_chunks=chunks_dir, reference_idx=9, work_ticket_idx=1
-    )
-    asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
-    assert seen["buckets"] == ["reference_9"]

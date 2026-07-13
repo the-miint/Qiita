@@ -1,10 +1,10 @@
-"""Unit tests for `syndna.execute` (the rype classify seam stubbed).
+"""Unit tests for `syndna.execute` (the minimap2 align seam stubbed).
 
-`syndna` is the FIRST step of the read-mask chain: it classifies the RAW reads
-against a spike-in rype index and emits a PARTIAL mask (the 6-column qc_mask
-shape) marking hits `spikein_syndna`, everything else `pass`. The real
-`rype_classify` needs the miint extension and a built `.ryxdi`, so it is stubbed
-here and exercised in test_syndna_smoke.py.
+`syndna` is the FIRST step of the read-mask chain: it ALIGNS the RAW reads against
+a spike-in minimap2 index and emits a PARTIAL mask (the 6-column qc_mask shape)
+marking hits `spikein_syndna`, everything else `pass`. The real `align_minimap2`
+needs the miint extension and a built `.mmi`, so it is stubbed here and exercised
+(identity threshold included) in test_syndna_smoke.py.
 
 Asserted here:
   - hits become `spikein_syndna`, everything else `pass`;
@@ -12,7 +12,7 @@ Asserted here:
     trim), under the `partial_mask` binding — NOT the final read_mask;
   - the mate-trim columns follow the read_mask convention (NULL single-end,
     0 paired) so both-mates counting stays correct downstream;
-  - a missing or empty `.ryxdi` fails fast.
+  - a missing or empty `.mmi` fails fast.
 """
 
 from __future__ import annotations
@@ -56,10 +56,10 @@ def _rows(path: Path) -> list[tuple]:
 
 
 def _index(tmp_path: Path) -> Path:
-    d = tmp_path / "syndna.ryxdi"
-    d.mkdir()
-    (d / "index.bin").write_text("x")
-    return d
+    """A minimap2 index is a single non-empty `.mmi` FILE (not a rype directory)."""
+    f = tmp_path / "syndna.mmi"
+    f.write_bytes(b"\x00mmi")
+    return f
 
 
 def _run(tmp_path, reads, index):
@@ -67,25 +67,32 @@ def _run(tmp_path, reads, index):
 
     return asyncio.run(
         syndna.execute(
-            syndna.Inputs(reads=reads, syndna_rype_path=index, work_ticket_idx=1),
+            syndna.Inputs(reads=reads, syndna_minimap2_path=index, work_ticket_idx=1),
             tmp_path / "ws",
         )
     )
 
 
 def _stub_hits(monkeypatch, hits: list[int]):
-    """Stub rype_classify: insert the flagged sequence_idx set directly."""
+    """Stub align_minimap2: insert the flagged sequence_idx set directly.
+
+    The real seam applies the identity floor itself (see `_MIN_IDENTITY`), so what
+    reaches `dest_table` is already the >= threshold set — the stub therefore models
+    the POST-threshold hits. The threshold arithmetic is pinned in the smoke test
+    against a real `.mmi`."""
     from qiita_compute_orchestrator.jobs import syndna
 
-    def fake(conn, index_path, sequence_table, dest_table, *, threshold):
+    def fake(conn, index_path, query_table, dest_table, *, preset, min_identity):
         # Only reads visible in the query view may be flagged — mirrors the real
-        # function, which classifies exactly that relation (here: every raw read).
-        visible = {r[0] for r in conn.execute(f"SELECT read_id FROM {sequence_table}").fetchall()}
+        # function, which aligns exactly that relation (here: every raw read).
+        assert preset == syndna._MM2_PRESET
+        assert min_identity == syndna._MIN_IDENTITY
+        visible = {r[0] for r in conn.execute(f"SELECT read_id FROM {query_table}").fetchall()}
         for sidx in hits:
             assert sidx in visible, f"stub flagged {sidx}, not in the query view"
             conn.execute(f"INSERT INTO {dest_table} VALUES (?)", [sidx])
 
-    monkeypatch.setattr(syndna, "_run_rype_classify", fake)
+    monkeypatch.setattr(syndna, "_run_align_minimap2", fake)
 
 
 def test_syndna_marks_hits_and_passes_the_rest(tmp_path, monkeypatch):
@@ -145,15 +152,16 @@ def test_syndna_no_hits_marks_everything_pass(tmp_path, monkeypatch):
 def test_syndna_missing_index_raises(tmp_path, monkeypatch):
     reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGT", None)])
     _stub_hits(monkeypatch, [])
-    with pytest.raises(FileNotFoundError, match="syndna_rype_path"):
-        _run(tmp_path, reads, tmp_path / "nope.ryxdi")
+    with pytest.raises(FileNotFoundError, match="syndna_minimap2_path"):
+        _run(tmp_path, reads, tmp_path / "nope.mmi")
 
 
 def test_syndna_empty_index_raises(tmp_path, monkeypatch):
-    """An empty .ryxdi would classify nothing and silently report zero spike-ins."""
+    """A zero-byte .mmi would align nothing and silently report zero spike-ins for a
+    sample that has them — which the cell-count model would then divide by."""
     reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGT", None)])
     _stub_hits(monkeypatch, [])
-    empty = tmp_path / "empty.ryxdi"
-    empty.mkdir()
-    with pytest.raises(ValueError, match="empty directory"):
+    empty = tmp_path / "empty.mmi"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError, match="non-empty .mmi"):
         _run(tmp_path, reads, empty)
