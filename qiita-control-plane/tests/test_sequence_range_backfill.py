@@ -88,11 +88,12 @@ async def sample(postgres_pool):
         "version": version,
     }
 
-    # Everything this fixture seeds that another test could SEE. The tickets are the
-    # load-bearing half: they are seeded terminal with `notified_at IS NULL`, which is
-    # exactly the notify sweeper's owed-set predicate, and the sweeper scans the whole
-    # database — so a leaked one gets emailed about, failing an innocent test in
-    # another file. The DB is isolated per xdist WORKER, not per test.
+    # The rows another test could TRIP OVER. (The principal, biosample, prep_sample and
+    # pool rows survive: every count in the suite is idx-scoped, so nothing acts on
+    # them.) The tickets are the load-bearing half — seeded terminal with `notified_at
+    # IS NULL`, which is exactly the notify sweeper's owed-set predicate, and the
+    # sweeper scans the whole database, so a leaked one gets emailed about and fails an
+    # innocent test elsewhere. The DB is isolated per xdist WORKER, not per test.
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE originator_principal_idx = $1", principal_idx
     )
@@ -101,7 +102,11 @@ async def sample(postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = $1", ps_idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.action WHERE version = $1", version)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = ANY($1::text[]) AND version = $2",
+        ["bam-to-parquet", "fastq-to-parquet", "bcl-convert"],
+        version,
+    )
 
 
 async def _seed_action(pool, action_id: str, version: str, target_kind: str) -> None:

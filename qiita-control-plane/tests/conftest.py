@@ -52,13 +52,15 @@ async def _no_leaked_owed_tickets(request):
     The test database is isolated per xdist *worker*, not per test, and the notify
     sweeper's owed-set query (`sweeper._OWED_SET_WHERE`) scans all of it. So a test
     that seeds a terminal ticket and doesn't clean it up makes the sweeper email that
-    ticket's originator — and the failure surfaces as `assert 5 == 1` in
-    test_notify_sweeper, a file the leaker never touched, and only when the runner's
-    core count happens to co-locate the two. That is a genuinely hostile debug.
+    ticket's originator, and the failure lands on whichever test asserts against a
+    global sweep tally — in a file the leaker never touched, and only when the
+    scheduler happens to co-locate the two on one worker. That is a hostile debug:
+    the symptom names the victim, never the culprit. This names the culprit.
 
-    Autouse fixtures finalize last, so this runs after the test's own teardown. It is
-    a no-op for the vast majority of tests, which never touch the DB: it only queries
-    when a test actually built one.
+    A function-scoped autouse fixture is set up before the test's other function-scoped
+    fixtures, so it finalizes after them — including the one that seeded the tickets.
+    It is a no-op for the tests that never touch the DB: it only queries when a test
+    actually built one.
 
     It compares against a BASELINE taken before the test, rather than asserting the
     owed set is empty. The worker database is reused across pytest sessions, so an
