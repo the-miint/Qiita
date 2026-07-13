@@ -93,11 +93,7 @@ from ..miint import (
     resolve_duckdb_memory_gb,
 )
 from . import JobPlan, JobResourcePlan
-from ._partial_mask import (
-    assert_covers_reads,
-    assert_single_end,
-    assert_trims_within_read,
-)
+from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "qc"
 
@@ -152,9 +148,14 @@ _INCOMING = "qc_incoming_mask"
 # the insert. substr takes a 1-based start + a LENGTH; the qual array takes a
 # 1-based INCLUSIVE slice. The two must stay in lockstep or filter_read judges a
 # sequence against another read's phred values. `r` is the read alias, `m` the
-# incoming-mask alias. Guarded by `_partial_mask.assert_trims_within_read` — DuckDB's substr
-# with a NEGATIVE length walks BACKWARDS and returns bases (while the qual slice
-# yields []), so an over-trimmed row would desync the two rather than error.
+# incoming-mask alias.
+#
+# The trims are guaranteed to fit inside the read by the mask's PRODUCERS (syndna
+# emits literal zeros; lima_mask's `infer_trim` fails loud unless the clipped read
+# is a contiguous substring of the original), and that is pinned in their tests. It
+# matters because the failure would be silent rather than loud: DuckDB's substr with
+# a NEGATIVE length walks BACKWARDS and returns bases, while the qual slice yields
+# [], so an over-trimmed row would desync the two instead of erroring.
 _INCOMING_SEQ1 = (
     "substr(r.sequence1, m.left_trim1 + 1, length(r.sequence1) - m.left_trim1 - m.right_trim1)"
 )
@@ -488,6 +489,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # miint overloads. The qual columns ride along (QC needs decoded
             # phred). read_id is not needed — the mask keys on sequence_idx only.
             #
+            # This does NOT assume a read set can be both. A prep_sample's reads come
+            # from one library on one run, so in practice every row is SE or every row
+            # is PE and the other view is empty (contributing no rows to the union).
+            # The split is layout ROUTING to the right miint overload, not a claim that
+            # the two mix; keeping both branches unconditional means one code path
+            # instead of an `if` that would have to re-derive the layout to pick a seam.
+            #
             # Both SE shapes expose `in_left1`/`in_right1`, so `_qc_se_select` has
             # one code path: with no incoming mask they are literal zeros and
             # `sequence1`/`qual1` are the raw columns; with one, they are the
@@ -503,13 +511,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             else:
                 mask_sql = validate_parquet_path(inputs.partial_mask)
                 conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
-                # Boundary guards, cheapest first. All three are fail-fast: a
-                # malformed incoming mask corrupts trims or read counts silently.
+                # The one condition our own construction does NOT establish: the
+                # gates are client-supplied, so a caller can ask for the long-read
+                # chain over a paired-end read set. The mask's SHAPE (one row per
+                # read, trims within the read) is guaranteed by its producers and
+                # pinned in their tests — see `_partial_mask`.
                 assert_single_end(conn, reads_sql, "partial_mask", inputs.partial_mask)
-                assert_covers_reads(conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask)
-                assert_trims_within_read(
-                    conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask
-                )
                 # Only still-`pass` rows are re-classified, on the trimmed insert.
                 conn.execute(
                     f"CREATE VIEW {_SE} AS "

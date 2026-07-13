@@ -165,3 +165,36 @@ def test_syndna_empty_index_raises(tmp_path, monkeypatch):
     empty.write_bytes(b"")
     with pytest.raises(ValueError, match="non-empty .mmi"):
         _run(tmp_path, reads, empty)
+
+
+def test_syndna_emits_exactly_one_row_per_read(tmp_path, monkeypatch):
+    """THE BIJECTION, pinned at the producer. `qc` / `lima_export` / `lima_mask` all
+    JOIN their incoming mask against the reads, so a missing row silently DROPS a read
+    (under-reporting the sample's `raw` total) and a duplicate fans the join out and
+    double-counts. syndna guarantees one row per read by construction — `reads LEFT
+    JOIN hits` over a DISTINCT hit set — and this is what holds that guarantee, so the
+    consumers do not each re-check it at runtime (see jobs/_partial_mask)."""
+    rows = [(i, "ACGT" if i % 2 else "TTTT", None) for i in range(1, 8)]
+    reads = _write_reads(tmp_path / "reads.parquet", rows)
+    _stub_hits(monkeypatch, [2, 4])
+    out = _run(tmp_path, reads, _index(tmp_path))
+    with duckdb.connect(":memory:") as conn:
+        n, distinct = conn.execute(
+            f"SELECT count(*), count(DISTINCT sequence_idx) "
+            f"FROM read_parquet('{out['partial_mask']}')"
+        ).fetchone()
+    assert n == distinct == len(rows)
+
+
+def test_syndna_trims_are_always_zero_so_they_cannot_exceed_the_read(tmp_path, monkeypatch):
+    """The other invariant the consumers rely on rather than re-check: an incoming
+    mask's trims fit inside its read. SynDNA does not trim, so its trims are literal
+    zeros — pinned here so a future edit cannot quietly introduce a trim."""
+    reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGTACGT", None), (2, "TT", None)])
+    _stub_hits(monkeypatch, [1])
+    out = _run(tmp_path, reads, _index(tmp_path))
+    with duckdb.connect(":memory:") as conn:
+        assert conn.execute(
+            f"SELECT count(*) FROM read_parquet('{out['partial_mask']}') "
+            "WHERE left_trim1 <> 0 OR right_trim1 <> 0"
+        ).fetchone() == (0,)

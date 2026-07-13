@@ -43,7 +43,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._partial_mask import assert_covers_reads, assert_single_end
+from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "lima_export"
 
@@ -110,7 +110,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             else:
                 mask_sql = validate_parquet_path(inputs.partial_mask)
                 conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
-                assert_covers_reads(conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask)
                 conn.execute(
                     f"CREATE VIEW lima_export_pass AS "
                     f"SELECT r.* FROM read_parquet('{reads_sql}') r JOIN {_INCOMING} m "

@@ -202,3 +202,33 @@ def test_mask_fails_loud_when_lima_edited_internal_bases(tmp_path):
     lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, "GGGGGG")])
     with pytest.raises(duckdb.Error, match="infer_trim"):
         _mask(tmp_path, reads, lima_out)
+
+
+def test_mask_emits_exactly_one_row_per_read_even_when_lima_drops_some(tmp_path):
+    """THE BIJECTION, pinned at the producer. `qc` JOINs its incoming mask against the
+    reads, so a missing row silently drops a read and a duplicate double-counts.
+    `infer_trim` returns one row per ORIGINAL read (NULL/NULL for one the tool omitted),
+    so the bijection survives lima dropping reads — which is the interesting case, and
+    the reason the consumers do not re-check it at runtime (see jobs/_partial_mask)."""
+    reads = _reads(tmp_path, [(11, _LEAD + _INSERT), (22, _INSERT), (33, _INSERT + _TRAIL)])
+    # lima kept only 11 and 33; 22 carried no adaptor and was dropped.
+    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT), (33, _INSERT)])
+    rows = _mask_rows(_mask(tmp_path, reads, lima_out)["partial_mask"])
+    assert [r[0] for r in rows] == [11, 22, 33], "one row per ORIGINAL read, dropped or not"
+    assert len({r[0] for r in rows}) == 3
+
+
+def test_mask_trims_never_exceed_the_raw_read(tmp_path):
+    """The other invariant the consumers rely on rather than re-check. `infer_trim`
+    locates the clipped read as a contiguous substring of the original and fails loud
+    otherwise, so `left + right <= length` holds by construction. If it ever did not,
+    the failure would be SILENT downstream: DuckDB's substr with a negative length
+    walks backwards and returns bases instead of erroring."""
+    raw = _LEAD + _INSERT + _TRAIL
+    reads = _reads(tmp_path, [(11, raw), (22, _INSERT)])
+    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT)])
+    for sidx, reason, left, right, _lt2, _rt2 in _mask_rows(
+        _mask(tmp_path, reads, lima_out)["partial_mask"]
+    ):
+        length = len(raw) if sidx == 11 else len(_INSERT)
+        assert left + right <= length, f"{sidx} ({reason}) trims {left}+{right} > {length}"

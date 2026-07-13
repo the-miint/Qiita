@@ -771,35 +771,44 @@ def _assert_pacbio_submission_coherent(
 
     A NULL `human_filtering` still aborts (as on the Illumina path): the pre-flight
     could not answer, and guessing would either leak human reads or silently drop
-    a filter the operator asked for."""
+    a filter the operator asked for.
+
+    Aborts the way its Illumina twin `_assert_pool_intent_matches` does — the message
+    to stderr, then `sys.exit(1)` — so an operator's stdout stays clean for the JSON
+    summary the success path prints."""
+
+    def _abort(message: str) -> None:
+        print(message, file=sys.stderr)
+        sys.exit(1)
+
     unknown = [s["sequenced_pool_item_id"] for s in samples if s.get("human_filtering") is None]
     if unknown and not force:
-        raise SystemExit(
+        _abort(
             f"sequenced_pool {sequenced_pool_idx}: {len(unknown)} sample(s) have no"
             " intake human_filtering intent in the stored pre-flight"
             f" (e.g. {unknown[:3]}). Refusing to guess. Re-check the pre-flight, or"
             " pass --force to submit them with host filtering disabled."
         )
     if host_minimap2_reference_idx is not None:
-        raise SystemExit(
+        _abort(
             "long-read host filtering is rype-only; --host-minimap2-reference-idx is"
             " not applicable to a PacBio pool"
         )
     if any(s.get("human_filtering") for s in samples) and host_rype_reference_idx is None:
-        raise SystemExit(
+        _abort(
             f"sequenced_pool {sequenced_pool_idx}: some samples request host"
             " filtering (human_filtering true in the pre-flight) but no"
             " --host-rype-reference-idx was given"
         )
     gates = [g for g in (_pacbio_gates(s) for s in samples) if g is not None]
     if any(g["syndna_enabled"] for g in gates) and syndna_reference_idx is None:
-        raise SystemExit(
+        _abort(
             f"sequenced_pool {sequenced_pool_idx}: sheet_type is"
             f" {SHEET_TYPE_PACBIO_ABSQUANT!r}, so its samples carry SynDNA spike-ins;"
             " --syndna-reference-idx is required"
         )
     if not any(g["syndna_enabled"] for g in gates) and syndna_reference_idx is not None:
-        raise SystemExit(
+        _abort(
             "--syndna-reference-idx given but no sample in this pool carries SynDNA"
             f" spike-ins (sheet_type is not {SHEET_TYPE_PACBIO_ABSQUANT!r})"
         )

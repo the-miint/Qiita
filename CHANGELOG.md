@@ -229,6 +229,17 @@ the `no-changelog` label).
 - **`sequenced_sample.spikein_read_count_r1r2`** and a `spikein` bucket on the
   pool read-metrics rollup. A spike-in is added in the lab, so it is disjoint
   from `biological`. (#270)
+- **Review follow-ups on the read-mask chain.** The two incoming-partial-mask guards that
+  re-checked the mask's SHAPE at every consumer (one row per read; trims within the read) are
+  REMOVED: both producers establish those invariants by construction — `syndna` emits `reads LEFT
+  JOIN hits` over a DISTINCT hit set, and `lima_mask`'s `infer_trim` returns one row per original
+  read and fails loud on a non-substring — so the checks guarded our own code against itself. The
+  invariants are now pinned at the producers, where they are actually established. The guard that
+  REMAINS is the one our construction does not establish: the `syndna_enabled` / `lima_enabled`
+  gates are client-supplied, so a submission can still ask for the long-read chain over a
+  paired-end read set. `lima_mask`'s check on lima's own output also remains — lima is an external
+  container binary, and `infer_trim` would absorb a broken contract silently. (#270)
+
 - **`qiita submit-host-filter-pool --syndna-reference-idx`**, and per-sample gate
   derivation for PacBio pools: `lima_enabled`, `syndna_enabled`, and per-sample
   `host_filter_enabled` are read back from the pool's stored pre-flight blob. The

@@ -4511,10 +4511,10 @@ def _case5(**kw):
     )
 
 
-def test_pacbio_submission_requires_syndna_reference():
+def test_pacbio_submission_requires_syndna_reference(capsys):
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
 
-    with pytest.raises(SystemExit, match="syndna-reference-idx is required"):
+    with pytest.raises(SystemExit) as exc:
         _assert_pacbio_submission_coherent(
             [_case5()],
             sequenced_pool_idx=1,
@@ -4523,13 +4523,15 @@ def test_pacbio_submission_requires_syndna_reference():
             syndna_reference_idx=None,
             force=False,
         )
+    assert exc.value.code == 1
+    assert "--syndna-reference-idx is required" in capsys.readouterr().err
 
 
-def test_pacbio_submission_rejects_minimap2():
+def test_pacbio_submission_rejects_minimap2(capsys):
     """Long-read host filtering is rype-only."""
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
 
-    with pytest.raises(SystemExit, match="rype-only"):
+    with pytest.raises(SystemExit) as exc:
         _assert_pacbio_submission_coherent(
             [_case5()],
             sequenced_pool_idx=1,
@@ -4538,12 +4540,14 @@ def test_pacbio_submission_rejects_minimap2():
             syndna_reference_idx=7,
             force=False,
         )
+    assert exc.value.code == 1
+    assert "rype-only" in capsys.readouterr().err
 
 
-def test_pacbio_submission_requires_host_ref_when_any_sample_wants_filtering():
+def test_pacbio_submission_requires_host_ref_when_any_sample_wants_filtering(capsys):
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
 
-    with pytest.raises(SystemExit, match="no.*host-rype-reference-idx"):
+    with pytest.raises(SystemExit) as exc:
         _assert_pacbio_submission_coherent(
             [_case5(human_filtering=False), _case5(human_filtering=True)],
             sequenced_pool_idx=1,
@@ -4552,9 +4556,11 @@ def test_pacbio_submission_requires_host_ref_when_any_sample_wants_filtering():
             syndna_reference_idx=7,
             force=False,
         )
+    assert exc.value.code == 1
+    assert "no --host-rype-reference-idx was given" in capsys.readouterr().err
 
 
-def test_pacbio_submission_allows_a_mixed_host_filter_pool():
+def test_pacbio_submission_allows_a_mixed_host_filter_pool(capsys):
     """PacBio host filtering is PER SAMPLE: a pool may legitimately mix filtered
     and unfiltered samples. This is what the Illumina pool-uniform guard forbids."""
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
@@ -4569,12 +4575,12 @@ def test_pacbio_submission_allows_a_mixed_host_filter_pool():
     )
 
 
-def test_pacbio_submission_aborts_on_a_null_intent():
+def test_pacbio_submission_aborts_on_a_null_intent(capsys):
     """The pre-flight could not answer; guessing would leak human reads or silently
     drop a filter the operator asked for."""
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
 
-    with pytest.raises(SystemExit, match="no.*human_filtering intent"):
+    with pytest.raises(SystemExit) as exc:
         _assert_pacbio_submission_coherent(
             [_case5(human_filtering=None)],
             sequenced_pool_idx=1,
@@ -4583,12 +4589,14 @@ def test_pacbio_submission_aborts_on_a_null_intent():
             syndna_reference_idx=7,
             force=False,
         )
+    assert exc.value.code == 1
+    assert "have no intake human_filtering intent" in capsys.readouterr().err
 
 
-def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool():
+def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
 
-    with pytest.raises(SystemExit, match="no sample in this pool carries SynDNA"):
+    with pytest.raises(SystemExit) as exc:
         _assert_pacbio_submission_coherent(
             [_sample(sheet_type="pacbio_metag", twist_adaptor_id=None, syndna_is_twisted=None)],
             sequenced_pool_idx=1,
@@ -4597,3 +4605,5 @@ def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool():
             syndna_reference_idx=7,
             force=False,
         )
+    assert exc.value.code == 1
+    assert "no sample in this pool carries SynDNA" in capsys.readouterr().err

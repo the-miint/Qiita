@@ -17,7 +17,7 @@ pure end-trimmer, so that contract holds; do not suppress the failure.
 the record name and lima preserves it verbatim (appending its BAM tags after a
 space, which `read_fastx` parses into `comment`). `read_fastx`'s own
 `sequence_index` is POSITIONAL and resets per file, so it is NOT our
-`sequence_idx` — the key is recovered as `CAST(read_id AS BIGINT)`.
+`sequence_idx` — the key is recovered as `read_id::BIGINT`.
 
 **Reads lima dropped become `twist_no_adaptor`.** A HiFi read carrying no Twist
 adaptor is not a library molecule from this run — it is artifactual. It is masked
@@ -48,7 +48,6 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._partial_mask import assert_covers_reads
 
 YAML_STEP_NAME = "lima_mask"
 
@@ -98,12 +97,22 @@ class Inputs(BaseModel):
 
 
 def _assert_lima_reads_are_known(conn: duckdb.DuckDBPyConnection, lima_out_fastq: Path) -> None:
-    """Every record lima emitted must correspond to an input read.
+    """Every record lima emitted must correspond to exactly one input read.
 
-    `infer_trim` LEFT JOINs original→clipped, so an UNKNOWN clipped key is silently
-    dropped rather than erroring — the mask would still be complete, but a stale or
-    mismatched lima output would pass unnoticed. A duplicate key is worse: it fans
-    the join out and emits two mask rows for one read. Assert neither."""
+    lima's output should be a SUBSET of what we sent it (it only drops reads and
+    clips ends), so both conditions checked here — an unknown record name, or a
+    duplicated one — would indeed be a lima bug, or a stale/mismatched output file.
+    Neither has been observed; this is a boundary check, not a workaround.
+
+    It is here, and not deleted as over-defensive, for one reason: lima is an EXTERNAL
+    container binary, so its output is not an invariant our own code establishes (the
+    shape of an incoming `partial_mask` IS — see `_partial_mask`, where the equivalent
+    checks were dropped for exactly that reason). And if the contract does break, it
+    breaks SILENTLY: `infer_trim` LEFT JOINs original→clipped, so an unknown clipped
+    key is dropped rather than erroring, and a duplicate key fans the join out and
+    emits two mask rows for one read. A wrong mask would ship looking like a right
+    one. Two aggregate scans is a cheap price for turning that into a loud failure.
+    """
     (unknown,) = conn.execute(
         f"SELECT count(*) FROM {_QCD} q ANTI JOIN {_ORIG} o USING (sequence_index)"
     ).fetchone()
@@ -161,7 +170,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             else:
                 mask_sql = validate_parquet_path(inputs.partial_mask)
                 conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
-                assert_covers_reads(conn, reads_sql, _INCOMING, "partial_mask", inputs.partial_mask)
                 conn.execute(
                     f"CREATE VIEW {_ORIG} AS "
                     "SELECT r.sequence_idx AS sequence_index, r.sequence1 AS sequence "
@@ -187,7 +195,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             else:
                 conn.execute(
                     f"CREATE VIEW {_QCD} AS "
-                    "SELECT CAST(read_id AS BIGINT) AS sequence_index, sequence1 AS sequence "
+                    "SELECT read_id::BIGINT AS sequence_index, sequence1 AS sequence "
                     f"FROM read_fastx('{lima_sql}')"
                 )
             _assert_lima_reads_are_known(conn, inputs.lima_out_fastq)
