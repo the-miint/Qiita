@@ -1314,13 +1314,19 @@ def validate_primary_secondary_studies(
         )
 
 
+# The `internal_name`s whose `required` flag this import path actually enforces.
+# Narrow ON PURPOSE — see assert_required_global_fields_supplied. Adding an entry
+# here is the whole change needed to start enforcing another field.
+_ENFORCED_REQUIRED_FIELDS = frozenset({"host_taxon_id"})
+
+
 async def assert_required_global_fields_supplied(
     conn: asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     metadata: Mapping[str, str],
 ) -> None:
-    """Reject an import that omits a global field marked `required`.
+    """Reject an import that omits an ENFORCED required global field.
 
     `biosample_global_field.required` has been in the schema since the first
     migration and was never enforced anywhere — a field could be declared required
@@ -1332,6 +1338,15 @@ async def assert_required_global_fields_supplied(
     newly-ingested pool would arrive broken and the backfill would be a treadmill
     rather than a one-off.
 
+    DELIBERATELY NARROW. This enforces only `_ENFORCED_REQUIRED_FIELDS`, not every
+    field the schema marks `required` — because the other required fields
+    (collection_date, the geo/ENVO set, taxon_id) were ALSO never enforced, and
+    turning them all on at once would reject historical-shaped imports this arc has
+    no reason to touch. `host_taxon_id` is enforced because this is the PR that makes
+    its absence a hard failure downstream; the rest is a separate decision about
+    intake strictness, made when someone owns it. Widening the set is the whole
+    change required to enforce another field.
+
     A missing-value marker ('not applicable', 'missing: control sample', …) COUNTS
     as supplied — declining to give a value is a decision, and it is one the
     resolver understands. What is rejected is silence.
@@ -1339,7 +1354,9 @@ async def assert_required_global_fields_supplied(
     Raises before any DB write, with the whole missing set at once.
     """
     rows = await conn.fetch(
-        f"SELECT display_name FROM {spec.global_field_table} WHERE required"  # noqa: S608
+        f"SELECT display_name FROM {spec.global_field_table}"  # noqa: S608
+        " WHERE required AND internal_name = ANY($1::text[])",
+        sorted(_ENFORCED_REQUIRED_FIELDS),
     )
     required = {r["display_name"] for r in rows}
     supplied = set(metadata)

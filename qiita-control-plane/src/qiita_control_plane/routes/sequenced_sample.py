@@ -47,7 +47,10 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_STUDY_PREFIX,
@@ -59,8 +62,11 @@ from qiita_common.models import (
     MetadataChecklistRef,
     SequencedSampleCreateRequest,
     SequencedSampleCreateResponse,
+    SequencedSampleListItem,
+    SequencedSampleListResponse,
     SequencedSamplePatchRequest,
     SequencedSampleResponse,
+    Tier,
 )
 
 from ..auth.guards import (
@@ -73,9 +79,12 @@ from ..auth.guards import (
     require_scope,
     require_sequenced_pool_in_run,
     require_sequencing_run_exists,
+    require_study_access,
+    require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..host_filter_resolver import resolve_host_filter_many
 from ..preflight import (
     PacbioProtocol,
     open_blob,
@@ -91,13 +100,17 @@ from ..repositories._sample_helpers import (
 )
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ..repositories.sequenced_sample import (
+    fetch_sequenced_pool_samples,
     fetch_sequenced_sample_idxs_for_run,
+    fetch_sequenced_sample_idxs_for_study,
     fetch_sequenced_sample_with_prep_sample,
+    fetch_sequenced_samples_for_run,
     import_sequenced_prep_sample,
     update_sequenced_sample,
 )
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool_preflight,
+    fetch_sequencing_run_platform,
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
@@ -384,6 +397,169 @@ async def _pool_sample_facts_by_item_id(
             exc,
         )
         return {}
+
+
+@router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_POOL)
+async def list_sequenced_samples_in_pool(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> SequencedSampleListResponse:
+    """List the path's pool's active sequenced_samples with their
+    prep_sample_idx + sequenced_pool_item_id, ordered by pool-item id.
+
+    Pool-scoped sibling of `list_sequenced_sample_idxs_in_run`: that route is
+    run-scoped (spans every pool in the run) and returns bare idxs; this one
+    is scoped to a single pool and returns the richer per-sample rows a
+    fan-out needs (e.g. `qiita submit-host-filter-pool`, which keys each
+    bcl-convert FASTQ on the sequenced_pool_item_id). Caller must be a
+    HumanUser with Scope.PREP_SAMPLE_READ and system_role at least
+    wet_lab_admin — the same gate as the run-scoped list. The
+    require_sequenced_pool_in_run guard fires a 404 for an unknown pool and a
+    422 when the pool does not belong to the path's run, before the read
+    runs. Excludes rows whose supertype prep_sample is retired. The
+    `truncated` flag indicates the underlying set exceeded the hard cap;
+    callers hitting it should narrow their scope.
+
+    Each sample carries `host_filter` — what host filtering it WOULD get, resolved
+    from its own `host_taxon_id` metadata plus the run's platform. This is what the
+    submit path reads (there is no intake host-filter flag any more).
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals
+    # truncation; the route slices back to the cap before returning.
+    rows = await fetch_sequenced_pool_samples(
+        pool,
+        sequenced_pool_idx=sequenced_pool_idx,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
+    )
+    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
+    if truncated:
+        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    # PacBio protocol facts from the pool's stored pre-flight, keyed by
+    # sequenced_pool_item_id. Empty for an Illumina pool (it has none) and for a
+    # pool whose blob cannot be parsed.
+    pacbio_by_item_id = await _pool_sample_facts_by_item_id(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+    )
+    # Resolve host filtering for the whole roster in two queries — NOT one call
+    # per sample; see resolve_host_filter_many.
+    #
+    # The run's platform is the resolution's second input (the same host is
+    # depleted with different stages depending on how it was sequenced) and is
+    # constant across the pool, so it is read once here rather than per sample.
+    # Not-None: require_sequenced_pool_in_run has already established that the
+    # path's pool belongs to this run, so the run exists.
+    platform = await fetch_sequencing_run_platform(pool, sequencing_run_idx)
+    host_filter_by_biosample = await resolve_host_filter_many(
+        pool,
+        biosample_idxs=[r["biosample_idx"] for r in rows],
+        platform=platform,
+    )
+    samples = []
+    for r in rows:
+        item = dict(r)
+        item_id = item["sequenced_pool_item_id"]
+        # PacBio protocol facts; absent (None) for an Illumina pool. The read-mask
+        # submit derives lima_enabled / syndna_enabled from these.
+        facts = pacbio_by_item_id.get(item_id)
+        if facts is not None:
+            item["sheet_type"] = facts.sheet_type
+            item["twist_adaptor_id"] = facts.twist_adaptor_id
+            item["syndna_is_twisted"] = facts.syndna_is_twisted
+        # Every roster row gets a resolution — a sample with no host metadata
+        # comes back UNRESOLVED rather than absent, so "we don't know" is
+        # visible instead of silent. The resolver already returns the wire type,
+        # so there is nothing to map.
+        item["host_filter"] = host_filter_by_biosample[item["biosample_idx"]]
+        samples.append(SequencedSampleListItem.model_validate(item))
+    return SequencedSampleListResponse(
+        samples=samples,
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+
+
+@router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL)
+async def list_sequenced_samples_in_run(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+) -> SequencedSampleListResponse:
+    """List a run's active sequenced_samples — across every pool in the run —
+    with their biosample linkage and ENA/biosample accessions.
+
+    Run-scoped sibling of `list_sequenced_samples_in_pool`: same richer
+    per-sample shape and the same gate (HumanUser, Scope.PREP_SAMPLE_READ,
+    system_role at least wet_lab_admin), but spans every pool in the path's
+    run instead of one pool. require_sequencing_run_exists fires a 404 for an
+    unknown run. Excludes rows whose supertype prep_sample is retired; the
+    `truncated` flag indicates the underlying set exceeded the hard cap.
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals
+    # truncation; the route slices back to the cap before returning.
+    rows = await fetch_sequenced_samples_for_run(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
+    )
+    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
+    if truncated:
+        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    # same-pattern-ok: run-scoped twin of list_sequenced_samples_in_pool's
+    # envelope; the scope variants are kept as separate routes, not
+    # parameterized into one shared pool/run handler
+    return SequencedSampleListResponse(
+        samples=[SequencedSampleListItem.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+
+
+@study_scoped_router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY)
+async def list_sequenced_sample_idxs_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> IdxsListResponse:
+    """List sequenced_sample idxs linked to the path's study, newest-linked first.
+
+    Caller must be a HumanUser with Scope.STUDY_READ; access to the
+    path's study_idx requires viewer tier or higher (wet_lab_admin and
+    system_admin bypass tier). require_study_exists composes alongside
+    require_study_access so admin-bypass callers still get 404 on a
+    non-existent study_idx rather than a silent empty list. Walks
+    prep_sample_to_study -> prep_sample -> sequenced_sample and excludes
+    retired prep_sample_to_study links and retired prep_samples
+    unconditionally; the sequenced_sample subtype has no own retirement
+    surface. The `truncated` flag indicates the underlying set exceeded
+    the hard cap; callers hitting it should narrow their scope.
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals
+    # truncation; build_idxs_list_response slices back to the cap.
+    rows = await fetch_sequenced_sample_idxs_for_study(
+        pool,
+        study_idx=study_idx,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
+    )
+    return build_idxs_list_response(
+        rows, cap=_SEQUENCED_SAMPLE_HARD_CAP, caller_system_role=user.system_role
+    )
 
 
 def _sequenced_sample_response_from_row(
