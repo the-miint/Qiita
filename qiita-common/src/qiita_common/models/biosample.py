@@ -10,6 +10,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, SystemRole
 from qiita_common.models._base import PatchRequestModel
+from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
@@ -406,6 +407,15 @@ class SequencedSampleListItem(BaseModel):
     samples a prior (possibly interrupted) fan-out already submitted, and gives
     operators per-sample visibility into host-processing coverage without an
     N+1 of work-ticket lookups.
+
+    `host_filter` is what host filtering the sample WOULD get, resolved at
+    request time from its `host_taxon_id` metadata plus the run's platform. It
+    is the read-only preview of a submission's plan — nothing acts on it yet.
+    Only the pool-scoped list route populates it (it needs the run's platform,
+    and the resolution is per-pool work); the run-scoped list leaves it None.
+
+    It sits alongside `human_filtering` deliberately; HostFilterResolution
+    explains why the two are both reported and when they disagree.
     """
 
     sequenced_sample_idx: int
@@ -417,6 +427,7 @@ class SequencedSampleListItem(BaseModel):
     biosample_accession: str | None
     ena_sample_accession: str | None
     human_filtering: bool | None = None
+    host_filter: HostFilterResolution | None = None
     # PacBio protocol facts, None for an Illumina pool (or when the blob omits the
     # row). Derived at request time from the pool's stored run-preflight blob, the
     # same single-source-of-truth path `human_filtering` uses — none of these is a

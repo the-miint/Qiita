@@ -152,10 +152,21 @@ verification passes, the OLD build's config is the rollback path.
 - The pool `sequenced-sample` roster gains three PacBio fields (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the pool's stored pre-flight blob. Additive, and `null` for an Illumina pool — no client is required to read them. (#270)
 
 - (#293) `qiita.host_filter_profile` and the host-filter resolver are **inert on this
-  deploy** — nothing reads either yet (the read-only endpoint and the submit-path swap
-  are later PRs). No behavior change: host references still reach a submission the way
-  they do today, via the `--host-rype-reference-idx` / `--host-minimap2-reference-idx`
-  flags. The bucket-3 seed is what wires the table up for the PR that consumes it.
+  deploy** — nothing reads either yet (the submit-path swap is a later PR). No behavior
+  change: host references still reach a submission the way they do today, via the
+  `--host-rype-reference-idx` / `--host-minimap2-reference-idx` flags. The bucket-3 seed
+  is what wires the table up for the PR that consumes it.
+
+- (#294) Soft API change, additive, no host action. The pool `sequenced-sample` roster
+  gains a `host_filter` block per sample (the resolved host-filter plan), and a new
+  `GET /api/v1/host-filter-profile` lists the available profiles. Both are **read-only**
+  — the submit path is unchanged and still reads the intake `human_filtering` flag. No
+  client is required to read either.
+
+- (#294) Expect `host_filter.outcome = "unresolved"` on **every** sample until the
+  `host_taxon_id` backfill lands — no biosample carries the field yet. That is the
+  resolver reporting honestly, not a fault, and it is what makes the roster the
+  worklist for the backfill. Nothing depends on it being resolved yet.
 - (#293) **No `pacbio_smrt` host profile is seeded, deliberately.** No PacBio pool has
   been masked yet, so there is no live pairing to copy — which human build to deplete HiFi
   reads against is an open **assay** decision, not something the DB can answer. Leaving it
