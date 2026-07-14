@@ -56,9 +56,9 @@ from qiita_common.models import (
     TERMINOLOGY_TERM_VALUE_COLUMN,
 )
 
-from .preflight import control_samples_from_blob
-from .repositories._sample_helpers import _get_or_create_globally_linked_study_field
-from .repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from ..preflight import control_samples_from_blob
+from ..repositories._sample_helpers import _get_or_create_globally_linked_study_field
+from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 
 # ---------------------------------------------------------------------------
 # The curated mapping. THIS IS THE JUDGMENT — everything else is mechanism.

@@ -21,7 +21,7 @@ import secrets
 import pytest
 import pytest_asyncio
 
-from qiita_control_plane.host_taxon_backfill import (
+from qiita_control_plane.backfill.host_taxon import (
     HostTaxonSource,
     apply_backfill,
     classify,

@@ -40,7 +40,7 @@ import httpx
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
-from ...host_taxon_backfill import (
+from ...backfill.host_taxon import (
     BackfillPlan,
     HostTaxonSource,
     apply_backfill,

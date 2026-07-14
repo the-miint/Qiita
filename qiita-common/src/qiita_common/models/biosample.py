@@ -146,6 +146,18 @@ MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 # The terminology `taxon_id` / `host_taxon_id` name their terms in, and the
 # term_id of the human host. Shared so production code and the test seeds spell
 # them the same way — production must not reach into `testing/` for them.
+#
+# `NCBI_TAXONOMY_HUMAN_TERM_ID` is a STRING even though an NCBI taxon id is a number,
+# and that is not an oversight. It is a `qiita.terminology_term.term_id`, whose column
+# is `VARCHAR(255)` because that table is generic across terminologies — the same column
+# holds ENVO ids like 'ENVO:01000249', which are never going to be integers. Typing it
+# as an int here would mean casting back to text at every lookup.
+#
+# Nothing stores this string against a biosample. What a biosample carries is
+# `value_terminology_term_idx BIGINT` — the surrogate `terminology_term.idx` — so every
+# join and every comparison downstream (`host_filter_resolver.host_term_idx`) is already
+# a BIGINT. The string is the natural key, used once, at the boundary, to resolve TO
+# that BIGINT.
 NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
 NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
 
