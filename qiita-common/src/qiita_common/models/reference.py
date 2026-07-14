@@ -397,10 +397,15 @@ class ReferenceDeleteResponse(BaseModel):
     Counts are the Postgres rows removed by the cascade; `orphan_feature_count`
     is the subset of this reference's features that no other reference still
     claimed (and so were deleted from `qiita.feature` and the DuckLake
-    sequence tables). `artifacts_removed` reflects the orchestrator cleanup."""
+    sequence tables). `artifacts_removed` reflects the orchestrator cleanup.
+
+    A reference claims a feature in two ways, and `orphan_feature_count` spans
+    both: as a MEMBER (`membership_deleted`) and as an ANNOTATED INTERVAL
+    (`annotation_deleted`)."""
 
     reference_idx: Annotated[int, Field(gt=0)]
     membership_deleted: int
+    annotation_deleted: int
     index_deleted: int
     work_ticket_deleted: int
     orphan_feature_count: int

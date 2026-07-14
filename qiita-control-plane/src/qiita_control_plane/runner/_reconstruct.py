@@ -309,10 +309,24 @@ async def _run_action_primitive(
         return {entry.outputs[0]: feature_map_path}
 
     if entry.name == LibraryPrimitive.MINT_ANNOTATION_FEATURES:
-        annotation_manifest_path = Path(bound[entry.inputs[0]])
+        # Resolved by fixed binding NAME, not positionally, so a YAML reorder cannot
+        # silently swap the annotation manifest for the sequence one — they have
+        # overlapping column names and the swap would mint the wrong features.
+        if set(entry.inputs) != {"annotation_manifest", "manifest", "feature_map"}:
+            raise RuntimeError(
+                "mint-annotation-features expects inputs "
+                f"[annotation_manifest, manifest, feature_map]; got {entry.inputs!r}"
+            )
         annotation_feature_map_path, _, _ = await LIBRARY[
             LibraryPrimitive.MINT_ANNOTATION_FEATURES
-        ](pool, annotation_manifest_path, workspace)
+        ](
+            pool,
+            scope_target["reference_idx"],
+            Path(bound["annotation_manifest"]),
+            Path(bound["manifest"]),
+            Path(bound["feature_map"]),
+            workspace,
+        )
         # YAML declares one output ("annotation_feature_map"); bind it.
         return {entry.outputs[0]: annotation_feature_map_path}
 

@@ -87,6 +87,7 @@ Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-b
 - (#293) The seed is **safe to defer** — nothing reads the table on this deploy (see
   Notes), so leaving it empty breaks nothing. Running it now just means the submit-path PR
   that consumes it lands against an already-configured host.
+- `20260713020000_reference_annotation.sql` — adds `qiita.reference_annotation`, the reference's claim on features that are ANNOTATED INTERVALS of another feature (a SynDNA insert on its plasmid). Plain additive `CREATE TABLE`, standard `make migrate`, no backfill: no reference carries annotations until one is ingested with `--gff`. (#269)
 
 ### 4. Deploy
 

@@ -75,6 +75,11 @@ context_schema:
     # align to the parent. Coordinates are converted from GFF3's 1-based
     # CLOSED [start, end] to the half-open [position, stop_position) the
     # alignment side speaks, ONCE, at ingest.
+    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
+    # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
+    # is minted its OWN feature_idx so it can key a feature table while reads align to
+    # its parent. Contract + the closed->half-open coordinate conversion:
+    # qiita_compute_orchestrator.jobs.hash_sequences.
     gff_path: {type: string, pattern: "^/"}
 
 success_status: active
@@ -104,11 +109,9 @@ steps:
     module: qiita_compute_orchestrator.jobs.hash_sequences
     target_status: hashing
     inputs: [fasta_path]
-    # `gff_path` is optional; absent → hash_sequences still emits a ZERO-ROW
-    # annotation_manifest (a workflow `outputs:` binding is unconditional, so a
-    # sometimes-present output would KeyError). The empty file costs nothing: the
-    # only consumer is mint-annotation-features, an in-process control-plane
-    # action, so no extra SLURM job is scheduled on a no-GFF reference.
+    # Optional GFF3 of annotated intervals. Absent → a ZERO-ROW annotation_manifest
+    # rather than an absent output; see the hash_sequences module docstring for why
+    # that beats a `when:` gate (short version: `when:` is default-ON).
     optional_inputs: [gff_path]
     outputs: [manifest, reference_sequence_chunks, annotation_manifest]
     baseline_resources:
@@ -121,15 +124,14 @@ steps:
     inputs: [manifest]
     outputs: [feature_map]
 
-  # Mint a feature_idx for each ANNOTATED INTERVAL (a SynDNA insert on its
-  # plasmid, a gene on a chromosome), keyed on the canonical hash of the
-  # sub-sequence the interval cuts out of its parent. Deliberately NOT followed by
-  # write-membership: `reference_membership` is what gets INDEXED and aligned
-  # against, and reads align to the parent (the plasmid), never to the bare
-  # insert — a membership row here would put inserts in the aligner index and in
-  # shard planning, competing with their own parent for alignments.
+  # Mint a feature_idx for each ANNOTATED INTERVAL, and record the reference's claim
+  # on it in qiita.reference_annotation. Deliberately NOT followed by
+  # write-membership — membership is what gets INDEXED, and an interval is
+  # quantified, not aligned against. `manifest` + `feature_map` are the SEQUENCE
+  # side's, read only to resolve each interval's parent_feature_idx.
+  # See qiita_control_plane.actions.library.mint_annotation_features.
   - action: mint-annotation-features
-    inputs: [annotation_manifest]
+    inputs: [annotation_manifest, manifest, feature_map]
     outputs: [annotation_feature_map]
 
   - action: write-membership

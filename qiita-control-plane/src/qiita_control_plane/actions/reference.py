@@ -160,23 +160,36 @@ async def delete_reference_cascade(
 
     The schema uses ON DELETE RESTRICT throughout (no cascades), so order is
     explicit: work_ticket (→ work_ticket_step CASCADEs) → reference_index →
-    reference_membership → orphan feature_genome/feature → orphan genome →
-    reference. Features and genomes are deleted only when *orphaned* — claimed
-    by no other reference — so a shared feature survives.
+    reference_membership → reference_annotation → orphan feature_genome/feature →
+    orphan genome → reference. Features and genomes are deleted only when
+    *orphaned* — claimed by no other reference — so a shared feature survives.
 
     Returns the per-table delete counts for the caller's response."""
     # Orphan features: this reference's features that no other reference claims.
-    # Computed before the membership DELETE below (the EXCEPT needs this
-    # reference's rows present). This set MUST match the data-plane orphan
-    # computation in qiita-data-plane's flight_service.rs::delete_reference —
-    # the two stores GC the same features independently, so a change to either
-    # query must change the other or sequences/features desync across stores.
+    #
+    # A reference claims a feature in TWO ways, and both count: as a member
+    # (reference_membership — a whole sequence, indexed and aligned against) or as
+    # an annotated interval (reference_annotation — a SynDNA insert on its plasmid,
+    # minted its own feature_idx but deliberately kept OUT of membership). Reading
+    # only membership here would leave every annotated feature_idx behind forever,
+    # referenced by nothing; reading only membership on the *right* side of the
+    # EXCEPT would delete a feature another reference still annotates.
+    #
+    # Computed before the DELETEs below (the EXCEPT needs this reference's rows
+    # present). This set MUST match the data-plane orphan computation in
+    # qiita-data-plane's flight_service.rs::delete_reference — the two stores GC the
+    # same features independently, so a change to either query must change the other
+    # or sequences/features desync across stores.
     orphan_features = [
         r["feature_idx"]
         for r in await conn.fetch(
-            "SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1"
+            "  SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1"
+            "  UNION"
+            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx = $1"
             " EXCEPT"
-            " SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx <> $1",
+            " ( SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx <> $1"
+            "  UNION"
+            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx <> $1)",
             reference_idx,
         )
     ]
@@ -192,6 +205,14 @@ async def delete_reference_cascade(
     membership_deleted = _rowcount(
         await conn.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+    )
+    # Must precede the qiita.feature delete below: reference_annotation FKs BOTH
+    # feature_idx and parent_feature_idx with ON DELETE RESTRICT, so an orphan
+    # feature that is still claimed by one of these rows cannot be removed.
+    annotation_deleted = _rowcount(
+        await conn.execute(
+            "DELETE FROM qiita.reference_annotation WHERE reference_idx = $1", reference_idx
         )
     )
 
@@ -227,6 +248,7 @@ async def delete_reference_cascade(
 
     return {
         "membership_deleted": membership_deleted,
+        "annotation_deleted": annotation_deleted,
         "index_deleted": index_deleted,
         "work_ticket_deleted": work_ticket_deleted,
         "orphan_feature_count": len(orphan_features),

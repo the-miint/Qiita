@@ -231,7 +231,7 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
     stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
     `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
     inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
-    chunks back into a temp file via `_unwrap_chunks_to_temp_file`.
+    chunks back into a temp file via `_blob_input.resolve_blob_input`.
 
     Reads gzipped (`.gz`) inputs transparently — chunk_data carries the
     decompressed bytes. The server's stitched temp file is then valid

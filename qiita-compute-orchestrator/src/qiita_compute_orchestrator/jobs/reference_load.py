@@ -42,10 +42,13 @@ resolution; absent uploads → absent paths → absent outputs.
 
 `annotation_manifest` / `annotation_feature_map` are the odd pair: they
 are not uploads but STEP OUTPUTS (hash_sequences + mint-annotation-
-features, both `when: gff_enabled`-gated), so they arrive already bound.
-They must be present together or absent together — one without the other
-is a mis-wired workflow whose only symptom would be an empty
-`reference_annotation` table, so `execute` refuses it.
+features), so they arrive already bound, and every reference-add workflow
+binds BOTH unconditionally — a reference with no GFF3 simply carries zero
+annotation rows through them. They are typed optional here only so a caller
+constructing `Inputs` directly (a test, a future workflow) can omit them;
+supplying one without the other is a mis-wired workflow whose only symptom
+would be a silently EMPTY `reference_annotation` table, so `execute` refuses
+it up front.
 """
 
 from __future__ import annotations
@@ -135,10 +138,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if opt is not None and not opt.exists():
             raise FileNotFoundError(f"{label} not found: {opt}")
 
-    # The two annotation inputs are produced by hash_sequences + mint-annotation-
-    # features, both gated on the same `gff_enabled`. One without the other means
-    # the workflow is mis-wired, and the failure it would otherwise produce is a
-    # silently EMPTY reference_annotation table — so refuse up front.
+    # hash_sequences produces the manifest and mint-annotation-features the
+    # feature-map; every workflow binds both. One without the other means the
+    # workflow is mis-wired, and the failure it would otherwise produce is a
+    # silently EMPTY reference_annotation table — so refuse up front rather than
+    # emit a well-formed, wrong result.
     if (inputs.annotation_manifest is None) != (inputs.annotation_feature_map is None):
         raise ValueError(
             "annotation_manifest and annotation_feature_map must be supplied together; got "
@@ -240,16 +244,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
                 written.append(placements_out_path)
 
-            if inputs.annotation_manifest is not None:
-                assert inputs.annotation_feature_map is not None  # paired check above
-                _write_annotation(
+            if inputs.annotation_manifest is not None and inputs.annotation_feature_map is not None:
+                # Returns False (and writes nothing) for a reference with no
+                # annotations — the common case; see _write_annotation.
+                if _write_annotation(
                     conn,
                     annotation_manifest=inputs.annotation_manifest,
                     annotation_feature_map=inputs.annotation_feature_map,
                     reference_idx=inputs.reference_idx,
                     out=annotation_out,
-                )
-                written.append(annotation_out_path)
+                ):
+                    written.append(annotation_out_path)
 
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
@@ -310,7 +315,7 @@ def _write_annotation(
     annotation_feature_map: Path,
     reference_idx: int,
     out: str,
-) -> None:
+) -> bool:
     """Emit DuckLake's `reference_annotation` shape — one row per annotated
     interval, carrying BOTH feature_idx values the table is about:
 
@@ -334,6 +339,22 @@ def _write_annotation(
     fatal: it would emit a row whose `feature_idx` is NULL, and a feature table
     keyed on a NULL feature is not a degraded result, it is a wrong one.
     """
+    # The zero-annotation case is the COMMON one — almost no reference carries a
+    # GFF3, but every reference-add reaches here (the manifest is bound
+    # unconditionally so the step's output binding always resolves). Emitting the
+    # file anyway would have `register-files` move a zero-row Parquet into permanent
+    # lake storage and add a DuckLake snapshot for it, on every single reference-add,
+    # forever. So write NOTHING and tell the caller: the table already exists
+    # (ensure_reference_tables creates it at data-plane boot), so a reference with no
+    # annotations is correctly represented by having no rows, not by an empty file.
+    if (
+        conn.execute("SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest)]).fetchone()[
+            0
+        ]
+        == 0
+    ):
+        return False
+
     conn.execute(
         "CREATE TEMP TABLE annotation_feature_map AS SELECT * FROM read_parquet(?)",
         [str(annotation_feature_map)],
@@ -344,12 +365,12 @@ def _write_annotation(
     )
 
     unresolved = conn.execute(
-        "SELECT am.read_id, am.parent_read_id "
+        "SELECT am.annotation_id, am.parent_read_id "
         "FROM annotation_manifest am "
         "LEFT JOIN annotation_feature_map afm ON afm.sequence_hash = am.sequence_hash "
         "LEFT JOIN id_map im ON im.read_id = am.parent_read_id "
         "WHERE afm.feature_idx IS NULL OR im.feature_idx IS NULL "
-        "ORDER BY am.read_id LIMIT 5"
+        "ORDER BY am.annotation_id LIMIT 5"
     ).fetchall()
     if unresolved:
         raise ValueError(
@@ -363,8 +384,8 @@ def _write_annotation(
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, "
         "         afm.feature_idx, "
         "         im.feature_idx AS parent_feature_idx, "
-        "         am.read_id AS annotation_id, "
-        "         am.type, "
+        "         am.annotation_id, "
+        "         am.annotation_type, "
         "         am.position, "
         "         am.stop_position, "
         "         am.strand, "
@@ -377,6 +398,7 @@ def _write_annotation(
     )
     conn.execute("DROP TABLE annotation_manifest")
     conn.execute("DROP TABLE annotation_feature_map")
+    return True
 
 
 def _warn_taxonomy_anomaly(

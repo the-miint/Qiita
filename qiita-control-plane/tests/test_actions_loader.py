@@ -289,10 +289,6 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert step_names == [
         "hash_sequences",
         "mint-features",
-        # Mints a feature_idx per ANNOTATED INTERVAL (GFF3-derived). Sits between
-        # mint-features and write-membership, and is deliberately NOT followed by a
-        # membership write — membership is what gets indexed, and an insert is
-        # quantified, not aligned against.
         "mint-annotation-features",
         "write-membership",
         "load",
@@ -495,10 +491,6 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "stage_local_fasta",
         "hash_sequences",
         "mint-features",
-        # Mints a feature_idx per ANNOTATED INTERVAL (GFF3-derived). Sits between
-        # mint-features and write-membership, and is deliberately NOT followed by a
-        # membership write — membership is what gets indexed, and an insert is
-        # quantified, not aligned against.
         "mint-annotation-features",
         "write-membership",
         "load",

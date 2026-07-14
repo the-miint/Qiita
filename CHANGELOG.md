@@ -54,9 +54,27 @@ duplicates further down are historical strata; leave them where they are.
     failure, not a warning — each silently corrupts a depth number rather than
     crashing.
   - New DuckLake table `reference_annotation` (created by `ensure_reference_tables`
-    at data-plane boot; readable over Flight; purged by `delete_reference`).
+    at data-plane boot; readable over Flight; purged by `delete_reference`), plus a
+    Postgres twin `qiita.reference_annotation` holding the reference's *claim* on
+    those features — the same claim/data split `reference_membership` already uses.
+    Without it, `delete_reference_cascade` (which computes orphan features from the
+    claim tables) could not see annotated features at all, and every one of them
+    would survive `DELETE /reference/{idx}` forever while the data plane deleted its
+    lake rows — the two stores disagreeing about which features exist.
+    `ReferenceDeleteResponse` gains `annotation_deleted`.
 
 ### Fixed
+
+- **`align-plan` would have `TypeError`d on every submission once #268 and #270 were
+  both on `main` (#269).** A semantic merge conflict, invisible to either PR's CI:
+  #270 added two required keyword arguments to `_build_mask_params`
+  (`resolved_lima` / `resolved_syndna`), and #268's `align_planner` calls it to
+  reconstruct the mask params a block-masked sample was minted under. Each branch is
+  green alone; the merge is not. `align_planner` now passes both as `None`, matching
+  what `block_planner` actually mints (the block workflow is `qc → host_filter` only
+  — no lima chain, no syndna step). Had it passed anything else the lookup would have
+  silently missed, every sample would have looked unmasked, and the align plan would
+  have quietly produced nothing.
 
 - **A local reference-add carrying a tree or jplace crashed (#269).** The local
   ingest path DoPuts nothing — "no bytes cross the wire" — so `tree_path` /

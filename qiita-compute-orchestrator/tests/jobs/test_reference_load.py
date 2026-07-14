@@ -244,7 +244,7 @@ def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_pat
     import qiita_compute_orchestrator.jobs._feature_load as fl
 
     # 5 single-chunk features, budget of 2 chunks -> 3 parts (2 + 2 + 1).
-    monkeypatch.setattr(fl, "_CHUNK_BUDGET_PER_BATCH", 2)
+    monkeypatch.setattr(fl, "CHUNK_BUDGET_PER_BATCH", 2)
     outputs = _run(_inputs(**staging_inputs), tmp_path / "ws")
     chunks_dir = outputs["staging_dir"] / "reference_sequence_chunks"
     parts = sorted(chunks_dir.glob("part_*.parquet"))
@@ -448,7 +448,7 @@ def _wrap_chunked_blob_parquet(path: Path, payload: bytes) -> Path:
     """Write a chunked-blob upload Parquet `(chunk_index INTEGER,
     chunk_data BLOB)` via DuckDB. Matches the CLI's DoPut wire shape
     for opaque binary inputs (Newick / jplace); reference_load stitches
-    chunks back into a temp file via `_unwrap_chunks_to_temp_file`."""
+    chunks back into a temp file via `resolve_blob_input`."""
     chunks = [
         (i // _CHUNK_SIZE, payload[i : i + _CHUNK_SIZE])
         for i in range(0, len(payload), _CHUNK_SIZE)

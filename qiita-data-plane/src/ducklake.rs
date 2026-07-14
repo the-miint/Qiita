@@ -138,44 +138,34 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             pendant_length DOUBLE
         );
 
-        -- Annotations: a feature that is a REGION OF another feature.
+        -- Annotations: a feature that is a REGION OF another feature — a SynDNA
+        -- insert on its plasmid, a gene on a chromosome. Every other reference table
+        -- treats feature_idx as a WHOLE sequence; this is the one place it is a
+        -- sub-interval, which is what lets a quantification be keyed by the thing
+        -- measured (the insert) while reads align to the thing sequenced (the plasmid).
         --
-        -- Every other reference table treats feature_idx as a whole sequence.
-        -- This is the one place a feature is a sub-interval of a parent: a
-        -- SynDNA insert on its plasmid, a gene on a chromosome. It is what lets
-        -- a quantification be keyed by the thing being measured (the insert)
-        -- while the alignment is against the thing that was sequenced (the
-        -- plasmid).
+        --   feature_idx        -- the annotated interval (minted from the canonical
+        --                        hash of the EXTRACTED sub-sequence).
+        --   parent_feature_idx -- the sequence it sits on, and what reads align to.
+        --   annotation_id      -- the annotation's IDENTITY. Not feature_idx: identical
+        --                        bases share one feature_idx (a bacterial 16S occurs in
+        --                        5-7 byte-identical copies), so a feature is a SEQUENCE
+        --                        and an annotation is an OCCURRENCE of it at a place.
         --
-        --   feature_idx        -- the ANNOTATED feature (the insert). Minted from
-        --                        the canonical hash of the EXTRACTED sub-sequence,
-        --                        so identical inserts dedup lake-wide like any
-        --                        other feature.
-        --   parent_feature_idx -- the sequence the interval is ON, and the
-        --                        sequence reads actually align to (the plasmid).
+        -- Annotated features are deliberately absent from reference_membership (which
+        -- is what gets INDEXED and aligned against) and from reference_sequences /
+        -- _chunks (the bytes are recoverable from parent + interval). Rationale in
+        -- full: qiita-control-plane/db/migrations/20260713020000_reference_annotation.sql
         --
-        -- Annotated features are deliberately NOT in reference_membership:
-        -- membership is what gets INDEXED and aligned against, and we align to
-        -- plasmids, not to bare inserts. They also have no reference_sequences /
-        -- reference_sequence_chunks row — the bytes are recoverable from the
-        -- parent plus the interval, so storing them again would be a second copy
-        -- that can drift.
-        --
-        -- COORDINATES ARE HALF-OPEN [position, stop_position), 1-based --
-        -- deliberately NOT the closed convention GFF3 arrives in. This matches
-        -- read_alignments / alignment_slice / the qiita_lake.alignment table, so
-        -- every alignment-side consumer compares like with like. The single
-        -- closed->half-open conversion happens ONCE, at ingest, in the
-        -- hash_sequences GFF reader. Length is (stop_position - position), with
-        -- no +1. Feeding a closed GFF stop straight into alignment_slice
-        -- silently drops the interval's last base and raises nothing, which is
-        -- why the conversion is pinned by a test rather than left to a comment.
+        -- Coordinates are 1-based HALF-OPEN [position, stop_position) — matching
+        -- read_alignments / alignment_slice / qiita_lake.alignment, NOT the closed
+        -- convention GFF3 arrives in. Converted once, at ingest, in hash_sequences.
         CREATE TABLE IF NOT EXISTS qiita_lake.reference_annotation (
             reference_idx BIGINT NOT NULL,
             feature_idx BIGINT NOT NULL,
             parent_feature_idx BIGINT NOT NULL,
             annotation_id VARCHAR NOT NULL,
-            type VARCHAR,
+            annotation_type VARCHAR,
             position BIGINT NOT NULL,
             stop_position BIGINT NOT NULL,
             strand VARCHAR,
@@ -535,6 +525,73 @@ mod tests {
             cols.contains(&"sequence_length_bp".to_string()),
             "missing sequence_length_bp column, got: {cols:?}"
         );
+    }
+
+    /// `reference_annotation` is the first `qiita_lake` table with a MAP column, and
+    /// the only one a producer writes as a ZERO-ROW file on the common path (every
+    /// reference ingested without a GFF3 emits one). Both properties are load-bearing
+    /// and neither is exercised anywhere else, so pin them here — against the real
+    /// DDL rather than a copy of it.
+    ///
+    /// The zero-row half is not a formality: `register-files` moves EVERY staging
+    /// `*.parquet` into the lake, so a no-GFF reference-add registers an empty file on
+    /// every single run. If DuckLake rejected that, the annotation work would break
+    /// reference ingest for references that have nothing to do with annotations.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn reference_annotation_accepts_a_map_column_and_a_zero_row_file() {
+        let conn = setup_conn();
+        ensure_reference_tables(&conn).unwrap();
+        let id = next_test_id();
+        let _cleanup = Cleanup {
+            conn: &conn,
+            table: "reference_annotation",
+            column: "reference_idx",
+            id,
+        };
+
+        // A populated row: the MAP round-trips, and the per-insert mass the cell-count
+        // model needs is reachable by key.
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.reference_annotation VALUES \
+             ({id}, 7, 42, 'insert_01', 'insert', 2001, 3001, '+', \
+              MAP{{'ID': 'insert_01', 'mass_ng': '0.5'}});"
+        ))
+        .unwrap();
+
+        // A zero-row insert, the no-GFF shape: must be a clean no-op, not an error.
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.reference_annotation \
+             SELECT * FROM qiita_lake.reference_annotation WHERE reference_idx = {id} AND false;"
+        ))
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT feature_idx, parent_feature_idx, position, stop_position, \
+                        attributes['mass_ng'] \
+                 FROM qiita_lake.reference_annotation WHERE reference_idx = {id}"
+            ))
+            .unwrap();
+        let (feature_idx, parent, position, stop, mass): (i64, i64, i64, i64, String) = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(feature_idx, 7);
+        assert_eq!(parent, 42);
+        // Half-open: a 1000 bp insert starting at 2001 stops at 3001, not 3000.
+        assert_eq!(position, 2001);
+        assert_eq!(stop, 3001);
+        assert_eq!(stop - position, 1000);
+        assert_eq!(mass, "0.5");
     }
 
     #[test]

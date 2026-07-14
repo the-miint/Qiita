@@ -430,37 +430,144 @@ async def mint_features(
 
 async def mint_annotation_features(
     pool: asyncpg.Pool,
+    reference_idx: int,
     annotation_manifest_path: Path,
+    manifest_path: Path,
+    feature_map_path: Path,
     output_dir: Path,
 ) -> tuple[Path, int, int]:
     """Mint a feature_idx for each ANNOTATED INTERVAL in hash_sequences'
-    `annotation_manifest.parquet`, writing `annotation_feature_map.parquet`
-    (sequence_hash → feature_idx) into `output_dir`.
+    `annotation_manifest.parquet`, write `annotation_feature_map.parquet`
+    (sequence_hash → feature_idx) into `output_dir`, and record the reference's
+    claim on those features in `qiita.reference_annotation`.
 
-    This is `mint_features` pointed at a different manifest. Minting only ever
-    reads `sequence_hash` and never touches a reference table, so an interval's
-    sub-sequence hash mints exactly like a whole sequence's — which is the point:
-    an insert that is also ingested standalone elsewhere deduplicates onto the
-    SAME feature_idx, lake-wide, for free.
+    The minting half is `mint_features` pointed at a different manifest — it only
+    ever reads `sequence_hash` and never touches a reference table, so an interval's
+    sub-sequence hash mints exactly like a whole sequence's. That is the point: an
+    insert also ingested standalone deduplicates onto the SAME feature_idx lake-wide,
+    for free.
 
-    Two things it deliberately does NOT do:
+    **Why it must also write `qiita.reference_annotation`.** Annotated intervals are
+    deliberately NOT in `reference_membership` (membership is what gets INDEXED), so
+    without this claim row `delete_reference_cascade` cannot see them and every
+    annotated feature would survive `DELETE /reference/{idx}` forever. Full rationale
+    in the `20260713020000_reference_annotation.sql` migration header.
 
-    * **No `write-membership`.** `reference_membership` is what gets indexed and
-      aligned against. Reads align to the plasmid, not to the bare insert; putting
-      annotated intervals in membership would add them to the aligner index and to
-      shard planning, and the insert would start competing with its own parent for
-      alignments.
-    * **No `genome_map_path`.** An interval is not a genome.
+    `manifest_path` + `feature_map_path` are the SEQUENCE side's manifest and map —
+    needed only to resolve each interval's `parent_feature_idx` (the annotation
+    manifest's `parent_read_id` → the sequence manifest's `read_id` → its
+    `sequence_hash` → its `feature_idx`). Neither is minted from.
+
+    Deliberately no `genome_map_path`: an interval is not a genome.
 
     Returns (annotation_feature_map_path, minted, reused). Idempotent for the same
-    reasons `mint_features` is.
+    reasons `mint_features` is — the claim rows go in ON CONFLICT DO NOTHING.
     """
-    return await mint_features(
+    annotation_feature_map_path, minted, reused = await mint_features(
         pool,
         annotation_manifest_path,
         output_dir,
         output_basename=MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME,
     )
+    await _write_annotation_claims(
+        pool,
+        reference_idx,
+        annotation_manifest_path=annotation_manifest_path,
+        annotation_feature_map_path=annotation_feature_map_path,
+        manifest_path=manifest_path,
+        feature_map_path=feature_map_path,
+    )
+    return annotation_feature_map_path, minted, reused
+
+
+async def _write_annotation_claims(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    *,
+    annotation_manifest_path: Path,
+    annotation_feature_map_path: Path,
+    manifest_path: Path,
+    feature_map_path: Path,
+) -> int:
+    """INSERT this reference's `(annotation_id, feature_idx, parent_feature_idx)`
+    annotation claims.
+
+    Resolves both idx values off the two feature maps in DuckDB (the annotation map
+    for the interval, mint-features' map for the parent, reached through the
+    manifest's `read_id`), then upserts. A row whose parent cannot be resolved is a
+    hard error, not a skip: it would mean the GFF named a sequence the FASTA never
+    hashed, which `hash_sequences` already rejects — reaching here means the two
+    manifests disagree, and the honest outcome is a failed ticket rather than a
+    silently under-claimed reference that later leaks features on delete.
+
+    **The zero-annotation early-out is not an optimisation, it is the common path.**
+    Every reference-add reaches here, and almost none carry a GFF3. The join below
+    hash-builds `feature_map.parquet` as its build side — the WHOLE reference, even
+    against an empty annotation manifest — inside the control-plane process, on the
+    event loop. Measured: ~200 ms and ~1 GB of un-spillable RSS at 20M features. The
+    `count(*)` that avoids it is a Parquet footer read, sub-millisecond at any scale.
+
+    Streaming + `to_thread` for the same reason `mint_features` does it (see its
+    docstring): this runs in-process on the CP's single event loop, and the `--gff`
+    contract advertises a genome's gene coordinates — a eukaryotic GFF3 is millions
+    of rows, not the handful a plasmid map carries.
+    """
+    read_conn = duckdb.connect(":memory:")
+    try:
+        # Footer-only count first: on the no-GFF path this is the entire cost.
+        expected = read_conn.execute(
+            "SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest_path)]
+        ).fetchone()[0]
+        if expected == 0:
+            return 0
+
+        read_conn.execute("SET preserve_insertion_order=false")
+        reader = read_conn.execute(
+            "SELECT am.annotation_id, afm.feature_idx, fm.feature_idx AS parent_feature_idx "
+            "FROM read_parquet(?) am "
+            "JOIN read_parquet(?) afm ON afm.sequence_hash = am.sequence_hash "
+            "JOIN read_parquet(?) m ON m.read_id = am.parent_read_id "
+            "JOIN read_parquet(?) fm ON fm.sequence_hash = m.sequence_hash",
+            [
+                str(annotation_manifest_path),
+                str(annotation_feature_map_path),
+                str(manifest_path),
+                str(feature_map_path),
+            ],
+        ).to_arrow_reader(_CHUNK_SIZE)
+
+        resolved = 0
+        for batch in reader:
+            annotation_ids = batch.column("annotation_id").to_pylist()
+            if not annotation_ids:
+                continue
+            feature_idxs = batch.column("feature_idx").to_pylist()
+            parents = batch.column("parent_feature_idx").to_pylist()
+            resolved += len(annotation_ids)
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "INSERT INTO qiita.reference_annotation"
+                    " (reference_idx, annotation_id, feature_idx, parent_feature_idx)"
+                    " SELECT $1, * FROM unnest($2::text[], $3::bigint[], $4::bigint[])"
+                    " ON CONFLICT DO NOTHING",
+                    reference_idx,
+                    annotation_ids,
+                    feature_idxs,
+                    parents,
+                )
+    finally:
+        read_conn.close()
+
+    # An unresolvable interval (or parent) means the manifests disagree — the join
+    # dropped a row. Fail rather than under-claim: an unclaimed annotated feature is
+    # exactly the leak this table exists to close.
+    if resolved != expected:
+        raise ValueError(
+            f"reference {reference_idx}: resolved {resolved} annotation claim(s) from "
+            f"{expected} annotation(s) — an interval's feature_idx or its parent's could "
+            "not be resolved from the feature maps"
+        )
+    return resolved
 
 
 async def write_membership(

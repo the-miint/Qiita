@@ -169,12 +169,12 @@ def test_attributes_survive_as_a_map(tmp_path):
     out = _run(tmp_path, gff=_standard_gff(tmp_path))
     (ann,) = _annotations(out["annotation_manifest"])
 
-    assert ann["read_id"] == "insert_01"  # the minting key; renamed to annotation_id in the lake
+    assert ann["annotation_id"] == "insert_01"
     assert ann["attributes"]["mass_ng"] == "0.5"
     assert ann["attributes"]["Name"] == "synDNA-1"
     assert ann["parent_read_id"] == _PLASMID_READ_ID
     assert ann["strand"] == "+"
-    assert ann["type"] == "insert"
+    assert ann["annotation_type"] == "insert"
 
 
 def test_stored_window_feeds_alignment_slice_with_no_adjustment(tmp_path):
@@ -278,6 +278,19 @@ def test_no_gff_yields_a_typed_empty_manifest(tmp_path):
     assert types["stop_position"] == "BIGINT"
     assert types["attributes"] == "MAP(VARCHAR, VARCHAR)"
 
+    # The real assertion: the empty file's schema must equal the POPULATED file's,
+    # column for column and type for type. Both land in one DuckLake table, so a
+    # divergence is a lake-level schema conflict — and spot-checking four columns
+    # would not catch it. This is what makes "same code path" a fact rather than a
+    # claim in a docstring.
+    populated = _run(tmp_path / "with_gff", gff=_standard_gff(tmp_path))["annotation_manifest"]
+    with duckdb.connect(":memory:") as conn:
+        populated_types = conn.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{populated}')"
+        ).fetchall()
+        empty_types = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()
+    assert [(c[0], c[1]) for c in empty_types] == [(c[0], c[1]) for c in populated_types]
+
 
 @pytest.mark.parametrize(
     ("rows", "expected"),
@@ -311,3 +324,76 @@ def test_malformed_gff_fails_loud(tmp_path, rows, expected):
     gff = _write_gff(tmp_path / "bad.gff3", rows)
     with pytest.raises(ValueError, match=expected):
         _run(tmp_path, gff=gff)
+
+
+def test_interval_ending_on_the_parents_last_base_is_accepted(tmp_path):
+    """The bound check is `stop_position > sequence_length_bp + 1`, and that `+1` is
+    exactly where an off-by-one would hide. An interval whose last base IS the
+    parent's last base is legal and must survive — pair it with the test below,
+    which pushes one base further and must fail. Neither test means much alone."""
+    last = len(_PLASMID)  # 4000, the parent's final base, CLOSED
+    gff = _write_gff(tmp_path / "edge.gff3", [(_PLASMID_READ_ID, last - 99, last, "ID=tail")])
+    (ann,) = _annotations(_run(tmp_path, gff=gff)["annotation_manifest"])
+    assert ann["stop_position"] == last + 1  # half-open, one past the last base
+    assert ann["sequence_length_bp"] == 100
+
+
+def test_interval_one_base_past_the_parents_end_is_rejected(tmp_path):
+    """One base beyond the test above. Must fail — otherwise `substr` would silently
+    return a SHORT sequence and mint a feature_idx for bases that do not exist."""
+    last = len(_PLASMID)
+    gff = _write_gff(tmp_path / "over.gff3", [(_PLASMID_READ_ID, last - 99, last + 1, "ID=over")])
+    with pytest.raises(ValueError, match="outside their parent sequence"):
+        _run(tmp_path, gff=gff)
+
+
+def test_interval_spanning_the_whole_parent_is_rejected(tmp_path):
+    """A GFF3 `region` / `source` line covering 1..len is routine in NCBI-style files.
+    Its extracted bytes ARE the parent's bytes, so it canonically hashes to the
+    PARENT's feature_idx — yielding an annotation row whose feature_idx equals its
+    parent_feature_idx, pointing at a feature that IS in reference_membership and IS
+    indexed. That quietly falsifies the invariant the whole design rests on, and
+    nothing would raise. So it is refused."""
+    gff = _write_gff(tmp_path / "region.gff3", [(_PLASMID_READ_ID, 1, len(_PLASMID), "ID=whole")])
+    with pytest.raises(ValueError, match="ENTIRE parent sequence"):
+        _run(tmp_path, gff=gff)
+
+
+def test_two_annotations_with_identical_bases_are_KEPT(tmp_path):
+    """Two intervals with identical bases collapse to ONE feature_idx — and that is
+    correct, not an error.
+
+    This case is the whole reason `annotation_id`, not `feature_idx`, is the
+    annotation's identity. A bacterial genome carries the 16S rRNA gene in 5-7
+    BYTE-IDENTICAL copies, which canonically hash to one feature_idx. An earlier
+    revision of this code REJECTED that, which made `--gff` raise on essentially
+    every real bacterial genome while working fine on the SynDNA plasmids it was
+    written against — exactly the SynDNA-shaped failure the issue warned about.
+
+    A feature is a SEQUENCE; an annotation is an OCCURRENCE of it at a place. Both
+    occurrences survive, they share a feature_idx, and they are told apart by their
+    ids and their windows.
+    """
+    dup = _BACKBONE_A[:100]
+    plasmid = dup + _dna(50) + dup + _dna(50)
+    upload = _write_chunked_upload(tmp_path / "dup.parquet", [("p", plasmid)])
+    gff = _write_gff(
+        tmp_path / "dup.gff3", [("p", 1, 100, "ID=copy_a"), ("p", 151, 250, "ID=copy_b")]
+    )
+
+    out = asyncio.run(
+        execute(
+            Inputs(fasta_path=upload, gff_path=gff, reference_idx=1, work_ticket_idx=1),
+            tmp_path / "ws2",
+        )
+    )
+    anns = _annotations(out["annotation_manifest"])
+
+    assert [a["annotation_id"] for a in anns] == ["copy_a", "copy_b"]
+    assert anns[0]["sequence_hash"] == anns[1]["sequence_hash"], (
+        "identical bases must canonically hash to ONE feature — that is what "
+        "content-addressed features MEAN"
+    )
+    # ...and they remain distinguishable, because identity is the id + the window.
+    assert (anns[0]["position"], anns[0]["stop_position"]) == (1, 101)
+    assert (anns[1]["position"], anns[1]["stop_position"]) == (151, 251)
