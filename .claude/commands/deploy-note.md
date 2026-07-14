@@ -4,6 +4,14 @@ description: Fold the current branch's operator-impacting changes into the Pendi
 
 You are folding this branch's operator-facing deploy steps into the **single consolidated `## Pending deploy` checklist** in `DEPLOY_CHECKLIST.md`. Read `DEPLOY_CHECKLIST.md`'s preamble and the "Operator-facing changes" + "Deployments" sections of `CLAUDE.md` first — they define the model. Do **not** create a standalone per-PR entry; this repo replaced that format with the living checklist.
 
+**Read only the live section — never the whole file.** `## Pending deploy` is the only part you edit. Print it with the same recipe the operator uses on the deploy host (`docs/runbooks/redeploy.md` §1):
+
+```
+sed -n '/^## Pending deploy/,/^## Deployed history/p' DEPLOY_CHECKLIST.md
+```
+
+Everything below `## Deployed history` is archive — past deploys, pointing at `docs/deploy-archive/`. It is never the target of a fold. Don't grep the file for a bucket heading either: use the line range this recipe gives you and `Read` that span.
+
 ## 1. Detect what this branch changes that the operator must act on
 
 Diff the branch against `main` and look for each category below. `$ARGUMENTS` may name a PR number to tag with; if absent, use the branch name (e.g. `#feat/foo`) as the tag and tell the user to retag once the PR number exists.
