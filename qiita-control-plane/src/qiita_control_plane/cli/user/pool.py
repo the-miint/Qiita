@@ -775,6 +775,16 @@ def _dry_run_summary(
     }
 
 
+def _abort(message: str) -> None:
+    """Print an operator-actionable message to stderr and exit non-zero.
+
+    Shared by the pool-submit preflights: the message goes to stderr so an
+    operator's stdout stays clean for the JSON summary the success path prints.
+    """
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
 def _assert_resolved_references_ready(
     base_url: str,
     token: str,
@@ -832,10 +842,6 @@ def _resolved_decisions(
     an operator "this pool has a problem" when it has 384 samples is not a message,
     it is a scavenger hunt.
     """
-
-    def _abort(message: str) -> None:
-        print(message, file=sys.stderr)
-        sys.exit(1)
 
     missing = [s["sequenced_pool_item_id"] for s in samples if not s.get("host_filter")]
     if missing:
@@ -909,10 +915,6 @@ def _assert_pacbio_submission_coherent(
 
     Aborts with the message on stderr, then `sys.exit(1)`, so an operator's stdout
     stays clean for the JSON summary the success path prints."""
-
-    def _abort(message: str) -> None:
-        print(message, file=sys.stderr)
-        sys.exit(1)
 
     with_minimap2 = [
         item_id
