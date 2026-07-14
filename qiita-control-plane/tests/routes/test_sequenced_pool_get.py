@@ -42,7 +42,8 @@ async def seeded_pool(ctx):
     )
     await db.execute(
         "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = 1000,"
-        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 850 WHERE idx = $1",
+        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 850,"
+        " spikein_read_count_r1r2 = 40 WHERE idx = $1",
         ss_idx,
     )
     yield {"run_idx": run_idx, "pool_idx": pool_idx, "ss_idx": ss_idx}
@@ -67,6 +68,9 @@ async def test_get_pool_returns_rollup(ctx, seeded_pool):
     assert rm["raw_read_count_r1r2"] == 1000
     assert rm["biological_read_count_r1r2"] == 900
     assert rm["quality_filtered_read_count_r1r2"] == 850
+    # The spikein SUM + the route's .pop() — a NULL-only fixture would pass with
+    # the rollup column missing entirely.
+    assert rm["spikein_read_count_r1r2"] == 40
     assert rm["sample_count"] == 1
     assert rm["samples_with_metrics"] == 1
     assert rm["fraction_passing_quality_filter"] == pytest.approx(0.85)

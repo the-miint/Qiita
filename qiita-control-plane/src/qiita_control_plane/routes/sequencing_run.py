@@ -31,6 +31,7 @@ read/PATCH live in the sibling sequenced_sample route module.
 import base64
 import json
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -450,6 +451,24 @@ async def update_sequenced_pool_preflight_lane(
     )
 
 
+# The rollup columns `PoolReadMetrics` is built from — derived from the model, not
+# re-listed, so adding a metric cannot silently miss a construction site. (The model's
+# `fraction_passing_quality_filter` is a computed_field, so it is not in `model_fields`
+# and is correctly absent here: it is recomputed from the summed counts, never read.)
+_POOL_READ_METRIC_FIELDS: tuple[str, ...] = tuple(PoolReadMetrics.model_fields)
+
+
+def _pool_read_metrics(row: Mapping[str, Any]) -> PoolReadMetrics:
+    """The pool read-metric rollup, from any mapping carrying its columns.
+
+    ONE construction site, on purpose. This was hand-built field-by-field in two places
+    (the pool GET and the QC-report GET) from the same `fetch_sequenced_pool_read_metrics`
+    row, so every new metric had to be added twice — and a missed one is not a crash but a
+    silently-null metric on one endpoint only.
+    """
+    return PoolReadMetrics.model_validate({f: row[f] for f in _POOL_READ_METRIC_FIELDS})
+
+
 @router.get(PATH_SEQUENCED_POOL_BY_IDX)
 async def get_sequenced_pool(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
@@ -490,13 +509,11 @@ async def get_sequenced_pool(
     data["sequenced_pool_idx"] = data.pop("idx")
     if isinstance(data["extra_metadata"], str):
         data["extra_metadata"] = json.loads(data["extra_metadata"])
-    data["read_metrics"] = PoolReadMetrics(
-        raw_read_count_r1r2=data.pop("raw_read_count_r1r2"),
-        biological_read_count_r1r2=data.pop("biological_read_count_r1r2"),
-        quality_filtered_read_count_r1r2=data.pop("quality_filtered_read_count_r1r2"),
-        sample_count=data.pop("sample_count"),
-        samples_with_metrics=data.pop("samples_with_metrics"),
-    )
+    # Build BEFORE popping: the metric columns are the source, and popping them is what
+    # leaves `data` holding exactly SequencedPoolResponse's top-level fields.
+    data["read_metrics"] = _pool_read_metrics(data)
+    for field in _POOL_READ_METRIC_FIELDS:
+        data.pop(field)
     return SequencedPoolResponse.model_validate(data)
 
 
@@ -554,13 +571,7 @@ async def get_sequenced_pool_qc_report(
         sequencing_run_idx=rollup["sequencing_run_idx"],
         sample_count=rollup["sample_count"],
         samples_with_qc_report=sum(1 for s in samples if s.raw_qc_report is not None),
-        read_metrics=PoolReadMetrics(
-            raw_read_count_r1r2=rollup["raw_read_count_r1r2"],
-            biological_read_count_r1r2=rollup["biological_read_count_r1r2"],
-            quality_filtered_read_count_r1r2=rollup["quality_filtered_read_count_r1r2"],
-            sample_count=rollup["sample_count"],
-            samples_with_metrics=rollup["samples_with_metrics"],
-        ),
+        read_metrics=_pool_read_metrics(rollup),
         merged=merge_qc_reports(samples),
         samples=samples,
     )

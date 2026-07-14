@@ -207,6 +207,43 @@ async def _resolve_host_filter_two_reference(
     return bound
 
 
+async def _resolve_syndna_index(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    action_context: dict[str, Any],
+) -> dict[str, Path]:
+    """Resolve the syndna spike-in minimap2 index when syndna is enabled, else {}.
+
+    A syndna reference is just another **minimap2** reference —
+    `_resolve_reference_index_path` is generic on `index_type`, so no new index type,
+    builder, or `derived_store` path is needed. Binds `syndna_minimap2_path` for the
+    syndna step's input. (The spike-in inserts are the subject sequences; a read
+    aligning to one at high identity is a spike-in — see `jobs/syndna.py`.)
+
+    Run before the step loop (and so before the mask mint) for the same reason the
+    host arms are: a stale, deleted, or non-active `syndna_reference_idx` must fail
+    at SUBMISSION rather than sail into the mask identity hash and die deep in the
+    step loop. Gated by `syndna_enabled`; enabled without a reference is a contract
+    error, not a silent no-op.
+
+    `_resolve_required_host_index` is named for its first caller but is generic —
+    it maps unknown / non-active / index-not-built to a SUBMISSION BAD_INPUT.
+    """
+    if not action_context.get("syndna_enabled"):
+        return {}
+    syndna_idx = action_context.get("syndna_reference_idx")
+    if syndna_idx is None:
+        raise _submission_bad_input("syndna_enabled requires syndna_reference_idx")
+    return {
+        SYNDNA_MINIMAP2_BINDING: await _resolve_required_host_index(
+            pool,
+            _coerce_reference_idx(syndna_idx, "syndna_reference_idx"),
+            HOST_FILTER_INDEX_TYPE_MINIMAP2,
+            "syndna_reference_idx",
+        )
+    }
+
+
 async def _resolve_host_filter_legacy(
     pool: asyncpg.Pool | asyncpg.Connection,
     host_reference_idx: Any,
@@ -249,6 +286,9 @@ async def _resolve_host_filter_legacy(
         )
     return bound
 
+
+# Binding for the syndna spike-in minimap2 index (the syndna step's input).
+SYNDNA_MINIMAP2_BINDING = "syndna_minimap2_path"
 
 # Binding name the runner stages the canonical adapter set (a Parquet) under. A
 # step that lists this in its `inputs` (the qc step) signals the runner to

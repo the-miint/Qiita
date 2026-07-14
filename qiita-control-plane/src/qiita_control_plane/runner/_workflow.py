@@ -55,9 +55,12 @@ from ._dispatch import (
     _patch_resource_status,
 )
 from ._mask import (
+    LIMA_ARGS_BINDING,
     MASK_IDX_BINDING,
     _mint_read_mask,
     _persist_mask_idx,
+    _resolved_lima,
+    _resolved_syndna,
     _workflow_needs_mask,
 )
 from ._processing import (
@@ -86,6 +89,7 @@ from ._reference import (
     QC_ADAPTER_BINDING,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
+    _resolve_syndna_index,
     _workflow_needs_adapters,
 )
 from ._upload import (
@@ -234,6 +238,16 @@ async def run_workflow(
         # of the host_*_reference_idx keys are `*_upload_idx`, so the walker above
         # left them untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
+        # Syndna's minimap2 index, resolved (and validated ACTIVE) before the mask
+        # mint below reads `syndna_reference_idx` into the identity hash.
+        bound.update(await _resolve_syndna_index(pool, action_context=bound))
+        # lima's argument string is CP-resolved from the client's `lima_preset`
+        # (never client-supplied) and bound so the lima_export step's `params:`
+        # can thread it into `lima_config.json` for the container. Resolving here
+        # also fails a bad preset at SUBMISSION rather than mid-loop.
+        _lima = _resolved_lima(bound)
+        if _lima is not None:
+            bound[LIMA_ARGS_BINDING] = _lima["args"]
 
         # QC adapter materialization: when any step needs `adapter_parquet` (the
         # qc step), DoGet the configured artifact_sequence_set reference's
@@ -359,6 +373,12 @@ async def run_workflow(
                         adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
                         host_rype_reference_idx=bound.get("host_rype_reference_idx"),
                         host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
+                        # What actually distinguishes the five PacBio protocols:
+                        # prep_protocol_idx is uniform across them. Both are gated
+                        # on their `*_enabled` flag, so a stale key cannot shift
+                        # the hash of a run that did not use the feature.
+                        resolved_lima=_resolved_lima(bound),
+                        resolved_syndna=_resolved_syndna(bound),
                     )
                 )
                 # Persist the minted mask_idx onto the ticket for durable
@@ -408,13 +428,21 @@ async def run_workflow(
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
             # entry when its named action_context key is present and falsy
-            # (default-ON — an absent key runs). Evaluated FIRST, before the
-            # fast-forward / target_status PATCH / dispatch, so a gated-off
-            # entry neither advances status nor binds outputs. `bound` is
-            # seeded from the persisted action_context, so the decision is
-            # deterministic and resume-safe; skipping via `continue` (never by
-            # filtering action.steps) keeps the integer step_index that
-            # `_completed_progress_row` matches on stable across a resume.
+            # (default-ON — an absent key RUNS the step; read-mask's
+            # context_schema `required:` is what stops that being a footgun).
+            # Evaluated FIRST, before the fast-forward / target_status PATCH /
+            # dispatch, so a gated-off entry neither advances status nor binds
+            # outputs.
+            #
+            # `bound` is NOT just the persisted action_context: it is seeded from
+            # it, then accumulates resolved paths, mask bindings, the minted
+            # processing_idx, and `bound.update(outputs)` after EVERY completed
+            # step. So a later entry's gate key can in principle be shadowed by an
+            # earlier step's OUTPUT binding. Nothing does that today (every shipped
+            # `when:` key comes from action_context), but do not assume otherwise
+            # when naming an output. Resume is unaffected: action_context is
+            # persisted, and a skipped entry `continue`s rather than being filtered
+            # out, so step_index stays stable.
             if entry.when is not None and not bool(bound.get(entry.when, True)):
                 _log.info(
                     "workflow %d: skipping entry %d (%s) — when=%r is falsy",

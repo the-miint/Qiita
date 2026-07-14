@@ -96,6 +96,38 @@ def write_reads_q():
 
 
 @pytest.fixture
+def write_partial_mask():
+    """Factory writing a 6-column partial mask parquet — the shape `qc` emits and
+    the shape `qc` optionally CONSUMES as `adapter_mask`:
+    `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
+
+    `rows` are `(sequence_idx, reason, left_trim1, right_trim1)`; the mate trims
+    are written NULL (single-end — the only layout an incoming mask supports).
+    Used by `test_qc.py` / `test_qc_smoke.py`, so the incoming-mask schema lives
+    in exactly one place."""
+
+    def _write(path: Path, rows: list[tuple[int, str, int, int]]) -> Path:
+        with duckdb.connect(":memory:") as conn:
+            values = ", ".join(
+                "(CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS UINTEGER), "
+                "CAST(? AS UINTEGER), CAST(NULL AS UINTEGER), CAST(NULL AS UINTEGER))"
+                for _ in rows
+            )
+            params: list = []
+            for sidx, reason, lt1, rt1 in rows:
+                params.extend([sidx, reason, lt1, rt1])
+            conn.execute(
+                f"COPY (SELECT * FROM (VALUES {values}) AS t("
+                "sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)) "
+                f"TO '{path}' (FORMAT PARQUET)",
+                params,
+            )
+        return path
+
+    return _write
+
+
+@pytest.fixture
 def read_survivors():
     """Return the sorted `sequence_idx` list remaining in a filtered_reads.parquet."""
 

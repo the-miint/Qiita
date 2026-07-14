@@ -136,7 +136,18 @@ def setup_miint_test_env(component: str) -> None:
     the env is already set). Call at conftest top. `component` names the
     private dir (`qiita-<component>-duckdb-ext` under the system temp), kept
     distinct per component so a mirror build in one suite doesn't collide with
-    another's cached extension."""
+    another's cached extension.
+
+    The conftest fixtures INSTALL (not FORCE INSTALL) into that dir, so it caches
+    across runs and NEVER refreshes. After the mirror rebuilds — e.g. a new miint
+    function lands — a warm cache still holds the old build, and the symptom is a
+    bare `Catalog Error: ... does not exist` from the new function, which points at
+    the code rather than at the cache. Clear it:
+
+        rm -rf "$TMPDIR"/qiita-*-duckdb-ext        # NOT /tmp on macOS
+
+    CI is unaffected (it always starts cold), and the deploy is covered by
+    compute-readiness's miint probes."""
     os.environ.setdefault("MIINT_EXTENSION_REPO", MIINT_MIRROR_URL)
     ext_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-duckdb-ext")
     os.makedirs(ext_dir, exist_ok=True)

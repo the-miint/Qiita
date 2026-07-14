@@ -81,7 +81,7 @@ async def fetch_sequenced_sample_with_prep_sample(
         " ss.sequenced_pool_item_id, ss.ena_experiment_accession,"
         " ss.ena_run_accession, ss.last_submission_at, ss.submission_error,"
         " ss.raw_read_count_r1r2, ss.biological_read_count_r1r2,"
-        " ss.quality_filtered_read_count_r1r2,"
+        " ss.quality_filtered_read_count_r1r2, ss.spikein_read_count_r1r2,"
         " ps.biosample_idx, ps.owner_idx, ps.prep_protocol_idx,"
         " ps.metadata_checklist_idx,"
         " (SELECT name FROM qiita.metadata_checklist mc"

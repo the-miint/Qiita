@@ -49,6 +49,7 @@ from qiita_common.models import (
     WorkTicketCreateRequest,
 )
 
+from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
 
 # action_id + version for the bundled bcl-convert submission flow. Pinned
@@ -724,6 +725,95 @@ def _assert_host_reference_ready(
         raise SystemExit(1)
 
 
+# PacBio read-mask gates, derived per sample from the roster's pre-flight facts.
+# The roster surfaces the raw facts (sheet_type / twist_adaptor_id /
+# syndna_is_twisted); the POLICY that turns them into gates lives here, in the
+# submit, so a generic roster response carries no read-mask semantics.
+_LIMA_PRESET_TWIST = "ASYMMETRIC"
+
+
+def _pacbio_gates(sample: dict) -> dict | None:
+    """The sample's `(lima_enabled, syndna_enabled)` gates, or None when the pool
+    is not PacBio (`sheet_type` absent — an Illumina roster carries no such field).
+
+        syndna_enabled = sheet_type == 'pacbio_absquant'   (protocols 2, 4, 5)
+        lima_enabled   = twist_adaptor_id filled AND NOT syndna_is_twisted  (5)
+
+    `syndna_is_twisted is False` rather than `not ...`: a NULL means the pre-flight
+    never answered, which is not the same as "no", and must not silently enable
+    lima."""
+    sheet_type = sample.get("sheet_type")
+    if not sheet_type:
+        return None
+    return {
+        "syndna_enabled": sheet_type == SHEET_TYPE_PACBIO_ABSQUANT,
+        "lima_enabled": bool(sample.get("twist_adaptor_id"))
+        and sample.get("syndna_is_twisted") is False,
+    }
+
+
+def _assert_pacbio_submission_coherent(
+    samples: list[dict],
+    *,
+    sequenced_pool_idx: int,
+    host_rype_reference_idx: int | None,
+    host_minimap2_reference_idx: int | None,
+    syndna_reference_idx: int | None,
+    force: bool,
+) -> None:
+    """Fail fast, before any ticket, on a PacBio submission that cannot succeed.
+
+    Unlike the Illumina path this does NOT require pool-uniform host filtering:
+    `host_filter_enabled` is per sample, from each sample's intake
+    `human_filtering`. A pool may legitimately mix filtered and unfiltered samples
+    — that is the near-future goal for Illumina too. What it does require is that
+    a reference exists for every gate some sample turns on.
+
+    A NULL `human_filtering` still aborts (as on the Illumina path): the pre-flight
+    could not answer, and guessing would either leak human reads or silently drop
+    a filter the operator asked for.
+
+    Aborts the way its Illumina twin `_assert_pool_intent_matches` does — the message
+    to stderr, then `sys.exit(1)` — so an operator's stdout stays clean for the JSON
+    summary the success path prints."""
+
+    def _abort(message: str) -> None:
+        print(message, file=sys.stderr)
+        sys.exit(1)
+
+    unknown = [s["sequenced_pool_item_id"] for s in samples if s.get("human_filtering") is None]
+    if unknown and not force:
+        _abort(
+            f"sequenced_pool {sequenced_pool_idx}: {len(unknown)} sample(s) have no"
+            " intake human_filtering intent in the stored pre-flight"
+            f" (e.g. {unknown[:3]}). Refusing to guess. Re-check the pre-flight, or"
+            " pass --force to submit them with host filtering disabled."
+        )
+    if host_minimap2_reference_idx is not None:
+        _abort(
+            "long-read host filtering is rype-only; --host-minimap2-reference-idx is"
+            " not applicable to a PacBio pool"
+        )
+    if any(s.get("human_filtering") for s in samples) and host_rype_reference_idx is None:
+        _abort(
+            f"sequenced_pool {sequenced_pool_idx}: some samples request host"
+            " filtering (human_filtering true in the pre-flight) but no"
+            " --host-rype-reference-idx was given"
+        )
+    gates = [g for g in (_pacbio_gates(s) for s in samples) if g is not None]
+    if any(g["syndna_enabled"] for g in gates) and syndna_reference_idx is None:
+        _abort(
+            f"sequenced_pool {sequenced_pool_idx}: sheet_type is"
+            f" {SHEET_TYPE_PACBIO_ABSQUANT!r}, so its samples carry SynDNA spike-ins;"
+            " --syndna-reference-idx is required"
+        )
+    if not any(g["syndna_enabled"] for g in gates) and syndna_reference_idx is not None:
+        _abort(
+            "--syndna-reference-idx given but no sample in this pool carries SynDNA"
+            f" spike-ins (sheet_type is not {SHEET_TYPE_PACBIO_ABSQUANT!r})"
+        )
+
+
 def _assert_pool_intent_matches(
     samples: list[dict],
     *,
@@ -905,13 +995,30 @@ def _handle_submit_host_filter_pool(
         # Roster-driven: every pool member is compared against its intake intent
         # (resolved server-side from the pool's stored preflight). Shared with
         # submit-block-mask-pool via _assert_pool_intent_matches.
-        _assert_pool_intent_matches(
-            samples,
-            sequenced_pool_idx=args.sequenced_pool_idx,
-            host_rype_reference_idx=args.host_rype_reference_idx,
-            applying_host_filter=applying_host_filter,
-            force=args.force,
-        )
+        # PacBio pools derive their gates PER SAMPLE from the stored pre-flight, so
+        # they do not take the pool-uniform host-filter guard: a pool may mix
+        # filtered and unfiltered samples. Illumina keeps that guard until the
+        # per-sample generalization lands there too (then this branch collapses).
+        is_pacbio_pool = any(s.get("sheet_type") for s in samples)
+        if is_pacbio_pool:
+            _assert_pacbio_submission_coherent(
+                samples,
+                sequenced_pool_idx=args.sequenced_pool_idx,
+                host_rype_reference_idx=args.host_rype_reference_idx,
+                host_minimap2_reference_idx=args.host_minimap2_reference_idx,
+                syndna_reference_idx=args.syndna_reference_idx,
+                force=args.force,
+            )
+        else:
+            if args.syndna_reference_idx is not None:
+                parser.error("--syndna-reference-idx applies only to a PacBio pool")
+            _assert_pool_intent_matches(
+                samples,
+                sequenced_pool_idx=args.sequenced_pool_idx,
+                host_rype_reference_idx=args.host_rype_reference_idx,
+                applying_host_filter=applying_host_filter,
+                force=args.force,
+            )
 
         # Step 2: pre-flight the given host reference(s) before any ticket — one
         # actionable error instead of N FAILED tickets. No host refs given (the
@@ -932,6 +1039,17 @@ def _handle_submit_host_filter_pool(
                     HOST_FILTER_INDEX_TYPE_MINIMAP2,
                     "--host-minimap2-reference-idx",
                 )
+        # The syndna reference is just another minimap2 reference — same index type
+        # as the host filter's minimap2 arm, same readiness check. One actionable
+        # error instead of N FAILED tickets.
+        if args.syndna_reference_idx is not None:
+            _assert_host_reference_ready(
+                args.base_url,
+                token,
+                args.syndna_reference_idx,
+                HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                "--syndna-reference-idx",
+            )
 
         # Step 3: the run's instrument_model gates QC's polyG; read it once and
         # forward per sample. Nullable (a non-bcl run may not record it).
@@ -943,6 +1061,39 @@ def _handle_submit_host_filter_pool(
             f"{PATH_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=args.sequencing_run_idx)}",
         )
         instrument_model = run.get("instrument_model")
+
+        # Step 3.5: a PacBio run whose roster carries NO protocol facts means the
+        # server could not parse the pool's stored pre-flight — NOT that the pool is
+        # Illumina. Refuse, before any ticket.
+        #
+        # The direction of this check is the whole point. `is_pacbio_pool` above is
+        # derived from `any(sheet_type)`, i.e. it infers "not PacBio" from ABSENCE —
+        # so an unparseable blob silently takes the Illumina branch and writes
+        # `lima_enabled: false, syndna_enabled: false` onto every ticket. That is a
+        # case-5 pool masked with no lima and no syndna, whose spike-in count is then
+        # structurally zero: exactly what the chain's step order exists to prevent.
+        #
+        # Today that is caught only INCIDENTALLY — the same unparseable blob also nulls
+        # `human_filtering`, tripping the intent guard above. But that guard is
+        # --force-bypassable, and it EVAPORATES when `human_filtering` moves to sample
+        # metadata (it will then be populated even when the blob is unreadable). So this
+        # keys on the run's `platform` column, which is authoritative and depends on
+        # neither. --force does NOT bypass it: forcing host filtering off is a choice,
+        # masking a PacBio pool with the long-read chain silently off is not.
+        if run.get("platform") == Platform.PACBIO_SMRT.value:
+            no_facts = [s["sequenced_pool_item_id"] for s in samples if not s.get("sheet_type")]
+            if no_facts:
+                print(
+                    f"sequencing_run {args.sequencing_run_idx} is PacBio, but"
+                    f" {len(no_facts)} sample(s) carry no protocol facts on the roster"
+                    f" (e.g. {no_facts[:3]}). The pool's stored pre-flight could not be"
+                    " parsed server-side, so lima and syndna cannot be gated. Refusing:"
+                    " masking a PacBio pool with the long-read chain silently off would"
+                    " leave its spike-in count structurally zero. Check the pool's"
+                    " run_preflight_blob. (--force does not bypass this.)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         # Step 5: one read-mask ticket per sample — always-on QC + the host
         # filtering chosen on this submission, uniform across the pool. A given
@@ -959,13 +1110,33 @@ def _handle_submit_host_filter_pool(
         per_sample_results: list[dict] = []
         failures: list[dict] = []
         for sample in samples:
+            gates = _pacbio_gates(sample)
+            # `when:` is DEFAULT-ON — an absent gate key RUNS the step. Both are
+            # written explicitly on EVERY ticket, or a short-read read-mask ticket
+            # would execute the long-read lima chain.
             action_context: dict[str, Any] = {
-                "host_filter_enabled": host_filter_enabled,
+                "lima_enabled": False,
+                "syndna_enabled": False,
             }
-            if host_filter_enabled:
-                action_context["host_rype_reference_idx"] = host_rype
-                if host_minimap2 is not None:
-                    action_context["host_minimap2_reference_idx"] = host_minimap2
+            if gates is None:
+                # Illumina: host filtering is pool-uniform (guarded above).
+                action_context["host_filter_enabled"] = host_filter_enabled
+                if host_filter_enabled:
+                    action_context["host_rype_reference_idx"] = host_rype
+                    if host_minimap2 is not None:
+                        action_context["host_minimap2_reference_idx"] = host_minimap2
+            else:
+                # PacBio: every gate is per sample, from the stored pre-flight.
+                # Long reads are rype-only, so no minimap2 index is ever bound.
+                action_context.update(gates)
+                sample_host_filter = bool(sample.get("human_filtering"))
+                action_context["host_filter_enabled"] = sample_host_filter
+                if sample_host_filter:
+                    action_context["host_rype_reference_idx"] = host_rype
+                if gates["lima_enabled"]:
+                    action_context["lima_preset"] = _LIMA_PRESET_TWIST
+                if gates["syndna_enabled"]:
+                    action_context["syndna_reference_idx"] = args.syndna_reference_idx
             if instrument_model is not None:
                 action_context["instrument_model"] = instrument_model
             ticket_body = WorkTicketCreateRequest(
@@ -1100,6 +1271,9 @@ def _handle_submit_block_mask_pool(
         # with submit-host-filter-pool). --only-missing is applied server-side, so
         # the check runs over every active sample; an already-gated sample the
         # server will skip is compared too (conservative, never under-checks).
+        # The BLOCK path masks a whole pool under one recipe, so host filtering
+        # stays pool-uniform here even for a PacBio pool (read-mask-block is
+        # `qc -> host_filter` only — it has neither the lima chain nor syndna).
         _assert_pool_intent_matches(
             samples,
             sequenced_pool_idx=args.sequenced_pool_idx,

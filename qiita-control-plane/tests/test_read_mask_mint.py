@@ -101,6 +101,8 @@ async def test_mint_read_mask_binds_and_dedups(seeded):
         adapter_parquet=None,
         host_rype_reference_idx=None,
         host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
     )
     a = await runner._mint_read_mask(pool, instrument_model="NextSeq 550", **common)
     b = await runner._mint_read_mask(pool, instrument_model="NextSeq 550", **common)
@@ -131,6 +133,8 @@ async def test_mint_read_mask_host_ref_drives_identity(seeded):
         instrument_model="NextSeq 550",
         adapter_parquet=None,
         host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
     )
     a = await runner._mint_read_mask(pool, host_rype_reference_idx=7, **common)
     a_again = await runner._mint_read_mask(pool, host_rype_reference_idx=7, **common)
@@ -163,6 +167,8 @@ async def test_mint_read_mask_adapter_bytes_drive_identity(seeded, tmp_path):
         instrument_model="NextSeq 550",
         host_rype_reference_idx=None,
         host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
     )
     a = await runner._mint_read_mask(pool, adapter_parquet=adapters_a, **common)
     a_again = await runner._mint_read_mask(pool, adapter_parquet=adapters_a, **common)
@@ -228,6 +234,8 @@ async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
             adapter_parquet=None,
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
+            resolved_lima=None,
+            resolved_syndna=None,
         )
         mask_idx = minted[runner.MASK_IDX_BINDING]
 
@@ -290,4 +298,154 @@ async def test_mint_read_mask_requires_sequenced_sample(seeded):
             adapter_parquet=None,
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
+            resolved_lima=None,
+            resolved_syndna=None,
         )
+
+
+# --------------------------------------------------------------------------- lima / syndna
+#
+# `resolved_lima` + `resolved_syndna` are what distinguish the five PacBio
+# protocols in the mask identity. `prep_protocol_idx` cannot: it is the operator's
+# `--prep-protocol-idx` flag, uniform across them.
+
+
+def _params(**overrides):
+    base = dict(
+        action_id="read-mask",
+        action_version="1.0.0",
+        prep_protocol_idx=2,
+        instrument_model="Revio",
+        adapter_set_hash="a3f2",
+        host_rype_reference_idx=None,
+        host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+    base.update(overrides)
+    return runner._mask._build_mask_params(**base)
+
+
+def test_lima_and_syndna_discriminate_pacbio_protocols():
+    """Case 5 (lima + syndna) and case 1 (neither) differ ONLY in these two keys:
+    same operator flags, same run, same everything else. Without them the two
+    hash identically and share one mask_idx whose params describe only case 1."""
+    case1 = _params()
+    case5 = _params(
+        resolved_lima=runner._mask._resolved_lima(
+            {"lima_enabled": True, "lima_preset": "ASYMMETRIC"}
+        ),
+        resolved_syndna=runner._mask._resolved_syndna(
+            {"syndna_enabled": True, "syndna_reference_idx": 57}
+        ),
+    )
+    assert case1 != case5
+    assert case1["resolved_lima"] is None and case1["resolved_syndna"] is None
+    assert case5["resolved_syndna"]["reference_idx"] == 57
+    assert case5["resolved_lima"]["preset"] == "ASYMMETRIC"
+
+
+def test_resolved_lima_is_none_when_disabled_even_with_a_stale_preset():
+    """A stale `lima_preset` left by a disabled run must not shift the hash."""
+    assert runner._mask._resolved_lima({"lima_preset": "ASYMMETRIC"}) is None
+    assert runner._mask._resolved_lima({"lima_enabled": False, "lima_preset": "ASYMMETRIC"}) is None
+
+
+def test_resolved_lima_carries_cp_resolved_args_and_adapter_md5():
+    """The client picks the preset; the CP resolves the args + adapter identity.
+    `--neighbors` (which makes the adapter FASTA's record order load-bearing) is
+    NOT implied by the preset, so it must appear in the resolved args."""
+    r = runner._mask._resolved_lima({"lima_enabled": True, "lima_preset": "ASYMMETRIC"})
+    assert r["args"] == "--hifi-preset ASYMMETRIC --neighbors --peek-guess"
+    assert r["adapter_set_md5"] == runner._mask._LIMA_ADAPTER_SET_MD5
+    # lima decides where the clip lands, so its version is part of the filter.
+    assert r["version"] == runner._mask._LIMA_VERSION
+    sym = runner._mask._resolved_lima({"lima_enabled": True, "lima_preset": "SYMMETRIC"})
+    assert "--neighbors" not in sym["args"]
+
+
+@pytest.mark.parametrize("preset", [None, "", "asymmetric", "--rm -rf", 5, True])
+def test_resolved_lima_rejects_an_unknown_preset(preset):
+    """The preset is the ONLY client-facing lima knob; anything outside the table
+    fails loud at SUBMISSION rather than reaching a container as a flag."""
+    with pytest.raises(Exception, match="lima_preset"):
+        runner._mask._resolved_lima({"lima_enabled": True, "lima_preset": preset})
+
+
+def test_resolved_syndna_is_gated_on_enabled():
+    """A stale `syndna_reference_idx` left by a disabled run must not shift the hash."""
+    assert runner._mask._resolved_syndna({"syndna_reference_idx": 57}) is None
+    assert (
+        runner._mask._resolved_syndna({"syndna_enabled": False, "syndna_reference_idx": 57}) is None
+    )
+    assert (
+        runner._mask._resolved_syndna({"syndna_enabled": True, "syndna_reference_idx": 57})[
+            "reference_idx"
+        ]
+        == 57
+    )
+
+
+def test_resolved_syndna_carries_the_effective_alignment_config():
+    """The reference alone does not describe the filter: a read is a spike-in when it has
+    a PRIMARY alignment at >= min_identity under a preset. Every one of those belongs in
+    the identity, so that changing any of them RE-MINTS rather than silently reusing a
+    mask built under the old rule.
+
+    Asserted as a WHOLE-DICT equality, deliberately: a new knob added to the filter must
+    fail here until it is folded into the hash. `primary_only` was added exactly because
+    this equality did NOT fail when the predicate changed — the numbers were pinned but
+    the semantics were not."""
+    r = runner._mask._resolved_syndna({"syndna_enabled": True, "syndna_reference_idx": 57})
+    assert r == {
+        "reference_idx": 57,
+        "aligner": "minimap2",
+        "preset": "map-hifi",
+        "identity_method": "blast",
+        "min_identity": 0.95,
+        "primary_only": True,
+    }
+
+
+def test_syndna_threshold_bump_remints_only_syndna_masks(monkeypatch):
+    """Moving the identity threshold changes the effective spike-in filter, so a
+    syndna mask must re-hash. Because `resolved_syndna` is None when syndna is off,
+    it leaves every non-syndna mask hashing exactly as before."""
+    ctx = {"syndna_enabled": True, "syndna_reference_idx": 57}
+    before_syndna = _params(resolved_syndna=runner._mask._resolved_syndna(ctx))
+    before_plain = _params()
+
+    monkeypatch.setattr(runner._mask, "_SYNDNA_MIN_IDENTITY", 0.99)
+    after_syndna = _params(resolved_syndna=runner._mask._resolved_syndna(ctx))
+    after_plain = _params()
+
+    assert before_syndna != after_syndna, "a threshold bump must re-mint a syndna mask"
+    assert before_plain == after_plain, "it must NOT disturb a non-syndna mask"
+
+
+def test_mask_params_are_canonical_json_serializable():
+    """mint_mask_definition hashes canonical JSON of this dict; a non-serializable
+    value would fail at mint time, not here."""
+    json.dumps(
+        _params(
+            resolved_lima=runner._mask._resolved_lima(
+                {"lima_enabled": True, "lima_preset": "ASYMMETRIC"}
+            ),
+            resolved_syndna=runner._mask._resolved_syndna(
+                {"syndna_enabled": True, "syndna_reference_idx": 57}
+            ),
+        ),
+        sort_keys=True,
+    )
+
+
+def test_lima_version_bump_remints_only_lima_masks():
+    """A lima upgrade changes where the clip lands, so it must re-mint. Because
+    `resolved_lima` is None when lima is off, the bump leaves every Illumina (and
+    non-lima PacBio) mask hashing exactly as before."""
+    on = {"lima_enabled": True, "lima_preset": "ASYMMETRIC"}
+    before = _params(resolved_lima=runner._mask._resolved_lima(on))
+    bumped = dict(runner._mask._resolved_lima(on), version="2.14.0")
+    assert _params(resolved_lima=bumped) != before
+    # ...while a mask that never ran lima is unaffected by the same bump.
+    assert _params() == _params()

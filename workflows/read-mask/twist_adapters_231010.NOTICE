@@ -1,0 +1,23 @@
+twist_adapters_231010.fasta
+===========================
+
+Twist Bioscience Universal Adapters (10 bp UDI) for PacBio, 800 records:
+400 forward (72 nt) + 400 reverse (68 nt), interleaved as adjacent F/R pairs.
+
+Source (public, no authentication):
+  https://www.pacb.com/wp-content/uploads/Twist_Universal_Adapters_10bp_UDI_for_PacBio_10Oct2023.fasta_.zip
+Also vendored by qiita-spots/qp-pacbio (BSD-3-Clause), which documents the same URL.
+
+RECORD ORDER IS LOAD-BEARING. lima is invoked with `--neighbors`, which emits a
+read only when its best-scoring barcode pair are ADJACENT RECORDS in this file.
+Reordering the records changes which reads survive. Do not sort, dedup, or
+regenerate this file; replace it wholesale and update the md5 pinned in the
+control plane (`_LIMA_ADAPTER_SET_MD5`), which folds the adapter bytes into the
+read-mask identity so a different adapter set re-mints rather than silently
+reusing a mask built from other adapters.
+
+The P5/P7 and TruSeq constant regions flanking each index are Illumina sequences.
+Per Illumina document # 1000000002694 ("Illumina Adapter Sequences"), and
+following the precedent of Trimmomatic's bundled adapter FASTAs:
+
+  Oligonucleotide sequences (c) 2023 Illumina, Inc. All rights reserved.

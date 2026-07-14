@@ -86,6 +86,12 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..preflight import (
+    PacbioProtocol,
+    open_blob,
+    pacbio_human_filtering_by_sample_idx,
+    pacbio_protocol_by_sample_idx,
+)
 from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataUnknownFieldsError,
@@ -385,6 +391,84 @@ def _human_filtering_by_item_id(blob: bytes) -> dict[str, bool]:
     }
 
 
+def _pacbio_facts_by_item_id(blob: bytes) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
+    """Return ``(human_filtering, protocol_facts)`` for a PacBio blob, both keyed on
+    ``str(pacbio_sample_idx)`` — which IS the ``sequenced_pool_item_id`` the PacBio
+    composer assigns (the barcode is only the BAM-locating key). ``({}, {})`` for a
+    non-PacBio blob, so the caller can probe both platforms without branching.
+
+    Two readers, one blob open. They are separate in ``qiita_control_plane.preflight``
+    on purpose: ``human_filtering`` is host-filtering POLICY whose source is moving to
+    sample metadata, while the protocol facts stay pre-flight-sourced. When that lands,
+    the ``pacbio_human_filtering_by_sample_idx`` call below is what gets deleted.
+    """
+    with open_blob(blob) as conn:
+        protocol = pacbio_protocol_by_sample_idx(conn)
+        if not protocol:
+            return {}, {}
+        return pacbio_human_filtering_by_sample_idx(conn), protocol
+
+
+async def _pool_sample_facts_by_item_id(
+    pool: asyncpg.Pool,
+    *,
+    sequencing_run_idx: int,
+    sequenced_pool_idx: int,
+) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
+    """Return ``(human_filtering_by_item_id, pacbio_facts_by_item_id)`` for a pool.
+
+    PLATFORM-AWARE, and the SINGLE seam where the roster sources its per-sample
+    intake facts. Both maps key on the pool's ``sequenced_pool_item_id``:
+    ``str(illumina_sample_idx)`` for Illumina, ``str(pacbio_sample_idx)`` for PacBio.
+    A pool is one or the other (a pre-flight carries a single run-level
+    ``sheet_type``), so at most one platform's facts are populated — but both are
+    returned so the roster route itself stays branch-free.
+
+    For PacBio, ``human_filtering`` needs its own reader: the Illumina one walks
+    ``run_illumina_sample``, which PacBio has no analogue for, and would return
+    ``{}`` — leaving every PacBio sample's intent null and aborting
+    ``submit-host-filter-pool`` before it starts.
+
+    THIS is the function the sample-metadata migration repoints: when
+    ``human_filtering`` stops coming from the blob, both readers below lose their
+    first return value and it comes from sample metadata instead. The roster still
+    carries the field and the CLI still reads it off the roster row, so nothing
+    downstream changes.
+
+    Degrades to ``({}, {})`` on an unparseable blob (see the warning below).
+    """
+    row = await fetch_sequenced_pool_preflight(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+    )
+    if row is None or row["run_preflight_blob"] is None:
+        return {}, {}
+    blob = bytes(row["run_preflight_blob"])
+    # The PacBio read is a PROBE: a blob it cannot parse is simply not PacBio, and
+    # must not take the Illumina reader down with it. One `try` around both would do
+    # exactly that — every Illumina pool's intents would go null the moment the
+    # PacBio read raised. Only the Illumina failure warns, because by then the blob
+    # has failed BOTH readers.
+    try:
+        pacbio_filtering, pacbio = _pacbio_facts_by_item_id(blob)
+    except sqlite3.DatabaseError, ValueError:
+        pacbio_filtering, pacbio = {}, {}
+    if pacbio:
+        return pacbio_filtering, pacbio
+    try:
+        return _human_filtering_by_item_id(blob), {}
+    except (sqlite3.DatabaseError, ValueError) as exc:
+        _log.warning(
+            "could not parse stored run-preflight for sequenced_pool %s (run %s);"
+            " human_filtering will be null for its samples: %s",
+            sequenced_pool_idx,
+            sequencing_run_idx,
+            exc,
+        )
+        return {}, {}
+
+
 async def _pool_human_filtering_by_item_id(
     pool: asyncpg.Pool,
     *,
@@ -471,7 +555,7 @@ async def list_sequenced_samples_in_pool(
     # Derive each sample's intake human_filtering intent from the pool's stored
     # preflight blob and attach it by sequenced_pool_item_id; None per sample
     # when the pool has no preflight or the blob omits its row.
-    human_filtering_by_item_id = await _pool_human_filtering_by_item_id(
+    human_filtering_by_item_id, pacbio_by_item_id = await _pool_sample_facts_by_item_id(
         pool,
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
@@ -479,7 +563,15 @@ async def list_sequenced_samples_in_pool(
     samples = []
     for r in rows:
         item = dict(r)
-        item["human_filtering"] = human_filtering_by_item_id.get(item["sequenced_pool_item_id"])
+        item_id = item["sequenced_pool_item_id"]
+        item["human_filtering"] = human_filtering_by_item_id.get(item_id)
+        # PacBio protocol facts; absent (None) for an Illumina pool. The read-mask
+        # submit derives lima_enabled / syndna_enabled from these.
+        facts = pacbio_by_item_id.get(item_id)
+        if facts is not None:
+            item["sheet_type"] = facts.sheet_type
+            item["twist_adaptor_id"] = facts.twist_adaptor_id
+            item["syndna_is_twisted"] = facts.syndna_is_twisted
         samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(
         samples=samples,
@@ -598,6 +690,7 @@ def _sequenced_sample_response_from_row(
             "raw_read_count_r1r2": row["raw_read_count_r1r2"],
             "biological_read_count_r1r2": row["biological_read_count_r1r2"],
             "quality_filtered_read_count_r1r2": row["quality_filtered_read_count_r1r2"],
+            "spikein_read_count_r1r2": row["spikein_read_count_r1r2"],
             "last_metadata_change_at": row["last_metadata_change_at"],
             "created_by_idx": row["created_by_idx"],
             "created_at": row["created_at"],

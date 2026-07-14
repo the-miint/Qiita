@@ -144,7 +144,7 @@ class SequencedPoolCreateResponse(BaseModel):
 class PoolReadMetrics(BaseModel):
     """Compute-on-read read-metric rollup for a sequenced_pool.
 
-    The three counts are SUMS over the pool's NON-retired sequenced_samples
+    The four counts are SUMS over the pool's NON-retired sequenced_samples
     (each NULL until at least one sample in the pool has been processed);
     `fraction_passing_quality_filter` is recomputed from the summed counts via
     `_fraction_passing_quality_filter` — NOT a mean of per-sample fractions — and
@@ -156,6 +156,9 @@ class PoolReadMetrics(BaseModel):
     raw_read_count_r1r2: int | None
     biological_read_count_r1r2: int | None
     quality_filtered_read_count_r1r2: int | None
+    # SynDNA spike-ins, disjoint from biological (added in the lab, not a molecule
+    # from the sample). Always 0/NULL for protocols that carry no spike-in.
+    spikein_read_count_r1r2: int | None
     sample_count: int
     samples_with_metrics: int
 
@@ -645,10 +648,15 @@ class SequencedSampleResponse(BaseModel):
     submission_error: str | None
     # Per-stage read counts, both-mates (R1+R2) totals. NULL until the
     # sample is processed by fastq-to-parquet/1.2.0 (the persist-read-metrics
-    # action writes them). raw >= biological >= quality_filtered by the DB CHECK.
+    # action writes them). By the DB CHECK: quality_filtered <= biological and
+    # biological + spikein <= raw. `spikein` (SynDNA) is DISJOINT from biological —
+    # a spike-in is added in the lab, not a molecule from the sample — and is 0 for
+    # protocols that carry none. `qc_*` and `twist_no_adaptor` reads count toward
+    # raw only.
     raw_read_count_r1r2: int | None
     biological_read_count_r1r2: int | None
     quality_filtered_read_count_r1r2: int | None
+    spikein_read_count_r1r2: int | None
     last_metadata_change_at: AwareDatetime | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime

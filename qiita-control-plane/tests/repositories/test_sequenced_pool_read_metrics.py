@@ -42,7 +42,9 @@ async def pool_ctx(postgres_pool):
     )
     samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
 
-    async def add_sample(*, raw=None, biological=None, quality_filtered=None, retired=False):
+    async def add_sample(
+        *, raw=None, biological=None, quality_filtered=None, spikein=None, retired=False
+    ):
         bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
             postgres_pool, owner_idx=owner_idx
         )
@@ -58,12 +60,14 @@ async def pool_ctx(postgres_pool):
         if raw is not None:
             await postgres_pool.execute(
                 "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = $2,"
-                " biological_read_count_r1r2 = $3, quality_filtered_read_count_r1r2 = $4"
+                " biological_read_count_r1r2 = $3, quality_filtered_read_count_r1r2 = $4,"
+                " spikein_read_count_r1r2 = $5"
                 " WHERE idx = $1",
                 ss_idx,
                 raw,
                 biological,
                 quality_filtered,
+                spikein,
             )
         if retired:
             await postgres_pool.execute(
@@ -102,16 +106,33 @@ async def test_empty_pool_is_null_sums_zero_counts(pool_ctx):
 
 async def test_sums_across_processed_samples(pool_ctx):
     """Two processed samples: per-stage counts sum; the ::bigint cast yields
-    plain ints (not Decimal)."""
-    await pool_ctx["add_sample"](raw=1000, biological=900, quality_filtered=850)
-    await pool_ctx["add_sample"](raw=2000, biological=1800, quality_filtered=1700)
+    plain ints (not Decimal). The spikein column sums too — a PacBio absquant
+    sample carries one, an Illumina sample carries 0, and the rollup adds both."""
+    await pool_ctx["add_sample"](raw=1000, biological=900, quality_filtered=850, spikein=40)
+    await pool_ctx["add_sample"](raw=2000, biological=1800, quality_filtered=1700, spikein=0)
     row = await fetch_sequenced_pool_read_metrics(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["raw_read_count_r1r2"] == 3000
     assert row["biological_read_count_r1r2"] == 2700
     assert row["quality_filtered_read_count_r1r2"] == 2550
+    assert row["spikein_read_count_r1r2"] == 40
     assert isinstance(row["raw_read_count_r1r2"], int)
+    assert isinstance(row["spikein_read_count_r1r2"], int)
     assert row["sample_count"] == 2
     assert row["samples_with_metrics"] == 2
+
+
+async def test_spikein_sums_only_over_non_retired_samples(pool_ctx):
+    """The spikein SUM carries the same `FILTER (WHERE ps.retired IS NOT TRUE)`
+    as its three siblings — a retired sample's spike-ins must not inflate the
+    pool's spike-in masking total (NOT the cell-count model's input — that
+    is per-insert coverage depth)."""
+    await pool_ctx["add_sample"](raw=1000, biological=900, quality_filtered=850, spikein=40)
+    await pool_ctx["add_sample"](
+        raw=500, biological=400, quality_filtered=300, spikein=99, retired=True
+    )
+    row = await fetch_sequenced_pool_read_metrics(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert row["spikein_read_count_r1r2"] == 40
+    assert row["raw_read_count_r1r2"] == 1000
 
 
 async def test_partial_pool_counts_only_processed(pool_ctx):
