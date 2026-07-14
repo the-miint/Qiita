@@ -196,6 +196,7 @@ const ALLOWED_TABLES: &[&str] = &[
     "reference_taxonomy",
     "reference_phylogeny",
     "reference_placements",
+    "reference_annotation",
     "read_masked",
 ];
 
@@ -204,6 +205,8 @@ const ALLOWED_TABLES: &[&str] = &[
 /// via error messages for non-existent columns.
 const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "feature_idx",
+    "parent_feature_idx",
+    "annotation_idx",
     "reference_idx",
     "node_index",
     "mask_idx",
@@ -1860,9 +1863,9 @@ fn register_files(
 /// Delete every DuckLake row belonging to a reference.
 ///
 /// Scoping rules mirror the identifier hierarchy:
-/// - `reference_taxonomy`, `reference_phylogeny`, `reference_placements`, and
-///   `reference_membership` carry `reference_idx` directly → deleted by a plain
-///   `WHERE reference_idx = ?`.
+/// - `reference_taxonomy`, `reference_phylogeny`, `reference_placements`,
+///   `reference_annotation`, and `reference_membership` carry `reference_idx`
+///   directly → deleted by a plain `WHERE reference_idx = ?`.
 /// - `reference_sequences` / `reference_sequence_chunks` are keyed by
 ///   `feature_idx` and **shared across references** (a feature deduplicates by
 ///   sequence hash). Only *orphan* features — owned by this reference and no
@@ -1892,7 +1895,7 @@ fn delete_reference(
             .map_err(|e| Status::internal(format!("delete failed ({sql}): {e}")))
     };
 
-    // All six deletes are one DuckLake transaction so the action is
+    // All seven deletes are one DuckLake transaction so the action is
     // all-or-nothing: a mid-delete failure rolls every table back rather than
     // leaving a half-purged reference. That atomicity is what lets the control
     // plane safely retry — a failed call leaves DuckLake membership fully
@@ -1901,26 +1904,39 @@ fn delete_reference(
         .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
 
     // Orphan features: this reference's features minus every other reference's.
+    //
+    // A reference claims a feature in TWO ways and both count: as a MEMBER (a whole
+    // sequence, indexed and aligned against) or as an annotated INTERVAL (a SynDNA
+    // insert on its plasmid — minted its own feature_idx, deliberately kept out of
+    // membership). Omitting reference_annotation on the left would leak annotated
+    // features; omitting it on the right would delete a sequence another reference
+    // still annotates.
+    //
     // This set MUST match the Postgres-side orphan computation in
     // qiita_control_plane.actions.reference.delete_reference_cascade — the two
     // stores GC the same features independently, so a change to one query must
     // change the other or sequences/features desync across stores.
     let orphan_filter = "feature_idx IN (
-            SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx = ?
+            (SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx = ?
+             UNION
+             SELECT feature_idx FROM qiita_lake.reference_annotation WHERE reference_idx = ?)
             EXCEPT
-            SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx <> ?
+            (SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx <> ?
+             UNION
+             SELECT feature_idx FROM qiita_lake.reference_annotation WHERE reference_idx <> ?)
         )";
 
-    // Sequence/chunk deletes run BEFORE the membership delete: the orphan
-    // subquery needs this reference's membership rows still present.
+    // Sequence/chunk deletes run BEFORE the membership AND annotation deletes: the
+    // orphan subquery reads both of this reference's claim tables, so both must
+    // still be present.
     let deletes = (|| -> Result<serde_json::Value, Status> {
         let sequences_deleted = exec(
             &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx],
+            &[reference_idx, reference_idx, reference_idx, reference_idx],
         )?;
         let chunks_deleted = exec(
             &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx],
+            &[reference_idx, reference_idx, reference_idx, reference_idx],
         )?;
         let membership_deleted = exec(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
@@ -1938,6 +1954,15 @@ fn delete_reference(
             "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
             &[reference_idx],
         )?;
+        // Annotation ROWS delete by reference_idx (they carry it directly), not by
+        // the orphan filter — but they must go AFTER the sequence/chunk deletes
+        // above, which read this table as one of the two claim sets in
+        // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
+        // filter, like any other orphan.
+        let annotations_deleted = exec(
+            "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
+            &[reference_idx],
+        )?;
         Ok(serde_json::json!({
             "sequences_deleted": sequences_deleted,
             "chunks_deleted": chunks_deleted,
@@ -1945,6 +1970,7 @@ fn delete_reference(
             "taxonomy_deleted": taxonomy_deleted,
             "phylogeny_deleted": phylogeny_deleted,
             "placements_deleted": placements_deleted,
+            "annotations_deleted": annotations_deleted,
         }))
     })();
 

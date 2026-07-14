@@ -767,6 +767,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # every applicable index; the opt-out flags skip one (the entry point rejects
     # building none). --minimap2-preset tunes the HOST builder only; a sharded
     # reference's per-shard .mmi is always built with the fixed map-hifi preset.
+    # GFF3 of per-interval annotations on the FASTA's sequences (a plasmid map
+    # naming each SynDNA insert's window; a genome's gene coordinates). Each
+    # interval is minted its own feature_idx so it can key a feature table while
+    # reads align to its parent sequence.
+    p_reference_load.add_argument("--gff", type=Path)
     p_reference_load.add_argument(
         "--no-rype-index",
         action="store_true",

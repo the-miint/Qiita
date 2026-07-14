@@ -289,6 +289,7 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert step_names == [
         "hash_sequences",
         "mint-features",
+        "mint-annotation-features",
         "write-membership",
         "load",
         "build_rype_index",
@@ -490,6 +491,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "stage_local_fasta",
         "hash_sequences",
         "mint-features",
+        "mint-annotation-features",
         "write-membership",
         "load",
         "build_rype_index",

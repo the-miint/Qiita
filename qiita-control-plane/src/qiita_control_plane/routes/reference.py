@@ -416,6 +416,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
         "reference_taxonomy",
         "reference_phylogeny",
         "reference_placements",
+        "reference_annotation",
         "read_masked",
     }
 )

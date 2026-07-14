@@ -244,7 +244,7 @@ def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_pat
     import qiita_compute_orchestrator.jobs._feature_load as fl
 
     # 5 single-chunk features, budget of 2 chunks -> 3 parts (2 + 2 + 1).
-    monkeypatch.setattr(fl, "_CHUNK_BUDGET_PER_BATCH", 2)
+    monkeypatch.setattr(fl, "CHUNK_BUDGET_PER_BATCH", 2)
     outputs = _run(_inputs(**staging_inputs), tmp_path / "ws")
     chunks_dir = outputs["staging_dir"] / "reference_sequence_chunks"
     parts = sorted(chunks_dir.glob("part_*.parquet"))
@@ -448,7 +448,7 @@ def _wrap_chunked_blob_parquet(path: Path, payload: bytes) -> Path:
     """Write a chunked-blob upload Parquet `(chunk_index INTEGER,
     chunk_data BLOB)` via DuckDB. Matches the CLI's DoPut wire shape
     for opaque binary inputs (Newick / jplace); reference_load stitches
-    chunks back into a temp file via `_unwrap_chunks_to_temp_file`."""
+    chunks back into a temp file via `resolve_blob_input`."""
     chunks = [
         (i // _CHUNK_SIZE, payload[i : i + _CHUNK_SIZE])
         for i in range(0, len(payload), _CHUNK_SIZE)
@@ -490,6 +490,31 @@ def test_phylogeny_lifted_writer_populates_tip_feature_idx(staging_inputs, tree_
             f"SELECT count(*) FROM '{pq}' WHERE NOT is_tip AND feature_idx IS NOT NULL"
         ).fetchone()[0]
         assert internal_with_fidx == 0
+
+
+def test_phylogeny_accepts_a_RAW_newick_on_the_local_path(staging_inputs, tmp_path):
+    """The local ingest path DoPuts nothing — "no bytes cross the wire" — so
+    `tree_path` arrives as the raw `.nwk` file itself, not a chunked-BLOB upload
+    Parquet. `resolve_blob_input` sniffs which shape it got.
+
+    Before it did, `reference_load` unconditionally `read_parquet()`'d the tree,
+    so `local-reference-add` carrying a tree crashed with a Parquet error. The
+    remote (wrapped) form is covered by the test above; this pins the other half,
+    and the two together are what make the sniff meaningful."""
+    raw_nwk = tmp_path / "tree.nwk"
+    raw_nwk.write_text("((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);")
+
+    outputs = _run(_inputs(**staging_inputs, tree_path=raw_nwk), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    assert pq.exists()
+    with duckdb.connect(":memory:") as conn:
+        tips_with_fidx = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT feature_idx FROM '{pq}' WHERE is_tip AND feature_idx IS NOT NULL"
+            ).fetchall()
+        }
+    assert tips_with_fidx == set(_FEATURE_MAP.values())
 
 
 @pytest.fixture
@@ -566,5 +591,106 @@ def test_missing_optional_taxonomy_raises_file_not_found(staging_inputs, tmp_pat
     with pytest.raises(FileNotFoundError):
         _run(
             _inputs(**staging_inputs, taxonomy_path=tmp_path / "missing.parquet"),
+            tmp_path / "ws",
+        )
+
+
+# =============================================================================
+# Annotations
+# =============================================================================
+
+
+def _annotation_fixtures(tmp_path, *, map_rows=None):
+    """hash_sequences' annotation manifest + mint-annotation-features' annotation map.
+
+    One interval: bases [3, 8) of seq3, sitting on seq3 as its parent. The map's
+    `parent_feature_idx` is seq3's, and every identifier on the eventual lake row comes
+    from the map — this job mints nothing.
+    """
+    parent = "seq3"
+    interval_hash = _HASHES["seq1"]  # stand-in for the extracted interval's own hash
+
+    manifest = tmp_path / "annotation_manifest.parquet"
+    _write_parquet(
+        manifest,
+        "sequence_hash UUID, parent_sequence_hash UUID, parent_read_id VARCHAR, "
+        "annotation_id VARCHAR, source VARCHAR, annotation_type VARCHAR, "
+        "position BIGINT, stop_position BIGINT, strand VARCHAR, "
+        "score DOUBLE, phase SMALLINT, attributes MAP(VARCHAR, VARCHAR)",
+        [
+            (
+                str(interval_hash),
+                str(_HASHES[parent]),
+                parent,
+                "insert_01",
+                "syndna",
+                "insert",
+                3,
+                8,
+                "+",
+                None,
+                None,
+                {"mass_ng": "0.5"},
+            )
+        ],
+    )
+
+    amap = tmp_path / "annotation_map.parquet"
+    _write_parquet(
+        amap,
+        "annotation_idx BIGINT, feature_idx BIGINT, parent_feature_idx BIGINT, "
+        "position BIGINT, stop_position BIGINT, annotation_type VARCHAR, strand VARCHAR",
+        map_rows
+        if map_rows is not None
+        else [
+            (9001, _FEATURE_MAP[interval_hash], _FEATURE_MAP[_HASHES[parent]], 3, 8, "insert", "+")
+        ],
+    )
+    return {"annotation_manifest": manifest, "annotation_map": amap}
+
+
+def test_annotation_row_carries_the_minted_annotation_idx(staging_inputs, tmp_path):
+    """The lake row's identity is the annotation_idx the CONTROL PLANE minted, joined in
+    off the annotation map on the natural key. Nothing here re-derives it, and the GFF3
+    `ID` is carried as provenance only — it is not unique, so nothing may join on it."""
+    outputs = _run(_inputs(**staging_inputs, **_annotation_fixtures(tmp_path)), tmp_path / "ws")
+    out = outputs["staging_dir"] / "reference_annotation.parquet"
+    with duckdb.connect(":memory:") as conn:
+        cols = [
+            c[0] for c in conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()
+        ]
+        rows = conn.execute(f"SELECT * FROM read_parquet('{out}')").fetchall()
+
+    (row,) = [dict(zip(cols, r, strict=True)) for r in rows]
+    assert row["annotation_idx"] == 9001
+    assert row["reference_idx"] == _REFERENCE_IDX
+    assert row["parent_feature_idx"] == _FEATURE_MAP[_HASHES["seq3"]]
+    assert row["annotation_id"] == "insert_01"
+    assert (row["position"], row["stop_position"]) == (3, 8)
+    assert row["attributes"] == {"mass_ng": "0.5"}
+
+
+def test_annotation_row_with_no_minted_idx_raises(staging_inputs, tmp_path):
+    """If the map and the manifest disagree about the natural key, the inner join would
+    simply DROP the row and register a lake table quietly missing an annotation. That is
+    the failure this raise exists to convert into a dead ticket — here the map claims a
+    window the manifest never declared."""
+    fixtures = _annotation_fixtures(
+        tmp_path,
+        map_rows=[
+            (9001, 1, _FEATURE_MAP[_HASHES["seq3"]], 4, 9, "insert", "+")
+        ],  # window off by one
+    )
+    with pytest.raises(ValueError, match="no minted annotation_idx"):
+        _run(_inputs(**staging_inputs, **fixtures), tmp_path / "ws")
+
+
+def test_annotation_manifest_without_map_is_refused(staging_inputs, tmp_path):
+    """Supplying one without the other is a mis-wired workflow whose only symptom would
+    be a silently EMPTY reference_annotation table."""
+    fixtures = _annotation_fixtures(tmp_path)
+    with pytest.raises(ValueError, match="must be supplied together"):
+        _run(
+            _inputs(**staging_inputs, annotation_manifest=fixtures["annotation_manifest"]),
             tmp_path / "ws",
         )

@@ -103,6 +103,10 @@ class LibraryPrimitive(StrEnum):
     """
 
     MINT_FEATURES = "mint-features"
+    # Mint a feature_idx for each ANNOTATED INTERVAL (a SynDNA insert on its plasmid)
+    # and record the reference's claim on it. Deliberately NOT followed by
+    # write-membership. See qiita_control_plane.actions.library.mint_annotation_features.
+    MINT_ANNOTATION_FEATURES = "mint-annotation-features"
     WRITE_MEMBERSHIP = "write-membership"
     # Assembly analogue of write-membership: link a prep_sample's assembly RUN
     # (processing_idx) contigs — already minted against the shared qiita.feature —

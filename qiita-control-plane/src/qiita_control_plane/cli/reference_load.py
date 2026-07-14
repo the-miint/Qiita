@@ -231,7 +231,7 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
     stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
     `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
     inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
-    chunks back into a temp file via `_unwrap_chunks_to_temp_file`.
+    chunks back into a temp file via `_blob_input.resolve_blob_input`.
 
     Reads gzipped (`.gz`) inputs transparently — chunk_data carries the
     decompressed bytes. The server's stitched temp file is then valid
@@ -297,6 +297,10 @@ _ROLE_STREAMERS: dict[str, Callable[[Path], Any]] = {
     "tree": _blob_upload_stream,
     "jplace": _blob_upload_stream,
     "genome_map": _passthrough_parquet_stream,
+    # A GFF3 is raw text like Newick/jplace — same chunked-BLOB envelope. The
+    # server unwraps it with _blob_input.resolve_blob_input and hands the file
+    # to miint's read_gff.
+    "gff": _blob_upload_stream,
 }
 
 
@@ -484,6 +488,7 @@ async def do_reference_load(
     jplace_path: Path | None = None,
     genome_map_path: Path | None = None,
     shard_index: bool = False,
+    gff_path: Path | None = None,
     build_rype: bool = True,
     build_minimap2: bool = True,
     build_bowtie2: bool = True,
@@ -659,6 +664,7 @@ async def do_reference_load(
             ("--tree", tree_path),
             ("--jplace", jplace_path),
             ("--genome-map", genome_map_path),
+            ("--gff", gff_path),
         ):
             if companion is not None and not companion.is_absolute():
                 raise ValueError(f"{flag} must be absolute under --local, got {str(companion)!r}")
@@ -721,6 +727,7 @@ async def do_reference_load(
             ("tree", tree_path),
             ("jplace", jplace_path),
             ("genome_map", genome_map_path),
+            ("gff", gff_path),
         ]:
             if src is None:
                 continue
@@ -738,6 +745,7 @@ async def do_reference_load(
             ("tree", tree_path),
             ("jplace", jplace_path),
             ("genome_map", genome_map_path),
+            ("gff", gff_path),
         ]:
             if src is None:
                 continue

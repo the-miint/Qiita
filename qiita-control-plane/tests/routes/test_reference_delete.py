@@ -224,6 +224,175 @@ async def test_delete_reference_orphan_vs_shared_features(client, postgres_pool)
         )
 
 
+async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
+    """An ANNOTATED interval's feature is GC'd on delete, exactly like a member's.
+
+    Annotated features are deliberately kept OUT of `reference_membership` (membership
+    is what gets indexed, and an insert is quantified rather than aligned against). If
+    the orphan computation read only membership — which it did before
+    `qiita.reference_annotation` existed — every annotated `feature_idx` would survive
+    `DELETE /reference/{idx}` forever, referenced by nothing, while the data plane
+    happily deleted its lake rows. The two stores would then disagree about which
+    features exist, which is precisely the desync the cascade is built to avoid.
+
+    Both directions are asserted, because only one of them is the interesting one:
+    the annotated feature of the deleted reference must GO, and a feature another
+    reference still ANNOTATES must STAY — the latter is what a naive "just delete all
+    annotation features" fix would get wrong.
+    """
+    ref_a = await _create_ref(client, f"del-annot-a-{uuid.uuid4()}")
+    ref_b = await _create_ref(client, f"del-annot-b-{uuid.uuid4()}")
+
+    async def _feature():
+        return await postgres_pool.fetchval(
+            "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid())"
+            " RETURNING feature_idx"
+        )
+
+    # Modelled on what mint_annotation_features actually writes: a plasmid is a
+    # MEMBER (it is what reads align to) and its insert is an ANNOTATION whose parent
+    # is that same reference's member. An annotation whose parent the reference does
+    # NOT own is unreachable through the ingest path, and `reference_annotation`'s
+    # ON DELETE RESTRICT FK on parent_feature_idx is the backstop that keeps it that
+    # way — it turns any such corruption into a loud error rather than a silent
+    # dangling parent.
+    plasmid_a, insert_a = await _feature(), await _feature()  # ref_a only
+    plasmid_shared, insert_shared = await _feature(), await _feature()  # both refs
+
+    await postgres_pool.executemany(
+        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx) VALUES ($1, $2)",
+        [(ref_a, plasmid_a), (ref_a, plasmid_shared), (ref_b, plasmid_shared)],
+    )
+    await postgres_pool.executemany(
+        "INSERT INTO qiita.reference_annotation"
+        " (reference_idx, annotation_id, feature_idx, parent_feature_idx,"
+        "  annotation_type, position, stop_position, strand)"
+        " VALUES ($1, $2, $3, $4, 'CDS', $5, $6, '+')",
+        [
+            (ref_a, "insert_a", insert_a, plasmid_a, 1, 101),
+            (ref_a, "insert_shared", insert_shared, plasmid_shared, 1, 101),
+            # A SECOND occurrence of the SAME feature in the SAME reference, at a
+            # different place — the 16S case (identical bases → one feature_idx, many
+            # occurrences). It is representable only because identity is the minted
+            # annotation_idx keyed on the natural key (parent + WINDOW + type + strand);
+            # under a (reference_idx, feature_idx) key this row is a constraint
+            # violation, and no real bacterial genome could be ingested.
+            (ref_a, "insert_shared_copy2", insert_shared, plasmid_shared, 201, 301),
+            (ref_b, "insert_shared", insert_shared, plasmid_shared, 1, 101),
+        ],
+    )
+
+    # Terms: a SHARED one (both references cite it — must survive ref_a's delete) and one
+    # only ref_a cites (must be GC'd). A term is global, so this is the same orphan rule
+    # qiita.feature gets, and the same both-directions trap.
+    shared_term = await postgres_pool.fetchval(
+        "INSERT INTO qiita.annotation_term (system, system_id, definition)"
+        " VALUES ('RFAM', $1, '16S ribosomal RNA') RETURNING annotation_term_idx",
+        f"RF-shared-{uuid.uuid4()}",
+    )
+    only_a_term = await postgres_pool.fetchval(
+        "INSERT INTO qiita.annotation_term (system, system_id) VALUES ('KEGG', $1)"
+        " RETURNING annotation_term_idx",
+        f"K-only-a-{uuid.uuid4()}",
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.annotation_to_term (annotation_idx, annotation_term_idx)"
+        " SELECT ra.annotation_idx, t.term FROM qiita.reference_annotation ra"
+        " CROSS JOIN (VALUES ($2::bigint), ($3::bigint)) AS t(term)"
+        " WHERE ra.reference_idx = $1 AND ra.annotation_id = 'insert_a'",
+        ref_a,
+        shared_term,
+        only_a_term,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.annotation_to_term (annotation_idx, annotation_term_idx)"
+        " SELECT ra.annotation_idx, $2 FROM qiita.reference_annotation ra"
+        " WHERE ra.reference_idx = $1",
+        ref_b,
+        shared_term,
+    )
+
+    everything = [plasmid_a, insert_a, plasmid_shared, insert_shared]
+    try:
+        resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_a))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["annotation_deleted"] == 3  # two occurrences of one feature + one more
+        # plasmid_a + insert_a are orphans. insert_shared is still ANNOTATED by ref_b
+        # (it is in no membership row at all — which is exactly the case a
+        # membership-only orphan query gets wrong, in both directions).
+        assert body["orphan_feature_count"] == 2
+
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", insert_a
+            )
+            is None
+        ), "an annotated feature claimed only by the deleted reference must be GC'd"
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", plasmid_a
+            )
+            is None
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", insert_shared
+            )
+            == 1
+        ), "a feature another reference still ANNOTATES must survive — it is in no membership row"
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", plasmid_shared
+            )
+            == 1
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.reference_annotation WHERE reference_idx = $1", ref_b
+            )
+            == 1
+        )
+
+        # The term GC, in both directions — the half that matters is the second.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.annotation_term WHERE annotation_term_idx = $1", only_a_term
+            )
+            is None
+        ), "a term no surviving annotation cites must be GC'd"
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.annotation_term WHERE annotation_term_idx = $1", shared_term
+            )
+            == 1
+        ), "a term another reference still cites must SURVIVE"
+    finally:
+        # FK order: the junction FKs annotation_idx, which FKs feature_idx.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.annotation_to_term l USING qiita.reference_annotation ra"
+            " WHERE l.annotation_idx = ra.annotation_idx"
+            "   AND ra.feature_idx = ANY($1::bigint[])",
+            everything,
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_annotation WHERE feature_idx = ANY($1::bigint[])",
+            everything,
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.annotation_term t WHERE NOT EXISTS ("
+            " SELECT 1 FROM qiita.annotation_to_term l"
+            " WHERE l.annotation_term_idx = t.annotation_term_idx)"
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE feature_idx = ANY($1::bigint[])",
+            everything,
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", everything
+        )
+
+
 async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
     client, postgres_pool
 ):
