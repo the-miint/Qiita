@@ -14,6 +14,7 @@ gracefully (same posture as the apptainer-optional workflow tests).
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -245,6 +246,47 @@ def test_buckets_12_pins_real_checklist_headers() -> None:
         "qiita_buckets_12 could not locate buckets 1 & 2 in the real "
         f"DEPLOY_CHECKLIST.md (rc={result.returncode}); the '### 1. Env vars' / "
         "'### 3. Migrations' markers it keys on have drifted from the file."
+    )
+
+
+def test_deployed_history_heading_pins_the_live_section_boundary() -> None:
+    """`## Deployed history` terminates the sed range that prints the live section.
+
+    Two consumers slice DEPLOY_CHECKLIST.md with
+    `sed -n '/^## Pending deploy/,/^## Deployed history/p'` — the operator, in
+    redeploy.md §1, and the agent, in /deploy-note. Since the archived deploys
+    moved out to docs/deploy-archive/, the heading is a short pointer stub with no
+    content under it, which makes it look like dead weight a tidy-up would delete.
+    It isn't: delete it and both ranges run to EOF. Pin it."""
+    text = (_REPO_ROOT / "DEPLOY_CHECKLIST.md").read_text()
+    assert "\n## Deployed history\n" in text, (
+        "DEPLOY_CHECKLIST.md lost its '## Deployed history' heading. It is the "
+        "terminator of the `## Pending deploy` sed range used by redeploy.md §1 "
+        "and /deploy-note; without it both print the rest of the file."
+    )
+    assert text.index("\n## Pending deploy\n") < text.index("\n## Deployed history\n"), (
+        "'## Deployed history' must come after '## Pending deploy' — the sed range "
+        "between them is empty otherwise."
+    )
+
+
+def test_deploy_archive_index_covers_every_archived_deploy() -> None:
+    """`docs/deploy-archive/README.md` indexes exactly the files beside it.
+
+    The index is hand-maintained (by `/deploy-archive`, which adds a line when it
+    writes a file), so it drifts the moment someone writes one and forgets the
+    other. A missing line hides a deploy from the only listing anyone reads; a
+    stale line is a dead link. Both are silent."""
+    archive = _REPO_ROOT / "docs" / "deploy-archive"
+    index = (archive / "README.md").read_text()
+
+    on_disk = {p.name for p in archive.glob("*.md")} - {"README.md"}
+    linked = set(re.findall(r"\]\((\d{4}-\d{2}-\d{2}-[^)]+\.md)\)", index))
+
+    assert on_disk == linked, (
+        "docs/deploy-archive/ and its README index disagree. Missing from the "
+        f"index: {sorted(on_disk - linked)}. Indexed but absent from disk (dead "
+        f"links): {sorted(linked - on_disk)}."
     )
 
 

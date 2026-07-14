@@ -11,6 +11,13 @@ project does not cut versioned releases yet, so everything lands under
 **Unreleased**. Every PR adds an entry here (CI `changelog-check`; opt out with
 the `no-changelog` label).
 
+**Where to add your entry.** This file is long, and `Unreleased` accumulated
+duplicate bucket headings because each wave of PRs added a fresh one at the top
+rather than scrolling to find the existing one. Don't do that: add your bullet
+under the **first** `### Added` / `### Changed` / `### Fixed` / `### Removed`
+heading under `## [Unreleased]`, and **never create a new bucket heading**. The
+duplicates further down are historical strata; leave them where they are.
+
 ## [Unreleased]
 
 ### Changed
@@ -33,6 +40,37 @@ the `no-changelog` label).
   at deploy (miint staging) instead of per job. Added a neutral `INDEX_TYPE_MINIMAP2`
   constant for the analysis-reference context (the host-filter-branded alias stays).
   (#268)
+
+- **The deploy history moved out of `DEPLOY_CHECKLIST.md` into `docs/deploy-archive/`,
+  one file per deploy.** 97% of that file was 36 archived deploys, whose bucket
+  headings differ from the live ones by a single `#` — so every grep for a bucket
+  returned ~37 hits and the file every PR folds into was 123 KB. It is now 67 lines.
+  `/deploy-archive` writes the next archive file there instead of appending in place,
+  and `/deploy-note` was given the same scoped-read recipe `redeploy.md` §1 already
+  handed the human operator. Both `sed` contracts the deploy path depends on still
+  hold, and both are now pinned by `test_deploy_scripts.py`: `qiita_buckets_12()`'s
+  `### 1. Env vars` → `### 3. Migrations` span (already covered), and — newly —
+  `## Deployed history`, which survives as an empty pointer stub *because* it
+  terminates the range that prints the live section, and would otherwise read as
+  dead weight for a future tidy-up to delete. (#296)
+
+- **Enum parity is now checked without a database, so `make test` catches it.**
+  `test_enum_parity.py` was `pytestmark = pytest.mark.db` in its entirety, so the
+  rule most likely to be broken — adding a `StrEnum` value without its
+  `ALTER TYPE ... ADD VALUE` twin — was only caught under Docker or in CI after a
+  push. The Postgres value sets are now also reconstructed by replaying the enum DDL
+  in `db/migrations/`, and the DB-backed checks are retained (plus a new one pinning
+  the replay to the live schema, so the cheap tier cannot go green on a stale parse).
+  (#296)
+
+- **Agent tool output is quiet by default** via a checked-in `.claude/settings.json`
+  (`PYTEST_ADDOPTS`, `CARGO_TERM_QUIET`, `UV_NO_PROGRESS`), newly tracked in
+  `.gitignore` alongside `.claude/commands/`. A green `cargo test` printed 69
+  `... ok` lines and a green `pytest` a header and warnings block on every invocation;
+  failures still print in full. Human and CI runs are untouched — the vars are set in
+  the agent's environment, not the shell's or the Makefile's, and CLAUDE.md now records
+  the invariant that only *presentation* may live there (anything changing selection,
+  ordering, or exit status belongs in the Makefile, where CI sees it too). (#296)
 
 - **The work-ticket notification email now accounts for every ticket the recipient
   has, not just the ones that reached a terminal state.** Notifications land
@@ -116,6 +154,34 @@ the `no-changelog` label).
   - The minimap2 identity floor is 0.90 (was sharing bowtie2's 0.99), so long-read
     placements are no longer silently discarded; `build_routing_index` also cleans up
     its multi-GB `router_chunks.parquet` intermediate instead of leaking it. (#268)
+
+- **One definition of "a migration's `up` half," shared by every test that replays the
+  schema without a DB** (`qiita_control_plane.testing.migrations`). Splitting a
+  migration on the bare substring `migrate:down` truncates any file whose up-half prose
+  *mentions* the marker — `20260624000000_drop_sequenced_sample_host_references.sql`
+  does, at line 19, cutting its up half from 28 lines to 19 and silently dropping the
+  DDL below. The marker is now matched anchored to a line start. Comment stripping is
+  likewise quote-aware, because the migrations really do contain `--` inside
+  `COMMENT ON ... IS '...'` literals, and a naive strip cuts the literal in half and
+  leaves an unbalanced quote; it now asserts quote balance rather than trusting itself.
+  `test_work_ticket_state_parity.py` (which had its own correct-but-separate scanner)
+  uses the shared helper too, so the two cannot drift apart. (#296)
+
+- **`CLAUDE.md` described the native-job contract as "exactly two symbols."** It has
+  three: `Inputs` and `execute` are required, and `plan(inputs) -> JobPlan` is an
+  optional submit-time resource-sizing hook — dispatched by `run_native_job_plan`,
+  exposed at `/step/plan`, and implemented today by `jobs/qc.py`.
+  `docs/writing-a-job.md` had it right; `CLAUDE.md` now agrees with it and the code.
+  Also documents the `sif-build.d/<image>.env` multi-image spec form, which
+  `deploy/build-sifs.sh` globs and `read-mask` / `long-read-assembly` use, and which
+  `CLAUDE.md` did not mention at all. (#296)
+
+- **`/deploy-archive` told the agent to reset `## Pending deploy` to "five" bucket
+  sub-headings; the checklist has six.** An agent following it literally dropped
+  bucket 6 — the irreversible-cleanup bucket, whose whole purpose is to hold the
+  steps that burn the rollback path. It is now told to empty the buckets *in place*
+  rather than retype the list, so the file remains the source of truth for its own
+  shape. (#296)
 
 - **A DB-tier test leaked terminal work tickets, reddening `main` on macOS.**
   `test_sequence_range_backfill`'s fixture seeded `work_ticket` rows and never removed
@@ -239,6 +305,10 @@ the `no-changelog` label).
   `build-sifs.sh`'s refuse-on-unbuildable-image guard. All four images have since
   been built and smoke-tested on the deploy host under production apptainer flags.
   (#275)
+
+### Removed
+
+_None yet._
 
 ### Added
 
@@ -442,6 +512,18 @@ the `no-changelog` label).
   chunk_data)` stream into DuckDB for lazy, unbuffered reassembly. The live `compute`
   service account needs the `ticket:doget` scope (already within
   `SERVICE_ACCOUNT_SCOPE_CEILING`) to mint the ticket. (#268)
+
+- **`docs/runbooks/pacbio-ingest.md`** — the operational knowledge from the first
+  production PacBio ingest, which until now lived only in a gitignored local file.
+  Covers the pre-flight `.db` read-write trap (pool identity is the SHA-256 of the
+  blob's bytes, so submitting against an unpatched file and re-running mints a
+  *second* pool), why `--prep-protocol-idx` is not validated against the platform,
+  why `--force` must never be used to retry an ingest, and why `pool-completion`
+  reports `fully_processed: false` permanently for a PacBio pool. (#296)
+
+- **A read-discipline rule in `CLAUDE.md`.** Several files here run past 4,000 lines;
+  reading one whole costs more context than every instruction file in the repo
+  combined. Nothing previously said so. (#296)
 - **PacBio case-5 read-mask chain.** The read-mask workflow gains two optional,
   `when:`-gated stages around its always-on QC and host filter, so one workflow
   serves all five PacBio protocols and Illumina unchanged:

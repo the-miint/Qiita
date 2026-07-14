@@ -332,8 +332,9 @@ deployed commit from step 7.
 A maintainer then, in a local checkout, runs `/deploy-archive <sha>`
 (passing the operator-reported commit — not the maintainer's local
 `HEAD`, which may have moved on). It moves the just-deployed `## Pending
-deploy` block into `## Deployed history` stamped with the date + that
-commit, resets Pending to empty, and the maintainer commits + pushes.
-No Claude? Do the same move by hand following the shape in
-`DEPLOY_CHECKLIST.md`. Either way, also record the deployed commit somewhere
+deploy` block out of `DEPLOY_CHECKLIST.md` into its own file under
+[`docs/deploy-archive/`](../deploy-archive/), empties Pending for the next
+cycle, and the maintainer commits + pushes.
+No Claude? Do the same move by hand, copying the shape of the newest file in
+`docs/deploy-archive/`. Either way, also record the deployed commit somewhere
 durable (deploy log, ops channel).

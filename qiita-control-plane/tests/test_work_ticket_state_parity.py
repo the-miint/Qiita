@@ -15,11 +15,10 @@ instead. No DB needed; they read the migration files.
 """
 
 import re
-from pathlib import Path
 
 from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
 
-_MIGRATIONS = Path(__file__).resolve().parent.parent / "db" / "migrations"
+from qiita_control_plane.testing.migrations import migrate_up, migration_files
 
 # Every migration is globbed, so an index added in a NEW migration is covered the
 # moment it lands — no test edit, no opt-in.
@@ -51,8 +50,8 @@ def _in_flight_indexes() -> dict[str, set[str]]:
     migration this test exists to ask for.
     """
     found: dict[str, set[str]] = {}
-    for sql_file in sorted(_MIGRATIONS.glob("*.sql")):
-        up = sql_file.read_text().split("-- migrate:down", 1)[0]
+    for sql_file in migration_files():
+        up = migrate_up(sql_file.read_text())
         for name, body in _IN_FLIGHT_INDEX.findall(up):
             states = _STATE_IN_LIST.search(body)
             assert states, f"{name} in {sql_file.name} has no `state IN (...)` predicate"
