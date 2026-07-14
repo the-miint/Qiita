@@ -263,6 +263,41 @@ async def test_doget_table_is_in_cp_allowlist(ctx):
     assert "read_masked" in _DOGET_ALLOWED_TABLES
 
 
+def test_cp_doget_allowlist_matches_the_rust_one_exactly():
+    """`_DOGET_ALLOWED_TABLES` is a hand-copy of the data plane's `ALLOWED_TABLES`
+    (flight_service.rs). The CP signs tickets; the DP serves them. The two lists must
+    be IDENTICAL, and the failure when they aren't is asymmetric and silent:
+
+    * a table in the DP list but not the CP one is UNREACHABLE — the DP would serve
+      it happily, but nobody can sign a ticket for it, so the feature simply does not
+      work and no test notices (this is exactly what happened when
+      `reference_annotation` was added to the DP list alone);
+    * a table in the CP list but not the DP one mints tickets the DP then rejects.
+
+    The comment above `_DOGET_ALLOWED_TABLES` has always said "must stay in sync with
+    it" — this is what makes that true. Rust cannot import the Python set and vice
+    versa, so the const is parsed out of the source, exactly as
+    `test_read_mask_counts` does for the mask-reason lists.
+    """
+    import re
+    from pathlib import Path
+
+    from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
+
+    src = (
+        Path(__file__).resolve().parents[3] / "qiita-data-plane" / "src" / "flight_service.rs"
+    ).read_text()
+    m = re.search(r"const ALLOWED_TABLES: &\[&str\] = &\[(.*?)\];", src, flags=re.DOTALL)
+    assert m, "ALLOWED_TABLES not found in flight_service.rs"
+    rust_tables = set(re.findall(r'"([^"]+)"', m.group(1)))
+
+    assert rust_tables == set(_DOGET_ALLOWED_TABLES), (
+        "the CP DoGet allowlist and the data plane's ALLOWED_TABLES have drifted; "
+        f"only in Rust: {sorted(rust_tables - set(_DOGET_ALLOWED_TABLES))}; "
+        f"only in Python: {sorted(set(_DOGET_ALLOWED_TABLES) - rust_tables)}"
+    )
+
+
 async def test_doget_read_masked_not_signable_via_reference_route(ctx):
     """The reference DoGet route must NOT accept read_masked — that surface is
     served only by this route, with its mandatory (prep_sample_idx, mask_idx)
