@@ -3166,16 +3166,45 @@ def _both_indexes_body(reference_idx=7):
     ]
 
 
+def _hf(outcome, *, rype=None, minimap2=None, host=9606):
+    """A roster `host_filter` block — what the server resolved for one sample.
+
+    The CLI no longer decides host filtering; it reads this. So the tests below
+    drive the submit path by choosing what the SAMPLE resolves to, not by choosing
+    a flag — which is the whole point of the change.
+    """
+    return {
+        "outcome": outcome,
+        "host_term_idx": host if outcome == "filter" else None,
+        "rype_reference_idx": rype,
+        "minimap2_reference_idx": minimap2,
+        "reason": f"test: {outcome}",
+    }
+
+
+def _hf_filter(rype=7, minimap2=None, host=9606):
+    return _hf("filter", rype=rype, minimap2=minimap2, host=host)
+
+
+_HF_PASS_THROUGH = _hf("pass_through")
+_HF_CONTROL = _hf("control")
+_HF_UNRESOLVED = _hf("unresolved")
+
+
 def _pool_samples_body(samples):
     """samples: list of (sequenced_sample_idx, prep_sample_idx, pool_item_id[,
-    human_filtering]).
+    host_filter][, has_read_mask_ticket]).
 
-    Host references are no longer a sample property — they are chosen at
-    submit-host-filter-pool time, so the sample-list rows carry none. The roster
-    DOES carry each sample's intake `human_filtering` intent, which the route
-    derives server-side from the pool's stored preflight; supply it as the 4th
-    tuple entry. A 3-tuple leaves `human_filtering` None (the route's "no stored
-    intent for this item" case), which the host-filter-pool guard rejects."""
+    Host references are not a sample property and are no longer chosen at submit
+    time either: each roster row carries the RESOLVED host filtering the server
+    derived from that sample's own `host_taxon_id` metadata. Supply it as the 4th
+    tuple entry (see `_hf_filter` / `_HF_PASS_THROUGH` / `_HF_CONTROL` /
+    `_HF_UNRESOLVED`); it defaults to a plain human FILTER against rype 7, which is
+    what the overwhelming majority of these tests want.
+
+    A 4th entry of None means the roster carried NO resolution — an older server —
+    which the submit path refuses rather than guessing what to deplete.
+    """
 
     def _row(entry):
         ss, ps, item = entry[0], entry[1], entry[2]
@@ -3183,7 +3212,7 @@ def _pool_samples_body(samples):
             "sequenced_sample_idx": ss,
             "prep_sample_idx": ps,
             "sequenced_pool_item_id": item,
-            "human_filtering": entry[3] if len(entry) > 3 else None,
+            "host_filter": entry[3] if len(entry) > 3 else _hf_filter(),
             # 5th tuple entry → has_read_mask_ticket (default False = no ticket).
             "has_read_mask_ticket": entry[4] if len(entry) > 4 else False,
         }

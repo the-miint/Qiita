@@ -6,20 +6,20 @@ sequenced_sample column. The pool-roster route therefore parses it server-side t
 surface those facts on the roster, which is where `submit-host-filter-pool` reads
 them to derive each sample's read-mask gates.
 
-Two DIFFERENT kinds of fact live here, and they have different lifetimes:
+What lives here is PROTOCOL facts (`PacbioProtocol`: sheet_type /
+twist_adaptor_id / syndna_is_twisted) — library-prep truths about how the sample
+was built, which drive `lima_enabled` / `syndna_enabled`. The pre-flight is their
+only home and will stay so.
 
-  * PROTOCOL facts (`PacbioProtocol`: sheet_type / twist_adaptor_id /
-    syndna_is_twisted) — library-prep truths about how the sample was built. They
-    drive `lima_enabled` / `syndna_enabled`. The pre-flight is their only home and
-    will stay so.
-  * HOST-FILTERING intent (`human_filtering`) — policy, not prep. It drives
-    `host_filter_enabled`. Its source is MOVING to sample metadata, so the blob
-    stops being where it comes from; see the DOOMED section below.
+Host-filtering intent (`human_filtering`) used to live here too, as a second kind
+of fact with a different lifetime: policy, not prep. It is gone. `host_filter_enabled`
+now comes from the sample's own `host_taxon_id` metadata, resolved server-side —
+so a sample's host is a property of the sample, not of the project it was booked
+under. Keeping the two kinds of fact in SEPARATE readers is what made that removal
+an excision rather than surgery.
 
-They are deliberately kept in SEPARATE readers, rather than one row type carrying
-both, so that migration is an excision and not surgery: delete the human_filtering
-reader and its Illumina twin, repoint the one seam in the roster route, and the
-protocol reader is untouched.
+The CONTROL reader (`control_samples`) is the one host-filter-adjacent thing that
+stays: a blank is a prep fact (there was nothing in the well), not a policy one.
 
 The PacBio facts come from kl-run-preflight's own `get_pacbio_sample_info` — the
 same accessor `cli/user/pacbio.py::_read_pacbio_preflight_rows` uses at ingest, so
@@ -58,9 +58,8 @@ class PacbioProtocol:
         syndna_enabled = sheet_type == 'pacbio_absquant'
         lima_enabled   = twist_adaptor_id filled AND syndna_is_twisted is False
 
-    `human_filtering` is deliberately NOT a field here: it is host-filtering
-    policy, not a prep fact, and its source is moving to sample metadata. Keeping
-    it out means that move never has to un-pick a field out of this type.
+    Host-filtering is deliberately NOT a field here: it is resolved from the
+    sample's own metadata, not from the pre-flight.
     """
 
     sheet_type: str
@@ -170,63 +169,6 @@ def pacbio_protocol_from_blob(blob: bytes) -> dict[str, PacbioProtocol]:
     """`pacbio_protocol_by_sample_idx` over a stored blob."""
     with open_blob(blob) as conn:
         return pacbio_protocol_by_sample_idx(conn)
-
-
-# =============================================================================
-# Host-filtering intent — the DOOMED reader
-# =============================================================================
-#
-# `human_filtering` is host-filtering POLICY, and its source is moving from the
-# pre-flight blob to sample metadata. When that lands, this function and its
-# Illumina twin (`routes/sequenced_sample.py::_human_filtering_by_item_id`) are
-# DELETED, and the single seam that calls them
-# (`routes/sequenced_sample.py::_pool_sample_facts_by_item_id`) is repointed at the
-# metadata lookup. Nothing else moves: the roster still carries a `human_filtering`
-# field and the CLI still reads it off the roster row, so no client changes.
-#
-# Keep this reader free of protocol facts so that deletion stays a clean excision.
-
-
-def pacbio_human_filtering_by_sample_idx(conn: sqlite3.Connection) -> dict[str, bool]:
-    """Map each PacBio sample's `pacbio_sample_idx` to its intake human_filtering.
-
-    `get_pacbio_sample_info` omits this one intake fact, so it is read from the
-    canonical run-scoped `run_pacbio_sample` view (which resolves a control's
-    project to its plate primary) joined to `project.human_filtering` — the same
-    pair `cli/user/pacbio.py` reads at ingest. Keyed to match
-    `pacbio_protocol_by_sample_idx`.
-
-    A sample whose project cannot be resolved is simply ABSENT from the map — the
-    caller then reports None ("intent unknown"), and the submit guard turns that
-    into an actionable abort rather than guessing. Defaulting here would either
-    leak human reads or silently drop a filter the operator asked for.
-    """
-    from run_preflight.db import get_single_run_idx  # noqa: PLC0415
-
-    if not is_pacbio_sheet_type(run_sheet_type(conn)):
-        return {}
-    run_idx = get_single_run_idx(conn)
-    project_by_idx = conn.execute(
-        "SELECT pacbio_sample_idx, project_name FROM run_pacbio_sample WHERE run_idx = ?",
-        (run_idx,),
-    ).fetchall()
-    filtering_by_project = {
-        name: bool(flag)
-        for name, flag in conn.execute(
-            "SELECT project_name, human_filtering FROM project"
-        ).fetchall()
-    }
-    return {
-        str(idx): filtering_by_project[project_name]
-        for idx, project_name in project_by_idx
-        if project_name in filtering_by_project
-    }
-
-
-def pacbio_human_filtering_from_blob(blob: bytes) -> dict[str, bool]:
-    """`pacbio_human_filtering_by_sample_idx` over a stored blob."""
-    with open_blob(blob) as conn:
-        return pacbio_human_filtering_by_sample_idx(conn)
 
 
 class ControlSamples(NamedTuple):

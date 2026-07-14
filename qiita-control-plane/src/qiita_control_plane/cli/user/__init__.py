@@ -43,7 +43,7 @@ from .pool import (
     _BCL_CONVERT_ACTION_VERSION,
     _READ_MASK_ACTION_VERSION,
     _assert_host_reference_ready,
-    _assert_pool_intent_matches,
+    _assert_resolved_references_ready,
     _build_missing_section,
     _handle_delete_sequenced_pool,
     _handle_pool_completion,
@@ -54,6 +54,7 @@ from .pool import (
     _PreflightRow,
     _print_missing_accession_error,
     _read_preflight_rows,
+    _resolved_decisions,
 )
 from .reference import (
     _handle_reference_list,
@@ -104,7 +105,8 @@ __all__ = [
     "_PreflightRow",
     "_READ_MASK_ACTION_VERSION",
     "_assert_host_reference_ready",
-    "_assert_pool_intent_matches",
+    "_assert_resolved_references_ready",
+    "_resolved_decisions",
     "_build_body",
     "_build_missing_section",
     "_get_work_ticket",

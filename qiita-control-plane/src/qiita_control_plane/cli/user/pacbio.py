@@ -97,7 +97,6 @@ class _PacbioPreflightRow(NamedTuple):
     biosample_accession: str
     primary_project_accession: str
     secondary_project_accessions: list[str]
-    human_filtering: bool
     sheet_type: str
     twist_adaptor_id: str | None
     syndna_is_twisted: bool | None
@@ -117,10 +116,7 @@ def _read_pacbio_preflight_rows(
     validates + raises on any missing required accession, and resolves a control's
     project to the plate primary itself, so this wrapper adds no accession SQL.
     The `pacbio_sample_idx` it returns is the sample's unique id (used as the
-    pool-item-id). The one intake fact the accessor omits — the project's
-    `human_filtering` flag — is read from the canonical `run_pacbio_sample` view +
-    the `project` table. (Reading the run-preflight schema directly here is a known
-    smell — the reader should own it; a dedicated accessor is the follow-up.)
+    pool-item-id).
 
     Operator-actionable errors (not a SQLite, a non-PacBio sheet, an empty sample
     set, a missing accession, or an impossible protocol combo) raise via
@@ -150,12 +146,6 @@ def _read_pacbio_preflight_rows(
             for idx, project in conn.execute(
                 "SELECT pacbio_sample_idx, project_name FROM run_pacbio_sample WHERE run_idx = ?",
                 (run_idx,),
-            ).fetchall()
-        }
-        filtering_by_project = {
-            name: bool(flag)
-            for name, flag in conn.execute(
-                "SELECT project_name, human_filtering FROM project"
             ).fetchall()
         }
         # The accessor's ValueError is meaning-specific (a missing biosample /
@@ -204,7 +194,6 @@ def _read_pacbio_preflight_rows(
                 " is absent from the run_pacbio_sample view — the preflight is"
                 " internally inconsistent"
             )
-        project_name = project_by_idx[info.sample_idx]
         if not pbs.barcode_id:
             parser.error(
                 f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
@@ -217,11 +206,6 @@ def _read_pacbio_preflight_rows(
             biosample_accession=info.biosample_accession,
             primary_project_accession=info.primary_bioproject_accession,
             secondary_project_accessions=list(info.secondary_bioproject_accessions),
-            # project_name is always a real project here (the view resolves it,
-            # incl. a control's plate primary), so the default is unreachable —
-            # but keep it the privacy-SAFE direction (filter), matching the schema
-            # (project.human_filtering NOT NULL DEFAULT 1).
-            human_filtering=filtering_by_project.get(project_name, True),
             # sheet_type is a RUN-level property (a run is one protocol), read once
             # from the legacy format above and stamped on every row — there is no
             # per-sample sheet_type.
@@ -374,11 +358,10 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        instrument_model from args, since PacBio has no RunInfo.xml) and
        /sequencing-run/{run}/sequenced-pool (attaching the preflight blob). The
        blob is attached per the store-once design so a later read-mask submission
-       can re-read the protocol columns (human_filtering, twist_adaptor_id,
-       syndna_is_twisted) server-side and derive the mask chain, as
-       submit-host-filter-pool already does for the Illumina blob. No PacBio
-       server-side re-read parser exists yet: human_filtering is echoed in this
-       command's summary for operator reference only and is not forwarded onward.
+       can re-read the protocol columns (twist_adaptor_id, syndna_is_twisted)
+       server-side and derive the mask chain, as submit-host-filter-pool already
+       does for the Illumina blob. Host filtering is NOT among them: it resolves
+       from the sample's own host_taxon_id metadata, not from the blob.
     4. GET the pool roster and create only the MISSING sequenced-samples
        (`sequenced_pool_item_id = pacbio_sample_idx`, the sample's unique preflight
        id — the exact analogue of bcl-convert's illumina_sample_idx; the barcode is
@@ -452,7 +435,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                 "bam_path": str(bam_by_barcode[s.row.barcode]),
                 "biosample_idx": s.biosample_idx,
                 "primary_study_idx": s.primary_study_idx,
-                "human_filtering": s.row.human_filtering,
                 "prep_sample_idx": s.prep_sample_idx,
                 "sequenced_sample_idx": s.sequenced_sample_idx,
                 "reused": s.reused,

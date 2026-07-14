@@ -436,13 +436,6 @@ class SequencedSampleListItem(BaseModel):
     sample property: they parameterize the read mask and are supplied at
     human-filter submission, not carried here.
 
-    `human_filtering` is the sample's intake host-filter intent, derived at
-    request time from the pool's stored run-preflight blob (the single source
-    of truth — it is not a stored sample column) and keyed by
-    sequenced_pool_item_id. Only the pool-scoped list route populates it (the
-    pool-wide host-filter guard in `submit-host-filter-pool` reads it); the
-    run-scoped list leaves it None. It is also None when the pool has no
-    preflight populated or the blob carries no row for this item.
 
     `has_read_mask_ticket` is True when at least one `read-mask` work ticket
     (any state) already exists for the sample's prep_sample_idx. Both list
@@ -457,8 +450,9 @@ class SequencedSampleListItem(BaseModel):
     Only the pool-scoped list route populates it (it needs the run's platform,
     and the resolution is per-pool work); the run-scoped list leaves it None.
 
-    It sits alongside `human_filtering` deliberately; HostFilterResolution
-    explains why the two are both reported and when they disagree.
+    It replaces the intake `human_filtering` intent the roster used to carry: a
+    sample's host is a property of the SAMPLE, not of the project it was booked
+    under, so the decision now comes from its own metadata.
     """
 
     sequenced_sample_idx: int
@@ -469,7 +463,6 @@ class SequencedSampleListItem(BaseModel):
     ena_run_accession: str | None
     biosample_accession: str | None
     ena_sample_accession: str | None
-    human_filtering: bool | None = None
     host_filter: HostFilterResolution | None = None
     # PacBio protocol facts, None for an Illumina pool (or when the blob omits the
     # row). Derived at request time from the pool's stored run-preflight blob, the

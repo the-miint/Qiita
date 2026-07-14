@@ -1148,9 +1148,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Proceed even when some samples' intake human_filtering intent"
-            " disagrees with this submission's pool-wide host-reference choice."
-            " The mismatch is printed as a warning instead of aborting."
+            "Bypass per-sample host-filter resolution entirely and apply the given"
+            " --host-*-reference-idx pool-wide, blanks included (with none given,"
+            " disable host filtering pool-wide). The escape hatch for when a sample's"
+            " host_taxon_id metadata is wrong or absent and you know better."
         ),
     )
     p_submit_hf.add_argument(
@@ -1222,9 +1223,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Proceed even when some samples' intake human_filtering intent"
-            " disagrees with this submission's pool-wide host-reference choice"
-            " (printed as a warning instead of aborting)."
+            "Bypass per-sample host-filter resolution and apply the given"
+            " --host-*-reference-idx pool-wide (with none given, disable host"
+            " filtering pool-wide)."
         ),
     )
     p_submit_block.add_argument(
