@@ -95,6 +95,7 @@ from qiita_common.models.biosample import (
     TerminologyTermRef,
 )
 from qiita_common.models.health import HealthResponse, HealthStatus
+from qiita_common.models.host_filter_profile import HostFilterProfile
 from qiita_common.models.reference import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -267,6 +268,8 @@ __all__ = [
     # Health.
     "HealthResponse",
     "HealthStatus",
+    # Host filter.
+    "HostFilterProfile",
     # Reference.
     "FeatureHashEntry",
     "FieldDataType",
