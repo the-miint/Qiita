@@ -606,10 +606,13 @@ _None yet._
   test DB.
 
 - **The two host-filter stages are keyed on platform, not constrained by it (#293).**
-  *Which* stages an assay wants depends on how the sample was sequenced — but minimap2
-  aligns long reads perfectly well (`map-ont` / `map-pb`), so "our long-read profiles are
-  rype-only today" is a config choice, not a property of the tool, and is deliberately not
-  a CHECK.
+  Which stages a given (host, platform) wants is an assay decision, so the schema does not
+  freeze today's answer into a CHECK — revisiting it would then cost a migration. The
+  `rype` stage being required, and `minimap2` optional, describes the profiles we actually
+  run (illumina, pacbio_smrt); it is not a claim about what any aligner can or cannot do.
+  Whether rype is usable on a high-indel platform such as ONT is an open question — if it
+  is not, an ONT profile would need to be minimap2-only, which is the one case the current
+  `rype NOT NULL` would have to relax.
 
 - **`host_filter_resolver.resolve_host_filter` — resolves what host filtering one
   biosample should get (#293).** Given a biosample and a platform it returns FILTER (with

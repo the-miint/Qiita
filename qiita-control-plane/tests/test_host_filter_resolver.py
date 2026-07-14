@@ -93,10 +93,9 @@ async def ctx(postgres_pool):
     # Two profiles for the same host: one carrying both stages, one that stops
     # after rype. Between them they pin that the SECOND STAGE IS OPTIONAL and
     # that the resolver reports whichever the platform's profile declares. They
-    # do NOT pin any platform<->stage coupling — nothing stops a long-read
-    # profile from carrying a minimap2 stage, and that is deliberate (see the
-    # migration: which stages an assay wants is a config choice, not a tool
-    # constraint).
+    # do NOT pin any platform<->stage coupling — the schema deliberately leaves
+    # which stages a (host, platform) runs to config rather than a CHECK, so the
+    # resolver must report what the row says, not what the platform implies.
     async with pool.acquire() as conn:
         await insert_host_filter_profile(
             conn,

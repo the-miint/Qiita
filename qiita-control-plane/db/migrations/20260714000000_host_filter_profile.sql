@@ -29,13 +29,24 @@ CREATE TABLE qiita.host_filter_profile (
     -- Stage 1, required: the host DB carrying a rype .ryxdi index. A profile row
     -- MEANS "filter this host", so there is always something to filter against —
     -- which is why this is NOT NULL and carries no "requires" CHECK.
+    --
+    -- NOT NULL encodes "every profile we run today starts with rype", which is
+    -- true of the platforms we actually filter (illumina, pacbio_smrt). It is an
+    -- open question whether rype is usable on a high-indel platform such as ONT;
+    -- if it is not, an ONT profile would have to be minimap2-only, and THIS is
+    -- the constraint that would need relaxing (rype nullable, plus a CHECK that
+    -- at least one stage is present). Deliberately not pre-emptively relaxed —
+    -- no ONT profile exists to design against.
     rype_reference_idx     BIGINT NOT NULL REFERENCES qiita.reference(reference_idx) ON DELETE RESTRICT,
     -- Stage 2, optional: a minimap2 .mmi. NULL means this profile has no second
-    -- stage and stops after rype. Deliberately NOT constrained against platform:
-    -- minimap2 aligns long reads perfectly well (map-ont / map-pb), so "our
-    -- long-read profiles happen to be rype-only today" is an ASSAY choice about
-    -- which reads should be depleted, not a property of the tool. Encoding
-    -- today's choice as a CHECK would make revisiting it a migration.
+    -- stage and stops after rype.
+    --
+    -- Deliberately NOT constrained against platform. Which stages a given
+    -- (host, platform) wants is an ASSAY decision, and the schema should not
+    -- freeze today's answer: encoding the current pairing as a CHECK would make
+    -- revisiting it a migration. It is NOT a claim that any aligner does or does
+    -- not work on any read type — that is a question for the assay owner and for
+    -- measurement, not for this column comment.
     minimap2_reference_idx BIGINT REFERENCES qiita.reference(reference_idx) ON DELETE RESTRICT,
     created_by_idx         BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
