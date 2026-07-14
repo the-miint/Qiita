@@ -16,7 +16,8 @@
 #     builds its own def (DEF_FILE, relative to the workflow dir) into its own
 #     SIF, so one workflow can ship N single-tool images that rebuild
 #     independently. Invoke: `build-sif.sh <wf> <image>`. The entrypoints and
-#     shared _lib.sh stay at the workflow root and each def %files-copies just
+#     entrypoints stay at the workflow root; the shared _lib.sh lives under
+#     workflows/_shared/ (like manifest_writer.py) and each def %files-copies just
 #     the ones it needs; the whole workflow tree is staged so those relative
 #     paths still resolve. A multi spec declares HASH_INPUTS (its own build
 #     inputs) so the idempotency hash is scoped to that image alone (see below).
@@ -150,8 +151,8 @@ HASH_PATH="${SIF_PATH}.buildhash"
 # def/entrypoint/manifest changes it and so triggers a rebuild below, while a
 # re-vendored SOURCES (deliberately excluded) does not.
 #
-# A multi-image spec declares HASH_INPUTS (its own def + entrypoint(s) + any
-# shared helper it %files-copies, workflow-relative) so the hash is scoped to
+# A multi-image spec declares HASH_INPUTS (its own def + entrypoint(s), workflow-
+# relative; NOT _shared/, which every hash covers wholesale) so the hash is scoped to
 # THIS image — an edit to a sibling tool's def then leaves this image's stamp
 # unchanged and skips its rebuild. Without HASH_INPUTS (the legacy single-image
 # case) the whole workflow dir is hashed, exactly as before.

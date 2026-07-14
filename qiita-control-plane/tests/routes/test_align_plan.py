@@ -176,6 +176,8 @@ async def planned(ctx, monkeypatch):
             adapter_set_hash=None,
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
+            resolved_lima=None,
+            resolved_syndna=None,
         )
         async with db.acquire() as conn:
             mask = await mint_mask_definition(

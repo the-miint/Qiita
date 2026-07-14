@@ -4915,3 +4915,132 @@ async def test_runner_local_passthrough_threads_paths(
         "write-membership",
         "register-files",
     ]
+
+
+# --- deliberate output shadowing (read-mask: lima_mask self-shadows partial_mask) ---
+#
+# The read-mask chain threads a `partial_mask` binding through syndna -> lima -> qc.
+# `lima_mask` (when lima_enabled) both CONSUMES `partial_mask` (syndna's) and
+# PRODUCES it, so its output overwrites the incoming binding (bound.update is
+# last-writer-wins) and qc reads whichever ran latest; when lima is skipped,
+# syndna's binding stands. This self-shadow is safe because _bind_step_inputs reads
+# `bound` BEFORE bound.update(outputs).
+#
+# The shape below exercises that mechanism generically, without read-mask's reads /
+# adapters / rype machinery: `first` always runs, `second` is `when:`-gated and both
+# reads and overwrites the binding, `consumer` reads whichever value stands. A
+# regression in the read/update ordering would otherwise miscount silently.
+
+_SHADOW_STEPS = [
+    {
+        "kind": "step",
+        "name": "first",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_rype_index",
+        "inputs": [],
+        "outputs": ["shared_out"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "second",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_minimap2_index",
+        # Reads the binding it also writes — the self-shadow lima_mask relies on.
+        "inputs": ["shared_out"],
+        "when": "second_enabled",
+        "outputs": ["shared_out"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "consumer",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_rype_index",
+        "inputs": ["shared_out"],
+        "outputs": [],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def _make_shadow_ticket(pool, reference_idx, action_context: dict) -> tuple[int, str]:
+    version = f"shadow-{uuid.uuid4()}"
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling,"
+        "  success_status, failure_status"
+        ") VALUES ('host-reference-add', $1, 'reference', $2::text[], $3::jsonb,"
+        "  '{}'::jsonb, $4::jsonb, 4, 32, '1 hour', NULL, 'failed')",
+        version,
+        ["reference:write"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps(_SHADOW_STEPS),
+    )
+    wt_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ('host-reference-add', $1, 1, 'reference', $2, $3::jsonb)"
+        " RETURNING work_ticket_idx",
+        version,
+        reference_idx,
+        json.dumps(action_context),
+    )
+    return wt_idx, version
+
+
+async def _run_shadow(postgres_pool, reference_idx, tmp_path, *, second_enabled: bool):
+    backend = FakeBackendClient()
+    first_out = tmp_path / "first" / "out.parquet"
+    second_out = tmp_path / "second" / "out.parquet"
+    for p in (first_out, second_out):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    backend.outputs_for["first"] = {"shared_out": first_out}
+    backend.outputs_for["second"] = {"shared_out": second_out}
+
+    wt_idx, version = await _make_shadow_ticket(
+        postgres_pool, reference_idx, {"second_enabled": second_enabled}
+    )
+    try:
+        await _run(wt_idx, postgres_pool, backend, tmp_path)
+        by_name = {name: inputs for name, inputs, *_ in backend.calls}
+        return [name for name, *_ in backend.calls], by_name, first_out, second_out
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = 'host-reference-add' AND version = $1",
+            version,
+        )
+
+
+async def test_gated_step_shadows_the_earlier_steps_output_binding(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Gate ON: the consumer sees the SECOND step's output, not the first's. This
+    is what makes register-files persist syndna's extended mask rather than
+    host_filter's pre-syndna one."""
+    calls, by_name, first_out, second_out = await _run_shadow(
+        postgres_pool, reference_idx, tmp_path, second_enabled=True
+    )
+    assert calls == ["first", "second", "consumer"]
+    # The self-shadow: `second` reads the binding it also writes, and reads the
+    # value bound BEFORE its own outputs land.
+    assert by_name["second"]["shared_out"] == first_out
+    assert by_name["consumer"]["shared_out"] == second_out
+
+
+async def test_skipped_gated_step_leaves_the_earlier_binding_standing(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Gate OFF: the consumer sees the FIRST step's output. Distinct output names
+    would break exactly this case — the consumer takes one input binding."""
+    calls, by_name, first_out, _second_out = await _run_shadow(
+        postgres_pool, reference_idx, tmp_path, second_enabled=False
+    )
+    assert calls == ["first", "consumer"]
+    assert by_name["consumer"]["shared_out"] == first_out

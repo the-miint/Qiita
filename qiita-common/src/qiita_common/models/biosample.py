@@ -417,6 +417,16 @@ class SequencedSampleListItem(BaseModel):
     biosample_accession: str | None
     ena_sample_accession: str | None
     human_filtering: bool | None = None
+    # PacBio protocol facts, None for an Illumina pool (or when the blob omits the
+    # row). Derived at request time from the pool's stored run-preflight blob, the
+    # same single-source-of-truth path `human_filtering` uses — none of these is a
+    # stored sequenced_sample column. The read-mask submit derives its per-sample
+    # gates from them:
+    #     syndna_enabled = sheet_type == 'pacbio_absquant'
+    #     lima_enabled   = twist_adaptor_id filled AND NOT syndna_is_twisted
+    sheet_type: str | None = None
+    twist_adaptor_id: str | None = None
+    syndna_is_twisted: bool | None = None
     has_read_mask_ticket: bool = False
 
 

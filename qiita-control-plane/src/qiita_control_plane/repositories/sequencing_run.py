@@ -398,6 +398,8 @@ async def fetch_sequenced_pool_read_metrics(
         "   AS biological_read_count_r1r2,"
         " SUM(ss.quality_filtered_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
         "   AS quality_filtered_read_count_r1r2,"
+        " SUM(ss.spikein_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+        "   AS spikein_read_count_r1r2,"
         " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE) AS sample_count,"
         " count(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)"
         "   AS samples_with_metrics"

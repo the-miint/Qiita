@@ -1128,6 +1128,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_hf.add_argument(
+        "--syndna-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "ACTIVE reference_idx whose minimap2 (.mmi) index identifies SynDNA"
+            " spike-ins. REQUIRED for a PacBio absquant pool (sheet_type"
+            " pacbio_absquant); rejected otherwise. Build it with --no-rype-index"
+            " --minimap2-preset map-hifi (the spike-in inserts are the subject"
+            " sequences; a read aligning to one is a spike-in)."
+        ),
+    )
+    p_submit_hf.add_argument(
         "--force",
         action="store_true",
         help=(

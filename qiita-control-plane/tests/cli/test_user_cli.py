@@ -3239,6 +3239,60 @@ def _run_submit_host_filter_pool(
     return main(argv)
 
 
+def test_submit_host_filter_pool_pacbio_run_with_no_protocol_facts_aborts(monkeypatch, capsys):
+    """REGRESSION. A PacBio run whose roster carries no `sheet_type` means the server
+    could not parse the pool's stored pre-flight — NOT that the pool is Illumina.
+
+    Without this guard the submit infers "not PacBio" from the ABSENCE of sheet_type,
+    takes the Illumina branch, and writes `lima_enabled: false, syndna_enabled: false`
+    onto every ticket: a case-5 pool masked with no lima and no syndna, whose spike-in
+    count is then structurally zero. It is caught today only incidentally (the same bad
+    blob nulls human_filtering), and that backstop is --force-bypassable and disappears
+    when human_filtering moves to sample metadata. So this keys on the run's `platform`,
+    and NO ticket may be posted."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            # roster: samples carry human_filtering but NO sheet_type (blob unparseable)
+            (200, _pool_samples_body([(100, 1000, "1", False), (101, 1001, "2", False)])),
+            (200, run_body),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_submit_host_filter_pool(run=3, pool=5)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "is PacBio" in err
+    assert "could not be parsed" in err
+    # and nothing was submitted
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_pacbio_no_facts_not_bypassable_by_force(monkeypatch, capsys):
+    """--force turns host filtering off deliberately; it must NOT also let a PacBio pool
+    be masked with lima and syndna silently off."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "1", False)])),
+            (200, run_body),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_submit_host_filter_pool(run=3, pool=5, force=True)
+    assert exc.value.code == 1
+    assert "--force does not bypass this" in capsys.readouterr().err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
 def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, capsys):
     """Two samples, host-filtered against the submission's rype reference 7 →
     two read-mask/1.0.0 POSTs, each with host_filter_enabled against that
@@ -4432,3 +4486,178 @@ def test_reference_list_index_type_no_match_returns_empty(monkeypatch, capsys):
     )
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == []
+
+
+# --- PacBio read-mask gate derivation ----------------------------------------
+#
+# The roster carries the raw pre-flight facts; the POLICY that turns them into
+# `when:` gates lives in the submit. `when:` is DEFAULT-ON, so both keys must be
+# written on EVERY ticket — an Illumina ticket that merely omitted lima_enabled
+# would run the long-read lima chain.
+
+
+def _sample(**kw):
+    base = {"sequenced_pool_item_id": "bc01", "prep_sample_idx": 1, "human_filtering": False}
+    base.update(kw)
+    return base
+
+
+def test_pacbio_gates_none_for_an_illumina_roster():
+    """An Illumina roster carries no sheet_type; the submit must not invent one."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    assert _pacbio_gates(_sample()) is None
+
+
+def test_pacbio_gates_case5_signature():
+    """absquant + twist filled + syndna_is_twisted False -> both gates on."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=False)
+    )
+    assert g == {"syndna_enabled": True, "lima_enabled": True}
+
+
+def test_pacbio_gates_absquant_without_twist_is_syndna_only():
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id=None, syndna_is_twisted=None)
+    )
+    assert g == {"syndna_enabled": True, "lima_enabled": False}
+
+
+def test_pacbio_gates_twisted_syndna_disables_lima():
+    """syndna_is_twisted True means the spike-in already carries the adaptor, so
+    lima must NOT run even though twist_adaptor_id is filled."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=True)
+    )
+    assert g["lima_enabled"] is False
+
+
+def test_pacbio_gates_null_syndna_is_twisted_does_not_enable_lima():
+    """NULL means the pre-flight never answered — not the same as 'no'. `not None`
+    would be True and would silently enable lima."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=None)
+    )
+    assert g["lima_enabled"] is False
+
+
+def test_pacbio_gates_non_absquant_sheet_has_no_syndna():
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_metag", twist_adaptor_id="T1", syndna_is_twisted=False)
+    )
+    assert g == {"syndna_enabled": False, "lima_enabled": True}
+
+
+def _case5(**kw):
+    return _sample(
+        sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=False, **kw
+    )
+
+
+def test_pacbio_submission_requires_syndna_reference(capsys):
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_case5()],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=None,
+            force=False,
+        )
+    assert exc.value.code == 1
+    assert "--syndna-reference-idx is required" in capsys.readouterr().err
+
+
+def test_pacbio_submission_rejects_minimap2(capsys):
+    """Long-read host filtering is rype-only."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_case5()],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=3,
+            host_minimap2_reference_idx=4,
+            syndna_reference_idx=7,
+            force=False,
+        )
+    assert exc.value.code == 1
+    assert "rype-only" in capsys.readouterr().err
+
+
+def test_pacbio_submission_requires_host_ref_when_any_sample_wants_filtering(capsys):
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_case5(human_filtering=False), _case5(human_filtering=True)],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=7,
+            force=False,
+        )
+    assert exc.value.code == 1
+    assert "no --host-rype-reference-idx was given" in capsys.readouterr().err
+
+
+def test_pacbio_submission_allows_a_mixed_host_filter_pool(capsys):
+    """PacBio host filtering is PER SAMPLE: a pool may legitimately mix filtered
+    and unfiltered samples. This is what the Illumina pool-uniform guard forbids."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    _assert_pacbio_submission_coherent(
+        [_case5(human_filtering=True), _case5(human_filtering=False)],
+        sequenced_pool_idx=1,
+        host_rype_reference_idx=3,
+        host_minimap2_reference_idx=None,
+        syndna_reference_idx=7,
+        force=False,
+    )
+
+
+def test_pacbio_submission_aborts_on_a_null_intent(capsys):
+    """The pre-flight could not answer; guessing would leak human reads or silently
+    drop a filter the operator asked for."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_case5(human_filtering=None)],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=3,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=7,
+            force=False,
+        )
+    assert exc.value.code == 1
+    assert "have no intake human_filtering intent" in capsys.readouterr().err
+
+
+def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_sample(sheet_type="pacbio_metag", twist_adaptor_id=None, syndna_is_twisted=None)],
+            sequenced_pool_idx=1,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+            syndna_reference_idx=7,
+            force=False,
+        )
+    assert exc.value.code == 1
+    assert "no sample in this pool carries SynDNA" in capsys.readouterr().err

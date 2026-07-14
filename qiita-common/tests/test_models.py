@@ -685,6 +685,7 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
         raw_read_count_r1r2=1000,
         biological_read_count_r1r2=200,
         quality_filtered_read_count_r1r2=100,
+        spikein_read_count_r1r2=50,
         sample_count=2,
         samples_with_metrics=2,
     )
@@ -694,6 +695,7 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
         raw_read_count_r1r2=None,
         biological_read_count_r1r2=None,
         quality_filtered_read_count_r1r2=None,
+        spikein_read_count_r1r2=None,
         sample_count=3,
         samples_with_metrics=0,
     )
@@ -810,3 +812,57 @@ def test_pool_completion_status_fully_processed_flag():
     mask_partial = _status(demux_state="completed", samples_completed=2)
     assert mask_partial.complete is False
     assert mask_partial.fully_processed is False
+
+
+# --- read-mask count buckets --------------------------------------------------
+
+
+def test_read_mask_buckets_classify_every_reason():
+    """The bucket map is a WHITELIST. The predicate it replaced
+    (`reason NOT LIKE 'qc_%'`) was fail-OPEN, so every reason added since would
+    have been silently counted as biological — which is exactly how
+    `spikein_syndna` and `twist_no_adaptor` would have inflated it.
+
+    A new ReadMaskReason must be placed in a bucket ON PURPOSE. This test is what
+    forces that."""
+    from qiita_common.models import READ_MASK_BUCKET, ReadMaskReason
+
+    unclassified = set(ReadMaskReason) - set(READ_MASK_BUCKET)
+    assert not unclassified, (
+        f"unclassified ReadMaskReason(s): {sorted(r.value for r in unclassified)} — "
+        "add each to READ_MASK_BUCKET (biological / spikein / raw_only)"
+    )
+
+
+def test_read_mask_bucket_membership():
+    """Pin the semantics, not just the coverage: a host read is still biological
+    (we deplete it, but it came from the sample); a spike-in was added in the lab;
+    a read with no Twist adaptor is artifactual, so it counts toward raw only."""
+    from qiita_common.models import READ_MASK_BUCKET, ReadMaskBucket, ReadMaskReason
+
+    def in_bucket(bucket):
+        return {r.value for r, b in READ_MASK_BUCKET.items() if b is bucket}
+
+    assert in_bucket(ReadMaskBucket.BIOLOGICAL) == {"pass", "host_rype", "host_minimap2"}
+    assert in_bucket(ReadMaskBucket.SPIKEIN) == {"spikein_syndna"}
+    assert in_bucket(ReadMaskBucket.RAW_ONLY) == {
+        "qc_too_short",
+        "qc_too_long",
+        "qc_low_quality",
+        "qc_too_many_n",
+        "twist_no_adaptor",
+    }
+    # biological and spikein are disjoint — the sequenced_sample monotonic CHECK
+    # (`biological + spikein <= raw`) depends on it.
+    assert not in_bucket(ReadMaskBucket.BIOLOGICAL) & in_bucket(ReadMaskBucket.SPIKEIN)
+    # quality_filtered is the `pass` SUBSET of biological, not a bucket.
+    assert ReadMaskReason.PASS.value in in_bucket(ReadMaskBucket.BIOLOGICAL)
+
+
+def test_read_mask_reason_sql_list_is_sorted_and_quoted():
+    from qiita_common.models import ReadMaskBucket, read_mask_reason_sql_list
+
+    assert read_mask_reason_sql_list(ReadMaskBucket.BIOLOGICAL) == (
+        "'host_minimap2', 'host_rype', 'pass'"
+    )
+    assert read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN) == "'spikein_syndna'"

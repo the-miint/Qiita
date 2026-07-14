@@ -39,12 +39,32 @@ class ReadMaskReason(StrEnum):
     `pass` survives the mask (its recorded trims are applied by the `read_masked`
     view); every other value excludes the read from `read_masked`. The `qc_*`
     values come from the `qc` step's `filter_read` fail reasons; the `host_*`
-    values come from the `host_filter` step's rype / minimap2 hits.
+    values come from the `host_filter` step's rype / minimap2 hits;
+    `twist_no_adaptor` comes from the long-read `lima` adapter chain.
 
     Reason precedence (privacy-critical): a read that both fails QC and hits the
     host filter records the `host_*` hit, so a host/human read can never leak
     through a code path that only inspects `qc_*`. Host classification runs only
-    on the QC-pass subset, so `host_*` only ever overrides `pass`.
+    on the QC-pass subset, so `host_*` only ever overrides `pass`. Each step in
+    the chain classifies only rows still `pass` and falls through to the incoming
+    reason, so an earlier verdict is never overwritten by a later step.
+
+    `twist_no_adaptor` marks a HiFi read in which lima found no Twist adaptor. Such
+    a read is not a library molecule from this run — it is artifactual, not a real
+    read whose adapter ligation merely failed. It therefore counts toward `raw`
+    only, and is excluded from the biological bucket along with the `qc_*` values.
+
+    `spikein_syndna` marks a SynDNA spike-in: added in the lab, so not a molecule
+    from the sample. It is excluded from `biological` and carries its OWN count
+    bucket — so the read accounting balances, since a spike-in read leaves
+    `biological` and must be accounted somewhere. Its rows are RETAINED in
+    `read_mask`, so a later per-insert quantification can re-derive exactly those
+    reads without a re-ingest. (That quantification is COVERAGE DEPTH, not this
+    count — see the SynDNA cell-count issue.)
+
+    Note the biological predicate is a WHITELIST (`pass` + `host_*`), not
+    `NOT LIKE 'qc_%'`: a new reason must be classified explicitly, never bucketed
+    as biological by default.
 
     Backs a DuckLake VARCHAR column, NOT a Postgres `CREATE TYPE ... AS ENUM`.
     Per the enum-parity carve-out in CLAUDE.md (a StrEnum backed by a
@@ -59,6 +79,61 @@ class ReadMaskReason(StrEnum):
     QC_TOO_MANY_N = "qc_too_many_n"
     HOST_RYPE = "host_rype"
     HOST_MINIMAP2 = "host_minimap2"
+    TWIST_NO_ADAPTOR = "twist_no_adaptor"
+    SPIKEIN_SYNDNA = "spikein_syndna"
+
+
+class ReadMaskBucket(StrEnum):
+    """Which `sequenced_sample` read-count column a `ReadMaskReason` contributes to.
+
+    Every reason counts toward `raw` (it is a row in the mask). Beyond that:
+
+    * `BIOLOGICAL` — a molecule from the sample that survived the technical
+      filters. `pass` plus the `host_*` hits: a human read is still a biological
+      read, just one we deplete. `quality_filtered` is the `pass` SUBSET of this
+      bucket, not a bucket of its own.
+    * `SPIKEIN` — added in the lab. Disjoint from BIOLOGICAL, with its own column,
+      so the accounting balances: a spike-in read leaves BIOLOGICAL and has to be
+      counted somewhere. (This is a MASKING metric. The cell-count model consumes
+      per-insert COVERAGE DEPTH, not this read count.)
+    * `RAW_ONLY` — counted nowhere else. QC failures, and `twist_no_adaptor`
+      (a read with no Twist adaptor is artifactual, not a library molecule).
+
+    This map is a WHITELIST, deliberately. The predicate it replaced was
+    `reason NOT LIKE 'qc_%'` — fail-OPEN, so every reason added since would have
+    been silently counted as biological. `test_read_mask_buckets` fails on any
+    unclassified reason, so a new one must be placed here on purpose.
+    """
+
+    BIOLOGICAL = "biological"
+    SPIKEIN = "spikein"
+    RAW_ONLY = "raw_only"
+
+
+READ_MASK_BUCKET: dict[ReadMaskReason, ReadMaskBucket] = {
+    ReadMaskReason.PASS: ReadMaskBucket.BIOLOGICAL,
+    ReadMaskReason.HOST_RYPE: ReadMaskBucket.BIOLOGICAL,
+    ReadMaskReason.HOST_MINIMAP2: ReadMaskBucket.BIOLOGICAL,
+    ReadMaskReason.SPIKEIN_SYNDNA: ReadMaskBucket.SPIKEIN,
+    ReadMaskReason.QC_TOO_SHORT: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.QC_TOO_LONG: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.QC_LOW_QUALITY: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.QC_TOO_MANY_N: ReadMaskBucket.RAW_ONLY,
+    ReadMaskReason.TWIST_NO_ADAPTOR: ReadMaskBucket.RAW_ONLY,
+}
+
+
+def read_mask_reason_sql_list(bucket: ReadMaskBucket) -> str:
+    """A SQL `IN (...)` list of the reasons in `bucket`, sorted for determinism.
+
+    The single source of truth for the count predicates in
+    `qiita_control_plane.actions.library._read_mask_counts`. The data plane's
+    `mask_metrics_counts` (Rust) MUST emit the same lists — it cannot import this,
+    so the two are kept in lockstep by `test_rust_reason_lists_match_the_python_bucket_map`
+    (NOT the block e2e test, whose fixture emits no `spikein_syndna` rows), which asserts
+    both paths produce identical counts."""
+    reasons = sorted(r.value for r, b in READ_MASK_BUCKET.items() if b is bucket)
+    return ", ".join(f"'{r}'" for r in reasons)
 
 
 class GenomeSource(StrEnum):

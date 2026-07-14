@@ -172,36 +172,13 @@ def test_validate_protocol_allows_untwisted_without_adapter():
 # ---------------------------------------------------------------------------
 
 
-def _build_case5_preflight(tmp_path: Path, *, populate_accessions: bool) -> Path:
-    """Build a real kl-run-preflight SQLite from the pinned case-5 fixture.
-
-    Uses run_preflight's own CSV loader so the seam is exercised against the true
-    schema and the real `get_pacbio_sample_info` reader. The fixture leaves the
-    biosample + project **bioproject** accessions NULL (populated upstream in
-    production); `get_pacbio_sample_info` REQUIRES both and raises otherwise, so
-    when `populate_accessions` we set them via plain sqlite (run_preflight's
-    save_db_file is avoided — it blocks in this harness). biosample -> BIO_<name>;
-    the single project's bioproject -> PRJNA<external_project_id>."""
-    from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
-
-    db = tmp_path / "case5.db"
-    migrate_legacy_csv_to_db_file(str(_CASE5_CSV), str(db))
-    if populate_accessions:
-        conn = sqlite3.connect(db)
-        conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
-        conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
-        conn.commit()
-        conn.close()
-    return db
-
-
-def test_read_preflight_rows_case5(tmp_path):
+def test_read_preflight_rows_case5(build_case5_preflight):
     """The seam returns one row per sample for the real case-5 sheet, including
     the control blank (sample.3, which the reader resolves to the plate primary
     bioproject). twist filled + syndna_is_twisted False is the case-5 signature.
     The project accession is the ENA **bioproject** (what the study lookup keys
     on), and smrt_cell rides through from the reader when the preflight records it."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     conn = sqlite3.connect(db)
     # Record a SMRT cell on sample.1 only, to prove it threads onto the row.
     conn.execute(
@@ -230,12 +207,12 @@ def test_read_preflight_rows_case5(tmp_path):
         assert r.syndna_is_twisted is False
 
 
-def test_read_preflight_rows_accepts_barcode_shared_across_samples(tmp_path):
+def test_read_preflight_rows_accepts_barcode_shared_across_samples(build_case5_preflight):
     """The reader does NOT reject a barcode shared by two samples at parse —
     pacbio_sample_idx is the identity now, so the reader returns both rows. The
     ambiguity is a BAM-resolution concern (see the _resolve_sample_bams tests), so
     the guard genuinely MOVED rather than vanished."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     conn = sqlite3.connect(db)
     conn.execute("UPDATE pacbio_sample SET barcode_id = 'bc3011' WHERE barcode_id = 'bc0112'")
     conn.commit()
@@ -245,10 +222,10 @@ def test_read_preflight_rows_accepts_barcode_shared_across_samples(tmp_path):
     assert [r.barcode for r in rows].count("bc3011") == 2  # the shared barcode
 
 
-def test_read_preflight_rows_fails_on_missing_accession(tmp_path):
+def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
     """Unpopulated biosample / bioproject accessions are an operator-actionable
     fail-fast: `get_pacbio_sample_info` raises and the CLI surfaces its message."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=False)
+    db = build_case5_preflight(populate_accessions=False)
     with pytest.raises(_RaisingParser.Error, match="missing required accession"):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
@@ -343,8 +320,8 @@ def _submit_args(run, db, *, force=False):
     return args
 
 
-def test_submit_pacbio_ingest_fans_out_bam_to_parquet(monkeypatch, tmp_path):
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+def test_submit_pacbio_ingest_fans_out_bam_to_parquet(monkeypatch, tmp_path, build_case5_preflight):
+    db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
@@ -409,10 +386,12 @@ def test_submit_pacbio_ingest_fans_out_bam_to_parquet(monkeypatch, tmp_path):
     assert sorted(r["json"]["sequenced_pool_item_id"] for r in sample_posts) == ["1", "2", "3"]
 
 
-def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(monkeypatch, tmp_path):
+def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(
+    monkeypatch, tmp_path, build_case5_preflight
+):
     """A barcode reused across SMRT cells fails fast (exit 2) with NO network
     call — resolution happens before the flow's _run."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     run = tmp_path / "run"
     _make_bam(run, "1_A01", "m84_s1", "bc3011")
     _make_bam(run, "1_B01", "m84_s2", "bc3011")  # collide the first sample's barcode
@@ -442,10 +421,12 @@ def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(monkeypatc
     assert captured["requests"] == []  # aborted before any HTTP
 
 
-def test_submit_pacbio_ingest_missing_bam_aborts_before_network(monkeypatch, tmp_path):
+def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
+    monkeypatch, tmp_path, build_case5_preflight
+):
     """A sample whose barcode has no BAM fails fast (exit 2) before any HTTP,
     like the ambiguous case — no half-populated pool."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     run = tmp_path / "run"
     _make_bam(run, "1_A01", "m84_s1", "bc3011")
     _make_bam(run, "1_A01", "m84_s1", "bc0112")
@@ -459,10 +440,12 @@ def test_submit_pacbio_ingest_missing_bam_aborts_before_network(monkeypatch, tmp
     assert captured["requests"] == []
 
 
-def test_submit_pacbio_ingest_resilient_to_ticket_failure(monkeypatch, tmp_path):
+def test_submit_pacbio_ingest_resilient_to_ticket_failure(
+    monkeypatch, tmp_path, build_case5_preflight
+):
     """One bam-to-parquet ticket 500ing does NOT strand the others: the remaining
     tickets still POST, the summary records the failure, and the command exits 1."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
@@ -486,8 +469,10 @@ def test_submit_pacbio_ingest_resilient_to_ticket_failure(monkeypatch, tmp_path)
     assert len(ticket_posts) == 3
 
 
-def test_submit_pacbio_ingest_force_reaches_ticket_body(monkeypatch, tmp_path):
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+def test_submit_pacbio_ingest_force_reaches_ticket_body(
+    monkeypatch, tmp_path, build_case5_preflight
+):
+    db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
@@ -504,11 +489,13 @@ def test_submit_pacbio_ingest_force_reaches_ticket_body(monkeypatch, tmp_path):
     assert ticket_posts and all(r["json"]["force"] is True for r in ticket_posts)
 
 
-def test_submit_pacbio_ingest_retry_reuses_existing_roster(monkeypatch, tmp_path):
+def test_submit_pacbio_ingest_retry_reuses_existing_roster(
+    monkeypatch, tmp_path, build_case5_preflight
+):
     """A re-run against a pool that already has the samples creates NONE of them
     (create-missing), reuses their prep_sample_idx, and still fans out the tickets
     — the convergent-retry contract."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
@@ -546,11 +533,13 @@ def test_submit_pacbio_ingest_retry_reuses_existing_roster(monkeypatch, tmp_path
     ]
 
 
-def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(monkeypatch, tmp_path):
+def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(
+    monkeypatch, tmp_path, build_case5_preflight
+):
     """A re-run cannot silently change an existing sample's identity: if the roster
     row's biosample_idx differs from what this submission resolves, fail loud
     (exit 1) instead of reusing it and pretending the correction landed."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
@@ -566,12 +555,14 @@ def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(monkeypatch
     assert ei.value.code == 1
 
 
-def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(monkeypatch, tmp_path):
+def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
+    monkeypatch, tmp_path, build_case5_preflight
+):
     """A real re-submit: the samples exist AND their ingest tickets already
     COMPLETED (or are in-flight), so the work-ticket POSTs 409. Those are the
     convergence signal, not failures — the command records them as skipped and
     exits 0 (the operator must be able to tell already-done from a real failure)."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
         _make_bam(run, "1_A01", "m84_s1", bc)
@@ -592,9 +583,9 @@ def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(monkeypatch, tmp_pa
     assert rc == 0  # all-already-done converges to success, not a failure exit
 
 
-def test_read_preflight_rows_rejects_non_pacbio_sheet(tmp_path):
+def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):
     """A preflight whose sheet_type is not a PacBio sheet fails loud."""
-    db = _build_case5_preflight(tmp_path, populate_accessions=True)
+    db = build_case5_preflight()
     conn = sqlite3.connect(db)
     # Retarget only THIS run's format row (updating all rows collides on the
     # (legacy_sheet_type, legacy_version) unique constraint).

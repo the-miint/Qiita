@@ -36,7 +36,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 3. Migrations
 
-- Reference-sharding + sharded-alignment schema (nine additive migrations, plain `make migrate`, no out-of-band backfill): (#268)
+Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-band setup — plain `ALTER TABLE`s / additive migrations.
+
+- Reference-sharding + sharded-alignment schema (nine additive migrations, no out-of-band backfill): (#268)
   - `20260706000000_genome_source_and_origin_sample.sql` — genome source + origin-sample columns.
   - `20260707010000_reference_index_shard_id.sql` — `reference_index.shard_id` (per-shard index rows).
   - `20260708000000_reference_membership_shard_id.sql` — `reference_membership.shard_id` (the shard cover-map).
@@ -46,6 +48,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   - `20260712000000_alignment_definition.sql` — `alignment_definition` (params-hash align identity).
   - `20260712010000_alignment_sample.sql` — the per-`(alignment_idx, prep_sample)` completion gate.
   - `20260712020000_work_ticket_alignment_idx.sql` — `work_ticket.alignment_idx` arm (ON DELETE SET NULL, no backfill).
+- `20260713010000_sequenced_sample_spikein_read_count.sql` — adds `sequenced_sample.spikein_read_count_r1r2` (a spike-in is added in the lab, so it is disjoint from `biological`). (#270)
 
 ### 4. Deploy
 
@@ -63,6 +66,14 @@ _None yet._
   psql "$DATABASE_URL" -tAc "SELECT sa.name, t.scopes FROM qiita.service_account sa JOIN qiita.api_token t ON t.principal_idx = sa.principal_idx WHERE t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now()) ORDER BY sa.name"
   # expect the compute account's active token scopes to include ticket:doget (and sequence_range:mint)
   ```
+- `read-mask` **1.0.0** is present in the `qiita.action` list printed by `make verify-deploy` — the workflow YAML is edited in place (new `syndna` + lima steps) and re-synced by `qiita-admin actions sync` inside `activate.sh`, not migrated. (#270)
+- The new `lima` image built and carries the pinned version (the read-mask identity hash pins `lima 2.13.0`, so a drifted binary would silently change where the adapter clip lands):
+  ```bash
+  cd /tmp && sudo -u qiita-orch apptainer exec --no-home \
+      "${PATH_DERIVED}/images/lima-2.13.0.sif" micromamba run -n lima lima --version
+  # expect: lima 2.13.0
+  ```
+  (#270)
 
 ### 6. After the deploy verifies green
 
@@ -81,6 +92,10 @@ verification passes, the OLD build's config is the rollback path.
 - **Reference sharding + sharded alignment are opt-in and inert until an operator runs them.** Sharded indexing is enabled per reference by a `shard_index` context flag on `reference-add` / `local-reference-add` (absent ⇒ byte-identical to today's whole-reference `loading → active`, no build); the alignment consumer (`align/1.0.0`, `POST …/sequenced-pool/{P}/align-plan`, `DELETE /alignment-definition/{idx}`) needs a sharded, ACTIVE reference plus completed masks to do anything. Existing reference and read-mask flows are unchanged. (#268)
 - **The DuckLake `alignment` table is created automatically at data-plane startup** by `ensure_alignment_tables` (idempotent, runs every DP boot) — **no data-plane action**. It is a sink (not in `ALLOWED_TABLES`); there is no Flight read-side yet. (#268)
 - **New scope `alignment_definition:delete` is granted automatically to `system_admin`** via `ROLE_IMPLIED_SCOPES` (the disallow-without-delete escape hatch for alignments) — no host action, never granted to service accounts. (#268)
+- **EVERY container SIF rebuilds on this deploy — budget for it in bucket 4.** Not just the new `read-mask` `lima` image: `_lib.sh` moved to `workflows/_shared/`, and the build-inputs hash covers each file's repo-relative PATH as well as its bytes (`deploy/_common.sh`), so the move re-hashes every image that stages it — the four `long-read-assembly` images — and `bcl-convert` too, whose whole-dir hash includes `_shared/`. All are auto-rebuilt by `activate.sh` → `build-sifs.sh` before any service restart; nothing to do by hand, but `bcl-convert` in particular is a slow image. A failed build aborts the deploy before the restart (by design). (#270)
+- The new `read-mask` **`lima` image needs nothing staged**: lima comes from bioconda in `%post` and the Twist adapter FASTA is in-repo, so its spec declares no `SOURCES`. (#270)
+- **A SynDNA spike-in reference needs a minimap2 (`.mmi`) index**, not a rype one, before the first PacBio absquant read-mask submission — `qiita submit-host-filter-pool --syndna-reference-idx` refuses a reference without one. Load it with `qiita reference load --host --no-rype-index --minimap2-preset map-hifi` (the spike-in inserts are the subject sequences). No action if no absquant pool is being masked yet. (#270)
+- The pool `sequenced-sample` roster gains three PacBio fields (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the pool's stored pre-flight blob. Additive, and `null` for an Illumina pool — no client is required to read them. (#270)
 
 ---
 

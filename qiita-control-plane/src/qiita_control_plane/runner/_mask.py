@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,12 @@ MASK_IDX_BINDING = "mask_idx"
 # `params:` so every emitted row is keyed by it. None for non-align tickets.
 ALIGNMENT_IDX_BINDING = "alignment_idx"
 
+# Binding for the CP-resolved lima argument string. The `lima_export` step lists
+# it in its `params:` and writes it into `lima_config.json`, which the container
+# reads — a scalar cannot ride a container step's `inputs` (they are bind-mount
+# paths).
+LIMA_ARGS_BINDING = "lima_args"
+
 # Resolved QC config the mask hash covers — the effective fastp-equivalent
 # filter the qc job applies. Mirrors the constants in
 # qiita_compute_orchestrator.jobs.qc (the fastp `-l 100` defaults); kept here
@@ -44,6 +51,56 @@ ALIGNMENT_IDX_BINDING = "alignment_idx"
 # faithful to the filter actually applied.
 _QC_RESOLVED_MIN_LENGTH = 100
 _QC_RESOLVED_FILTER_TAIL = "0, 15, 40, 5, 0"
+
+# Canonical lima argument string per preset. The CLIENT chooses only the preset
+# (`lima_preset` in action_context); the control plane resolves the arguments.
+# A client-supplied arg string would let a caller forge mask identity (collide
+# with any existing mask by naming its args) and pass arbitrary flags into a
+# container. Adding a preset here is purely additive — existing masks hash
+# unchanged.
+#
+# `--neighbors` is why the adapter FASTA's record ORDER is load-bearing: it keeps
+# only barcode pairs that are adjacent records in the file. It is NOT implied by
+# `--hifi-preset ASYMMETRIC` (lima scores barcodes all-vs-all).
+_LIMA_PRESET_ARGS = {
+    "ASYMMETRIC": "--hifi-preset ASYMMETRIC --neighbors --peek-guess",
+    "SYMMETRIC": "--hifi-preset SYMMETRIC --peek-guess",
+}
+
+# lima version vendored into the container image. It belongs in the mask identity
+# for the same reason `filter_version` does: lima decides where the adapter clip
+# lands, so a version bump changes the effective filter and MUST re-mint rather
+# than silently reuse a mask built by a different binary. The CI guard ties this
+# to `sif-build.env`'s VERIFY_MATCH, so the constant and the installed binary
+# cannot drift. Floor is the version qp-pacbio validated against.
+_LIMA_VERSION = "2.13.0"
+
+# MD5 of the Twist adapter FASTA vendored INTO the lima container image
+# (`workflows/read-mask/twist_adapters_231010.fasta`). The control plane cannot hash a
+# file inside a SIF, so this constant is how the adapter bytes enter the mask
+# identity: re-vendoring a different set re-mints rather than silently reusing a
+# mask built from other adapters. A CI guard asserts it equals the vendored
+# file's md5, so the constant and the bytes lima sees cannot drift.
+_LIMA_ADAPTER_SET_MD5 = "ace7e3019407e034ee6e6fafb36f9362"
+
+# Resolved syndna config the mask hash covers — the effective spike-in filter the
+# syndna job applies. Mirrors the constants in `qiita_compute_orchestrator.jobs.syndna`
+# (kept here, not imported: the control plane does not depend on the orchestrator
+# package). A change to the spike-in classifier must update both, so the mask
+# identity stays faithful to the filter actually applied.
+_SYNDNA_ALIGNER = "minimap2"
+_SYNDNA_MM2_PRESET = "map-hifi"
+# The identity METHOD is part of the effective filter, not a detail: `blast` charges a
+# deletion per base and `gap_compressed` charges it once, so the same read can be a
+# spike-in under one and not the other. A change here must re-mint.
+_SYNDNA_IDENTITY_METHOD = "blast"
+_SYNDNA_MIN_IDENTITY = 0.95
+# Whether a read may be called a spike-in on a NON-primary (supplementary) alignment.
+# Also part of the effective filter, and a bigger lever than it sounds: it turns the rule
+# from "ANY alignment >= min_identity" into "the read's BEST alignment >= min_identity",
+# so the same read can be a spike-in under one and not the other. A change here must
+# re-mint, which is why it is hashed and not merely a comment in the job.
+_SYNDNA_PRIMARY_ONLY = True
 
 
 def _workflow_needs_mask(steps: list[Any]) -> bool:
@@ -73,6 +130,68 @@ def _adapter_set_hash(adapter_parquet: Path) -> str:
     return hashlib.sha256(adapter_parquet.read_bytes()).hexdigest()
 
 
+def _resolved_lima(action_context: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The effective lima config for the mask hash, or None when lima is off.
+
+    Gated on `lima_enabled` so a stale `lima_preset` left in action_context by a
+    disabled run cannot shift the hash. Only `preset` is client-chosen; `args`
+    and `adapter_set_md5` are control-plane constants (see `_LIMA_PRESET_ARGS`).
+
+    Returned as a NESTED block, mirroring `resolved_qc`: a future lima knob added
+    inside it changes the hash only for masks that actually ran lima, leaving
+    every Illumina (and non-lima PacBio) mask untouched. Flat top-level keys would
+    re-mint the whole fleet on every addition.
+    """
+    if not action_context.get("lima_enabled"):
+        return None
+    preset = action_context.get("lima_preset")
+    args = _LIMA_PRESET_ARGS.get(preset) if isinstance(preset, str) else None
+    if args is None:
+        raise _submission_bad_input(
+            f"lima_enabled requires lima_preset to be one of "
+            f"{sorted(_LIMA_PRESET_ARGS)}; got {preset!r}"
+        )
+    return {
+        "version": _LIMA_VERSION,
+        "preset": preset,
+        "args": args,
+        "adapter_set_md5": _LIMA_ADAPTER_SET_MD5,
+    }
+
+
+def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The effective syndna config for the mask hash, or None when syndna is off.
+
+    Gated on `syndna_enabled` for the same reason as `_resolved_lima`. (The
+    `host_*_reference_idx` keys below are read UNGATED — a stale value with
+    `host_filter_enabled` false would enter the hash. Pre-existing; not widened
+    here, since every producer writes the flag and the refs together.)
+
+    NESTED, mirroring `resolved_lima` / `resolved_qc`: the reference alone does not
+    describe the filter. A read is a spike-in when it has a PRIMARY alignment to the
+    reference at >= `min_identity` under `preset` — so the preset, the identity method,
+    the threshold, AND the primary-only rule are all part of the effective filter, and
+    all belong in the identity. The threshold in particular is expected to move once it
+    is confirmed against real data with the assay owner — when it does, masks MUST
+    re-mint rather than silently reuse one built at the old cutoff.
+
+    Only the reference idx is client-chosen; the aligner, preset, and threshold are
+    control-plane constants mirroring `jobs/syndna.py` (kept here, not imported —
+    the control plane does not depend on the orchestrator package; a change to
+    either must update both, as with the resolved-QC constants).
+    """
+    if not action_context.get("syndna_enabled"):
+        return None
+    return {
+        "reference_idx": action_context.get("syndna_reference_idx"),
+        "aligner": _SYNDNA_ALIGNER,
+        "preset": _SYNDNA_MM2_PRESET,
+        "identity_method": _SYNDNA_IDENTITY_METHOD,
+        "min_identity": _SYNDNA_MIN_IDENTITY,
+        "primary_only": _SYNDNA_PRIMARY_ONLY,
+    }
+
+
 def _build_mask_params(
     *,
     action_id: str,
@@ -82,6 +201,8 @@ def _build_mask_params(
     adapter_set_hash: str | None,
     host_rype_reference_idx: int | None,
     host_minimap2_reference_idx: int | None,
+    resolved_lima: dict[str, Any] | None,
+    resolved_syndna: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Assemble the resolved-filter-config dict that `mint_mask_definition`
     hashes (canonical JSON → SHA-256 → `params_hash`) to mint/dedup a mask.
@@ -95,6 +216,16 @@ def _build_mask_params(
     the materialized adapter Parquet, via `_adapter_set_hash`) rather than a file
     path, so the backfill can supply it from a re-materialized adapter set without
     this helper touching the filesystem.
+
+    `resolved_lima` and `resolved_syndna` are what distinguish the five PacBio
+    protocols. `prep_protocol_idx` cannot: it is the operator's `--prep-protocol-idx`
+    flag, stamped uniformly onto every sample in a run, so it is IDENTICAL across
+    the protocols. Neither does `instrument_model` (a model string, not a run id),
+    and no run/pool identifier appears here BY DESIGN — a mask definition is a
+    recipe that dedups fleet-wide. Without these two keys, a case-5 run (lima +
+    syndna) and a case-1 run (neither) submitted weeks apart with the same operator
+    flags hash identically and share one mask_idx, whose stored params then describe
+    only one of them.
 
     Any change to the keys, nesting, or resolved-QC constants here changes every
     mask's identity fleet-wide — keep it deterministic and keyed only on the
@@ -112,6 +243,8 @@ def _build_mask_params(
             "filter_read_tail": _QC_RESOLVED_FILTER_TAIL,
             "adapter_set_hash": adapter_set_hash,
         },
+        "resolved_lima": resolved_lima,
+        "resolved_syndna": resolved_syndna,
     }
 
 
@@ -126,6 +259,8 @@ async def _mint_read_mask(
     adapter_parquet: Path | None,
     host_rype_reference_idx: int | None,
     host_minimap2_reference_idx: int | None,
+    resolved_lima: dict[str, Any] | None,
+    resolved_syndna: dict[str, Any] | None,
 ) -> dict[str, int]:
     """Mint (or resolve) the `mask_idx` for this filtering config and bind it.
 
@@ -182,6 +317,8 @@ async def _mint_read_mask(
         ),
         host_rype_reference_idx=host_rype_reference_idx,
         host_minimap2_reference_idx=host_minimap2_reference_idx,
+        resolved_lima=resolved_lima,
+        resolved_syndna=resolved_syndna,
     )
 
     try:

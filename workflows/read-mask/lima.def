@@ -1,0 +1,56 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# Adapter-removal image for the read-mask `lima` step. lima clips the Twist
+# adapter from each end of a HiFi read; the surrounding native steps
+# (jobs/lima_export.py, jobs/lima_mask.py) handle the FASTQ round-trip and turn
+# lima's output into a partial read mask via miint's `infer_trim`.
+#
+# The adapter FASTA is BAKED INTO THIS IMAGE rather than resolved as a qiita
+# reference, because the reference store cannot round-trip an ordered sequence
+# set: it keeps no record order, and lima's `--neighbors` (see lima.sh) emits a
+# read only when its best-scoring barcode pair are ADJACENT RECORDS in the FASTA.
+# The control plane pins the file's md5 into the read-mask identity hash
+# (`_LIMA_ADAPTER_SET_MD5`) so a re-vendored adapter set re-mints; a CI guard ties
+# the constant to the vendored bytes. See twist_adapters_231010.NOTICE.
+#
+# The step is invoked as `apptainer exec <sif> /opt/qiita/lima.sh`, so the
+# %runscript is unused.
+
+%labels
+    workflow read-mask
+    tool lima
+    version 2.13.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    ../_shared/_lib.sh /opt/qiita/_lib.sh
+    # This image's entrypoint.
+    lima.sh /opt/qiita/lima.sh
+    # The adapter set. Record ORDER is load-bearing (--neighbors); never sort it.
+    twist_adapters_231010.fasta /opt/qiita/twist_adapters_231010.fasta
+    twist_adapters_231010.NOTICE /opt/qiita/twist_adapters_231010.NOTICE
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+    export QIITA_LIMA_ADAPTER_FASTA=/opt/qiita/twist_adapters_231010.fasta
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json) + the base utilities the entrypoint relies on outside the
+    # tool env. Mirrors long-read-assembly's per-tool images.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+
+    # lima is PINNED, not floated. It decides where the adapter clip lands, so a
+    # version bump changes the effective filter — the control plane carries this
+    # version in the read-mask identity hash (`_LIMA_VERSION`) precisely so a bump
+    # re-mints instead of silently reusing a mask trimmed by another binary. A CI
+    # guard ties that constant to VERIFY_MATCH in sif-build.d/lima.env.
+    # 2.13.0 is the version qp-pacbio validated against (pbbam 2.8.0 / pbcopper
+    # 2.7.0 / htslib 1.17). Bumping is a deliberate act: update the constant too.
+    micromamba create -y -n lima -c bioconda -c conda-forge lima=2.13.0

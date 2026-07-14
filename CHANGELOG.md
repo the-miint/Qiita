@@ -442,6 +442,75 @@ the `no-changelog` label).
   chunk_data)` stream into DuckDB for lazy, unbuffered reassembly. The live `compute`
   service account needs the `ticket:doget` scope (already within
   `SERVICE_ACCOUNT_SCOPE_CEILING`) to mint the ticket. (#268)
+- **PacBio case-5 read-mask chain.** The read-mask workflow gains two optional,
+  `when:`-gated stages around its always-on QC and host filter, so one workflow
+  serves all five PacBio protocols and Illumina unchanged:
+  `syndna? → [lima_export → lima → lima_mask]? → qc → host_filter`.
+  - **SynDNA spike-in marking (syndna)** runs FIRST, on the RAW reads. In case 5
+    (`syndna_is_twisted == False`) the spike-ins are added *after* Twist
+    amplification and so carry no Twist adaptor: if lima ran first it would mask
+    them `twist_no_adaptor`, and because every later step only re-classifies rows
+    still `pass`, the spike-in count would be **structurally zero**. Marking them
+    up front also makes `twist_no_adaptor` a correct "artifactual" signal on the
+    reads that remain. A read is a spike-in when it has a **PRIMARY** alignment to the
+    SynDNA reference (minimap2, `map-hifi`) at ≥ 0.95 identity, computed by miint's
+    `alignment_seq_identity` — an identity floor host filtering does not need, because
+    a spike-in call is a claim about a read's ORIGIN: a false positive silently removes
+    a genuine biological read from `biological`. The primary-only rule is there for the
+    same reason: identity is scored per alignment ROW and then DISTINCT'd to a read, so
+    without it a single short high-identity SUPPLEMENTARY segment marks a whole read —
+    the local-alignment false positive a chimeric HiFi read produces. coverm does not
+    credit a reference on a supplementary alignment either (measured, coverm 0.8.0), so
+    excluding them is what porting its spec requires. Both rules, plus the coverage floor
+    deliberately NOT applied and the open questions that belong to the assay owner, are
+    argued at the job's constants; both are folded into the read-mask identity, so a
+    change to either re-mints rather than silently reusing a mask built under the old
+    rule. Spike-in reads are RETAINED in
+    `read_mask` (their `sequence_idx` survives), so a later per-insert quantification
+    needs no re-ingest. Two notes on `spikein_read_count_r1r2`: because a non-`pass`
+    verdict is carried verbatim through the rest of the chain it is a **raw-space**
+    count, not a QC'd / host-depleted one; and it is a **masking diagnostic** (it makes
+    the read accounting balance), NOT the cell-count model's input — that is per-insert
+    coverage depth, a different quantity. (#270)
+  - **Adapter removal (lima)** runs before QC, so lima sees the intact adaptor and
+    QC's length filter judges the insert. The Twist adapter FASTA is vendored
+    into the lima image rather than loaded as a reference: lima is invoked with
+    `--neighbors`, which only keeps barcode pairs adjacent in the FASTA, and the
+    reference store cannot round-trip an ordered sequence set (no ordinal, no
+    record name, and a revcomp-canonical `feature_idx` under a
+    `(reference_idx, feature_idx)` PK). Reads with no Twist adaptor are masked
+    `twist_no_adaptor`. Trims come from miint's `infer_trim`, not from parsing
+    lima's output. (#270)
+  - `qc` gained an optional incoming partial mask, extending it with trims that
+    stay **cumulative from the raw read**.
+- **`sequenced_sample.spikein_read_count_r1r2`** and a `spikein` bucket on the
+  pool read-metrics rollup. A spike-in is added in the lab, so it is disjoint
+  from `biological`. (#270)
+- **Review follow-ups on the read-mask chain.** The two incoming-partial-mask guards that
+  re-checked the mask's SHAPE at every consumer (one row per read; trims within the read) are
+  REMOVED: both producers establish those invariants by construction — `syndna` emits `reads LEFT
+  JOIN hits` over a DISTINCT hit set, and `lima_mask`'s `infer_trim` returns one row per original
+  read and fails loud on a non-substring — so the checks guarded our own code against itself. The
+  invariants are now pinned at the producers, where they are actually established. The guard that
+  REMAINS is the one our construction does not establish: the `syndna_enabled` / `lima_enabled`
+  gates are client-supplied, so a submission can still ask for the long-read chain over a
+  paired-end read set. `lima_mask`'s check on lima's own output also remains — lima is an external
+  container binary, and `infer_trim` would absorb a broken contract silently. (#270)
+
+- **`qiita submit-host-filter-pool --syndna-reference-idx`**, and per-sample gate
+  derivation for PacBio pools: `lima_enabled`, `syndna_enabled`, and per-sample
+  `host_filter_enabled` are read back from the pool's stored pre-flight blob. The
+  SynDNA reference carries a **minimap2 (`.mmi`)** index — the same index type the
+  host filter's minimap2 arm uses, so no new builder or index type is needed. (#270)
+- **PacBio protocol facts on the sequenced-sample roster** (`sheet_type`,
+  `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the
+  stored pre-flight — the same single-source-of-truth path `human_filtering`
+  already used. (#270)
+- **`compute-readiness` probes `infer_trim`**, invoking the macro rather than
+  checking registration. A stale `extension_directory` (a plain `INSTALL` never
+  refreshes a warm cache) otherwise yields a build with every other function
+  present and fails at the first real submit. (#270)
+
 - **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
   analogue of `submit-bcl-convert`: it reads a kl-run-preflight blob, stands up
   the `sequencing_run` (platform `pacbio_smrt`) / `sequenced_pool` (blob attached)
@@ -1148,6 +1217,19 @@ the `no-changelog` label).
   column (study: `ena_study_accession` or `bioproject_accession`; biosample:
   `biosample_accession` or `ena_sample_accession`) (#91)
 
+### Fixed
+
+- **SynDNA spike-in count was structurally zero in case 5.** The chain ran
+  `lima -> qc -> host_filter -> syndna`, but a case-5 spike-in
+  (`syndna_is_twisted == False`) carries no Twist adaptor, so lima marked it
+  `twist_no_adaptor` first — and every later step (including syndna) only
+  re-classifies still-`pass` rows, so syndna never saw it. Reordered to
+  `syndna -> lima -> qc -> host_filter`: syndna marks the spike-ins on the raw
+  reads before lima can drop them, lima then processes only the biological reads
+  (which all carry the adaptor), and a single `partial_mask` binding threads the
+  verdict through so a `spikein_syndna` mark is never overwritten. A real-miint
+  case-5 chain test reproduces the bug and pins the fix. (#270)
+
 ### Changed
 
 - **Reference-arc efficiency/latency/DRY follow-ups.** Dropped a redundant
@@ -1188,6 +1270,36 @@ the `no-changelog` label).
   (the rank columns are already nullable) and no migration; already-ingested
   references are not backfilled — only new ingests get the 1-1-at-rest shape.
   (#268)
+- **The read-mask `biological` count predicate is now a whitelist.** It was
+  `reason NOT LIKE 'qc_%'` — fail-OPEN, so every reason added since would have
+  been counted as biological by default, which is exactly how `spikein_syndna`
+  and `twist_no_adaptor` would have inflated it. Buckets now derive from
+  `READ_MASK_BUCKET` in qiita-common (`biological` = `pass` + `host_*`), and a
+  coverage test fails on any unclassified reason. The data plane's
+  `mask_metrics_counts` carried the same predicate and changed in lockstep; its
+  `mask_metrics` JSON gains a `spikein` key, so control plane and data plane
+  must deploy together. (#270)
+- **Read-mask identity (`mask_idx`) now carries `resolved_lima` and
+  `syndna_reference_idx`.** Nothing in the hash distinguished the five PacBio
+  protocols: `prep_protocol_idx` is an operator CLI flag, uniform across them,
+  and no run identifier participates by design. A case-5 run and a case-1 run
+  submitted with the same flags hashed identically and shared one `mask_idx`
+  whose stored params described only one of them. `resolved_lima` is nested and
+  `None` when lima is off, so a future lima knob re-mints only lima masks.
+  **Consequence: `params_hash` changes for every existing mask.** The existing
+  rows stay valid and referenced; a re-run of an identical config mints one new
+  `mask_idx` rather than reusing the old. (#270)
+- **The pre-flight `human_filtering` derivation is platform-aware.** It keyed on
+  `illumina_sample_idx` and walked `run_illumina_sample`, so a PacBio pool's
+  samples all came back with a null intent — and `submit-host-filter-pool`
+  aborts on a null intent. It could not run against a PacBio pool at all. PacBio
+  now keys on the barcode (which is the `sequenced_pool_item_id`). PacBio host
+  filtering is per sample; Illumina keeps its pool-uniform guard for now. (#270)
+- **`read-mask`'s `context_schema` requires `host_filter_enabled`,
+  `lima_enabled`, and `syndna_enabled`.** `when:` is default-ON — an absent gate
+  key RUNS its step — so a ticket that omitted `lima_enabled` would have executed
+  the long-read lima chain on a short-read sample. (#270)
+
 
 - **`submit-bcl-convert` re-run is now convergent (create-missing roster).** The
   run → pool → sequenced-sample provisioning is unified with `submit-pacbio-ingest`

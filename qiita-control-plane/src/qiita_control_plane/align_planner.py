@@ -237,6 +237,13 @@ async def plan_and_submit_alignments(
             adapter_set_hash=adapter_set_hash,
             host_rype_reference_idx=host_rype_reference_idx,
             host_minimap2_reference_idx=host_minimap2_reference_idx,
+            # Align looks up BLOCK masks (it aligns block-masked reads), and the
+            # block read-mask workflow is `qc -> host_filter` only — it has no lima
+            # chain and no syndna step, so a block mask never carries either. This
+            # MUST mirror block_planner's mint call exactly or the reconstructed
+            # hash won't match the mask the block path minted.
+            resolved_lima=None,
+            resolved_syndna=None,
         )
         mask_by_protocol[protocol_idx] = await lookup_mask_idx_by_params(pool, params)
 

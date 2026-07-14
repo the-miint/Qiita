@@ -414,3 +414,79 @@ def test_qc_plan_walltime_grows_with_read_count(tmp_path):
 
     # 2M reads adds ceil(2 * 30) = 60 s over the base; 10 reads adds 1 s.
     assert _plan_for(2_000_000) > _plan_for(10)
+
+
+# --- optional incoming mask (`adapter_mask`) ---------------------------------
+#
+# The trim MATH is pinned in test_qc_smoke.py against real miint. Here we assert
+# the orchestration around it: the boundary guards, and that the incoming mask's
+# non-`pass` rows reach the output via the carry branch without touching a seam.
+
+
+def test_qc_missing_adapter_mask_raises(tmp_path, write_reads):
+    from qiita_compute_orchestrator.jobs import qc
+
+    reads = write_reads(tmp_path / "reads.parquet", [(1, "a", "ACGT", None)])
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path, _AD),
+        partial_mask=tmp_path / "nope.parquet",
+        work_ticket_idx=1,
+    )
+    with pytest.raises(FileNotFoundError, match="partial_mask not found"):
+        asyncio.run(qc.execute(inputs, tmp_path / "ws"))
+
+
+def test_qc_incoming_mask_rejects_paired_end(tmp_path, write_reads, write_partial_mask):
+    """PE + incoming mask is unsupported (only long reads carry one) -> fail loud,
+    rather than run the SE seam's cumulative-trim math on half a pair."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    reads = write_reads(tmp_path / "reads.parquet", [(1, "a", "ACGT", "TGCA")])
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path, _AD),
+        partial_mask=write_partial_mask(
+            tmp_path / "m.parquet", [(1, ReadMaskReason.PASS.value, 0, 0)]
+        ),
+        work_ticket_idx=1,
+    )
+    with pytest.raises(ValueError, match="paired-end"):
+        asyncio.run(qc.execute(inputs, tmp_path / "ws"))
+
+
+def test_qc_carry_branch_passes_non_pass_rows_through(
+    tmp_path, monkeypatch, write_reads, write_partial_mask
+):
+    """Non-`pass` incoming rows reach the output verbatim without visiting a seam.
+
+    Both seams are stubbed to emit nothing, so every row in the output came from
+    the carry branch — and the `pass` row is absent precisely because its seam
+    produced no rows.
+    """
+    from qiita_compute_orchestrator.jobs import qc
+
+    reads = write_reads(
+        tmp_path / "reads.parquet", [(1, "kept", "ACGT", None), (2, "dropped", "ACGT", None)]
+    )
+    monkeypatch.setattr(qc, "_qc_se_select", lambda *a, **k: _EMPTY_SEAM_SELECT)
+    monkeypatch.setattr(qc, "_qc_pe_select", lambda *a, **k: _EMPTY_SEAM_SELECT)
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path, _AD),
+        partial_mask=write_partial_mask(
+            tmp_path / "m.parquet",
+            [(1, ReadMaskReason.PASS.value, 0, 0), (2, ReadMaskReason.QC_TOO_MANY_N.value, 4, 6)],
+        ),
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
+    assert _schema(out["qc_mask"]) == _MASK_SCHEMA
+    # _rows -> (sequence_idx, reason, left_trim2 IS NULL): only the carried row.
+    assert _rows(out["qc_mask"]) == [(2, ReadMaskReason.QC_TOO_MANY_N.value, True)]
+    # ...and its trims survived verbatim.
+    with duckdb.connect(":memory:") as conn:
+        trims = conn.execute(
+            f"SELECT left_trim1, right_trim1 FROM read_parquet('{out['qc_mask']}')"
+        ).fetchall()
+    assert trims == [(4, 6)]
