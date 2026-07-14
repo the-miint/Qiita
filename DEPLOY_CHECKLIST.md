@@ -88,35 +88,6 @@ Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-b
   Notes), so leaving it empty breaks nothing. Running it now just means the submit-path PR
   that consumes it lands against an already-configured host.
 
-- (#299) **Backfill `host_taxon_id`.** No biosample carries the field, so the host-filter
-  resolver reports every sample UNRESOLVED. This is a data step, not a schema one — plain
-  `make migrate` does not do it. It is **read-only until you pass `--execute`**.
-
-  Run the dry-run first and READ IT. It prints how many samples resolve via the pre-flight
-  (controls), how many via their own taxon, and — the part that matters — the UNRESOLVED
-  residue, grouped by the taxon that could not be mapped. Those samples stay UNRESOLVED and
-  will abort their pool at submit; they are a curation worklist, not a failure.
-
-  ```bash
-  sudo -u qiita env DATABASE_URL="$(sudo grep -m1 '^DATABASE_URL=' /etc/qiita/control-plane.env | cut -d= -f2-)" \
-      /home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin backfill host-taxon-id
-  ```
-
-  Then, once the residue looks right:
-
-  ```bash
-  sudo -u qiita env DATABASE_URL="…" \
-      /home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin backfill host-taxon-id --execute
-  ```
-
-  Idempotent — re-run it freely as curation lands; already-populated samples are skipped.
-  A mid-run failure commits the rows it got to and reports the count; re-running converges.
-
-  Also heed the two WARNINGs it can print: an unreadable pool pre-flight, or a control with
-  no biosample accession. Both mean blanks in that pool are NOT recognised as controls and
-  will fall to UNRESOLVED — which aborts that pool rather than mis-depleting it, but you
-  want to know.
-
 ### 4. Deploy
 
 _None yet._
@@ -157,6 +128,41 @@ _None yet._
 
   Expect exactly one row: `illumina | HPRCr2-hg38-T2TCHM13v2.0-gencode49 | T2TCHM13v2.0-phiX174`.
   A NULL `minimap2_ref` means the name lookup missed — re-run the seed (it is idempotent).
+
+
+- (#299) **Backfill `host_taxon_id`. RUN THIS BEFORE THE FIRST `submit-host-filter-pool`.**
+  No biosample carries the field, so the resolver reports every sample UNRESOLVED and the
+  submit path aborts every pool until this runs.
+
+  A DATA step, not a schema one — `make migrate` does not do it — and it needs the code
+  THIS deploy ships (the `qiita-admin backfill` command). That is why it lives here and not
+  in bucket 3: bucket 3 runs before the venv is synced, so the command does not exist yet.
+  Read-only until you pass `--execute`.
+
+  Run the dry-run first and READ IT. It prints how many samples resolve via the pre-flight
+  (controls), how many via their own taxon, and — the part that matters — the UNRESOLVED
+  residue, grouped by the taxon that could not be mapped. Those samples stay UNRESOLVED and
+  will abort their pool at submit; they are a curation worklist, not a failure.
+
+  ```bash
+  sudo -u qiita env DATABASE_URL="$(sudo grep -m1 '^DATABASE_URL=' /etc/qiita/control-plane.env | cut -d= -f2-)" \
+      /home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin backfill host-taxon-id
+  ```
+
+  Then, once the residue looks right:
+
+  ```bash
+  sudo -u qiita env DATABASE_URL="…" \
+      /home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin backfill host-taxon-id --execute
+  ```
+
+  Idempotent — re-run it freely as curation lands; already-populated samples are skipped.
+  A mid-run failure commits the rows it got to and reports the count; re-running converges.
+
+  Also heed the two WARNINGs it can print: an unreadable pool pre-flight, or a control with
+  no biosample accession. Both mean blanks in that pool are NOT recognised as controls and
+  will fall to UNRESOLVED — which aborts that pool rather than mis-depleting it, but you
+  want to know.
 
 
 ### 6. After the deploy verifies green
