@@ -180,11 +180,31 @@ verification passes, the OLD build's config is the rollback path.
 
 ### Notes (no host action)
 
-- (#299) **Nothing changes behaviour on this deploy.** The backfill writes sample metadata
-  that only the (not-yet-merged) submit-path swap reads; the current submit path still reads
-  the intake `human_filtering` flag and is untouched. So the backfill is safe to run now, or
-  to defer — but it MUST land before the submit swap is exercised, or that swap aborts every
-  pool. Ordering is the entire point of this note.
+- (#303) **`submit-host-filter-pool` now resolves host filtering per sample from
+  `host_taxon_id` metadata — the `--host-*-reference-idx` flags are gone as inputs.** This is
+  a LIVE behaviour change, and it is why the #299 backfill (bucket 5) is not optional: run
+  the backfill BEFORE the first `submit-host-filter-pool` after this deploy, or every pool
+  aborts UNRESOLVED. After the backfill, sanity-check with `submit-host-filter-pool
+  --dry-run` (prints the resolved plan, submits nothing) before a real run. The old flags
+  still exist as a `--force` override (apply one reference pool-wide, blanks included). No
+  env/migration/scope/workflow change — the submit path is client + CP code only.
+
+- (#303) **`host_taxon_id` is now enforced at biosample import** (422 if omitted; a
+  missing-value marker counts as supplied). New pools must carry it — that is what stops the
+  backfill being a treadmill. No deploy action; noted because a client that imports
+  biosamples without it will start getting 422s. Deliberately narrow: only `host_taxon_id`
+  is enforced, not the other schema-`required` fields.
+
+- (#303) **A human PacBio pool will abort UNRESOLVED until a `pacbio_smrt` host profile is
+  seeded.** The #299 bucket-3 seed only covers `illumina`. The live PacBio pool is seawater
+  (resolves PASS_THROUGH, so unaffected), but the first human PacBio pool needs a
+  `pacbio_smrt` profile row — which human long-read build to deplete against is an open assay
+  decision, so it is NOT pre-seeded. Seed it (same `ON CONFLICT` statement, `'pacbio_smrt'`)
+  when that decision is made.
+
+- (#299) **The #299 backfill (bucket 5) must run before the first `submit-host-filter-pool`
+  of the post-#303 deploy** — see the #303 note above. It writes sample metadata the submit
+  path now reads; without it, every pool resolves UNRESOLVED and aborts.
 
 - (#299) The 25 seawater samples are backfilled to `not applicable`, which resolves
   PASS_THROUGH — i.e. **no host depletion**. They have never been masked, so this changes
