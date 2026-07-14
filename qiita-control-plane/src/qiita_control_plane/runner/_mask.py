@@ -95,6 +95,11 @@ _SYNDNA_MM2_PRESET = "map-hifi"
 # spike-in under one and not the other. A change here must re-mint.
 _SYNDNA_IDENTITY_METHOD = "blast"
 _SYNDNA_MIN_IDENTITY = 0.95
+# Minimum fraction of the read that aligns, against the whole PLASMID. Mirrors
+# jobs/syndna._MIN_ALIGNED_FRACTION. It CHANGES which reads are called spike-in, so it
+# must enter the mask identity — a mask built at 0.90 and one built at 0.0 describe
+# different filters and cannot share a mask_idx.
+_SYNDNA_MIN_ALIGNED_FRACTION = 0.90
 # Whether a read may be called a spike-in on a NON-primary (supplementary) alignment.
 # Also part of the effective filter, and a bigger lever than it sounds: it turns the rule
 # from "ANY alignment >= min_identity" into "the read's BEST alignment >= min_identity",
@@ -188,6 +193,7 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
         "preset": _SYNDNA_MM2_PRESET,
         "identity_method": _SYNDNA_IDENTITY_METHOD,
         "min_identity": _SYNDNA_MIN_IDENTITY,
+        "min_aligned_fraction": _SYNDNA_MIN_ALIGNED_FRACTION,
         "primary_only": _SYNDNA_PRIMARY_ONLY,
     }
 

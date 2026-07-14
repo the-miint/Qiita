@@ -67,6 +67,11 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._coverage import (
+    ALIGNED_FRACTION_EXPR,
+    IDENTITY_EXPR,
+    MAPPED_PRIMARY_EXPR,
+)
 from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "syndna"
@@ -113,6 +118,15 @@ _MM2_PRESET = "map-hifi"
 # with the assay owner alongside the open questions below.
 _IDENTITY_METHOD = "blast"
 _MIN_IDENTITY = 0.95
+
+# Minimum fraction of the READ that aligns, computed against the whole PLASMID (not the
+# bare insert). Settled with the assay owner for the coverage-depth pipeline, and it is
+# correct for masking too now that the reference is plasmid-level: a read spanning the
+# insert->backbone junction is fully aligned against the plasmid, so the filter keeps it —
+# whereas against an insert-only index the same read looks 60% aligned and would be lost.
+# That asymmetry is why the old insert-only reference could not carry an aligned-fraction
+# filter at all.
+_MIN_ALIGNED_FRACTION = 0.90
 
 # =============================================================================
 # PRIMARY alignments only — matching coverm
@@ -178,6 +192,7 @@ _PRIMARY_ONLY = True
 _READS = "syndna_reads"
 _QUERY = "syndna_query"
 _HITS = "syndna_hits"
+_ALIGNMENT = "syndna_alignment"
 
 
 class Inputs(BaseModel):
@@ -214,7 +229,6 @@ def _run_align_minimap2(
     dest_table: str,
     *,
     preset: str,
-    min_identity: float,
 ) -> None:
     """Seam around miint's `align_minimap2`. Appends the DISTINCT spike-in
     `sequence_idx` set into the pre-created `dest_table`.
@@ -242,14 +256,23 @@ def _run_align_minimap2(
 
     Isolated as a seam so unit tests stub the real aligner.
     """
+    # Materialise the ALIGNMENT, not a boolean. Every column coverage depth needs —
+    # `reference` (which plasmid), `position`/`stop_position`, `cigar` — is computed by
+    # miint here; the old `SELECT DISTINCT read_id` threw all of it away one line after it
+    # existed, which is precisely what made per-insert quantification impossible.
+    #
+    # UNGATED on purpose: only the mapped-primary filter is applied here. The identity and
+    # aligned-fraction gate is a property of the MEASUREMENT, and it lives in exactly one
+    # place (`_coverage`), so the mask and the coverage table can never drift apart on
+    # which reads count.
     conn.execute(
-        f"INSERT INTO {dest_table} "
-        "SELECT DISTINCT read_id AS sequence_idx "
+        f"CREATE OR REPLACE TABLE {dest_table} AS "
+        "SELECT read_id AS sequence_idx, "
+        "       CAST(reference AS BIGINT) AS parent_feature_idx, "
+        "       flags, position, stop_position, cigar "
         "FROM align_minimap2(?, index_path := ?, preset := ?, max_secondary := 0) "
-        "WHERE alignment_is_primary(flags) "
-        "AND NOT alignment_is_unmapped(flags) "
-        "AND alignment_seq_identity(cigar, tag_nm, tag_md, ?) >= ?",
-        [query_table, str(index_path), preset, _IDENTITY_METHOD, min_identity],
+        f"WHERE {MAPPED_PRIMARY_EXPR}",
+        [query_table, str(index_path), preset],
     )
 
 
@@ -260,9 +283,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     partial_mask = workspace / "syndna_mask.parquet"
+    alignment = workspace / "syndna_alignment.parquet"
 
     reads_sql = validate_parquet_path(inputs.reads)
     out_sql = validate_parquet_path(partial_mask)
+    alignment_sql = validate_parquet_path(alignment)
+    # prep_sample_idx is framework-injected; NULL only in a unit-test harness.
+    prep_sample_sql = (
+        f"{inputs.prep_sample_idx}::BIGINT"
+        if inputs.prep_sample_idx is not None
+        else "NULL::BIGINT"
+    )
 
     success = False
     try:
@@ -290,14 +321,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 f"CREATE VIEW {_QUERY} AS SELECT sequence_idx AS read_id, sequence1 FROM {_READS}"
             )
-            conn.execute(f"CREATE TABLE {_HITS} (sequence_idx BIGINT)")
             _run_align_minimap2(
                 conn,
                 inputs.syndna_minimap2_path,
                 _QUERY,
-                _HITS,
+                _ALIGNMENT,
                 preset=_MM2_PRESET,
-                min_identity=_MIN_IDENTITY,
+            )
+
+            # The gate — identity AND aligned fraction, both against the whole plasmid.
+            # ONE definition, imported from `_coverage`, so the reads that are MASKED as
+            # spike-in and the reads that are COUNTED toward depth can never disagree.
+            conn.execute(
+                f"CREATE OR REPLACE VIEW {_HITS} AS "
+                f"SELECT DISTINCT sequence_idx FROM {_ALIGNMENT} "
+                f"WHERE {IDENTITY_EXPR} >= {_MIN_IDENTITY} "
+                f"  AND {ALIGNED_FRACTION_EXPR} >= {_MIN_ALIGNED_FRACTION}"
             )
 
             # Emit the partial mask: one row per read, spike-in hits marked, all else
@@ -315,11 +354,26 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "      ORDER BY sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
+
+            # The alignment itself, for the coverage-depth step. Carries prep_sample_idx
+            # so the downstream job needs nothing else to key its output. Emitted UNGATED
+            # (mapped-primary only) — the measurement gate is applied by the consumer, so
+            # it lives in one place.
+            conn.execute(
+                "COPY (SELECT "
+                f"        {prep_sample_sql} AS prep_sample_idx, "
+                "         sequence_idx, parent_feature_idx, "
+                "         flags, position, stop_position, cigar "
+                f"      FROM {_ALIGNMENT} "
+                "      ORDER BY prep_sample_idx, parent_feature_idx, position) "
+                f"TO '{alignment_sql}' ({PARQUET_OPTS})"
+            )
         success = True
     finally:
         if not success:
             partial_mask.unlink(missing_ok=True)
+            alignment.unlink(missing_ok=True)
 
     # The partial mask threaded forward to the lima chain / qc under one binding
     # (see the module docstring). NOT the final read_mask — host_filter emits that.
-    return {"partial_mask": partial_mask}
+    return {"partial_mask": partial_mask, "syndna_alignment": alignment}

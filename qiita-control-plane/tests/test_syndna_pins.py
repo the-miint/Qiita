@@ -46,6 +46,7 @@ _PINNED = [
     ("_MM2_PRESET", "_SYNDNA_MM2_PRESET"),
     ("_IDENTITY_METHOD", "_SYNDNA_IDENTITY_METHOD"),
     ("_MIN_IDENTITY", "_SYNDNA_MIN_IDENTITY"),
+    ("_MIN_ALIGNED_FRACTION", "_SYNDNA_MIN_ALIGNED_FRACTION"),
     ("_PRIMARY_ONLY", "_SYNDNA_PRIMARY_ONLY"),
 ]
 
@@ -103,3 +104,39 @@ def test_resolved_syndna_carries_every_pinned_constant():
             f"{cp_name} is pinned to the job but does not appear in resolved_syndna — "
             f"the mask identity would not change when it does."
         )
+
+
+def test_every_filter_knob_in_the_job_is_pinned():
+    """A NEW filter knob added to the job must be registered in `_PINNED`.
+
+    `test_pinned_constants_match` only checks the constants already listed, so a knob
+    added to `jobs/syndna.py` and forgotten here slips through — and the failure is the
+    worst kind: the job filters differently, but the mask identity hash does not change,
+    so the new mask silently collapses onto a `mask_idx` whose stored params describe the
+    OLD filter. That is the same defect class the syndna mask identity was introduced to
+    fix, one level up.
+
+    Caught exactly this: `_MIN_ALIGNED_FRACTION` was added to the job and every test still
+    passed. So the guard is a NAME-shaped one — anything that looks like a filter knob has
+    to be pinned deliberately, or explicitly excluded here with a reason.
+    """
+    # Constants that describe the FILTER (what gets called a spike-in) rather than the
+    # execution environment (memory, threads, table names).
+    knob_prefixes = ("_MIN_", "_MAX_", "_IDENTITY_", "_PRIMARY_", "_MM2_PRESET")
+    not_filter_knobs = {
+        # Resource caps — they change how the job RUNS, never which reads it calls.
+        "_MM2_RESERVE_GB",
+    }
+
+    job = _job_constants()
+    pinned = {job_name for job_name, _ in _PINNED}
+    knobs = {
+        name for name in job if name.startswith(knob_prefixes) and name not in not_filter_knobs
+    }
+    unpinned = knobs - pinned
+    assert not unpinned, (
+        f"filter knob(s) in jobs/syndna.py are not in _PINNED: {sorted(unpinned)}. "
+        "A knob that changes which reads are called spike-in MUST enter the mask identity "
+        "hash (runner/_mask.py::_resolved_syndna), or masks built under the new setting "
+        "will reuse a mask_idx describing the old one."
+    )
