@@ -122,6 +122,27 @@ def test_from_env_path_derived_dev_fallback(monkeypatch):
     assert settings.path_derived == "/tmp/xyz/qiita/derived"
 
 
+def test_from_env_data_plane_url_explicit(monkeypatch):
+    """DATA_PLANE_URL is the gRPC origin native jobs DoGet reference chunks from.
+    Resolved on every backend; when set, it is used verbatim."""
+    monkeypatch.setenv("DATA_PLANE_URL", "grpc://qiita-miint.ucsd.edu:50051")
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    settings = Settings.from_env(require_cp_to_co_token=False)
+    assert settings.data_plane_url == "grpc://qiita-miint.ucsd.edu:50051"
+
+
+def test_from_env_data_plane_url_dev_default(monkeypatch):
+    """With no DATA_PLANE_URL, it falls back to the localhost default — NOT
+    fail-fast (unlike the SLURM-only required vars), so a deploy that forgets it
+    keeps the unit up rather than down."""
+    monkeypatch.delenv("DATA_PLANE_URL", raising=False)
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    settings = Settings.from_env(require_cp_to_co_token=False)
+    assert settings.data_plane_url == "grpc://localhost:50051"
+
+
 def test_resolve_co_to_cp_token_permission_denied_is_actionable(monkeypatch, tmp_path):
     """A present-but-unreadable CO→CP token file — the compute-readiness-as-the-
     wrong-user case (the token is 0400 qiita-orch, qiita-api can't read it) —

@@ -29,7 +29,7 @@ _WORK_TICKET_COLS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx, "
     "wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx, "
     "wt.prep_sample_idx, wt.sequenced_pool_idx, sp.sequencing_run_idx, "
-    "wt.block_idx, wt.mask_idx, "
+    "wt.block_idx, wt.mask_idx, wt.alignment_idx, wt.shard_id, "
     "wt.action_context, wt.state, wt.retry_count, wt.max_retries, "
     "wt.resource_override"
 )

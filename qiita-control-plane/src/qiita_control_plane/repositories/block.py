@@ -257,3 +257,115 @@ async def has_incomplete_covering_block(
         mask_idx,
     )
     return incomplete is not None
+
+
+# =============================================================================
+# alignment_sample gate (per-(alignment_idx, prep_sample) completion)
+# =============================================================================
+# Exact twins of the mask_sample gate primitives above, keyed on alignment_idx
+# instead of mask_idx. Alignment consumes the SAME block / block_member core
+# (WHY-agnostic) and the SAME per-sample-completion pattern; the only difference
+# is the WHY column the covering-block join reads (work_ticket.alignment_idx).
+# See qiita.alignment_sample (twin of qiita.mask_sample).
+
+
+async def create_alignment_sample_pending(
+    conn: asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    prep_sample_idxs: Sequence[int],
+) -> None:
+    """Materialize the per-sample completion gate for an alignment at PENDING.
+
+    One row per `(alignment_idx, prep_sample_idx)`. Idempotent via ON CONFLICT DO
+    NOTHING so re-planning the same partition does not error and — critically —
+    does not resurrect a row already flipped to 'completed' back to 'pending'.
+    The row is flipped to 'completed' at reconcile. Empty input is caller misuse.
+    Twin of `create_mask_sample_pending`.
+    """
+    require_transaction(conn)
+    if not prep_sample_idxs:
+        raise ValueError("create_alignment_sample_pending requires at least one prep_sample_idx")
+    await conn.executemany(
+        "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'pending')"
+        " ON CONFLICT (alignment_idx, prep_sample_idx) DO NOTHING",
+        [(alignment_idx, ps) for ps in prep_sample_idxs],
+    )
+
+
+async def lock_alignment_sample(
+    conn: asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+) -> str | None:
+    """`SELECT ... FOR UPDATE` the `(alignment_idx, prep_sample_idx)` gate row and
+    return its state, or None if no row exists.
+
+    require_transaction: the lock is the crux of the concurrent-finalize
+    serialization — two blocks that both cover a sample race to finalize it, and
+    holding this row lock for the duration of the check-and-flip means exactly one
+    wins. A None return under a live block is a bug: the gate row is materialized
+    PENDING at plan time before any block runs. Twin of `lock_mask_sample`."""
+    require_transaction(conn)
+    return await conn.fetchval(
+        "SELECT state FROM qiita.alignment_sample"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = $2"
+        " FOR UPDATE",
+        alignment_idx,
+        prep_sample_idx,
+    )
+
+
+async def finalize_alignment_sample(
+    conn: asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+) -> bool:
+    """Atomically flip a `(alignment_idx, prep_sample_idx)` gate row to
+    'completed'; return True iff a row moved (it was not already completed).
+
+    Guarded UPDATE (WHERE state <> 'completed'), never SELECT-then-UPDATE — the
+    caller holds the row's FOR UPDATE lock (`lock_alignment_sample`) across the
+    check-and-flip, but the guard is belt-and-suspenders against a double
+    finalize. A False return means the row was already completed. Twin of
+    `finalize_mask_sample`."""
+    require_transaction(conn)
+    updated = await conn.fetchval(
+        "UPDATE qiita.alignment_sample SET state = 'completed'"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = $2 AND state <> 'completed'"
+        " RETURNING prep_sample_idx",
+        alignment_idx,
+        prep_sample_idx,
+    )
+    return updated is not None
+
+
+async def has_incomplete_covering_alignment_block(
+    conn: asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+) -> bool:
+    """True iff some block covering `prep_sample_idx` under `alignment_idx` is not
+    yet 'completed' — the finalize gate for the sample.
+
+    A block covers the sample via `block_member`; its alignment identity is its
+    ticket's `work_ticket.alignment_idx`. The sample's alignment is COMPLETE only
+    when EVERY covering block has reached 'completed'; a still-running or failed
+    sibling block leaves the sample's alignment partial, so it must not finalize.
+    Checking `state <> 'completed'` (not "non-terminal") means a failed block
+    correctly blocks finalize until re-driven — the strict, fail-closed reading.
+    Twin of `has_incomplete_covering_block` (joins on alignment_idx not mask_idx)."""
+    incomplete = await conn.fetchval(
+        "SELECT 1 FROM qiita.block b"
+        "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
+        "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
+        " WHERE bm.prep_sample_idx = $1 AND wt.alignment_idx = $2 AND b.state <> 'completed'"
+        " LIMIT 1",
+        prep_sample_idx,
+        alignment_idx,
+    )
+    return incomplete is not None

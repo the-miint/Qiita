@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +28,22 @@ from qiita_common.models import (
 
 from .. import step_progress
 from ..actions.library import LIBRARY, MINT_FEATURES_OUTPUT_BASENAME
+from ..repositories.reference_membership import count_reference_shards
+from ..shard_orchestration import (
+    BUILD_SHARD_INDEX_ACTION_ID,
+    BUILD_SHARD_INDEX_ACTION_VERSION,
+    SHARD_BUILD_CONTEXT_KEYS,
+    expected_shard_index_types,
+    plan_and_submit_shards,
+)
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
-from ._mask import MASK_IDX_BINDING
+from ._mask import ALIGNMENT_IDX_BINDING, MASK_IDX_BINDING
 from ._processing import PROCESSING_IDX_BINDING
+from ._read_ingest import (
+    ROUTER_PENDING_BINDING,
+    SHARD_MAPPING_BINDING,
+    _stage_shard_mapping,
+)
 
 # =============================================================================
 # Restart-recovery output reconstruction
@@ -86,6 +100,7 @@ async def _reconstruct_completed_outputs(
     pool: asyncpg.Pool,
     work_ticket_idx: int,
     poll_interval_seconds: float,
+    scope_target: dict[str, Any],
 ) -> dict[str, Any]:
     """Rebuild the bound outputs of an already-COMPLETED entry from disk,
     without re-running it.
@@ -100,6 +115,10 @@ async def _reconstruct_completed_outputs(
 
     An `action:` entry rebuilds its deterministic output paths in-process (see
     `_reconstruct_action_outputs`) — the in-process primitive must not re-run.
+    `plan-shards` is the one action whose control-flow bindings (`router_pending`
+    + the staged `shard_mapping`) are re-derived from the DURABLE shard
+    assignment rather than a scratch path, so the router build stays gated and
+    fed correctly across a CP restart (see `_reconstruct_plan_shards_outputs`).
 
     A non-SLURM (local) completed step has no on-disk manifest to re-read;
     recovery is a SLURM-backend concern (local steps are synchronous and don't
@@ -107,6 +126,8 @@ async def _reconstruct_completed_outputs(
     downstream consumer that needs a missing binding fails loudly via KeyError."""
     attempt_workspace = workspace / entry.name / f"attempt-{completed.attempt}"
     if isinstance(entry, WorkflowAction):
+        if entry.name == LibraryPrimitive.PLAN_SHARDS:
+            return await _reconstruct_plan_shards_outputs(pool, scope_target, attempt_workspace)
         return _reconstruct_action_outputs(entry, attempt_workspace)
     if completed.compute_target is not ComputeTarget.SLURM:
         return {}
@@ -134,12 +155,40 @@ def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) 
     """Deterministic output paths an `action:` primitive wrote, for resume.
     Only `mint-features` contributes a binding (the feature-map Parquet it
     wrote into its workspace); the other primitives produce no bound output.
+    (`plan-shards` is handled separately in `_reconstruct_completed_outputs` —
+    its bindings come from the DB, not a scratch path.)
     The basename is single-sourced from `mint_features` itself
     (`MINT_FEATURES_OUTPUT_BASENAME`) so this resume path can't drift from where
     the primitive actually writes the file."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
         return {entry.outputs[0]: attempt_workspace / MINT_FEATURES_OUTPUT_BASENAME}
     return {}
+
+
+async def _reconstruct_plan_shards_outputs(
+    pool: asyncpg.Pool,
+    scope_target: dict[str, Any],
+    attempt_workspace: Path,
+) -> dict[str, Any]:
+    """Re-derive the plan-shards arm's control-flow bindings on resume.
+
+    plan-shards produces the router gate `router_pending` and — when it fanned
+    out (N > 0) — the staged `shard_mapping` Parquet the router build consumes.
+    Neither is a declared step output, so rebuild them from the DURABLE shard
+    assignment (`reference_membership.shard_id`) rather than trusting a scratch
+    file to survive: `router_pending = (N > 0)`, and when N > 0 re-stage
+    `shard_mapping` to the same deterministic path the live arm used. This keeps
+    the router build resume-robust — a CP restart between plan-shards and
+    build_routing_index re-provides the mapping and re-opens the gate. Mirrors
+    the live plan-shards arm's return; keep the two in step."""
+    reference_idx = scope_target["reference_idx"]
+    n = await count_reference_shards(pool, reference_idx)
+    if not n:
+        return {ROUTER_PENDING_BINDING: False}
+    mapping_path = await _stage_shard_mapping(
+        pool, reference_idx, attempt_workspace / "shard_mapping.parquet"
+    )
+    return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
 
 
 async def _dispatch_action(
@@ -154,6 +203,7 @@ async def _dispatch_action(
     attempt: int,
     signing_key: bytes,
     data_plane_url: str,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Run one in-process `action:` entry and record its progress.
 
@@ -187,6 +237,7 @@ async def _dispatch_action(
             work_ticket_idx=work_ticket_idx,
             signing_key=signing_key,
             data_plane_url=data_plane_url,
+            dispatch_cb=dispatch_cb,
         )
     except BackendFailure as exc:
         await _best_effort_record_failed(
@@ -227,6 +278,7 @@ async def _run_action_primitive(
     work_ticket_idx: int,
     signing_key: bytes,
     data_plane_url: str,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Translate a workflow `action:` entry into the matching LIBRARY call.
     Per-primitive logic lives here because each primitive has its own
@@ -324,7 +376,9 @@ async def _run_action_primitive(
         # the step's single declared input, NOT hardcoded: a host reference runs
         # two register-index steps (rype + minimap2), each pointing at its own
         # meta. Read it for index_type / fs_path / params (index_type comes from
-        # the builder, not hardcoded here).
+        # the builder, not hardcoded here). `shard_id` is optional: a host meta
+        # JSON omits it (`.get` -> None -> unsharded row); a sharded analysis
+        # index builder emits one meta per shard carrying its shard_id.
         if len(entry.inputs) != 1:
             raise RuntimeError(
                 f"register-index expects exactly one input (the index meta); got {entry.inputs!r}"
@@ -337,6 +391,95 @@ async def _run_action_primitive(
             index_type=meta["index_type"],
             fs_path=meta["fs_path"],
             params=meta["params"],
+            shard_id=meta.get("shard_id"),
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.PLAN_SHARDS:
+        # Assign this reference's genome-bearing features to N lineage-sorted
+        # shards (reference_membership.shard_id) and fan out one build-shard-index
+        # ticket per shard. No file inputs: reference_idx from the scope target;
+        # the taxonomy DoGet + PG export are internal. The build gates/knobs the
+        # shard tickets carry are copied from THIS ticket's action_context
+        # (present in `bound`); the originator is inherited from this ticket.
+        #
+        # Sharding is OPT-IN. The step self-defends on `shard_index` and no-ops
+        # when it is absent/falsy — mirroring the finalize check in
+        # `_is_sharded_fanout_in_progress` (which reads the same `bound` key), so a
+        # plain reference-add never fans out (and, absent this guard, would even
+        # shard a genome-bearing reference nobody asked to shard). The YAML's
+        # `when: shard_index` gate ALSO skips an explicit `shard_index: false`
+        # opt-out before we get here; this guard covers the absent-key default,
+        # which the gate treats as ON (its absent⇒ON default is correct for the
+        # build_* gates but not for this opt-in flag). A no-op → router_pending
+        # False so the router build entries stay OFF (see ROUTER_PENDING_BINDING).
+        if not bound.get("shard_index"):
+            return {ROUTER_PENDING_BINDING: False}
+        if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+            raise RuntimeError(
+                f"plan-shards requires a reference-scoped ticket; got {scope_target['kind']!r}"
+            )
+        if dispatch_cb is None:
+            # Fanning out without a dispatch mechanism would silently strand the
+            # shard tickets in PENDING until the next startup reconcile — fail
+            # loud instead (dispatch always threads a callback in production).
+            raise RuntimeError("plan-shards requires a dispatch_cb to fan out shard tickets")
+        originator_principal_idx = await pool.fetchval(
+            "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        shard_context = {k: bound[k] for k in SHARD_BUILD_CONTEXT_KEYS if k in bound}
+        summary = await plan_and_submit_shards(
+            pool,
+            scope_target["reference_idx"],
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+            workspace=workspace,
+            originator_principal_idx=originator_principal_idx,
+            build_action_id=BUILD_SHARD_INDEX_ACTION_ID,
+            build_action_version=BUILD_SHARD_INDEX_ACTION_VERSION,
+            action_context=shard_context,
+            dispatch_cb=dispatch_cb,
+        )
+        # N == 0 here means an EXPLICIT shard_index=true request (the :416 guard
+        # already returned for the absent/false case) produced zero shard-bearing
+        # features — a reference with no genomes / no genome map. Finalizing that to
+        # a terminal `active` reference with no router is the wrong outcome: the
+        # first align-plan 409s ("no rype_router built"), and ACTIVE is terminal so
+        # remediation would be delete + full re-ingest. Fail loud instead — the
+        # workflow's `failure_status: failed` applies and `failed → pending` is a
+        # legal redrive edge, so the operator supplies genomes / a genome map and
+        # re-runs. Server-side because a direct POST /work-ticket bypasses the CLI.
+        # N > 0 → stage the shard→bucket mapping the whole-reference rype_router
+        # build consumes (from the assignment plan_and_submit_shards just wrote) and
+        # flip router_pending True so the router build entries run.
+        if summary.get("shards", 0) <= 0:
+            raise RuntimeError(
+                f"plan-shards: reference {scope_target['reference_idx']} was requested "
+                "with shard_index=true but has no genome-bearing features to shard "
+                "(N=0); refusing to finalize an unroutable `active` reference. Supply "
+                "genomes / a genome map and redrive, or omit shard_index."
+            )
+        mapping_path = await _stage_shard_mapping(
+            pool,
+            scope_target["reference_idx"],
+            workspace / "shard_mapping.parquet",
+        )
+        return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
+
+    if entry.name == LibraryPrimitive.FINALIZE_SHARD:
+        # Terminal step of a build-shard-index ticket: count-based, fail-closed
+        # completion. The expected index_types are derived from THIS ticket's
+        # build gates (in `bound`), so finalize counts exactly what was built.
+        # No file inputs; reference_idx from the scope target.
+        if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+            raise RuntimeError(
+                f"finalize-shard requires a reference-scoped ticket; got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.FINALIZE_SHARD](
+            pool,
+            scope_target["reference_idx"],
+            expected_shard_index_types(bound),
         )
         return {}
 
@@ -420,6 +563,47 @@ async def _run_action_primitive(
             mask_idx=bound[MASK_IDX_BINDING],
             signing_key=signing_key,
             data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.DELETE_ALIGNMENT_BLOCK:
+        # Idempotent block replace (align): delete this block's exact alignment
+        # footprint BEFORE register-files re-writes it, so a re-run (retry, or a
+        # resubmitted block covering the same footprint) never double-counts. Exact
+        # by construction (per-member OR) and feature_idx-agnostic (all of a read's
+        # alignment rows go), so a split sample's sibling-block rows survive. No
+        # file inputs: block_idx from the scope target, alignment_idx from the
+        # ticket (runner-bound above for the align block branch).
+        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
+            raise RuntimeError(
+                f"delete-alignment-block requires a block-scoped ticket; got "
+                f"{scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK](
+            pool,
+            block_idx=scope_target["block_idx"],
+            alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK:
+        # Terminal step of the `align` workflow: mark this block completed, then
+        # finalize each covered sample whose last covering block just completed
+        # (flip its alignment_sample gate). No count-assertion / metrics rollup
+        # (alignment rows are not 1:1 with reads), so no data-plane hop. Runs AFTER
+        # register-files. No file inputs: block_idx from the scope target,
+        # alignment_idx from the ticket (runner-bound above for the align branch).
+        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
+            raise RuntimeError(
+                f"reconcile-alignment-block requires a block-scoped ticket; got "
+                f"{scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK](
+            pool,
+            block_idx=scope_target["block_idx"],
+            alignment_idx=bound[ALIGNMENT_IDX_BINDING],
         )
         return {}
 

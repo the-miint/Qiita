@@ -40,6 +40,39 @@ context_schema:
     tree_upload_idx: {type: integer, minimum: 1}
     jplace_upload_idx: {type: integer, minimum: 1}
     genome_map_upload_idx: {type: integer, minimum: 1}
+    # Analysis sharding (opt-in, default OFF). When true, after register-files the
+    # `plan-shards` action assigns this reference's genome-bearing features to N
+    # lineage-sorted shards (reference_membership.shard_id) and fans out one
+    # build-shard-index ticket per shard; the reference goes loading → indexing →
+    # (all shards registered) → active, so `active` guarantees complete sharded
+    # indexes. Sharding is an indexing choice ON the same reference data — not a
+    # separate action. Taxonomy SHOULD be supplied (sharding sorts by lineage);
+    # an all-unclassified reference still shards (lineage=''). Default OFF →
+    # today's loading → active, no build, byte-identical.
+    shard_index: {type: boolean}
+    # Which per-shard analysis indexes to build (default-ON via the
+    # build-shard-index steps' `when:`; only meaningful when shard_index is true).
+    # Per-shard rype no longer exists — routing is the ONE whole-reference
+    # rype_router the sharded path builds automatically after plan-shards, so a
+    # shard builds only minimap2 + bowtie2.
+    build_minimap2: {type: boolean}
+    build_bowtie2: {type: boolean}
+    # Build params forwarded to the shard builders (minimap2_preset ->
+    # build_minimap2_index.preset).
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+  # A sharded reference must build at least one per-shard index type — reject
+  # sharding with both aligner builders disabled. Fires only when shard_index is
+  # true AND both build_* are explicitly false (an omitted build_* defaults ON via
+  # `when:`, so the common sharded path is unaffected). The whole-reference
+  # rype_router is always built for a sharded reference regardless.
+  not:
+    required: [shard_index, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
 
 success_status: active
 failure_status: failed
@@ -79,6 +112,60 @@ steps:
 
   - action: register-files
     inputs: [staging_dir]
+    outputs: []
+
+  # Sharded-index fan-out (opt-in). Runs ONLY when action_context sets
+  # shard_index: true. MUST follow register-files — a shard build streams its
+  # chunks from DuckLake, and register-files is what MOVES the staging chunks in.
+  # plan-shards assigns reference_membership.shard_id, transitions
+  # loading → indexing, and fans out one build-shard-index ticket per shard.
+  # A shard_index: true reference with N = 0 shardable features (no genomes / no
+  # genome map) FAILS the ticket rather than finalizing an unroutable `active`
+  # reference. The action keeps success_status: active for the unsharded path; the
+  # runner's finalize skips that patch while a sharded fan-out is in progress (the
+  # reference is `indexing`), leaving `indexing → active` to each shard's terminal
+  # finalize-shard. No inputs/outputs: reference_idx is the scope target.
+  - action: plan-shards
+    when: shard_index
+    inputs: []
+    outputs: []
+
+  # Whole-reference routing index (gated on the same fan-out as plan-shards).
+  # plan-shards sets `router_pending: true` ONLY when it fanned out (N > 0 shards)
+  # and stages the `shard_mapping` Parquet these steps consume; for an unsharded
+  # reference (no `shard_index`) it sets `router_pending: false` so all three
+  # entries skip and the reference goes `active` inline. (A `shard_index: true`
+  # reference with N == 0 shardable features fails the ticket in plan-shards, so it
+  # never reaches these steps.) Runs in the PARENT ticket
+  # AFTER plan-shards (needs reference_membership.shard_id) and in parallel with
+  # the per-shard build children. build_routing_index builds the ONE
+  # whole-reference multi-bucket rype ROUTER (one bucket per shard) that routes a
+  # read to its shard(s); register-index records it as a `rype_router` row
+  # (shard_id NULL); finalize-shard re-counts (all per-shard indexes AND the
+  # router) and does the guarded indexing → active — converging with each child's
+  # finalize-shard so whichever completes the full set last flips `active`.
+  - step: build_routing_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_routing_index
+    when: router_pending
+    inputs: [shard_mapping]
+    outputs: [routing_index_meta]
+    # Whole-reference rype build, sized like host-reference-add's build_rype_index:
+    # DuckDB is hard-capped and rype gets the rest of the cgroup; an OOM retry
+    # doubles to the 128 GB action ceiling.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 64
+      walltime: PT2H
+
+  - action: register-index
+    when: router_pending
+    inputs: [routing_index_meta]
+    outputs: []
+
+  - action: finalize-shard
+    when: router_pending
+    inputs: []
     outputs: []
 
 action_ceiling:

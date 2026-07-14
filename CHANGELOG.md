@@ -15,6 +15,25 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Sharded-alignment review revisions (#268).** Reworked the sharded-alignment
+  path per review: the aligner is now derived from the run's sequencing platform
+  (Illumina → bowtie2, PacBio HiFi / Nanopore → minimap2) at align-plan rather than
+  chosen by the caller (`AlignPlanRequest` drops `aligner`; an unsupported platform
+  is refused 422); bowtie2 runs the modified-SHOGUN parameter set (all concordant
+  placements via `report_all`) and a pooled `cigar_sequence_identity` filter keeps
+  only high-identity pairs (kept/dropped as a unit, never orphaning a mate),
+  minimap2 uses `map-hifi` + `eqx` + `max_secondary := 100` (its analogue of
+  `report_all` — dropping the arg falls back to a finite default that truncates
+  multi-mapping reads). The identity floor is per-aligner: bowtie2 0.99 (short
+  reads match nearly end-to-end), minimap2 0.90 (long reads carry more per-read
+  divergence); the DuckLake `alignment` table drops the raw
+  `reference`/`mate_reference` VARCHARs (`feature_idx`/`mate_feature_idx` carry the
+  identity). A sharded reference's per-shard `.mmi` is now always built with the
+  fixed `map-hifi` preset (not tunable on load). The GPL boundary is installed once
+  at deploy (miint staging) instead of per job. Added a neutral `INDEX_TYPE_MINIMAP2`
+  constant for the analysis-reference context (the host-filter-branded alias stays).
+  (#268)
+
 - **The work-ticket notification email now accounts for every ticket the recipient
   has, not just the ones that reached a terminal state.** Notifications land
   per-batch as tickets terminate, so during a fanout the recipient gets a stream of
@@ -69,6 +88,34 @@ the `no-changelog` label).
   to match. (#276)
 
 ### Fixed
+
+- **Sharded-alignment review — silent-wrong-data and pre-flight-failure fixes (#268).**
+  A second review pass surfaced latent defects in the (never-yet-run) sharded path,
+  fixed here:
+  - `pyarrow` is now an explicit `qiita-compute-orchestrator` dependency — the sharded
+    index-build steps import `pyarrow.flight`, so without it the first `reference-add`
+    / `build-shard-index` ticket died `ModuleNotFoundError`.
+  - Deleting an alignment definition mid-flight no longer silently realigns RAW
+    (non-host-depleted, un-QC'd) reads: the align/mask discriminator now reads the
+    trusted `action_context` alignment_idx and fails loud when it disagrees with the
+    `ON DELETE SET NULL` `work_ticket.alignment_idx` column.
+  - Deleting a reference that any alignment definition aligns against is refused, even
+    with `force` — the cascade cannot clean the DuckLake `alignment` rows it owns
+    (keyed on orphaned `feature_idx`); the operator deletes the alignment definition
+    first.
+  - `finalize_shard` no longer flips a reference to `active` with the current shard
+    generation unbuilt: a re-plan invalidates the reference's per-shard
+    `reference_index` rows in the same transaction, re-scoping the completeness gate
+    to the current generation.
+  - `build_routing_index` scopes the rype corpus to the shard-mapped feature set
+    instead of hard-failing after the fan-out when a reference has no-genome members —
+    a partial genome map is a supported input, not a post-fan-out failure.
+  - `shard_index=true` on a reference with no shardable features now fails the ticket
+    (redrivable `failed → pending`) instead of finalizing a terminal, unroutable
+    `active` reference.
+  - The minimap2 identity floor is 0.90 (was sharing bowtie2's 0.99), so long-read
+    placements are no longer silently discarded; `build_routing_index` also cleans up
+    its multi-GB `router_chunks.parquet` intermediate instead of leaking it. (#268)
 
 - **A DB-tier test leaked terminal work tickets, reddening `main` on macOS.**
   `test_sequence_range_backfill`'s fixture seeded `work_ticket` rows and never removed
@@ -195,6 +242,206 @@ the `no-changelog` label).
 
 ### Added
 
+- **Sharded-reference alignment consumer (C2b).** Wires the C1 `align_sharded`
+  native job into a runnable `align` workflow: an operator submits an align run
+  for a sequenced-pool against an ACTIVE sharded reference + an aligner, the CP
+  mints an `alignment_idx` (deduped on the align config — reference + aligner +
+  mask + the reference's sorted shard-set; growth is not yet supported), tiles the
+  pool's already-MASKED samples into blocks, fans out one `align` block ticket
+  per block, each streams that block's masked reads (new Rust
+  `export_read_masked_block` DoAction over the `read_masked` view), runs
+  `align_sharded`, and registers an `alignment.parquet` into a new DuckLake
+  `alignment` table (keyed by `alignment_idx`, NOT `processing_idx` — the formal
+  hierarchy is deferred). A per-`(alignment_idx, prep_sample)` gate
+  (`alignment_sample`, twin of `mask_sample`) flips `completed` once every
+  covering block finishes; re-submitting a completed sample is refused until its
+  rows are DELETEd (disallow-without-delete). Adds the `alignment_definition` /
+  `alignment_sample` identity + gate tables and `mint_alignment_definition`
+  (migrations `20260712000000`/`010000`), a nullable `work_ticket.alignment_idx`
+  (`20260712020000`), the `delete-alignment-block` / `reconcile-alignment-block`
+  library primitives (backed by new replay-safe `delete_alignment_block` /
+  `delete_alignment` data-plane DoActions over the `alignment` table), the
+  `align_planner` fan-out, and `POST .../sequenced-pool/{}/align-plan`. The
+  disallow-without-delete escape hatch is `DELETE
+  /alignment-definition/{alignment_idx}` (new system_admin-only
+  `alignment_definition:delete` scope) — it purges the alignment's DuckLake rows
+  and its `alignment_definition` row, cascading the `alignment_sample` gate so a
+  fresh plan can re-align. (#268)
+
+- **Sharded-reference alignment foundation (C2a).** Makes a *sharded* reference
+  index-complete and resolvable — the piece C1 left missing (it shipped the
+  `align_sharded` consumer but nothing built the whole-reference router in
+  production or resolved its path). A sharded `reference-add` /
+  `local-reference-add` now builds and registers the ONE whole-reference
+  `rype_router` after `plan-shards`: the `plan-shards` runner arm stages a
+  `shard_mapping` Parquet from `reference_membership.shard_id` (Postgres — the
+  authoritative store) and returns `router_pending`, which gates three new
+  workflow entries (`build_routing_index` → `register-index` → `finalize-shard`)
+  run by the PARENT ticket in parallel with the per-shard build children.
+  `finalize_shard` now gates `indexing → active` on the `rype_router` row being
+  present (shard_id NULL) in addition to every per-shard index — so `active`
+  guarantees a routable, alignable sharded reference. Adds a shard-aware resolver
+  `_resolve_sharded_align_indexes(reference_idx, aligner) → (router_paths,
+  shard_directory)` (router paths returned as a LIST for the forward growable-
+  reference case; `shard_directory` derived from a per-shard row's fs_path parent)
+  — shipped tested but UNWIRED (the align workflow / DuckLake alignment sink /
+  block fan-out are the deferred C2b). The `reference_index.index_type` CHECK now
+  admits `rype_router` (migration `20260711000000`). (#268)
+
+- **Sharded alignment consumer (C1, native-job-only).** Three native jobs that
+  *consume* the per-shard indexes B5 produces, so a read aligns against only the
+  shard(s) it minimises into. `build_routing_index` builds a whole-reference
+  MULTI-bucket rype router (`references/{idx}/rype-router.ryxdi`, one bucket per
+  shard) that one `rype_classify` pass turns into a `read_to_shard` table.
+  `align_sharded` (aligner `minimap2`|`bowtie2`) streams that routing, makes a
+  SINGLE `align_{minimap2,bowtie2}_sharded` call over the whole read block
+  (modelled on `host_filter` — no SE/PE split; a read set is uniformly SE or PE
+  by construction and the aligners handle the mode natively), passes the aligner's
+  FULL output through verbatim, and adds only `prep_sample_idx`, `feature_idx`
+  (`CAST(reference)`), and `mate_feature_idx` (`CAST(mate_reference)`), emitting a
+  sorted `alignment.parquet`. NO dedup — `(sequence_idx, feature_idx)` is not a
+  key: a read routed to K shards yields K distinct-`feature_idx` rows, and a PE
+  read's two mate rows are ONE read's alignment to a feature (the pairing explicit
+  in `flags` + the mate columns), not two independent alignments. The
+  `derived_store` per-shard aligner layout was
+  revised to the exact `shard_directory` shape miint expects
+  (`minimap2-shards/{shard_id}.mmi`, `bowtie2-shards/{shard_id}/index*`), and the
+  `align_{minimap2,bowtie2}_sharded` + multi-bucket `rype_classify` contract is
+  now qiita-verified in `docs/duckdb-miint.md`. Adds `INDEX_TYPE_RYPE_ROUTER`.
+  Not wired into a workflow (C2 wires the runner block × shard fan-out + the
+  DuckLake alignment sink); the `reference_index.index_type` CHECK gains
+  `rype_router` only when C2 registers the router. (#268)
+
+- **Sharded-index status endpoint (B5, observability).** New
+  `GET /api/v1/reference/{idx}/shard-index-status` (model `ReferenceShardIndexStatus`)
+  surfaces a sharded reference's fan-out build progress: `expected_shards` (N, derived
+  from `reference_membership.shard_id` — the same count `finalize-shard` gates on),
+  per-`index_type` `registered_shards` (each expected type seeded to 0 so a wholly-unbuilt
+  type is visible rather than absent), and `failed_shard_tickets` (build-shard-index
+  tickets in `failed`). Makes a reference wedged in `indexing` on a permanently-failed
+  shard diagnosable; remediation is an operator redrive of the FAILED ticket. Scoped to
+  `reference:read` like the `/index` listing; an unsharded reference reads all-zero /
+  empty. (#268)
+
+- **Sharded reference-add wiring + build-shard-index workflow + CLI (B5,
+  live end-to-end).** `reference-add` / `local-reference-add` gain an opt-in
+  `shard_index` context flag (+ `build_rype`/`build_minimap2`/`build_bowtie2`
+  gates, `rype_w`/`minimap2_preset` knobs, and a both/all-off backstop); when set,
+  a `plan-shards` action runs after register-files to assign shards and fan out
+  the build. A new `build-shard-index/1.0.0` workflow (target_kind reference, NO
+  success_status) builds one shard's rype/minimap2/bowtie2 indexes (each gated,
+  each with a register-index sibling) and ends with `finalize-shard`. The runner's
+  finalize now skips the parent's success_status patch while a sharded fan-out is
+  in progress (`_shard_fanout_owns_finalize`) so `indexing → active` is owned by
+  the terminal finalize-shard — unsharded / sharded-but-N=0 / host paths patch
+  `active` inline unchanged. The CLI's `qiita reference load` gains `--shard-index`
+  (mutually exclusive with `--host`, requires `--taxonomy`) and `--no-bowtie2-index`,
+  and the existing index knobs (`--no-rype-index`/`--no-minimap2-index`/`--rype-w`/
+  `--minimap2-preset`) now apply to `--shard-index` as well as `--host`. Default
+  (no `shard_index`) is byte-identical to today's `loading → active`. (#268)
+
+- **Runner shard-roster staging + rype shard build streams (B5).** For a
+  reference-scoped ticket carrying a non-NULL `shard_id`, the runner now stages
+  the shard's feature roster before the step loop (`_stage_shard_roster`): it
+  reads the shard's members from `reference_membership.shard_id`, signs a
+  `feature_idx`-scoped `reference_sequences` DoGet (so each shard transfers only
+  its own slice, not the whole reference N times), and writes
+  `shard_roster.parquet`, binding `shard_features` + `shard_id` for the build
+  steps' `Inputs`. `build_rype_index` shard mode now STREAMS its chunks from the
+  data plane (`open_reference_chunk_stream`, scoped to the roster) instead of
+  reading a staging Parquet — a shard build runs after the ingest ticket's
+  register-files has moved the staging chunks into DuckLake, so there is no
+  staging Parquet to read (matching how B4's minimap2/bowtie2 shard modes already
+  stream). Host/whole-reference rype mode is byte-identical (staging read).
+  A Flight failure / empty shard is wrapped as a SUBMISSION BAD_INPUT.
+  (#268)
+
+- **Sharded-index fan-out + count-based completion (B5).** A new
+  `shard_orchestration.plan_and_submit_shards` turns a `plan_shards` assignment
+  into N build tickets: it transitions the reference `loading → indexing` and,
+  in one transaction, INSERTs one PENDING `build-shard-index` `work_ticket` per
+  shard (scope `reference`, carrying `shard_id=k` + the index-selection context
+  copied from the parent), then dispatches each fresh ticket. N = 0 (no genomes)
+  is a no-op. Idempotent on redrive (`ON CONFLICT DO NOTHING` on the per-shard
+  index; the `loading → indexing` transition tolerates an already-`indexing`
+  reference). The runner threads a `dispatch_cb` (`schedule_dispatch`) from the
+  dispatch layer down through `run_workflow` → `_run_action_primitive` so the
+  fan-out fires child dispatches; a crash between INSERT and dispatch leaves the
+  tickets PENDING for the next startup reconcile. A new `finalize-shard`
+  primitive (`actions.library.finalize_shard`, registered in `LIBRARY`) is each
+  build ticket's terminal step: it counts registered shards per expected
+  `index_type` against N (derived from `reference_membership`) and does the
+  guarded `indexing → active` only when every type is complete — fail-closed
+  (a missing shard leaves `indexing`; it never flips to `failed`), and
+  last-observer-race-safe (the guarded UPDATE lets exactly one racer win;
+  a finalize that finds the reference already `active` is idempotent success).
+  Dormant — no workflow YAML references these actions yet. (#268)
+
+- **`plan-shards` assignment core (B5).** A new CP-side `action:` primitive
+  (`plan_shards`, registered in `LIBRARY`) turns the B2 tiler + persistence into
+  an end-to-end shard assignment for one reference: it streams
+  `(feature_idx, genome_idx)` from Postgres to a Parquet, DoGets the reference's
+  `reference_taxonomy` from the data plane to a Parquet, reduces to one
+  lineage per genome in a local DuckDB (`arg_min` over the lowest feature_idx —
+  a deterministic representative; all-NULL taxonomy → unclassified `''`), tiles
+  lineage-sorted via `tile_by_lineage`, expands genome→feature back in DuckDB,
+  and persists onto `reference_membership.shard_id`. Returns N (=
+  `min(num_shards, genome_count)`; 0 for a reference with no genomes).
+  No-genome features are dropped by the inner JOIN and stay `shard_id NULL`
+  (16S / deferred). `write_shard_assignment` now clears every membership row's
+  `shard_id` first, so a re-plan that drops a feature leaves it NULL rather than
+  stale. Dormant — the N-ticket fan-out over the assigned shards is a later
+  commit. (#268)
+
+- **`work_ticket.shard_id` fan-out discriminant (B5 schema).** A nullable
+  `INTEGER` column (CHECK: only legal on `reference` scope, `>= 0`) lets N
+  concurrent same-action build tickets fan out over one reference without
+  colliding. The existing `work_ticket_one_in_flight_per_reference` partial
+  UNIQUE is re-partitioned with `AND shard_id IS NULL` (preserving the exact
+  one-per-reference guarantee for every non-sharded action and the ingest
+  ticket), and a new `work_ticket_one_in_flight_per_shard` gates at most one
+  non-terminal ticket per `(action, reference, shard)`. The `WorkTicket` model
+  and the runner/route read paths carry `shard_id`; a racing INSERT maps to 409
+  like every other scope. Dormant — nothing sets `shard_id` yet. (#268)
+
+- **Per-shard aligner-subject builders (B4): minimap2 `.mmi` + bowtie2 `.bt2`,
+  streaming via B6s.** `build_minimap2_index` gains a shard mode and a new
+  `build_bowtie2_index` native job lands alongside it. Given a `shard_id` + a
+  runner-staged feature roster, each builds one shard's analysis subject index over
+  just that shard's features, pulling the chunk bytes from the data plane over Arrow
+  Flight (the B6s stream) instead of staging Parquet, and writing to
+  `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/{minimap2,bowtie2}/index*`
+  (new `derived_store` helpers). Host/whole-reference mode is unchanged
+  (byte-identical staging read). The chunk reassembly is single-sourced in a new
+  `subject.stage_subject`; the ticket-fetch+stream composition is a new
+  `data_plane_client.open_reference_chunk_stream`. Both builders expose a `plan()`
+  that sizes shard memory down from the whole-reference baseline. bowtie2's index is
+  preset-independent (`save_bowtie2_index` takes no preset, unlike minimap2) and
+  needs no GPL boundary — both verified against the team-mirror miint build by the
+  host-mode real-miint smokes. The builders are unwired (jobs only); shard
+  assignment, roster staging, fan-out, and workflow wiring are B5. (#268)
+
+- **`reference_index.index_type` admits `'bowtie2'` (B4 precursor).** A one-line
+  additive CHECK migration extends the `reference_index_index_type_check` allow-list
+  to `rype`/`minimap2`/`bowtie2`; a matching `INDEX_TYPE_BOWTIE2` constant lands in
+  `qiita-common`. bowtie2 is an analysis-only subject index, so it is deliberately
+  absent from `HOST_FILTER_REQUIRED_INDEX_TYPES` (unlike the dual-purpose
+  rype/minimap2). No Postgres ENUM twin (TEXT+CHECK), no `register_index`/runner
+  change (already generic over `index_type`). (#268)
+
+- **Compute-side reference-chunk streaming (B6s).** The orchestrator can now pull a
+  reference's sequence chunks from the data plane over Arrow Flight instead of
+  reading staging Parquet — the streaming foundation the B4 shard builders sit on.
+  A new orchestrator `DATA_PLANE_URL` setting (default `grpc://localhost:50051`, not
+  fail-fast) is propagated into the SLURM job env like `PATH_DERIVED` so the native
+  launcher resolves the real data-plane origin on the compute node. A new
+  `data_plane_client` module carries the two-step retrieval path: an async
+  `fetch_reference_doget_ticket` (CO→CP, compute SA PAT) that obtains a
+  `feature_idx`-scoped ticket at job runtime, and a streaming `stream_reference_chunks`
+  context manager (CO→DP Flight DoGet) that registers the `(feature_idx, chunk_index,
+  chunk_data)` stream into DuckDB for lazy, unbuffered reassembly. The live `compute`
+  service account needs the `ticket:doget` scope (already within
+  `SERVICE_ACCOUNT_SCOPE_CEILING`) to mint the ticket. (#268)
 - **PacBio case-5 read-mask chain.** The read-mask workflow gains two optional,
   `when:`-gated stages around its always-on QC and host filter, so one workflow
   serves all five PacBio protocols and Illumina unchanged:
@@ -985,6 +1232,44 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Reference-arc efficiency/latency/DRY follow-ups.** Dropped a redundant
+  `ORDER BY rm.feature_idx` from `_export_member_genome` (no consumer relies on
+  the row order — every downstream reducer/tiler re-sorts — so it only risked an
+  explicit Sort over millions of `(feature_idx, genome_idx)` rows at GG2 scale).
+  Moved the `delete_read_mask_block` / `delete_alignment_block` data-plane
+  DoActions onto `tokio::task::spawn_blocking` so their blocking DuckLake delete
+  transactions never starve a tonic async worker (matching the four sibling
+  delete arms). Single-sourced the reference shard-set queries
+  (`count(DISTINCT shard_id)` / sorted `DISTINCT shard_id` over the non-NULL
+  `reference_membership` rows) into a new `repositories/reference_membership.py`
+  (`count_reference_shards` / `reference_shard_ids`), replacing four
+  byte-identical copies whose drift would make the reference-add finalizer gate
+  on a different threshold than the planner assigned. Pure quality — no change to
+  persisted data. (#268)
+
+- **Single-sourced the sequence-chunk reassembly SQL.** Added
+  `reassemble_chunks_expr` to `qiita_common.chunking` next to the existing
+  `sequence_split_expr`, so the `string_agg(chunk_data, '' ORDER BY chunk_index)`
+  reassembly (previously hand-written in `build_minimap2_index` and
+  `hash_sequences`) has one home for both directions of the chunk contract.
+  Pure refactor — both call sites emit byte-identical SQL. (#268)
+
+- **`reference_taxonomy` is now 1-1 with a reference's features; taxonomy
+  coverage gaps warn loudly instead of dropping silently.** `reference_load`'s
+  `_write_taxonomy` used an INNER JOIN on `read_id`, which silently dropped both
+  features with no supplied taxonomy row and taxonomy rows keyed to an unknown
+  `feature_id` (the same ID-namespace-mismatch class that already bit the genome
+  map). It now writes exactly one row per reference feature: a feature with no
+  supplied taxonomy is recorded at rest as an all-NULL-rank ("unclassified")
+  row rather than dropped. Coverage anomalies — missing taxonomy, stray/unmatched
+  `feature_id`s, and duplicate supplied rows (collapsed to one per feature) — are
+  logged as loud `WARNING`s (landing in the SLURM job log) rather than failing
+  the ingest, because real corpora are not strictly 1-1 (GG2's 2024.09 backbone
+  has ~29 features with no taxonomy). The supplied-content format checks (≤8
+  ranks, no blank fields, prefix order) stay hard `ValueError`s. No schema change
+  (the rank columns are already nullable) and no migration; already-ingested
+  references are not backfilled — only new ingests get the 1-1-at-rest shape.
+  (#268)
 - **The read-mask `biological` count predicate is now a whitelist.** It was
   `reason NOT LIKE 'qc_%'` — fail-OPEN, so every reason added since would have
   been counted as biological by default, which is exactly how `spikein_syndna`
@@ -1670,6 +1955,17 @@ the `no-changelog` label).
 
 ### Removed
 
+- **Per-shard rype build (C2a).** The whole-reference `rype_router` replaces the
+  per-shard `.ryxdi` for read routing, so the vestigial per-shard rype build is
+  gone: `build_rype_index` is now host/whole-reference only (its SHARD-mode
+  Inputs, both-or-neither validator, streaming branch, shard bucket, and `plan()`
+  shard sizing removed); `build-shard-index` drops the `build_rype_index` step +
+  its `register-index` + the `build_rype`/`rype_w` context keys (per-shard indexes
+  are now minimap2 + bowtie2 only); `reference-add` / `local-reference-add` drop
+  `build_rype`/`rype_w` from their sharded context (rype/`rype_w` now apply to
+  `--host` only in the CLI); and `derived_store` drops `shard_rype_index_path` +
+  `reference_shard_dir`. (#268)
+
 - **`qiita-admin work-ticket backfill-mask-idx` retired.** The one-time mask_idx
   backfill (for tickets predating the column) has run in production; the CLI
   command — the only ticket signer outside the control-plane web process, which
@@ -1689,6 +1985,108 @@ the `no-changelog` label).
   are manual and there is no CI/tag-triggered deploy path. (#233)
 
 ### Fixed
+
+- **`plan-shards` is now genuinely opt-in (B5).** The `when: shard_index` gate
+  defaults ON for an absent key (correct for the `build_*` gates, which default to
+  building all index types), so `plan-shards` ran on a plain `reference-add` that
+  never set `shard_index` — fanning out (or, in production with a dispatch
+  callback, even sharding a genome-bearing reference nobody asked to shard). The
+  runner's `plan-shards` arm now self-defends — no-op when `bound.get("shard_index")`
+  is falsy, mirroring the finalize `_is_sharded_fanout_in_progress` check — before
+  the fan-out precondition (`dispatch_cb`) is required. `when: shard_index` is kept
+  as the explicit-opt-out gate. Fixes the two reference-add smokes. (#268)
+
+- **Data plane: ambiguous `feature_idx` under the reference-membership JOIN.**
+  `build_query` qualified only `reference_idx` (with the membership alias `m.`)
+  when a `reference_sequences` / `reference_sequence_chunks` filter triggered the
+  membership JOIN, leaving any other column unqualified. A combined
+  `{reference_idx, feature_idx}` filter — exactly what the B6 `feature_idx`-scoped
+  DoGet ticket mints — then failed to bind with "Ambiguous reference to column name
+  feature_idx" (`feature_idx` exists on both joined tables). The non-reference_idx
+  columns are now qualified with the base-table alias `t.`. (#268)
+
+- **`feature_idx`-scoped DoGet ticket (B6).** `POST /reference/{idx}/ticket/doget`
+  gains an optional `feature_idx` subset on its request body: omitted ⇒ today's
+  whole-reference ticket (`filter={"reference_idx":[idx]}`), byte-identical;
+  present ⇒ the ticket additionally scopes to those features
+  (`filter` gains `"feature_idx":[...]`, bounded at 100k) so a shard builder
+  streams only its own roster's sequences from `reference_sequences` /
+  `reference_sequence_chunks`. The status gate now admits `active` **and**
+  `indexing` (a shard build streams mid-ingest, post-`register-files`);
+  `pending`/`loading` stay 409, missing stays 404. No new route (the existing
+  `URL_REFERENCE_DOGET` triple is reused), no migration, no data-plane change
+  (`feature_idx` filtering already exists and is tested there). (#268)
+
+- **Per-shard rype `.ryxdi` build (parameterized `build_rype_index` + `plan()`).**
+  The `build_rype_index` native job gains an optional **shard mode**: given a
+  `shard_id` and a runner-staged feature roster (`shard_features`, a Parquet of
+  `(feature_idx, sequence_length_bp)`), it builds one shard's rype `.ryxdi` routing
+  index over just that shard's features and writes it to
+  `{PATH_DERIVED}/references/{idx}/shards/{shard_id}/index.ryxdi`
+  (`derived_store.shard_rype_index_path`), recording `shard_id` in the meta JSON
+  (the register-index arm already threads it, B1). Both shard fields unset =
+  today's whole-reference host build, byte-identical. Adds a `plan()` that sizes
+  the shard build's `mem_gb` down from the whole-reference baseline (floored at the
+  runtime-consistent rype+DuckDB+headroom minimum, scaled by the shard's total bp),
+  so a fleet of small shards doesn't each grab the 64 GB whole-reference slot.
+  Re-verified `rype_index_create` against upstream miint (`docs/duckdb-miint.md`
+  refreshed). No shard fan-out / workflow wiring yet — that's a later milestone;
+  16S/no-genome sharding deferred. (#268)
+
+- **Lineage-sorted shard planner + `reference_membership.shard_id` persistence.**
+  The deterministic partition of an analysis reference's features into shards. A
+  pure tiler `qiita_control_plane.shard_planner.tile_by_lineage(items, num_shards)`
+  sorts the sharding units lexicographically by taxonomy lineage string and cuts
+  the sorted list into a fixed `_SHARD_COUNT = 1000` approximately-even shards
+  (fixed count / variable size — the mirror image of the read-block planner). The
+  tiler is generic over units (the caller chooses `item_id = genome_idx` for a
+  genome reference so shards balance by genome count and a genome's contigs stay
+  together); it is deterministic and re-derivable (internal `(lineage, item_id)`
+  sort). A new nullable `qiita.reference_membership.shard_id INTEGER` (+ a `>= 0`
+  CHECK) records the assignment (NULL = unassigned/unsharded), written by
+  `write_shard_assignment` (idempotent, replay-safe, reference-scoped). No shard
+  builds, fan-out, routing, or workflow wiring yet — those are later milestones;
+  16S / no-genome sharding is deferred. (#268)
+
+- **Per-shard `reference_index.shard_id` + register/GET/derived-store plumbing.**
+  The foundation for per-shard *analysis* reference indexes: `qiita.reference_index`
+  gains a nullable `shard_id INTEGER` (+ a `>= 0` CHECK) so a sharded index writes
+  one row per shard (`shard_id` 0..N-1) while the existing unsharded host index
+  keeps `shard_id` NULL. Additive and backward-compatible — no `shard_count`
+  (it's `COUNT(*)` per `(reference_idx, index_type)`), no new UNIQUE (the
+  `(reference_idx, index_type, fs_path)` idempotency key already dedups
+  path-distinct shard rows). `register_index` and `GET /reference/{idx}/index`
+  thread `shard_id`; the runner's register-index arm reads it from the meta JSON
+  (`meta.get` → NULL for host metas); the whole-reference resolver
+  (`_resolve_reference_index_path`) filters `shard_id IS NULL` so a shard row is
+  never served as the unsharded index; and `derived_store.reference_shard_dir`
+  lays down the `references/{idx}/shards/{shard_id}/` layout (under the existing
+  purge subtree). No shard builds, planner, or routing yet — those are later
+  milestones. (#268)
+
+- **`genome_source` controlled vocabulary + qiita-origin sample link.** `qiita.genome.source`
+  is now a closed vocabulary (`genbank`, `refseq`, `qiita`), enforced both up front at ingest
+  (fail-fast in `_associate_genomes`, before any DB write) and by a `CHECK`, mirrored by the new
+  `GenomeSource` `StrEnum`. Qiita-derived genomes (`source='qiita'`) now record the exact
+  originating sample via a new nullable `qiita.genome.prep_sample_idx` (FK to `qiita.prep_sample`,
+  required iff the source is `qiita` — a biconditional `CHECK`); the genome-map Parquet gains an
+  optional `prep_sample_idx` column. (#268)
+
+- **Reference-load's sequence-chunk re-key no longer sorts `chunk_data` (fixes a
+  GG2-scale OOM).** `_write_reference_sequence_chunks` re-keyed hash → feature_idx
+  by materializing each batch and sorting it `ORDER BY feature_idx, chunk_index` —
+  putting the 64 KB `chunk_data` rows through a sort, the exact anti-pattern
+  `hash_sequences` was built to avoid when writing the same table shape upstream.
+  The parallel sort's working set ballooned far past the batched input and OOM'd
+  DuckDB at genome scale (a sort can't spill rows that fat). It now writes each part
+  with a SINGLE streaming COPY — the narrow per-batch `feature_map` subset is the
+  hash-join build side and `chunk_data` rides the probe straight to the writer,
+  never buffered into a build or a sort (peak ~1 GB/thread, constant in file size).
+  File-level DuckLake pruning is preserved by bin-packing features into disjoint,
+  contiguous feature_idx ranges (one per part); the within-part sort is dropped
+  (on-disk order isn't load-bearing — reassembly sorts `chunk_index` in memory and
+  DoGet filters by feature_idx), and `_CHUNK_BUDGET_PER_BATCH` drops 50k→10k to keep
+  the per-part ranges narrow for pruning. (#268)
 
 - **`long-read-assembly` could never complete a run**, for two independent
   reasons. Container dispatch was gated to `{reference, sequenced_pool}`-scoped

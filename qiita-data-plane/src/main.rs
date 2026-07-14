@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     ducklake::ensure_reference_tables(&setup_conn)?;
     ducklake::ensure_read_tables(&setup_conn)?;
+    ducklake::ensure_alignment_tables(&setup_conn)?;
     ducklake::ensure_assembly_tables(&setup_conn)?;
     drop(setup_conn);
 

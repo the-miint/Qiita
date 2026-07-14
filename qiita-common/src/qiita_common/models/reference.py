@@ -136,6 +136,28 @@ def read_mask_reason_sql_list(bucket: ReadMaskBucket) -> str:
     return ", ".join(f"'{r}'" for r in reasons)
 
 
+class GenomeSource(StrEnum):
+    """Controlled vocabulary for a genome's provenance (`qiita.genome.source`).
+
+    `genbank` / `refseq` are the two NCBI assembly repositories; `qiita` marks a
+    genome derived from a qiita sample itself — those rows additionally carry
+    the originating `prep_sample_idx` on `qiita.genome` (enforced by the
+    `genome_qiita_origin_check` biconditional CHECK: prep_sample_idx set iff
+    source = 'qiita'). Extend deliberately (a new migration + a new value here);
+    ingest rejects anything outside the set.
+
+    Backs the `qiita.genome.source` column, which is plain `TEXT` + `CHECK`
+    (`genome_source_check`), NOT a Postgres `CREATE TYPE ... AS ENUM`. Per the
+    enum-parity carve-out in CLAUDE.md, it has no `ENUM_PAIRS` entry and is out
+    of scope for the parity test; the light `test_genome_schema` CHECK↔StrEnum
+    guard catches drift instead. Keep this set and the CHECK list in sync by hand.
+    """
+
+    GENBANK = "genbank"
+    REFSEQ = "refseq"
+    QIITA = "qiita"
+
+
 class TerminologyStatus(StrEnum):
     """Lifecycle states of a terminology row.
 
@@ -263,16 +285,44 @@ class PrepProtocolResponse(BaseModel):
     created_at: AwareDatetime
 
 
+# The minimap2 `.mmi` subject index. DUAL-PURPOSE: the second host-filter pass AND a
+# per-shard analysis-alignment index the sharded aligner consumes. Use this neutral
+# name in the analysis-reference (sharding / alignment) context;
+# HOST_FILTER_INDEX_TYPE_MINIMAP2 below is the SAME value, aliased for the
+# host-filter context so that code reads in host-filter terms.
+INDEX_TYPE_MINIMAP2 = "minimap2"
+
 # The two search-index types a host reference must carry to host-filter: a rype
 # `.ryxdi` minimizer index (first pass) and a minimap2 `.mmi` (second pass). Shared
 # so the runner's "must carry both" gate (_resolve_host_filter_indexes) and the
 # CLI's submit-host-filter-pool pre-check resolve the same pair instead of pinning
 # the literals independently and drifting.
 HOST_FILTER_INDEX_TYPE_RYPE = "rype"
-HOST_FILTER_INDEX_TYPE_MINIMAP2 = "minimap2"
+HOST_FILTER_INDEX_TYPE_MINIMAP2 = INDEX_TYPE_MINIMAP2
 HOST_FILTER_REQUIRED_INDEX_TYPES = frozenset(
     {HOST_FILTER_INDEX_TYPE_RYPE, HOST_FILTER_INDEX_TYPE_MINIMAP2}
 )
+
+# The bowtie2 subject index (`.bt2` set), an ANALYSIS-alignment index the sharded
+# aligner consumes. bowtie2 is analysis-only (unlike dual-purpose rype/minimap2), so
+# it is deliberately NOT in HOST_FILTER_REQUIRED_INDEX_TYPES. Mirrors the
+# `reference_index.index_type` CHECK allow-list (plain TEXT+CHECK, no Postgres ENUM
+# twin — see CLAUDE.md "Enum parity").
+INDEX_TYPE_BOWTIE2 = "bowtie2"
+
+# The whole-reference rype ROUTER `.ryxdi`: a single multi-bucket rype index
+# over the entire reference, one bucket per shard (`bucket_name = str(shard_id)`),
+# that one `rype_classify` pass turns into the `read_to_shard` table the sharded
+# aligners need. Analysis-only (like bowtie2) — NOT in
+# HOST_FILTER_REQUIRED_INDEX_TYPES. Written by the `build_routing_index` native
+# job with `shard_id` NULL (whole-reference, not per-shard).
+#
+# Admitted into the `reference_index.index_type` CHECK allow-list by
+# 20260711000000_reference_index_rype_router_type.sql: the sharded reference-add
+# path builds the router and registers the row. Previously the router was
+# native-job-only and its path passed directly to the align job, so no row
+# carried it yet.
+INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
 
 class ReferenceIndex(BaseModel):
@@ -282,7 +332,12 @@ class ReferenceIndex(BaseModel):
     the authoritative manifest (buckets, minimizer params, etc.) lives inside
     the index artifact itself. Mirrors the `qiita.reference_index` row. There
     may be more than one index per reference (different `index_type`, or — once
-    references can grow — newer generations of the same type)."""
+    references can grow — newer generations of the same type).
+
+    A sharded *analysis* index writes one row per shard (`shard_id` 0..N-1); an
+    unsharded whole-reference index (a host `rype`/`minimap2`) has `shard_id`
+    None. Like `index_type`, `shard_id` carries no allow-list here — the DB
+    CHECK (`shard_id IS NULL OR shard_id >= 0`) is authoritative."""
 
     reference_index_idx: Annotated[int, Field(gt=0)]
     reference_idx: Annotated[int, Field(gt=0)]
@@ -290,6 +345,37 @@ class ReferenceIndex(BaseModel):
     fs_path: str
     params: dict[str, Any]
     created_at: AwareDatetime
+    shard_id: int | None = None
+
+
+class ReferenceShardIndexStatus(BaseModel):
+    """Returned by GET /api/v1/reference/{idx}/shard-index-status.
+
+    Observability for a sharded analysis reference's fan-out build (the
+    `plan-shards` -> N x `build-shard-index` -> `finalize-shard` pipeline).
+    Makes a reference wedged in `indexing` on a permanently-failed shard
+    visible so an operator can redrive the offending ticket.
+
+    `expected_shards` is N, the shard count the planner assigned (COUNT(DISTINCT
+    shard_id) over `reference_membership`). `registered_shards` maps each
+    expected `index_type` to how many of the N shards have a registered
+    `reference_index` row: a type whose shards all completed reads `N`, a wedged
+    type reads `< N`, and a wholly-failed type reads `0` (still keyed, so it is
+    visible rather than silently absent). The reference reaches `active` only
+    once every expected type reaches N — the same count `finalize_shard` gates
+    on. `failed_shard_tickets` counts this reference's build-shard-index work
+    tickets in `failed`; those are what an operator redrives to unwedge the
+    build (its `finalize_shard` re-counts and, as the last observer, flips
+    `active`).
+
+    An unsharded reference — or one whose sharding fanned out zero shards (no
+    genome-bearing features) — reads `expected_shards=0`, empty
+    `registered_shards`, and zero `failed_shard_tickets`."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    expected_shards: Annotated[int, Field(ge=0)]
+    registered_shards: dict[str, Annotated[int, Field(ge=0)]]
+    failed_shard_tickets: Annotated[int, Field(ge=0)]
 
 
 class ReferenceArtifactPurgeResponse(BaseModel):
@@ -331,7 +417,7 @@ class ReferenceDeleteResponse(BaseModel):
 # genome data still gets the validator's protection.
 class FeatureHashEntry(BaseModel):
     sequence_hash: UUID
-    genome_source: str | None = None
+    genome_source: GenomeSource | None = None
     genome_source_id: str | None = None
 
     @model_validator(mode="after")

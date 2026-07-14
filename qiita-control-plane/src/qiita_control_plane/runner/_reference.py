@@ -10,6 +10,9 @@ import asyncpg
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    INDEX_TYPE_BOWTIE2,
+    INDEX_TYPE_MINIMAP2,
+    INDEX_TYPE_RYPE_ROUTER,
     ReferenceStatus,
 )
 
@@ -19,6 +22,7 @@ from ..actions.reference import (
     ReferenceNotFound,
 )
 from ..auth.tickets import sign_ticket
+from ._read_ingest import _workflow_declares_input
 from ._upload import _submission_bad_input
 
 # =============================================================================
@@ -50,6 +54,12 @@ async def _resolve_reference_index_path(
     ordered by created_at then reference_index_idx, both descending, so a
     same-timestamp tie still resolves deterministically to the latest row.
 
+    This is the *whole-reference* (unsharded) lookup: it filters to
+    `shard_id IS NULL` so a per-shard analysis-index row can never be served
+    here. All rows are NULL today, so this is a no-op now and forward-safe once
+    shard rows exist. Shard-aware resolution (routing a read to its shard) is a
+    later milestone and is deliberately NOT built here.
+
     Raises:
       * ReferenceNotFound — the reference row doesn't exist.
       * ValueError — the reference exists but isn't `active` (an index built
@@ -71,7 +81,7 @@ async def _resolve_reference_index_path(
         )
     fs_path = await pool.fetchval(
         "SELECT fs_path FROM qiita.reference_index"
-        " WHERE reference_idx = $1 AND index_type = $2"
+        " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NULL"
         " ORDER BY created_at DESC, reference_index_idx DESC"
         " LIMIT 1",
         reference_idx,
@@ -285,6 +295,172 @@ async def _resolve_host_filter_legacy(
             "a host reference must carry at least one host-filter index"
         )
     return bound
+
+
+# Sharded-aligner index resolution ------------------------------------------
+#
+# Maps a sharded aligner to (a) the reference_index.index_type its per-shard rows
+# carry and (b) how deep the per-aligner shard-ROOT sits above a single shard
+# row's fs_path. There is no reference_index row for the root itself, so the root
+# is derived from any one shard row's fs_path via `Path(fs_path).parents[depth]`:
+#   * minimap2 stores `.../minimap2-shards/{shard_id}.mmi`  -> root = parents[0]
+#   * bowtie2  stores `.../bowtie2-shards/{shard_id}/index` -> root = parents[1]
+# (see derived_store.shard_minimap2_index_path / shard_bowtie2_index_prefix). The
+# CP derives the root from the DB fs_path rather than reconstructing the path
+# convention — it cannot import the orchestrator's derived_store.
+# Per-aligner facts, kept together so a new aligner is one entry: the DB
+# `reference_index.index_type` string, and the number of `fs_path` parents to
+# climb to reach the shared shard-root directory (the path convention above).
+_SHARD_ALIGNER: dict[str, tuple[str, int]] = {
+    "minimap2": (INDEX_TYPE_MINIMAP2, 0),
+    "bowtie2": (INDEX_TYPE_BOWTIE2, 1),
+}
+
+
+async def _resolve_sharded_align_indexes(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    aligner: str,
+) -> tuple[list[Path], Path]:
+    """Resolve `(router_index_paths, shard_directory)` for `align_sharded`
+    against an ACTIVE sharded reference and one sharded aligner
+    (`minimap2` | `bowtie2`).
+
+    * **router_index_paths** — the whole-reference `rype_router` `.ryxdi`
+      path(s) (shard_id NULL), newest-first. Today exactly one, but returned as a
+      LIST so a future GROWABLE reference (new shards land in a SEPARATE router
+      UNIONed at classify time, no full rebuild) resolves to the SET the consumer
+      classifies against without a signature change. `align_sharded`'s current
+      single-Path `router_index_path` input is a consumer-side change.
+    * **shard_directory** — the per-aligner root holding all shards. There is no
+      `reference_index` row for the root, so it is derived from any one per-shard
+      row's `fs_path` (see `_SHARD_ALIGNER`): minimap2's root is
+      the fs_path PARENT (`.../minimap2-shards`), bowtie2's the PARENT-OF-PARENT
+      (`.../bowtie2-shards`).
+
+    Reached from the align workflow's runner staging (via
+    `_resolve_sharded_align_index_bindings`) and from
+    `align_planner.plan_and_submit_alignments`. Fail-fast, mirroring
+    `_resolve_reference_index_path`:
+      * ReferenceNotFound — no such reference.
+      * ValueError — the reference isn't `active` (an unknown aligner is also a
+        ValueError — a programming error, not a caller BAD_INPUT).
+      * ReferenceIndexNotBuilt (a ValueError subclass) — the reference is active
+        but the router, or the per-shard `aligner` index, isn't built yet.
+    """
+    if aligner not in _SHARD_ALIGNER:
+        raise ValueError(
+            f"unknown sharded aligner {aligner!r}; expected one of {sorted(_SHARD_ALIGNER)}"
+        )
+    index_type, root_parent_depth = _SHARD_ALIGNER[aligner]
+
+    status = await pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if status is None:
+        raise ReferenceNotFound(reference_idx)
+    if status != ReferenceStatus.ACTIVE.value:
+        raise ValueError(
+            f"reference {reference_idx} status is {status!r}, must be "
+            f"{ReferenceStatus.ACTIVE.value!r} to resolve its sharded {aligner} indexes"
+        )
+
+    # The router(s): whole-reference rype_router rows (shard_id NULL), newest
+    # first. `active` already guarantees >= 1 (finalize_shard gates on it), but
+    # resolve defensively.
+    router_rows = await pool.fetch(
+        "SELECT fs_path FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NULL"
+        " ORDER BY created_at DESC, reference_index_idx DESC",
+        reference_idx,
+        INDEX_TYPE_RYPE_ROUTER,
+    )
+    if not router_rows:
+        raise ReferenceIndexNotBuilt(
+            f"reference {reference_idx} has no {INDEX_TYPE_RYPE_ROUTER!r} routing index built yet"
+        )
+    router_paths = [Path(r["fs_path"]) for r in router_rows]
+
+    # Any one per-shard row of this aligner fixes the shard-root (all shards of a
+    # given aligner share the root by construction — the shard->path bijection
+    # register_index preserves).
+    shard_fs_path = await pool.fetchval(
+        "SELECT fs_path FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NOT NULL"
+        " LIMIT 1",
+        reference_idx,
+        index_type,
+    )
+    if shard_fs_path is None:
+        raise ReferenceIndexNotBuilt(
+            f"reference {reference_idx} has no per-shard {index_type!r} index built yet"
+        )
+    shard_directory = Path(shard_fs_path).parents[root_parent_depth]
+    return router_paths, shard_directory
+
+
+# Binding names the align step (`align_sharded`) declares as inputs. Their
+# presence signals the runner to resolve the sharded reference's router + shard
+# root from action_context before the step loop (the consumer wiring). The
+# router is bound as a SINGLE path (router_paths[0] — one router today; the
+# resolver returns a list for the deferred growth case).
+ROUTER_INDEX_PATH_BINDING = "router_index_path"
+SHARD_DIRECTORY_BINDING = "shard_directory"
+
+
+def _workflow_needs_sharded_align_indexes(steps: list[Any]) -> bool:
+    """True iff some entry declares `router_index_path`/`shard_directory` as inputs
+    — the signal the runner must resolve the sharded-aligner router + shard root
+    from action_context before the step loop (the `align` workflow). Mirrors
+    `_workflow_needs_mask`/`_workflow_needs_adapters`; the align step lists both, so
+    either presence triggers."""
+    return _workflow_declares_input(steps, ROUTER_INDEX_PATH_BINDING) or _workflow_declares_input(
+        steps, SHARD_DIRECTORY_BINDING
+    )
+
+
+async def _resolve_sharded_align_index_bindings(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    action_context: dict[str, Any],
+) -> dict[str, Path]:
+    """Resolve `router_index_path` + `shard_directory` for the `align` workflow
+    from action_context (`align_reference_idx` + `aligner`), binding the FIRST
+    router (`router_paths[0]`) as the single-Path `router_index_path` input
+    `align_sharded` takes. The entrypoint into the resolver.
+
+    `align_reference_idx` (not the reserved `reference_idx` key — block scope
+    injects no scope scalar) names the ACTIVE sharded reference; `aligner`
+    (`minimap2`|`bowtie2`) selects the per-aligner shard root. Wraps every failure
+    as a typed `BackendFailure(BAD_INPUT)` at stage=SUBMISSION that `run_workflow`
+    turns into a FAILED work_ticket — mirroring `_resolve_host_filter_indexes`."""
+    reference_idx = action_context.get("align_reference_idx")
+    aligner = action_context.get("aligner")
+    if reference_idx is None or aligner is None:
+        raise _submission_bad_input(
+            "an align ticket requires align_reference_idx + aligner in action_context; "
+            f"got align_reference_idx={reference_idx!r}, aligner={aligner!r}"
+        )
+    try:
+        router_paths, shard_directory = await _resolve_sharded_align_indexes(
+            pool, _coerce_reference_idx(reference_idx, "align_reference_idx"), str(aligner)
+        )
+    except ReferenceNotFound as exc:
+        raise _submission_bad_input(
+            f"align_reference_idx={reference_idx} references an unknown reference"
+        ) from exc
+    except ValueError as exc:
+        # Non-active reference, an unbuilt router / per-shard index
+        # (ReferenceIndexNotBuilt, a ValueError subclass), or an unknown aligner.
+        raise _submission_bad_input(
+            f"could not resolve sharded {aligner!r} indexes for reference {reference_idx}: {exc}"
+        ) from exc
+    # router_paths is non-empty (the resolver raises ReferenceIndexNotBuilt
+    # otherwise); take the newest as the single router align_sharded aligns against.
+    return {
+        ROUTER_INDEX_PATH_BINDING: router_paths[0],
+        SHARD_DIRECTORY_BINDING: shard_directory,
+    }
 
 
 # Binding for the syndna spike-in minimap2 index (the syndna step's input).

@@ -247,6 +247,75 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Create the DuckLake `alignment` table — the sink for the sharded-alignment
+/// consumer.
+///
+/// One row per emitted alignment: the `align_sharded` native job aligns a block
+/// of a sample's HOST-DEPLETED reads against a sharded reference and register-files
+/// lands its `alignment.parquet` here. The table is keyed by the CP-minted
+/// `alignment_idx` (the align config's params-hash identity: reference, aligner,
+/// mask, and shard-set), NOT by the deferred processing_idx / processed_prep_sample
+/// hierarchy. It carries `feature_idx` (the aligned subject) but NOT
+/// `reference_idx`: reference scoping is a query-time join against
+/// `reference_membership`, and a feature's shard is likewise derivable via
+/// `reference_membership.shard_id`, so there is no per-row `shard_id` column either
+/// (the identifier-ownership design in CLAUDE.md).
+///
+/// Column order = the exact order `align_sharded`'s COPY writes (so register-files'
+/// `ducklake_add_data_files` schema-matches for free): the five CP identity columns
+/// (`alignment_idx`, `prep_sample_idx`, `sequence_idx`, `feature_idx`,
+/// `mate_feature_idx`) followed by the miint aligner output
+/// `a.* EXCLUDE (read_id, reference, mate_reference)` — the SAM columns MINUS the raw
+/// VARCHAR subject ids, which are dropped because `feature_idx` / `mate_feature_idx`
+/// (cast from them) already carry that identity. That miint output was qiita-verified
+/// against the team-mirror v1.5.4 build for BOTH `align_minimap2_sharded` and
+/// `align_bowtie2_sharded` (identical schema; see docs/duckdb-miint.md). The types
+/// match miint exactly (`flags` USMALLINT, `mapq` UTINYINT, positions/lengths BIGINT)
+/// so the parquet registers without a cast; a miint SAM-schema change would need a
+/// matching migration here (coupled to the pinned DuckDB/miint version, per the
+/// version-lockstep discipline).
+///
+/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
+/// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
+/// stamps feature_idx). NOT exposed via Flight (absent from
+/// flight_service::ALLOWED_TABLES): the alignment table is a sink this milestone;
+/// a Flight read-side is deferred until a downstream consumer needs it.
+pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.alignment (
+            -- CP identity columns (align_sharded prepends these to the aligner output).
+            alignment_idx    BIGINT NOT NULL,
+            prep_sample_idx  BIGINT NOT NULL,
+            sequence_idx     BIGINT NOT NULL,
+            feature_idx      BIGINT NOT NULL,
+            mate_feature_idx BIGINT,
+            -- miint aligner output minus the raw VARCHAR subject ids
+            -- (reference / mate_reference): their identity is already carried by
+            -- feature_idx / mate_feature_idx (cast from them in align_sharded), so
+            -- persisting the strings too would be redundant.
+            flags            USMALLINT,
+            position         BIGINT,
+            stop_position    BIGINT,
+            mapq             UTINYINT,
+            cigar            VARCHAR,
+            mate_position    BIGINT,
+            template_length  BIGINT,
+            tag_as           BIGINT,
+            tag_xs           BIGINT,
+            tag_ys           BIGINT,
+            tag_xn           BIGINT,
+            tag_xm           BIGINT,
+            tag_xo           BIGINT,
+            tag_xg           BIGINT,
+            tag_nm           BIGINT,
+            tag_yt           VARCHAR,
+            tag_md           VARCHAR,
+            tag_sa           VARCHAR
+        );",
+    )?;
+    Ok(())
+}
+
 /// Create the assembly-result tables in DuckLake — the assembly analogue of the
 /// reference-sequence tables, following the SAME chunked + content-hashed model.
 ///
@@ -541,6 +610,63 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "read_masked view should exist exactly once");
+    }
+
+    /// ensure_alignment_tables is idempotent (CREATE TABLE IF NOT EXISTS, run on
+    /// every DP restart) and lays down the alignment sink in the EXACT column
+    /// order + types align_sharded's COPY writes, so register-files'
+    /// ducklake_add_data_files schema-matches. The full column list is pinned
+    /// here so a drift from the align_sharded output or the miint SAM
+    /// schema is caught at unit time rather than at register-files runtime.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_alignment_tables_is_idempotent_and_matches_align_output() {
+        let conn = setup_conn();
+        ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
+        ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, data_type FROM information_schema.columns \
+                 WHERE table_name = 'alignment' ORDER BY ordinal_position",
+            )
+            .unwrap();
+        let cols: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // 5 CP identity columns + the miint SAM columns MINUS the raw subject ids
+        // (a.* EXCLUDE (read_id, reference, mate_reference)), in align_sharded COPY
+        // order.
+        let expected: &[(&str, &str)] = &[
+            ("alignment_idx", "BIGINT"),
+            ("prep_sample_idx", "BIGINT"),
+            ("sequence_idx", "BIGINT"),
+            ("feature_idx", "BIGINT"),
+            ("mate_feature_idx", "BIGINT"),
+            ("flags", "USMALLINT"),
+            ("position", "BIGINT"),
+            ("stop_position", "BIGINT"),
+            ("mapq", "UTINYINT"),
+            ("cigar", "VARCHAR"),
+            ("mate_position", "BIGINT"),
+            ("template_length", "BIGINT"),
+            ("tag_as", "BIGINT"),
+            ("tag_xs", "BIGINT"),
+            ("tag_ys", "BIGINT"),
+            ("tag_xn", "BIGINT"),
+            ("tag_xm", "BIGINT"),
+            ("tag_xo", "BIGINT"),
+            ("tag_xg", "BIGINT"),
+            ("tag_nm", "BIGINT"),
+            ("tag_yt", "VARCHAR"),
+            ("tag_md", "VARCHAR"),
+            ("tag_sa", "VARCHAR"),
+        ];
+        let got: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        assert_eq!(got, expected, "alignment table schema/order drift");
     }
 
     #[test]

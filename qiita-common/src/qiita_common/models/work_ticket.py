@@ -12,7 +12,7 @@ priority resolve from the originator, not the executor.
 """
 
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
@@ -188,6 +188,12 @@ class WorkTicket(BaseModel):
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     originator_principal_idx: Annotated[int, Field(gt=0)]
     scope_target: ScopeTarget
+    # Analysis-index shard ordinal (0..N-1) for a sharded reference build
+    # ticket; None for every non-sharded ticket. Mirrors qiita.work_ticket.
+    # shard_id, whose CHECK ties a non-NULL value to reference scope. Lets N
+    # concurrent same-action build tickets fan out over one reference without
+    # colliding on work_ticket_one_in_flight_per_reference.
+    shard_id: int | None = None
     action_context: dict[str, Any] = Field(default_factory=dict)
     state: WorkTicketState
     # Retry accounting. retry_count starts at 0 and increments on each
@@ -348,6 +354,94 @@ class BlockMaskPlanResponse(BaseModel):
     blocks_created: Annotated[int, Field(ge=0)]
     partitions: list[BlockPlanPartition]
     blocks: list[BlockPlanBlock]
+
+
+class AlignPlanRequest(BaseModel):
+    """Request body for `POST .../sequenced-pool/{P}/align-plan` — the bulk-block
+    alignment entrypoint (the align analog of `block-mask-plan`).
+
+    Aligns the pool's HOST-DEPLETED, QC-passed reads (the completed read-mask the
+    block-mask-plan produced) against a sharded `reference_idx`. The aligner is NOT
+    a caller choice — the server derives it from the run's sequencing platform
+    (short-read Illumina → bowtie2, long-read PacBio HiFi / Nanopore → minimap2) and
+    reports it in the response. The host references identify WHICH mask the reads
+    were depleted under — the same `(host_rype_reference_idx[,
+    host_minimap2_reference_idx])` shape block-mask-plan takes — so the planner can
+    LOOK UP each sample's already-minted mask_idx (it never mints a mask). A pool
+    QC-only masked (no host filtering) is aligned by omitting both host refs.
+    minimap2 is the optional second host stage and never rides without rype.
+
+    `only_missing` drops samples already carrying a completion gate for their
+    resolved alignment, so an interrupted plan re-runs only the gap; off by default
+    so a deliberate re-plan still tiles pool-wide (and is refused, 409, if any
+    sample is already gated — DELETE the alignment first or pass only_missing)."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
+    host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
+    only_missing: bool = False
+
+    @model_validator(mode="after")
+    def _minimap2_requires_rype(self) -> AlignPlanRequest:
+        if self.host_minimap2_reference_idx is not None and self.host_rype_reference_idx is None:
+            raise ValueError(
+                "host_minimap2_reference_idx requires host_rype_reference_idx"
+                " (minimap2 is the optional second host-filter stage)"
+            )
+        return self
+
+
+class AlignPlanPartition(BaseModel):
+    """One mask-partition of an align plan: the samples sharing a resolved
+    `mask_idx` (and the `alignment_idx` minted over it) and how many blocks they
+    tiled into."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
+    sample_count: Annotated[int, Field(ge=0)]
+    block_count: Annotated[int, Field(ge=0)]
+
+
+class AlignPlanBlock(BaseModel):
+    """One planned align block: its idx, the block work_ticket dispatched for it,
+    the alignment + partition-mask it carries, and its size (members + reads)."""
+
+    block_idx: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    alignment_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
+    member_count: Annotated[int, Field(gt=0)]
+    read_count: Annotated[int, Field(gt=0)]
+
+
+class AlignPlanResponse(BaseModel):
+    """Returned (HTTP 202) by `POST .../align-plan`: the plan the server persisted
+    + dispatched. `blocks` lists every created block with its dispatched
+    work_ticket; `partitions` summarizes the per-mask tiling and the alignment_idx
+    minted over each; the `samples_*` counts reconcile the pool's samples (planned +
+    the several skip reasons). A pool with nothing to align returns 202 with zero
+    counts."""
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    reference_idx: Annotated[int, Field(gt=0)]
+    aligner: Literal["minimap2", "bowtie2"]
+    host_rype_reference_idx: int | None
+    host_minimap2_reference_idx: int | None
+    samples_planned: Annotated[int, Field(ge=0)]
+    # Dropped by only_missing (already carry an alignment_sample gate).
+    samples_skipped_existing: Annotated[int, Field(ge=0)]
+    # No read-mask minted for the sample's resolved filtering config (it was never
+    # block-masked under this host config).
+    samples_skipped_no_mask: Annotated[int, Field(ge=0)]
+    # A mask exists but is not `completed` for the sample (its masking is still
+    # in-flight / failed) — align only fully-masked samples.
+    samples_skipped_mask_incomplete: Annotated[int, Field(ge=0)]
+    # ACTIVE pool sample with no stored reads (no sequence_range) — nothing to tile.
+    samples_skipped_no_reads: Annotated[int, Field(ge=0)]
+    blocks_created: Annotated[int, Field(ge=0)]
+    partitions: list[AlignPlanPartition]
+    blocks: list[AlignPlanBlock]
 
 
 class WorkTicketSummary(WorkTicket):

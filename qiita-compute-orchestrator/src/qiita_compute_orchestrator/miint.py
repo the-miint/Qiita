@@ -255,6 +255,14 @@ def stage_miint_extension() -> str:
     with open_conn() as conn:
         conn.execute(miint_install_sql(force=True))
         conn.execute(miint_load_sql())
+        # Install the GPL-boundary tool host ONCE, here at deploy time — not per
+        # job. Several GPL-licensed tools (bowtie2 alignment, vsearch, …) run
+        # out-of-process behind this boundary; a native job that uses one only
+        # LOADs miint and relies on the boundary being pre-installed. Idempotent
+        # (a no-op once the binary is cached), and this stage runs as the account
+        # that owns the extension directory (qiita-orch in prod), the same account
+        # the SLURM jobs run as, so the cached binary is reachable at job runtime.
+        conn.execute("SELECT install_gpl_boundary()")
     # Record the staged build's fingerprint so the next deploy can skip a
     # redundant FORCE INSTALL when the mirror hasn't moved (see miint_staging).
     write_staging_marker()

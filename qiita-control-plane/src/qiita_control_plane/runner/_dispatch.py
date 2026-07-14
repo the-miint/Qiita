@@ -81,6 +81,44 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError(f"unknown scope_target_kind: {kind!r}")
 
 
+async def _shard_fanout_owns_finalize(
+    conn: asyncpg.Connection,
+    scope_target: dict[str, Any],
+    bound: dict[str, Any],
+) -> bool:
+    """True when this ticket kicked off a sharded fan-out, so the parent action's
+    finalize must NOT apply its success_status — the terminal `finalize-shard`
+    (each shard's, AND the parent's own router-tail one) owns `indexing → active`
+    once every shard + the router register.
+
+    Fires for a reference-scoped ticket whose action_context set `shard_index`
+    AND whose reference is `indexing` (plan-shards transitioned it because N > 0)
+    OR already `active`. The `active` case is essential: the parent reference-add
+    now runs its OWN terminal `finalize-shard` (the router tail), and because
+    the parent's whole-reference router build is the long pole, that parent
+    finalize is usually the LAST completion event — so it flips `indexing →
+    active` itself, and by the time this workflow-finalize runs the reference is
+    already `active`. Without admitting `active` here the parent would then
+    re-`_patch_resource_status(active)`, an illegal `active → active` transition
+    that fails the whole (successful) ticket.
+
+    An unsharded reference-add (no `shard_index`) returns False → the parent
+    patches `active` unchanged. (A `shard_index=true` request that yields N == 0 no
+    longer reaches finalize at all — plan-shards fails the ticket rather than
+    finalize an unroutable `active` reference, so there is no live N == 0 sharded
+    path here.) `bound` carries the action_context (resume-safe: reseeded from the
+    persisted ticket context), so this is correct across a CP restart."""
+    if not bound.get("shard_index"):
+        return False
+    if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+        return False
+    status = await conn.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+        scope_target["reference_idx"],
+    )
+    return status in (ReferenceStatus.INDEXING.value, ReferenceStatus.ACTIVE.value)
+
+
 async def _patch_resource_status(
     pool: asyncpg.Pool | asyncpg.Connection,
     scope_target: dict[str, Any],

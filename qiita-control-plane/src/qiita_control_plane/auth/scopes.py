@@ -77,6 +77,12 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # deleting a mask drops its mask_definition row and DuckLake
             # read_mask data. Service accounts never get it.
             Scope.MASK_DEFINITION_DELETE,
+            # Full alignment purge is system_admin-only, same as
+            # MASK_DEFINITION_DELETE: deleting an alignment drops its
+            # alignment_definition row (cascading the alignment_sample gate) and
+            # its DuckLake alignment data. The disallow-without-delete escape
+            # hatch. Service accounts never get it.
+            Scope.ALIGNMENT_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             Scope.ADMIN_USER,

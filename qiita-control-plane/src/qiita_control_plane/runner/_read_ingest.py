@@ -52,6 +52,166 @@ STAGED_MASKED_READS_BINDING = "masked_reads_fastq"
 READS_STAGING_ROOT_BINDING = "reads_staging_root"
 
 
+# Bindings a sharded build ticket's build steps consume: the per-shard feature
+# roster Parquet (`shard_features`) and the shard ordinal (`shard_id`). The
+# runner stages both BEFORE the step loop (see `_stage_shard_roster`), from the
+# ticket's `shard_id` + `reference_membership.shard_id`; the shard build jobs
+# (build_rype/minimap2/bowtie2_index) resolve them as their `Inputs`.
+SHARD_FEATURES_BINDING = "shard_features"
+SHARD_ID_BINDING = "shard_id"
+_REFERENCE_SEQUENCES_TABLE = "reference_sequences"
+
+# Binding the plan-shards arm sets to gate the whole-reference rype_router build
+# entries (build_routing_index → register-index → finalize-shard) that follow it
+# in the sharded reference-add flow. Present-and-True only when plan-shards fanned
+# out (N > 0 shards); present-and-False otherwise so the `when: router_pending`
+# gate skips those entries — an ABSENT gate key defaults ON, so the runner seeds
+# this False before the step loop (below) to make the router build default-OFF
+# even when plan-shards is skipped (shard_index explicitly false) or a no-op.
+ROUTER_PENDING_BINDING = "router_pending"
+# The runner-staged shard→bucket mapping Parquet `(feature_idx BIGINT,
+# bucket_name VARCHAR = str(shard_id))` build_routing_index consumes. Staged by
+# the plan-shards arm from qiita.reference_membership.shard_id right after the
+# fan-out assigns it — shard_id is authoritative in Postgres (the DuckLake
+# reference_membership has no shard_id column), so this is a direct PG read, not
+# a Flight export.
+SHARD_MAPPING_BINDING = "shard_mapping"
+
+
+def _do_get_reference_sequences_roster(
+    data_plane_url: str, ticket_bytes: bytes, out_path: Path
+) -> int:
+    """Synchronous Flight DoGet of a feature-scoped `reference_sequences` slice,
+    written to a `(feature_idx BIGINT, sequence_length_bp BIGINT)` roster Parquet
+    at `out_path`. Runs in a thread executor (pyarrow.flight is sync); isolated
+    so `_stage_shard_roster`'s unit test stubs the whole seam. Returns the row
+    count (the shard's feature count that has a sequence)."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        table = client.do_get(flight.Ticket(ticket_bytes)).read_all()
+    # Project to exactly the roster columns the build jobs expect (drop
+    # sequence_hash) — the shard build reads `feature_idx` to scope its own chunk
+    # stream and `sequence_length_bp` for plan() sizing.
+    roster = table.select(["feature_idx", "sequence_length_bp"])
+    pq.write_table(roster, str(out_path), compression="snappy")
+    return roster.num_rows
+
+
+async def _stage_shard_roster(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    shard_id: int,
+    *,
+    data_plane_url: str,
+    signing_key: bytes,
+    workspace: Path,
+) -> dict[str, Any]:
+    """Stage this shard's feature roster before the build step loop and bind it.
+
+    The shard's features are the cover-map (`reference_membership.shard_id`);
+    their `sequence_length_bp` lives in DuckLake `reference_sequences`, reachable
+    only over Flight. So we read the shard's feature_idx set from Postgres, sign
+    a `feature_idx`-scoped `reference_sequences` DoGet (the subset ticket — so
+    each shard transfers only its own slice, not the whole reference N times),
+    and write `<workspace>/shard_roster.parquet`. Binds `shard_features` (the
+    roster path) and `shard_id` so the build steps' `Inputs` resolve.
+
+    Like the other pre-loop resolvers, a Flight failure is wrapped as a
+    SUBMISSION-attributed BAD_INPUT so it lands in the outer FAILED handler
+    instead of escaping as an untyped exception (which would violate the
+    step-name CHECK). An empty membership shard is a misconfiguration — fail
+    loud rather than build an empty index."""
+    rows = await pool.fetch(
+        "SELECT feature_idx FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND shard_id = $2",
+        reference_idx,
+        shard_id,
+    )
+    feature_idxs = [r["feature_idx"] for r in rows]
+    if not feature_idxs:
+        raise _submission_bad_input(
+            f"shard {shard_id} of reference {reference_idx} has no member features "
+            "(reference_membership.shard_id) — nothing to build"
+        )
+    ticket = sign_ticket(
+        table=_REFERENCE_SEQUENCES_TABLE,
+        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+        secret=signing_key,
+    )
+    workspace.mkdir(parents=True, exist_ok=True)
+    roster_path = workspace / "shard_roster.parquet"
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            _runner_pkg._do_get_reference_sequences_roster,
+            data_plane_url,
+            ticket,
+            roster_path,
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not fetch reference_sequences for reference {reference_idx} "
+            f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}"
+        ) from exc
+    return {SHARD_FEATURES_BINDING: roster_path, SHARD_ID_BINDING: shard_id}
+
+
+def _write_shard_mapping_parquet(rows: list[tuple[int, int]], out_path: Path) -> None:
+    """Write `(feature_idx, shard_id)` rows to a
+    `(feature_idx BIGINT, bucket_name VARCHAR)` Parquet — one row per sharded
+    feature, `bucket_name = str(shard_id)`. This is exactly the shape
+    `build_routing_index.Inputs.shard_mapping` expects (the router build's
+    multi-bucket `rype_index_create` mapping table). pyarrow (already a Flight
+    dependency) writes it directly, mirroring `_write_sample_map_parquet`."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    feature = [int(f) for f, _ in rows]
+    bucket = [str(s) for _, s in rows]
+    table = pa.table(
+        {
+            "feature_idx": pa.array(feature, type=pa.int64()),
+            "bucket_name": pa.array(bucket, type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
+async def _stage_shard_mapping(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    out_path: Path,
+) -> Path:
+    """Stage the whole-reference shard→bucket mapping the router build consumes.
+
+    Exports `qiita.reference_membership` (the authoritative store for
+    `shard_id` — the DuckLake mirror has no such column) to a
+    `(feature_idx BIGINT, bucket_name VARCHAR)` Parquet at `out_path`, one row
+    per feature assigned to a shard (`bucket_name = str(shard_id)`,
+    `shard_id IS NOT NULL`). Called by the plan-shards arm right after
+    `plan_and_submit_shards` has written the assignment (N > 0), so the rows are
+    present; re-staged verbatim on resume from the durable assignment. A missing
+    assignment where one is expected is a fail-loud bug (the caller only stages
+    when the fan-out reported N > 0)."""
+    rows = await pool.fetch(
+        "SELECT feature_idx, shard_id FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND shard_id IS NOT NULL"
+        " ORDER BY feature_idx",
+        reference_idx,
+    )
+    if not rows:
+        raise RuntimeError(
+            f"reference {reference_idx}: no reference_membership.shard_id assignment "
+            "to build a routing index from (plan-shards reported a fan-out but wrote "
+            "no shard assignment)"
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_shard_mapping_parquet([(r["feature_idx"], r["shard_id"]) for r in rows], out_path)
+    return out_path
+
+
 def _workflow_declares_input(steps: list[Any], name: str) -> bool:
     """True iff some entry declares `name` among its `inputs`/`optional_inputs`."""
     for entry in steps:
@@ -166,6 +326,16 @@ def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str,
     `read` table into one per-ticket Parquet. Isolated (thin wrapper over
     `_do_action_export`) so unit tests stub the real call by name."""
     return _do_action_export("export_read_block", data_plane_url, token)
+
+
+def _do_action_export_read_masked_block(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """`export_read_masked_block` DoAction: the data plane materializes the UNION
+    of a block's members from its DuckLake `read_masked` VIEW (trimmed +
+    host/QC-`pass`-filtered), scoped to the ticket's `mask_idx`, into one
+    per-ticket Parquet — the MASKED-reads sibling of `export_read_block` (same
+    output column shape). Isolated (thin wrapper over `_do_action_export`) so unit
+    tests stub the real call by name."""
+    return _do_action_export("export_read_masked_block", data_plane_url, token)
 
 
 def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest: Path) -> int:
@@ -434,5 +604,113 @@ async def _resolve_staged_reads_block(
     if not dest.exists():
         raise _submission_bad_input(
             f"the data plane reported reads for the block but wrote no file at {dest}"
+        )
+    return {STAGED_READS_BINDING: dest}
+
+
+def _write_empty_reads_parquet(dest: Path) -> None:
+    """Write a schema-correct 0-row `reads.parquet` at `dest`, in the exact
+    `export_read_block` column shape (`prep_sample_idx, sequence_idx, read_id,
+    sequence1, qual1, sequence2, qual2`) `align_sharded` binds. Used for the
+    zero-masked-block no-op (see `_resolve_staged_masked_reads_block`): the data
+    plane writes no file for an empty selection, so the align step still needs a
+    valid empty input file to align over (emitting an empty alignment.parquet).
+    pyarrow (already this module's Flight dependency) writes it directly."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array([], type=pa.int64()),
+            "sequence_idx": pa.array([], type=pa.int64()),
+            "read_id": pa.array([], type=pa.string()),
+            "sequence1": pa.array([], type=pa.string()),
+            "qual1": pa.array([], type=pa.string()),
+            "sequence2": pa.array([], type=pa.string()),
+            "qual2": pa.array([], type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(dest))
+
+
+async def _resolve_staged_masked_reads_block(
+    members: list[dict[str, int]],
+    *,
+    mask_idx: int,
+    data_plane_url: str,
+    signing_key: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Bind `reads` to a BLOCK's MASKED reads for an align workflow — the
+    host-depleted, QC-passed twin of `_resolve_staged_reads_block`.
+
+    Same block-member shape and per-ticket `reads.parquet` contract as the raw
+    path, but the data plane sources the `read_masked` VIEW (trimmed +
+    `pass`-filtered) scoped to `mask_idx` via the `export_read_masked_block`
+    DoAction, so `align_sharded` aligns exactly the reads that survived the
+    host-depletion mask. The output column shape is identical to
+    `export_read_block`, so the `align_sharded.reads` contract is unchanged.
+
+    `mask_idx` is the ticket's pre-resolved (plan-time) mask — the SAME
+    completed mask the block's samples were masked under. Fails
+    SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly, step_name=None) if:
+    `members` is empty (a planning bug); the data plane is unreachable; or the
+    data plane reported reads but no file landed. **Unlike the raw path, zero
+    selected reads is NOT a failure** — a completed mask can legitimately carry 0
+    passing reads (a blank/control or fully host/QC-filtered sample the planner
+    still tiles), so an empty selection binds an empty (schema-correct)
+    reads.parquet and the block runs to a clean no-op completion (empty
+    alignment.parquet → register 0 rows → gate flip)."""
+    if not members:
+        raise _submission_bad_input("an align block requires a non-empty members list")
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "reads.parquet"
+    try:
+        member_payload = [
+            {
+                "prep_sample_idx": int(m["prep_sample_idx"]),
+                "sequence_idx_start": int(m["sequence_idx_start"]),
+                "sequence_idx_stop": int(m["sequence_idx_stop"]),
+            }
+            for m in members
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _submission_bad_input(
+            f"malformed align block member (a planning bug): {type(exc).__name__}: {exc}"
+        ) from exc
+    token = sign_action(
+        action="export_read_masked_block",
+        payload={"dest": str(dest), "mask_idx": int(mask_idx), "members": member_payload},
+        secret=signing_key,
+    )
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _runner_pkg._do_action_export_read_masked_block, data_plane_url, token
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize masked reads for the block from the data plane: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if result.get("count", 0) == 0:
+        # Zero passing masked reads is a LEGITIMATE no-op, NOT a failure — unlike
+        # the raw `_resolve_staged_reads_block` path, where zero reads is a planning
+        # bug. A block ticket is only fanned out over samples whose mask_sample gate
+        # is `completed`, and a completed mask can carry 0 passing reads (a
+        # blank/no-template control, or a fully host/QC-filtered sample); a block's
+        # tail sub-range can also be entirely masked out. Failing here would
+        # permanently wedge the ticket (the count is 0 on every redrive) and strand
+        # the sample's alignment_sample gate at `pending` forever. Instead, bind an
+        # empty (schema-correct) reads.parquet: `align_sharded` emits an empty
+        # alignment.parquet (it guards the empty-read_to_shard case miint rejects),
+        # register-files registers 0 rows, and reconcile flips the gate with no
+        # rows (it has no count-assertion). The data plane writes NO file for an
+        # empty selection, so materialize the empty file here.
+        _write_empty_reads_parquet(dest)
+        return {STAGED_READS_BINDING: dest}
+    if not dest.exists():
+        raise _submission_bad_input(
+            f"the data plane reported masked reads for the block but wrote no file at {dest}"
         )
     return {STAGED_READS_BINDING: dest}

@@ -370,6 +370,50 @@ pub fn verify_export_read_block(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `export_read_masked_block` DoAction — the MASKED-reads
+/// sibling of `export_read_block`.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.runner._resolve_staged_masked_reads_block`:
+/// `{"action": "export_read_masked_block", "dest": "<abs path>", "mask_idx": N,
+///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
+///                "sequence_idx_stop": b}, ...]}`.
+/// The data plane re-materializes the union of the members' sub-ranges from its
+/// DuckLake `read_masked` VIEW (filtered `mask_idx = ?`, so already trimmed and
+/// host/QC-`pass`-filtered) to `dest` — a per-ticket `reads.parquet` the sharded
+/// `align_sharded` job then consumes, in the SAME column shape `export_read_block`
+/// writes. It is `export_read_block` (dest + members, reusing
+/// `ExportReadBlockMember`) plus the `mask_idx` scope — the raw `read` export
+/// needs no mask column, a masked export does. `deny_unknown_fields` keeps the
+/// contract tight: any extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportReadMaskedBlockPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "export_read_masked_block".
+    pub action: String,
+    /// Absolute destination path for the materialized Parquet. The handler
+    /// re-validates it (`validate_export_dest`) before writing — under the
+    /// data plane's scratch root, no `..`, no single quote — even though the
+    /// token is Ed25519-signed by the control plane (defense in depth).
+    pub dest: String,
+    /// `i64`, matching the Postgres `alignment_definition` mask scope and the
+    /// `read_mask.mask_idx BIGINT` column the `read_masked` view filters on.
+    pub mask_idx: i64,
+    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
+    /// an empty list (an empty block is a control-plane bug, not a valid ask).
+    pub members: Vec<ExportReadBlockMember>,
+}
+
+/// Verify an `export_read_masked_block` DoAction token and return its payload.
+pub fn verify_export_read_masked_block(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<ExportReadMaskedBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed payload for the `delete_read_mask_block` DoAction — the idempotent
 /// block-replace sibling of `export_read_block`.
 ///
@@ -408,6 +452,81 @@ pub fn verify_delete_read_mask_block(
     ticket: &[u8],
     verifying_key: &VerifyingKey,
 ) -> Result<DeleteReadMaskBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `delete_alignment_block` DoAction — the idempotent
+/// block-replace primitive of the `align` workflow, the alignment twin of
+/// `delete_read_mask_block`.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.delete_alignment_block_data`:
+/// `{"action": "delete_alignment_block", "alignment_idx": N,
+///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
+///                "sequence_idx_stop": b}, ...]}`.
+/// The data plane deletes exactly this block's footprint from the DuckLake
+/// `alignment` table — the rows for `alignment_idx` whose `(prep_sample_idx,
+/// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
+/// delete-then-re-register without double-counting or clobbering a sibling
+/// block's rows for a shared sample. The footprint is the SAME
+/// `(prep_sample_idx, sub-range)` member list `export_read_masked_block` carries
+/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member OR
+/// residual) and feature_idx-agnostic (all of a read's alignment rows go, since a
+/// read produces multiple rows via cross-shard + PE multiplicity). The extra
+/// `alignment_idx` scopes the delete to this align-config identity — the raw
+/// `read` export needs no such column, the `alignment` sink does.
+/// `deny_unknown_fields` keeps the contract tight: any extra field is a design
+/// slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAlignmentBlockPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_alignment_block".
+    pub action: String,
+    /// `i64`, matching the Postgres `alignment_definition.alignment_idx BIGINT`
+    /// source of truth and the `alignment.alignment_idx BIGINT` DuckLake column.
+    pub alignment_idx: i64,
+    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
+    /// an empty list (an empty block is a control-plane bug, not a valid ask).
+    pub members: Vec<ExportReadBlockMember>,
+}
+
+/// Verify a `delete_alignment_block` DoAction token and return its parsed payload.
+pub fn verify_delete_alignment_block(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<DeleteAlignmentBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `delete_alignment` DoAction — the whole-alignment
+/// purge, the alignment twin of `delete_mask`.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.delete_alignment_data`:
+/// `{"action": "delete_alignment", "alignment_idx": N}`. The data plane deletes
+/// every `alignment` row for `alignment_idx` in one DuckLake transaction — the
+/// minimal DELETE path the disallow-without-delete resubmission rule requires (a
+/// completed `alignment_sample` must be cleared before re-aligning). Idempotent:
+/// an alignment whose rows never registered deletes zero rows. `deny_unknown_fields`
+/// keeps the contract tight: any extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAlignmentPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_alignment".
+    pub action: String,
+    /// `i64`, matching the Postgres `alignment_definition.alignment_idx BIGINT`
+    /// source of truth and the `alignment.alignment_idx BIGINT` DuckLake column.
+    pub alignment_idx: i64,
+}
+
+/// Verify a `delete_alignment` DoAction token and return its parsed payload.
+pub fn verify_delete_alignment(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<DeleteAlignmentPayload, AuthError> {
     let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
@@ -702,6 +821,76 @@ mod tests {
         }
     }
 
+    // --------------------------------------------------------------------
+    // export_read_masked_block action token variant
+    // --------------------------------------------------------------------
+
+    fn make_export_read_masked_block_ticket(
+        dest: &str,
+        mask_idx: i64,
+        members: &str,
+        key: &SigningKey,
+        expiry: u64,
+    ) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace. Top-level keys sorted:
+        // action, dest, mask_idx, members.
+        let payload = format!(
+            r#"{{"action":"export_read_masked_block","dest":"{dest}","mask_idx":{mask_idx},"members":{members}}}"#
+        );
+        build_ticket(payload.as_bytes(), key, expiry)
+    }
+
+    #[test]
+    fn verify_export_read_masked_block_round_trip() {
+        let members =
+            r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}]"#;
+        let ticket = make_export_read_masked_block_ticket(
+            "/scratch/ticket/900/reads.parquet",
+            7,
+            members,
+            &test_signing_key(),
+            future_expiry(300),
+        );
+        let payload = verify_export_read_masked_block(&ticket, &test_vk())
+            .expect("valid token should verify");
+        assert_eq!(payload.action, "export_read_masked_block");
+        assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
+        assert_eq!(payload.mask_idx, 7);
+        assert_eq!(payload.members.len(), 1);
+        assert_eq!(payload.members[0].prep_sample_idx, 101);
+        assert_eq!(payload.members[0].sequence_idx_start, 100);
+        assert_eq!(payload.members[0].sequence_idx_stop, 109);
+    }
+
+    #[test]
+    fn verify_export_read_masked_block_rejects_bad_signature() {
+        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
+        let mut ticket = make_export_read_masked_block_ticket(
+            "/scratch/ticket/1/reads.parquet",
+            3,
+            members,
+            &test_signing_key(),
+            future_expiry(300),
+        );
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_export_read_masked_block(&ticket, &test_vk()).unwrap_err(),
+            AuthError::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn verify_export_read_masked_block_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled top-level field (or a missing mask_idx)
+        // is a contract slip surfaced here.
+        let payload = br#"{"action":"export_read_masked_block","dest":"/scratch/x","mask_idx":1,"members":[],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_export_read_masked_block(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
     // -------------------- mask_metrics --------------------
 
     #[test]
@@ -741,6 +930,80 @@ mod tests {
         let payload = br#"{"action":"delete_read_mask_block","mask_idx":42,"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}],"smuggled":9}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         match verify_delete_read_mask_block(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // delete_alignment / delete_alignment_block action token variants
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn verify_delete_alignment_round_trip() {
+        let payload = br#"{"action":"delete_alignment","alignment_idx":77}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed =
+            verify_delete_alignment(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.action, "delete_alignment");
+        assert_eq!(parsed.alignment_idx, 77);
+    }
+
+    #[test]
+    fn verify_delete_alignment_rejects_bad_signature() {
+        let payload = br#"{"action":"delete_alignment","alignment_idx":1}"#;
+        let mut ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        ticket[10] ^= 0xFF;
+        assert_eq!(
+            verify_delete_alignment(&ticket, &test_vk()).unwrap_err(),
+            AuthError::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn verify_delete_alignment_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
+        let payload = br#"{"action":"delete_alignment","alignment_idx":1,"mask_idx":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_alignment(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_delete_alignment_block_round_trip() {
+        let payload = br#"{"action":"delete_alignment_block","alignment_idx":42,"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed =
+            verify_delete_alignment_block(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.action, "delete_alignment_block");
+        assert_eq!(parsed.alignment_idx, 42);
+        assert_eq!(parsed.members.len(), 2);
+        assert_eq!(parsed.members[0].prep_sample_idx, 101);
+        assert_eq!(parsed.members[0].sequence_idx_start, 100);
+        assert_eq!(parsed.members[0].sequence_idx_stop, 109);
+        assert_eq!(parsed.members[1].prep_sample_idx, 103);
+    }
+
+    #[test]
+    fn verify_delete_alignment_block_rejects_bad_signature() {
+        let payload = br#"{"action":"delete_alignment_block","alignment_idx":1,"members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]}"#;
+        let mut ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_delete_alignment_block(&ticket, &test_vk()).unwrap_err(),
+            AuthError::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn verify_delete_alignment_block_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled top-level field is a contract slip.
+        let payload =
+            br#"{"action":"delete_alignment_block","alignment_idx":1,"members":[],"smuggled":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_alignment_block(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }

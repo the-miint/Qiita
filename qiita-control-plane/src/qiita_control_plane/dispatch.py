@@ -79,6 +79,12 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fal
             upload_staging_root=upload_staging_root,
             default_adapter_reference_idx=app.state.settings.default_adapter_reference_idx,
             resume=resume,
+            # A `plan-shards` action fans out one build ticket per shard; it
+            # dispatches each freshly-inserted ticket through this callback (a
+            # child `schedule_dispatch` — the same fire-and-forget path a route
+            # uses). A crash between INSERT and dispatch leaves the tickets
+            # PENDING for the next startup reconcile.
+            dispatch_cb=lambda child_idx: schedule_dispatch(app, child_idx),
         )
     except Exception:
         # run_workflow transitions the ticket to FAILED for any failure inside

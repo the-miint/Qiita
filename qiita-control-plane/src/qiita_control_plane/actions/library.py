@@ -19,33 +19,45 @@ it differently.
 """
 
 import asyncio
+import itertools
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 import duckdb
+import pyarrow as pa
 import pyarrow.flight as _flight
+import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.models import (
+    INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
+    GenomeSource,
     ReadMaskBucket,
     ReadMaskReason,
+    ReferenceStatus,
     read_mask_reason_sql_list,
 )
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
-from ..auth.tickets import sign_action
+from ..auth.tickets import sign_action, sign_ticket
 from ..repositories.assembly import insert_assembly_membership_rows
 from ..repositories.block import (
     fetch_block_members,
+    finalize_alignment_sample,
     finalize_mask_sample,
+    has_incomplete_covering_alignment_block,
     has_incomplete_covering_block,
+    lock_alignment_sample,
     lock_mask_sample,
     set_block_state,
 )
+from ..repositories.reference_membership import count_reference_shards
+from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
+from .reference import IllegalStatusTransition, transition_reference_status
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535
 # scalar parameter limit, but large arrays increase memory pressure and
@@ -118,24 +130,45 @@ async def _write_genome_associations(
     feat_idxs: list[int],
     sources: list[str],
     source_ids: list[str],
+    prep_sample_idxs: list[int | None],
 ) -> None:
     """Batch upsert genomes and write feature_genome junction rows.
 
-    All three lists are positionally aligned: row i links
-    feat_idxs[i] to (sources[i], source_ids[i]). DO UPDATE on the genome
-    upsert guarantees RETURNING fires for every row even when the genome
-    already exists.
+    All four lists are positionally aligned: row i links feat_idxs[i] to
+    (sources[i], source_ids[i]) with originating prep_sample_idxs[i] (NULL for
+    external genomes; the qiita-origin sample for source='qiita'). DO UPDATE on
+    the genome upsert guarantees RETURNING fires for every row even when the
+    genome already exists, and keeps prep_sample_idx current on re-ingest.
     """
     if not feat_idxs:
         return
 
+    # Dedupe to one row per (source, source_id) before the upsert. A genome (a
+    # binned MAG or a circular isolate) maps to many features — its contigs — all
+    # sharing that genome's source_id, and a single sample's assembly can yield MANY
+    # such genomes (each bin its own (source, source_id)). So a given (source,
+    # source_id) recurs across the batch once per contig of that genome, and
+    # Postgres refuses to let one INSERT ... ON CONFLICT DO UPDATE touch the same
+    # conflict target twice ("cannot affect row a second time"). The dict keeps the
+    # last prep_sample_idx per key (consistent for valid input — a genome has one
+    # origin sample, already vetted by _validate_genome_map).
+    genome_prep = {
+        (s, sid): prep for s, sid, prep in zip(sources, source_ids, prep_sample_idxs, strict=True)
+    }
+    uniq_sources = [s for s, _ in genome_prep]
+    uniq_source_ids = [sid for _, sid in genome_prep]
+    uniq_preps = list(genome_prep.values())
+
     genome_rows = await conn.fetch(
-        "INSERT INTO qiita.genome (source, source_id)"
-        " SELECT unnest($1::text[]), unnest($2::text[])"
-        " ON CONFLICT (source, source_id) DO UPDATE SET source = EXCLUDED.source"
+        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
+        " SELECT unnest($1::text[]), unnest($2::text[]), unnest($3::bigint[])"
+        " ON CONFLICT (source, source_id)"
+        " DO UPDATE SET source = EXCLUDED.source,"
+        "               prep_sample_idx = EXCLUDED.prep_sample_idx"
         " RETURNING genome_idx, source, source_id",
-        sources,
-        source_ids,
+        uniq_sources,
+        uniq_source_ids,
+        uniq_preps,
     )
     genome_map = {(row["source"], row["source_id"]): row["genome_idx"] for row in genome_rows}
 
@@ -149,26 +182,74 @@ async def _write_genome_associations(
     )
 
 
+def _validate_genome_map(duck: duckdb.DuckDBPyConnection, genome_map_path: Path) -> bool:
+    """Fail-fast validation of the whole genome map before any DB write.
+
+    Returns whether the map carries a `prep_sample_idx` column — external-only
+    maps may omit it (treated as all-NULL). Raises ValueError if any
+    `genome_source` is outside the GenomeSource vocabulary, or if the
+    qiita-origin rule is violated (prep_sample_idx set iff genome_source='qiita').
+    One DISTINCT scan, so a genome-scale map is never materialised.
+    """
+    columns = {
+        c[0]
+        for c in duck.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [str(genome_map_path)]
+        ).description
+    }
+    missing = {"genome_source", "genome_source_id"} - columns
+    if missing:
+        raise ValueError(f"genome_map is missing required column(s): {sorted(missing)}")
+    has_prep = "prep_sample_idx" in columns
+    prep_expr = "prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT)"
+    combos = duck.execute(
+        f"SELECT DISTINCT genome_source, (({prep_expr}) IS NOT NULL) AS has_prep"
+        " FROM read_parquet(?)",
+        [str(genome_map_path)],
+    ).fetchall()
+
+    allowed = {s.value for s in GenomeSource}
+    bad_vocab = {src for src, _ in combos if src not in allowed}
+    if bad_vocab:
+        raise ValueError(
+            "genome_map has genome_source value(s) outside the allowed "
+            f"vocabulary {sorted(allowed)}: {sorted(str(s) for s in bad_vocab)}"
+        )
+    # Reached only when every source is valid (so no NULL sources here).
+    bad_origin = sorted({src for src, has in combos if (src == GenomeSource.QIITA.value) != has})
+    if bad_origin:
+        raise ValueError(
+            "genome_map violates the qiita-origin rule (prep_sample_idx is set "
+            f"iff genome_source='qiita'); offending source(s): {bad_origin}"
+        )
+    return has_prep
+
+
 async def _associate_genomes(
     pool: asyncpg.Pool,
     manifest_path: Path,
     genome_map_path: Path,
     feature_map_path: Path,
 ) -> None:
-    """Write qiita.feature_genome rows for the entries in `genome_map_path`.
+    """Write qiita.feature_genome (and qiita.genome) rows for `genome_map_path`.
 
     DuckDB JOINs the manifest (read_id → sequence_hash) against genome_map
-    (read_id → genome_source, genome_source_id) on read_id, and against the
-    already-written feature_map (sequence_hash → feature_idx) on
+    (read_id → genome_source, genome_source_id[, prep_sample_idx]) on read_id,
+    and against the already-written feature_map (sequence_hash → feature_idx) on
     sequence_hash — so feature_idx is resolved set-side in DuckDB rather than
     from an in-memory Python mapping. Rows whose read_id isn't in the manifest
     are dropped by the INNER JOIN — the genome map may legitimately cover only
     a subset of FASTA reads. Streamed in `_CHUNK_SIZE` batches so a
     genome-scale map never materialises in Python.
+
+    The whole map is validated up front (`_validate_genome_map`) — vocabulary
+    and the qiita-origin rule — so a bad map fails before any DB write.
     """
     with duckdb.connect(":memory:") as duck:
+        has_prep = _validate_genome_map(duck, genome_map_path)
+        prep_select = "g.prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT) AS prep_sample_idx"
         reader = duck.execute(
-            "SELECT fm.feature_idx, g.genome_source, g.genome_source_id"
+            f"SELECT fm.feature_idx, g.genome_source, g.genome_source_id, {prep_select}"
             " FROM read_parquet(?) AS m"
             " JOIN read_parquet(?) AS g USING (read_id)"
             " JOIN read_parquet(?) AS fm USING (sequence_hash)",
@@ -180,8 +261,11 @@ async def _associate_genomes(
                 continue
             sources = batch.column("genome_source").to_pylist()
             source_ids = batch.column("genome_source_id").to_pylist()
+            prep_sample_idxs = batch.column("prep_sample_idx").to_pylist()
             async with pool.acquire() as conn, conn.transaction():
-                await _write_genome_associations(conn, feat_idxs, sources, source_ids)
+                await _write_genome_associations(
+                    conn, feat_idxs, sources, source_ids, prep_sample_idxs
+                )
 
 
 async def _write_membership_rows(
@@ -377,6 +461,270 @@ async def write_membership(
     return total_linked, total_seen - total_linked
 
 
+async def write_shard_assignment(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    shards: Sequence[Sequence[int]],
+) -> int:
+    """Record a shard planner's output onto qiita.reference_membership.shard_id.
+
+    `shards[i]` is the list of feature_idx assigned to shard `i`; each listed
+    feature's membership row for this reference is stamped with that shard index.
+    A feature present in no shard list keeps `shard_id NULL` (e.g. a deferred
+    16S / no-genome feature the current sharding pass does not cover).
+
+    Clear-first: as the first statement in the transaction it NULLs every
+    membership row's shard_id for this reference, then sets the new layout. So a
+    re-plan that DROPS a feature (present before, absent now) leaves it NULL
+    instead of carrying a stale shard_id from the prior plan — the persisted
+    assignment always reflects exactly the passed `shards`.
+
+    In the SAME transaction it also DELETEs this reference's per-shard
+    `reference_index` rows (`shard_id IS NOT NULL`). Those rows are keyed on
+    (reference_idx, index_type, fs_path) with a generation-independent fs_path, so
+    a re-plan that reshuffles the lineage tiling would otherwise leave STALE
+    prior-generation index rows on the books — and finalize_shard's completeness
+    gate counts them, so a stale count could flip the reference `active` with the
+    CURRENT generation's shards still unbuilt. Clearing them here re-scopes the
+    gate to the current generation; the fanned-out build children re-register their
+    rows as they actually complete. The whole-reference `rype_router` row
+    (shard_id NULL) is owned by the parent's build_routing_index and is untouched.
+
+    Idempotent and replay-safe: clear-then-set over one transaction, so
+    re-running the same assignment sets the same values without error. Scoped to
+    `reference_idx`, so a feature shared across references (same feature_idx) is
+    stamped only for this reference's membership row. Batched in `_CHUNK_SIZE`
+    slices so a GG2-scale reference doesn't send one giant array. Returns the
+    total number of membership rows updated to a non-NULL shard (feature_idx
+    values not in this reference's membership match nothing and are not counted;
+    the clear-first NULLing is not counted).
+    """
+    total_updated = 0
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE qiita.reference_membership SET shard_id = NULL WHERE reference_idx = $1",
+            reference_idx,
+        )
+        # Generation-scope the completeness gate: drop this reference's per-shard
+        # index rows so finalize_shard cannot mistake a stale prior-generation
+        # count for the current one (see the docstring). Router row (shard_id NULL)
+        # is left for the parent's build_routing_index to own.
+        await conn.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1 AND shard_id IS NOT NULL",
+            reference_idx,
+        )
+        # Flatten to a (feature_idx, shard_id) pair stream and apply one
+        # set-based UPDATE...FROM unnest per _CHUNK_SIZE slice — a handful of
+        # round-trips instead of one per shard. `itertools.islice` keeps only a
+        # slice in memory at a time (the generator never materializes all pairs).
+        # Each feature is in exactly one shard (feature_genome.feature_idx is
+        # UNIQUE), so no pair targets a row twice. RETURNING preserves the count.
+        pair_stream = (
+            (feature_idx, shard_id)
+            for shard_id, feature_idxs in enumerate(shards)
+            for feature_idx in feature_idxs
+        )
+        while batch := list(itertools.islice(pair_stream, _CHUNK_SIZE)):
+            rows = await conn.fetch(
+                "UPDATE qiita.reference_membership rm SET shard_id = t.shard_id"
+                " FROM unnest($1::bigint[], $2::int[]) AS t(feature_idx, shard_id)"
+                " WHERE rm.reference_idx = $3 AND rm.feature_idx = t.feature_idx"
+                " RETURNING rm.feature_idx",
+                [feature_idx for feature_idx, _ in batch],
+                [shard_id for _, shard_id in batch],
+                reference_idx,
+            )
+            total_updated += len(rows)
+    return total_updated
+
+
+# Taxonomy rank columns, coarsest→finest, in the lineage sort-key order. `class`
+# and `order` are quoted — `order` is a SQL keyword and `class` is reserved in
+# some dialects; DuckDB stores the reference_taxonomy columns under these exact
+# (lowercase, prefix-stripped) names (see the data plane's qiita_lake schema).
+_TAXONOMY_RANK_COLUMNS = (
+    "domain",
+    "phylum",
+    '"class"',
+    '"order"',
+    "family",
+    "genus",
+    "species",
+    "strain",
+)
+
+_REFERENCE_TAXONOMY_TABLE = "reference_taxonomy"
+
+
+def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_path: Path) -> Path:
+    """Synchronous Flight DoGet of a reference's taxonomy rows, streamed to a
+    Parquet at `out_path` (one row per feature: feature_idx + the eight rank
+    columns). Runs in a thread executor (pyarrow.flight is sync); isolated as a
+    module function so plan_shards's DB test can stub the whole seam.
+
+    Streams via `.to_reader()` (not `read_all()`) so a GG2-scale taxonomy never
+    fully materializes in memory. The writer is created from the stream schema
+    up front, so an empty stream still writes a valid, correctly-typed Parquet
+    (a reference with no taxonomy loaded → every genome sorts as unclassified)."""
+    with _flight.FlightClient(data_plane_url) as client:
+        reader = client.do_get(_flight.Ticket(ticket_bytes)).to_reader()
+        writer = pq.ParquetWriter(str(out_path), reader.schema, compression="snappy")
+        try:
+            for batch in reader:
+                writer.write_batch(batch)
+        finally:
+            writer.close()
+    return out_path
+
+
+async def _export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path: Path) -> None:
+    """Stream this reference's (feature_idx, genome_idx) pairs from Postgres to a
+    Parquet at `out_path`, in `_CHUNK_SIZE` batches (a GG2-scale reference has
+    millions of members — never one giant array). The INNER JOIN to
+    feature_genome drops features with no genome, which is deliberate: no-genome
+    features (16S / deferred) never enter a shard and keep shard_id NULL.
+
+    An empty result still writes a valid two-column Parquet (schema created up
+    front) so DuckDB's read_parquet doesn't fail on a zero-genome reference."""
+    schema = pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())])
+    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            cursor = await conn.cursor(
+                "SELECT rm.feature_idx, fg.genome_idx"
+                " FROM qiita.reference_membership rm"
+                " JOIN qiita.feature_genome fg USING (feature_idx)"
+                " WHERE rm.reference_idx = $1",
+                reference_idx,
+            )
+            while batch := await cursor.fetch(_CHUNK_SIZE):
+                writer.write_table(
+                    pa.table(
+                        {
+                            "feature_idx": pa.array([r["feature_idx"] for r in batch], pa.int64()),
+                            "genome_idx": pa.array([r["genome_idx"] for r in batch], pa.int64()),
+                        }
+                    )
+                )
+    finally:
+        writer.close()
+
+
+def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
+    """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
+    relations to one LineageItem per genome. The lineage is the semicolon-joined
+    rank string of the genome's LOWEST-feature_idx member (via `arg_min`), so the
+    representative is deterministic regardless of scan order and independent of
+    which sibling features carry divergent taxonomy. `concat_ws` skips NULL
+    ranks, so an unclassified genome (all ranks NULL, or no taxonomy row via the
+    LEFT JOIN) reduces to lineage '' — which sorts first in the tiler."""
+    ranks = ", ".join(f"t.{col}" for col in _TAXONOMY_RANK_COLUMNS)
+    rows = con.execute(
+        f"SELECT mg.genome_idx,"
+        f"       arg_min(concat_ws(';', {ranks}), mg.feature_idx) AS lineage"
+        f"  FROM member_genome mg"
+        f"  LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
+        f" GROUP BY mg.genome_idx"
+    ).fetchall()
+    return [LineageItem(item_id=genome_idx, lineage=lineage or "") for genome_idx, lineage in rows]
+
+
+def _compute_shards(
+    con: duckdb.DuckDBPyConnection, *, num_shards: int = _SHARD_COUNT
+) -> list[list[int]]:
+    """Given a DuckDB connection with `member_genome` + `taxonomy` relations,
+    return `shards[k]` = the feature_idxs assigned to shard `k`: reduce to one
+    lineage per genome, tile lineage-sorted (`tile_by_lineage`), then expand each
+    genome back to ITS features via a DuckDB join (keeping the fan-out in DuckDB,
+    not Python). Every genome-bearing member feature lands in exactly one shard;
+    a no-genome feature is absent from `member_genome` and so from every shard.
+    A zero-genome reference yields `[]`."""
+    shards = tile_by_lineage(_genome_lineages(con), num_shards)
+    if not shards:
+        return []
+    con.execute("CREATE OR REPLACE TEMP TABLE shard_map (genome_idx BIGINT, shard_id INTEGER)")
+    # One vectorized insert via a registered Arrow table, not a row-by-row
+    # executemany (genome count is GG2-scale). The pre-created typed shard_map +
+    # INSERT...SELECT pins the column types (BIGINT/INTEGER) regardless of Arrow.
+    shard_pairs = pa.table(
+        {
+            "genome_idx": pa.array(
+                [genome_idx for genomes in shards for genome_idx in genomes], pa.int64()
+            ),
+            "shard_id": pa.array(
+                [k for k, genomes in enumerate(shards) for _ in genomes], pa.int32()
+            ),
+        }
+    )
+    con.register("shard_pairs", shard_pairs)
+    con.execute("INSERT INTO shard_map SELECT genome_idx, shard_id FROM shard_pairs")
+    con.unregister("shard_pairs")
+    rows = con.execute(
+        "SELECT sm.shard_id, list(mg.feature_idx ORDER BY mg.feature_idx) AS features"
+        "  FROM member_genome mg"
+        "  JOIN shard_map sm USING (genome_idx)"
+        " GROUP BY sm.shard_id"
+        " ORDER BY sm.shard_id"
+    ).fetchall()
+    return [features for _shard_id, features in rows]
+
+
+async def plan_shards(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    *,
+    signing_key: bytes,
+    data_plane_url: str,
+    workspace: Path,
+    num_shards: int = _SHARD_COUNT,
+) -> int:
+    """Assign this reference's genome-bearing features to `num_shards`
+    lineage-sorted shards, persisting the result onto
+    reference_membership.shard_id. Returns N, the number of shards actually
+    produced (`min(num_shards, genome_count)`; 0 for a reference with no
+    genomes — nothing to shard).
+
+    The cross-store assembly stays off the CP event loop's Python heap: the
+    (feature_idx, genome_idx) map streams from Postgres to a Parquet in chunks,
+    the taxonomy streams from the data plane (DoGet) to a Parquet, and the
+    lineage reduce + genome→feature expansion run in a local in-memory DuckDB
+    over those two Parquets. Only the final shard lists (feature_idx arrays)
+    materialize in Python, handed to `write_shard_assignment`.
+
+    Idempotent / re-plan-safe: write_shard_assignment clears-first, so a re-plan
+    that drops a genome leaves its features NULL. DoGet is read-only, so a resume
+    re-materializes the same inputs."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    member_parquet = workspace / "member_genome.parquet"
+    taxonomy_parquet = workspace / "taxonomy.parquet"
+
+    await _export_member_genome(pool, reference_idx, member_parquet)
+
+    ticket = sign_ticket(
+        table=_REFERENCE_TAXONOMY_TABLE,
+        filter={"reference_idx": [reference_idx]},
+        secret=signing_key,
+    )
+    await asyncio.get_event_loop().run_in_executor(
+        None, _do_get_reference_taxonomy, data_plane_url, ticket, taxonomy_parquet
+    )
+
+    # Validate the inlined read paths (fail-fast escaping contract), consistent
+    # with every other read_parquet/COPY target in the codebase.
+    member_sql = validate_parquet_path(member_parquet)
+    taxonomy_sql = validate_parquet_path(taxonomy_parquet)
+    with duckdb.connect(":memory:") as con:
+        con.execute(
+            "CREATE TABLE member_genome AS"
+            f" SELECT feature_idx, genome_idx FROM read_parquet('{member_sql}')"
+        )
+        con.execute(f"CREATE TABLE taxonomy AS SELECT * FROM read_parquet('{taxonomy_sql}')")
+        feature_shards = _compute_shards(con, num_shards=num_shards)
+
+    await write_shard_assignment(pool, reference_idx, feature_shards)
+    return len(feature_shards)
+
+
 # DuckDB JOIN that resolves each assembly contig to its bin + feature_idx.
 # bin_map (read_id -> kind, bin_id) x manifest (read_id -> sequence_hash) x
 # feature_map (sequence_hash -> feature_idx). The read_id is assembly_hash's
@@ -459,24 +807,35 @@ async def register_index(
     index_type: str,
     fs_path: str,
     params: dict[str, Any],
+    shard_id: int | None = None,
 ) -> int:
     """Record a built search index (e.g. a rype `.ryxdi`) for a reference in
     qiita.reference_index. `fs_path` is the on-disk location; `params` is the
     build configuration (k, w, bucket_name, ...) stored as JSONB — the
     authoritative manifest lives inside the index artifact itself.
 
+    `shard_id` is recorded verbatim: None for an unsharded whole-reference index
+    (host `rype`/`minimap2`), or the shard's index (0..N-1) for a sharded
+    analysis index that writes one row per shard.
+
     Returns the reference_index_idx. Idempotent on
     (reference_idx, index_type, fs_path): a workflow retried from the start
     re-runs this primitive, and re-inserting would otherwise duplicate the
     row (the table has no UNIQUE on that triple, by design, so growth can
     append generations). The conditional INSERT + fallback SELECT returns the
-    existing row's id instead. This guards the sequential re-run path; truly
-    concurrent registrations of the same reference are not expected (one
+    existing row's id instead. `shard_id` is deliberately NOT part of that key:
+    each shard's `fs_path` is already shard-distinct (the per-aligner shard root
+    encodes the shard, e.g. `.../minimap2-shards/{shard_id}.mmi`,
+    `.../bowtie2-shards/{shard_id}/index`),
+    so distinct shards never collide and re-registering the same shard dedups on
+    path exactly like the unsharded case — a future sharded-index builder must
+    preserve that shard->path bijection. This guards the sequential re-run path;
+    truly concurrent registrations of the same reference are not expected (one
     workflow runs per reference at a time).
     """
     row = await pool.fetchrow(
-        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
-        " SELECT $1, $2, $3, $4::jsonb"
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " SELECT $1, $2, $3, $4::jsonb, $5"
         " WHERE NOT EXISTS ("
         "   SELECT 1 FROM qiita.reference_index"
         "   WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3)"
@@ -485,6 +844,7 @@ async def register_index(
         index_type,
         fs_path,
         json.dumps(params),
+        shard_id,
     )
     if row is not None:
         return row["reference_index_idx"]
@@ -495,6 +855,100 @@ async def register_index(
         index_type,
         fs_path,
     )
+
+
+async def finalize_shard(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    expected_index_types: Sequence[str],
+) -> dict[str, Any]:
+    """Terminal step of each shard's build ticket: count-based, fail-closed
+    completion of a sharded reference.
+
+    Derives N = the number of shards from `reference_membership` (COUNT(DISTINCT
+    shard_id) over the non-NULL rows — no `shard_count` column to keep in sync),
+    then, for each expected `index_type` (the build_* subset this reference was
+    sharded for), counts registered shard rows in `reference_index`. Iff every
+    expected type has a registered row for all N shards AND the ONE
+    whole-reference `rype_router` row is registered (shard_id NULL), it does the
+    guarded `indexing -> active` transition so `active` guarantees a
+    fully-index-complete AND routable sharded reference (the consumer needs no
+    coverage check). A single still-missing shard, or a missing router, leaves the
+    reference honestly in `indexing` (fail-closed) — this primitive NEVER
+    transitions to `failed` (the FSM's only exit from `failed` is `-> pending`, a
+    full-ingest restart — wrong blast radius; an operator redrives the failed
+    shard / router ticket instead).
+
+    The router is checked SEPARATELY from `expected_index_types` (which is the
+    per-shard set): it is whole-reference, built once by the parent reference-add
+    ticket, not per shard. Both the child shard `finalize-shard` calls and the
+    parent's own `finalize-shard` (after it registers the router) converge on this
+    check — whichever completes the full set (all N shards for every expected type
+    + the router) last flips `active`.
+
+    Race-safe: register_index rows are dedup'd on (reference_idx, index_type,
+    fs_path) and committed before each ticket's own finalize_shard, so the last
+    finalize in wall-clock time observes every sibling's rows; the guarded
+    UPDATE (transition_reference_status) lets exactly one racer flip `active`,
+    and a finalize that finds the reference already `active` treats the
+    IllegalStatusTransition as idempotent success.
+
+    Returns a JSON-able summary: `activated` (whether the reference is now
+    active), the derived `expected_shards` N, and per-type `registered_shards`.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        n = await count_reference_shards(conn, reference_idx)
+        registered: dict[str, int] = {}
+        for index_type in expected_index_types:
+            registered[index_type] = await conn.fetchval(
+                "SELECT count(DISTINCT shard_id) FROM qiita.reference_index"
+                " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NOT NULL",
+                reference_idx,
+                index_type,
+            )
+        # The whole-reference rype_router (shard_id NULL) — built once by the
+        # parent, not per shard. Required for `active`: without it the sharded
+        # aligners can't route a read to its shard(s), so the reference is not
+        # actually alignable.
+        router_present = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM qiita.reference_index"
+            " WHERE reference_idx = $1 AND index_type = $2 AND shard_id IS NULL)",
+            reference_idx,
+            INDEX_TYPE_RYPE_ROUTER,
+        )
+        # Fail-closed: require at least one expected type AND at least one shard
+        # AND the router, so a degenerate call (no expected types → registered={}
+        # → all([]) is vacuously True) can NEVER flip `active` with zero indexes.
+        # `active` must always mean "every expected index is built for all N shards
+        # and the whole-reference router is registered".
+        complete = (
+            n > 0
+            and bool(registered)
+            and all(count >= n for count in registered.values())
+            and router_present
+        )
+        activated = False
+        if complete:
+            try:
+                await transition_reference_status(conn, reference_idx, ReferenceStatus.ACTIVE)
+                activated = True
+            except IllegalStatusTransition:
+                # A sibling finalize already flipped `active` (or the reference
+                # is otherwise past `indexing`) — idempotent success, not a fault.
+                current = await conn.fetchval(
+                    "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+                    reference_idx,
+                )
+                activated = current == ReferenceStatus.ACTIVE.value
+                if not activated:
+                    raise
+    return {
+        "reference_idx": reference_idx,
+        "expected_shards": n,
+        "registered_shards": registered,
+        "router_present": bool(router_present),
+        "activated": activated,
+    }
 
 
 def _both_mates(predicate: str) -> str:
@@ -871,6 +1325,74 @@ async def delete_read_mask_block_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def delete_alignment_block_data(
+    *,
+    alignment_idx: int,
+    members: list[dict[str, int]],
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete one block's exact `alignment` footprint via the
+    `delete_alignment_block` DoAction, returning the rows-deleted count. The
+    alignment twin of `delete_read_mask_block_data`.
+
+    `members` is the block's cover-map as `{prep_sample_idx, sequence_idx_start,
+    sequence_idx_stop}` dicts (from `block_member`). The data plane deletes the
+    rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)` fall in those
+    sub-ranges — exact by construction (per-member OR) and feature_idx-agnostic
+    (all of a read's alignment rows go, since a read produces multiple rows via
+    cross-shard + PE multiplicity), so a split sample's sibling-block rows survive.
+    This is the idempotent-block-replace step run immediately before register-files.
+
+    Idempotent: a fresh block (no rows yet) deletes 0 and still succeeds; an empty
+    `members` list short-circuits without a Flight call (an empty block is a
+    control-plane bug the runner never dispatches, guarded here too). Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    if not members:
+        return 0
+    token = sign_action(
+        action="delete_alignment_block",
+        payload={"alignment_idx": alignment_idx, "members": members},
+        secret=signing_key,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action, "delete_alignment_block", data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
+async def delete_alignment_data(
+    *,
+    alignment_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete an alignment's DuckLake `alignment` rows via the data plane's
+    `delete_alignment` DoAction, returning the rows-deleted count. The alignment
+    twin of `delete_mask_data` — the whole-alignment purge the
+    disallow-without-delete resubmission rule needs.
+
+    Signs a `delete_alignment` action token carrying only `alignment_idx`. The
+    delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
+    DuckLake transaction — no parquet is reclaimed from disk (mirrors
+    `delete_mask`). Idempotent: an alignment whose rows never registered (or were
+    already deleted) deletes zero rows and still succeeds. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    token = sign_action(
+        action="delete_alignment",
+        payload={"alignment_idx": alignment_idx},
+        secret=signing_key,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action, "delete_alignment", data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
 async def _finalize_sample_metrics(
     conn: asyncpg.Connection,
     *,
@@ -1047,6 +1569,125 @@ async def reconcile_block(
     return {"block_idx": block_idx, "finalized_samples": finalized}
 
 
+async def delete_alignment_block(
+    pool: asyncpg.Pool,
+    *,
+    block_idx: int,
+    alignment_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Idempotent block replace: delete this block's exact `alignment` footprint
+    before register-files re-writes it, so a block re-run never double-counts. The
+    alignment twin of `delete_read_mask_block`.
+
+    Reads the block's cover-map (`block_member`) and asks the data plane to delete
+    the `alignment` rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)`
+    fall in the members' sub-ranges. The delete is exact by construction (per-member
+    OR residual) and feature_idx-agnostic — it clears ALL of a read's alignment rows
+    (a read produces multiple rows via cross-shard + PE multiplicity) — so a sample
+    split across several blocks keeps its sibling blocks' rows; only THIS block's
+    footprint goes.
+
+    On a fresh block this deletes 0 rows (nothing registered yet); on a re-run
+    (retry, or an operator-resubmitted block covering the same footprint) it clears
+    the prior rows so the subsequent register-files leaves exactly one copy. There
+    is no reconcile count-assertion for alignment (rows are not 1:1 with reads), but
+    the delete-then-register discipline keeps a retried block from accumulating
+    duplicate alignment rows. Read-only on Postgres — the delete lands in DuckLake.
+    Returns the rows-deleted count for the workflow log."""
+    members = [
+        {
+            "prep_sample_idx": prep_sample_idx,
+            "sequence_idx_start": min_seq,
+            "sequence_idx_stop": max_seq,
+        }
+        for prep_sample_idx, min_seq, max_seq in await fetch_block_members(pool, block_idx)
+    ]
+    if not members:
+        raise RuntimeError(
+            f"block {block_idx} has no block_member rows; a block must carry its "
+            "cover-map (materialized at plan time) before any step runs"
+        )
+    rows_deleted = await delete_alignment_block_data(
+        alignment_idx=alignment_idx,
+        members=members,
+        signing_key=signing_key,
+        data_plane_url=data_plane_url,
+    )
+    return {"block_idx": block_idx, "rows_deleted": rows_deleted}
+
+
+async def reconcile_alignment_block(
+    pool: asyncpg.Pool,
+    *,
+    block_idx: int,
+    alignment_idx: int,
+) -> dict[str, Any]:
+    """Terminal step of the `align` workflow: mark this block done, then finalize
+    each sample it covers whose LAST covering block just completed. The alignment
+    twin of `reconcile_block`, keyed on `alignment_idx` not `mask_idx`.
+
+    In one transaction (the whole reconcile is atomic):
+
+    1. Flip this block to 'completed' — its `alignment` rows are registered
+       (register-files ran before this step).
+    2. For each covered sample, in a stable prep_sample_idx order (deadlock-free):
+       take the `alignment_sample` gate row's `FOR UPDATE` lock (serializes
+       concurrent block finalizers of the same sample), skip if already 'completed'
+       (idempotent / lost the race), skip if any covering block is not yet
+       'completed' (a sibling still owes alignments), else flip the gate to
+       'completed'.
+
+    **No count-assertion, no metrics rollup** (unlike `reconcile_block`): alignment
+    rows are NOT 1:1 with reads — a read routed to K shards emits K rows, and a
+    paired-end read emits one row per mate — so "row count == read count" does not
+    hold and completion is purely "every covering block done". This is also why the
+    primitive needs no data-plane hop (no `signing_key`/`data_plane_url`): it only
+    touches Postgres gate rows.
+
+    Idempotent: a re-run flips nothing new (its block is already completed and its
+    samples already finalized). Returns a summary of the samples this block
+    finalized."""
+    finalized: list[int] = []
+    async with pool.acquire() as conn, conn.transaction():
+        # This block's work is done; count it as completed BEFORE the per-sample
+        # gate check below (same txn — the UPDATE is visible to our own SELECTs).
+        # We proceed regardless of the guarded bool: a re-run where it is already
+        # completed still (idempotently) finalizes its samples.
+        await set_block_state(
+            conn,
+            block_idx=block_idx,
+            new_state="completed",
+            expected_states=["pending", "processing", "failed"],
+        )
+        for prep_sample_idx, _min_seq, _max_seq in await fetch_block_members(conn, block_idx):
+            state = await lock_alignment_sample(
+                conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            )
+            if state is None:
+                raise RuntimeError(
+                    f"alignment_sample gate row missing for (alignment={alignment_idx}, "
+                    f"prep_sample={prep_sample_idx}); it must be materialized PENDING "
+                    "at plan time before any block runs"
+                )
+            if state == "completed":
+                # Already finalized (idempotent re-run, or a concurrent block
+                # finalizer won this sample's race) — nothing to do.
+                continue
+            if await has_incomplete_covering_alignment_block(
+                conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            ):
+                # A sibling block still owes this sample alignments — do not
+                # finalize a partially-aligned sample.
+                continue
+            await finalize_alignment_sample(
+                conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            )
+            finalized.append(prep_sample_idx)
+    return {"block_idx": block_idx, "finalized_samples": finalized}
+
+
 # =============================================================================
 # Name → callable lookup for the workflow runner
 # =============================================================================
@@ -1062,8 +1703,12 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
+    LibraryPrimitive.PLAN_SHARDS: plan_shards,
+    LibraryPrimitive.FINALIZE_SHARD: finalize_shard,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
+    LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
+    LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
 }

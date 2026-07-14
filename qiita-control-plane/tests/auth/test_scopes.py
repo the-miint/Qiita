@@ -152,6 +152,23 @@ def test_mask_definition_delete_is_system_admin_only():
     assert Scope.MASK_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
 
 
+def test_alignment_definition_delete_is_system_admin_only():
+    """alignment-definition:delete is the full-alignment-purge scope — system_admin
+    only, like mask-definition:delete. wet_lab_admin can submit align runs (via
+    prep_sample:write) but not destroy their alignments, and service accounts never
+    get it. It is the disallow-without-delete escape hatch, gated like every other
+    destructive purge."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.ALIGNMENT_DEFINITION_DELETE in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
+    assert Scope.ALIGNMENT_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    assert Scope.ALIGNMENT_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.ALIGNMENT_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
+
+
 def test_masked_read_export_is_system_admin_only():
     """admin:masked_read_export gates the admin per-pool masked-read export
     (the manifest + per-sample DoGet ticket the qiita-admin masked-read-export

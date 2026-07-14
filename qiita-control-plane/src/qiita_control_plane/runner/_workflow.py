@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -53,8 +54,10 @@ from ._dispatch import (
     _escalated_walltime_after_timeout,
     _fetch_plan_hint,
     _patch_resource_status,
+    _shard_fanout_owns_finalize,
 )
 from ._mask import (
+    ALIGNMENT_IDX_BINDING,
     LIMA_ARGS_BINDING,
     MASK_IDX_BINDING,
     _mint_read_mask,
@@ -70,11 +73,14 @@ from ._processing import (
 )
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
+    ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
+    _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
+    _stage_shard_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
@@ -89,8 +95,10 @@ from ._reference import (
     QC_ADAPTER_BINDING,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
+    _resolve_sharded_align_index_bindings,
     _resolve_syndna_index,
     _workflow_needs_adapters,
+    _workflow_needs_sharded_align_indexes,
 )
 from ._upload import (
     _consume_upload_handles,
@@ -111,6 +119,7 @@ async def run_workflow(
     default_adapter_reference_idx: int | None = None,
     poll_interval_seconds: float = _STEP_POLL_INTERVAL_SECONDS,
     resume: bool = False,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> None:
     """Execute (or resume) the workflow attached to one work ticket.
 
@@ -249,6 +258,17 @@ async def run_workflow(
         if _lima is not None:
             bound[LIMA_ARGS_BINDING] = _lima["args"]
 
+        # Sharded-aligner index resolution (the `align` workflow): when a step
+        # lists router_index_path/shard_directory as inputs, resolve them from
+        # action_context (align_reference_idx + aligner) before the loop — the
+        # consumer wiring into the resolver. Same inside-try placement as the
+        # host-filter resolver so a failure (unknown / non-active reference,
+        # unbuilt router / per-shard index) lands in the outer FAILED handler
+        # instead of leaving the ticket stuck in PROCESSING. None of these keys are
+        # `*_upload_idx`, so the upload walker left them untouched.
+        if _workflow_needs_sharded_align_indexes(action.steps):
+            bound.update(await _resolve_sharded_align_index_bindings(pool, action_context=bound))
+
         # QC adapter materialization: when any step needs `adapter_parquet` (the
         # qc step), DoGet the configured artifact_sequence_set reference's
         # sequences and stage them as a local Parquet in the ticket workspace.
@@ -302,14 +322,57 @@ async def run_workflow(
                     }
                     for (ps, lo, hi) in await fetch_block_members(pool, scope_target["block_idx"])
                 ]
-                bound.update(
-                    await _resolve_staged_reads_block(
-                        members,
-                        data_plane_url=data_plane_url,
-                        signing_key=signing_key,
-                        workspace=workspace,
+                # An ALIGN block ticket carries a non-NULL alignment_idx and aligns
+                # the block's HOST-DEPLETED reads: stage the MASKED reads (the
+                # read_masked view scoped to the ticket's completed mask_idx). A
+                # read-mask-block ticket (alignment_idx NULL) masks the RAW reads,
+                # so it stages the raw `read` table. mask_idx is pre-resolved at
+                # plan time on both paths (the align planner sets it to the samples'
+                # completed mask; the block-mask planner to the partition mask).
+                #
+                # Discriminate on the action_context alignment_idx (the value the
+                # rest of the run already trusts — _reconstruct reads
+                # bound[ALIGNMENT_IDX_BINDING]), NOT the work_ticket.alignment_idx
+                # COLUMN: that column is ON DELETE SET NULL, so a mid-flight
+                # DELETE /alignment-definition NULLs it while action_context still
+                # carries the idx. Trusting the column would silently fall to the
+                # raw-reads branch and realign non-host-depleted, un-QC'd reads. Fail
+                # loud on any disagreement (the delete case) instead.
+                context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
+                if context_alignment_idx is not None:
+                    if work_ticket.get("alignment_idx") != context_alignment_idx:
+                        raise _submission_bad_input(
+                            "align block ticket action_context alignment_idx "
+                            f"{context_alignment_idx} disagrees with "
+                            "work_ticket.alignment_idx "
+                            f"{work_ticket.get('alignment_idx')!r} — the alignment "
+                            "definition was likely deleted mid-flight (the column is "
+                            "ON DELETE SET NULL); refusing to silently realign raw reads"
+                        )
+                    align_mask_idx = work_ticket["mask_idx"]
+                    if align_mask_idx is None:
+                        raise _submission_bad_input(
+                            "an align block ticket must carry the completed mask_idx its "
+                            "reads were masked under (set at plan time); found NULL"
+                        )
+                    bound.update(
+                        await _resolve_staged_masked_reads_block(
+                            members,
+                            mask_idx=align_mask_idx,
+                            data_plane_url=data_plane_url,
+                            signing_key=signing_key,
+                            workspace=workspace,
+                        )
                     )
-                )
+                else:
+                    bound.update(
+                        await _resolve_staged_reads_block(
+                            members,
+                            data_plane_url=data_plane_url,
+                            signing_key=signing_key,
+                            workspace=workspace,
+                        )
+                    )
             else:
                 raise _submission_bad_input(
                     "a workflow that masks stored reads must be prep_sample- or "
@@ -339,6 +402,27 @@ async def run_workflow(
                     pool,
                     scope_target,
                     int(mask_idx),
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
+                    workspace=workspace,
+                )
+            )
+
+        # Sharded-index build roster (build-shard-index workflow): a
+        # reference-scoped ticket carrying a non-NULL shard_id builds ONE shard.
+        # Stage its feature roster (`shard_features`) + `shard_id` before the loop
+        # so the build steps' Inputs resolve. Inside-try, so a Flight failure /
+        # empty shard FAILs the ticket cleanly. Keyed off the ticket's shard_id
+        # (not a step-input scan) — the whole ticket is a single-shard build.
+        if (
+            scope_target["kind"] == ScopeTargetKind.REFERENCE.value
+            and work_ticket.get("shard_id") is not None
+        ):
+            bound.update(
+                await _stage_shard_roster(
+                    pool,
+                    scope_target["reference_idx"],
+                    work_ticket["shard_id"],
                     data_plane_url=data_plane_url,
                     signing_key=signing_key,
                     workspace=workspace,
@@ -425,6 +509,18 @@ async def run_workflow(
                 )
             )
 
+        # Default-OFF anchor for the whole-reference rype_router build gate. The
+        # `when: router_pending` router entries (sharded reference-add) must NOT
+        # run unless the plan-shards arm sets router_pending True (N > 0). Because
+        # an absent `when:` key defaults ON, seed it False here so the gate is OFF
+        # in every no-router case — including when plan-shards is skipped
+        # (shard_index explicitly false, so it never runs and never sets the key)
+        # or a no-op. plan-shards overrides this to True on a real fan-out; on a
+        # resume the completed plan-shards re-derives it from the durable shard
+        # assignment (see `_reconstruct_completed_outputs`). Harmless for
+        # workflows with no router entries (nothing reads the key).
+        bound.setdefault(ROUTER_PENDING_BINDING, False)
+
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
             # entry when its named action_context key is present and falsy
@@ -484,6 +580,7 @@ async def run_workflow(
                         pool=pool,
                         work_ticket_idx=work_ticket_idx,
                         poll_interval_seconds=poll_interval_seconds,
+                        scope_target=scope_target,
                     )
                 )
                 continue
@@ -514,6 +611,7 @@ async def run_workflow(
                 poll_interval_seconds=poll_interval_seconds,
                 prior_progress=progress,
                 resume=resume,
+                dispatch_cb=dispatch_cb,
             )
             bound.update(outputs)
 
@@ -540,7 +638,14 @@ async def run_workflow(
         try:
             async with pool.acquire() as conn, conn.transaction():
                 await _consume_upload_handles(conn, upload_idxs=uploads_to_consume)
-                if action.success_status:
+                # Skip the success_status patch when a sharded fan-out is in
+                # progress — finalize-shard owns `indexing → active` once every
+                # shard registers (see `_shard_fanout_owns_finalize`). Every
+                # other case (unsharded ref-add, sharded-but-N=0, host-ref-add)
+                # patches inline as before.
+                if action.success_status and not await _shard_fanout_owns_finalize(
+                    conn, scope_target, bound
+                ):
                     await _patch_resource_status(conn, scope_target, action.success_status)
                 await _atomic_transition(
                     conn,
@@ -677,6 +782,7 @@ async def _run_entry_with_retry(
     poll_interval_seconds: float,
     prior_progress: list[step_progress.StepProgressRow],
     resume: bool = False,
+    dispatch_cb: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
     `BackendFailure`. Returns the entry's output map on success; raises
@@ -805,6 +911,7 @@ async def _run_entry_with_retry(
                     attempt=attempt,
                     signing_key=signing_key,
                     data_plane_url=data_plane_url,
+                    dispatch_cb=dispatch_cb,
                 )
             # WorkflowEntry is a closed union; the discriminator on
             # ActionDefinition guarantees one of the two arms above.

@@ -40,6 +40,7 @@ import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_SEQUENCED_POOL_ALIGN_PLAN,
     PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
@@ -54,6 +55,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    AlignPlanRequest,
+    AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
     PoolCompletionStatus,
@@ -75,7 +78,7 @@ from qiita_common.models import (
     merge_qc_reports,
 )
 
-from .. import block_planner
+from .. import align_planner, block_planner
 from ..actions.library import delete_pool_reads_data
 from ..actions.sequenced_pool import (
     PreflightNotEditable,
@@ -733,6 +736,135 @@ async def submit_block_mask_plan(
             },
         ) from exc
     return BlockMaskPlanResponse(**summary)
+
+
+@router.post(PATH_SEQUENCED_POOL_ALIGN_PLAN, status_code=status.HTTP_202_ACCEPTED)
+async def submit_align_plan(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    body: AlignPlanRequest,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+) -> AlignPlanResponse:
+    """Plan + submit the pool's bulk-block sharded alignment in ONE call — the
+    align analog of block-mask-plan.
+
+    Looks up each sample's already-minted host-depletion mask (a LOOKUP, never a
+    mint — the reads are the completed read-mask block-mask-plan produced), mints
+    an `alignment_idx` per mask partition over the sharded reference + aligner +
+    shard-set, tiles each partition into fixed ~10M-read blocks, persists the
+    `block`/`block_member` cover-map + a PENDING `alignment_sample` gate per sample,
+    creates one block work_ticket per block, and dispatches each. Returns the plan
+    (blocks + tickets + partition/sample counts) with HTTP 202; a pool with nothing
+    to align returns 202 with zero counts.
+
+    Same gate as block-mask-plan — a HumanUser with `Scope.PREP_SAMPLE_WRITE` at
+    system_role ≥ wet_lab_admin (alignment re-materializes host-depleted,
+    human-derived reads, a privileged lab operation).
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) / 422 (pool not under
+    this run). Host-ref coherence (minimap2⇒rype) is validated on the model.
+    """
+    # Dispatch is fire-and-forget in-process; refuse if the orchestrator hop is
+    # unconfigured rather than minting blocks whose tickets can never run.
+    if request.app.state.compute_backend_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
+        )
+
+    # The align workflow ships out-of-tree (qiita-admin actions sync). If it is not
+    # yet registered the ticket INSERT would FK-violate mid-plan; front it with a
+    # clear 503 so the operator syncs actions rather than seeing a 500.
+    action_enabled = await pool.fetchval(
+        "SELECT enabled FROM qiita.action WHERE action_id = $1 AND version = $2",
+        align_planner.ALIGN_ACTION_ID,
+        align_planner.ALIGN_ACTION_VERSION,
+    )
+    if action_enabled is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"align workflow "
+                f"({align_planner.ALIGN_ACTION_ID}/{align_planner.ALIGN_ACTION_VERSION})"
+                " is not registered; run `qiita-admin actions sync`"
+            ),
+        )
+    if not action_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                f"align workflow "
+                f"({align_planner.ALIGN_ACTION_ID}/{align_planner.ALIGN_ACTION_VERSION})"
+                " is deprecated"
+            ),
+        )
+
+    # The mask LOOKUP folds in the same canonical adapter-set hash the per-sample
+    # read-mask mint used, so it resolves to the SAME mask_idx the block-mask plan
+    # minted (else the lookup misses and every sample skips as no_mask). The helper
+    # decides inclusion exactly as the mint path does and materializes it once.
+    try:
+        adapter_set_hash = await block_planner.resolve_block_mask_adapter_hash(
+            pool,
+            default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
+            data_plane_url=data_plane_url,
+            signing_key=signing_key,
+            staging_root=staging_root,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+        )
+    except block_planner.AdapterMaterializationUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    try:
+        summary = await align_planner.plan_and_submit_alignments(
+            pool,
+            app=request.app,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+            reference_idx=body.reference_idx,
+            host_rype_reference_idx=body.host_rype_reference_idx,
+            host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            only_missing=body.only_missing,
+            adapter_set_hash=adapter_set_hash,
+            originator_principal_idx=user.principal_idx,
+            align_action_id=align_planner.ALIGN_ACTION_ID,
+            align_action_version=align_planner.ALIGN_ACTION_VERSION,
+        )
+    except align_planner.AlignReferenceNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except align_planner.AlignUnsupportedPlatform as exc:
+        # The run's platform has no defined sharded aligner (only Illumina / PacBio
+        # HiFi / Nanopore are alignable) — a request the server can't process.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except align_planner.AlignReferenceNotReady as exc:
+        # Reference exists but is not ACTIVE + sharded — the operator must build /
+        # shard it (or wait for it to go active) before aligning against it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except align_planner.AlignResubmitError as exc:
+        # A sample already gated for the resolved alignment would be re-aligned
+        # (completed → alignment double-write) or wedged (pending → duplicate
+        # covering block). DELETE the alignment or pass only_missing.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": str(exc),
+                "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
+            },
+        ) from exc
+    return AlignPlanResponse(**summary)
 
 
 @router.delete(PATH_SEQUENCED_POOL_BY_IDX)

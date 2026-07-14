@@ -806,6 +806,19 @@ class MaskDefinitionDeleteResponse(BaseModel):
     rows_deleted: int
 
 
+class AlignmentDefinitionDeleteResponse(BaseModel):
+    """Returned by DELETE /api/v1/alignment-definition/{alignment_idx}.
+
+    `rows_deleted` is the DuckLake `alignment` row count the data plane removed
+    (0 on an idempotent re-run); the Postgres `alignment_definition` row is purged
+    last, cascading the `alignment_sample` gate rows (so a fresh align plan can
+    re-create them) and detaching any referencing `work_ticket` via its
+    `ON DELETE SET NULL` FK. The disallow-without-delete escape hatch."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    rows_deleted: int
+
+
 class ReadMaskedDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read-masked/ticket/doget.
 

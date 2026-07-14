@@ -51,6 +51,10 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             # Propagated into the job env for the same reason as path_scratch:
             # native index builders derive {path_derived}/references/{idx}/...
             path_derived=settings.path_derived,
+            # Propagated into the job env so a native job that streams reference
+            # chunks (Flight DoGet) resolves the real data-plane origin on the
+            # compute node instead of the localhost default.
+            data_plane_url=settings.data_plane_url,
             qos=settings.slurm.qos,
             # PATH_DERIVED/images is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.

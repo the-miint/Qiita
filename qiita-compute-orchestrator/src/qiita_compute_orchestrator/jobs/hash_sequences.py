@@ -43,7 +43,7 @@ import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
-from qiita_common.chunking import canonical_sequence_hash_expr
+from qiita_common.chunking import canonical_sequence_hash_expr, reassemble_chunks_expr
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -208,7 +208,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "WITH per_read AS ("
                     "  SELECT "
                     "    c.read_id, "
-                    "    string_agg(c.chunk_data, '' ORDER BY c.chunk_index) AS sequence "
+                    f"    {reassemble_chunks_expr('c.')} AS sequence "
                     "  FROM read_parquet(?) c "
                     "  WHERE c.read_id = ANY(?) "
                     "  GROUP BY c.read_id"

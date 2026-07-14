@@ -73,6 +73,13 @@ CORRECT_COMPUTE_READINESS_INVOCATION = (
 BACKEND_LOCAL = "local"
 BACKEND_SLURM = "slurm"
 
+# Default data-plane gRPC origin for outbound Flight DoGet from native jobs
+# (reference-chunk streaming). Mirrors the control plane's own DATA_PLANE_URL
+# default. Overridden in production via DATA_PLANE_URL so the compute node
+# DoGets against the nginx-fronted gRPC origin. Not fail-fast (has a default),
+# unlike the SLURM-only required vars.
+DEFAULT_DATA_PLANE_URL = "grpc://localhost:50051"
+
 
 @dataclass(frozen=True, slots=True)
 class SlurmSettings:
@@ -140,6 +147,12 @@ class Settings:
     # name; `compute` on the live deploy), presented as Bearer auth on
     # outbound CO→CP calls. Same file-or-env resolution pattern as cp_to_co_token.
     co_to_cp_token: str
+    # Data-plane gRPC origin native jobs DoGet reference chunks from. Propagated
+    # into the SLURM job env like PATH_DERIVED so the launcher's get_settings()
+    # resolves the real origin on the compute node (see SlurmBackend). Has a
+    # default (DEFAULT_DATA_PLANE_URL) so it is NOT fail-fast — a deploy that
+    # forgets it falls back to localhost rather than keeping the unit down.
+    data_plane_url: str = DEFAULT_DATA_PLANE_URL
     # SLURM config — non-None only when backend_type=slurm.
     slurm: SlurmSettings | None = None
     # Shared-FS dir where built SIFs land, derived as PATH_DERIVED/images.
@@ -190,6 +203,7 @@ class Settings:
             cp_to_co_token=_resolve_token("cp_to_co") if require_cp_to_co_token else "",
             cp_url=_resolve_cp_url(),
             co_to_cp_token=_resolve_token("co_to_cp"),
+            data_plane_url=os.environ.get("DATA_PLANE_URL", DEFAULT_DATA_PLANE_URL),
             slurm=slurm,
             path_derived_images=path_derived_images,
         )

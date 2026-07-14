@@ -41,6 +41,32 @@ context_schema:
     tree_path: {type: string, pattern: "^/"}
     jplace_path: {type: string, pattern: "^/"}
     genome_map_path: {type: string, pattern: "^/"}
+    # Analysis sharding (opt-in, default OFF) — identical semantics to
+    # reference-add's shard_index: after register-files, `plan-shards` assigns
+    # reference_membership.shard_id and fans out one build-shard-index ticket per
+    # shard (loading → indexing → active). Sharding is an indexing choice on the
+    # same reference data. Default OFF → today's loading → active, byte-identical.
+    shard_index: {type: boolean}
+    # Which per-shard analysis indexes to build (default-ON; only meaningful when
+    # shard_index is true). Per-shard rype no longer exists — routing is the ONE
+    # whole-reference rype_router the sharded path builds automatically, so a
+    # shard builds only minimap2 + bowtie2.
+    build_minimap2: {type: boolean}
+    build_bowtie2: {type: boolean}
+    # Build params forwarded to the shard builders (minimap2_preset ->
+    # build_minimap2_index.preset).
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+  # A sharded reference must build at least one per-shard index type (same
+  # backstop as reference-add). Fires only when shard_index is true AND both
+  # build_* are explicitly false. The whole-reference rype_router is always built.
+  not:
+    required: [shard_index, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
 
 success_status: active
 failure_status: failed
@@ -100,7 +126,48 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
+  # Sharded-index fan-out (opt-in) — identical to reference-add's plan-shards
+  # tail. Runs only when shard_index: true; MUST follow register-files (shard
+  # builds stream chunks from DuckLake). See reference-add/1.0.0.yaml for the
+  # full rationale (loading → indexing → active, conditional finalize).
+  - action: plan-shards
+    when: shard_index
+    inputs: []
+    outputs: []
+
+  # Whole-reference routing index — identical to reference-add's router tail (see
+  # that file for the full rationale). Gated on `router_pending` (plan-shards sets
+  # it true + stages `shard_mapping` only on a real fan-out, N > 0). Runs in the
+  # PARENT ticket after plan-shards; build_routing_index builds the whole-reference
+  # rype ROUTER, register-index records the `rype_router` row, and finalize-shard
+  # converges with the per-shard children on the guarded indexing → active.
+  - step: build_routing_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_routing_index
+    when: router_pending
+    inputs: [shard_mapping]
+    outputs: [routing_index_meta]
+    # Whole-reference rype build (sized like local-host-reference-add's
+    # build_rype_index — the local path allows a long walltime for genome-scale
+    # references); an OOM retry doubles mem to the 128 GB action ceiling.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 64
+      walltime: PT24H
+
+  - action: register-index
+    when: router_pending
+    inputs: [routing_index_meta]
+    outputs: []
+
+  - action: finalize-shard
+    when: router_pending
+    inputs: []
+    outputs: []
+
 action_ceiling:
   cpu: 16
-  mem_gb: 64
+  # 128 (not 64): build_routing_index starts at 64 GB and an OOM retry doubles it,
+  # matching local-host-reference-add's build_rype_index ceiling rationale.
+  mem_gb: 128
   walltime: PT48H

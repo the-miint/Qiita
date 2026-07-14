@@ -718,6 +718,17 @@ def _build_parser() -> argparse.ArgumentParser:
             " which builds the rype + minimap2 host-filter indexes. Requires --taxonomy."
         ),
     )
+    p_reference_load.add_argument(
+        "--shard-index",
+        action="store_true",
+        dest="shard_index",
+        help=(
+            "Build per-shard ANALYSIS aligner indexes (minimap2 + bowtie2) on a plain"
+            " reference, plus the ONE whole-reference rype router: after ingest,"
+            " plan-shards fans out one build per lineage-sorted shard (loading ->"
+            " indexing -> active). Requires --taxonomy; mutually exclusive with --host."
+        ),
+    )
     # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local
     # by-path). Neither is argparse-required because exactly which one applies
     # depends on --local; the entry point enforces the XOR and the
@@ -749,35 +760,50 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument("--tree", type=Path)
     p_reference_load.add_argument("--jplace", type=Path)
     p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
-    # Host index selection + build params (apply only with --host). Default
-    # builds both indexes; the opt-out flags skip one (not both — the entry
-    # point rejects building neither). --rype-w / --minimap2-preset tune the
-    # builders; omitted, they use the builders' defaults (w=20, preset=sr).
+    # Index selection + build params, scoped by index type: rype knobs apply to
+    # --host ONLY (a sharded reference's routing index is the auto-built
+    # whole-reference router, not a per-shard rype); minimap2 knobs to --host OR
+    # --shard-index; --no-bowtie2-index to --shard-index only. Default builds
+    # every applicable index; the opt-out flags skip one (the entry point rejects
+    # building none). --minimap2-preset tunes the HOST builder only; a sharded
+    # reference's per-shard .mmi is always built with the fixed map-hifi preset.
     p_reference_load.add_argument(
         "--no-rype-index",
         action="store_true",
         help=(
-            "With --host: skip the rype index (build minimap2 only). Cannot be"
-            " combined with --no-minimap2-index."
+            "With --host: skip the rype host-filter index. Cannot be combined with"
+            " --no-minimap2-index such that neither host index is built."
         ),
     )
     p_reference_load.add_argument(
         "--no-minimap2-index",
         action="store_true",
         help=(
-            "With --host: skip the minimap2 index (build rype only). Cannot be"
-            " combined with --no-rype-index."
+            "With --host/--shard-index: skip the minimap2 index. Cannot be combined"
+            " with the other --no-*-index flags such that none is built."
+        ),
+    )
+    p_reference_load.add_argument(
+        "--no-bowtie2-index",
+        action="store_true",
+        dest="no_bowtie2_index",
+        help=(
+            "With --shard-index: skip the bowtie2 per-shard analysis index (bowtie2 is"
+            " analysis-only, so this does not apply to --host)."
         ),
     )
     p_reference_load.add_argument(
         "--rype-w",
         type=int,
-        help="With --host: rype minimizer window `w` for the rype index build (default 20).",
+        help="With --host: rype minimizer window `w` (default 20).",
     )
     p_reference_load.add_argument(
         "--minimap2-preset",
         choices=("sr", "map-ont", "map-pb", "map-hifi", "asm5", "asm10", "asm20"),
-        help="With --host: minimap2 preset baked into the .mmi index (default sr).",
+        help=(
+            "With --host only: minimap2 preset baked into the host .mmi index (default"
+            " sr). Not allowed with --shard-index (per-shard .mmi is fixed at map-hifi)."
+        ),
     )
     p_reference_load.add_argument(
         "--data-plane-url",

@@ -42,6 +42,7 @@ resolution; absent uploads → absent paths → absent outputs.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
@@ -61,6 +62,8 @@ from ._feature_load import (
     write_feature_sequence_chunks,
     write_feature_sequences,
 )
+
+_LOG = logging.getLogger(__name__)
 
 YAML_STEP_NAME = "load"
 
@@ -289,6 +292,30 @@ def _write_reference_membership(
     )
 
 
+def _warn_taxonomy_anomaly(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    count_sql: str,
+    sample_sql: str,
+    params: list,
+    describe: str,
+) -> None:
+    """Emit a loud WARNING (never a raise) with a LIMIT-5 sample when a
+    taxonomy-coverage anomaly is present.
+
+    Coverage gaps and namespace mismatches are expected on real corpora —
+    GG2's 2024.09 backbone has ~29 features with no taxonomy row, and a
+    supplied taxonomy keyed in a different ID namespace than the FASTA is
+    the exact class that already bit the genome map — so they must NOT
+    fail the ingest. They must be visible, though: an unconfigured WARNING
+    reaches stderr via Python's last-resort handler and lands in the SLURM
+    job log, the loudest channel this architecture offers today."""
+    n = conn.execute(count_sql, params).fetchone()[0]
+    if n:
+        sample = [r[0] for r in conn.execute(sample_sql, params).fetchall()]
+        _LOG.warning("%d %s (sample: %s)", n, describe, sample)
+
+
 def _write_taxonomy(
     conn: duckdb.DuckDBPyConnection,
     taxonomy_path: Path,
@@ -297,8 +324,15 @@ def _write_taxonomy(
 ) -> None:
     """Parse semicolon-delimited rank string from the input Parquet's
     `(feature_id, taxonomy)` rows, JOIN against id_map on read_id, and
-    emit one DuckLake row per matched feature. Validation: ≤8 ranks, no
-    blank fields, prefix order."""
+    emit exactly one DuckLake row per reference feature — including
+    features with no supplied taxonomy, which are recorded at rest as
+    all-NULL-rank ("unclassified") rows. So `reference_taxonomy` is 1-1
+    with the reference's features.
+
+    Format checks on *supplied* content stay hard ValueErrors (≤8 ranks,
+    no blank fields, prefix order). Coverage anomalies (missing / stray /
+    duplicate) are warned loudly, not raised: real data isn't strictly
+    1-1 and a hard check would reject GG2."""
     conn.execute(
         "CREATE TEMP TABLE parsed_taxonomy AS "
         "SELECT "
@@ -339,22 +373,78 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
+    # Warn (don't raise) on coverage anomalies. Distinct-feature counts so
+    # a canonical-hash collision (two read_ids → one feature) isn't
+    # double-counted.
+    _warn_taxonomy_anomaly(
+        conn,
+        count_sql=(
+            "SELECT count(*) FROM (SELECT DISTINCT feature_idx FROM id_map) x "
+            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx"
+        ),
+        sample_sql=(
+            "SELECT DISTINCT x.read_id FROM id_map x "
+            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx LIMIT 5"
+        ),
+        params=[],
+        describe="feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
+    )
+    _warn_taxonomy_anomaly(
+        conn,
+        count_sql=(
+            "SELECT count(*) FROM read_parquet(?) t ANTI JOIN id_map m ON t.feature_id = m.read_id"
+        ),
+        sample_sql=(
+            "SELECT t.feature_id FROM read_parquet(?) t "
+            "ANTI JOIN id_map m ON t.feature_id = m.read_id LIMIT 5"
+        ),
+        params=[str(taxonomy_path)],
+        describe=(
+            "supplied taxonomy row(s) reference a feature_id that is not a sequence read_id "
+            "(stray / unmatched — ID-namespace mismatch); dropping them"
+        ),
+    )
+    _warn_taxonomy_anomaly(
+        conn,
+        count_sql=(
+            "SELECT count(*) FROM "
+            "(SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1)"
+        ),
+        sample_sql=(
+            "SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1 LIMIT 5"
+        ),
+        params=[str(taxonomy_path)],
+        describe=(
+            "feature_id(s) have duplicate supplied taxonomy rows; collapsing to one per feature"
+        ),
+    )
+
+    # LEFT JOIN off the distinct reference feature set (same features
+    # reference_sequences / reference_membership emit) so every feature
+    # gets exactly one row; features with no supplied taxonomy get NULL
+    # ranks (the existing NULLIF(substr(ranks[i], 4), '') yields NULL for
+    # a NULL `ranks`). Dedupe supplied taxonomy to one row per feature_idx
+    # first so a duplicate read_id can't multiply the LEFT JOIN.
     conn.execute(
         "COPY ("
         "  SELECT "
         f"    CAST({reference_idx} AS BIGINT) AS reference_idx,"
-        "    feature_idx,"
-        "    NULLIF(substr(ranks[1], 4), '') AS domain,"
-        "    NULLIF(substr(ranks[2], 4), '') AS phylum,"
-        "    NULLIF(substr(ranks[3], 4), '') AS class,"
-        "    NULLIF(substr(ranks[4], 4), '') AS \"order\","
-        "    NULLIF(substr(ranks[5], 4), '') AS family,"
-        "    NULLIF(substr(ranks[6], 4), '') AS genus,"
-        "    NULLIF(substr(ranks[7], 4), '') AS species,"
-        "    NULLIF(substr(ranks[8], 4), '') AS strain,"
+        "    m.feature_idx,"
+        "    NULLIF(substr(p.ranks[1], 4), '') AS domain,"
+        "    NULLIF(substr(p.ranks[2], 4), '') AS phylum,"
+        "    NULLIF(substr(p.ranks[3], 4), '') AS class,"
+        "    NULLIF(substr(p.ranks[4], 4), '') AS \"order\","
+        "    NULLIF(substr(p.ranks[5], 4), '') AS family,"
+        "    NULLIF(substr(p.ranks[6], 4), '') AS genus,"
+        "    NULLIF(substr(p.ranks[7], 4), '') AS species,"
+        "    NULLIF(substr(p.ranks[8], 4), '') AS strain,"
         "    NULL::BIGINT AS ncbi_taxon_id"
-        "  FROM parsed_taxonomy"
-        "  ORDER BY feature_idx"
+        "  FROM (SELECT DISTINCT feature_idx FROM id_map) m"
+        "  LEFT JOIN ("
+        "    SELECT feature_idx, any_value(ranks) AS ranks"
+        "    FROM parsed_taxonomy GROUP BY feature_idx"
+        "  ) p ON m.feature_idx = p.feature_idx"
+        "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})"
     )
     conn.execute("DROP TABLE parsed_taxonomy")

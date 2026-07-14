@@ -32,6 +32,11 @@ from ._upload import _submission_bad_input
 # into the step.
 MASK_IDX_BINDING = "mask_idx"
 
+# The align run's alignment_idx (mask-style identity), read off an align block
+# ticket's `work_ticket.alignment_idx` and threaded into the align_sharded step's
+# `params:` so every emitted row is keyed by it. None for non-align tickets.
+ALIGNMENT_IDX_BINDING = "alignment_idx"
+
 # Binding for the CP-resolved lima argument string. The `lima_export` step lists
 # it in its `params:` and writes it into `lima_config.json`, which the container
 # reads — a scalar cannot ride a container step's `inputs` (they are bind-mount

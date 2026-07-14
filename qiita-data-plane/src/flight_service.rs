@@ -223,10 +223,11 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 ///   overwrite, so a replay after success fails closed (AlreadyExists), never a
 ///   double-registration.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
-///   `delete_read_mask_block` — logical DELETEs; re-running deletes zero rows.
-/// - `export_read` / `export_read_block` — re-materialize the same sample/block
-///   bytes to the same ticket path via atomic publish; a replay reproduces
-///   identical output.
+///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` —
+///   logical DELETEs; re-running deletes zero rows.
+/// - `export_read` / `export_read_block` / `export_read_masked_block` —
+///   re-materialize the same sample/block bytes to the same ticket path via
+///   atomic publish; a replay reproduces identical output.
 /// - `count_masked` / `mask_metrics` — read-only aggregates.
 ///
 /// The `do_action` dispatcher rejects any action not in this set, so a **new**
@@ -240,8 +241,11 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_mask",
     "delete_pool_reads",
     "delete_read_mask_block",
+    "delete_alignment",
+    "delete_alignment_block",
     "export_read",
     "export_read_block",
+    "export_read_masked_block",
     "count_masked",
     "mask_metrics",
 ];
@@ -536,12 +540,101 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                let deleted = delete_read_mask_block(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    payload.mask_idx,
-                    &payload.members,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_alignment_block). The closure opens and drops its own
+                // connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let mask_idx = payload.mask_idx;
+                let members = payload.members;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_read_mask_block(&catalog, &data_path, mask_idx, &members)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_read_mask_block task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "delete_alignment" => {
+                let payload = auth::verify_delete_alignment(&action.body, &self.flight_public_key)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_alignment" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_alignment', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_mask). The closure opens and drops its own connection, so
+                // it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let alignment_idx = payload.alignment_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_alignment(&catalog, &data_path, alignment_idx)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_alignment task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "delete_alignment_block" => {
+                let payload =
+                    auth::verify_delete_alignment_block(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_alignment_block" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_alignment_block', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+                // An empty block is a control-plane bug, not a valid ask —
+                // reject it loudly rather than deleting nothing silently.
+                if payload.members.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "delete_alignment_block requires a non-empty members list",
+                    ));
+                }
+
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_alignment). The closure opens and drops its own
+                // connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let alignment_idx = payload.alignment_idx;
+                let members = payload.members;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_alignment_block(&catalog, &data_path, alignment_idx, &members)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_alignment_block task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -635,6 +728,66 @@ impl FlightService for QiitaFlightService {
                 .await
                 .map_err(|e| {
                     Status::internal(format!("export_read_block task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&serde_json::json!({
+                    "count": count,
+                    "dest": payload.dest,
+                }))
+                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "export_read_masked_block" => {
+                let payload =
+                    auth::verify_export_read_masked_block(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "export_read_masked_block" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'export_read_masked_block', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+                // An empty block is a control-plane bug, not a valid ask —
+                // reject it loudly rather than silently writing an empty file.
+                if payload.members.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "export_read_masked_block requires a non-empty members list",
+                    ));
+                }
+
+                // Defense in depth on the HMAC-trusted destination before it is
+                // inlined into a DuckDB `COPY ... TO` literal and written to.
+                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
+
+                // `COPY` is synchronous and, for a ~10M-read block, long-lived —
+                // run it on the blocking pool so it never starves a tonic async
+                // worker. The closure opens and drops its own connection, so it
+                // is Send and crosses no await (mirrors `export_read_block`).
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
+                let mask_idx = payload.mask_idx;
+                let members = payload.members;
+                let count = tokio::task::spawn_blocking(move || {
+                    export_read_masked_block_to_parquet(
+                        &catalog,
+                        &data_path,
+                        mask_idx,
+                        &members,
+                        &dest,
+                        &scratch_root,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("export_read_masked_block task join failed: {e}"))
                 })??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
@@ -1105,6 +1258,15 @@ where
 const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
 
+/// The read-export projection, in `read` / `read_masked` table order. Shared by
+/// the raw (`export_read` / `export_read_block`, from `qiita_lake.read`) and
+/// masked (`export_read_masked_block`, from the `read_masked` VIEW) exports so
+/// every read-block Parquet has the identical column shape — the shape
+/// `align_sharded.reads` / the read-mask jobs bind. `read_masked` exposes exactly
+/// these columns (plus `mask_idx`), already trimmed and `pass`-filtered.
+const EXPORT_READ_COLUMNS: &str =
+    "prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2";
+
 /// Validate a control-plane-signed `export_read` destination before the data
 /// plane writes to it. The token is signature-trusted, so this is defense in depth:
 /// the dest must be absolute, contain no single quote (it is inlined into a
@@ -1142,17 +1304,20 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
     Ok(path.to_path_buf())
 }
 
-/// Re-materialize a selection of the DuckLake `read` table into a Parquet at
-/// `dest`, filtered by the caller-supplied `where_clause` (an already-safe SQL
-/// predicate — signature-verified inlined integers only). Returns the row count.
+/// Run a caller-supplied `select_sql` (an already-safe SELECT — signature-verified
+/// inlined integers only) and materialize its rows into a Parquet at `dest`.
+/// Returns the row count.
 ///
-/// Shared machinery for the read-export DoActions: `export_read` (one whole
-/// sample) and `export_read_block` (the union of a block's `(prep_sample,
-/// sub-range)` members). An empty selection writes NO file and returns 0 — the
-/// control plane turns that into a clean submission failure. The `COPY` streams
-/// row groups to disk, so memory stays bounded regardless of selection size.
-/// Opens and drops its own connection so the caller can run it on the blocking
-/// pool (mirrors `register_files`).
+/// Shared machinery for every read-export DoAction: `export_read` (one whole
+/// sample) and `export_read_block` (a block's `(prep_sample, sub-range)` members)
+/// read `qiita_lake.read`; `export_read_masked_block` reads the `read_masked`
+/// VIEW (trimmed + `pass`-filtered) scoped by `mask_idx`. Each caller builds its
+/// own SELECT (same `EXPORT_READ_COLUMNS` projection so the output shape is
+/// identical); this function owns the publish. An empty selection writes NO file
+/// and returns 0 — the control plane turns that into a clean submission failure.
+/// The `COPY` streams row groups to disk, so memory stays bounded regardless of
+/// selection size. Opens and drops its own connection so the caller can run it on
+/// the blocking pool (mirrors `register_files`).
 ///
 /// `dest` arrives already lexically validated (`validate_export_dest`), but this
 /// is human-read data, so we ALSO resolve symlinks: another job on the shared
@@ -1164,10 +1329,10 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// `reads.parquet` a retry could read. The row count is read back from the
 /// written file, so it always matches the bytes on disk (no separate catalog
 /// scan that could race the `COPY`).
-fn export_read_where_to_parquet(
+fn export_select_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
-    where_clause: &str,
+    select_sql: &str,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
@@ -1211,10 +1376,10 @@ fn export_read_where_to_parquet(
 
     // Write to a sibling temp, then publish atomically. `dest` is validated
     // (absolute, under the scratch root, no `..`, no single quote) and the
-    // `.partial` suffix preserves all of that; the `where_clause` carries only
-    // signature-verified inlined integers — all safe to inline. The column list is
-    // the full `read` schema in table order, so the file is a drop-in for the
-    // durable staging copy (modulo row order, which does not matter).
+    // `.partial` suffix preserves all of that; the `select_sql` carries only
+    // signature-verified inlined integers — all safe to inline. Callers project the
+    // full `EXPORT_READ_COLUMNS` set in table order, so the file is a drop-in for
+    // the durable staging copy (modulo row order, which does not matter).
     let tmp = {
         let mut s = dest.as_os_str().to_os_string();
         s.push(".partial");
@@ -1223,11 +1388,7 @@ fn export_read_where_to_parquet(
     let tmp_sql = tmp
         .to_str()
         .ok_or_else(|| Status::internal(format!("non-UTF-8 dest path: {}", tmp.display())))?;
-    let copy_sql = format!(
-        "COPY (SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2 \
-         FROM qiita_lake.read WHERE {where_clause}) \
-         TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})"
-    );
+    let copy_sql = format!("COPY ({select_sql}) TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})");
 
     // The fallible sequence is isolated so the temp file is cleaned up on the
     // empty path (count 0) and on any error; on success it is renamed away.
@@ -1270,8 +1431,8 @@ fn export_read_where_to_parquet(
 
 /// Re-materialize one prep_sample's reads into a per-ticket `reads.parquet` a
 /// read-mask job consumes (the per-sample export). A sample with no stored reads
-/// writes NO file and returns 0. `prep_sample_idx` is an signature-verified i64, safe
-/// to inline. See `export_read_where_to_parquet` for the shared write/publish.
+/// writes NO file and returns 0. `prep_sample_idx` is a signature-verified i64, safe
+/// to inline. See `export_select_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
@@ -1279,10 +1440,13 @@ fn export_read_to_parquet(
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
-    export_read_where_to_parquet(
+    export_select_to_parquet(
         catalog_connstr,
         data_path,
-        &format!("prep_sample_idx = {prep_sample_idx}"),
+        &format!(
+            "SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read \
+             WHERE prep_sample_idx = {prep_sample_idx}"
+        ),
         dest,
         scratch_root,
     )
@@ -1316,10 +1480,51 @@ fn export_read_block_to_parquet(
         return Ok(0);
     }
     let where_clause = block_read_where_clause(members);
-    export_read_where_to_parquet(
+    export_select_to_parquet(
         catalog_connstr,
         data_path,
-        &where_clause,
+        &format!("SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read WHERE {where_clause}"),
+        dest,
+        scratch_root,
+    )
+}
+
+/// Re-materialize a block's MASKED reads — the union of its `(prep_sample_idx,
+/// sequence_idx sub-range)` members, from the `read_masked` VIEW scoped to
+/// `mask_idx` — into a per-ticket `reads.parquet` the `align_sharded` job
+/// consumes. Returns the row count (0 ⇒ no file written).
+///
+/// The masked sibling of `export_read_block_to_parquet`: same exact-by-
+/// construction member selector (`block_read_where_clause`) and identical
+/// `EXPORT_READ_COLUMNS` output shape, but the source is the `read_masked` VIEW
+/// (trimmed + host/QC-`pass`-filtered) rather than the raw `read` table, and the
+/// selection is further scoped by `mask_idx = ?` so it materializes exactly the
+/// reads that survived THIS host-depletion mask. That means a block's masked
+/// export can be SMALLER than its raw range (masked-out reads drop) — legitimate,
+/// not an under-selection; only a genuinely empty result (no covering pass row)
+/// writes no file. `read_masked` exposes `EXPORT_READ_COLUMNS` verbatim, so
+/// `align_sharded.reads` is unchanged. `mask_idx` + all member integers are
+/// HMAC-verified i64s, safe to inline. See `export_select_to_parquet` for the
+/// shared write/publish.
+fn export_read_masked_block_to_parquet(
+    catalog_connstr: &str,
+    data_path: &str,
+    mask_idx: i64,
+    members: &[auth::ExportReadBlockMember],
+    dest: &Path,
+    scratch_root: &Path,
+) -> Result<i64, Status> {
+    if members.is_empty() {
+        return Ok(0);
+    }
+    let where_clause = block_read_where_clause(members);
+    export_select_to_parquet(
+        catalog_connstr,
+        data_path,
+        &format!(
+            "SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read_masked \
+             WHERE mask_idx = {mask_idx} AND ({where_clause})"
+        ),
         dest,
         scratch_root,
     )
@@ -1969,6 +2174,133 @@ fn delete_read_mask_block(
     }))
 }
 
+/// Logically delete every `alignment` row for one `alignment_idx` from DuckLake —
+/// the whole-alignment purge the disallow-without-delete resubmission rule needs
+/// (a completed `alignment_sample` must be cleared before re-aligning).
+///
+/// The alignment twin of `delete_mask`: one DuckLake transaction, logical
+/// `DELETE` only. No raw parquet `unlink` — DuckLake owns file lifecycle and a
+/// manual unlink would corrupt the catalog; orphan parquets are tolerated until a
+/// future maintenance pass (matches `delete_mask`). Idempotent: deleting an
+/// `alignment_idx` with zero rows is success and returns `rows_deleted: 0`, so the
+/// control plane can safely retry. `alignment_idx` is an HMAC-verified i64.
+fn delete_alignment(
+    catalog_connstr: &str,
+    data_path: &str,
+    alignment_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // Single-statement delete wrapped in an explicit transaction so the action
+    // is all-or-nothing and the control plane can safely retry: a failed call
+    // leaves the alignment's rows fully intact, so a retry sees the same row set.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deleted = conn.execute(
+        "DELETE FROM qiita_lake.alignment WHERE alignment_idx = ?",
+        [&alignment_idx as &dyn duckdb::ToSql],
+    );
+
+    let rows_deleted = match deleted {
+        Ok(n) => n,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Status::internal(format!(
+                "delete failed (DELETE FROM qiita_lake.alignment WHERE alignment_idx = ?): {e}"
+            )));
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "alignment_idx": alignment_idx,
+        "rows_deleted": rows_deleted,
+    }))
+}
+
+/// Delete exactly one block's footprint from the DuckLake `alignment` table: the
+/// rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)` fall in the
+/// members' sub-ranges. This is the idempotent-block-replace primitive — the
+/// `align` workflow runs it immediately before `register-files`, so a re-run
+/// deletes the prior run's rows before writing fresh ones and never double-counts.
+///
+/// The alignment twin of `delete_read_mask_block`: same exact-by-construction
+/// footprint selector (`block_read_where_clause`) scoped further by
+/// `alignment_idx = ?`. The per-member OR residual makes it exact — a split member
+/// deletes ONLY its own sub-range, so a sibling block's rows for a shared sample
+/// survive (independent of tiling order). The selector is on `(prep_sample_idx,
+/// sequence_idx)` and is feature_idx-agnostic, so it clears ALL of a read's
+/// alignment rows (a read produces multiple rows via cross-shard + PE
+/// multiplicity) — exactly what a re-run must replace.
+///
+/// Mirrors `delete_read_mask_block`: one DuckLake transaction (all-or-nothing,
+/// retriable), logical `DELETE` only (no raw parquet unlink — DuckLake owns file
+/// lifecycle). Idempotent: a fresh block (no rows yet) deletes 0. Empty `members`
+/// is a control-plane bug (the DoAction arm rejects it before this); guarded here
+/// too, returning a zero-count noop. All integers are HMAC-verified i64s, safe to
+/// inline.
+fn delete_alignment_block(
+    catalog_connstr: &str,
+    data_path: &str,
+    alignment_idx: i64,
+    members: &[auth::ExportReadBlockMember],
+) -> Result<serde_json::Value, Status> {
+    if members.is_empty() {
+        return Ok(serde_json::json!({
+            "alignment_idx": alignment_idx,
+            "rows_deleted": 0,
+        }));
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // Scope the shared footprint selector to this align-config identity. The
+    // `read`/`read_mask` blocks key on sequence_idx; the `alignment` sink also
+    // carries a sequence_idx column, so the SAME clause applies.
+    let where_clause = format!(
+        "alignment_idx = {alignment_idx} AND {}",
+        block_read_where_clause(members)
+    );
+
+    // Single-statement delete wrapped in an explicit transaction so the action
+    // is all-or-nothing and the control plane can safely retry: a failed call
+    // leaves the block's rows fully intact, so a retry sees the same row set.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deleted = conn.execute(
+        &format!("DELETE FROM qiita_lake.alignment WHERE {where_clause}"),
+        [],
+    );
+
+    let rows_deleted = match deleted {
+        Ok(n) => n,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Status::internal(format!(
+                "delete failed (DELETE FROM qiita_lake.alignment WHERE {where_clause}): {e}"
+            )));
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "alignment_idx": alignment_idx,
+        "rows_deleted": rows_deleted,
+    }))
+}
+
 /// Mint a unique, ticket-traceable lake-storage filename for a registered
 /// Parquet.
 ///
@@ -2115,6 +2447,13 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         if needs_membership_join && col == "reference_idx" {
             // Applied as a WHERE on the joined membership table alias.
             where_clauses.push(format!("m.reference_idx IN ({csv})"));
+        } else if needs_membership_join {
+            // Under the membership JOIN, feature_idx exists on BOTH the base
+            // table (t) and the membership table (m), so an unqualified
+            // reference is ambiguous — a combined {reference_idx, feature_idx}
+            // filter (what the CP's feature_idx-scoped DoGet ticket mints)
+            // would otherwise fail to bind. Qualify with the base alias.
+            where_clauses.push(format!("t.{col} IN ({csv})"));
         } else {
             where_clauses.push(format!("{col} IN ({csv})"));
         }
@@ -2449,6 +2788,161 @@ mod tests {
 
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});"
+        ));
+    }
+
+    /// `delete_alignment` drops exactly the target alignment_idx's `alignment`
+    /// rows, leaves a different alignment untouched, and is idempotent: a second
+    /// delete of the same alignment_idx succeeds and reports `rows_deleted: 0`.
+    /// The alignment twin of `delete_mask_drops_target_idempotently`.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_alignment_drops_target_idempotently() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let align_a: i64 = 960_100;
+        let align_b: i64 = 960_101;
+        let prep: i64 = 960_110;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             INSERT INTO qiita_lake.alignment \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep}, 1, 10), \
+                 ({align_a}, {prep}, 2, 11), \
+                 ({align_b}, {prep}, 1, 10);"
+        ))
+        .unwrap();
+
+        let first =
+            delete_alignment(&connstr, &data_path, align_a).expect("delete_alignment failed");
+        assert_eq!(first["rows_deleted"], 2, "both align_a rows deleted");
+        assert_eq!(first["alignment_idx"], align_a);
+
+        let count = |align: i64| -> i64 {
+            conn.query_row(
+                &format!("SELECT count(*) FROM qiita_lake.alignment WHERE alignment_idx = {align}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(align_a), 0, "align_a rows gone");
+        assert_eq!(count(align_b), 1, "align_b untouched");
+
+        // Idempotency: re-deleting the now-empty alignment is success with 0 rows.
+        let second =
+            delete_alignment(&connstr, &data_path, align_a).expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align_b};"
+        ));
+    }
+
+    /// `delete_alignment_block` deletes EXACTLY one block's footprint from the
+    /// `alignment` table: the per-member OR residual keeps a split sample's
+    /// sibling-block sub-range, the `alignment_idx` scope keeps a different
+    /// alignment's rows for the same sample, ALL of a read's rows go (multiplicity
+    /// — a read with two feature_idx rows loses both), and a re-delete is an
+    /// idempotent 0-row noop. The alignment twin of
+    /// `delete_read_mask_block_deletes_footprint_only`.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_alignment_block_deletes_footprint_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let align_a: i64 = 960_200;
+        let align_b: i64 = 960_201;
+        let prep_a: i64 = 960_210;
+        let prep_b: i64 = 960_211;
+
+        // align_a/prep_a is a SPLIT sample: block 1 owns seq 100-101, block 2 owns
+        // seq 102-103. seq 100 has TWO rows (feature 10 + 11 — a read aligned to
+        // two shards' features), exercising the feature_idx-agnostic multiplicity
+        // delete. align_a/prep_b (seq 200-201) is whole in block 1. align_b's row
+        // for prep_a (seq 100) is a different align-config identity.
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             INSERT INTO qiita_lake.alignment \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep_a}, 100, 10), \
+                 ({align_a}, {prep_a}, 100, 11), \
+                 ({align_a}, {prep_a}, 101, 10), \
+                 ({align_a}, {prep_a}, 102, 10), \
+                 ({align_a}, {prep_a}, 103, 10), \
+                 ({align_a}, {prep_b}, 200, 10), \
+                 ({align_a}, {prep_b}, 201, 10), \
+                 ({align_b}, {prep_a}, 100, 10);"
+        ))
+        .unwrap();
+
+        // Block 1's footprint: prep_a[100,101] (its half of the split) + prep_b
+        // whole. block_min=100, block_max=201 spans prep_a's 102-103 too, so the
+        // per-member OR is what keeps block 2's sub-range intact.
+        let members = vec![
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_a,
+                sequence_idx_start: 100,
+                sequence_idx_stop: 101,
+            },
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_b,
+                sequence_idx_start: 200,
+                sequence_idx_stop: 201,
+            },
+        ];
+
+        let first = delete_alignment_block(&connstr, &data_path, align_a, &members)
+            .expect("delete_alignment_block failed");
+        // 3 rows for prep_a[100,101] (two at seq 100 + one at 101) + 2 for prep_b.
+        assert_eq!(
+            first["rows_deleted"], 5,
+            "block 1's 5 footprint rows deleted"
+        );
+        assert_eq!(first["alignment_idx"], align_a);
+
+        let count = |align: i64, prep: i64| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.alignment \
+                     WHERE alignment_idx = {align} AND prep_sample_idx = {prep}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Block 2's sub-range of the split sample survives (per-member OR exact).
+        assert_eq!(
+            count(align_a, prep_a),
+            2,
+            "prep_a 102-103 (block 2) untouched"
+        );
+        // prep_b's whole sample was in block 1 — fully deleted.
+        assert_eq!(count(align_a, prep_b), 0, "prep_b fully deleted");
+        // The different alignment's row for the same sample is out of scope.
+        assert_eq!(count(align_b, prep_a), 1, "align_b untouched");
+
+        // Idempotency: re-deleting the same footprint removes nothing.
+        let second = delete_alignment_block(&connstr, &data_path, align_a, &members)
+            .expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});"
         ));
     }
 
@@ -3460,6 +3954,144 @@ mod tests {
         ));
     }
 
+    /// `export_read_masked_block_to_parquet` materializes the block's members from
+    /// the `read_masked` VIEW scoped to `mask_idx`: it excludes non-`pass` reads
+    /// (the view's privacy filter), a different mask's rows, and non-member
+    /// samples — writing the same `EXPORT_READ_COLUMNS` shape as the raw block
+    /// export. Because masked-out reads drop, the masked export can be a proper
+    /// subset of the raw range.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn export_read_masked_block_writes_only_pass_rows_for_mask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let mask_a: i64 = 942_000;
+        let mask_b: i64 = 942_001;
+        let prep_a: i64 = 942_010; // the member sample
+        let prep_b: i64 = 942_011; // present in read_mask but NOT a member
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_b});
+             DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep_a}, 100, 'a0', 'AAAAA', [30,30,30,30,30]::UTINYINT[], NULL, NULL), \
+                 ({prep_a}, 101, 'a1', 'CCCCC', [30,30,30,30,30]::UTINYINT[], NULL, NULL), \
+                 ({prep_a}, 102, 'a2', 'GGGGG', [30,30,30,30,30]::UTINYINT[], NULL, NULL), \
+                 ({prep_b}, 200, 'b0', 'TTTTT', [30,30,30,30,30]::UTINYINT[], NULL, NULL);
+             -- mask_a: seq 100 & 102 pass, seq 101 is a host hit (excluded by the
+             -- read_masked view). prep_b's 200 passes but is not a block member.
+             -- Trims 0 so bytes pass through unchanged.
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
+                 ({mask_a}, {prep_a}, 100, 'pass'), \
+                 ({mask_a}, {prep_a}, 101, 'host_minimap2'), \
+                 ({mask_a}, {prep_a}, 102, 'pass'), \
+                 ({mask_a}, {prep_b}, 200, 'pass'), \
+                 ({mask_b}, {prep_a}, 100, 'pass');"
+        ))
+        .unwrap();
+
+        let members = vec![auth::ExportReadBlockMember {
+            prep_sample_idx: prep_a,
+            sequence_idx_start: 100,
+            sequence_idx_stop: 102,
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("reads.parquet");
+        let count = export_read_masked_block_to_parquet(
+            &connstr,
+            &data_path,
+            mask_a,
+            &members,
+            &dest,
+            dir.path(),
+        )
+        .expect("export_read_masked_block_to_parquet failed");
+        // seq 100 & 102 pass; seq 101 (host) excluded by the view => 2 rows.
+        assert_eq!(
+            count, 2,
+            "only the 2 pass rows in the member range are exported"
+        );
+        assert!(dest.exists());
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o440, "exported parquet is mode 440");
+
+        let reader = Connection::open_in_memory().unwrap();
+        let dest_str = dest.to_str().unwrap();
+        // Same column shape as the raw block export (EXPORT_READ_COLUMNS).
+        let cols: Vec<String> = {
+            let mut stmt = reader
+                .prepare(&format!(
+                    "DESCRIBE SELECT * FROM read_parquet('{dest_str}')"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            cols,
+            vec![
+                "prep_sample_idx",
+                "sequence_idx",
+                "read_id",
+                "sequence1",
+                "qual1",
+                "sequence2",
+                "qual2"
+            ],
+            "masked export has the EXPORT_READ_COLUMNS shape"
+        );
+        // Exactly the two pass sequence_idxs; the host row (101) and prep_b (200)
+        // and mask_b are all excluded.
+        let seqs: Vec<i64> = {
+            let mut stmt = reader
+                .prepare(&format!(
+                    "SELECT sequence_idx FROM read_parquet('{dest_str}') ORDER BY sequence_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            seqs,
+            vec![100, 102],
+            "host-masked seq 101 excluded; only pass rows"
+        );
+
+        // An empty members list writes no file and returns 0.
+        let dest_empty = dir.path().join("empty.parquet");
+        let zero = export_read_masked_block_to_parquet(
+            &connstr,
+            &data_path,
+            mask_a,
+            &[],
+            &dest_empty,
+            dir.path(),
+        )
+        .expect("empty block should succeed with 0");
+        assert_eq!(zero, 0);
+        assert!(!dest_empty.exists(), "no file written for an empty block");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_b});
+             DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});"
+        ));
+    }
+
     /// A split member whose `sequence_idx_stop` is NOT the block's max still
     /// contributes only its own sub-range: the per-member predicate excludes the
     /// part of that sample living in a sibling block, even though those rows fall
@@ -3598,6 +4230,41 @@ mod tests {
         );
         assert!(sql.contains("m.reference_idx IN (42)"));
         assert!(sql.starts_with("SELECT t.* FROM"));
+    }
+
+    #[test]
+    fn build_query_chunks_reference_and_feature_idx_qualifies_columns() {
+        // The shape the CP's feature_idx-scoped DoGet ticket mints: BOTH
+        // reference_idx (→ membership JOIN) and feature_idx. Under the JOIN,
+        // feature_idx lives on both t and m, so it MUST be qualified `t.` or the
+        // query fails to bind ("Ambiguous reference to column name feature_idx").
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(5)],
+        );
+        filter.insert(
+            "feature_idx".to_string(),
+            vec![
+                serde_json::Value::from(800001),
+                serde_json::Value::from(800002),
+            ],
+        );
+        let (sql, _) = build_query("reference_sequence_chunks", &filter).unwrap();
+        assert!(
+            sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
+            "expected membership JOIN, got: {sql}"
+        );
+        assert!(sql.contains("m.reference_idx IN (5)"), "got: {sql}");
+        assert!(
+            sql.contains("t.feature_idx IN (800001,800002)"),
+            "feature_idx must be qualified with the base alias under the JOIN, got: {sql}"
+        );
+        // No unqualified `feature_idx IN` clause (the ambiguous form).
+        assert!(
+            !sql.contains(" feature_idx IN ("),
+            "unqualified feature_idx clause is ambiguous under the JOIN, got: {sql}"
+        );
     }
 
     #[test]

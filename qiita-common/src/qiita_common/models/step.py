@@ -3,7 +3,7 @@ plus the DoGet ticket request/response the data plane's Flight surface uses."""
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from qiita_common.auth_constants import MAX_TABLE_NAME_LENGTH
 from qiita_common.models._base import (
@@ -221,8 +221,29 @@ class StepFindByNameResponse(BaseModel):
     jobs: list[FoundJobWire]
 
 
+# Upper bound on a feature_idx-scoped DoGet ticket's subset list. A reference
+# shard is ~hundreds/thousands of features; the cap guards ticket/query size
+# (the list rides the signed ticket payload and becomes a `feature_idx IN (...)`
+# on the data plane) without constraining any realistic shard roster.
+_MAX_DOGET_FEATURE_IDX = 100_000
+
+
 class DoGetTicketRequest(BaseModel):
     table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
+    # Optional feature_idx subset. Omitted ⇒ a whole-reference ticket
+    # (filter={"reference_idx":[idx]}), byte-identical to the historical shape.
+    # Present ⇒ the ticket additionally scopes to these features
+    # (filter gains "feature_idx":[...]) so a shard builder streams only its
+    # own roster's sequences from reference_sequences / reference_sequence_chunks.
+    # `min_length=1` rejects an explicit empty list (422) rather than silently
+    # widening it to the whole reference — an empty roster is a caller bug we
+    # surface loudly, and it also keeps an empty value list from reaching
+    # sign_ticket (which rejects one). Whole-reference is expressed by *omitting*
+    # the field, never by an empty list.
+    feature_idx: list[Annotated[int, Field(gt=0)]] | None = Field(
+        default=None, min_length=1, max_length=_MAX_DOGET_FEATURE_IDX
+    )
+    model_config = ConfigDict(extra="forbid")
 
 
 class DoGetTicketResponse(BaseModel):

@@ -49,6 +49,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ("URL_REFERENCE_BY_IDX", "PATH_REFERENCE_PREFIX", "PATH_REFERENCE_BY_IDX"),
     ("URL_REFERENCE_STATUS", "PATH_REFERENCE_PREFIX", "PATH_REFERENCE_STATUS"),
     ("URL_REFERENCE_INDEX", "PATH_REFERENCE_PREFIX", "PATH_REFERENCE_INDEX"),
+    (
+        "URL_REFERENCE_SHARD_INDEX_STATUS",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_SHARD_INDEX_STATUS",
+    ),
     ("URL_REFERENCE_DOGET", "PATH_REFERENCE_PREFIX", "PATH_REFERENCE_DOGET"),
     # /step
     ("URL_STEP_SUBMIT", "PATH_STEP_PREFIX", "PATH_STEP_SUBMIT"),
@@ -177,6 +182,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN",
     ),
+    (
+        "URL_SEQUENCED_POOL_ALIGN_PLAN",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGN_PLAN",
+    ),
     # /biosample — three routes; two re-anchor on /study, one on /biosample
     ("URL_BIOSAMPLE_BY_STUDY", "PATH_STUDY_PREFIX", "PATH_BIOSAMPLE_BY_STUDY"),
     (
@@ -244,6 +254,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_MASK_DEFINITION_BY_IDX",
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_BY_IDX",
+    ),
+    # /alignment-definition
+    (
+        "URL_ALIGNMENT_DEFINITION_BY_IDX",
+        "PATH_ALIGNMENT_DEFINITION_PREFIX",
+        "PATH_ALIGNMENT_DEFINITION_BY_IDX",
     ),
 ]
 
