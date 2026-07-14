@@ -32,12 +32,20 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import asyncpg
 import httpx
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
+from ...backfill.host_taxon import (
+    BackfillPlan,
+    HostTaxonSource,
+    apply_backfill,
+    plan_backfill,
+)
 from .. import _common
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
@@ -223,6 +231,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="After each resubmit, poll the new ticket to a terminal state and report it.",
     )
     p_purge.set_defaults(handler=_handle_mask_purge_failed)
+
+    p_backfill = sub.add_parser("backfill", help="One-off data backfills")
+    p_backfill_sub = p_backfill.add_subparsers(dest="backfill_cmd", required=True)
+    p_backfill_host = p_backfill_sub.add_parser(
+        "host-taxon-id",
+        help="Populate biosample host_taxon_id from the sample's own taxon + control status",
+        description=(
+            "Backfill the host_taxon_id biosample field, which postdates every sample"
+            " we hold. A control (per the pre-flight's own is_control) gets 'missing:"
+            " control sample'; otherwise the sample's own taxon_id is mapped to a host"
+            " through a small curated table. A sample neither rule settles is REPORTED"
+            " and left unwritten — it stays UNRESOLVED at submit, which aborts rather"
+            " than passing an un-depleted sample through. Idempotent: a biosample that"
+            " already carries the field is skipped, so this can be re-run as curation"
+            " lands. Dry-run by default; pass --execute to write. Needs DATABASE_URL."
+        ),
+    )
+    p_backfill_host.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the metadata rows (default: dry-run, report only, no writes).",
+    )
+    p_backfill_host.add_argument(
+        "--show-unresolved",
+        type=int,
+        default=20,
+        metavar="N",
+        help="How many unresolved biosamples to list in the report (default 20; 0 for none).",
+    )
+    p_backfill_host.set_defaults(handler=_handle_backfill_host_taxon_id)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -740,6 +778,92 @@ def main(argv: list[str] | None = None) -> int:
     return args.handler(args, parser)
 
 
+async def _backfill_host_taxon_id(database_url: str, *, execute: bool) -> tuple[BackfillPlan, int]:
+    """Plan the host_taxon_id backfill and, when `execute`, apply it.
+
+    Returns `(plan, written)`. `written` is 0 on a dry run — the plan is computed
+    the same way either way, so the report an operator reads before writing is
+    the report of exactly what will be written.
+    """
+    try:
+        pool = await asyncpg.create_pool(
+            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
+        )
+    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
+        raise RuntimeError(
+            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        plan = await plan_backfill(pool)
+        if not execute:
+            return plan, 0
+        written = await apply_backfill(pool, plan.writable(), principal_idx=SYSTEM_PRINCIPAL_IDX)
+        return plan, written
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_host_taxon_id(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+
+    try:
+        plan, written = asyncio.run(_backfill_host_taxon_id(database_url, execute=args.execute))
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    by_source = Counter(a.source for a in plan.assignments)
+    unresolved = plan.unresolved()
+
+    scan = plan.control_scan
+    print(f"already populated (skipped)          : {plan.already_populated}")
+    print(f"no taxon_id at all (not backfillable): {plan.no_taxon}")
+    print(f"candidates                           : {len(plan.assignments)}")
+    print(f"  control -> missing: control sample : {by_source[HostTaxonSource.CONTROL]}")
+    print(f"  taxon   -> host term               : {by_source[HostTaxonSource.TAXON]}")
+    print(f"  taxon   -> not applicable          : {by_source[HostTaxonSource.NO_HOST]}")
+    print(f"  UNRESOLVED (left unwritten)        : {len(unresolved)}")
+
+    if unresolved and args.show_unresolved:
+        # An unresolved sample is a curation item, so name what it is rather than
+        # just counting it — the taxon it carries is the thing to fix.
+        print("\nunresolved biosamples (these stay UNRESOLVED at submit):")
+        by_taxon = Counter((a.sample_taxon_term_id, a.sample_taxon_label) for a in unresolved)
+        for (term_id, label), n in by_taxon.most_common():
+            # NOT the same as plan.no_taxon: these biosamples HAVE a taxon_id row,
+            # it just carries no terminology term (a missing-reason, or a legacy
+            # free-text value from before the field was terminology-typed).
+            shown = "taxon row present, no term" if term_id is None else f"{term_id} ({label})"
+            print(f"  {n:>6}  {shown}")
+        print("\n  example biosample_idx:")
+        for a in unresolved[: args.show_unresolved]:
+            print(f"    {a.biosample_idx}")
+
+    if scan.unreadable_pools:
+        print(
+            f"\nWARNING: {len(scan.unreadable_pools)} pool pre-flight(s) could not be read:"
+            f" {scan.unreadable_pools}."
+            " Their blanks are NOT recognised as controls and fall to UNRESOLVED."
+        )
+    if scan.controls_without_accession:
+        print(
+            f"\nWARNING: {scan.controls_without_accession} control(s) carry no biosample"
+            " accession, so they cannot be matched and fall to UNRESOLVED."
+        )
+
+    if args.execute:
+        print(f"\nwrote {written} host_taxon_id metadata row(s)")
+    else:
+        n = len(plan.writable())
+        print(f"\nDRY RUN — nothing written. Pass --execute to write {n} row(s).")
+    return 0
+
+
 __all__ = [
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
@@ -768,6 +892,8 @@ __all__ = [
     "_handle_compute_readiness",
     "_handle_login",
     "_handle_mask_delete",
+    "_backfill_host_taxon_id",
+    "_handle_backfill_host_taxon_id",
     "_handle_mask_purge_failed",
     "_handle_masked_read_export",
     "_handle_owner_biosample_id",

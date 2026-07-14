@@ -30,6 +30,9 @@ from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.models import (
+    BIOSAMPLE_FIELD_HOST_TAXON_ID,
+    MISSING_REASON_CONTROL_SAMPLE,
+    MISSING_REASON_NOT_APPLICABLE,
     HostFilterOutcome,
     HostFilterProfile,
     HostFilterResolution,
@@ -41,19 +44,12 @@ from .repositories.host_filter_profile import (
     list_host_filter_profiles,
 )
 
-# The biosample global field carrying the host organism, seeded as a
-# terminology-typed field bound to NCBI Taxonomy. Because it is
-# terminology-typed, a value is only ever a term or a missing-reason — the
-# field-contract trigger rejects a value_text on it — so this module has no
-# free-text branch to consider.
-_HOST_TAXON_FIELD = "host_taxon_id"
-
-# `missing_value_reason.name` values, seeded by the terminology-lifecycle migration.
-_REASON_NOT_APPLICABLE = "not applicable"
-_REASON_CONTROL_SAMPLE = "missing: control sample"
-
 # The columns every host_taxon_id read selects, shared by the single-sample and
 # batch queries so the two cannot drift into classifying different shapes.
+#
+# host_taxon_id is terminology-typed, so a value is only ever a term or a
+# missing-reason — the field-contract trigger rejects a value_text on it — which
+# is why there is no free-text branch below.
 _METADATA_COLUMNS = (
     "bm.biosample_idx,"
     " bm.value_terminology_term_idx,"
@@ -79,11 +75,11 @@ _METADATA_FROM = (
 # filter it". Widening this dict is therefore the single, deliberate place a
 # missing-reason can be promoted from "abort" to "proceed".
 _RECOGNISED_MISSING_REASON: dict[str, tuple[HostFilterOutcome, str]] = {
-    _REASON_NOT_APPLICABLE: (
+    MISSING_REASON_NOT_APPLICABLE: (
         HostFilterOutcome.PASS_THROUGH,
         "the sample deliberately has no host",
     ),
-    _REASON_CONTROL_SAMPLE: (
+    MISSING_REASON_CONTROL_SAMPLE: (
         HostFilterOutcome.CONTROL,
         "a control sample; what it filters against is decided pool-side",
     ),
@@ -126,7 +122,7 @@ async def resolve_host_filter(
     # still cannot carry two conflicting host_taxon_id values.
     row = await conn.fetchrow(
         f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = $2",
-        _HOST_TAXON_FIELD,
+        BIOSAMPLE_FIELD_HOST_TAXON_ID,
         biosample_idx,
     )
 
@@ -177,7 +173,7 @@ async def resolve_host_filter_many(
 
     rows = await conn.fetch(
         f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = ANY($2::bigint[])",
-        _HOST_TAXON_FIELD,
+        BIOSAMPLE_FIELD_HOST_TAXON_ID,
         list(biosample_idxs),
     )
     row_by_biosample = {r["biosample_idx"]: r for r in rows}
@@ -214,7 +210,7 @@ def _classify(
     if row is None:
         return _without_references(
             HostFilterOutcome.UNRESOLVED,
-            f"{_HOST_TAXON_FIELD} is not set on biosample {biosample_idx}",
+            f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is not set on biosample {biosample_idx}",
         )
 
     host_term_idx = row["value_terminology_term_idx"]
@@ -243,7 +239,7 @@ def _classify(
     if recognised is not None:
         outcome, explanation = recognised
         return _without_references(
-            outcome, f"{_HOST_TAXON_FIELD} is {missing_reason!r}: {explanation}"
+            outcome, f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is {missing_reason!r}: {explanation}"
         )
 
     # Neither a term nor a missing reason. Unreachable through the field-contract
@@ -253,7 +249,7 @@ def _classify(
     if missing_reason is None:
         return _without_references(
             HostFilterOutcome.UNRESOLVED,
-            f"{_HOST_TAXON_FIELD} on biosample {biosample_idx} has neither a"
+            f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} on biosample {biosample_idx} has neither a"
             " terminology term nor a missing reason",
         )
 
@@ -261,7 +257,7 @@ def _classify(
     # as "no host".
     return _without_references(
         HostFilterOutcome.UNRESOLVED,
-        f"{_HOST_TAXON_FIELD} is {missing_reason!r}, which does not say whether"
+        f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is {missing_reason!r}, which does not say whether"
         " the sample has a host",
     )
 
