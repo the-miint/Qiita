@@ -20,6 +20,52 @@ duplicates further down are historical strata; leave them where they are.
 
 ## [Unreleased]
 
+### Added
+
+- **Reference feature annotations: GFF3 in, typed interval rows out (#269).** A
+  reference can now carry per-interval ANNOTATIONS — a SynDNA insert on its
+  plasmid, a gene on a chromosome — supplied as a GFF3 (`qiita reference load
+  --gff`, on all four `reference-add` workflows, remote and local). This is the
+  prerequisite for per-feature coverage depth: depth is a quantity per
+  *annotated interval*, but reads align to the interval's *parent*.
+  - Parsed by `hash_sequences` with miint's `read_gff` (no hand-rolled parser).
+    Each interval is cut from its parent, canonically hashed, and minted its
+    **own `feature_idx`** by the new in-process `mint-annotation-features`
+    action — so an interval can key a feature table, and an insert that is also
+    ingested standalone deduplicates onto the same `feature_idx` lake-wide.
+  - Annotated features are deliberately **not** in `reference_membership`, and
+    have no `reference_sequences` / `reference_sequence_chunks` row. Membership
+    is what gets INDEXED and aligned against: reads align to the plasmid, never
+    to the bare insert, and a membership row would put inserts into the aligner
+    index and shard planning, competing with their own parent for alignments.
+    The bytes are recoverable from the parent plus the interval, so a second
+    copy could only drift.
+  - **Coordinates are stored HALF-OPEN `[position, stop_position)`**, converted
+    from GFF3's 1-based CLOSED `[start, end]` exactly once, at ingest. This
+    matches `alignment_slice` / `read_alignments` / the `alignment` table, so
+    every alignment-side consumer compares like with like. Both conventions spell
+    the column `stop_position`, so mixing them type-checks, runs, and raises
+    nothing — it just silently stops counting the interval's last base. The `+1`
+    is pinned by `test_annotation_ingest_smoke.py` against the real miint build,
+    including an anti-vacuity control proving the closed form gives a different
+    (wrong) answer.
+  - A GFF3 with a `seqid` absent from the FASTA, an interval running off the end
+    of its parent, an inverted interval, or a duplicate annotation ID is a hard
+    failure, not a warning — each silently corrupts a depth number rather than
+    crashing.
+  - New DuckLake table `reference_annotation` (created by `ensure_reference_tables`
+    at data-plane boot; readable over Flight; purged by `delete_reference`).
+
+### Fixed
+
+- **A local reference-add carrying a tree or jplace crashed (#269).** The local
+  ingest path DoPuts nothing — "no bytes cross the wire" — so `tree_path` /
+  `jplace_path` arrive as the raw `.nwk` / `.jplace` file, but `reference_load`
+  unconditionally `read_parquet()`'d them to unwrap a chunked-BLOB upload
+  envelope, which raises on a raw file. Both now go through the shared
+  `resolve_blob_input`, which sniffs which shape it was handed. Found while
+  wiring the GFF3 companion through the same seam.
+
 ### Changed
 
 - **Sharded-alignment review revisions (#268).** Reworked the sharded-alignment

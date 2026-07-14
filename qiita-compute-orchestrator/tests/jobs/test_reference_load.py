@@ -492,6 +492,31 @@ def test_phylogeny_lifted_writer_populates_tip_feature_idx(staging_inputs, tree_
         assert internal_with_fidx == 0
 
 
+def test_phylogeny_accepts_a_RAW_newick_on_the_local_path(staging_inputs, tmp_path):
+    """The local ingest path DoPuts nothing — "no bytes cross the wire" — so
+    `tree_path` arrives as the raw `.nwk` file itself, not a chunked-BLOB upload
+    Parquet. `resolve_blob_input` sniffs which shape it got.
+
+    Before it did, `reference_load` unconditionally `read_parquet()`'d the tree,
+    so `local-reference-add` carrying a tree crashed with a Parquet error. The
+    remote (wrapped) form is covered by the test above; this pins the other half,
+    and the two together are what make the sniff meaningful."""
+    raw_nwk = tmp_path / "tree.nwk"
+    raw_nwk.write_text("((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);")
+
+    outputs = _run(_inputs(**staging_inputs, tree_path=raw_nwk), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    assert pq.exists()
+    with duckdb.connect(":memory:") as conn:
+        tips_with_fidx = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT feature_idx FROM '{pq}' WHERE is_tip AND feature_idx IS NOT NULL"
+            ).fetchall()
+        }
+    assert tips_with_fidx == set(_FEATURE_MAP.values())
+
+
 @pytest.fixture
 def jplace_path(tmp_path):
     """jplace input wrapped in the CLI's chunked DoPut shape.

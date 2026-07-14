@@ -14,6 +14,22 @@ This step reads that chunked upload and produces:
     read_id to canonical sequence_hash. When multiple reads collapse to
     the same canonical hash (a read + its reverse complement), only one
     read's chunks survive — the lex-smallest read_id, deterministically.
+  - `annotation_manifest.parquet` — ONLY when an optional `gff_path` is
+    supplied. One row per annotated interval, carrying the canonical hash
+    of the sub-sequence that interval cuts out of its parent, so the
+    interval can be minted a `feature_idx` of its own. See
+    `_write_annotation_manifest` for the shape and the coordinate
+    conversion.
+
+**Why annotations are hashed HERE.** An annotated interval (a SynDNA insert
+on its plasmid, a gene on a chromosome) is quantified as a feature in its own
+right, so it needs a `feature_idx` — and `feature_idx` is minted from a
+canonical sequence hash. This step is the one place that already holds both
+the assembled parent sequences and the hashing machinery, so cutting the
+interval out and hashing it is the same job it already does, not a new one.
+The extracted bytes are deliberately NOT stored (no `reference_sequences` /
+`reference_sequence_chunks` row): they are recoverable from the parent plus
+the interval, and a second copy could drift from the first.
 
 **Canonical hashing.** A sequence and its reverse complement describe
 the same molecular entity. We compute md5 on BOTH strands and store the
@@ -54,6 +70,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._blob_input import resolve_blob_input
 
 YAML_STEP_NAME = "hash_sequences"
 
@@ -100,6 +117,11 @@ class Inputs(BaseModel):
     the runner's `{prefix}_upload_idx → {prefix}_path` convention
     requires the role name to live on the model.
 
+    `gff_path` is optional and follows the same `*_upload_idx → *_path`
+    convention on the remote path; on the local path the runner passes the
+    raw absolute path straight through. `resolve_blob_input` accepts either
+    shape. Absent → no `annotation_manifest` output.
+
     `reference_idx` and `work_ticket_idx` are framework-injected scope
     scalars merged by `flatten_native_inputs`. Both are accepted (typed)
     even though this step doesn't consume them — declaring them on the
@@ -110,6 +132,7 @@ class Inputs(BaseModel):
     """
 
     fasta_path: Path
+    gff_path: Path | None = None
     reference_idx: int
     work_ticket_idx: int
 
@@ -126,6 +149,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     manifest_path = workspace / "manifest.parquet"
+    annotation_manifest_path = workspace / "annotation_manifest.parquet"
     # reference_sequence_chunks is a DIRECTORY of part_*.parquet files
     # rather than a single file — the consumer contract is
     # `read_parquet(dir/part_*.parquet)`. The relabel below writes one
@@ -280,6 +304,20 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [str(inputs.fasta_path)],
             )
 
+            gff_file = (
+                resolve_blob_input(
+                    conn, path=inputs.gff_path, out_path=duckdb_tmp / "annotations.gff3"
+                )
+                if inputs.gff_path is not None
+                else None
+            )
+            _write_annotation_manifest(
+                conn,
+                gff_path=gff_file,
+                fasta_path=inputs.fasta_path,
+                out=validate_parquet_path(annotation_manifest_path),
+            )
+
             conn.execute("DROP TABLE hashed")
         success = True
     finally:
@@ -290,9 +328,174 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # fresh attempt-N+1 workspace on retry so it doesn't cascade.
         if not success:
             manifest_path.unlink(missing_ok=True)
+            annotation_manifest_path.unlink(missing_ok=True)
             shutil.rmtree(reference_sequence_chunks_dir, ignore_errors=True)
 
     return {
         "manifest": manifest_path,
         "reference_sequence_chunks": reference_sequence_chunks_dir,
+        # ALWAYS bound — zero rows when no GFF was supplied. A workflow `outputs:`
+        # list is bound unconditionally (`raw_outputs[name] for name in
+        # entry.outputs`), so a sometimes-present output would KeyError. Emitting a
+        # typed-empty file instead of gating the downstream entries on a `when:`
+        # boolean is deliberate: `when:` is DEFAULT-ON (an absent key RUNS the
+        # step), so gating would force a new REQUIRED context key on all four
+        # reference-add workflows — a 422 for every existing caller — to protect
+        # against a footgun that costs nothing to sidestep. Nothing extra is
+        # scheduled either way: hash_sequences and load already run, and
+        # mint-annotation-features is an in-process control-plane action.
+        "annotation_manifest": annotation_manifest_path,
     }
+
+
+def _write_annotation_manifest(
+    conn,
+    *,
+    gff_path: Path | None,
+    fasta_path: Path,
+    out: str,
+) -> None:
+    """Parse a GFF3 into the annotation manifest: one row per annotated interval,
+    carrying the canonical hash of the EXTRACTED sub-sequence so `mint-annotation-
+    features` can mint it a feature_idx of its own.
+
+    Emitted shape (`read_id` / `sequence_hash` are the two columns the minting
+    action requires; the rest ride along for `reference_load`):
+
+        read_id             VARCHAR  -- the annotation's ID; the minting key
+        sequence_hash       UUID     -- canonical hash of the extracted interval
+        sequence_length_bp  BIGINT   -- interval length
+        parent_read_id      VARCHAR  -- GFF seqid == the parent FASTA read_id
+        type, strand        VARCHAR
+        position            BIGINT   -- 1-based INCLUSIVE  (unchanged from GFF)
+        stop_position       BIGINT   -- 1-based EXCLUSIVE  (GFF stop + 1)
+        attributes          MAP(VARCHAR, VARCHAR)
+
+    **The closed → half-open conversion happens HERE and nowhere else.** `read_gff`
+    emits GFF3's 1-based CLOSED `[start, end]`; every alignment-side consumer
+    (`alignment_slice`, `read_alignments`, `qiita_lake.alignment`) speaks 1-based
+    HALF-OPEN `[start, stop)`. Both call the column `stop_position`, so nothing
+    type-checks the difference and nothing raises — the only symptom of getting it
+    wrong is that the interval's last base silently stops being counted. Converting
+    once, at ingest, means no downstream consumer ever has to remember. The +1 is
+    pinned by `test_annotation_window_is_half_open`.
+
+    Extraction is strand-agnostic ON PURPOSE. A `-` strand annotation is NOT
+    reverse-complemented before hashing, because `canonical_sequence_hash_expr`
+    already hashes both strands and keeps the lex-smaller — so a feature and its
+    reverse complement mint the SAME feature_idx. Revcomping first would be a
+    no-op at best.
+
+    Fails loud (per the repo's fail-fast ethos) on: a `seqid` naming no sequence in
+    the FASTA, an interval running off the end of its parent, a non-positive
+    interval, and a duplicate annotation ID. Each of these silently corrupts a
+    downstream depth number rather than crashing, so none of them is a warning.
+
+    `gff_path=None` (the no-GFF reference, which is most of them) writes a
+    zero-row file with the SAME schema, via the same code path — the empty case is
+    an empty `annotation` table, not a separate projection that could drift from
+    the populated one.
+    """
+    # read_gff's `attributes` is already a MAP(VARCHAR,VARCHAR) — no parsing.
+    # `annotation_id` prefers the GFF3 `ID` attribute and falls back to a
+    # positional synthetic so an ID-less GFF still ingests deterministically.
+    if gff_path is not None:
+        conn.execute(
+            "CREATE TEMP TABLE annotation AS "
+            "SELECT "
+            "  coalesce(attributes['ID'], seqid || ':' || position || '-' || stop_position)"
+            "    AS annotation_id, "
+            "  seqid AS parent_read_id, "
+            "  type, "
+            "  strand, "
+            "  CAST(position AS BIGINT) AS position, "
+            # The one conversion. GFF3 stop is INCLUSIVE; we store EXCLUSIVE.
+            "  CAST(stop_position AS BIGINT) + 1 AS stop_position, "
+            "  attributes "
+            f"FROM read_gff('{gff_path}')"
+        )
+    else:
+        conn.execute(
+            "CREATE TEMP TABLE annotation ("
+            "  annotation_id VARCHAR, "
+            "  parent_read_id VARCHAR, "
+            "  type VARCHAR, "
+            "  strand VARCHAR, "
+            "  position BIGINT, "
+            "  stop_position BIGINT, "
+            "  attributes MAP(VARCHAR, VARCHAR)"
+            ")"
+        )
+
+    n = conn.execute("SELECT count(*) FROM annotation").fetchone()[0]
+    if gff_path is not None and n == 0:
+        raise ValueError(f"{gff_path} parsed to zero annotations — the GFF3 is empty or malformed")
+
+    dupes = conn.execute(
+        "SELECT annotation_id, count(*) AS n FROM annotation "
+        "GROUP BY annotation_id HAVING count(*) > 1 ORDER BY annotation_id LIMIT 5"
+    ).fetchall()
+    if dupes:
+        raise ValueError(
+            f"{gff_path} has duplicate annotation IDs (a feature table keys on them): "
+            + ", ".join(f"{a!r} x{c}" for a, c in dupes)
+        )
+
+    # seqid must name a sequence we actually hashed, or the annotation has no
+    # parent to be an interval OF.
+    orphans = conn.execute(
+        "SELECT DISTINCT a.parent_read_id FROM annotation a "
+        "LEFT JOIN hashed h ON h.read_id = a.parent_read_id "
+        "WHERE h.read_id IS NULL ORDER BY 1 LIMIT 5"
+    ).fetchall()
+    if orphans:
+        raise ValueError(
+            f"{gff_path} references seqid(s) absent from the FASTA: "
+            + ", ".join(repr(o[0]) for o in orphans)
+        )
+
+    # The interval must lie inside its parent. `stop_position` is exclusive here,
+    # so the legal range is 1 <= position < stop_position <= length + 1.
+    bad = conn.execute(
+        "SELECT a.annotation_id, a.parent_read_id, a.position, a.stop_position, "
+        "       h.sequence_length_bp "
+        "FROM annotation a JOIN hashed h ON h.read_id = a.parent_read_id "
+        "WHERE a.position < 1 "
+        "   OR a.stop_position <= a.position "
+        "   OR a.stop_position > h.sequence_length_bp + 1 "
+        "ORDER BY a.annotation_id LIMIT 5"
+    ).fetchall()
+    if bad:
+        detail = ", ".join(
+            f"{aid!r} on {parent!r} [{pos}, {stop}) vs parent length {plen}"
+            for aid, parent, pos, stop, plen in bad
+        )
+        raise ValueError(f"{gff_path} has interval(s) outside their parent sequence: {detail}")
+
+    # Reassemble ONLY the annotated parents (a plasmid map annotates a handful of
+    # sequences, not the whole reference), then cut each interval out. DuckDB's
+    # substr is (1-based start, LENGTH) — and length is stop - position exactly
+    # because stop is already exclusive.
+    conn.execute(
+        "COPY ("
+        "  WITH parents AS ("
+        "    SELECT c.read_id, "
+        f"          {reassemble_chunks_expr('c.')} AS sequence "
+        "    FROM read_parquet(?) c "
+        "    WHERE c.read_id IN (SELECT DISTINCT parent_read_id FROM annotation) "
+        "    GROUP BY c.read_id"
+        "  ), extracted AS ("
+        "    SELECT a.*, "
+        "           substr(p.sequence, a.position, a.stop_position - a.position) AS sequence "
+        "    FROM annotation a JOIN parents p ON p.read_id = a.parent_read_id"
+        "  )"
+        "  SELECT annotation_id AS read_id, "
+        f"        {canonical_sequence_hash_expr('sequence')} AS sequence_hash, "
+        "         CAST(length(sequence) AS BIGINT) AS sequence_length_bp, "
+        "         parent_read_id, type, strand, position, stop_position, attributes "
+        "  FROM extracted "
+        "  ORDER BY parent_read_id, position, annotation_id"
+        f") TO '{out}' ({PARQUET_OPTS})",
+        [str(fasta_path)],
+    )
+    conn.execute("DROP TABLE annotation")

@@ -71,7 +71,11 @@ from qiita_common.models import (
 )
 
 from .. import step_progress
-from ..actions.library import LIBRARY, MINT_FEATURES_OUTPUT_BASENAME
+from ..actions.library import (
+    LIBRARY,
+    MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME,
+    MINT_FEATURES_OUTPUT_BASENAME,
+)
 from ..actions.reference import (
     IllegalStatusTransition,
     ReferenceNotFound,
@@ -242,6 +246,7 @@ __all__: list[str] = [
     "LibraryPrimitive",
     "PROCESSING_IDX_BINDING",
     "MASK_IDX_BINDING",
+    "MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME",
     "MINT_FEATURES_OUTPUT_BASENAME",
     "Path",
     "QC_ADAPTER_BINDING",

@@ -69,6 +69,12 @@ _CHUNK_SIZE = 10_000
 # Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
 # rebuilds this path WITHOUT re-running the primitive, so the two must not drift.
 MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
+# The annotation twin's basename. Distinct from MINT_FEATURES_OUTPUT_BASENAME
+# because both primitives can run in the SAME workflow (a GFF-bearing reference
+# mints sequence features and then annotated-interval features), and the resume
+# path in runner._reconstruct rebuilds each output by basename — one shared name
+# would have the two collide and silently resume onto the wrong map.
+MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME = "annotation_feature_map.parquet"
 
 
 # =============================================================================
@@ -317,6 +323,7 @@ async def mint_features(
     manifest_path: Path,
     output_dir: Path,
     genome_map_path: Path | None = None,
+    output_basename: str = MINT_FEATURES_OUTPUT_BASENAME,
 ) -> tuple[Path, int, int]:
     """Mint feature_idx values for sequence hashes in a manifest Parquet file.
 
@@ -355,7 +362,7 @@ async def mint_features(
     if genome_map_path is not None and not genome_map_path.exists():
         raise FileNotFoundError(f"Genome map not found: {genome_map_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    feature_map_path = output_dir / MINT_FEATURES_OUTPUT_BASENAME
+    feature_map_path = output_dir / output_basename
 
     total_minted = 0
     total_reused = 0
@@ -419,6 +426,41 @@ async def mint_features(
         await _associate_genomes(pool, manifest_path, genome_map_path, feature_map_path)
 
     return feature_map_path, total_minted, total_reused
+
+
+async def mint_annotation_features(
+    pool: asyncpg.Pool,
+    annotation_manifest_path: Path,
+    output_dir: Path,
+) -> tuple[Path, int, int]:
+    """Mint a feature_idx for each ANNOTATED INTERVAL in hash_sequences'
+    `annotation_manifest.parquet`, writing `annotation_feature_map.parquet`
+    (sequence_hash → feature_idx) into `output_dir`.
+
+    This is `mint_features` pointed at a different manifest. Minting only ever
+    reads `sequence_hash` and never touches a reference table, so an interval's
+    sub-sequence hash mints exactly like a whole sequence's — which is the point:
+    an insert that is also ingested standalone elsewhere deduplicates onto the
+    SAME feature_idx, lake-wide, for free.
+
+    Two things it deliberately does NOT do:
+
+    * **No `write-membership`.** `reference_membership` is what gets indexed and
+      aligned against. Reads align to the plasmid, not to the bare insert; putting
+      annotated intervals in membership would add them to the aligner index and to
+      shard planning, and the insert would start competing with its own parent for
+      alignments.
+    * **No `genome_map_path`.** An interval is not a genome.
+
+    Returns (annotation_feature_map_path, minted, reused). Idempotent for the same
+    reasons `mint_features` is.
+    """
+    return await mint_features(
+        pool,
+        annotation_manifest_path,
+        output_dir,
+        output_basename=MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME,
+    )
 
 
 async def write_membership(
@@ -1699,6 +1741,7 @@ async def reconcile_alignment_block(
 
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
+    LibraryPrimitive.MINT_ANNOTATION_FEATURES: mint_annotation_features,
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
     LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,

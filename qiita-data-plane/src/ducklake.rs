@@ -136,6 +136,50 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             like_weight_ratio DOUBLE,
             distal_length DOUBLE,
             pendant_length DOUBLE
+        );
+
+        -- Annotations: a feature that is a REGION OF another feature.
+        --
+        -- Every other reference table treats feature_idx as a whole sequence.
+        -- This is the one place a feature is a sub-interval of a parent: a
+        -- SynDNA insert on its plasmid, a gene on a chromosome. It is what lets
+        -- a quantification be keyed by the thing being measured (the insert)
+        -- while the alignment is against the thing that was sequenced (the
+        -- plasmid).
+        --
+        --   feature_idx        -- the ANNOTATED feature (the insert). Minted from
+        --                        the canonical hash of the EXTRACTED sub-sequence,
+        --                        so identical inserts dedup lake-wide like any
+        --                        other feature.
+        --   parent_feature_idx -- the sequence the interval is ON, and the
+        --                        sequence reads actually align to (the plasmid).
+        --
+        -- Annotated features are deliberately NOT in reference_membership:
+        -- membership is what gets INDEXED and aligned against, and we align to
+        -- plasmids, not to bare inserts. They also have no reference_sequences /
+        -- reference_sequence_chunks row — the bytes are recoverable from the
+        -- parent plus the interval, so storing them again would be a second copy
+        -- that can drift.
+        --
+        -- COORDINATES ARE HALF-OPEN [position, stop_position), 1-based --
+        -- deliberately NOT the closed convention GFF3 arrives in. This matches
+        -- read_alignments / alignment_slice / the qiita_lake.alignment table, so
+        -- every alignment-side consumer compares like with like. The single
+        -- closed->half-open conversion happens ONCE, at ingest, in the
+        -- hash_sequences GFF reader. Length is (stop_position - position), with
+        -- no +1. Feeding a closed GFF stop straight into alignment_slice
+        -- silently drops the interval's last base and raises nothing, which is
+        -- why the conversion is pinned by a test rather than left to a comment.
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_annotation (
+            reference_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            parent_feature_idx BIGINT NOT NULL,
+            annotation_id VARCHAR NOT NULL,
+            type VARCHAR,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            strand VARCHAR,
+            attributes MAP(VARCHAR, VARCHAR)
         );",
     )?;
     // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk

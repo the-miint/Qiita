@@ -196,6 +196,7 @@ const ALLOWED_TABLES: &[&str] = &[
     "reference_taxonomy",
     "reference_phylogeny",
     "reference_placements",
+    "reference_annotation",
     "read_masked",
 ];
 
@@ -1860,9 +1861,9 @@ fn register_files(
 /// Delete every DuckLake row belonging to a reference.
 ///
 /// Scoping rules mirror the identifier hierarchy:
-/// - `reference_taxonomy`, `reference_phylogeny`, `reference_placements`, and
-///   `reference_membership` carry `reference_idx` directly → deleted by a plain
-///   `WHERE reference_idx = ?`.
+/// - `reference_taxonomy`, `reference_phylogeny`, `reference_placements`,
+///   `reference_annotation`, and `reference_membership` carry `reference_idx`
+///   directly → deleted by a plain `WHERE reference_idx = ?`.
 /// - `reference_sequences` / `reference_sequence_chunks` are keyed by
 ///   `feature_idx` and **shared across references** (a feature deduplicates by
 ///   sequence hash). Only *orphan* features — owned by this reference and no
@@ -1892,7 +1893,7 @@ fn delete_reference(
             .map_err(|e| Status::internal(format!("delete failed ({sql}): {e}")))
     };
 
-    // All six deletes are one DuckLake transaction so the action is
+    // All seven deletes are one DuckLake transaction so the action is
     // all-or-nothing: a mid-delete failure rolls every table back rather than
     // leaving a half-purged reference. That atomicity is what lets the control
     // plane safely retry — a failed call leaves DuckLake membership fully
@@ -1938,6 +1939,15 @@ fn delete_reference(
             "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
             &[reference_idx],
         )?;
+        // Annotations carry reference_idx directly, so they delete by it — NOT by
+        // the orphan filter. An annotated feature_idx never appears in
+        // reference_membership (membership is what gets indexed; an insert is not
+        // aligned against), so routing it through `orphan_filter` would match
+        // nothing and silently leak every annotation row.
+        let annotations_deleted = exec(
+            "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
+            &[reference_idx],
+        )?;
         Ok(serde_json::json!({
             "sequences_deleted": sequences_deleted,
             "chunks_deleted": chunks_deleted,
@@ -1945,6 +1955,7 @@ fn delete_reference(
             "taxonomy_deleted": taxonomy_deleted,
             "phylogeny_deleted": phylogeny_deleted,
             "placements_deleted": placements_deleted,
+            "annotations_deleted": annotations_deleted,
         }))
     })();
 
