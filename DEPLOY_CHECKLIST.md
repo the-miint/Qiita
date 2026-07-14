@@ -88,6 +88,35 @@ Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-b
   Notes), so leaving it empty breaks nothing. Running it now just means the submit-path PR
   that consumes it lands against an already-configured host.
 
+- (#299) **Backfill `host_taxon_id`.** No biosample carries the field, so the host-filter
+  resolver reports every sample UNRESOLVED. This is a data step, not a schema one — plain
+  `make migrate` does not do it. It is **read-only until you pass `--execute`**.
+
+  Run the dry-run first and READ IT. It prints how many samples resolve via the pre-flight
+  (controls), how many via their own taxon, and — the part that matters — the UNRESOLVED
+  residue, grouped by the taxon that could not be mapped. Those samples stay UNRESOLVED and
+  will abort their pool at submit; they are a curation worklist, not a failure.
+
+  ```bash
+  sudo -u qiita env DATABASE_URL="$(sudo grep -m1 '^DATABASE_URL=' /etc/qiita/control-plane.env | cut -d= -f2-)" \
+      /home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin backfill host-taxon-id
+  ```
+
+  Then, once the residue looks right:
+
+  ```bash
+  sudo -u qiita env DATABASE_URL="…" \
+      /home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin backfill host-taxon-id --execute
+  ```
+
+  Idempotent — re-run it freely as curation lands; already-populated samples are skipped.
+  A mid-run failure commits the rows it got to and reports the count; re-running converges.
+
+  Also heed the two WARNINGs it can print: an unreadable pool pre-flight, or a control with
+  no biosample accession. Both mean blanks in that pool are NOT recognised as controls and
+  will fall to UNRESOLVED — which aborts that pool rather than mis-depleting it, but you
+  want to know.
+
 ### 4. Deploy
 
 _None yet._
@@ -129,6 +158,7 @@ _None yet._
   Expect exactly one row: `illumina | HPRCr2-hg38-T2TCHM13v2.0-gencode49 | T2TCHM13v2.0-phiX174`.
   A NULL `minimap2_ref` means the name lookup missed — re-run the seed (it is idempotent).
 
+
 ### 6. After the deploy verifies green
 
 Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
@@ -142,6 +172,19 @@ verification passes, the OLD build's config is the rollback path.
   ```
 
 ### Notes (no host action)
+
+- (#299) **Nothing changes behaviour on this deploy.** The backfill writes sample metadata
+  that only the (not-yet-merged) submit-path swap reads; the current submit path still reads
+  the intake `human_filtering` flag and is untouched. So the backfill is safe to run now, or
+  to defer — but it MUST land before the submit swap is exercised, or that swap aborts every
+  pool. Ordering is the entire point of this note.
+
+- (#299) The 25 seawater samples are backfilled to `not applicable`, which resolves
+  PASS_THROUGH — i.e. **no host depletion**. They have never been masked, so this changes
+  nothing today. But it is the one place the backfill writes a value whose consequence is
+  "stop filtering" rather than "keep filtering" or "abort": whether human reads should still
+  be removed from a host-LESS sample for contamination/privacy reasons is a separate assay
+  question the host model cannot express.
 
 - **Reference sharding + sharded alignment are opt-in and inert until an operator runs them.** Sharded indexing is enabled per reference by a `shard_index` context flag on `reference-add` / `local-reference-add` (absent ⇒ byte-identical to today's whole-reference `loading → active`, no build); the alignment consumer (`align/1.0.0`, `POST …/sequenced-pool/{P}/align-plan`, `DELETE /alignment-definition/{idx}`) needs a sharded, ACTIVE reference plus completed masks to do anything. Existing reference and read-mask flows are unchanged. (#268)
 - **The DuckLake `alignment` table is created automatically at data-plane startup** by `ensure_alignment_tables` (idempotent, runs every DP boot) — **no data-plane action**. It is a sink (not in `ALLOWED_TABLES`); there is no Flight read-side yet. (#268)

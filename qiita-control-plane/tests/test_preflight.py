@@ -164,3 +164,71 @@ def test_an_unreadable_blob_raises_rather_than_looking_non_pacbio(build_case5_pr
     assert (
         pacbio_protocol_from_blob(build_case5_preflight(sheet_type="bclconvert").read_bytes()) == {}
     )
+
+
+# ---------------------------------------------------------------------------
+# control_samples — the ONLY new I/O in the backfill path
+# ---------------------------------------------------------------------------
+
+
+def test_control_samples_reads_is_control_off_the_input_sample_row(build_case5_preflight):
+    """Controls come from `input_sample.project_idx IS NULL` — run_preflight's own
+    definition of `is_control` — and their accession is read off that SAME row.
+
+    The tempting alternative is to take the names from
+    `get_input_sample_project_info` and resolve each to an accession via
+    `lookup_input_samples_by_name`. That is BROKEN: the first returns
+    `input_sample.sample_name`, the second matches the `prepped_sample_name` view
+    (the prep-level EFFECTIVE name, `COALESCE(prepped, input)`). A control whose
+    prep overrides its name resolves to zero matches and is silently skipped — and
+    a missed blank resolves UNRESOLVED, which aborts its entire pool. Hence the
+    single-row read; this test is the pin on it.
+    """
+    from qiita_control_plane.preflight import control_samples, open_blob
+
+    blob = build_case5_preflight().read_bytes()
+    with open_blob(blob) as conn:
+        found = control_samples(conn)
+        # Ground truth, straight from the definition.
+        expected = {
+            row[0]
+            for row in conn.execute(
+                "SELECT biosample_accession FROM input_sample WHERE project_idx IS NULL"
+            ).fetchall()
+            if row[0]
+        }
+
+    assert found.accessions == expected
+    assert found.unusable == 0
+    # And it must not sweep up the non-controls.
+    with open_blob(blob) as conn:
+        non_control = conn.execute(
+            "SELECT count(*) FROM input_sample WHERE project_idx IS NOT NULL"
+        ).fetchone()[0]
+    assert non_control > 0, "fixture must contain real samples, or this proves nothing"
+
+
+def test_control_samples_counts_a_control_with_no_accession_rather_than_dropping_it(
+    build_case5_preflight,
+):
+    """A blank the pre-flight KNOWS about but that carries no biosample accession
+    cannot be joined to a qiita.biosample — but it must be COUNTED, not silently
+    dropped, because it will fall to UNRESOLVED and abort its pool, and the
+    operator needs to know that was an accession problem and not a curation one."""
+    import sqlite3 as _sqlite3
+
+    from qiita_control_plane.preflight import control_samples, open_blob
+
+    db = build_case5_preflight()
+    conn = _sqlite3.connect(db)
+    # Force one control (or, if the fixture has none, one sample) to be an
+    # accession-less blank.
+    conn.execute("UPDATE input_sample SET project_idx = NULL, biosample_accession = NULL")
+    conn.commit()
+    conn.close()
+
+    with open_blob(db.read_bytes()) as c:
+        found = control_samples(c)
+
+    assert found.accessions == set()
+    assert found.unusable > 0

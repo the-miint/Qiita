@@ -20,6 +20,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ## [Unreleased]
 
+### Added
+
+- **`qiita-admin backfill host-taxon-id` — populate the host organism on samples that
+  predate the field (#299).** `host_taxon_id` was added as a biosample global field after
+  every sample we hold was ingested, so **none** carry it — which means the host-filter
+  resolver correctly reports every sample UNRESOLVED, and the submit-path swap would abort
+  every pool. This backfills it. **Dry-run by default**; `--execute` writes. Idempotent, so
+  it can be re-run as curation lands.
+
+- **The host is decided by two facts, in order, and anything else is reported rather than
+  guessed (#299).** First: is it a CONTROL? A blank has no host of its own whatever taxon
+  it carries — and it must be checked first, because blanks *do* carry a taxon and **every
+  pool contains blanks**, so checking taxon first would abort every pool. The signal is the
+  pre-flight's own `is_control` (`input_sample.project_idx IS NULL`), never the `BLANK.*`
+  naming convention. Second: the sample's own `taxon_id` is mapped to a host through a
+  small **curated** table — `human gut metagenome` → human; `seawater metagenome` → `not
+  applicable` (no host). The mapping cannot be computed: `terminology_term` carries no
+  lineage, and NCBI's metagenome taxa do not sit under their host. A sample neither rule
+  settles is left unwritten and stays UNRESOLVED, which aborts at submit rather than
+  passing an un-depleted sample through. The residue is the curation worklist, and the
+  command prints it.
+
 ### Changed
 
 - **Sharded-alignment review revisions (#268).** Reworked the sharded-alignment

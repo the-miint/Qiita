@@ -118,6 +118,37 @@ MISSING_REASON_VALUE_COLUMN = "value_missing_reason_idx"
 # value sentinels.
 TERMINOLOGY_TERM_VALUE_COLUMN = "value_terminology_term_idx"
 
+# `biosample_global_field.internal_name` values the host-filter arc reads. Both
+# are terminology-typed against NCBI Taxonomy, and they are NOT the same fact:
+#
+#   TAXON_ID      — the sample's OWN organism. For a metagenome, the environment
+#                   it came from ('human gut metagenome', 'seawater metagenome').
+#   HOST_TAXON_ID — the organism the sample was taken FROM. Absent for an
+#                   environmental sample; a missing-reason for a control.
+#
+# Conflating them is the bug this arc exists to prevent, so they are named side
+# by side. Shared because the resolver reads host_taxon_id and the backfill reads
+# taxon_id to derive it — two consumers, one spelling.
+BIOSAMPLE_FIELD_TAXON_ID = "taxon_id"
+BIOSAMPLE_FIELD_HOST_TAXON_ID = "host_taxon_id"
+
+# The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES
+# — i.e. the two that say something definite about whether a host exists.
+#
+# Deliberately not an exhaustive enum of the INSDC vocabulary. The other reasons
+# ('not collected', 'not provided', 'restricted access', …) exist in the DB and
+# have no constant here ON PURPOSE: recognising a reason is an explicit act that
+# promotes it from "abort" to "proceed", and an enum listing every reason would
+# invite exactly the mechanical widening the fail-closed rule is there to stop.
+MISSING_REASON_NOT_APPLICABLE = "not applicable"
+MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
+
+# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the
+# term_id of the human host. Shared so production code and the test seeds spell
+# them the same way — production must not reach into `testing/` for them.
+NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
+NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
+
 
 class MissingReasonRef(BaseModel):
     """Resolved-once shape for a metadata text value recognised as a marker

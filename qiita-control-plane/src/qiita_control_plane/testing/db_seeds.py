@@ -15,18 +15,20 @@ import secrets
 
 import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
+
+# Re-exported (redundant-alias form, so the linter keeps what looks unused here).
+# The taxonomy constants live in qiita_common.models now — production code must
+# not reach into `testing/` for them — but the suite imports them alongside these
+# seed helpers, so they stay reachable from here.
+from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
+from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
 
 # Seeded NCBI Taxonomy fixture data — must match the seed migration at
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
-NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
 NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
-# Human. Seeded by 20260709000000_seed_water_metadata_terminology.sql; the
-# host-filter tests read it rather than minting their own so they stay honest
-# about the term the live host profile actually points at.
-NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
 
 
 async def fetch_ncbi_taxonomy_term(pool: asyncpg.Pool, term_id: str) -> asyncpg.Record | None:

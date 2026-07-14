@@ -35,6 +35,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 # Sheet types the PacBio path recognizes. `pacbio_absquant` is the absolute-
 # quantification protocol — the one that carries SynDNA spike-ins. The ingest CLI
@@ -226,3 +227,60 @@ def pacbio_human_filtering_from_blob(blob: bytes) -> dict[str, bool]:
     """`pacbio_human_filtering_by_sample_idx` over a stored blob."""
     with open_blob(blob) as conn:
         return pacbio_human_filtering_by_sample_idx(conn)
+
+
+class ControlSamples(NamedTuple):
+    """The run's control (blank) samples, split by whether we can identify them.
+
+    `accessions` are the controls we can join to a `qiita.biosample`.
+    `unusable` counts controls the pre-flight KNOWS are blanks but that carry no
+    biosample accession — surfaced rather than dropped, because a missed blank
+    resolves UNRESOLVED and aborts its whole pool, and "the pre-flight said blank
+    but we couldn't match it" is a very different problem from "this sample's
+    metadata needs curating."
+    """
+
+    accessions: set[str]
+    unusable: int
+
+
+def control_samples(conn: sqlite3.Connection) -> ControlSamples:
+    """Return the run's CONTROL samples (blanks), keyed by biosample accession.
+
+    A control is a sample with no project of its own — `input_sample.project_idx
+    IS NULL`. That is run_preflight's own definition (see
+    `db.get_input_sample_project_info`, whose `is_control` is exactly this
+    predicate), and it is the one we use.
+
+    Deliberately NOT derived from either of the two tempting proxies:
+
+      * the sample's NAME. Controls are conventionally named `BLANK.*`, and on
+        the live data 650 of 652 are — but a naming convention is not a fact, and
+        the two that aren't would be silently mis-depleted.
+      * a non-empty `secondary_project_accessions`. Controls carry one secondary
+        per non-primary plate project, so "has secondaries" implies control — but
+        NOT the converse: a blank on a plate with a SINGLE project has no
+        secondaries at all, and would read as a normal sample.
+
+    Reads `input_sample` directly, which is a known smell (the reader should own
+    its schema — there are open issues to give run_preflight the accessors this
+    path wants). It is done here on purpose, because the accessor route is WRONG:
+    `get_input_sample_project_info` returns `input_sample.sample_name`, while
+    `lookup_input_samples_by_name` matches the `prepped_sample_name` view — the
+    prep-level EFFECTIVE name (`COALESCE(prepped.sample_name, input.sample_name)`).
+    The two are different columns, so a control whose prep carries an override
+    name resolves to zero matches and would be silently skipped. `project_idx`
+    and `biosample_accession` are columns on the SAME row, so reading them
+    together removes the join, the lossy key, and the failure mode at once.
+    """
+    rows = conn.execute(
+        "SELECT biosample_accession FROM input_sample WHERE project_idx IS NULL"
+    ).fetchall()
+    accessions = {r[0] for r in rows if r[0]}
+    return ControlSamples(accessions=accessions, unusable=len(rows) - len(accessions))
+
+
+def control_samples_from_blob(blob: bytes) -> ControlSamples:
+    """`control_samples` over a stored blob."""
+    with open_blob(blob) as conn:
+        return control_samples(conn)
