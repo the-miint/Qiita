@@ -8,6 +8,7 @@ from .alignment import alignment_definition_router
 from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
 from .biosample import router as biosample_router
+from .host_filter_profile import router as host_filter_profile_router
 from .prep_protocol import router as prep_protocol_router
 from .prep_sample import router as prep_sample_router
 from .read_masked import mask_definition_router, read_masked_router
@@ -28,6 +29,7 @@ from .work_ticket import router as work_ticket_router
 
 api_router = APIRouter(prefix=API_PREFIX)
 api_router.include_router(reference_router)
+api_router.include_router(host_filter_profile_router)
 api_router.include_router(biosample_router)
 api_router.include_router(biosample_top_level_router)
 api_router.include_router(sequencing_router)

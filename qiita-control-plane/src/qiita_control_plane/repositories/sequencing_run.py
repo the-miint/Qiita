@@ -226,6 +226,27 @@ async def fetch_sequencing_run_created_by(
     )
 
 
+async def fetch_sequencing_run_platform(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+) -> Platform | None:
+    """Return only `platform` for the run; None on miss.
+
+    Narrow SELECT, for the same reason as fetch_sequencing_run_created_by: the
+    pool roster needs the run's platform to resolve host filtering, and pulling
+    every column (notably the JSONB extra_metadata) to read one enum is waste on
+    a route that already fans out over hundreds of samples.
+
+    asyncpg hands the qiita.platform column back as a plain str; coerce so the
+    caller gets the enum its signature asks for.
+    """
+    platform = await pool_or_conn.fetchval(
+        "SELECT platform FROM qiita.sequencing_run WHERE idx = $1",
+        sequencing_run_idx,
+    )
+    return Platform(platform) if platform is not None else None
+
+
 async def fetch_sequencing_run_exists(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequencing_run_idx: int,

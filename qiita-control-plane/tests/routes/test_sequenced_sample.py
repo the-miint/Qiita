@@ -31,13 +31,22 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_LIST_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, Platform
 
 from qiita_control_plane.main import app
+from qiita_control_plane.repositories._sample_helpers import (
+    _get_or_create_globally_linked_study_field,
+)
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
+    NCBI_TAXONOMY_HUMAN_TERM_ID,
+    fetch_missing_value_reason_idx,
+    fetch_ncbi_taxonomy_term,
     fetch_seeded_metagenome_term,
     seed_biosample,
     seed_biosample_to_study_link,
+    seed_host_filter_profile,
+    seed_host_reference,
     seed_prep_sample_global_field,
     seed_user_principal,
 )
@@ -106,6 +115,9 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             st,
         )
     await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
+    # host_filter_profile FKs the reference with ON DELETE RESTRICT, so the
+    # profiles must go before the references they point at, just below.
+    await delete_idxs(pool, "host_filter_profile", created["host_filter_profile"])
     # References are FK'd by sequenced_sample.host_*_reference_idx (ON DELETE
     # RESTRICT), so drop them only after the samples above are gone. The
     # reference PK is reference_idx (not idx), so delete_idxs does not apply.
@@ -123,6 +135,10 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             bs,
             st,
         )
+    # biosample_metadata references the biosample and its study field; the
+    # field references the (seeded, shared) global field, which we never own.
+    await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
+    await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
     await delete_idxs(pool, "biosample", created["biosample"])
     for st, pr in created["study_access"]:
         await pool.execute(
@@ -167,6 +183,9 @@ async def ctx(role_keyed_clients):
     inputs the test seeds)."""
     created: dict = {
         "prep_sample_metadata": [],
+        "biosample_metadata": [],
+        "biosample_study_field": [],
+        "host_filter_profile": [],
         "prep_sample_to_study": [],
         "sequenced_sample": [],
         "reference": [],
@@ -1637,7 +1656,33 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
         # A freshly seeded sample has no work tickets, so both list routes report
         # has_read_mask_ticket False.
         "has_read_mask_ticket": False,
+        # Only the POOL-scoped list resolves host filtering (it needs the run's
+        # platform); the run-scoped list leaves it None. Pool-scoped tests that
+        # compare the full item override this via _with_host_filter().
+        "host_filter": None,
     }
+
+
+def _unresolved_host_filter(biosample_idx: int) -> dict:
+    """The host_filter block a freshly-seeded sample gets on the pool roster.
+
+    A minimal biosample carries no `host_taxon_id`, so it resolves UNRESOLVED —
+    which is not an edge case but the CURRENT STATE OF EVERY LIVE SAMPLE: the
+    field exists and nothing has been backfilled into it yet. The roster saying
+    so out loud, per sample, is the point of exposing the resolution at all.
+    """
+    return {
+        "outcome": "unresolved",
+        "host_term_idx": None,
+        "rype_reference_idx": None,
+        "minimap2_reference_idx": None,
+        "reason": f"host_taxon_id is not set on biosample {biosample_idx}",
+    }
+
+
+def _with_host_filter(items):
+    """Return `items` with each one's expected pool-roster host_filter block set."""
+    return [{**i, "host_filter": _unresolved_host_filter(i["biosample_idx"])} for i in items]
 
 
 async def test_list_pool_samples_happy_path(ctx):
@@ -1667,7 +1712,7 @@ async def test_list_pool_samples_happy_path(ctx):
     )
     assert resp.status_code == 200, resp.text
     expected = {
-        "samples": sorted(landed, key=lambda s: s["sequenced_pool_item_id"]),
+        "samples": _with_host_filter(sorted(landed, key=lambda s: s["sequenced_pool_item_id"])),
         "count": 2,
         "truncated": False,
         "caller_system_role": "wet_lab_admin",
@@ -1885,7 +1930,7 @@ async def test_list_pool_samples_excludes_retired_prep_sample(ctx):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["count"] == 1
-    assert body["samples"] == [keep]
+    assert body["samples"] == _with_host_filter([keep])
 
 
 async def test_list_pool_samples_truncated(ctx, monkeypatch):
@@ -1921,7 +1966,7 @@ async def test_list_pool_samples_truncated(ctx, monkeypatch):
     # cap=1 keeps the first row in sequenced_pool_item_id order.
     first = sorted(landed, key=lambda s: s["sequenced_pool_item_id"])[0]
     assert body == {
-        "samples": [first],
+        "samples": _with_host_filter([first]),
         "count": 1,
         "truncated": True,
         "caller_system_role": "wet_lab_admin",
@@ -3303,3 +3348,198 @@ async def test_list_pool_samples_carries_pacbio_protocol_facts(ctx, build_case5_
     # ...and human_filtering comes from the PacBio reader, not the Illumina one.
     assert sample["human_filtering"] == filtering[item_id]
     assert sample["human_filtering"] is not None
+
+
+# ---------------------------------------------------------------------------
+# host_filter — the resolved plan the roster reports per sample
+# ---------------------------------------------------------------------------
+
+
+async def _bind_host_taxon_field(ctx, study_idx):
+    """Create the study's `host_taxon_id` field, bound to the seeded GLOBAL field.
+
+    The binding is the whole point: `biosample_metadata.global_field_idx` is
+    populated by trigger only for a globally-linked study field, and that column
+    is what the resolver reads. A same-named purely-local field would leave it
+    NULL and the sample would (correctly) resolve as having no host set.
+    """
+    global_field_idx = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'host_taxon_id'"
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=global_field_idx,
+            display_name="host taxon id",
+            created_by_idx=ctx["wet_session"]["principal_idx"],
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+    return field_idx
+
+
+async def _write_host_taxon(ctx, *, biosample_idx, field_idx, term_idx=None, reason_idx=None):
+    """Write the sample's host_taxon_id as either a terminology term or a missing-reason."""
+    column = "value_terminology_term_idx" if term_idx is not None else "value_missing_reason_idx"
+    meta_idx = await ctx["pool"].fetchval(
+        f"INSERT INTO qiita.biosample_metadata"
+        f" (biosample_idx, biosample_study_field_idx, {column}, created_by_idx)"
+        f" VALUES ($1, $2, $3, $4) RETURNING idx",
+        biosample_idx,
+        field_idx,
+        term_idx if term_idx is not None else reason_idx,
+        ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_metadata"].append(meta_idx)
+
+
+async def _seed_illumina_human_profile(ctx, suffix):
+    """Seed a host reference pair + an illumina profile for human (9606).
+
+    Returns (human_term_idx, rype_idx, minimap2_idx).
+    """
+    principal_idx = ctx["wet_session"]["principal_idx"]
+    rype_idx = await seed_host_reference(
+        ctx["pool"], name=f"hf-rype-{suffix}", created_by_idx=principal_idx
+    )
+    ctx["created"]["reference"].append(rype_idx)
+    minimap2_idx = await seed_host_reference(
+        ctx["pool"], name=f"hf-mm2-{suffix}", created_by_idx=principal_idx
+    )
+    ctx["created"]["reference"].append(minimap2_idx)
+    human_term = await fetch_ncbi_taxonomy_term(ctx["pool"], NCBI_TAXONOMY_HUMAN_TERM_ID)
+    profile_idx = await seed_host_filter_profile(
+        ctx["pool"],
+        host_term_idx=human_term["idx"],
+        platform=Platform.ILLUMINA,
+        rype_reference_idx=rype_idx,
+        minimap2_reference_idx=minimap2_idx,
+        created_by_idx=principal_idx,
+    )
+    ctx["created"]["host_filter_profile"].append(profile_idx)
+    return human_term["idx"], rype_idx, minimap2_idx
+
+
+async def _roster_host_filter(ctx, run_idx, pool_idx):
+    """GET the pool roster; return {sequenced_pool_item_id: host_filter block}."""
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    return {s["sequenced_pool_item_id"]: s["host_filter"] for s in resp.json()["samples"]}
+
+
+async def test_roster_resolves_host_filter_per_sample(ctx):
+    """One pool, four samples, four different host_taxon_id states — the roster
+    reports each sample's own resolution, not a pool-wide verdict.
+
+    This is the whole reason the resolution is exposed read-only: an operator can
+    see, before submitting anything, exactly which samples would be depleted,
+    which would be passed through, and which would abort.
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "hf-mix")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="hf-mix"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    field_idx = await _bind_host_taxon_field(ctx, study_idx)
+    human_term_idx, rype_idx, minimap2_idx = await _seed_illumina_human_profile(ctx, "mix")
+
+    samples = {
+        name: await _seed_pool_sample(
+            ctx,
+            run_idx=run_idx,
+            pool_idx=pool_idx,
+            study_idx=study_idx,
+            protocol_idx=protocol_idx,
+            suffix=f"HF-{name}",
+        )
+        for name in ("HUMAN", "WATER", "BLANK", "ABSENT")
+    }
+
+    # A human host with a profile -> FILTER against both stages.
+    await _write_host_taxon(
+        ctx,
+        biosample_idx=samples["HUMAN"]["biosample_idx"],
+        field_idx=field_idx,
+        term_idx=human_term_idx,
+    )
+    # Deliberately no host -> PASS_THROUGH.
+    await _write_host_taxon(
+        ctx,
+        biosample_idx=samples["WATER"]["biosample_idx"],
+        field_idx=field_idx,
+        reason_idx=await fetch_missing_value_reason_idx(ctx["pool"], "not applicable"),
+    )
+    # A control -> CONTROL (a marker; the pool decides what it filters against).
+    await _write_host_taxon(
+        ctx,
+        biosample_idx=samples["BLANK"]["biosample_idx"],
+        field_idx=field_idx,
+        reason_idx=await fetch_missing_value_reason_idx(ctx["pool"], "missing: control sample"),
+    )
+    # samples["ABSENT"] gets no host_taxon_id at all -> UNRESOLVED.
+
+    by_item = await _roster_host_filter(ctx, run_idx, pool_idx)
+
+    human = by_item[samples["HUMAN"]["sequenced_pool_item_id"]]
+    assert human["outcome"] == "filter"
+    assert human["host_term_idx"] == human_term_idx
+    assert human["rype_reference_idx"] == rype_idx
+    assert human["minimap2_reference_idx"] == minimap2_idx
+
+    water = by_item[samples["WATER"]["sequenced_pool_item_id"]]
+    assert water["outcome"] == "pass_through"
+    assert water["rype_reference_idx"] is None
+
+    blank = by_item[samples["BLANK"]["sequenced_pool_item_id"]]
+    assert blank["outcome"] == "control"
+    assert blank["rype_reference_idx"] is None
+
+    absent = by_item[samples["ABSENT"]["sequenced_pool_item_id"]]
+    assert absent["outcome"] == "unresolved"
+    assert "not set" in absent["reason"]
+
+
+async def test_roster_unresolved_when_host_has_no_profile_on_this_platform(ctx):
+    """A known host with no build for the run's platform is UNRESOLVED — and its
+    reason names the taxon, so an operator can act on it.
+
+    Distinct from the "no metadata" UNRESOLVED above: the two are different
+    problems with different fixes (seed a profile vs. backfill the sample), so
+    they must not collapse into one indistinguishable message.
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "hf-noprof")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="hf-noprof"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    field_idx = await _bind_host_taxon_field(ctx, study_idx)
+    # A human host, but NO profile seeded for it on any platform.
+    human_term = await fetch_ncbi_taxonomy_term(ctx["pool"], NCBI_TAXONOMY_HUMAN_TERM_ID)
+    sample = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="HF-NOPROF",
+    )
+    await _write_host_taxon(
+        ctx,
+        biosample_idx=sample["biosample_idx"],
+        field_idx=field_idx,
+        term_idx=human_term["idx"],
+    )
+
+    by_item = await _roster_host_filter(ctx, run_idx, pool_idx)
+    block = by_item[sample["sequenced_pool_item_id"]]
+
+    assert block["outcome"] == "unresolved"
+    # The taxon rides along on the failure, so the message is actionable.
+    assert block["host_term_idx"] == human_term["idx"]
+    assert "no host_filter_profile" in block["reason"]
+    assert block["rype_reference_idx"] is None

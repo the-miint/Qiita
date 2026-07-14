@@ -86,6 +86,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..host_filter_resolver import resolve_host_filter_many
 from ..preflight import (
     PacbioProtocol,
     open_blob,
@@ -110,7 +111,10 @@ from ..repositories.sequenced_sample import (
     import_sequenced_prep_sample,
     update_sequenced_sample,
 )
-from ..repositories.sequencing_run import fetch_sequenced_pool_preflight
+from ..repositories.sequencing_run import (
+    fetch_sequenced_pool_preflight,
+    fetch_sequencing_run_platform,
+)
 from ._helpers import (
     GENERIC_FK_VIOLATION,
     build_idxs_list_response,
@@ -541,6 +545,11 @@ async def list_sequenced_samples_in_pool(
     truth) — so `submit-host-filter-pool` can run its pool-wide host-filter guard
     without an operator-supplied preflight file. It is None when the pool has no
     preflight populated or the blob carries no row for that pool item.
+
+    And each sample carries `host_filter` — what host filtering it WOULD get,
+    resolved from its own `host_taxon_id` metadata plus the run's platform.
+    Read-only: nothing acts on it, and the submit path still reads
+    `human_filtering`. See HostFilterResolution for why both are reported.
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
     # truncation; the route slices back to the cap before returning.
@@ -560,6 +569,20 @@ async def list_sequenced_samples_in_pool(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
     )
+    # Resolve host filtering for the whole roster in two queries — NOT one call
+    # per sample; see resolve_host_filter_many.
+    #
+    # The run's platform is the resolution's second input (the same host is
+    # depleted with different stages depending on how it was sequenced) and is
+    # constant across the pool, so it is read once here rather than per sample.
+    # Not-None: require_sequenced_pool_in_run has already established that the
+    # path's pool belongs to this run, so the run exists.
+    platform = await fetch_sequencing_run_platform(pool, sequencing_run_idx)
+    host_filter_by_biosample = await resolve_host_filter_many(
+        pool,
+        biosample_idxs=[r["biosample_idx"] for r in rows],
+        platform=platform,
+    )
     samples = []
     for r in rows:
         item = dict(r)
@@ -572,6 +595,11 @@ async def list_sequenced_samples_in_pool(
             item["sheet_type"] = facts.sheet_type
             item["twist_adaptor_id"] = facts.twist_adaptor_id
             item["syndna_is_twisted"] = facts.syndna_is_twisted
+        # Every roster row gets a resolution — a sample with no host metadata
+        # comes back UNRESOLVED rather than absent, so "we don't know" is
+        # visible instead of silent. The resolver already returns the wire type,
+        # so there is nothing to map.
+        item["host_filter"] = host_filter_by_biosample[item["biosample_idx"]]
         samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(
         samples=samples,

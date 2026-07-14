@@ -524,6 +524,30 @@ _None yet._
 - **A read-discipline rule in `CLAUDE.md`.** Several files here run past 4,000 lines;
   reading one whole costs more context than every instruction file in the repo
   combined. Nothing previously said so. (#296)
+
+- **The pool roster now reports what host filtering each sample WOULD get (#294).**
+  Every item in `GET .../sequenced-pool/{idx}/sequenced-sample/list` carries a
+  `host_filter` block — `filter` (with the resolved rype/minimap2 references),
+  `pass_through`, `control`, or `unresolved`, each with a human-readable reason —
+  resolved from the sample's own `host_taxon_id` metadata plus the run's platform.
+  Read-only: nothing acts on it, and the submit path still reads the intake
+  `human_filtering` flag. Both are exposed side by side on purpose, because they
+  answer the same question from opposite ends (recorded intent vs. the sample's own
+  metadata) and will disagree until the metadata is backfilled — which is exactly
+  what an operator needs to see before that switchover.
+
+- **`GET /host-filter-profile` — the catalog of what we can deplete (#294).**
+  Optionally narrowed by `?platform=`. This is the menu that makes an override
+  well-defined: you cannot sensibly force a sample onto a host profile without
+  first being able to see which profiles exist. Gated to `wet_lab_admin` with the
+  existing `reference:read` scope — a profile names no sample, only which reference
+  builds deplete which host, so it is reference config.
+
+- **`resolve_host_filter_many` — whole-pool resolution in two queries (#294).**
+  Live pools run to hundreds of samples, so resolving one at a time would turn a
+  single roster GET into ~1300 round trips. The batch path shares its classification
+  core with the single-sample path, so a roster and a per-sample submit cannot
+  disagree about the same sample.
 - **PacBio case-5 read-mask chain.** The read-mask workflow gains two optional,
   `when:`-gated stages around its always-on QC and host filter, so one workflow
   serves all five PacBio protocols and Illumina unchanged:

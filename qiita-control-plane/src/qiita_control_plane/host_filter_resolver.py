@@ -26,13 +26,20 @@ UNRESOLVED rather than to "no filtering". Silently passing an un-depleted human
 sample through is the one outcome we cannot take back.
 """
 
-from dataclasses import dataclass
-from enum import StrEnum
+from collections.abc import Sequence
 
 import asyncpg
-from qiita_common.models import HostFilterProfile, Platform
+from qiita_common.models import (
+    HostFilterOutcome,
+    HostFilterProfile,
+    HostFilterResolution,
+    Platform,
+)
 
-from .repositories.host_filter_profile import get_host_filter_profile
+from .repositories.host_filter_profile import (
+    get_host_filter_profile,
+    list_host_filter_profiles,
+)
 
 # The biosample global field carrying the host organism, seeded as a
 # terminology-typed field bound to NCBI Taxonomy. Because it is
@@ -45,26 +52,21 @@ _HOST_TAXON_FIELD = "host_taxon_id"
 _REASON_NOT_APPLICABLE = "not applicable"
 _REASON_CONTROL_SAMPLE = "missing: control sample"
 
-
-class HostFilterOutcome(StrEnum):
-    """What should happen to one biosample's reads, host-filtering-wise.
-
-    Python-only. There is no Postgres twin (nothing persists an outcome — it is
-    recomputed at submit), so this is out of scope for the enum-parity tests.
-    """
-
-    # The sample has a host, and that host has a reference build on this
-    # platform. Deplete against it.
-    FILTER = "filter"
-    # The sample deliberately has no host ('not applicable' — e.g. a water or
-    # soil sample). Nothing to deplete; this is a decision, not a gap.
-    PASS_THROUGH = "pass_through"
-    # A control/blank. It has no host of its own, but it is not
-    # "pass-through" either: what it gets filtered against is decided at the
-    # pool level, by its neighbours. A marker for the caller, not an answer.
-    CONTROL = "control"
-    # We cannot tell. Abort unless the caller supplies an explicit override.
-    UNRESOLVED = "unresolved"
+# The columns every host_taxon_id read selects, shared by the single-sample and
+# batch queries so the two cannot drift into classifying different shapes.
+_METADATA_COLUMNS = (
+    "bm.biosample_idx,"
+    " bm.value_terminology_term_idx,"
+    " bm.value_missing_reason_idx,"
+    " mvr.name AS missing_reason"
+)
+_METADATA_FROM = (
+    " FROM qiita.biosample_metadata bm"
+    " JOIN qiita.biosample_global_field bgf"
+    "   ON bgf.idx = bm.global_field_idx AND bgf.internal_name = $1"
+    " LEFT JOIN qiita.missing_value_reason mvr"
+    "   ON mvr.idx = bm.value_missing_reason_idx"
+)
 
 
 # The missing-reasons that say something DEFINITE about whether a host exists,
@@ -88,27 +90,6 @@ _RECOGNISED_MISSING_REASON: dict[str, tuple[HostFilterOutcome, str]] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class HostFilterResolution:
-    """The resolver's answer for one biosample.
-
-    `reason` is always populated and is written to be shown to a human — it is
-    the body of the abort message when the outcome is UNRESOLVED, and the
-    explanation the read-only preview endpoint renders for the other outcomes.
-
-    `host_term_idx` is set whenever the sample named a host, even if no profile
-    was found for it: an UNRESOLVED "taxon 9606 has no pacbio_smrt profile" is a
-    far more actionable message than "unresolved", and the caller needs the term
-    to offer a fix. The reference idxs are set only on FILTER.
-    """
-
-    outcome: HostFilterOutcome
-    host_term_idx: int | None
-    rype_reference_idx: int | None
-    minimap2_reference_idx: int | None
-    reason: str
-
-
 async def resolve_host_filter(
     conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -125,7 +106,16 @@ async def resolve_host_filter(
     UNRESOLVED with a reason, because whether that is fatal is the caller's call
     (a submit aborts; the preview endpoint renders it). asyncpg errors from a
     genuinely broken query propagate.
+
+    Resolving a whole pool? Use `resolve_host_filter_many` — this one costs two
+    round trips per sample, which a large roster cannot afford.
     """
+    # Coerce at the boundary rather than trusting the annotation: asyncpg hands a
+    # qiita.platform column back as a plain str, so a caller reading one straight
+    # out of a row would otherwise reach the SQL untyped, and a bad value would
+    # surface as an InvalidTextRepresentation from Postgres instead of here.
+    platform = Platform(platform)
+
     # Read the host_taxon_id value via the trigger-maintained global_field_idx,
     # which is what makes this a cross-study read: it resolves the same field no
     # matter which study's local field the value was written against.
@@ -135,19 +125,90 @@ async def resolve_host_filter(
     # per (biosample, global field), so a biosample linked to several studies
     # still cannot carry two conflicting host_taxon_id values.
     row = await conn.fetchrow(
-        "SELECT bm.value_terminology_term_idx,"
-        "       bm.value_missing_reason_idx,"
-        "       mvr.name AS missing_reason"
-        "  FROM qiita.biosample_metadata bm"
-        "  JOIN qiita.biosample_global_field bgf"
-        "    ON bgf.idx = bm.global_field_idx AND bgf.internal_name = $2"
-        "  LEFT JOIN qiita.missing_value_reason mvr"
-        "    ON mvr.idx = bm.value_missing_reason_idx"
-        " WHERE bm.biosample_idx = $1",
-        biosample_idx,
+        f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = $2",
         _HOST_TAXON_FIELD,
+        biosample_idx,
     )
 
+    # Look the profile up only when the sample actually named a host; the
+    # classifier below needs it for exactly that branch.
+    profile = None
+    if row is not None and row["value_terminology_term_idx"] is not None:
+        profile = await get_host_filter_profile(
+            conn, host_term_idx=row["value_terminology_term_idx"], platform=platform
+        )
+    return _classify(biosample_idx, row, profile, platform)
+
+
+async def resolve_host_filter_many(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    biosample_idxs: Sequence[int],
+    platform: Platform,
+) -> dict[int, HostFilterResolution]:
+    """Resolve a whole pool at once. Returns {biosample_idx: resolution}.
+
+    Same answers as calling `resolve_host_filter` per sample — they share the
+    `_classify` core, so the two can't drift — but in TWO queries total rather
+    than two per sample. A pool holds hundreds of samples, so the per-sample path
+    would turn one roster GET into a four-figure count of round trips (each also
+    acquiring a connection when handed a pool).
+
+    The profile side is fetched as one platform-scoped list rather than one
+    lookup per distinct host: `qiita.host_filter_profile` holds a handful of rows
+    (one per host per platform), so fetching all of them for this platform is
+    cheaper than an IN-list and keeps the query count fixed at two regardless of
+    how many distinct hosts the pool spans.
+
+    Every requested idx appears in the result. A biosample with no host_taxon_id
+    row is not silently dropped — it comes back UNRESOLVED, which is the whole
+    point of the fail-closed contract.
+    """
+    # Coerce before anything else — see resolve_host_filter. It matters more here:
+    # `profile_by_term` below is keyed on host_term_idx ALONE, which is only
+    # unambiguous because every row in `profiles` is for one platform. A None
+    # platform would make list_host_filter_profiles return every platform's rows
+    # and the dict would silently keep the last one per host — resolving a sample
+    # against another platform's build. Platform(None) raises instead.
+    platform = Platform(platform)
+
+    if not biosample_idxs:
+        return {}
+
+    rows = await conn.fetch(
+        f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = ANY($2::bigint[])",
+        _HOST_TAXON_FIELD,
+        list(biosample_idxs),
+    )
+    row_by_biosample = {r["biosample_idx"]: r for r in rows}
+
+    profiles = await list_host_filter_profiles(conn, platform=platform)
+    profile_by_term = {p.host_term_idx: p for p in profiles}
+
+    resolutions: dict[int, HostFilterResolution] = {}
+    for biosample_idx in biosample_idxs:
+        row = row_by_biosample.get(biosample_idx)
+        term = row["value_terminology_term_idx"] if row is not None else None
+        profile = profile_by_term.get(term) if term is not None else None
+        resolutions[biosample_idx] = _classify(biosample_idx, row, profile, platform)
+    return resolutions
+
+
+def _classify(
+    biosample_idx: int,
+    row: asyncpg.Record | None,
+    profile: HostFilterProfile | None,
+    platform: Platform,
+) -> HostFilterResolution:
+    """The whole decision, as a pure function of the two facts it needs: the
+    sample's host_taxon_id row (or its absence) and the profile for whatever host
+    that row names (or its absence).
+
+    Both the single-sample and batch entry points fetch those two facts their own
+    way — one round trip each vs. two queries for a whole pool — and then land
+    here. Keeping the branching in one place is what guarantees a pool roster and
+    a per-sample submit cannot disagree about the same sample.
+    """
     # The field was never set. Not the same as "no host" — we simply were not
     # told, so we refuse rather than guess.
     if row is None:
@@ -158,11 +219,9 @@ async def resolve_host_filter(
 
     host_term_idx = row["value_terminology_term_idx"]
 
-    # A named host. Its build is config, so ask the profile table.
+    # A named host. Its build is config, so the caller looked it up in the
+    # profile table.
     if host_term_idx is not None:
-        profile = await get_host_filter_profile(
-            conn, host_term_idx=host_term_idx, platform=platform
-        )
         if profile is None:
             # The term rides along even on the failure: "taxon N has no build on
             # this platform" is far more actionable than a bare "unresolved", and
@@ -170,7 +229,7 @@ async def resolve_host_filter(
             return _without_references(
                 HostFilterOutcome.UNRESOLVED,
                 f"no host_filter_profile for terminology term {host_term_idx}"
-                f" on platform {platform!r}",
+                f" on platform {platform}",
                 host_term_idx=host_term_idx,
             )
         return _filter_against(host_term_idx, profile)

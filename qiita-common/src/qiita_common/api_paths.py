@@ -66,6 +66,16 @@ URL_REFERENCE_SHARD_INDEX_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_SHARD
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
 
 # =============================================================================
+# /host-filter-profile/*
+# =============================================================================
+
+PATH_HOST_FILTER_PROFILE_PREFIX = "/host-filter-profile"
+PATH_HOST_FILTER_PROFILE_ROOT = ""  # list against the prefix itself
+
+URL_HOST_FILTER_PROFILE_PREFIX = f"{API_PREFIX}{PATH_HOST_FILTER_PROFILE_PREFIX}"
+URL_HOST_FILTER_PROFILE_LIST = f"{URL_HOST_FILTER_PROFILE_PREFIX}{PATH_HOST_FILTER_PROFILE_ROOT}"
+
+# =============================================================================
 # /prep-protocol/*
 # =============================================================================
 

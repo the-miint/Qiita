@@ -17,6 +17,8 @@ import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
 
+from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
+
 # Seeded NCBI Taxonomy fixture data — must match the seed migration at
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
 NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
@@ -76,6 +78,35 @@ async def seed_host_reference(
         version,
         created_by_idx,
     )
+
+
+async def seed_host_filter_profile(
+    pool: asyncpg.Pool,
+    *,
+    host_term_idx: int,
+    platform: str,
+    rype_reference_idx: int,
+    created_by_idx: int,
+    minimap2_reference_idx: int | None = None,
+) -> int:
+    """Insert one qiita.host_filter_profile row; return its idx.
+
+    Unlike its siblings here this seeds through the repository rather than inline
+    SQL, because the profile's insert is a single plain INSERT with no composition
+    — reproducing it here would be a second copy of the same statement to keep in
+    step with the table. Tests of the repository itself call the repository
+    directly; seeding those through this helper would be circular.
+    """
+    async with pool.acquire() as conn:
+        profile = await insert_host_filter_profile(
+            conn,
+            host_term_idx=host_term_idx,
+            platform=platform,
+            rype_reference_idx=rype_reference_idx,
+            minimap2_reference_idx=minimap2_reference_idx,
+            principal_idx=created_by_idx,
+        )
+    return profile.idx
 
 
 async def seed_user_principal(

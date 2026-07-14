@@ -23,6 +23,7 @@ from qiita_common.models import Platform
 from qiita_control_plane.host_filter_resolver import (
     HostFilterOutcome,
     resolve_host_filter,
+    resolve_host_filter_many,
 )
 from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
@@ -419,3 +420,117 @@ async def test_a_biosample_cannot_carry_two_host_taxon_id_values(ctx):
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
     assert res.outcome is HostFilterOutcome.FILTER
     assert res.host_term_idx == ctx["human_term_idx"]
+
+
+# ---------------------------------------------------------------------------
+# The batch path must agree with the single-sample path, exactly
+# ---------------------------------------------------------------------------
+
+
+async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
+    """resolve_host_filter_many is an OPTIMIZATION, not a second implementation:
+    the roster resolves a whole pool in two queries while a submit resolves one
+    sample at a time, and if the two ever disagree an operator is shown one plan
+    and a different one runs.
+
+    They share `_classify`, but they fetch its inputs by different routes (one
+    profile lookup vs. a platform-scoped list indexed by host term), so "cannot
+    drift" is only true if something checks it. Compare the FULL resolution —
+    including `reason`, which is the operator-facing text and the field most
+    likely to diverge silently.
+    """
+    biosamples = {}
+
+    # One biosample per outcome, so the comparison spans every branch.
+    biosamples["filter"] = await _make_biosample(ctx)
+    await _set_host_term(ctx, biosamples["filter"], ctx["human_term_idx"])
+
+    biosamples["pass_through"] = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, biosamples["pass_through"], "not applicable")
+
+    biosamples["control"] = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, biosamples["control"], "missing: control sample")
+
+    biosamples["unrecognised_reason"] = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, biosamples["unrecognised_reason"], "not collected")
+
+    # No host_taxon_id at all.
+    biosamples["absent"] = await _make_biosample(ctx)
+
+    idxs = list(biosamples.values())
+    batch = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=idxs, platform=Platform.ILLUMINA
+    )
+    for idx in idxs:
+        single = await resolve_host_filter(
+            ctx["pool"], biosample_idx=idx, platform=Platform.ILLUMINA
+        )
+        assert batch[idx] == single, f"batch/single disagree for biosample {idx}"
+
+    # And the fan actually covered every branch — otherwise the equality above
+    # could pass by comparing five identical UNRESOLVEDs.
+    assert {batch[i].outcome for i in idxs} == {
+        HostFilterOutcome.FILTER,
+        HostFilterOutcome.PASS_THROUGH,
+        HostFilterOutcome.CONTROL,
+        HostFilterOutcome.UNRESOLVED,
+    }
+
+
+async def test_batch_agrees_with_single_sample_when_the_host_has_no_profile(ctx):
+    """The no-profile-for-this-platform branch, which is where the two paths'
+    inputs are fetched most differently (a lookup that misses, vs. a term absent
+    from the platform's profile map) — and where the reason string names the
+    platform, so an enum-vs-str slip would show up here first."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+
+    # oxford_nanopore has no profile seeded for this host.
+    batch = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[bs_idx], platform=Platform.OXFORD_NANOPORE
+    )
+    single = await resolve_host_filter(
+        ctx["pool"], biosample_idx=bs_idx, platform=Platform.OXFORD_NANOPORE
+    )
+
+    assert batch[bs_idx] == single
+    assert batch[bs_idx].outcome is HostFilterOutcome.UNRESOLVED
+    # The platform renders as its value, not as a StrEnum repr — this reason is
+    # shown to an operator.
+    assert "on platform oxford_nanopore" in batch[bs_idx].reason
+
+
+async def test_batch_accepts_a_raw_platform_string(ctx):
+    """The roster reads `platform` straight off a sequencing_run row, and asyncpg
+    hands a qiita.platform column back as a plain str. Coercing at the boundary is
+    what keeps that caller from silently producing different reason text than an
+    enum-passing caller would."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+
+    from_str = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[bs_idx], platform="illumina"
+    )
+    from_enum = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[bs_idx], platform=Platform.ILLUMINA
+    )
+    assert from_str[bs_idx] == from_enum[bs_idx]
+    assert from_str[bs_idx].outcome is HostFilterOutcome.FILTER
+
+
+async def test_batch_edge_cases(ctx):
+    """Empty input is an empty dict (not a query); a repeated idx collapses rather
+    than duplicating; and an idx with no metadata row comes back UNRESOLVED rather
+    than being silently dropped from the result — a missing key would KeyError the
+    roster, which is the fail-loud direction but a worse one than reporting it."""
+    assert (
+        await resolve_host_filter_many(ctx["pool"], biosample_idxs=[], platform=Platform.ILLUMINA)
+        == {}
+    )
+
+    bs_idx = await _make_biosample(ctx)
+    repeated = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[bs_idx, bs_idx], platform=Platform.ILLUMINA
+    )
+    assert list(repeated) == [bs_idx]
+    assert repeated[bs_idx].outcome is HostFilterOutcome.UNRESOLVED
