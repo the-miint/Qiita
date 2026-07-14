@@ -112,7 +112,7 @@ def test_syndna_marks_hits_and_passes_the_rest(tmp_path, monkeypatch):
     reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGT", None), (2, "TTTT", None)])
     _stub_hits(monkeypatch, [1])
     out = _run(tmp_path, reads, _index(tmp_path))
-    assert set(out) == {"partial_mask", "syndna_alignment"}
+    assert set(out) == {"partial_mask", "alignment"}
     assert _rows(out["partial_mask"]) == [(1, _SPIKEIN), (2, _PASS)]
 
 

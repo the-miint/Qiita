@@ -376,4 +376,4 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     # The partial mask threaded forward to the lima chain / qc under one binding
     # (see the module docstring). NOT the final read_mask — host_filter emits that.
-    return {"partial_mask": partial_mask, "syndna_alignment": alignment}
+    return {"partial_mask": partial_mask, "alignment": alignment}
