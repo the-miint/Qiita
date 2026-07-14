@@ -531,6 +531,47 @@ pub fn verify_delete_alignment(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `delete_coverage` DoAction — the idempotent-replace half of
+/// the coverage write path.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.delete_coverage_data`:
+/// `{"action": "delete_coverage", "coverage_idx": N, "prep_sample_idx": [M, ...]}`.
+///
+/// DuckLake has no uniqueness constraint, so a re-run of a coverage ticket would APPEND a
+/// second set of rows under the same `coverage_idx` rather than replace them — and the
+/// duplicate is invisible: every row is individually well-formed, and a consumer summing
+/// or averaging them just gets a silently doubled number. So the workflow deletes this
+/// ticket's exact footprint immediately before registering the new file.
+///
+/// Scoped to `(coverage_idx, prep_sample_idx)` and NOT to coverage_idx alone: several
+/// samples share one coverage_idx (it is the identity of the MEASUREMENT, not of a
+/// sample's rows), so a whole-idx purge would delete every other sample's results as a
+/// side effect of re-running one.
+///
+/// Idempotent: a first run deletes zero rows. `deny_unknown_fields` keeps the contract
+/// tight.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteCoveragePayload {
+    /// Action discriminator; the handler also rejects a mismatched `action`.
+    pub action: String,
+    /// `i64`, matching `coverage_definition.coverage_idx BIGINT` and the
+    /// `coverage.coverage_idx BIGINT` DuckLake column.
+    pub coverage_idx: i64,
+    /// The samples whose rows this ticket is about to rewrite. An empty list is a
+    /// control-plane bug, not a valid ask — the handler rejects it.
+    pub prep_sample_idx: Vec<i64>,
+}
+
+/// Verify a `delete_coverage` DoAction token and return its parsed payload.
+pub fn verify_delete_coverage(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<DeleteCoveragePayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed payload for the `mask_metrics` DoAction.
 ///
 /// Wire shape pinned by `qiita_control_plane.actions.library.mask_metrics_data`:

@@ -149,6 +149,12 @@ class LibraryPrimitive(StrEnum):
     # fresh block it deletes 0 rows. See
     # qiita_control_plane.actions.library.delete_alignment_block.
     DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Idempotent REPLACE for the coverage feature table. DuckLake has no uniqueness, so
+    # a re-run would APPEND a second set of rows under the same coverage_idx — and the
+    # duplicate is undetectable downstream (every row is well-formed; a consumer just
+    # reads a doubled number). Runs immediately before register-files in the coverage
+    # chain. See qiita_control_plane.actions.library.delete_coverage.
+    DELETE_COVERAGE = "delete-coverage"
     # Block-compute (align): the `align` workflow's terminal step, the alignment
     # twin of reconcile-block. Marks the block completed, then finalizes each
     # covered sample's alignment_sample gate once ALL its covering blocks are done.

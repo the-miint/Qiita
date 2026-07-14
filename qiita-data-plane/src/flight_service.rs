@@ -246,6 +246,11 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_read_mask_block",
     "delete_alignment",
     "delete_alignment_block",
+    // Idempotent by construction: it deletes this (coverage_idx, prep_sample) footprint,
+    // so a replay deletes the same rows (or none). It exists BECAUSE the write is not
+    // idempotent — DuckLake has no uniqueness, so re-registering would append a duplicate
+    // set of coverage rows that no consumer could detect.
+    "delete_coverage",
     "export_read",
     "export_read_block",
     "export_read_masked_block",
@@ -566,6 +571,30 @@ impl FlightService for QiitaFlightService {
                     body: result_body.into(),
                 };
                 let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "delete_coverage" => {
+                let payload = auth::verify_delete_coverage(&action.body, &self.flight_public_key)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_coverage" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_coverage', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let result = delete_coverage(
+                    &self.catalog_connstr,
+                    &self.data_path,
+                    payload.coverage_idx,
+                    &payload.prep_sample_idx,
+                )?;
+                let output = futures::stream::once(async move {
+                    Ok(arrow_flight::Result {
+                        body: result.to_string().into_bytes().into(),
+                    })
+                });
                 Ok(Response::new(Box::pin(output)))
             }
             "delete_alignment" => {
@@ -2210,6 +2239,67 @@ fn delete_read_mask_block(
 /// future maintenance pass (matches `delete_mask`). Idempotent: deleting an
 /// `alignment_idx` with zero rows is success and returns `rows_deleted: 0`, so the
 /// control plane can safely retry. `alignment_idx` is an HMAC-verified i64.
+/// Delete this ticket's coverage footprint: the `(coverage_idx, prep_sample_idx)` rows it
+/// is about to rewrite.
+///
+/// Runs immediately before `register-files` in the coverage chain, making the write an
+/// idempotent REPLACE. Without it a re-run appends a second set of rows under the same
+/// coverage_idx — and the duplicate is undetectable downstream, because every row is
+/// individually well-formed and a consumer just reads a doubled number.
+///
+/// Scoped to the samples, not to the whole coverage_idx: a coverage_idx is the identity of
+/// the MEASUREMENT and is shared across every sample measured that way, so purging by idx
+/// alone would wipe other samples' results as a side effect of re-running one.
+fn delete_coverage(
+    catalog_connstr: &str,
+    data_path: &str,
+    coverage_idx: i64,
+    prep_sample_idx: &[i64],
+) -> Result<serde_json::Value, Status> {
+    if prep_sample_idx.is_empty() {
+        return Err(Status::invalid_argument(
+            "delete_coverage requires a non-empty prep_sample_idx list; an empty scope is a \
+             control-plane bug, not a request to delete nothing",
+        ));
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let placeholders = vec!["?"; prep_sample_idx.len()].join(", ");
+    let sql = format!(
+        "DELETE FROM qiita_lake.coverage \
+         WHERE coverage_idx = ? AND prep_sample_idx IN ({placeholders})"
+    );
+    let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(prep_sample_idx.len() + 1);
+    params.push(&coverage_idx);
+    for p in prep_sample_idx {
+        params.push(p);
+    }
+
+    let deleted = conn.execute(&sql, params.as_slice());
+    let rows_deleted = match deleted {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Status::internal(format!("delete_coverage failed: {e}")));
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit: {e}")))?;
+
+    Ok(serde_json::json!({
+        "coverage_idx": coverage_idx,
+        "prep_sample_count": prep_sample_idx.len(),
+        "rows_deleted": rows_deleted,
+    }))
+}
+
 fn delete_alignment(
     catalog_connstr: &str,
     data_path: &str,
@@ -2879,6 +2969,73 @@ mod tests {
     /// — a read with two feature_idx rows loses both), and a re-delete is an
     /// idempotent 0-row noop. The alignment twin of
     /// `delete_read_mask_block_deletes_footprint_only`.
+    /// delete_coverage removes ONLY this (coverage_idx, prep_sample) footprint.
+    ///
+    /// The two things that must both hold, and only one of which is obvious:
+    ///   * another SAMPLE under the same coverage_idx survives — a coverage_idx is the
+    ///     identity of the MEASUREMENT and is shared across every sample measured that
+    ///     way, so a whole-idx purge would silently wipe other samples' results as a
+    ///     side effect of re-running one;
+    ///   * the same sample under a DIFFERENT coverage_idx survives — re-measuring under a
+    ///     new gate must not destroy the old measurement.
+    /// Plus: a re-delete is an idempotent 0-row no-op (it is the replace half of an
+    /// idempotent write, so it runs on every attempt including the first).
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_coverage_deletes_footprint_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_coverage_tables(&conn).unwrap();
+
+        // A fixed, high idx unique to this test — the suite is serial and the rows are
+        // cleaned up below.
+        let cov: i64 = 990_001;
+        let other_cov: i64 = 990_002;
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.coverage VALUES
+                 ({cov}, 1, 10, 100, 100, 1, 1.0),
+                 ({cov}, 1, 11, 50, 100, 1, 0.5),
+                 ({cov}, 2, 10, 200, 100, 1, 2.0),
+                 ({other_cov}, 1, 10, 900, 100, 1, 9.0);"
+        ))
+        .unwrap();
+
+        // Delete sample 1 under `cov` only.
+        let out = delete_coverage(&connstr, &data_path, cov, &[1]).unwrap();
+        assert_eq!(out["rows_deleted"], 2);
+
+        let survivors: Vec<(i64, i64)> = conn
+            .prepare(&format!(
+                "SELECT coverage_idx, prep_sample_idx FROM qiita_lake.coverage
+                 WHERE coverage_idx IN ({cov}, {other_cov})
+                 ORDER BY coverage_idx, prep_sample_idx"
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![(cov, 2), (other_cov, 1)],
+            "the other SAMPLE under this coverage_idx, and this sample under a DIFFERENT \
+             coverage_idx, must both survive"
+        );
+
+        // Idempotent: the replace runs on every attempt, including a first run with
+        // nothing to delete.
+        let again = delete_coverage(&connstr, &data_path, cov, &[1]).unwrap();
+        assert_eq!(again["rows_deleted"], 0);
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.coverage WHERE coverage_idx IN ({cov}, {other_cov});"
+        ))
+        .unwrap();
+    }
+
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]

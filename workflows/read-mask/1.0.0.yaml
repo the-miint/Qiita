@@ -313,6 +313,17 @@ steps:
       mem_gb: 16
       walltime: PT2H
 
+  # Idempotent REPLACE. DuckLake has no uniqueness constraint, so re-running this ticket
+  # would APPEND a second set of coverage rows under the same coverage_idx — and the
+  # duplicate is undetectable: every row is individually well-formed, so a consumer
+  # summing or averaging them just reads a silently doubled number. Deletes exactly this
+  # (coverage_idx, prep_sample) footprint, so a first run deletes nothing. MUST run
+  # immediately before register-files.
+  - action: delete-coverage
+    when: syndna_enabled
+    inputs: []
+    outputs: []
+
   # coverage.parquet -> the DuckLake `coverage` table (basename IS the table name).
   - action: register-files
     when: syndna_enabled

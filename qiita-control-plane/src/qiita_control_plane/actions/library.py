@@ -1847,6 +1847,67 @@ async def delete_alignment_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def delete_coverage_data(
+    *,
+    coverage_idx: int,
+    prep_sample_idx: list[int],
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete this ticket's `(coverage_idx, prep_sample_idx)` coverage rows via the
+    `delete_coverage` DoAction, returning the rows-deleted count.
+
+    Scoped to the SAMPLES, never to coverage_idx alone: a coverage_idx is the identity of
+    the MEASUREMENT and is shared by every sample measured that way, so a whole-idx purge
+    would wipe other samples' results as a side effect of re-running one.
+
+    Idempotent — a first run deletes zero rows and still succeeds."""
+    token = sign_action(
+        action="delete_coverage",
+        payload={"coverage_idx": coverage_idx, "prep_sample_idx": prep_sample_idx},
+        secret=signing_key,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action, "delete_coverage", data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
+async def delete_coverage(
+    pool: asyncpg.Pool,
+    prep_sample_idx: int,
+    coverage_idx: int,
+    *,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Workflow primitive: make the coverage write an idempotent REPLACE.
+
+    Runs immediately before `register-files` in the coverage chain and deletes exactly the
+    footprint the ticket is about to re-register. Without it, DuckLake (which has no
+    uniqueness constraint) would hold BOTH the old and the new rows for this
+    (coverage_idx, prep_sample) — and nothing downstream could tell: every row is
+    individually well-formed, so a consumer summing or averaging them simply reads a
+    silently doubled number.
+
+    A first run deletes zero rows. `pool` is unused (the delete is entirely data-plane
+    side); it is accepted so the primitive matches the LIBRARY dispatch signature.
+    """
+    rows_deleted = await delete_coverage_data(
+        coverage_idx=coverage_idx,
+        prep_sample_idx=[prep_sample_idx],
+        signing_key=signing_key,
+        data_plane_url=data_plane_url,
+    )
+    return {
+        "coverage_idx": coverage_idx,
+        "prep_sample_idx": prep_sample_idx,
+        "rows_deleted": rows_deleted,
+    }
+
+
 async def _finalize_sample_metrics(
     conn: asyncpg.Connection,
     *,
@@ -2165,5 +2226,6 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
+    LibraryPrimitive.DELETE_COVERAGE: delete_coverage,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
 }
