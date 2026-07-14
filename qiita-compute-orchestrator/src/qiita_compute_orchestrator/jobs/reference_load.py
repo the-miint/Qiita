@@ -1,9 +1,9 @@
 """Native job: re-key hash_sequences' outputs to feature_idx, write the
-six DuckLake-shape staging Parquets the data plane registers.
+DuckLake-shape staging Parquets the data plane registers.
 
 Reads the upstream Parquets (manifest from hash_sequences, feature_map
 from mint-features) and emits the files `register-files` then hands to
-the data plane's DoAction. The six staging outputs are:
+the data plane's DoAction. The staging outputs are:
 
   - `reference_sequences.parquet`        (feature_idx, sequence_hash, sequence_length_bp)
   - `reference_sequence_chunks/part_*.parquet` (feature_idx, chunk_index, chunk_data)
@@ -11,6 +11,7 @@ the data plane's DoAction. The six staging outputs are:
   - `reference_taxonomy.parquet`         (if taxonomy_path is set)
   - `reference_phylogeny.parquet`        (if tree_path is set)
   - `reference_placements.parquet`       (if jplace_path is set)
+  - `reference_annotation.parquet`       (if annotation_manifest is set)
 
 `reference_sequence_chunks` is a DIRECTORY of `part_*.parquet` files
 rather than a single file — the chunks output is bin-pack-batched by
@@ -38,6 +39,16 @@ write only when the corresponding `*_path` flows through `bound` from
 the work_ticket's `action_context`. The runner injects them under
 `taxonomy_path` / `tree_path` / `jplace_path` after upload-handle
 resolution; absent uploads → absent paths → absent outputs.
+
+`annotation_manifest` / `annotation_map` are the odd pair: they are not
+uploads but STEP OUTPUTS (hash_sequences + mint-annotation-features), so
+they arrive already bound, and every reference-add workflow binds BOTH
+unconditionally — a reference with no GFF3 simply carries zero annotation
+rows through them. They are typed optional here only so a caller
+constructing `Inputs` directly (a test, a future workflow) can omit them;
+supplying one without the other is a mis-wired workflow whose only symptom
+would be a silently EMPTY `reference_annotation` table, so `execute` refuses
+it up front.
 """
 
 from __future__ import annotations
@@ -57,6 +68,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._blob_input import resolve_blob_input
 from ._feature_load import (
     build_feature_id_map,
     write_feature_sequence_chunks,
@@ -102,6 +114,8 @@ class Inputs(BaseModel):
     taxonomy_path: Path | None = None
     tree_path: Path | None = None
     jplace_path: Path | None = None
+    annotation_manifest: Path | None = None
+    annotation_map: Path | None = None
     reference_idx: int
     work_ticket_idx: int
 
@@ -118,9 +132,23 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         ("taxonomy", inputs.taxonomy_path),
         ("tree", inputs.tree_path),
         ("jplace", inputs.jplace_path),
+        ("annotation_manifest", inputs.annotation_manifest),
+        ("annotation_map", inputs.annotation_map),
     ]:
         if opt is not None and not opt.exists():
             raise FileNotFoundError(f"{label} not found: {opt}")
+
+    # hash_sequences produces the manifest and mint-annotation-features the
+    # feature-map; every workflow binds both. One without the other means the
+    # workflow is mis-wired, and the failure it would otherwise produce is a
+    # silently EMPTY reference_annotation table — so refuse up front rather than
+    # emit a well-formed, wrong result.
+    if (inputs.annotation_manifest is None) != (inputs.annotation_map is None):
+        raise ValueError(
+            "annotation_manifest and annotation_map must be supplied together; got "
+            f"annotation_manifest={inputs.annotation_manifest!r}, "
+            f"annotation_map={inputs.annotation_map!r}"
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     sequences_path = workspace / "reference_sequences.parquet"
@@ -132,12 +160,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     taxonomy_out_path = workspace / "reference_taxonomy.parquet"
     phylogeny_out_path = workspace / "reference_phylogeny.parquet"
     placements_out_path = workspace / "reference_placements.parquet"
+    annotation_out_path = workspace / "reference_annotation.parquet"
 
     sequences_out = validate_parquet_path(sequences_path)
     membership_out = validate_parquet_path(membership_path)
     taxonomy_out = validate_parquet_path(taxonomy_out_path)
     phylogeny_out = validate_parquet_path(phylogeny_out_path)
     placements_out = validate_parquet_path(placements_out_path)
+    annotation_out = validate_parquet_path(annotation_out_path)
 
     # miint is needed for `read_newick` and `read_jplace` when the
     # optional tree / jplace inputs are present. LOAD unconditionally even
@@ -187,28 +217,44 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 written.append(taxonomy_out_path)
 
             if inputs.tree_path is not None:
-                # The CLI's DoPut writes Newick / jplace as a chunked
-                # `(chunk_index, chunk_data BLOB)` Parquet so the data
-                # plane stays schema-agnostic and large blobs stream
-                # under bounded memory. miint's `read_newick` /
-                # `read_jplace` parse on-disk text/JSON files, so we
-                # stitch chunks back into a temp file here.
-                newick_path = _unwrap_chunks_to_temp_file(
+                # On the REMOTE path the CLI DoPuts Newick / jplace as a chunked
+                # `(chunk_index, chunk_data BLOB)` Parquet, so the data plane
+                # stays schema-agnostic and large blobs stream under bounded
+                # memory; miint's `read_newick` / `read_jplace` parse on-disk
+                # text/JSON, so the chunks are stitched back into a temp file.
+                # On the LOCAL path no bytes cross the wire and this is already
+                # the raw file. `resolve_blob_input` sniffs which one it got —
+                # unconditionally unwrapping would `read_parquet()` a raw `.nwk`
+                # and raise, which is what a local reference-add carrying a tree
+                # used to do.
+                newick_path = resolve_blob_input(
                     conn,
-                    parquet_path=inputs.tree_path,
+                    path=inputs.tree_path,
                     out_path=duckdb_tmp / "tree.nwk",
                 )
                 _write_phylogeny(conn, newick_path, inputs.reference_idx, phylogeny_out)
                 written.append(phylogeny_out_path)
 
             if inputs.jplace_path is not None:
-                jplace_path = _unwrap_chunks_to_temp_file(
+                jplace_path = resolve_blob_input(
                     conn,
-                    parquet_path=inputs.jplace_path,
+                    path=inputs.jplace_path,
                     out_path=duckdb_tmp / "placement.jplace",
                 )
                 _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
                 written.append(placements_out_path)
+
+            if inputs.annotation_manifest is not None and inputs.annotation_map is not None:
+                # Returns False (and writes nothing) for a reference with no
+                # annotations — the common case; see _write_annotation.
+                if _write_annotation(
+                    conn,
+                    annotation_manifest=inputs.annotation_manifest,
+                    annotation_map=inputs.annotation_map,
+                    reference_idx=inputs.reference_idx,
+                    out=annotation_out,
+                ):
+                    written.append(annotation_out_path)
 
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
@@ -221,6 +267,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 taxonomy_out_path,
                 phylogeny_out_path,
                 placements_out_path,
+                annotation_out_path,
             ):
                 partial.unlink(missing_ok=True)
             shutil.rmtree(chunks_dir, ignore_errors=True)
@@ -242,37 +289,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     return {"staging_dir": workspace, "reference_sequence_chunks": chunks_dir}
 
 
-def _unwrap_chunks_to_temp_file(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    parquet_path: Path,
-    out_path: Path,
-) -> Path:
-    """Stitch a chunked-BLOB upload Parquet back into a temp file.
-
-    Upload shape: `(chunk_index INTEGER, chunk_data BLOB)`. Writes
-    `chunk_data` to `out_path` in `chunk_index` order, fetching rows in
-    batches so we never materialise the whole BLOB in memory — important
-    for jplace inputs that can run into the GB range."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cursor = conn.execute(
-        "SELECT chunk_data FROM read_parquet(?) ORDER BY chunk_index",
-        [str(parquet_path)],
-    )
-    with out_path.open("wb") as f:
-        while True:
-            rows = cursor.fetchmany(1024)
-            if not rows:
-                break
-            for (chunk_data,) in rows:
-                if chunk_data is None:
-                    raise ValueError(f"{parquet_path} contains a NULL chunk_data")
-                f.write(bytes(chunk_data))
-    if out_path.stat().st_size == 0:
-        raise ValueError(f"{parquet_path} produced an empty file — upload was malformed")
-    return out_path
-
-
 def _write_reference_membership(
     conn: duckdb.DuckDBPyConnection,
     reference_idx: int,
@@ -290,6 +306,118 @@ def _write_reference_membership(
         "  ORDER BY feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})"
     )
+
+
+def _write_annotation(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    annotation_manifest: Path,
+    annotation_map: Path,
+    reference_idx: int,
+    out: str,
+) -> bool:
+    """Emit DuckLake's `reference_annotation` shape — one row per annotated interval.
+
+    Every identifier on the row is MINTED by the control plane and arrives via
+    `annotation_map` (the output of `mint-annotation-features`); this job resolves none
+    of them itself:
+
+      * `annotation_idx`     — the OCCURRENCE's identity, and the join back to the
+                               Postgres claim and to the annotation's semantic terms.
+      * `feature_idx`        — the interval itself (the SynDNA insert, the gene).
+      * `parent_feature_idx` — the sequence the interval sits on and that reads actually
+                               align to (the plasmid, the chromosome).
+
+    The map is joined on the annotation's NATURAL key — parent + window + type + strand —
+    reached from the manifest through `id_map` (GFF `seqid` → FASTA `read_id` →
+    feature_idx), the same bridge `_write_taxonomy` and `_write_phylogeny` use. Not on the
+    GFF3 `ID`: the spec lets a discontinuous feature repeat one ID across N lines, so it
+    is carried as provenance and joined on by nothing.
+
+    Coordinates pass through VERBATIM. They were converted from GFF3's closed
+    `[start, end]` to half-open `[position, stop_position)` exactly once, at ingest, in
+    `hash_sequences._write_annotation_manifest`. Re-deriving or "correcting" them here
+    would be a second conversion.
+
+    Unlike taxonomy's coverage checks (which warn), an unresolved row here is fatal: it
+    would emit a lake row whose `annotation_idx` or `feature_idx` is NULL, and a feature
+    table keyed on a NULL feature is not a degraded result, it is a wrong one.
+    """
+    # The zero-annotation case is the COMMON one — almost no reference carries a
+    # GFF3, but every reference-add reaches here (the manifest is bound
+    # unconditionally so the step's output binding always resolves). Emitting the
+    # file anyway would have `register-files` move a zero-row Parquet into permanent
+    # lake storage and add a DuckLake snapshot for it, on every single reference-add,
+    # forever. So write NOTHING and tell the caller: the table already exists
+    # (ensure_reference_tables creates it at data-plane boot), so a reference with no
+    # annotations is correctly represented by having no rows, not by an empty file.
+    if (
+        conn.execute("SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest)]).fetchone()[
+            0
+        ]
+        == 0
+    ):
+        return False
+
+    conn.execute(
+        "CREATE TEMP TABLE annotation_map AS SELECT * FROM read_parquet(?)",
+        [str(annotation_map)],
+    )
+    conn.execute(
+        "CREATE TEMP TABLE annotation_manifest AS SELECT * FROM read_parquet(?)",
+        [str(annotation_manifest)],
+    )
+
+    # The natural-key join, single-sourced so the check below and the COPY cannot drift
+    # apart — an unresolved row must be REJECTED here, not silently dropped by the COPY's
+    # inner join.
+    natural_key_join = (
+        "JOIN id_map im ON im.read_id = am.parent_read_id "
+        "{kind} JOIN annotation_map map "
+        "  ON map.parent_feature_idx = im.feature_idx "
+        " AND map.position = am.position "
+        " AND map.stop_position = am.stop_position "
+        " AND map.annotation_type = am.annotation_type "
+        " AND map.strand = am.strand "
+    )
+
+    unresolved = conn.execute(
+        "SELECT am.parent_read_id, am.annotation_type, am.position, am.stop_position "
+        "FROM annotation_manifest am "
+        "LEFT " + natural_key_join.format(kind="LEFT") + "WHERE map.annotation_idx IS NULL "
+        "ORDER BY am.parent_read_id, am.position LIMIT 5"
+    ).fetchall()
+    if unresolved:
+        raise ValueError(
+            "annotation rows with no minted annotation_idx (the annotation map is "
+            "incomplete — mint-annotation-features and this load disagree about the "
+            "natural key): "
+            + ", ".join(f"{t} on {p!r} [{pos}, {stop})" for p, t, pos, stop in unresolved)
+        )
+
+    conn.execute(
+        "COPY ("
+        "  SELECT map.annotation_idx, "
+        f"         CAST({reference_idx} AS BIGINT) AS reference_idx, "
+        "         map.feature_idx, "
+        "         map.parent_feature_idx, "
+        "         am.annotation_id, "
+        "         am.source, "
+        "         am.annotation_type, "
+        "         am.position, "
+        "         am.stop_position, "
+        "         am.strand, "
+        "         am.score, "
+        "         am.phase, "
+        "         am.attributes "
+        "  FROM annotation_manifest am "
+        + natural_key_join.format(kind="")
+        + "  ORDER BY map.parent_feature_idx, am.position, am.stop_position"
+        f") TO '{out}' ({PARQUET_OPTS})"
+    )
+    conn.execute("DROP TABLE annotation_manifest")
+    conn.execute("DROP TABLE annotation_map")
+    return True
 
 
 def _warn_taxonomy_anomaly(

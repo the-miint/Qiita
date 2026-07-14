@@ -14,6 +14,39 @@ This step reads that chunked upload and produces:
     read_id to canonical sequence_hash. When multiple reads collapse to
     the same canonical hash (a read + its reverse complement), only one
     read's chunks survive — the lex-smallest read_id, deterministically.
+  - `annotation_manifest.parquet` — ONLY when an optional `gff_path` is
+    supplied. One row per annotated interval, carrying the canonical hash
+    of the sub-sequence that interval cuts out of its parent, so the
+    interval can be minted a `feature_idx` of its own. See
+    `_write_annotation_manifest` for the shape and the coordinate
+    conversion.
+
+**Why annotations are hashed HERE.** An annotated interval (a SynDNA insert
+on its plasmid, a gene on a chromosome) is quantified as a feature in its own
+right, so it needs a `feature_idx` — and `feature_idx` is minted from a
+canonical sequence hash. This step is the one place that already holds both
+the assembled parent sequences and the hashing machinery, so cutting the
+interval out and hashing it is the same job it already does, not a new one.
+The extracted bytes are deliberately NOT stored (no `reference_sequences` /
+`reference_sequence_chunks` row): they are recoverable from the parent plus
+the interval, and a second copy could drift from the first.
+
+**Why the annotation output is unconditional rather than `when:`-gated.** A
+step's declared `outputs:` are bound unconditionally, so an output that is
+sometimes absent raises a KeyError rather than simply not binding — the
+annotation manifest is therefore emitted on every run, zero rows and all.
+
+A `when:` gate *was* available (`when:` is default-ON, but the runner's
+`bound.setdefault(...)` idiom supplies a default-OFF anchor, exactly as the
+router-build gate does), so this is a choice, not a workaround. It is made for
+two reasons: the downstream entries stay unconditional, so there is no
+conditional register path to reason about; and nothing extra is scheduled
+either way — `hash_sequences` and `load` already run, and
+`mint-annotation-features` is an in-process control-plane action, not a SLURM
+job. The zero-row *file* costs nothing because the two consumers both short out
+on an empty manifest: `mint_annotation_features` early-returns on a footer-only
+`count(*)`, and `reference_load` writes no `reference_annotation.parquet` at all
+(so a no-GFF reference adds no lake file and no DuckLake snapshot).
 
 **Canonical hashing.** A sequence and its reverse complement describe
 the same molecular entity. We compute md5 on BOTH strands and store the
@@ -42,6 +75,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import duckdb
 from pydantic import BaseModel
 from qiita_common.chunking import canonical_sequence_hash_expr, reassemble_chunks_expr
 from qiita_common.parquet import validate_parquet_path
@@ -54,8 +88,35 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._blob_input import resolve_blob_input
+from ._feature_load import bin_pack_by_chunks
 
 YAML_STEP_NAME = "hash_sequences"
+
+# GFF3 LANDMARK types: rows that declare the extent of the sequence itself rather than
+# annotate an interval of it. NCBI ships one `region` line per record, and every one of
+# them spans its parent end to end — so they extract the parent's own bytes, hash to the
+# PARENT's feature_idx, and are not annotated features at all. Dropped at ingest.
+#
+# These are the SO terms GFF3 sanctions as landmarks; matched case-insensitively.
+_GFF_LANDMARK_TYPES = frozenset(
+    {
+        "region",
+        "chromosome",
+        "contig",
+        "scaffold",
+        "supercontig",
+        "sequence_assembly",
+        "biological_region",
+    }
+)
+
+
+def _sql_string(value: str) -> str:
+    """Quote a Python string as a SQL string LITERAL."""
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
 
 # DuckDB resource caps for this step. With the read_id-batched
 # pipeline below, peak memory per batch ≈ batch_size × avg record
@@ -71,22 +132,6 @@ YAML_STEP_NAME = "hash_sequences"
 _DUCKDB_MEMORY_GB = 24
 _DUCKDB_THREADS = 8
 
-# Per-batch chunk budget for the aggregation pass below. Sized so the
-# string_agg HASH_AGG state for one batch (which buffers every
-# in-flight group's chunks until the group finalises) stays well
-# below `_DUCKDB_MEMORY_GB`. 50K chunks × 64 KB/chunk = 3.2 GB max
-# uncompressed per batch.
-#
-# Batching by chunk count (not read count) is load-bearing because
-# read sizes vary by 3+ orders of magnitude on GG2 backbone: ~95% of
-# reads are 1-chunk 16S amplicons (~1.5 KB) and a tail of genomes
-# reach 327 chunks (~21 MB). Read_id-count batching (e.g., 50K reads
-# per batch) puts ~661K chunks / ~40 GB into the first alphabetical
-# batch (G0/G9 prefixes are genomes; they cluster at the front of a
-# sort), OOMing even a 24 GB DuckDB cap. Chunk-count batching
-# distributes the genome tail across many batches by bin-packing.
-_CHUNK_BUDGET_PER_BATCH = 50_000
-
 
 class Inputs(BaseModel):
     """Typed input contract for hash_sequences.
@@ -100,6 +145,11 @@ class Inputs(BaseModel):
     the runner's `{prefix}_upload_idx → {prefix}_path` convention
     requires the role name to live on the model.
 
+    `gff_path` is optional and follows the same `*_upload_idx → *_path`
+    convention on the remote path; on the local path the runner passes the
+    raw absolute path straight through. `resolve_blob_input` accepts either
+    shape. Absent → no `annotation_manifest` output.
+
     `reference_idx` and `work_ticket_idx` are framework-injected scope
     scalars merged by `flatten_native_inputs`. Both are accepted (typed)
     even though this step doesn't consume them — declaring them on the
@@ -110,6 +160,7 @@ class Inputs(BaseModel):
     """
 
     fasta_path: Path
+    gff_path: Path | None = None
     reference_idx: int
     work_ticket_idx: int
 
@@ -126,6 +177,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     manifest_path = workspace / "manifest.parquet"
+    annotation_manifest_path = workspace / "annotation_manifest.parquet"
     # reference_sequence_chunks is a DIRECTORY of part_*.parquet files
     # rather than a single file — the consumer contract is
     # `read_parquet(dir/part_*.parquet)`. The relabel below writes one
@@ -153,12 +205,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # exceeds any reasonable DuckDB cap. We batch by chunk-count
             # budget: Python first collects (read_id, n_chunks) for every
             # read (cheap count(*) aggregate, ~10 MB transfer), bin-packs
-            # reads into batches each totalling ≤ _CHUNK_BUDGET_PER_BATCH
+            # reads into batches each totalling ≤ CHUNK_BUDGET_PER_BATCH
             # chunks, and each batch's string_agg + native md5 runs
             # inside DuckDB. DuckDB still does the heavy lifting (native
             # md5, parallel string_agg); Python only carries the small
             # read-list metadata. Per-batch HASH_AGG state is bounded by
-            # _CHUNK_BUDGET_PER_BATCH × chunk_size (~3.2 GB).
+            # CHUNK_BUDGET_PER_BATCH × chunk_size (~3.2 GB).
             #
             # The full Parquet is re-scanned per batch (DuckDB can't
             # prune row-groups since the upload Parquet is single-RG by
@@ -174,18 +226,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [str(inputs.fasta_path)],
             ).fetchall()
 
-            batches: list[list[str]] = []
-            current_batch: list[str] = []
-            current_chunks = 0
-            for read_id, n_chunks in chunks_per_read:
-                if current_batch and current_chunks + n_chunks > _CHUNK_BUDGET_PER_BATCH:
-                    batches.append(current_batch)
-                    current_batch = []
-                    current_chunks = 0
-                current_batch.append(read_id)
-                current_chunks += n_chunks
-            if current_batch:
-                batches.append(current_batch)
+            batches = bin_pack_by_chunks(chunks_per_read)
 
             conn.execute(
                 "CREATE TEMP TABLE hashed ("
@@ -280,6 +321,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [str(inputs.fasta_path)],
             )
 
+            gff_file = (
+                resolve_blob_input(
+                    conn, path=inputs.gff_path, out_path=duckdb_tmp / "annotations.gff3"
+                )
+                if inputs.gff_path is not None
+                else None
+            )
+            _write_annotation_manifest(
+                conn,
+                gff_path=gff_file,
+                fasta_path=inputs.fasta_path,
+                chunks_per_read=chunks_per_read,
+                tmp_dir=duckdb_tmp,
+                out=validate_parquet_path(annotation_manifest_path),
+            )
+
             conn.execute("DROP TABLE hashed")
         success = True
     finally:
@@ -290,9 +347,294 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # fresh attempt-N+1 workspace on retry so it doesn't cascade.
         if not success:
             manifest_path.unlink(missing_ok=True)
+            annotation_manifest_path.unlink(missing_ok=True)
             shutil.rmtree(reference_sequence_chunks_dir, ignore_errors=True)
 
     return {
         "manifest": manifest_path,
         "reference_sequence_chunks": reference_sequence_chunks_dir,
+        # ALWAYS bound — zero rows when no GFF was supplied. A step's declared
+        # outputs are bound unconditionally, so a sometimes-present output is a
+        # KeyError, not an absent binding. Emitting a zero-row file rather than
+        # gating the downstream entries on a `when:` boolean is deliberate — see
+        # the module docstring.
+        "annotation_manifest": annotation_manifest_path,
     }
+
+
+def _write_annotation_manifest(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    gff_path: Path | None,
+    fasta_path: Path,
+    chunks_per_read: list[tuple[str, int]],
+    tmp_dir: Path,
+    out: str,
+) -> None:
+    """Parse a GFF3 into the annotation manifest: one row per annotated interval,
+    carrying the canonical hash of the EXTRACTED sub-sequence so
+    `mint-annotation-features` can mint it a feature_idx of its own.
+
+    Emitted shape (the two hashes are what the control plane joins on; the rest ride
+    along for `reference_load`):
+
+        sequence_hash        UUID     -- canonical hash of the EXTRACTED interval;
+                                         mints the interval's own feature_idx
+        parent_sequence_hash UUID     -- canonical hash of the PARENT; resolves
+                                         parent_feature_idx without a VARCHAR join
+        parent_read_id       VARCHAR  -- GFF seqid == parent FASTA read_id. Provenance
+                                         and error messages only — nothing keys on it.
+        annotation_id        VARCHAR  -- GFF3 `ID`. NULLABLE, and NOT unique. Provenance.
+        source               VARCHAR  -- GFF3 column 2 (the annotating tool/authority)
+        annotation_type      VARCHAR  -- GFF3 column 3
+        position             BIGINT   -- 1-based INCLUSIVE  (unchanged from GFF)
+        stop_position        BIGINT   -- 1-based EXCLUSIVE  (GFF stop + 1)
+        strand               VARCHAR  -- '+' / '-' / '.' / '?' — never NULL
+        score                DOUBLE   -- GFF3 column 6, NULLABLE
+        phase                SMALLINT -- GFF3 column 8, NULLABLE (CDS rows only)
+        attributes           MAP(VARCHAR, VARCHAR)
+
+    **`annotation_id` is provenance, not identity.** It is neither unique nor
+    required. GFF3 permits a DISCONTINUOUS feature (a ribosomal-slippage CDS) to
+    span several lines that all carry the SAME `ID` — NCBI's RefSeq annotation of
+    E. coli K-12 MG1655 has 20 such repeats, so keying on it rejects the single most
+    standard bacterial annotation there is. The row's identity is a BIGINT
+    `annotation_idx` minted by the control plane against the NATURAL key below;
+    nothing joins on the GFF3 string.
+
+    The natural key is `(parent, position, stop_position, annotation_type, strand)`,
+    and the manifest is deduplicated on it here so that a GFF3 repeating a line
+    verbatim cannot produce two lake rows sharing one minted `annotation_idx`.
+
+    **The closed → half-open conversion happens HERE and nowhere else.** `read_gff`
+    emits GFF3's 1-based CLOSED `[start, end]`; every alignment-side consumer
+    (`alignment_slice`, `read_alignments`, `qiita_lake.alignment`) speaks 1-based
+    HALF-OPEN `[start, stop)`. Both call the column `stop_position`, so nothing
+    type-checks the difference and nothing raises — the only symptom of getting it
+    wrong is that the interval's last base silently stops being counted. Converting
+    once, at ingest, means no downstream consumer ever has to remember.
+
+    Extraction is strand-agnostic ON PURPOSE. A `-` strand annotation is NOT
+    reverse-complemented before hashing, because `canonical_sequence_hash_expr`
+    already hashes both strands and keeps the lex-smaller — so a feature and its
+    reverse complement mint the SAME feature_idx. Revcomping first would be a no-op.
+
+    `gff_path=None` (the no-GFF reference, which is most of them) is handled by
+    pointing `read_gff` at a HEADER-ONLY GFF3. That is a real, zero-row GFF source,
+    so the empty file is produced by the SAME projection as the populated one and
+    cannot acquire a divergent schema — the alternative, a hand-declared empty
+    table, is a second schema declaration that drifts the moment `read_gff`'s column
+    types change.
+
+    **Two classes of row are dropped before anything else looks at them**, and both
+    are the common case rather than a corner one:
+
+    `read_gff` does not stop at a `##FASTA` directive — it keeps going and returns
+    one row per line of the embedded FASTA, with the sequence line itself in `seqid`
+    and NULL in every other column. prokka and bakta both ALWAYS append the genome
+    that way, so on a real prokka GFF3 `read_gff` returns 1638 rows for 99 features.
+    Those rows are identified by a NULL `type` (a GFF3 feature line cannot have one)
+    and dropped. Without the filter they reach the parent check and the ingest dies
+    complaining that a line of nucleotides is not a sequence in the FASTA.
+
+    GFF3 LANDMARK rows (`region`, `chromosome`, `contig`, ...) declare the extent of
+    the sequence itself rather than annotating an interval of it, and NCBI ships one
+    per record. They necessarily span their whole parent, so they would hash to the
+    PARENT's feature_idx — a feature that IS in reference_membership and IS indexed —
+    quietly falsifying the invariant the annotation design rests on. They are dropped
+    by type. A row of any OTHER type that spans its entire parent is not a landmark,
+    it is ambiguous, and it still raises.
+    """
+    if gff_path is None:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        gff_path = tmp_dir / "_no_annotations.gff3"
+        gff_path.write_text("##gff-version 3\n")
+
+    # read_gff's `attributes` is already a MAP(VARCHAR,VARCHAR) — no parsing.
+    #
+    # The projection is split across two levels deliberately: the inner query names
+    # read_gff's raw columns, so the outer one cannot silently read whichever
+    # `stop_position` the binder resolved — base column or half-open alias.
+    #
+    # `strand` is coalesced to GFF3's own "unstranded" value rather than left NULL,
+    # which keeps it out of the NULLS-DISTINCT semantics of the natural-key UNIQUE
+    # constraint the control plane upserts against.
+    conn.execute(
+        "CREATE TEMP TABLE annotation AS "
+        "SELECT "
+        "  g.attributes['ID'] AS annotation_id, "
+        "  g.seqid AS parent_read_id, "
+        "  g.source, "
+        "  g.annotation_type, "
+        "  coalesce(g.strand, '.') AS strand, "
+        "  CAST(g.gff_start AS BIGINT) AS position, "
+        # THE conversion. GFF3's stop is INCLUSIVE; we store EXCLUSIVE.
+        "  CAST(g.gff_stop_closed AS BIGINT) + 1 AS stop_position, "
+        "  g.score, "
+        "  CAST(g.phase AS SMALLINT) AS phase, "
+        "  g.attributes "
+        "FROM ("
+        "  SELECT seqid, source, type AS annotation_type, strand, score, phase, attributes,"
+        "         position AS gff_start, stop_position AS gff_stop_closed"
+        "  FROM read_gff(?)"
+        # The ##FASTA rows. A GFF3 feature line always has a type; read_gff's
+        # embedded-FASTA rows never do. See the docstring.
+        "  WHERE type IS NOT NULL"
+        # The landmark rows (NCBI ships one per record). Not annotations.
+        #
+        # The literals are quoted for SQL, not via Python's repr() — repr switches to
+        # double quotes the moment a value contains an apostrophe, and a double-quoted
+        # string is an IDENTIFIER in SQL, not a literal.
+        "    AND lower(type) NOT IN "
+        f"        ({', '.join(_sql_string(t) for t in sorted(_GFF_LANDMARK_TYPES))})"
+        ") g",
+        [str(gff_path)],
+    )
+
+    # A seqid must name a sequence we actually hashed, or the annotation has no
+    # parent to be an interval OF.
+    orphans = conn.execute(
+        "SELECT DISTINCT a.parent_read_id FROM annotation a "
+        "LEFT JOIN hashed h ON h.read_id = a.parent_read_id "
+        "WHERE h.read_id IS NULL ORDER BY 1 LIMIT 5"
+    ).fetchall()
+    if orphans:
+        raise ValueError(
+            f"{gff_path} references seqid(s) absent from the FASTA: "
+            + ", ".join(repr(o[0]) for o in orphans)
+        )
+
+    # The interval must lie inside its parent. `stop_position` is exclusive here, so
+    # the legal range is 1 <= position < stop_position <= length + 1.
+    bad = conn.execute(
+        "SELECT a.annotation_id, a.parent_read_id, a.position, a.stop_position, "
+        "       h.sequence_length_bp "
+        "FROM annotation a JOIN hashed h ON h.read_id = a.parent_read_id "
+        "WHERE a.position < 1 "
+        "   OR a.stop_position <= a.position "
+        "   OR a.stop_position > h.sequence_length_bp + 1 "
+        "ORDER BY a.annotation_id LIMIT 5"
+    ).fetchall()
+    if bad:
+        detail = ", ".join(
+            f"{aid!r} on {parent!r} [{pos}, {stop}) vs parent length {plen}"
+            for aid, parent, pos, stop, plen in bad
+        )
+        raise ValueError(f"{gff_path} has interval(s) outside their parent sequence: {detail}")
+
+    # An interval spanning its ENTIRE parent is not a sub-interval — the extracted
+    # bytes ARE the parent's bytes, so it canonically hashes to the PARENT's
+    # feature_idx. The resulting row would have feature_idx == parent_feature_idx,
+    # pointing at a feature that IS in reference_membership and IS indexed — quietly
+    # falsifying the invariant the whole annotation design rests on, with nothing
+    # raised.
+    #
+    # The rows that legitimately do this — GFF3 LANDMARKS, which NCBI ships one of per
+    # record — have already been dropped by type in the projection above, because a
+    # landmark declares the sequence rather than annotating an interval of it. Anything
+    # ELSE that spans its whole parent is not a landmark and not a sub-interval, and we
+    # have no basis for guessing which the author meant. Raise.
+    whole = conn.execute(
+        "SELECT a.annotation_id, a.annotation_type, a.parent_read_id, h.sequence_length_bp "
+        "FROM annotation a JOIN hashed h ON h.read_id = a.parent_read_id "
+        "WHERE a.position = 1 AND a.stop_position = h.sequence_length_bp + 1 "
+        "ORDER BY a.annotation_type, a.annotation_id LIMIT 5"
+    ).fetchall()
+    if whole:
+        detail = ", ".join(
+            f"{aid!r} ({atype}) spans all {plen} bp of {p!r}" for aid, atype, p, plen in whole
+        )
+        raise ValueError(
+            f"{gff_path} has non-landmark interval(s) spanning their ENTIRE parent "
+            f"sequence: {detail}. Such an interval hashes to its parent's own "
+            "feature_idx, so it is not a distinct annotated feature. GFF3 landmark "
+            f"types ({', '.join(sorted(_GFF_LANDMARK_TYPES))}) are dropped "
+            "automatically; drop these rows, or give them a real sub-interval."
+        )
+
+    # Reassemble only the ANNOTATED parents, batched by the same chunk budget the
+    # main hashing pass uses. A plasmid map annotates a handful of sequences, but the
+    # `--gff` contract also advertises a genome's gene coordinates, where the parents
+    # are chromosomes — one unbatched string_agg over those is exactly the HASH_AGG
+    # blow-up `CHUNK_BUDGET_PER_BATCH` exists to prevent.
+    annotated_parents = {
+        r[0] for r in conn.execute("SELECT DISTINCT parent_read_id FROM annotation").fetchall()
+    }
+    conn.execute("CREATE TEMP TABLE parent_sequence (read_id VARCHAR, sequence VARCHAR)")
+    for batch in bin_pack_by_chunks(
+        [(rid, n) for rid, n in chunks_per_read if rid in annotated_parents]
+    ):
+        conn.execute(
+            "INSERT INTO parent_sequence "
+            "SELECT c.read_id, "
+            f"       {reassemble_chunks_expr('c.')} AS sequence "
+            "FROM read_parquet(?) c "
+            "WHERE c.read_id = ANY(?) "
+            "GROUP BY c.read_id",
+            [str(fasta_path), batch],
+        )
+
+    # Cut each interval out of its parent and hash it ONCE, here — both the COPY and
+    # any future consumer read the stored column rather than re-evaluating the
+    # expression (which is 2 md5 + a reverse-complement per row).
+    #
+    # NOTE: two annotations with IDENTICAL bases legitimately collapse to ONE
+    # sequence_hash, hence one feature_idx. That is not an error and must not be
+    # rejected: a bacterial genome carries the 16S rRNA gene in 5-7 byte-identical
+    # copies, so refusing it would make `--gff` unusable on essentially every real
+    # bacterial genome — while working fine on the SynDNA plasmids that motivated
+    # this code. A feature is a SEQUENCE; an annotation is an OCCURRENCE of that
+    # sequence at a place. The occurrences stay distinct because they are minted an
+    # annotation_idx keyed on the natural key (see the reference_annotation migration);
+    # a consumer aggregating coverage over the feature sums across them.
+    #
+    # The extracted bases are hashed and DISCARDED — only the hash is stored. Keeping the
+    # cut sequence too would materialize the whole annotated portion of the reference a
+    # second time (on a genome GFF3 that is every coding base), and nothing reads it: the
+    # interval's bytes are recoverable from parent + window, which is the same reason
+    # annotated features get no reference_sequences row.
+    cut = "substr(p.sequence, a.position, a.stop_position - a.position)"
+    conn.execute(
+        "CREATE TEMP TABLE annotation_extracted AS "
+        f"SELECT a.*, {canonical_sequence_hash_expr(cut)} AS sequence_hash "
+        "FROM annotation a JOIN parent_sequence p ON p.read_id = a.parent_read_id"
+    )
+
+    # `parent_sequence_hash` rather than the parent's length: the control plane's job
+    # here is to resolve parent_feature_idx, and the hash is the key that mint-features'
+    # map is already keyed by, so carrying it turns a VARCHAR read_id join into a
+    # fixed-width UUID one. The interval's own length is NOT carried — it is
+    # `stop_position - position`, and a stored copy could only disagree with the
+    # coordinates it was derived from.
+    # The dedup partitions on the parent's HASH, not its read_id, because the hash is what
+    # the control plane's conflict key is derived from: two FASTA records with identical
+    # bases under different names canonically hash to one sequence_hash and therefore mint
+    # ONE parent feature_idx. Annotating the same interval on both would then hand the
+    # natural-key UPSERT two rows with one conflict key — a Postgres cardinality_violation,
+    # not a duplicate row. Partitioning on read_id would let exactly that through.
+    conn.execute(
+        "COPY ("
+        "  SELECT a.sequence_hash, "
+        "         h.sequence_hash AS parent_sequence_hash, "
+        "         a.parent_read_id, "
+        "         a.annotation_id, "
+        "         a.source, "
+        "         a.annotation_type, "
+        "         a.position, a.stop_position, a.strand, "
+        "         a.score, a.phase, "
+        "         a.attributes "
+        "  FROM annotation_extracted a "
+        "  JOIN hashed h ON h.read_id = a.parent_read_id "
+        "  QUALIFY row_number() OVER ("
+        "    PARTITION BY h.sequence_hash, a.position, a.stop_position,"
+        "                 a.annotation_type, a.strand"
+        "    ORDER BY a.annotation_id, a.parent_read_id"
+        "  ) = 1 "
+        # Genomic order — this file is small (one row per annotated interval) and no
+        # consumer keys on the order; it is for the human who opens it.
+        "  ORDER BY a.parent_read_id, a.position, a.stop_position"
+        f") TO '{out}' ({PARQUET_OPTS})"
+    )
+    conn.execute("DROP TABLE annotation_extracted")
+    conn.execute("DROP TABLE parent_sequence")
+    conn.execute("DROP TABLE annotation")

@@ -98,6 +98,7 @@ async def _run_reference_load(
         tree_path=args.tree,
         jplace_path=args.jplace,
         genome_map_path=args.genome_map,
+        gff_path=args.gff,
         build_rype=not args.no_rype_index,
         build_minimap2=not args.no_minimap2_index,
         build_bowtie2=not args.no_bowtie2_index,

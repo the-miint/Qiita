@@ -23,14 +23,44 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS, PARQUET_OPTS_CHUNKED
 
-# Per-batch chunk budget for `write_feature_sequence_chunks`. Same
-# rationale as hash_sequences: each batch's in-memory sort is bounded
-# by `_CHUNK_BUDGET_PER_BATCH × chunk_size` (~3.2 GB at 64 KB chunks).
-# Bin-packing by chunk-count (not feature-count) is load-bearing on
-# GG2 backbone where feature sizes span 3+ orders of magnitude;
-# feature-count batching would concentrate the genome tail into the
-# first batch and OOM even the 31 GB cap.
-_CHUNK_BUDGET_PER_BATCH = 50_000
+# Per-batch chunk budget, shared by every pass that reassembles or rewrites
+# chunked sequence data (`write_feature_sequence_chunks` here; the hashing pass and
+# the annotated-parent reassembly in `hash_sequences`). Each batch's in-memory state
+# is bounded by `CHUNK_BUDGET_PER_BATCH × chunk_size` (~3.2 GB at 64 KB chunks).
+#
+# One knob, deliberately: these passes all fail the same way (an unbounded
+# `string_agg` / sort over the whole corpus), so a tuning change that fixes one and
+# not the others is not a fix.
+CHUNK_BUDGET_PER_BATCH = 50_000
+
+
+def bin_pack_by_chunks[K](items: list[tuple[K, int]]) -> list[list[K]]:
+    """Bin-pack `(key, n_chunks)` into batches of at most `CHUNK_BUDGET_PER_BATCH`
+    chunks each, preserving input order.
+
+    Batching by CHUNK count rather than by item count is the load-bearing part. On a
+    GG2-scale reference, sequence sizes span 3+ orders of magnitude (~95% are
+    single-chunk 16S amplicons, with a tail of genomes at ~327 chunks each), so
+    item-count batching drops the entire genome tail into whichever batch it sorts
+    into and OOMs even a 31 GB cap. Bin-packing spreads it.
+
+    Generic in the key because the callers batch on different ones — `read_id` for
+    the upload-side passes, `sequence_hash` for the feature-keyed rewrite — while the
+    packing rule and the budget must stay identical.
+    """
+    batches: list[list[K]] = []
+    current_batch: list[K] = []
+    current_chunks = 0
+    for key, n_chunks in items:
+        if current_batch and current_chunks + n_chunks > CHUNK_BUDGET_PER_BATCH:
+            batches.append(current_batch)
+            current_batch = []
+            current_chunks = 0
+        current_batch.append(key)
+        current_chunks += n_chunks
+    if current_batch:
+        batches.append(current_batch)
+    return batches
 
 
 def build_feature_id_map(
@@ -118,7 +148,7 @@ def write_feature_sequence_chunks(
     miint-localdocs/sequence-chunking-assessment.md for the benchmark.
 
     **Batched shape.** Bin-pack features by chunk count into batches
-    of ≤ `_CHUNK_BUDGET_PER_BATCH` chunks (~3.2 GB raw per batch),
+    of ≤ `CHUNK_BUDGET_PER_BATCH` chunks (~3.2 GB raw per batch),
     write each batch as its own `part_NNNNN.parquet` with an internal
     `ORDER BY (feature_idx, chunk_index)`. Batches walk feature_idx
     in ascending order, so the parts collectively form one globally-
@@ -137,7 +167,7 @@ def write_feature_sequence_chunks(
     by `WHERE rc.sequence_hash = ANY(?)` (applied during the Parquet scan
     via late materialisation). Scan dominates per-batch wall time, so the
     number of batches matters more than per-batch size — the bin-pack
-    keeps it to one batch per ~`_CHUNK_BUDGET_PER_BATCH` chunks."""
+    keeps it to one batch per ~`CHUNK_BUDGET_PER_BATCH` chunks."""
     parts_glob = str(reference_sequence_chunks_path / "part_*.parquet")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -161,18 +191,9 @@ def write_feature_sequence_chunks(
     # Bin-pack in feature_idx order so output parts collectively form
     # a feature_idx-sorted dataset (each part is internally sorted by
     # feature_idx; batches walk feature_idx ascending).
-    batches: list[list[str]] = []
-    current_batch: list[str] = []
-    current_chunks = 0
-    for _feature_idx, sequence_hash, n_chunks in rows:
-        if current_batch and current_chunks + n_chunks > _CHUNK_BUDGET_PER_BATCH:
-            batches.append(current_batch)
-            current_batch = []
-            current_chunks = 0
-        current_batch.append(str(sequence_hash))
-        current_chunks += n_chunks
-    if current_batch:
-        batches.append(current_batch)
+    batches = bin_pack_by_chunks(
+        [(str(sequence_hash), n_chunks) for _feature_idx, sequence_hash, n_chunks in rows]
+    )
 
     if batches:
         for i, batch_hashes in enumerate(batches):
@@ -208,7 +229,7 @@ def write_feature_sequence_chunks(
                 [batch_hashes, parts_glob, batch_hashes],
             )
             # Phase 2 — sort THIS part in isolation and write it. The sort sees
-            # only the materialised batch (≤ _CHUNK_BUDGET_PER_BATCH chunks),
+            # only the materialised batch (≤ CHUNK_BUDGET_PER_BATCH chunks),
             # never the 30 GB glob, so it fits the cap (spilling if needed). The
             # per-part `ORDER BY feature_idx` clusters row groups so a
             # `WHERE feature_idx IN (...)` DoGet prunes row groups WITHIN a part;

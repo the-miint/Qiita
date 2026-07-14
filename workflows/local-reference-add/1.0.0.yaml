@@ -67,6 +67,12 @@ context_schema:
       shard_index: {const: true}
       build_minimap2: {const: false}
       build_bowtie2: {const: false}
+    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
+    # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
+    # is minted its OWN feature_idx so it can key a feature table while reads align to
+    # its parent. Contract + the closed->half-open coordinate conversion:
+    # qiita_compute_orchestrator.jobs.hash_sequences.
+    gff_path: {type: string, pattern: "^/"}
 
 success_status: active
 failure_status: failed
@@ -95,7 +101,11 @@ steps:
     module: qiita_compute_orchestrator.jobs.hash_sequences
     target_status: hashing
     inputs: [fasta_path]
-    outputs: [manifest, reference_sequence_chunks]
+    # Optional GFF3 of annotated intervals. Absent → a ZERO-ROW annotation_manifest
+    # rather than an absent output; see the hash_sequences module docstring for why
+    # that beats a `when:` gate (short version: `when:` is default-ON).
+    optional_inputs: [gff_path]
+    outputs: [manifest, reference_sequence_chunks, annotation_manifest]
     baseline_resources:
       cpu: 8
       mem_gb: 32
@@ -106,6 +116,16 @@ steps:
     inputs: [manifest]
     outputs: [feature_map]
 
+  # Mint a feature_idx for each ANNOTATED INTERVAL, and record the reference's claim
+  # on it in qiita.reference_annotation. Deliberately NOT followed by
+  # write-membership — membership is what gets INDEXED, and an interval is
+  # quantified, not aligned against. `manifest` + `feature_map` are the SEQUENCE
+  # side's, read only to resolve each interval's parent_feature_idx.
+  # See qiita_control_plane.actions.library.mint_annotation_features.
+  - action: mint-annotation-features
+    inputs: [annotation_manifest, feature_map]
+    outputs: [annotation_map]
+
   - action: write-membership
     inputs: [feature_map]
     outputs: []
@@ -114,7 +134,8 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
-    inputs: [manifest, feature_map, reference_sequence_chunks]
+    inputs: [manifest, feature_map, reference_sequence_chunks,
+             annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     baseline_resources:
