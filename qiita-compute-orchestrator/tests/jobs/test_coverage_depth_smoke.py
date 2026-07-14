@@ -28,6 +28,8 @@ import pytest
 from qiita_compute_orchestrator.jobs._coverage import (
     DEPTH_MODE_EXCLUDE_DELETIONS,
     DEPTH_MODE_INCLUDE_DELETIONS,
+    MIN_ALIGNED_FRACTION,
+    MIN_IDENTITY,
     compute_feature_depth,
 )
 from qiita_compute_orchestrator.miint import open_miint_conn
@@ -38,8 +40,6 @@ INSERT_START = 7_360  # 1-based inclusive
 INSERT_STOP = 9_907  # 1-based EXCLUSIVE (half-open, as reference_annotation stores it)
 INSERT_LEN = INSERT_STOP - INSERT_START  # 2547
 
-MIN_IDENTITY = 0.95
-MIN_ALIGNED_FRACTION = 0.90
 
 PARENT_FEATURE_IDX = 100  # the plasmid
 INSERT_FEATURE_IDX = 200  # the insert (its own feature — an interval of the plasmid)

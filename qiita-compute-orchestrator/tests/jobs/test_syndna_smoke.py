@@ -7,7 +7,7 @@ Builds a real `.mmi` from two synthetic spike-in inserts and runs the actual
     `qiita reference load --host --no-rype-index --minimap2-preset map-hifi`)
     identifies spike-in reads;
   - **the identity threshold is load-bearing.** A read that ALIGNS to a spike-in but
-    below `_MIN_IDENTITY` is NOT a spike-in. This is the whole reason syndna does not
+    below `MIN_IDENTITY` is NOT a spike-in. This is the whole reason syndna does not
     just reuse host_filter's "any alignment = hit" rule: a spike-in call is a claim
     about a read's ORIGIN, and a false positive silently removes a genuine biological
     read from `biological`. Without this case the threshold could be deleted and every
@@ -153,7 +153,7 @@ def test_syndna_smoke_marks_spikeins_from_a_real_minimap2_index(tmp_path):
 def test_syndna_smoke_low_identity_alignment_is_not_a_spikein(tmp_path):
     """THE threshold test. `_READ_FAR_A` aligns to spike-in A (so host_filter's
     "any alignment = hit" rule would call it a spike-in) but at ~0.90 identity, below
-    `_MIN_IDENTITY` — so syndna must leave it `pass`. Delete the identity floor and
+    `MIN_IDENTITY` — so syndna must leave it `pass`. Delete the identity floor and
     this is the test that fails."""
     reads = _write_reads(tmp_path / "reads.parquet", [(1, _READ_EXACT_A), (2, _READ_FAR_A)])
     out = _run(tmp_path, reads, _build_syndna_index(tmp_path))
@@ -171,14 +171,14 @@ def test_syndna_smoke_the_chimera_really_does_produce_a_high_identity_supplement
     """Guards the test below from passing vacuously.
 
     Asserts against the RAW aligner (no job, no predicate) that `_READ_CHIMERA` actually
-    elicits what it is supposed to: a PRIMARY alignment BELOW `_MIN_IDENTITY` and a
+    elicits what it is supposed to: a PRIMARY alignment BELOW `MIN_IDENTITY` and a
     SUPPLEMENTARY one AT OR ABOVE it. If a minimap2 or miint bump ever stops emitting
     that supplementary record, this fails loudly — rather than leaving the false-positive
     test green for the wrong reason.
     """
+    from qiita_compute_orchestrator.jobs._coverage import MIN_IDENTITY
     from qiita_compute_orchestrator.jobs.syndna import (
         _IDENTITY_METHOD,
-        _MIN_IDENTITY,
         _MM2_PRESET,
     )
 
@@ -204,8 +204,8 @@ def test_syndna_smoke_the_chimera_really_does_produce_a_high_identity_supplement
     supplementary = [ident for _, is_supp, ident in rows if is_supp]
     assert primary, f"expected a primary alignment, got {rows}"
     assert supplementary, f"expected a supplementary alignment, got {rows}"
-    assert all(i < _MIN_IDENTITY for i in primary), f"primary should be below the floor: {rows}"
-    assert any(i >= _MIN_IDENTITY for i in supplementary), (
+    assert all(i < MIN_IDENTITY for i in primary), f"primary should be below the floor: {rows}"
+    assert any(i >= MIN_IDENTITY for i in supplementary), (
         f"supplementary should be at/above the floor: {rows}"
     )
 

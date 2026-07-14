@@ -45,8 +45,11 @@ _SYNDNA_JOB = (
 _PINNED = [
     ("_MM2_PRESET", "_SYNDNA_MM2_PRESET"),
     ("_IDENTITY_METHOD", "_SYNDNA_IDENTITY_METHOD"),
-    ("_MIN_IDENTITY", "_SYNDNA_MIN_IDENTITY"),
-    ("_MIN_ALIGNED_FRACTION", "_SYNDNA_MIN_ALIGNED_FRACTION"),
+    # These two live in jobs/_coverage.py (the ONE gate both syndna and coverage use),
+    # not in syndna.py — pinning the CP mirror to the shared source also enforces that the
+    # syndna gate and the coverage gate are the same number.
+    ("MIN_IDENTITY", "_SYNDNA_MIN_IDENTITY"),
+    ("MIN_ALIGNED_FRACTION", "_SYNDNA_MIN_ALIGNED_FRACTION"),
     ("_PRIMARY_ONLY", "_SYNDNA_PRIMARY_ONLY"),
 ]
 
@@ -58,7 +61,11 @@ def _job_constants() -> dict[str, object]:
     `qiita-compute-orchestrator`, and importing it would create exactly the dependency
     the mirror exists to avoid.
     """
-    tree = ast.parse(_SYNDNA_JOB.read_text())
+    # Read the shared-gate module too: MIN_IDENTITY / MIN_ALIGNED_FRACTION moved there so
+    # syndna and coverage cannot diverge, so the values the mask identity pins now live in
+    # _coverage.py, not syndna.py.
+    coverage_job = _SYNDNA_JOB.parent / "_coverage.py"
+    tree = ast.parse(_SYNDNA_JOB.read_text() + "\n" + coverage_job.read_text())
     out: dict[str, object] = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign):

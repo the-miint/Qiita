@@ -53,6 +53,17 @@ import duckdb
 IDENTITY_EXPR = "cigar_sequence_identity(cigar)"
 ALIGNED_FRACTION_EXPR = "cigar_query_coverage(cigar)"
 
+# The gate's THRESHOLDS, single-sourced here alongside its expressions. Settled with the
+# assay owner: a read contributes iff it is >= 95% identical AND >= 90% of it aligns, both
+# measured against the whole PLASMID (pre-window). This is THE gate — the reason it lives
+# in one module is that syndna masks reads as spike-in and coverage_depth counts them
+# toward depth, and if the two ever used different cutoffs a read could be called a
+# spike-in and yet contribute no depth (or vice versa), silently. Both jobs import these;
+# neither redefines them. (They are still passed as parameters into `compute_feature_depth`
+# so a test can vary them, but the production callers pass THESE.)
+MIN_IDENTITY = 0.95
+MIN_ALIGNED_FRACTION = 0.90
+
 # Only primary, mapped alignments contribute. Primary-only is load-bearing rather than
 # tidy: the plasmid BACKBONE is identical across every SynDNA plasmid, so one read can
 # align to several of them at high identity. Counting secondaries would multi-count the

@@ -38,6 +38,8 @@ from ..miint import (
 )
 from ._coverage import (
     DEPTH_MODE_INCLUDE_DELETIONS,
+    MIN_ALIGNED_FRACTION,
+    MIN_IDENTITY,
     compute_feature_depth,
 )
 
@@ -50,11 +52,10 @@ YAML_STEP_NAME = "coverage_depth"
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
-# The measurement thresholds. Settled with the assay owner, and hashed into the CP-minted
-# `coverage_idx` — a change here re-mints rather than silently reusing a coverage_idx
-# whose stored params describe the old filter.
-_MIN_IDENTITY = 0.95
-_MIN_ALIGNED_FRACTION = 0.90
+# The measurement thresholds are single-sourced in `_coverage` and imported — the SAME
+# values syndna gates on, so masking and counting can't diverge. They are hashed into the
+# CP-minted `coverage_idx` (via the CP's pinned mirror), so a change re-mints rather than
+# silently reusing an idx whose params describe the old filter.
 _DEPTH_MODE = DEPTH_MODE_INCLUDE_DELETIONS
 
 _ANNOTATION = "coverage_annotation"
@@ -115,20 +116,25 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 f"CREATE VIEW {_ALIGNMENT} AS SELECT * FROM read_parquet('{alignment_sql}')"
             )
-            # The samples this ticket MEASURED. Taken from the ticket's scope, not from the
-            # alignment: a sample with no spike-in reads at all produces no alignment rows,
-            # and it must still appear in the feature table with zeros. Deriving the sample
-            # set from the alignment would make "measured, and it was zero" indistinguishable
-            # from "not measured".
-            conn.execute(
-                f"CREATE VIEW {_SAMPLE} AS "
-                f"SELECT DISTINCT prep_sample_idx FROM {_ALIGNMENT} "
-                + (
-                    f"UNION SELECT {inputs.prep_sample_idx}::BIGINT"
-                    if inputs.prep_sample_idx is not None
-                    else ""
+            # The samples this ticket MEASURED come from the ticket's SCOPE, not from the
+            # alignment. A sample with no spike-in reads produces no alignment rows, and it
+            # must still appear in the feature table with an explicit zero — deriving the
+            # sample set from the alignment would make "measured, and it was zero"
+            # indistinguishable from "not measured". A read-mask ticket is prep_sample-
+            # scoped, so the set is exactly `{prep_sample_idx}`.
+            #
+            # `prep_sample_idx is None` only in a unit-test harness that constructs Inputs
+            # directly (production always injects the scope scalar); there, and only there,
+            # fall back to the alignment's own samples so the fixture need not restate them.
+            if inputs.prep_sample_idx is not None:
+                conn.execute(
+                    f"CREATE VIEW {_SAMPLE} AS SELECT {inputs.prep_sample_idx}::BIGINT "
+                    "AS prep_sample_idx"
                 )
-            )
+            else:
+                conn.execute(
+                    f"CREATE VIEW {_SAMPLE} AS SELECT DISTINCT prep_sample_idx FROM {_ALIGNMENT}"
+                )
 
             # The feature windows, over Flight. `reference_annotation` carries reference_idx
             # itself, so the ticket scopes it with no membership join.
@@ -154,6 +160,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"reference {inputs.reference_idx} has no annotated intervals — "
                     "nothing to quantify. A coverage reference must be ingested with a "
                     "GFF3 (`qiita reference load --gff`)."
+                )
+
+            # A zero-length window (stop_position <= position) would divide by zero in
+            # mean_depth, whose column is DOUBLE NOT NULL. Ingest already rejects such an
+            # interval (reference_annotation stores half-open [position, stop_position) and
+            # hash_sequences enforces position < stop_position), so reaching here means the
+            # reference disagrees with itself — the same fail-loud posture as the
+            # parent-length check below, not a silent NULL.
+            bad_window = conn.execute(
+                f"SELECT count(*) FROM {_WINDOW} WHERE stop_position <= position"
+            ).fetchone()[0]
+            if bad_window:
+                raise ValueError(
+                    f"reference {inputs.reference_idx} has {bad_window} annotated "
+                    "interval(s) with stop_position <= position (a zero-length or inverted "
+                    "window); it cannot be quantified"
                 )
 
             # The parents' lengths — `compute_coverage_depth` sizes its per-base array to
@@ -192,8 +214,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 sample_relation=_SAMPLE,
                 window_relation=_WINDOW,
                 parent_length_relation=_PARENT_LEN,
-                min_identity=_MIN_IDENTITY,
-                min_aligned_fraction=_MIN_ALIGNED_FRACTION,
+                min_identity=MIN_IDENTITY,
+                min_aligned_fraction=MIN_ALIGNED_FRACTION,
                 depth_mode=_DEPTH_MODE,
                 out_relation=_OUT,
             )

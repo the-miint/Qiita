@@ -120,16 +120,33 @@ def test_emits_a_dense_feature_table_with_the_coverage_idx(tmp_path, monkeypatch
     ]
 
 
-def test_a_sample_with_no_alignment_still_gets_zero_rows(tmp_path, monkeypatch):
-    """The sample set comes from the TICKET, not from the alignment. A spike-in that failed
-    to amplify produces no alignment rows at all, and it must still be reported as zero —
-    otherwise it is indistinguishable from a sample that was never measured."""
-    _stub_flight(monkeypatch, annotations=_ANNOTATIONS, sequences=_SEQUENCES)
-    empty = _write_alignment(tmp_path / "empty.parquet", [])
+def test_the_measured_sample_is_the_ticket_scope_not_the_alignment(tmp_path, monkeypatch):
+    """The sample set comes from the TICKET, not the alignment — and this test is built so
+    the two implementations give DIFFERENT answers.
 
-    rows = _rows(_run(tmp_path, empty)["coverage"])
+    The ticket measures PREP_SAMPLE_IDX (7). The alignment contains rows for a DIFFERENT
+    sample (99) and NONE for 7. So:
+
+      * "from the ticket" -> the table reports sample 7, with explicit zeros (a spike-in
+        that failed to amplify is a real, different fact from one never in the pool);
+      * "from the alignment" -> the table would report sample 99 and omit 7 entirely.
+
+    The old implementation UNION-ed the two, so it happened to include 7 as well and this
+    distinction was untestable. Asserting the exact sample set is what pins it.
+    """
+    _stub_flight(monkeypatch, annotations=_ANNOTATIONS, sequences=_SEQUENCES)
+    other_sample = PREP_SAMPLE_IDX + 92
+    aln = _write_alignment(
+        tmp_path / "aln.parquet",
+        [(other_sample, 1, PARENT, 0, WIN_A[0], WIN_A[1], "2547=")],
+    )
+
+    rows = _rows(_run(tmp_path, aln)["coverage"])
+    assert {r[1] for r in rows} == {PREP_SAMPLE_IDX}, (
+        "the measured sample must be the ticket's, not whichever sample the alignment "
+        "happens to mention"
+    )
     assert [(r[2], r[3], r[6]) for r in rows] == [(INSERT_A, 0, 0.0), (INSERT_B, 0, 0.0)]
-    assert all(r[1] == PREP_SAMPLE_IDX for r in rows)
 
 
 def test_the_gate_is_applied_here_not_upstream(tmp_path, monkeypatch):

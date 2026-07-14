@@ -22,8 +22,8 @@ from qiita_control_plane.runner import _mask
 
 # (job constant, CP mirror constant)
 _PINNED = [
-    ("_MIN_IDENTITY", "_COVERAGE_MIN_IDENTITY"),
-    ("_MIN_ALIGNED_FRACTION", "_COVERAGE_MIN_ALIGNED_FRACTION"),
+    ("MIN_IDENTITY", "_COVERAGE_MIN_IDENTITY"),
+    ("MIN_ALIGNED_FRACTION", "_COVERAGE_MIN_ALIGNED_FRACTION"),
 ]
 
 _JOB = (
@@ -43,7 +43,9 @@ def _job_constants() -> dict[str, object]:
     path, and adding it just to read four numbers would couple the two packages for no
     reason.
     """
-    tree = ast.parse(_JOB.read_text())
+    # The thresholds moved to _coverage.py (shared with syndna), so read it too.
+    shared = _JOB.parent / "_coverage.py"
+    tree = ast.parse(_JOB.read_text() + "\n" + shared.read_text())
     out: dict[str, object] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -59,7 +61,7 @@ def _job_constants() -> dict[str, object]:
 @pytest.mark.parametrize(("job_name", "cp_name"), _PINNED)
 def test_pinned_constants_match(job_name, cp_name):
     job = _job_constants()
-    assert job_name in job, f"{job_name} is gone from jobs/coverage_depth.py"
+    assert job_name in job, f"{job_name} is gone from jobs/coverage_depth.py or jobs/_coverage.py"
     assert getattr(_mask, cp_name) == job[job_name], (
         f"{cp_name} ({getattr(_mask, cp_name)!r}) has drifted from the job's "
         f"{job_name} ({job[job_name]!r}). The coverage_idx would then describe a "
@@ -110,10 +112,16 @@ def test_every_gate_knob_in_the_job_is_pinned():
     untouched — the exact failure this whole apparatus exists to prevent. (It has already
     happened once, in the syndna job, and every test still passed.)
     """
-    knob_prefixes = ("_MIN_", "_MAX_")
+    # Match the syndna guard's breadth: any constant that looks like a measurement knob,
+    # not only the numeric floors. A preset / mode / primary-only toggle changes the number
+    # too, and would otherwise slip a `_MIN_`/`_MAX_`-only net.
+    knob_prefixes = ("MIN_", "MAX_", "_IDENTITY_", "_PRIMARY_", "_ALIGNER", "_PRESET")
     job = _job_constants()
     pinned = {job_name for job_name, _ in _PINNED}
-    knobs = {name for name in job if name.startswith(knob_prefixes)}
+    # DEPTH_MODE constants are string literals asserted by test_depth_mode_matches_the_job;
+    # exclude the enum members themselves (they are not a single gate value).
+    ignore = {"DEPTH_MODE_INCLUDE_DELETIONS", "DEPTH_MODE_EXCLUDE_DELETIONS"}
+    knobs = {name for name in job if name.startswith(knob_prefixes) and name not in ignore}
     unpinned = knobs - pinned
     assert not unpinned, (
         f"gate knob(s) in jobs/coverage_depth.py are not pinned: {sorted(unpinned)}. "

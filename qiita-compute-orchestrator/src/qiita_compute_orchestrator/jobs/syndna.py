@@ -39,7 +39,7 @@ excluded from `read_masked` (which serves only `pass`) and gets its own count
 bucket, with its rows RETAINED in `read_mask` so the counts survive.
 
 **Alignment, not k-mer classification.** A read is a spike-in when it has a PRIMARY
-alignment to a SynDNA insert at >= `_MIN_IDENTITY` identity. This mirrors
+alignment to a SynDNA insert at >= `MIN_IDENTITY` identity (from `_coverage`). This mirrors
 `host_filter`'s minimap2 arm (same `align_minimap2` seam, same `max_secondary := 0`)
 but adds an identity floor and a primary-only predicate, neither of which host
 filtering needs: host depletion is deliberately aggressive (any alignment = host),
@@ -71,6 +71,8 @@ from ._coverage import (
     ALIGNED_FRACTION_EXPR,
     IDENTITY_EXPR,
     MAPPED_PRIMARY_EXPR,
+    MIN_ALIGNED_FRACTION,
+    MIN_IDENTITY,
 )
 from ._partial_mask import assert_single_end
 
@@ -117,16 +119,11 @@ _MM2_PRESET = "map-hifi"
 # expected to carry such an event — and therefore which method the assay wants — is
 # with the assay owner alongside the open questions below.
 _IDENTITY_METHOD = "blast"
-_MIN_IDENTITY = 0.95
-
-# Minimum fraction of the READ that aligns, computed against the whole PLASMID (not the
-# bare insert). Settled with the assay owner for the coverage-depth pipeline, and it is
-# correct for masking too now that the reference is plasmid-level: a read spanning the
-# insert->backbone junction is fully aligned against the plasmid, so the filter keeps it —
-# whereas against an insert-only index the same read looks 60% aligned and would be lost.
-# That asymmetry is why the old insert-only reference could not carry an aligned-fraction
-# filter at all.
-_MIN_ALIGNED_FRACTION = 0.90
+# The gate's thresholds are single-sourced in `_coverage` (MIN_IDENTITY /
+# MIN_ALIGNED_FRACTION) and imported above — NOT redefined here. That is the whole point:
+# syndna masks a read as spike-in and coverage_depth counts it toward depth, so if the two
+# used different cutoffs a read could be masked out of `biological` yet contribute no depth
+# (or the reverse), silently. One definition guarantees they can't.
 
 # =============================================================================
 # PRIMARY alignments only — matching coverm
@@ -151,7 +148,7 @@ _MIN_ALIGNED_FRACTION = 0.90
 # alignment, which is the behaviour being ported.
 #
 # THE COST, which is a real trade and not free: the rule is now "the read's BEST
-# alignment is a spike-in at >= _MIN_IDENTITY", not "ANY alignment is". A read whose
+# alignment is a spike-in at >= MIN_IDENTITY", not "ANY alignment is". A read whose
 # primary falls below the floor but which carries a high-identity supplementary segment
 # is now `pass` — i.e. it lands in `biological`. If that read is a spike-in chimera it is
 # lab-added sequence, so we have both undercounted the spike-in and put it in the
@@ -335,8 +332,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 f"CREATE OR REPLACE VIEW {_HITS} AS "
                 f"SELECT DISTINCT sequence_idx FROM {_ALIGNMENT} "
-                f"WHERE {IDENTITY_EXPR} >= {_MIN_IDENTITY} "
-                f"  AND {ALIGNED_FRACTION_EXPR} >= {_MIN_ALIGNED_FRACTION}"
+                f"WHERE {IDENTITY_EXPR} >= {MIN_IDENTITY} "
+                f"  AND {ALIGNED_FRACTION_EXPR} >= {MIN_ALIGNED_FRACTION}"
             )
 
             # Emit the partial mask: one row per read, spike-in hits marked, all else
