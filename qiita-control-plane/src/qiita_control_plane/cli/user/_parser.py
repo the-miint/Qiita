@@ -772,10 +772,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # interval is minted its own feature_idx so it can key a feature table while
     # reads align to its parent sequence.
     p_reference_load.add_argument("--gff", type=Path)
-    # Host index selection + build params (apply only with --host). Default
-    # builds both indexes; the opt-out flags skip one (not both — the entry
-    # point rejects building neither). --rype-w / --minimap2-preset tune the
-    # builders; omitted, they use the builders' defaults (w=20, preset=sr).
     p_reference_load.add_argument(
         "--no-rype-index",
         action="store_true",

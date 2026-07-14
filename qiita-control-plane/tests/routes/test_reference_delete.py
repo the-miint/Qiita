@@ -265,18 +265,51 @@ async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
     )
     await postgres_pool.executemany(
         "INSERT INTO qiita.reference_annotation"
-        " (reference_idx, annotation_id, feature_idx, parent_feature_idx) VALUES ($1, $2, $3, $4)",
+        " (reference_idx, annotation_id, feature_idx, parent_feature_idx,"
+        "  annotation_type, position, stop_position, strand)"
+        " VALUES ($1, $2, $3, $4, 'CDS', $5, $6, '+')",
         [
-            (ref_a, "insert_a", insert_a, plasmid_a),
-            (ref_a, "insert_shared", insert_shared, plasmid_shared),
-            # A SECOND occurrence of the SAME feature in the SAME reference — the
-            # 16S case (identical bases → one feature_idx, many occurrences). It is
-            # representable only because the PK is (reference_idx, annotation_id);
-            # under a (reference_idx, feature_idx) PK this row is a constraint
+            (ref_a, "insert_a", insert_a, plasmid_a, 1, 101),
+            (ref_a, "insert_shared", insert_shared, plasmid_shared, 1, 101),
+            # A SECOND occurrence of the SAME feature in the SAME reference, at a
+            # different place — the 16S case (identical bases → one feature_idx, many
+            # occurrences). It is representable only because identity is the minted
+            # annotation_idx keyed on the natural key (parent + WINDOW + type + strand);
+            # under a (reference_idx, feature_idx) key this row is a constraint
             # violation, and no real bacterial genome could be ingested.
-            (ref_a, "insert_shared_copy2", insert_shared, plasmid_shared),
-            (ref_b, "insert_shared", insert_shared, plasmid_shared),
+            (ref_a, "insert_shared_copy2", insert_shared, plasmid_shared, 201, 301),
+            (ref_b, "insert_shared", insert_shared, plasmid_shared, 1, 101),
         ],
+    )
+
+    # Terms: a SHARED one (both references cite it — must survive ref_a's delete) and one
+    # only ref_a cites (must be GC'd). A term is global, so this is the same orphan rule
+    # qiita.feature gets, and the same both-directions trap.
+    shared_term = await postgres_pool.fetchval(
+        "INSERT INTO qiita.annotation_term (system, system_id, definition)"
+        " VALUES ('RFAM', $1, '16S ribosomal RNA') RETURNING annotation_term_idx",
+        f"RF-shared-{uuid.uuid4()}",
+    )
+    only_a_term = await postgres_pool.fetchval(
+        "INSERT INTO qiita.annotation_term (system, system_id) VALUES ('KEGG', $1)"
+        " RETURNING annotation_term_idx",
+        f"K-only-a-{uuid.uuid4()}",
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.annotation_to_term (annotation_idx, annotation_term_idx)"
+        " SELECT ra.annotation_idx, t.term FROM qiita.reference_annotation ra"
+        " CROSS JOIN (VALUES ($2::bigint), ($3::bigint)) AS t(term)"
+        " WHERE ra.reference_idx = $1 AND ra.annotation_id = 'insert_a'",
+        ref_a,
+        shared_term,
+        only_a_term,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.annotation_to_term (annotation_idx, annotation_term_idx)"
+        " SELECT ra.annotation_idx, $2 FROM qiita.reference_annotation ra"
+        " WHERE ra.reference_idx = $1",
+        ref_b,
+        shared_term,
     )
 
     everything = [plasmid_a, insert_a, plasmid_shared, insert_shared]
@@ -320,10 +353,36 @@ async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
             )
             == 1
         )
+
+        # The term GC, in both directions — the half that matters is the second.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.annotation_term WHERE annotation_term_idx = $1", only_a_term
+            )
+            is None
+        ), "a term no surviving annotation cites must be GC'd"
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.annotation_term WHERE annotation_term_idx = $1", shared_term
+            )
+            == 1
+        ), "a term another reference still cites must SURVIVE"
     finally:
+        # FK order: the junction FKs annotation_idx, which FKs feature_idx.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.annotation_to_term l USING qiita.reference_annotation ra"
+            " WHERE l.annotation_idx = ra.annotation_idx"
+            "   AND ra.feature_idx = ANY($1::bigint[])",
+            everything,
+        )
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_annotation WHERE feature_idx = ANY($1::bigint[])",
             everything,
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.annotation_term t WHERE NOT EXISTS ("
+            " SELECT 1 FROM qiita.annotation_to_term l"
+            " WHERE l.annotation_term_idx = t.annotation_term_idx)"
         )
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_membership WHERE feature_idx = ANY($1::bigint[])",

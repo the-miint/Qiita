@@ -119,8 +119,8 @@ steps:
   # side's, read only to resolve each interval's parent_feature_idx.
   # See qiita_control_plane.actions.library.mint_annotation_features.
   - action: mint-annotation-features
-    inputs: [annotation_manifest, manifest, feature_map]
-    outputs: [annotation_feature_map]
+    inputs: [annotation_manifest, feature_map]
+    outputs: [annotation_map]
 
   - action: write-membership
     inputs: [feature_map]
@@ -131,7 +131,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
     inputs: [manifest, feature_map, reference_sequence_chunks,
-             annotation_manifest, annotation_feature_map]
+             annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     # `reference_sequence_chunks` is re-emitted feature-keyed here (the
     # hash_sequences binding was sequence_hash-keyed); build_rype_index below

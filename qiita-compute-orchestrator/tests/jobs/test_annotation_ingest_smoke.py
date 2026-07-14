@@ -78,14 +78,32 @@ def _write_chunked_upload(path: Path, reads: list[tuple[str, str]]) -> Path:
     return path
 
 
-def _write_gff(path: Path, rows: list[tuple[str, int, int, str]]) -> Path:
+def _write_gff(
+    path: Path,
+    rows: list[tuple[str, int, int, str]],
+    *,
+    feature_type: str = "insert",
+    score: str = ".",
+    phase: str = ".",
+    extra_lines: list[str] = [],
+    fasta_section: str | None = None,
+) -> Path:
     """rows: (seqid, start, stop_CLOSED, attributes). Coordinates as a GFF3
-    carries them — 1-based, closed."""
+    carries them — 1-based, closed.
+
+    `extra_lines` takes verbatim GFF3 lines (for the landmark / discontinuous-feature
+    shapes), and `fasta_section` appends a `##FASTA` block — which is not an exotic
+    option but what prokka and bakta ALWAYS emit.
+    """
     lines = ["##gff-version 3"]
     lines += [
-        f"{seqid}\tsyndna\tinsert\t{start}\t{stop}\t.\t+\t.\t{attrs}"
+        f"{seqid}\tsyndna\t{feature_type}\t{start}\t{stop}\t{score}\t+\t{phase}\t{attrs}"
         for seqid, start, stop, attrs in rows
     ]
+    lines += extra_lines
+    if fasta_section is not None:
+        lines += ["##FASTA", f">{_PLASMID_READ_ID}"]
+        lines += [fasta_section[i : i + 60] for i in range(0, len(fasta_section), 60)]
     path.write_text("\n".join(lines) + "\n")
     return path
 
@@ -135,7 +153,9 @@ def test_annotation_window_is_half_open(tmp_path):
         "downstream coverage number silently loses the interval's last base"
     )
     assert ann["stop_position"] - ann["position"] == _INSERT_LEN
-    assert ann["sequence_length_bp"] == _INSERT_LEN
+    # The interval's length is NOT a stored column: it is stop - position, and a stored
+    # copy could only ever disagree with the coordinates it came from.
+    assert "sequence_length_bp" not in ann
 
 
 def test_annotation_feature_hash_is_the_insert_itself(tmp_path):
@@ -310,11 +330,6 @@ def test_no_gff_yields_a_typed_empty_manifest(tmp_path):
             "outside their parent sequence",
             id="inverted_window",
         ),
-        pytest.param(
-            [(_PLASMID_READ_ID, 100, 200, "ID=dup"), (_PLASMID_READ_ID, 300, 400, "ID=dup")],
-            "duplicate annotation IDs",
-            id="duplicate_id",
-        ),
     ],
 )
 def test_malformed_gff_fails_loud(tmp_path, rows, expected):
@@ -335,7 +350,7 @@ def test_interval_ending_on_the_parents_last_base_is_accepted(tmp_path):
     gff = _write_gff(tmp_path / "edge.gff3", [(_PLASMID_READ_ID, last - 99, last, "ID=tail")])
     (ann,) = _annotations(_run(tmp_path, gff=gff)["annotation_manifest"])
     assert ann["stop_position"] == last + 1  # half-open, one past the last base
-    assert ann["sequence_length_bp"] == 100
+    assert ann["stop_position"] - ann["position"] == 100
 
 
 def test_interval_one_base_past_the_parents_end_is_rejected(tmp_path):
@@ -347,14 +362,16 @@ def test_interval_one_base_past_the_parents_end_is_rejected(tmp_path):
         _run(tmp_path, gff=gff)
 
 
-def test_interval_spanning_the_whole_parent_is_rejected(tmp_path):
-    """A GFF3 `region` / `source` line covering 1..len is routine in NCBI-style files.
-    Its extracted bytes ARE the parent's bytes, so it canonically hashes to the
-    PARENT's feature_idx — yielding an annotation row whose feature_idx equals its
-    parent_feature_idx, pointing at a feature that IS in reference_membership and IS
-    indexed. That quietly falsifies the invariant the whole design rests on, and
-    nothing would raise. So it is refused."""
-    gff = _write_gff(tmp_path / "region.gff3", [(_PLASMID_READ_ID, 1, len(_PLASMID), "ID=whole")])
+def test_non_landmark_interval_spanning_the_whole_parent_is_rejected(tmp_path):
+    """A row of a REAL feature type covering 1..len extracts the parent's own bytes, so
+    it canonically hashes to the PARENT's feature_idx — yielding an annotation whose
+    feature_idx equals its parent_feature_idx, pointing at a feature that IS in
+    reference_membership and IS indexed. That quietly falsifies the invariant the whole
+    design rests on, and nothing would raise. So it is refused.
+
+    The landmark types (`region` & co.) are the ones that do this LEGITIMATELY, and they
+    are dropped rather than raised on — see the test below."""
+    gff = _write_gff(tmp_path / "whole.gff3", [(_PLASMID_READ_ID, 1, len(_PLASMID), "ID=whole")])
     with pytest.raises(ValueError, match="ENTIRE parent sequence"):
         _run(tmp_path, gff=gff)
 
@@ -397,3 +414,125 @@ def test_two_annotations_with_identical_bases_are_KEPT(tmp_path):
     # ...and they remain distinguishable, because identity is the id + the window.
     assert (anns[0]["position"], anns[0]["stop_position"]) == (1, 101)
     assert (anns[1]["position"], anns[1]["stop_position"]) == (151, 251)
+
+
+def test_embedded_fasta_section_is_not_parsed_as_annotations(tmp_path):
+    """prokka and bakta ALWAYS append the genome to their GFF3 as a `##FASTA` section,
+    and `read_gff` does not stop there — it returns one row per line of the embedded
+    FASTA, with the nucleotide line itself sitting in `seqid` and NULL in every other
+    column. On a real prokka file that is 1539 junk rows behind 99 real features.
+
+    Un-filtered, those rows reach the parent check and the ingest dies claiming a line
+    of nucleotides is not a sequence in the FASTA. So `--gff` would be unusable on the
+    output of the two most common bacterial annotators there are.
+
+    The CONTROL is the second half: the byte-identical GFF3 WITHOUT the `##FASTA`
+    section must give the same answer. If it didn't, this test would be pinning the
+    wrong thing.
+    """
+    with_fasta = _write_gff(
+        tmp_path / "prokka.gff3",
+        [(_PLASMID_READ_ID, _GFF_START, _GFF_STOP_CLOSED, "ID=insert_01")],
+        fasta_section=_PLASMID,
+    )
+    anns = _annotations(_run(tmp_path, gff=with_fasta)["annotation_manifest"])
+    assert [a["annotation_id"] for a in anns] == ["insert_01"], (
+        "the ##FASTA section must not become annotation rows"
+    )
+
+    # CONTROL: same file, section stripped. Same result — so what we filtered really was
+    # the FASTA block and not something load-bearing.
+    without = _write_gff(
+        tmp_path / "clean.gff3",
+        [(_PLASMID_READ_ID, _GFF_START, _GFF_STOP_CLOSED, "ID=insert_01")],
+    )
+    control = _annotations(_run(tmp_path / "ctl", gff=without)["annotation_manifest"])
+    assert [dict(a) for a in anns] == [dict(a) for a in control]
+
+
+def test_duplicate_gff3_ids_are_kept_not_rejected(tmp_path):
+    """GFF3 lets a DISCONTINUOUS feature — a ribosomal-slippage CDS — span several lines
+    that all carry the SAME `ID`. It is one feature at multiple locations, and the spec
+    says so explicitly. NCBI's RefSeq annotation of E. coli K-12 MG1655 has 20 of them.
+
+    An earlier revision raised on a duplicate `ID`, which rejected that file outright.
+    So `annotation_id` is provenance, not identity: both rows survive, and they are told
+    apart by their windows — which is what the minted `annotation_idx` keys on.
+    """
+    gff = _write_gff(
+        tmp_path / "discontinuous.gff3",
+        [
+            (_PLASMID_READ_ID, 2001, 2400, "ID=cds-slippage"),
+            (_PLASMID_READ_ID, 2402, 3000, "ID=cds-slippage"),
+        ],
+    )
+    anns = _annotations(_run(tmp_path, gff=gff)["annotation_manifest"])
+
+    assert [a["annotation_id"] for a in anns] == ["cds-slippage", "cds-slippage"]
+    assert [(a["position"], a["stop_position"]) for a in anns] == [(2001, 2401), (2402, 3001)]
+
+
+def test_landmark_rows_are_dropped_rather_than_rejected(tmp_path):
+    """Every NCBI GFF3 opens each record with a `region` line spanning the whole
+    sequence. It declares the landmark; it does not annotate an interval of it. It
+    necessarily extracts the parent's own bytes, so it would hash to the PARENT's
+    feature_idx — which is exactly the thing the design forbids.
+
+    Dropping it by type is what lets a stock RefSeq file ingest at all, while a
+    non-landmark row doing the same thing still raises (test above)."""
+    gff = _write_gff(
+        tmp_path / "ncbi.gff3",
+        [(_PLASMID_READ_ID, _GFF_START, _GFF_STOP_CLOSED, "ID=insert_01")],
+        extra_lines=[
+            f"{_PLASMID_READ_ID}\tRefSeq\tregion\t1\t{len(_PLASMID)}\t.\t+\t.\tID=NC_1:1..{len(_PLASMID)}"
+        ],
+    )
+    anns = _annotations(_run(tmp_path, gff=gff)["annotation_manifest"])
+    assert [a["annotation_id"] for a in anns] == ["insert_01"]
+    assert all(a["annotation_type"] != "region" for a in anns)
+
+
+def test_score_and_phase_are_persisted(tmp_path):
+    """GFF3 columns 6 and 8. Both are genuinely optional — `score` is NULL on 100% of the
+    rows of both a stock RefSeq and a stock prokka file, and `phase` is populated only on
+    CDS rows — so they are stored NULLABLE. Dropping them would mean a caller who wants
+    them has no way back to them short of a re-ingest."""
+    scored = _write_gff(
+        tmp_path / "scored.gff3",
+        [(_PLASMID_READ_ID, _GFF_START, _GFF_STOP_CLOSED, "ID=cds_01")],
+        feature_type="CDS",
+        score="42.5",
+        phase="0",
+    )
+    (ann,) = _annotations(_run(tmp_path, gff=scored)["annotation_manifest"])
+    assert ann["score"] == 42.5
+    assert ann["phase"] == 0
+    assert ann["source"] == "syndna"
+
+    # ...and the far more common shape: both absent. They must come back NULL, not 0.0 —
+    # a score of zero and no score at all are different claims.
+    (bare,) = _annotations(
+        _run(tmp_path / "bare", gff=_standard_gff(tmp_path))["annotation_manifest"]
+    )
+    assert bare["score"] is None
+    assert bare["phase"] is None
+
+
+def test_parent_sequence_hash_resolves_the_parent_without_a_read_id_join(tmp_path):
+    """The manifest carries the PARENT's canonical hash, not just its read_id. That is
+    what lets the control plane resolve parent_feature_idx off the feature map with a
+    fixed-width UUID join instead of a VARCHAR one — feature_idx itself cannot appear
+    here, because the orchestrator has no database and nothing has been minted yet."""
+    out = _run(tmp_path, gff=_standard_gff(tmp_path))
+    (ann,) = _annotations(out["annotation_manifest"])
+
+    with duckdb.connect(":memory:") as conn:
+        (parent_hash,) = conn.execute(
+            f"SELECT sequence_hash FROM read_parquet('{out['manifest']}') WHERE read_id = ?",
+            [_PLASMID_READ_ID],
+        ).fetchone()
+
+    assert ann["parent_sequence_hash"] == parent_hash
+    assert ann["parent_read_id"] == _PLASMID_READ_ID
+    # The interval is NOT its parent — different bytes, different feature.
+    assert ann["sequence_hash"] != parent_hash

@@ -144,13 +144,21 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- sub-interval, which is what lets a quantification be keyed by the thing
         -- measured (the insert) while reads align to the thing sequenced (the plasmid).
         --
-        --   feature_idx        -- the annotated interval (minted from the canonical
-        --                        hash of the EXTRACTED sub-sequence).
+        --   annotation_idx     -- the OCCURRENCE's identity, minted by the control
+        --                        plane. This is the join back to the Postgres claim
+        --                        (qiita.reference_annotation) and to the semantic terms
+        --                        (qiita.annotation_term via qiita.annotation_to_term).
+        --   feature_idx        -- the annotated interval's BYTES (minted from the
+        --                        canonical hash of the EXTRACTED sub-sequence).
         --   parent_feature_idx -- the sequence it sits on, and what reads align to.
-        --   annotation_id      -- the annotation's IDENTITY. Not feature_idx: identical
-        --                        bases share one feature_idx (a bacterial 16S occurs in
-        --                        5-7 byte-identical copies), so a feature is a SEQUENCE
-        --                        and an annotation is an OCCURRENCE of it at a place.
+        --   annotation_id      -- the GFF3 `ID`. PROVENANCE ONLY — nullable, and NOT
+        --                        unique: GFF3 lets a discontinuous feature repeat one ID
+        --                        across N lines (NCBI's E. coli RefSeq has 20 such).
+        --
+        -- feature_idx is NOT the occurrence's identity either: identical bases share one
+        -- feature_idx (a bacterial 16S occurs in 5-7 byte-identical copies), so a feature
+        -- is a SEQUENCE and an annotation is an OCCURRENCE of it at a place. A consumer
+        -- aggregating coverage over a feature sums across its occurrences.
         --
         -- Annotated features are deliberately absent from reference_membership (which
         -- is what gets INDEXED and aligned against) and from reference_sequences /
@@ -160,15 +168,24 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- Coordinates are 1-based HALF-OPEN [position, stop_position) — matching
         -- read_alignments / alignment_slice / qiita_lake.alignment, NOT the closed
         -- convention GFF3 arrives in. Converted once, at ingest, in hash_sequences.
+        --
+        -- `attributes` is kept RAW and lossless (it is what the GFF3 said). The
+        -- normalized cross-references parsed out of it live in Postgres as
+        -- qiita.annotation_term — the MAP stays so that a system we do not yet parse is
+        -- still recoverable without a re-ingest.
         CREATE TABLE IF NOT EXISTS qiita_lake.reference_annotation (
+            annotation_idx BIGINT NOT NULL,
             reference_idx BIGINT NOT NULL,
             feature_idx BIGINT NOT NULL,
             parent_feature_idx BIGINT NOT NULL,
-            annotation_id VARCHAR NOT NULL,
-            annotation_type VARCHAR,
+            annotation_id VARCHAR,
+            source VARCHAR,
+            annotation_type VARCHAR NOT NULL,
             position BIGINT NOT NULL,
             stop_position BIGINT NOT NULL,
-            strand VARCHAR,
+            strand VARCHAR NOT NULL,
+            score DOUBLE,
+            phase SMALLINT,
             attributes MAP(VARCHAR, VARCHAR)
         );",
     )?;
@@ -552,10 +569,15 @@ mod tests {
         };
 
         // A populated row: the MAP round-trips, and the per-insert mass the cell-count
-        // model needs is reachable by key.
+        // model needs is reachable by key. Columns are named rather than positional —
+        // the row carries a minted annotation_idx now, and a positional VALUES list
+        // silently shifts every column when one is added.
         conn.execute_batch(&format!(
-            "INSERT INTO qiita_lake.reference_annotation VALUES \
-             ({id}, 7, 42, 'insert_01', 'insert', 2001, 3001, '+', \
+            "INSERT INTO qiita_lake.reference_annotation \
+             (annotation_idx, reference_idx, feature_idx, parent_feature_idx, annotation_id, \
+              source, annotation_type, position, stop_position, strand, score, phase, attributes) \
+             VALUES \
+             (9001, {id}, 7, 42, 'insert_01', 'syndna', 'insert', 2001, 3001, '+', NULL, NULL, \
               MAP{{'ID': 'insert_01', 'mass_ng': '0.5'}});"
         ))
         .unwrap();
@@ -569,12 +591,19 @@ mod tests {
 
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT feature_idx, parent_feature_idx, position, stop_position, \
+                "SELECT annotation_idx, feature_idx, parent_feature_idx, position, stop_position, \
                         attributes['mass_ng'] \
                  FROM qiita_lake.reference_annotation WHERE reference_idx = {id}"
             ))
             .unwrap();
-        let (feature_idx, parent, position, stop, mass): (i64, i64, i64, i64, String) = stmt
+        let (annotation_idx, feature_idx, parent, position, stop, mass): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+        ) = stmt
             .query_row([], |row| {
                 Ok((
                     row.get(0)?,
@@ -582,9 +611,13 @@ mod tests {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             })
             .unwrap();
+        // The lake row's join back to its Postgres claim, and to the annotation's
+        // semantic terms. Minted by the control plane; the data plane never derives it.
+        assert_eq!(annotation_idx, 9001);
         assert_eq!(feature_idx, 7);
         assert_eq!(parent, 42);
         // Half-open: a 1000 bp insert starting at 2001 stops at 3001, not 3000.

@@ -73,14 +73,6 @@ context_schema:
       shard_index: {const: true}
       build_minimap2: {const: false}
       build_bowtie2: {const: false}
-    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a
-    # plasmid map: which sub-interval of each plasmid is a SynDNA insert; a
-    # genome's gene coordinates). Parsed by hash_sequences with miint's
-    # read_gff; each interval is cut from its parent, canonically hashed, and
-    # minted its OWN feature_idx so it can key a feature table while reads
-    # align to the parent. Coordinates are converted from GFF3's 1-based
-    # CLOSED [start, end] to the half-open [position, stop_position) the
-    # alignment side speaks, ONCE, at ingest.
     # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
     # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
     # is minted its OWN feature_idx so it can key a feature table while reads align to
@@ -119,8 +111,8 @@ steps:
   # side's, read only to resolve each interval's parent_feature_idx.
   # See qiita_control_plane.actions.library.mint_annotation_features.
   - action: mint-annotation-features
-    inputs: [annotation_manifest, manifest, feature_map]
-    outputs: [annotation_feature_map]
+    inputs: [annotation_manifest, feature_map]
+    outputs: [annotation_map]
 
   - action: write-membership
     inputs: [feature_map]
@@ -131,7 +123,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
     inputs: [manifest, feature_map, reference_sequence_chunks,
-             annotation_manifest, annotation_feature_map]
+             annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     baseline_resources:

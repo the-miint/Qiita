@@ -29,7 +29,7 @@ from qiita_common.models import (
 from .. import step_progress
 from ..actions.library import (
     LIBRARY,
-    MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME,
+    MINT_ANNOTATION_MAP_OUTPUT_BASENAME,
     MINT_FEATURES_OUTPUT_BASENAME,
 )
 from ..repositories.reference_membership import count_reference_shards
@@ -162,14 +162,21 @@ def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) 
     (`plan-shards` is handled separately in `_reconstruct_completed_outputs` —
     its bindings come from the DB, not a scratch path.)
     Each basename is single-sourced from the primitive itself
-    (`MINT_FEATURES_OUTPUT_BASENAME` / `MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME`)
-    so this resume path can't drift from where the primitive actually writes the
-    file. The two basenames differ precisely because both primitives can run in one
-    workflow, and a shared name would resume the second onto the first's map."""
+    (`MINT_FEATURES_OUTPUT_BASENAME` / `MINT_ANNOTATION_MAP_OUTPUT_BASENAME`) so this
+    resume path can't drift from where the primitive actually writes the file. The two
+    basenames differ precisely because both primitives can run in one workflow, and a
+    shared name would resume the second onto the first's map.
+
+    Note `mint-annotation-features` writes TWO Parquets and binds only one: the map
+    keyed by the annotation's natural key is the OUTPUT, while the sequence_hash →
+    feature_idx map it mints through (`MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME`) is an
+    intermediate that nothing downstream reads. Resuming onto the intermediate would
+    hand `reference_load` a file with an entirely different schema, so the two must not
+    be confused here."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
         return {entry.outputs[0]: attempt_workspace / MINT_FEATURES_OUTPUT_BASENAME}
     if entry.name == LibraryPrimitive.MINT_ANNOTATION_FEATURES:
-        return {entry.outputs[0]: attempt_workspace / MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME}
+        return {entry.outputs[0]: attempt_workspace / MINT_ANNOTATION_MAP_OUTPUT_BASENAME}
     return {}
 
 
@@ -312,23 +319,20 @@ async def _run_action_primitive(
         # Resolved by fixed binding NAME, not positionally, so a YAML reorder cannot
         # silently swap the annotation manifest for the sequence one — they have
         # overlapping column names and the swap would mint the wrong features.
-        if set(entry.inputs) != {"annotation_manifest", "manifest", "feature_map"}:
+        if set(entry.inputs) != {"annotation_manifest", "feature_map"}:
             raise RuntimeError(
                 "mint-annotation-features expects inputs "
-                f"[annotation_manifest, manifest, feature_map]; got {entry.inputs!r}"
+                f"[annotation_manifest, feature_map]; got {entry.inputs!r}"
             )
-        annotation_feature_map_path, _, _ = await LIBRARY[
-            LibraryPrimitive.MINT_ANNOTATION_FEATURES
-        ](
+        annotation_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_ANNOTATION_FEATURES](
             pool,
             scope_target["reference_idx"],
             Path(bound["annotation_manifest"]),
-            Path(bound["manifest"]),
             Path(bound["feature_map"]),
             workspace,
         )
-        # YAML declares one output ("annotation_feature_map"); bind it.
-        return {entry.outputs[0]: annotation_feature_map_path}
+        # YAML declares one output ("annotation_map"); bind it.
+        return {entry.outputs[0]: annotation_map_path}
 
     if entry.name == LibraryPrimitive.WRITE_MEMBERSHIP:
         feature_map_path = Path(bound[entry.inputs[0]])

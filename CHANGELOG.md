@@ -50,9 +50,30 @@ duplicates further down are historical strata; leave them where they are.
     including an anti-vacuity control proving the closed form gives a different
     (wrong) answer.
   - A GFF3 with a `seqid` absent from the FASTA, an interval running off the end
-    of its parent, an inverted interval, or a duplicate annotation ID is a hard
-    failure, not a warning — each silently corrupts a depth number rather than
-    crashing.
+    of its parent, or an inverted interval is a hard failure, not a warning — each
+    silently corrupts a depth number rather than crashing.
+  - **An annotation's identity is a minted `annotation_idx` (BIGINT), not the GFF3
+    `ID`.** The spec lets a DISCONTINUOUS feature (a ribosomal-slippage CDS) repeat
+    one `ID` across several lines — NCBI's RefSeq annotation of E. coli K-12 MG1655
+    carries 20 such repeats — so the `ID` is neither unique nor required. It is
+    stored as provenance; nothing joins on it. The occurrence is keyed on its
+    NATURAL key (parent + window + type + strand), which is what makes a re-ingest
+    idempotent. `feature_idx` is not the identity either: identical bases share one
+    (a bacterial 16S occurs in 5–7 byte-identical copies), so a feature is a
+    SEQUENCE and an annotation is an OCCURRENCE of it at a place.
+  - **New annotation catalog: `qiita.annotation_term` + `qiita.annotation_to_term`.**
+    The SEMANTICS of an annotation ('16S rRNA' / `RF00177`) are one row per
+    `(system, system_id)`, shared across every occurrence and every reference — the
+    same global dedup `qiita.feature` gets — with a MANY-TO-MANY junction to the
+    occurrence. Many-to-many because one interval routinely carries several
+    cross-references at once: in that same RefSeq file 4,816 features carry three
+    `Dbxref` entries and 4,161 carry five, spanning six systems. `definition` and
+    `version` are nullable by necessity — `product` is present on only ~50% of a
+    RefSeq file's rows, and GFF3 has nowhere to record an annotation database's
+    version at all.
+  - GFF3 `score` and `phase` are now persisted (both nullable — `score` is empty on
+    100% of real RefSeq and prokka rows, `phase` only on CDS), as is `source`. The
+    interval's length is *not* stored: it is `stop_position - position`.
   - New DuckLake table `reference_annotation` (created by `ensure_reference_tables`
     at data-plane boot; readable over Flight; purged by `delete_reference`), plus a
     Postgres twin `qiita.reference_annotation` holding the reference's *claim* on
@@ -61,10 +82,28 @@ duplicates further down are historical strata; leave them where they are.
     claim tables) could not see annotated features at all, and every one of them
     would survive `DELETE /reference/{idx}` forever while the data plane deleted its
     lake rows — the two stores disagreeing about which features exist.
-    `ReferenceDeleteResponse` gains `annotation_deleted`.
+    `ReferenceDeleteResponse` gains `annotation_deleted`,
+    `annotation_term_link_deleted` and `annotation_term_deleted`. The lake's raw
+    `attributes` MAP is kept alongside the normalized terms, so a system we do not
+    yet parse stays recoverable without a re-ingest.
 
 ### Fixed
 
+- **`--gff` was unusable on prokka and bakta output (#269).** Both annotators always
+  append the genome to their GFF3 as a `##FASTA` section, and miint's `read_gff` does
+  not stop there — it returns one row per line of the embedded FASTA, with the
+  nucleotide line itself in `seqid` and NULL in every other column (a real prokka file
+  gives 1,638 rows for 99 features). Those rows reached the parent check and killed the
+  ingest with a misleading error. They are identified by a NULL `type` — which a GFF3
+  feature line cannot have — and dropped. Pinned, with an anti-vacuity control, by
+  `test_annotation_ingest_smoke.py`.
+- **`--gff` rejected NCBI RefSeq (#269).** Two independent reasons, both fixed: the
+  duplicate-`ID` hard failure (see the `annotation_idx` note above — repeated IDs are
+  valid GFF3), and the `region` landmark line that every NCBI record opens with. A
+  landmark declares the extent of the sequence rather than annotating an interval of
+  it, so it necessarily spans its whole parent and would hash to the PARENT's
+  `feature_idx`. Landmark types are now dropped by type; a row of any *other* type
+  spanning its whole parent still raises, since that is genuinely ambiguous.
 - **`align-plan` would have `TypeError`d on every submission once #268 and #270 were
   both on `main` (#269).** A semantic merge conflict, invisible to either PR's CI:
   #270 added two required keyword arguments to `_build_mask_params`

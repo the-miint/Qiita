@@ -401,11 +401,17 @@ class ReferenceDeleteResponse(BaseModel):
 
     A reference claims a feature in two ways, and `orphan_feature_count` spans
     both: as a MEMBER (`membership_deleted`) and as an ANNOTATED INTERVAL
-    (`annotation_deleted`)."""
+    (`annotation_deleted`).
+
+    `annotation_term_deleted` counts ORPHANED terms — a term is global, shared across
+    every reference that cites it, so it goes only once no surviving annotation
+    anywhere still links to it. Same orphan rule `orphan_feature_count` reports."""
 
     reference_idx: Annotated[int, Field(gt=0)]
     membership_deleted: int
     annotation_deleted: int
+    annotation_term_link_deleted: int
+    annotation_term_deleted: int
     index_deleted: int
     work_ticket_deleted: int
     orphan_feature_count: int

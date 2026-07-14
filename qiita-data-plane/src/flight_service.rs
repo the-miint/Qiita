@@ -206,6 +206,7 @@ const ALLOWED_TABLES: &[&str] = &[
 const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "feature_idx",
     "parent_feature_idx",
+    "annotation_idx",
     "reference_idx",
     "node_index",
     "mask_idx",

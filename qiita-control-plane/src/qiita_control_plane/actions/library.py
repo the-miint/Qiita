@@ -75,6 +75,22 @@ MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
 # path in runner._reconstruct rebuilds each output by basename — one shared name
 # would have the two collide and silently resume onto the wrong map.
 MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME = "annotation_feature_map.parquet"
+# The second output of mint-annotation-features: the minted annotation_idx for each
+# interval, keyed by the annotation's NATURAL key (parent + window + type + strand).
+# reference_load joins it to put annotation_idx on every lake row, which is what lets
+# a lake row point back at its Postgres claim. Same no-drift reason as the two above.
+MINT_ANNOTATION_MAP_OUTPUT_BASENAME = "annotation_map.parquet"
+
+# GFF3 attributes carrying cross-references into an annotation authority, in the two
+# spellings the common annotators use (`Dbxref` is GFF3-spec and what NCBI emits;
+# `db_xref` is the GenBank-derived spelling prokka copies). Each holds a COMMA-SEPARATED
+# list — in NCBI's E. coli RefSeq, 4816 features carry three of them and 4161 carry five,
+# across six systems — which is why qiita.annotation_to_term is many-to-many.
+_GFF_XREF_KEYS = ("Dbxref", "db_xref")
+# GFF3 attributes that carry a human-readable meaning, best first. `product` is the real
+# one but sits on only about half the rows of a RefSeq file (genes have none, only their
+# CDS children do), so a term's `definition` stays NULLABLE and this is a best-effort.
+_GFF_DEFINITION_KEYS = ("product", "Name", "gene")
 
 
 # =============================================================================
@@ -432,36 +448,49 @@ async def mint_annotation_features(
     pool: asyncpg.Pool,
     reference_idx: int,
     annotation_manifest_path: Path,
-    manifest_path: Path,
     feature_map_path: Path,
     output_dir: Path,
-) -> tuple[Path, int, int]:
-    """Mint a feature_idx for each ANNOTATED INTERVAL in hash_sequences'
-    `annotation_manifest.parquet`, write `annotation_feature_map.parquet`
-    (sequence_hash → feature_idx) into `output_dir`, and record the reference's
-    claim on those features in `qiita.reference_annotation`.
+) -> tuple[Path, Path, int, int]:
+    """Mint the identifiers an annotated interval needs, and record the reference's
+    claim on them.
 
-    The minting half is `mint_features` pointed at a different manifest — it only
-    ever reads `sequence_hash` and never touches a reference table, so an interval's
-    sub-sequence hash mints exactly like a whole sequence's. That is the point: an
-    insert also ingested standalone deduplicates onto the SAME feature_idx lake-wide,
-    for free.
+    Three things get minted or resolved here, and they are different kinds of identity:
 
-    **Why it must also write `qiita.reference_annotation`.** Annotated intervals are
-    deliberately NOT in `reference_membership` (membership is what gets INDEXED), so
-    without this claim row `delete_reference_cascade` cannot see them and every
-    annotated feature would survive `DELETE /reference/{idx}` forever. Full rationale
-    in the `20260713020000_reference_annotation.sql` migration header.
+    * a **feature_idx** per interval, from the canonical hash of its EXTRACTED
+      sub-sequence. This is the identity of the interval's BYTES. Two occurrences with
+      byte-identical bases legitimately share one — a bacterial 16S occurs in 5-7
+      identical copies — and an insert also ingested standalone deduplicates onto the
+      same feature_idx lake-wide, for free.
+    * an **annotation_idx** per interval, minted against the annotation's NATURAL key
+      (parent + window + type + strand). This is the identity of the OCCURRENCE, and it
+      is what the lake rows and the term links point at. Deliberately not the GFF3 `ID`,
+      which the spec permits to repeat across the lines of a discontinuous feature (NCBI's
+      E. coli RefSeq has 20 such repeats) and which may be absent entirely.
+    * an **annotation_term_idx** per (system, system_id) cross-reference. This is the
+      identity of the MEANING — '16S rRNA / RF00177' — shared across every occurrence and
+      every reference that observes it.
 
-    `manifest_path` + `feature_map_path` are the SEQUENCE side's manifest and map —
-    needed only to resolve each interval's `parent_feature_idx` (the annotation
-    manifest's `parent_read_id` → the sequence manifest's `read_id` → its
-    `sequence_hash` → its `feature_idx`). Neither is minted from.
+    The step's OUTPUT is `annotation_map.parquet` — natural key → annotation_idx, with
+    the interval's feature_idx and its parent's alongside — which `reference_load` joins
+    so that every lake row carries the annotation_idx of its Postgres claim.
+    (`mint_features` writes its usual sequence_hash → feature_idx map on the way, into the
+    same workspace; it is an intermediate of the mint, not a consumed artifact.)
+
+    **Why the claim rows must exist at all.** Annotated intervals are deliberately NOT in
+    reference_membership (membership is what gets INDEXED, and reads align to the parent,
+    never to the bare insert), so without a claim row `delete_reference_cascade` cannot
+    see them and every annotated feature would survive `DELETE /reference/{idx}` forever
+    while the data plane deleted its lake rows. Full rationale in the
+    `20260713020000_reference_annotation.sql` migration header.
+
+    `feature_map_path` is the SEQUENCE side's map, read only to resolve each interval's
+    `parent_feature_idx` — the manifest carries the parent's `sequence_hash`, so this is
+    a fixed-width UUID join rather than one through a VARCHAR read_id.
 
     Deliberately no `genome_map_path`: an interval is not a genome.
 
-    Returns (annotation_feature_map_path, minted, reused). Idempotent for the same
-    reasons `mint_features` is — the claim rows go in ON CONFLICT DO NOTHING.
+    Returns (annotation_map_path, minted, reused). Idempotent for the same reasons
+    `mint_features` is — every write below upserts.
     """
     annotation_feature_map_path, minted, reused = await mint_features(
         pool,
@@ -469,15 +498,21 @@ async def mint_annotation_features(
         output_dir,
         output_basename=MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME,
     )
-    await _write_annotation_claims(
+    annotation_map_path = await _write_annotation_claims(
         pool,
         reference_idx,
         annotation_manifest_path=annotation_manifest_path,
         annotation_feature_map_path=annotation_feature_map_path,
-        manifest_path=manifest_path,
+        feature_map_path=feature_map_path,
+        output_dir=output_dir,
+    )
+    await _write_annotation_terms(
+        pool,
+        reference_idx,
+        annotation_manifest_path=annotation_manifest_path,
         feature_map_path=feature_map_path,
     )
-    return annotation_feature_map_path, minted, reused
+    return annotation_map_path, minted, reused
 
 
 async def _write_annotation_claims(
@@ -486,35 +521,268 @@ async def _write_annotation_claims(
     *,
     annotation_manifest_path: Path,
     annotation_feature_map_path: Path,
-    manifest_path: Path,
+    feature_map_path: Path,
+    output_dir: Path,
+) -> Path:
+    """UPSERT one `qiita.reference_annotation` row per interval and write the resulting
+    natural-key → annotation_idx map to `annotation_map.parquet`.
+
+    The UPSERT is `ON CONFLICT (natural key) DO UPDATE`, not `DO NOTHING`: a re-ingest of
+    the same reference must return the EXISTING annotation_idx for every row, and
+    `DO NOTHING` returns nothing for the rows that conflicted — which would silently leave
+    them out of the map and out of the lake.
+
+    A row whose interval or parent cannot be resolved off the feature maps is a hard
+    error, not a skip: it would mean the GFF named a sequence the FASTA never hashed,
+    which `hash_sequences` already rejects — reaching here means the manifests disagree,
+    and the honest outcome is a failed ticket rather than a silently under-claimed
+    reference that later leaks features on delete.
+
+    **The zero-annotation early-out is not an optimisation, it is the common path.** Every
+    reference-add reaches here, and almost none carry a GFF3. The join below would
+    hash-build `feature_map.parquet` as its build side — the WHOLE reference, even against
+    an empty annotation manifest — inside the control-plane process, on the event loop.
+    Measured: ~200 ms and ~1 GB of un-spillable RSS at 20M features. The `count(*)` that
+    avoids it is a Parquet footer read, sub-millisecond at any scale.
+
+    Streaming + `to_thread` for the same reason `mint_features` does it: this runs
+    in-process on the CP's single event loop, and the `--gff` contract advertises a
+    genome's gene coordinates — a eukaryotic GFF3 is millions of rows, not the handful a
+    plasmid map carries.
+    """
+    out_path = output_dir / MINT_ANNOTATION_MAP_OUTPUT_BASENAME
+    read_conn = duckdb.connect(":memory:")
+    write_conn = duckdb.connect(":memory:")
+    try:
+        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires preserve_insertion_order=false —
+        # DuckDB errors at BIND time otherwise, so this fires on the zero-annotation
+        # write too (i.e. on every reference-add, GFF3 or not). Same rule as
+        # mint_features' write connection; the COPY's explicit ORDER BY is what actually
+        # clusters the row groups.
+        write_conn.execute("SET preserve_insertion_order=false")
+        write_conn.execute(
+            "CREATE TABLE annotation_map ("
+            "  annotation_idx BIGINT, feature_idx BIGINT, parent_feature_idx BIGINT,"
+            "  position BIGINT, stop_position BIGINT,"
+            "  annotation_type VARCHAR, strand VARCHAR"
+            ")"
+        )
+
+        # Footer-only count first: on the no-GFF path this is the entire cost. The empty
+        # map is still WRITTEN — reference_load binds it unconditionally, so an absent
+        # file is a FileNotFoundError, not an absent annotation set.
+        expected = read_conn.execute(
+            "SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest_path)]
+        ).fetchone()[0]
+        if expected == 0:
+            _copy_annotation_map(write_conn, out_path)
+            return out_path
+
+        read_conn.execute("SET preserve_insertion_order=false")
+        reader = read_conn.execute(
+            "SELECT afm.feature_idx, "
+            "       fm.feature_idx AS parent_feature_idx, "
+            "       am.position, am.stop_position, am.annotation_type, am.strand, "
+            "       am.annotation_id, am.score, am.phase "
+            "FROM read_parquet(?) am "
+            "JOIN read_parquet(?) afm ON afm.sequence_hash = am.sequence_hash "
+            "JOIN read_parquet(?) fm ON fm.sequence_hash = am.parent_sequence_hash",
+            [
+                str(annotation_manifest_path),
+                str(annotation_feature_map_path),
+                str(feature_map_path),
+            ],
+        ).to_arrow_reader(_CHUNK_SIZE)
+
+        resolved = 0
+        for batch in reader:
+            if not batch.num_rows:
+                continue
+            resolved += batch.num_rows
+            cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
+            async with pool.acquire() as conn, conn.transaction():
+                rows = await conn.fetch(
+                    "INSERT INTO qiita.reference_annotation"
+                    " (reference_idx, feature_idx, parent_feature_idx, position,"
+                    "  stop_position, annotation_type, strand, annotation_id, score, phase)"
+                    " SELECT $1, * FROM unnest($2::bigint[], $3::bigint[], $4::bigint[],"
+                    "                          $5::bigint[], $6::text[], $7::text[],"
+                    "                          $8::text[], $9::double precision[],"
+                    "                          $10::smallint[])"
+                    " ON CONFLICT ON CONSTRAINT reference_annotation_natural_key"
+                    " DO UPDATE SET annotation_id = EXCLUDED.annotation_id,"
+                    "               score = EXCLUDED.score,"
+                    "               phase = EXCLUDED.phase"
+                    " RETURNING annotation_idx, feature_idx, parent_feature_idx, position,"
+                    "           stop_position, annotation_type, strand",
+                    reference_idx,
+                    cols["feature_idx"],
+                    cols["parent_feature_idx"],
+                    cols["position"],
+                    cols["stop_position"],
+                    cols["annotation_type"],
+                    cols["strand"],
+                    cols["annotation_id"],
+                    cols["score"],
+                    cols["phase"],
+                )
+            write_conn.executemany(
+                "INSERT INTO annotation_map VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        r["annotation_idx"],
+                        r["feature_idx"],
+                        r["parent_feature_idx"],
+                        r["position"],
+                        r["stop_position"],
+                        r["annotation_type"],
+                        r["strand"],
+                    )
+                    for r in rows
+                ],
+            )
+
+        # An unresolvable interval (or parent) means the manifests disagree — the join
+        # dropped a row. Fail rather than under-claim: an unclaimed annotated feature is
+        # exactly the leak the claim table exists to close.
+        if resolved != expected:
+            raise ValueError(
+                f"reference {reference_idx}: resolved {resolved} annotation claim(s) from "
+                f"{expected} annotation(s) — an interval's feature_idx or its parent's "
+                "could not be resolved from the feature maps"
+            )
+        await asyncio.to_thread(_copy_annotation_map, write_conn, out_path)
+    finally:
+        read_conn.close()
+        write_conn.close()
+    return out_path
+
+
+def _copy_annotation_map(write_conn: duckdb.DuckDBPyConnection, out_path: Path) -> None:
+    out = validate_parquet_path(out_path)
+    write_conn.execute(
+        f"COPY (SELECT * FROM annotation_map ORDER BY annotation_idx) TO '{out}' ({PARQUET_OPTS})"
+    )
+
+
+async def _links_exist(conn: asyncpg.Connection, reference_idx: int) -> bool:
+    """Does this reference already have ANY annotation-term link? Distinguishes a re-run
+    (every link already present, so `ON CONFLICT DO NOTHING` writes zero) from a genuinely
+    unresolvable batch (a first run that wrote zero because nothing joined)."""
+    return bool(
+        await conn.fetchval(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM qiita.annotation_to_term l"
+            "  JOIN qiita.reference_annotation ra ON ra.annotation_idx = l.annotation_idx"
+            "  WHERE ra.reference_idx = $1)",
+            reference_idx,
+        )
+    )
+
+
+def _exploded_xref_cte() -> str:
+    """CTE projecting one row per (annotation, cross-reference) pair out of the manifest.
+
+    A GFF3 packs the cross-references of one feature into a single COMMA-SEPARATED
+    attribute value (`Dbxref=ASAP:ABE-0000006,ECOCYC:EG11277,GeneID:944742`), so the
+    unnest here is what turns one interval into the several terms it actually asserts —
+    the thing a single annotation → term FK could not have represented.
+
+    Each entry splits on its FIRST colon only: the system itself may contain one
+    (`UniProtKB/Swiss-Prot:P0AD86` is system `UniProtKB/Swiss-Prot`, id `P0AD86`).
+    """
+    xref = ", ".join(f"am.attributes['{k}']" for k in _GFF_XREF_KEYS)
+    definition = ", ".join(f"am.attributes['{k}']" for k in _GFF_DEFINITION_KEYS)
+    return (
+        "WITH raw AS ("
+        "  SELECT fm.feature_idx AS parent_feature_idx, "
+        "         am.position, am.stop_position, am.annotation_type, am.strand, "
+        f"        coalesce({definition}) AS definition, "
+        f"        unnest(str_split(coalesce({xref}), ',')) AS entry "
+        "  FROM read_parquet(?) am "
+        "  JOIN read_parquet(?) fm ON fm.sequence_hash = am.parent_sequence_hash "
+        f" WHERE coalesce({xref}) IS NOT NULL"
+        "), "
+        "exploded AS ("
+        "  SELECT parent_feature_idx, position, stop_position, annotation_type, strand, "
+        "         definition, "
+        "         trim(split_part(entry, ':', 1)) AS system, "
+        # Everything AFTER the first colon — `split_part(.., 2)` would truncate an id
+        # that itself contains one, and a system like UniProtKB/Swiss-Prot pairs with ids
+        # that do.
+        "         trim(substr(entry, strpos(entry, ':') + 1)) AS system_id "
+        "  FROM raw "
+        "  WHERE strpos(entry, ':') > 1"
+        ") "
+    )
+
+
+def _term_grain_sql() -> str:
+    """One row per DISTINCT (system, system_id) — the grain of `qiita.annotation_term`.
+
+    **This grain is load-bearing, not a tidy-up.** Postgres raises `cardinality_violation`
+    ("ON CONFLICT DO UPDATE command cannot affect row a second time") if a single INSERT
+    proposes two rows with the same conflict key. Cross-references are cited by many
+    annotations at once — an NCBI `gene` line and its `CDS` child both carry the same
+    `GeneID:` — so a projection at the ANNOTATION grain hands the term UPSERT the same
+    (system, system_id) twice and raises on any real GFF3.
+
+    `max(definition)` collapses the group and is NOT arbitrary: within a batch the same
+    accession is cited by rows that disagree about whether they carry a `product` at all
+    (a RefSeq gene has none, its CDS child does), and `max` ignores NULLs — so the row
+    that knows the meaning wins over the row that doesn't. The cross-BATCH case is
+    handled by the coalesce in the UPSERT's DO UPDATE.
+    """
+    return (
+        _exploded_xref_cte() + "SELECT system, system_id, max(definition) AS definition "
+        "FROM exploded GROUP BY system, system_id"
+    )
+
+
+def _link_grain_sql() -> str:
+    """One row per (annotation, term) link — the grain of `qiita.annotation_to_term`.
+
+    Safe to leave at the annotation grain (unlike the term insert above) because the link
+    INSERT is `ON CONFLICT DO NOTHING`, which tolerates duplicate proposed rows rather
+    than raising.
+    """
+    return (
+        _exploded_xref_cte()
+        + "SELECT DISTINCT parent_feature_idx, position, stop_position, annotation_type, "
+        "       strand, system, system_id FROM exploded"
+    )
+
+
+async def _write_annotation_terms(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    *,
+    annotation_manifest_path: Path,
     feature_map_path: Path,
 ) -> int:
-    """INSERT this reference's `(annotation_id, feature_idx, parent_feature_idx)`
-    annotation claims.
+    """UPSERT `qiita.annotation_term` and link it to each occurrence via
+    `qiita.annotation_to_term`.
 
-    Resolves both idx values off the two feature maps in DuckDB (the annotation map
-    for the interval, mint-features' map for the parent, reached through the
-    manifest's `read_id`), then upserts. A row whose parent cannot be resolved is a
-    hard error, not a skip: it would mean the GFF named a sequence the FASTA never
-    hashed, which `hash_sequences` already rejects — reaching here means the two
-    manifests disagree, and the honest outcome is a failed ticket rather than a
-    silently under-claimed reference that later leaks features on delete.
+    A term is GLOBAL, deduplicated on (system, system_id) across every reference — the
+    same way qiita.feature is global across every reference. '16S rRNA / RF00177' means
+    the same thing whichever collection observed it, so the second reference to mention it
+    reuses the first one's annotation_term_idx rather than minting a parallel row.
 
-    **The zero-annotation early-out is not an optimisation, it is the common path.**
-    Every reference-add reaches here, and almost none carry a GFF3. The join below
-    hash-builds `feature_map.parquet` as its build side — the WHOLE reference, even
-    against an empty annotation manifest — inside the control-plane process, on the
-    event loop. Measured: ~200 ms and ~1 GB of un-spillable RSS at 20M features. The
-    `count(*)` that avoids it is a Parquet footer read, sub-millisecond at any scale.
+    `definition` is filled in on first sight and never overwritten with a NULL, because
+    the row that teaches us the meaning may not be the first row that cites the
+    accession (a RefSeq gene carries the xref but no `product`; its CDS child carries
+    both).
 
-    Streaming + `to_thread` for the same reason `mint_features` does it (see its
-    docstring): this runs in-process on the CP's single event loop, and the `--gff`
-    contract advertises a genome's gene coordinates — a eukaryotic GFF3 is millions
-    of rows, not the handful a plasmid map carries.
+    **Two passes, at two different grains, and they may not be merged.** The terms go in
+    first, one row per (system, system_id) — see `_term_grain_sql`, where the grain is
+    what keeps Postgres from raising `cardinality_violation` on a single UPSERT that
+    proposes the same accession twice. The links follow, one row per (annotation, term),
+    and can only be resolved once the terms they point at exist.
+
+    Returns the number of (annotation, term) links written or already present.
     """
     read_conn = duckdb.connect(":memory:")
     try:
-        # Footer-only count first: on the no-GFF path this is the entire cost.
         expected = read_conn.execute(
             "SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest_path)]
         ).fetchone()[0]
@@ -522,52 +790,89 @@ async def _write_annotation_claims(
             return 0
 
         read_conn.execute("SET preserve_insertion_order=false")
-        reader = read_conn.execute(
-            "SELECT am.annotation_id, afm.feature_idx, fm.feature_idx AS parent_feature_idx "
-            "FROM read_parquet(?) am "
-            "JOIN read_parquet(?) afm ON afm.sequence_hash = am.sequence_hash "
-            "JOIN read_parquet(?) m ON m.read_id = am.parent_read_id "
-            "JOIN read_parquet(?) fm ON fm.sequence_hash = m.sequence_hash",
-            [
-                str(annotation_manifest_path),
-                str(annotation_feature_map_path),
-                str(manifest_path),
-                str(feature_map_path),
-            ],
-        ).to_arrow_reader(_CHUNK_SIZE)
+        params = [str(annotation_manifest_path), str(feature_map_path)]
 
-        resolved = 0
-        for batch in reader:
-            annotation_ids = batch.column("annotation_id").to_pylist()
-            if not annotation_ids:
+        # PASS 1 — the terms themselves.
+        terms = read_conn.execute(_term_grain_sql(), params).to_arrow_reader(_CHUNK_SIZE)
+        for batch in terms:
+            if not batch.num_rows:
                 continue
-            feature_idxs = batch.column("feature_idx").to_pylist()
-            parents = batch.column("parent_feature_idx").to_pylist()
-            resolved += len(annotation_ids)
+            cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
             async with pool.acquire() as conn, conn.transaction():
                 await conn.execute(
-                    "INSERT INTO qiita.reference_annotation"
-                    " (reference_idx, annotation_id, feature_idx, parent_feature_idx)"
-                    " SELECT $1, * FROM unnest($2::text[], $3::bigint[], $4::bigint[])"
-                    " ON CONFLICT DO NOTHING",
-                    reference_idx,
-                    annotation_ids,
-                    feature_idxs,
-                    parents,
+                    "INSERT INTO qiita.annotation_term (system, system_id, definition)"
+                    " SELECT * FROM unnest($1::text[], $2::text[], $3::text[])"
+                    " ON CONFLICT ON CONSTRAINT annotation_term_identity"
+                    # Never overwrite a known meaning with a NULL: across batches, the row
+                    # that carries the `product` may arrive after the row that doesn't.
+                    " DO UPDATE SET definition ="
+                    "     coalesce(qiita.annotation_term.definition, EXCLUDED.definition)",
+                    cols["system"],
+                    cols["system_id"],
+                    cols["definition"],
                 )
+
+        # PASS 2 — the links, now that every term they name is resolvable.
+        links = read_conn.execute(_link_grain_sql(), params).to_arrow_reader(_CHUNK_SIZE)
+        linked = 0
+        for batch in links:
+            if not batch.num_rows:
+                continue
+            cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
+            async with pool.acquire() as conn, conn.transaction():
+                # Resolve BOTH sides by their natural keys in one statement: the
+                # occurrence by (reference, parent, window, type, strand) and the term by
+                # (system, system_id). Nothing is carried across statements, so a retry
+                # of this batch is a no-op rather than a duplicate-link risk.
+                #
+                # An INNER JOIN on both sides, so a link whose annotation or term cannot
+                # be resolved is DROPPED rather than written half-formed — which is why
+                # the caller asserts the count below rather than trusting it.
+                written = int(
+                    (
+                        await conn.execute(
+                            "INSERT INTO qiita.annotation_to_term"
+                            " (annotation_idx, annotation_term_idx)"
+                            " SELECT ra.annotation_idx, t.annotation_term_idx"
+                            " FROM unnest($2::bigint[], $3::bigint[], $4::bigint[],"
+                            "             $5::text[], $6::text[], $7::text[], $8::text[])"
+                            "   AS i(parent_feature_idx, position, stop_position,"
+                            "        annotation_type, strand, system, system_id)"
+                            " JOIN qiita.reference_annotation ra"
+                            "   ON ra.reference_idx = $1"
+                            "  AND ra.parent_feature_idx = i.parent_feature_idx"
+                            "  AND ra.position = i.position"
+                            "  AND ra.stop_position = i.stop_position"
+                            "  AND ra.annotation_type = i.annotation_type"
+                            "  AND ra.strand = i.strand"
+                            " JOIN qiita.annotation_term t"
+                            "   ON t.system = i.system AND t.system_id = i.system_id"
+                            " ON CONFLICT DO NOTHING",
+                            reference_idx,
+                            cols["parent_feature_idx"],
+                            cols["position"],
+                            cols["stop_position"],
+                            cols["annotation_type"],
+                            cols["strand"],
+                            cols["system"],
+                            cols["system_id"],
+                        )
+                    ).split()[-1]
+                )
+                # A re-ingest legitimately writes 0 (ON CONFLICT DO NOTHING), so only the
+                # FIRST-run shortfall is detectable here — but a natural-key spelling that
+                # drifts from the UPSERT's would silently resolve NOTHING on a first run,
+                # leaving a reference whose annotations cite no terms at all. Catch that.
+                if written == 0 and batch.num_rows and not await _links_exist(conn, reference_idx):
+                    raise ValueError(
+                        f"reference {reference_idx}: {batch.num_rows} annotation-term link(s) "
+                        "resolved to nothing — the natural key used to look up an annotation "
+                        "no longer matches the one it was minted against"
+                    )
+                linked += written
+        return linked
     finally:
         read_conn.close()
-
-    # An unresolvable interval (or parent) means the manifests disagree — the join
-    # dropped a row. Fail rather than under-claim: an unclaimed annotated feature is
-    # exactly the leak this table exists to close.
-    if resolved != expected:
-        raise ValueError(
-            f"reference {reference_idx}: resolved {resolved} annotation claim(s) from "
-            f"{expected} annotation(s) — an interval's feature_idx or its parent's could "
-            "not be resolved from the feature maps"
-        )
-    return resolved
 
 
 async def write_membership(

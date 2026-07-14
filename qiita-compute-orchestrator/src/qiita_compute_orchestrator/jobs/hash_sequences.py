@@ -93,6 +93,31 @@ from ._feature_load import bin_pack_by_chunks
 
 YAML_STEP_NAME = "hash_sequences"
 
+# GFF3 LANDMARK types: rows that declare the extent of the sequence itself rather than
+# annotate an interval of it. NCBI ships one `region` line per record, and every one of
+# them spans its parent end to end — so they extract the parent's own bytes, hash to the
+# PARENT's feature_idx, and are not annotated features at all. Dropped at ingest.
+#
+# These are the SO terms GFF3 sanctions as landmarks; matched case-insensitively.
+_GFF_LANDMARK_TYPES = frozenset(
+    {
+        "region",
+        "chromosome",
+        "contig",
+        "scaffold",
+        "supercontig",
+        "sequence_assembly",
+        "biological_region",
+    }
+)
+
+
+def _sql_string(value: str) -> str:
+    """Quote a Python string as a SQL string LITERAL."""
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
 # DuckDB resource caps for this step. With the read_id-batched
 # pipeline below, peak memory per batch ≈ batch_size × avg record
 # size (~50K × ~30 KB ≈ 1.5 GB, ~10 GB worst case if a batch lands
@@ -350,18 +375,36 @@ def _write_annotation_manifest(
     carrying the canonical hash of the EXTRACTED sub-sequence so
     `mint-annotation-features` can mint it a feature_idx of its own.
 
-    Emitted shape (`sequence_hash` is the only column minting reads; the rest ride
+    Emitted shape (the two hashes are what the control plane joins on; the rest ride
     along for `reference_load`):
 
-        annotation_id       VARCHAR  -- the interval's identity within the reference
-        sequence_hash       UUID     -- canonical hash of the extracted interval
-        sequence_length_bp  BIGINT   -- interval length
-        parent_read_id      VARCHAR  -- GFF seqid == the parent FASTA read_id
-        annotation_type     VARCHAR  -- GFF3 column 3
-        strand              VARCHAR
-        position            BIGINT   -- 1-based INCLUSIVE  (unchanged from GFF)
-        stop_position       BIGINT   -- 1-based EXCLUSIVE  (GFF stop + 1)
-        attributes          MAP(VARCHAR, VARCHAR)
+        sequence_hash        UUID     -- canonical hash of the EXTRACTED interval;
+                                         mints the interval's own feature_idx
+        parent_sequence_hash UUID     -- canonical hash of the PARENT; resolves
+                                         parent_feature_idx without a VARCHAR join
+        parent_read_id       VARCHAR  -- GFF seqid == parent FASTA read_id. Provenance
+                                         and error messages only — nothing keys on it.
+        annotation_id        VARCHAR  -- GFF3 `ID`. NULLABLE, and NOT unique. Provenance.
+        source               VARCHAR  -- GFF3 column 2 (the annotating tool/authority)
+        annotation_type      VARCHAR  -- GFF3 column 3
+        position             BIGINT   -- 1-based INCLUSIVE  (unchanged from GFF)
+        stop_position        BIGINT   -- 1-based EXCLUSIVE  (GFF stop + 1)
+        strand               VARCHAR  -- '+' / '-' / '.' / '?' — never NULL
+        score                DOUBLE   -- GFF3 column 6, NULLABLE
+        phase                SMALLINT -- GFF3 column 8, NULLABLE (CDS rows only)
+        attributes           MAP(VARCHAR, VARCHAR)
+
+    **`annotation_id` is provenance, not identity.** It is neither unique nor
+    required. GFF3 permits a DISCONTINUOUS feature (a ribosomal-slippage CDS) to
+    span several lines that all carry the SAME `ID` — NCBI's RefSeq annotation of
+    E. coli K-12 MG1655 has 20 such repeats, so keying on it rejects the single most
+    standard bacterial annotation there is. The row's identity is a BIGINT
+    `annotation_idx` minted by the control plane against the NATURAL key below;
+    nothing joins on the GFF3 string.
+
+    The natural key is `(parent, position, stop_position, annotation_type, strand)`,
+    and the manifest is deduplicated on it here so that a GFF3 repeating a line
+    verbatim cannot produce two lake rows sharing one minted `annotation_idx`.
 
     **The closed → half-open conversion happens HERE and nowhere else.** `read_gff`
     emits GFF3's 1-based CLOSED `[start, end]`; every alignment-side consumer
@@ -382,6 +425,25 @@ def _write_annotation_manifest(
     cannot acquire a divergent schema — the alternative, a hand-declared empty
     table, is a second schema declaration that drifts the moment `read_gff`'s column
     types change.
+
+    **Two classes of row are dropped before anything else looks at them**, and both
+    are the common case rather than a corner one:
+
+    `read_gff` does not stop at a `##FASTA` directive — it keeps going and returns
+    one row per line of the embedded FASTA, with the sequence line itself in `seqid`
+    and NULL in every other column. prokka and bakta both ALWAYS append the genome
+    that way, so on a real prokka GFF3 `read_gff` returns 1638 rows for 99 features.
+    Those rows are identified by a NULL `type` (a GFF3 feature line cannot have one)
+    and dropped. Without the filter they reach the parent check and the ingest dies
+    complaining that a line of nucleotides is not a sequence in the FASTA.
+
+    GFF3 LANDMARK rows (`region`, `chromosome`, `contig`, ...) declare the extent of
+    the sequence itself rather than annotating an interval of it, and NCBI ships one
+    per record. They necessarily span their whole parent, so they would hash to the
+    PARENT's feature_idx — a feature that IS in reference_membership and IS indexed —
+    quietly falsifying the invariant the annotation design rests on. They are dropped
+    by type. A row of any OTHER type that spans its entire parent is not a landmark,
+    it is ambiguous, and it still raises.
     """
     if gff_path is None:
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -390,44 +452,44 @@ def _write_annotation_manifest(
 
     # read_gff's `attributes` is already a MAP(VARCHAR,VARCHAR) — no parsing.
     #
-    # The projection is split across two levels deliberately. `annotation_id` is
-    # derived from the GFF's own CLOSED coordinates (so an ID-less interval gets the
-    # label a human reading the GFF3 file would expect, `seqid:2001-3000`), while
-    # the STORED window is half-open. Computing both in one SELECT would leave the
-    # fallback silently reading whichever `stop_position` the binder resolved —
-    # base column or alias. Naming the raw columns in an inner query removes the
-    # question entirely.
+    # The projection is split across two levels deliberately: the inner query names
+    # read_gff's raw columns, so the outer one cannot silently read whichever
+    # `stop_position` the binder resolved — base column or half-open alias.
+    #
+    # `strand` is coalesced to GFF3's own "unstranded" value rather than left NULL,
+    # which keeps it out of the NULLS-DISTINCT semantics of the natural-key UNIQUE
+    # constraint the control plane upserts against.
     conn.execute(
         "CREATE TEMP TABLE annotation AS "
         "SELECT "
-        "  coalesce("
-        "    g.attributes['ID'],"
-        "    g.seqid || ':' || g.gff_start || '-' || g.gff_stop_closed"
-        "  ) AS annotation_id, "
+        "  g.attributes['ID'] AS annotation_id, "
         "  g.seqid AS parent_read_id, "
+        "  g.source, "
         "  g.annotation_type, "
-        "  g.strand, "
+        "  coalesce(g.strand, '.') AS strand, "
         "  CAST(g.gff_start AS BIGINT) AS position, "
         # THE conversion. GFF3's stop is INCLUSIVE; we store EXCLUSIVE.
         "  CAST(g.gff_stop_closed AS BIGINT) + 1 AS stop_position, "
+        "  g.score, "
+        "  CAST(g.phase AS SMALLINT) AS phase, "
         "  g.attributes "
         "FROM ("
-        "  SELECT seqid, type AS annotation_type, strand, attributes,"
+        "  SELECT seqid, source, type AS annotation_type, strand, score, phase, attributes,"
         "         position AS gff_start, stop_position AS gff_stop_closed"
         "  FROM read_gff(?)"
+        # The ##FASTA rows. A GFF3 feature line always has a type; read_gff's
+        # embedded-FASTA rows never do. See the docstring.
+        "  WHERE type IS NOT NULL"
+        # The landmark rows (NCBI ships one per record). Not annotations.
+        #
+        # The literals are quoted for SQL, not via Python's repr() — repr switches to
+        # double quotes the moment a value contains an apostrophe, and a double-quoted
+        # string is an IDENTIFIER in SQL, not a literal.
+        "    AND lower(type) NOT IN "
+        f"        ({', '.join(_sql_string(t) for t in sorted(_GFF_LANDMARK_TYPES))})"
         ") g",
         [str(gff_path)],
     )
-
-    dupes = conn.execute(
-        "SELECT annotation_id, count(*) AS n FROM annotation "
-        "GROUP BY annotation_id HAVING count(*) > 1 ORDER BY annotation_id LIMIT 5"
-    ).fetchall()
-    if dupes:
-        raise ValueError(
-            f"{gff_path} has duplicate annotation IDs (a feature table keys on them): "
-            + ", ".join(f"{a!r} x{c}" for a, c in dupes)
-        )
 
     # A seqid must name a sequence we actually hashed, or the annotation has no
     # parent to be an interval OF.
@@ -465,22 +527,29 @@ def _write_annotation_manifest(
     # feature_idx. The resulting row would have feature_idx == parent_feature_idx,
     # pointing at a feature that IS in reference_membership and IS indexed — quietly
     # falsifying the invariant the whole annotation design rests on, with nothing
-    # raised. NCBI-style GFF3s ship exactly such lines (`region` / `source` covering
-    # 1..len), so this is the common case, not a corner one: reject it and tell the
-    # caller to drop those rows.
+    # raised.
+    #
+    # The rows that legitimately do this — GFF3 LANDMARKS, which NCBI ships one of per
+    # record — have already been dropped by type in the projection above, because a
+    # landmark declares the sequence rather than annotating an interval of it. Anything
+    # ELSE that spans its whole parent is not a landmark and not a sub-interval, and we
+    # have no basis for guessing which the author meant. Raise.
     whole = conn.execute(
-        "SELECT a.annotation_id, a.parent_read_id, h.sequence_length_bp "
+        "SELECT a.annotation_id, a.annotation_type, a.parent_read_id, h.sequence_length_bp "
         "FROM annotation a JOIN hashed h ON h.read_id = a.parent_read_id "
         "WHERE a.position = 1 AND a.stop_position = h.sequence_length_bp + 1 "
-        "ORDER BY a.annotation_id LIMIT 5"
+        "ORDER BY a.annotation_type, a.annotation_id LIMIT 5"
     ).fetchall()
     if whole:
-        detail = ", ".join(f"{aid!r} spans all {plen} bp of {p!r}" for aid, p, plen in whole)
+        detail = ", ".join(
+            f"{aid!r} ({atype}) spans all {plen} bp of {p!r}" for aid, atype, p, plen in whole
+        )
         raise ValueError(
-            f"{gff_path} has interval(s) spanning their ENTIRE parent sequence: {detail}. "
-            "Such an interval hashes to its parent's own feature_idx, so it is not a "
-            "distinct annotated feature. Drop whole-sequence rows (GFF3 `region` / "
-            "`source` lines) before ingest."
+            f"{gff_path} has non-landmark interval(s) spanning their ENTIRE parent "
+            f"sequence: {detail}. Such an interval hashes to its parent's own "
+            "feature_idx, so it is not a distinct annotated feature. GFF3 landmark "
+            f"types ({', '.join(sorted(_GFF_LANDMARK_TYPES))}) are dropped "
+            "automatically; drop these rows, or give them a real sub-interval."
         )
 
     # Reassemble only the ANNOTATED parents, batched by the same chunk budget the
@@ -515,27 +584,55 @@ def _write_annotation_manifest(
     # copies, so refusing it would make `--gff` unusable on essentially every real
     # bacterial genome — while working fine on the SynDNA plasmids that motivated
     # this code. A feature is a SEQUENCE; an annotation is an OCCURRENCE of that
-    # sequence at a place. The occurrences stay distinct because `annotation_id`,
-    # not `feature_idx`, is the annotation's identity (see the reference_annotation
-    # migration); a consumer aggregating coverage over the feature sums across them.
+    # sequence at a place. The occurrences stay distinct because they are minted an
+    # annotation_idx keyed on the natural key (see the reference_annotation migration);
+    # a consumer aggregating coverage over the feature sums across them.
+    #
+    # The extracted bases are hashed and DISCARDED — only the hash is stored. Keeping the
+    # cut sequence too would materialize the whole annotated portion of the reference a
+    # second time (on a genome GFF3 that is every coding base), and nothing reads it: the
+    # interval's bytes are recoverable from parent + window, which is the same reason
+    # annotated features get no reference_sequences row.
     cut = "substr(p.sequence, a.position, a.stop_position - a.position)"
     conn.execute(
         "CREATE TEMP TABLE annotation_extracted AS "
-        f"SELECT a.*, {cut} AS sequence, "
-        f"       {canonical_sequence_hash_expr(cut)} AS sequence_hash "
+        f"SELECT a.*, {canonical_sequence_hash_expr(cut)} AS sequence_hash "
         "FROM annotation a JOIN parent_sequence p ON p.read_id = a.parent_read_id"
     )
 
+    # `parent_sequence_hash` rather than the parent's length: the control plane's job
+    # here is to resolve parent_feature_idx, and the hash is the key that mint-features'
+    # map is already keyed by, so carrying it turns a VARCHAR read_id join into a
+    # fixed-width UUID one. The interval's own length is NOT carried — it is
+    # `stop_position - position`, and a stored copy could only disagree with the
+    # coordinates it was derived from.
+    # The dedup partitions on the parent's HASH, not its read_id, because the hash is what
+    # the control plane's conflict key is derived from: two FASTA records with identical
+    # bases under different names canonically hash to one sequence_hash and therefore mint
+    # ONE parent feature_idx. Annotating the same interval on both would then hand the
+    # natural-key UPSERT two rows with one conflict key — a Postgres cardinality_violation,
+    # not a duplicate row. Partitioning on read_id would let exactly that through.
     conn.execute(
         "COPY ("
-        "  SELECT annotation_id, "
-        "         sequence_hash, "
-        "         CAST(length(sequence) AS BIGINT) AS sequence_length_bp, "
-        "         parent_read_id, annotation_type, strand, position, stop_position, attributes "
-        "  FROM annotation_extracted "
+        "  SELECT a.sequence_hash, "
+        "         h.sequence_hash AS parent_sequence_hash, "
+        "         a.parent_read_id, "
+        "         a.annotation_id, "
+        "         a.source, "
+        "         a.annotation_type, "
+        "         a.position, a.stop_position, a.strand, "
+        "         a.score, a.phase, "
+        "         a.attributes "
+        "  FROM annotation_extracted a "
+        "  JOIN hashed h ON h.read_id = a.parent_read_id "
+        "  QUALIFY row_number() OVER ("
+        "    PARTITION BY h.sequence_hash, a.position, a.stop_position,"
+        "                 a.annotation_type, a.strand"
+        "    ORDER BY a.annotation_id, a.parent_read_id"
+        "  ) = 1 "
         # Genomic order — this file is small (one row per annotated interval) and no
         # consumer keys on the order; it is for the human who opens it.
-        "  ORDER BY parent_read_id, position, annotation_id"
+        "  ORDER BY a.parent_read_id, a.position, a.stop_position"
         f") TO '{out}' ({PARQUET_OPTS})"
     )
     conn.execute("DROP TABLE annotation_extracted")

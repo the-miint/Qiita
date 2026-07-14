@@ -593,3 +593,104 @@ def test_missing_optional_taxonomy_raises_file_not_found(staging_inputs, tmp_pat
             _inputs(**staging_inputs, taxonomy_path=tmp_path / "missing.parquet"),
             tmp_path / "ws",
         )
+
+
+# =============================================================================
+# Annotations
+# =============================================================================
+
+
+def _annotation_fixtures(tmp_path, *, map_rows=None):
+    """hash_sequences' annotation manifest + mint-annotation-features' annotation map.
+
+    One interval: bases [3, 8) of seq3, sitting on seq3 as its parent. The map's
+    `parent_feature_idx` is seq3's, and every identifier on the eventual lake row comes
+    from the map — this job mints nothing.
+    """
+    parent = "seq3"
+    interval_hash = _HASHES["seq1"]  # stand-in for the extracted interval's own hash
+
+    manifest = tmp_path / "annotation_manifest.parquet"
+    _write_parquet(
+        manifest,
+        "sequence_hash UUID, parent_sequence_hash UUID, parent_read_id VARCHAR, "
+        "annotation_id VARCHAR, source VARCHAR, annotation_type VARCHAR, "
+        "position BIGINT, stop_position BIGINT, strand VARCHAR, "
+        "score DOUBLE, phase SMALLINT, attributes MAP(VARCHAR, VARCHAR)",
+        [
+            (
+                str(interval_hash),
+                str(_HASHES[parent]),
+                parent,
+                "insert_01",
+                "syndna",
+                "insert",
+                3,
+                8,
+                "+",
+                None,
+                None,
+                {"mass_ng": "0.5"},
+            )
+        ],
+    )
+
+    amap = tmp_path / "annotation_map.parquet"
+    _write_parquet(
+        amap,
+        "annotation_idx BIGINT, feature_idx BIGINT, parent_feature_idx BIGINT, "
+        "position BIGINT, stop_position BIGINT, annotation_type VARCHAR, strand VARCHAR",
+        map_rows
+        if map_rows is not None
+        else [
+            (9001, _FEATURE_MAP[interval_hash], _FEATURE_MAP[_HASHES[parent]], 3, 8, "insert", "+")
+        ],
+    )
+    return {"annotation_manifest": manifest, "annotation_map": amap}
+
+
+def test_annotation_row_carries_the_minted_annotation_idx(staging_inputs, tmp_path):
+    """The lake row's identity is the annotation_idx the CONTROL PLANE minted, joined in
+    off the annotation map on the natural key. Nothing here re-derives it, and the GFF3
+    `ID` is carried as provenance only — it is not unique, so nothing may join on it."""
+    outputs = _run(_inputs(**staging_inputs, **_annotation_fixtures(tmp_path)), tmp_path / "ws")
+    out = outputs["staging_dir"] / "reference_annotation.parquet"
+    with duckdb.connect(":memory:") as conn:
+        cols = [
+            c[0] for c in conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()
+        ]
+        rows = conn.execute(f"SELECT * FROM read_parquet('{out}')").fetchall()
+
+    (row,) = [dict(zip(cols, r, strict=True)) for r in rows]
+    assert row["annotation_idx"] == 9001
+    assert row["reference_idx"] == _REFERENCE_IDX
+    assert row["parent_feature_idx"] == _FEATURE_MAP[_HASHES["seq3"]]
+    assert row["annotation_id"] == "insert_01"
+    assert (row["position"], row["stop_position"]) == (3, 8)
+    assert row["attributes"] == {"mass_ng": "0.5"}
+
+
+def test_annotation_row_with_no_minted_idx_raises(staging_inputs, tmp_path):
+    """If the map and the manifest disagree about the natural key, the inner join would
+    simply DROP the row and register a lake table quietly missing an annotation. That is
+    the failure this raise exists to convert into a dead ticket — here the map claims a
+    window the manifest never declared."""
+    fixtures = _annotation_fixtures(
+        tmp_path,
+        map_rows=[
+            (9001, 1, _FEATURE_MAP[_HASHES["seq3"]], 4, 9, "insert", "+")
+        ],  # window off by one
+    )
+    with pytest.raises(ValueError, match="no minted annotation_idx"):
+        _run(_inputs(**staging_inputs, **fixtures), tmp_path / "ws")
+
+
+def test_annotation_manifest_without_map_is_refused(staging_inputs, tmp_path):
+    """Supplying one without the other is a mis-wired workflow whose only symptom would
+    be a silently EMPTY reference_annotation table."""
+    fixtures = _annotation_fixtures(tmp_path)
+    with pytest.raises(ValueError, match="must be supplied together"):
+        _run(
+            _inputs(**staging_inputs, annotation_manifest=fixtures["annotation_manifest"]),
+            tmp_path / "ws",
+        )

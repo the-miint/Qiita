@@ -40,11 +40,11 @@ the work_ticket's `action_context`. The runner injects them under
 `taxonomy_path` / `tree_path` / `jplace_path` after upload-handle
 resolution; absent uploads → absent paths → absent outputs.
 
-`annotation_manifest` / `annotation_feature_map` are the odd pair: they
-are not uploads but STEP OUTPUTS (hash_sequences + mint-annotation-
-features), so they arrive already bound, and every reference-add workflow
-binds BOTH unconditionally — a reference with no GFF3 simply carries zero
-annotation rows through them. They are typed optional here only so a caller
+`annotation_manifest` / `annotation_map` are the odd pair: they are not
+uploads but STEP OUTPUTS (hash_sequences + mint-annotation-features), so
+they arrive already bound, and every reference-add workflow binds BOTH
+unconditionally — a reference with no GFF3 simply carries zero annotation
+rows through them. They are typed optional here only so a caller
 constructing `Inputs` directly (a test, a future workflow) can omit them;
 supplying one without the other is a mis-wired workflow whose only symptom
 would be a silently EMPTY `reference_annotation` table, so `execute` refuses
@@ -115,7 +115,7 @@ class Inputs(BaseModel):
     tree_path: Path | None = None
     jplace_path: Path | None = None
     annotation_manifest: Path | None = None
-    annotation_feature_map: Path | None = None
+    annotation_map: Path | None = None
     reference_idx: int
     work_ticket_idx: int
 
@@ -133,7 +133,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         ("tree", inputs.tree_path),
         ("jplace", inputs.jplace_path),
         ("annotation_manifest", inputs.annotation_manifest),
-        ("annotation_feature_map", inputs.annotation_feature_map),
+        ("annotation_map", inputs.annotation_map),
     ]:
         if opt is not None and not opt.exists():
             raise FileNotFoundError(f"{label} not found: {opt}")
@@ -143,11 +143,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # workflow is mis-wired, and the failure it would otherwise produce is a
     # silently EMPTY reference_annotation table — so refuse up front rather than
     # emit a well-formed, wrong result.
-    if (inputs.annotation_manifest is None) != (inputs.annotation_feature_map is None):
+    if (inputs.annotation_manifest is None) != (inputs.annotation_map is None):
         raise ValueError(
-            "annotation_manifest and annotation_feature_map must be supplied together; got "
+            "annotation_manifest and annotation_map must be supplied together; got "
             f"annotation_manifest={inputs.annotation_manifest!r}, "
-            f"annotation_feature_map={inputs.annotation_feature_map!r}"
+            f"annotation_map={inputs.annotation_map!r}"
         )
 
     workspace.mkdir(parents=True, exist_ok=True)
@@ -244,13 +244,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
                 written.append(placements_out_path)
 
-            if inputs.annotation_manifest is not None and inputs.annotation_feature_map is not None:
+            if inputs.annotation_manifest is not None and inputs.annotation_map is not None:
                 # Returns False (and writes nothing) for a reference with no
                 # annotations — the common case; see _write_annotation.
                 if _write_annotation(
                     conn,
                     annotation_manifest=inputs.annotation_manifest,
-                    annotation_feature_map=inputs.annotation_feature_map,
+                    annotation_map=inputs.annotation_map,
                     reference_idx=inputs.reference_idx,
                     out=annotation_out,
                 ):
@@ -312,32 +312,36 @@ def _write_annotation(
     conn: duckdb.DuckDBPyConnection,
     *,
     annotation_manifest: Path,
-    annotation_feature_map: Path,
+    annotation_map: Path,
     reference_idx: int,
     out: str,
 ) -> bool:
-    """Emit DuckLake's `reference_annotation` shape — one row per annotated
-    interval, carrying BOTH feature_idx values the table is about:
+    """Emit DuckLake's `reference_annotation` shape — one row per annotated interval.
 
-      * `feature_idx`        — the interval itself (the SynDNA insert), resolved
-                               from `annotation_feature_map` on the sub-sequence's
-                               canonical `sequence_hash`.
-      * `parent_feature_idx` — the sequence the interval sits on and that reads
-                               actually align to (the plasmid), resolved from
-                               `id_map` on the GFF `seqid` → FASTA `read_id`.
+    Every identifier on the row is MINTED by the control plane and arrives via
+    `annotation_map` (the output of `mint-annotation-features`); this job resolves none
+    of them itself:
 
-    The `id_map` join is the same bridge `_write_taxonomy` and `_write_phylogeny`
-    use (both key off `read_id`), so a GFF `seqid` naming an unknown sequence has
-    already been rejected upstream in `hash_sequences`.
+      * `annotation_idx`     — the OCCURRENCE's identity, and the join back to the
+                               Postgres claim and to the annotation's semantic terms.
+      * `feature_idx`        — the interval itself (the SynDNA insert, the gene).
+      * `parent_feature_idx` — the sequence the interval sits on and that reads actually
+                               align to (the plasmid, the chromosome).
+
+    The map is joined on the annotation's NATURAL key — parent + window + type + strand —
+    reached from the manifest through `id_map` (GFF `seqid` → FASTA `read_id` →
+    feature_idx), the same bridge `_write_taxonomy` and `_write_phylogeny` use. Not on the
+    GFF3 `ID`: the spec lets a discontinuous feature repeat one ID across N lines, so it
+    is carried as provenance and joined on by nothing.
 
     Coordinates pass through VERBATIM. They were converted from GFF3's closed
-    `[start, end]` to half-open `[position, stop_position)` exactly once, at
-    ingest, in `hash_sequences._write_annotation_manifest`. Re-deriving or
-    "correcting" them here would be a second conversion.
+    `[start, end]` to half-open `[position, stop_position)` exactly once, at ingest, in
+    `hash_sequences._write_annotation_manifest`. Re-deriving or "correcting" them here
+    would be a second conversion.
 
-    Unlike taxonomy's coverage checks (which warn), an unresolved hash here is
-    fatal: it would emit a row whose `feature_idx` is NULL, and a feature table
-    keyed on a NULL feature is not a degraded result, it is a wrong one.
+    Unlike taxonomy's coverage checks (which warn), an unresolved row here is fatal: it
+    would emit a lake row whose `annotation_idx` or `feature_idx` is NULL, and a feature
+    table keyed on a NULL feature is not a degraded result, it is a wrong one.
     """
     # The zero-annotation case is the COMMON one — almost no reference carries a
     # GFF3, but every reference-add reaches here (the manifest is bound
@@ -356,48 +360,63 @@ def _write_annotation(
         return False
 
     conn.execute(
-        "CREATE TEMP TABLE annotation_feature_map AS SELECT * FROM read_parquet(?)",
-        [str(annotation_feature_map)],
+        "CREATE TEMP TABLE annotation_map AS SELECT * FROM read_parquet(?)",
+        [str(annotation_map)],
     )
     conn.execute(
         "CREATE TEMP TABLE annotation_manifest AS SELECT * FROM read_parquet(?)",
         [str(annotation_manifest)],
     )
 
+    # The natural-key join, single-sourced so the check below and the COPY cannot drift
+    # apart — an unresolved row must be REJECTED here, not silently dropped by the COPY's
+    # inner join.
+    natural_key_join = (
+        "JOIN id_map im ON im.read_id = am.parent_read_id "
+        "{kind} JOIN annotation_map map "
+        "  ON map.parent_feature_idx = im.feature_idx "
+        " AND map.position = am.position "
+        " AND map.stop_position = am.stop_position "
+        " AND map.annotation_type = am.annotation_type "
+        " AND map.strand = am.strand "
+    )
+
     unresolved = conn.execute(
-        "SELECT am.annotation_id, am.parent_read_id "
+        "SELECT am.parent_read_id, am.annotation_type, am.position, am.stop_position "
         "FROM annotation_manifest am "
-        "LEFT JOIN annotation_feature_map afm ON afm.sequence_hash = am.sequence_hash "
-        "LEFT JOIN id_map im ON im.read_id = am.parent_read_id "
-        "WHERE afm.feature_idx IS NULL OR im.feature_idx IS NULL "
-        "ORDER BY am.annotation_id LIMIT 5"
+        "LEFT " + natural_key_join.format(kind="LEFT") + "WHERE map.annotation_idx IS NULL "
+        "ORDER BY am.parent_read_id, am.position LIMIT 5"
     ).fetchall()
     if unresolved:
         raise ValueError(
-            "annotation rows with an unresolvable feature_idx (the annotation "
-            "feature-map or the sequence feature-map is incomplete): "
-            + ", ".join(f"{a!r} on {p!r}" for a, p in unresolved)
+            "annotation rows with no minted annotation_idx (the annotation map is "
+            "incomplete — mint-annotation-features and this load disagree about the "
+            "natural key): "
+            + ", ".join(f"{t} on {p!r} [{pos}, {stop})" for p, t, pos, stop in unresolved)
         )
 
     conn.execute(
         "COPY ("
-        f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, "
-        "         afm.feature_idx, "
-        "         im.feature_idx AS parent_feature_idx, "
+        "  SELECT map.annotation_idx, "
+        f"         CAST({reference_idx} AS BIGINT) AS reference_idx, "
+        "         map.feature_idx, "
+        "         map.parent_feature_idx, "
         "         am.annotation_id, "
+        "         am.source, "
         "         am.annotation_type, "
         "         am.position, "
         "         am.stop_position, "
         "         am.strand, "
+        "         am.score, "
+        "         am.phase, "
         "         am.attributes "
         "  FROM annotation_manifest am "
-        "  JOIN annotation_feature_map afm ON afm.sequence_hash = am.sequence_hash "
-        "  JOIN id_map im ON im.read_id = am.parent_read_id "
-        "  ORDER BY parent_feature_idx, position, annotation_id"
+        + natural_key_join.format(kind="")
+        + "  ORDER BY map.parent_feature_idx, am.position, am.stop_position"
         f") TO '{out}' ({PARQUET_OPTS})"
     )
     conn.execute("DROP TABLE annotation_manifest")
-    conn.execute("DROP TABLE annotation_feature_map")
+    conn.execute("DROP TABLE annotation_map")
     return True
 
 
