@@ -725,6 +725,56 @@ def _pacbio_gates(sample: dict) -> dict | None:
     }
 
 
+def _dry_run_summary(
+    samples: list[dict],
+    decisions: dict[str, SampleHostFilter],
+    sequenced_pool_idx: int,
+) -> dict:
+    """Print what the submission WOULD do, per sample, and return the summary dict.
+
+    Grouped by the decision rather than listed per sample: a 384-sample pool that
+    resolves to two groups is comprehensible; 384 lines is not. Blanks are counted
+    separately from the samples that gave them their host, because "131 blanks are
+    being filtered against human" is the fact an operator most wants to sanity-check
+    — it is the one decision no sample made for itself.
+    """
+    is_control = {
+        s["sequenced_pool_item_id"]: (s.get("host_filter") or {}).get("outcome") == "control"
+        for s in samples
+    }
+    groups: dict[SampleHostFilter, list[str]] = {}
+    for item_id, decision in decisions.items():
+        groups.setdefault(decision, []).append(item_id)
+
+    print(f"sequenced_pool {sequenced_pool_idx}: {len(samples)} sample(s)", file=sys.stderr)
+    for decision, item_ids in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        blanks = sum(1 for i in item_ids if is_control.get(i))
+        if decision.enabled:
+            what = f"host_filter -> rype {decision.rype_reference_idx}"
+            if decision.minimap2_reference_idx is not None:
+                what += f" + minimap2 {decision.minimap2_reference_idx}"
+        else:
+            what = "no host filtering (QC-only pass-through)"
+        blank_note = f" (incl. {blanks} blank(s), inheriting the pool's host)" if blanks else ""
+        print(f"  {len(item_ids):>5}  {what}{blank_note}", file=sys.stderr)
+    print("\nDRY RUN — nothing submitted.", file=sys.stderr)
+
+    return {
+        "sequenced_pool_idx": sequenced_pool_idx,
+        "dry_run": True,
+        "samples": len(samples),
+        "per_sample": [
+            {
+                "sequenced_pool_item_id": item_id,
+                "host_filter_enabled": d.enabled,
+                "host_rype_reference_idx": d.rype_reference_idx if d.enabled else None,
+                "host_minimap2_reference_idx": d.minimap2_reference_idx if d.enabled else None,
+            }
+            for item_id, d in decisions.items()
+        ],
+    }
+
+
 def _assert_resolved_references_ready(
     base_url: str,
     token: str,
@@ -1062,6 +1112,18 @@ def _handle_submit_host_filter_pool(
                 sequenced_pool_idx=args.sequenced_pool_idx,
                 syndna_reference_idx=args.syndna_reference_idx,
             )
+
+        # Step 1.75: --dry-run stops here, after everything that could REFUSE has
+        # run and before anything that could WRITE.
+        #
+        # This is the only way to see a pool's plan before fanning out hundreds of
+        # tickets against it. It matters more than a preview usually would: host
+        # filtering used to be a thing the operator chose on the command line, so
+        # they knew what they were getting. It is now derived from each sample's
+        # metadata, and this is where they get to look at that derivation before it
+        # acts.
+        if args.dry_run:
+            return _dry_run_summary(samples, decisions, args.sequenced_pool_idx)
 
         # Step 2: pre-flight the host reference(s) the plan actually resolved to,
         # before any ticket — one actionable error instead of N FAILED tickets.

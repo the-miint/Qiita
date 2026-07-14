@@ -63,6 +63,7 @@ from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
+    MetadataMissingRequiredFieldsError,
     MetadataParseError,
     MetadataUnknownFieldsError,
     SlotOccupiedError,
@@ -198,6 +199,17 @@ async def import_biosample(
                 detail=(
                     f"owner_biosample_id_value {exc.owner_biosample_id_value!r}"
                     " cannot be a missing-value marker"
+                ),
+            )
+        except MetadataMissingRequiredFieldsError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "missing required metadata field(s):"
+                    f" {', '.join(exc.missing_display_names)}."
+                    " A field may be given a missing-value marker (e.g."
+                    " 'not applicable') — declining to answer is allowed, silence"
+                    " is not."
                 ),
             )
         except MetadataUnknownFieldsError as exc:

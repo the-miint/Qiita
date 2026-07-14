@@ -1155,6 +1155,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_hf.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Resolve the pool and print what WOULD be submitted, per sample, then"
+            " exit without creating any ticket. The way to see a pool's host-filter"
+            " plan before fanning out hundreds of tickets against it."
+        ),
+    )
+    p_submit_hf.add_argument(
         "--only-missing",
         action="store_true",
         help=(

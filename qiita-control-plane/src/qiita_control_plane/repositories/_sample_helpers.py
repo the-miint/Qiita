@@ -110,6 +110,20 @@ class MetadataUnknownFieldsError(Exception):
         )
 
 
+class MetadataMissingRequiredFieldsError(Exception):
+    """Raised when an import omits a global field marked `required`.
+
+    Carries every missing display_name in one list, so the caller fixes the whole
+    set at once rather than discovering them one 422 at a time.
+    """
+
+    def __init__(self, entity_kind: SampleEntityKind, missing_display_names: list[str]) -> None:
+        self.missing_display_names = missing_display_names
+        super().__init__(
+            f"missing required {entity_kind} global field(s): {missing_display_names!r}"
+        )
+
+
 class MetadataChecklistUnknownError(Exception):
     """Raised when a metadata_checklist name has no matching
     qiita.metadata_checklist row. Carries the unknown name.
@@ -1298,6 +1312,40 @@ def validate_primary_secondary_studies(
         raise ValueError(
             f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
         )
+
+
+async def assert_required_global_fields_supplied(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    metadata: Mapping[str, str],
+) -> None:
+    """Reject an import that omits a global field marked `required`.
+
+    `biosample_global_field.required` has been in the schema since the first
+    migration and was never enforced anywhere — a field could be declared required
+    and simply not supplied. That is how `host_taxon_id` came to be marked required
+    and yet be absent from every one of the samples we hold.
+
+    It matters now because host filtering is resolved FROM that field: a sample
+    without it resolves UNRESOLVED and aborts its pool at submit. Unenforced, every
+    newly-ingested pool would arrive broken and the backfill would be a treadmill
+    rather than a one-off.
+
+    A missing-value marker ('not applicable', 'missing: control sample', …) COUNTS
+    as supplied — declining to give a value is a decision, and it is one the
+    resolver understands. What is rejected is silence.
+
+    Raises before any DB write, with the whole missing set at once.
+    """
+    rows = await conn.fetch(
+        f"SELECT display_name FROM {spec.global_field_table} WHERE required"  # noqa: S608
+    )
+    required = {r["display_name"] for r in rows}
+    supplied = set(metadata)
+    missing = sorted(required - supplied)
+    if missing:
+        raise MetadataMissingRequiredFieldsError(spec.entity_kind, missing)
 
 
 async def preflight_global_metadata(
