@@ -593,6 +593,37 @@ _None yet._
   refreshes a warm cache) otherwise yields a build with every other function
   present and fails at the first real submit. (#270)
 
+- **`qiita.host_filter_profile` — the config layer mapping a host taxon + platform to the
+  reference build(s) to deplete against (#293).** It keeps *which organism* on the sample
+  (biosample metadata, the terminology-typed `host_taxon_id` field) and *which build* in
+  config, so rebuilding the host DB repoints existing samples instead of rewriting them.
+  Stage 1 (rype) is required; stage 2 (minimap2) is optional, and NULL means the profile
+  stops after stage 1. `UNIQUE (host_term_idx, platform)` means a rebuild UPDATEs the
+  existing row rather than racing a second one, so the lookup is unambiguous by
+  construction. The migration ships the table EMPTY — its rows point at `reference_idx`
+  values that exist only on a live deploy, so seeding is an operator step (see
+  `DEPLOY_CHECKLIST.md`), not a migration INSERT with nothing to reference in a fresh
+  test DB.
+
+- **The two host-filter stages are keyed on platform, not constrained by it (#293).**
+  *Which* stages an assay wants depends on how the sample was sequenced — but minimap2
+  aligns long reads perfectly well (`map-ont` / `map-pb`), so "our long-read profiles are
+  rype-only today" is a config choice, not a property of the tool, and is deliberately not
+  a CHECK.
+
+- **`host_filter_resolver.resolve_host_filter` — resolves what host filtering one
+  biosample should get (#293).** Given a biosample and a platform it returns FILTER (with
+  the references), PASS_THROUGH (`not applicable` — a water sample deliberately has no
+  host), CONTROL (a blank, whose filtering is a pool-level fact, so the resolver reports
+  it and stops), or UNRESOLVED. It returns reference *identity*, not on-disk readiness —
+  ACTIVE/index-built checks stay in the runner. Nothing calls it yet.
+
+- **The resolver fails closed on anything ambiguous (#293).** An absent `host_taxon_id`, a
+  host with no build on the platform, and an uninformative missing-reason such as `not
+  collected` all abort rather than degrade to "no filtering". `not collected` and `not
+  applicable` are both missing-reasons, and quietly reading the first as the second is
+  precisely how an un-depleted human sample would slip through.
+
 - **`qiita submit-pacbio-ingest` — one-gesture PacBio HiFi ingest.** The PacBio
   analogue of `submit-bcl-convert`: it reads a kl-run-preflight blob, stands up
   the `sequencing_run` (platform `pacbio_smrt`) / `sequenced_pool` (blob attached)

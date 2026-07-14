@@ -21,18 +21,60 @@ from qiita_common.models import FieldDataType
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
 NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
 NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
+# Human. Seeded by 20260709000000_seed_water_metadata_terminology.sql; the
+# host-filter tests read it rather than minting their own so they stay honest
+# about the term the live host profile actually points at.
+NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
 
 
-async def fetch_seeded_metagenome_term(pool: asyncpg.Pool) -> asyncpg.Record:
-    """Return the seeded NCBI Taxonomy metagenome term row (idx, term_id,
-    label, terminology_idx)."""
+async def fetch_ncbi_taxonomy_term(pool: asyncpg.Pool, term_id: str) -> asyncpg.Record | None:
+    """Return a seeded NCBI Taxonomy term row (idx, term_id, label,
+    terminology_idx) by its term_id, or None when the migration did not seed it.
+    """
     return await pool.fetchrow(
         "SELECT tt.idx, tt.term_id, tt.label, tt.terminology_idx"
         " FROM qiita.terminology_term tt"
         " JOIN qiita.terminology t ON t.idx = tt.terminology_idx"
         " WHERE t.name = $1 AND tt.term_id = $2",
         NCBI_TAXONOMY_NAME,
-        NCBI_TAXONOMY_METAGENOME_TERM_ID,
+        term_id,
+    )
+
+
+async def fetch_seeded_metagenome_term(pool: asyncpg.Pool) -> asyncpg.Record:
+    """Return the seeded NCBI Taxonomy metagenome term row (idx, term_id,
+    label, terminology_idx)."""
+    return await fetch_ncbi_taxonomy_term(pool, NCBI_TAXONOMY_METAGENOME_TERM_ID)
+
+
+async def fetch_missing_value_reason_idx(pool: asyncpg.Pool, name: str) -> int | None:
+    """Return the idx of a seeded qiita.missing_value_reason by name, or None.
+
+    The names are INSDC vocabulary seeded by the terminology-lifecycle
+    migration ('not applicable', 'not collected', 'missing: control sample', …).
+    """
+    return await pool.fetchval("SELECT idx FROM qiita.missing_value_reason WHERE name = $1", name)
+
+
+async def seed_host_reference(
+    pool: asyncpg.Pool,
+    *,
+    name: str,
+    created_by_idx: int,
+    version: str = "1.0",
+) -> int:
+    """Insert a host qiita.reference row (is_host=true), return its reference_idx.
+
+    A bare row with no reference_index children — enough to be the target of a
+    FK. Tests that need a *built* index register one separately.
+    """
+    return await pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, is_host, created_by_idx)"
+        " VALUES ($1, $2, 'sequence_reference', true, $3)"
+        " RETURNING reference_idx",
+        name,
+        version,
+        created_by_idx,
     )
 
 

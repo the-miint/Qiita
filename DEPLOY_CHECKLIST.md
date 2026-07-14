@@ -50,6 +50,44 @@ Standard `make migrate` (bucket order: before the bucket-4 restart). No out-of-b
   - `20260712020000_work_ticket_alignment_idx.sql` — `work_ticket.alignment_idx` arm (ON DELETE SET NULL, no backfill).
 - `20260713010000_sequenced_sample_spikein_read_count.sql` — adds `sequenced_sample.spikein_read_count_r1r2` (a spike-in is added in the lab, so it is disjoint from `biological`). (#270)
 
+- (#293) `20260714000000_host_filter_profile.sql` — creates `qiita.host_filter_profile`
+  **empty**. Plain `make migrate` applies it.
+
+- (#293) Seed the human host profile for **illumina** (out-of-band: the row points at
+  `reference_idx` values that exist only on this deploy, so it cannot be a migration
+  `INSERT`). Re-runnable — the `ON CONFLICT … DO UPDATE` is also the host-DB *rebuild*
+  path, repointing the existing profile at a new build rather than inserting a second row.
+
+  ```bash
+  sudo bash -c 'psql "$(grep -m1 "^DATABASE_URL=" /etc/qiita/control-plane.env | cut -d= -f2-)"' <<'SQL'
+  INSERT INTO qiita.host_filter_profile
+      (host_term_idx, platform, rype_reference_idx, minimap2_reference_idx, created_by_idx)
+  SELECT tt.idx, 'illumina',
+         (SELECT reference_idx FROM qiita.reference
+           WHERE is_host AND name = 'HPRCr2-hg38-T2TCHM13v2.0-gencode49' AND version = '1.0'),
+         (SELECT reference_idx FROM qiita.reference
+           WHERE is_host AND name = 'T2TCHM13v2.0-phiX174' AND version = '1.0'),
+         1
+    FROM qiita.terminology_term tt
+    JOIN qiita.terminology t ON t.idx = tt.terminology_idx AND t.name = 'NCBI Taxonomy'
+   WHERE tt.term_id = '9606'
+  ON CONFLICT (host_term_idx, platform) DO UPDATE
+     SET rype_reference_idx     = EXCLUDED.rype_reference_idx,
+         minimap2_reference_idx = EXCLUDED.minimap2_reference_idx;
+  SQL
+  ```
+
+- (#293) The two stages above are **different** references on purpose — that pair is what
+  every recent live mask was actually minted with (`mask_definition.params`): stage 1
+  routes against the HPRC pangenome, stage 2 refines against the phiX-bundled T2T build
+  (which also clears the Illumina phiX spike-in in the same pass). Both are looked up by
+  `(name, version)`, never by hardcoded idx; `created_by_idx = 1` is the seeded system
+  principal (`SYSTEM_PRINCIPAL_IDX`), matching the other seed migrations.
+
+- (#293) The seed is **safe to defer** — nothing reads the table on this deploy (see
+  Notes), so leaving it empty breaks nothing. Running it now just means the submit-path PR
+  that consumes it lands against an already-configured host.
+
 ### 4. Deploy
 
 _None yet._
@@ -75,6 +113,22 @@ _None yet._
   ```
   (#270)
 
+- (#293) Only if you ran the bucket-3 seed: confirm **both** stages resolved. A wrong
+  *rype* name fails loudly (NOT NULL), but a wrong *minimap2* name resolves to NULL
+  **silently** and quietly drops the minimap2 stage — the two mistakes do not fail the
+  same way, so the NULL is what to look for.
+
+  ```bash
+  sudo bash -c 'psql "$(grep -m1 "^DATABASE_URL=" /etc/qiita/control-plane.env | cut -d= -f2-)" -c \
+    "SELECT p.platform, r1.name AS rype_ref, r2.name AS minimap2_ref
+       FROM qiita.host_filter_profile p
+       JOIN qiita.reference r1 ON r1.reference_idx = p.rype_reference_idx
+       LEFT JOIN qiita.reference r2 ON r2.reference_idx = p.minimap2_reference_idx;"'
+  ```
+
+  Expect exactly one row: `illumina | HPRCr2-hg38-T2TCHM13v2.0-gencode49 | T2TCHM13v2.0-phiX174`.
+  A NULL `minimap2_ref` means the name lookup missed — re-run the seed (it is idempotent).
+
 ### 6. After the deploy verifies green
 
 Irreversible cleanup the deploy earns only by succeeding — retiring a superseded
@@ -96,6 +150,20 @@ verification passes, the OLD build's config is the rollback path.
 - The new `read-mask` **`lima` image needs nothing staged**: lima comes from bioconda in `%post` and the Twist adapter FASTA is in-repo, so its spec declares no `SOURCES`. (#270)
 - **A SynDNA spike-in reference needs a minimap2 (`.mmi`) index**, not a rype one, before the first PacBio absquant read-mask submission — `qiita submit-host-filter-pool --syndna-reference-idx` refuses a reference without one. Load it with `qiita reference load --host --no-rype-index --minimap2-preset map-hifi` (the spike-in inserts are the subject sequences). No action if no absquant pool is being masked yet. (#270)
 - The pool `sequenced-sample` roster gains three PacBio fields (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`), derived at request time from the pool's stored pre-flight blob. Additive, and `null` for an Illumina pool — no client is required to read them. (#270)
+
+- (#293) `qiita.host_filter_profile` and the host-filter resolver are **inert on this
+  deploy** — nothing reads either yet (the read-only endpoint and the submit-path swap
+  are later PRs). No behavior change: host references still reach a submission the way
+  they do today, via the `--host-rype-reference-idx` / `--host-minimap2-reference-idx`
+  flags. The bucket-3 seed is what wires the table up for the PR that consumes it.
+- (#293) **No `pacbio_smrt` host profile is seeded, deliberately.** No PacBio pool has
+  been masked yet, so there is no live pairing to copy — which human build to deplete HiFi
+  reads against is an open **assay** decision, not something the DB can answer. Leaving it
+  unseeded is the fail-closed choice: once the submit-path PR lands, a human PacBio sample
+  resolves `UNRESOLVED` and aborts with `no host_filter_profile for terminology term N on
+  platform 'pacbio_smrt'` — loud and actionable — rather than being silently depleted
+  against a build nobody chose. Seed it (same `ON CONFLICT` statement, `'pacbio_smrt'`)
+  when that decision is made.
 
 ---
 
