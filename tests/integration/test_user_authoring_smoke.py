@@ -292,6 +292,10 @@ async def test_user_authoring_smoke_via_cli(
             "sample_name",
             "--owner-biosample-id-value",
             "USER-CLI-SMOKE-1",
+            # host_taxon_id is enforced at intake — supply a missing-value marker
+            # (this smoke sample has no host of its own).
+            "--metadata",
+            "host taxon id=not applicable",
         )
         biosample_idx = biosample["biosample_idx"]
         created_biosample_idxs.append(biosample_idx)
