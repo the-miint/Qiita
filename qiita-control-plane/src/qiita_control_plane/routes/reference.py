@@ -418,6 +418,11 @@ _DOGET_ALLOWED_TABLES = frozenset(
         "reference_placements",
         "reference_annotation",
         "read_masked",
+        # The alignment sink's DoGet read-side (feature-table OGU consumer). Like
+        # read_masked it is served by its own route (routes/alignment.py), scoped
+        # by alignment_idx + prep_sample_idx, so it is excluded from
+        # _REFERENCE_DOGET_TABLES below.
+        "alignment",
     }
 )
 
@@ -426,7 +431,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # whose ticket carries (prep_sample_idx, mask_idx) — not reference_idx — and
 # which enforces the mandatory-filter invariant. The reference route restricts
 # itself to the reference_* tables whose membership it resolves.
-_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset({"read_masked"})
+_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset({"read_masked", "alignment"})
 
 
 @router.post(PATH_REFERENCE_DOGET, status_code=201)

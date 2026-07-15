@@ -1,0 +1,104 @@
+action_id: estimate-feature-table
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Estimate a metagenomic OGU feature table from an existing alignment run,
+  computed ON DEMAND and never persisted. Given one `alignment_idx` and an
+  explicit `prep_sample_idx` cohort (both on the ticket's action_context), the
+  single native step builds a genome-keyed OGU table (OGU key = `genome_idx`,
+  rolling `feature_idx -> genome_idx`) via duckdb-miint `woltka_ogu`, filtered to
+  genomes whose breadth of coverage — POOLED over the whole cohort — meets
+  `coverage_threshold` (a proportion in [0, 1]). The result is a single
+  `ogu_table.parquet` (v2 + zstd) in the ticket workspace.
+
+  Compute-on-demand by design: the table is deterministic but cohort-dependent
+  (coverage pools over the sample set), so persisting would mean one artifact per
+  sample-subset x threshold. No processing_idx / identity is minted, no DuckLake
+  row is written, and the reference status is NOT transitioned (hence no
+  success_status / register step) — this action's terminus is the emitted Parquet.
+
+  Inputs, three sources: the bulk `alignment` slice and the per-feature sequence
+  lengths STREAM from the data plane over Arrow Flight at job runtime (the job
+  mints its own short-TTL alignment DoGet ticket by work_ticket_idx; the CP
+  derives alignment_idx + the cohort from action_context). The one Postgres-only
+  input — the reference's `feature_idx -> genome_idx` map — is staged as a
+  workspace Parquet by the runner resolver (`runner/_feature_table.py`) before the
+  step loop; that resolver also validates the alignment's reference matches the
+  scope and refuses an incomplete cohort (any prep_sample not `completed` in
+  `alignment_sample`). `reference_idx` is the reference-scope scalar the framework
+  injects into the job (SCOPE_SCALARS_BY_KIND[reference]); only `coverage_threshold`
+  rides `params:`.
+
+# reference:read — this action only READS reference metadata + the (host-depleted,
+# derived) alignment table to compute a transient table; it writes no reference
+# data and mints no identity. Both audience roles already hold it. No REST trigger
+# is wired this cut, so the scope is not yet load-bearing (adjust when one lands).
+scopes:
+  - reference:read
+
+# Admin-only, matching the align workflow that produces the alignment this reads:
+# the compute re-reads host-depletion-derived alignment data, so it is a
+# privileged lab operation, not a service or general-user one.
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [alignment_idx, prep_sample_idx, coverage_threshold]
+  properties:
+    # The alignment run to estimate from. `reference_idx` is derived from it
+    # CP-side (alignment_definition.params.reference_idx) and re-checked against
+    # the reference-scope scalar by the resolver.
+    alignment_idx:
+      type: integer
+      minimum: 1
+    # The explicit cohort. Coverage pools over exactly these samples; the resolver
+    # refuses submission unless every one is `completed` in alignment_sample for
+    # this alignment. Read by parse_feature_table_scope (route + resolver), NOT a
+    # job input.
+    prep_sample_idx:
+      type: array
+      minItems: 1
+      items:
+        type: integer
+        minimum: 1
+    # Minimum pooled breadth of coverage a genome must meet to appear in the table
+    # (proportion of the FULL genome length covered, incl. unaligned contigs).
+    # Recommended default 0.01 (1%); required here (user-provided) since no REST
+    # trigger supplies a default this cut.
+    coverage_threshold:
+      type: number
+      minimum: 0
+      maximum: 1
+
+steps:
+  # The single native step. `genome_map_path` (the reference's feature->genome
+  # map) is runner-bound before the loop (_resolve_feature_table_bindings, gated
+  # on this input + reference scope). `coverage_threshold` rides `params:`
+  # (scalars can't ride `inputs:`). `reference_idx` + `work_ticket_idx` are
+  # framework-injected. The job streams the alignment slice (minting its own
+  # short-TTL DoGet by work_ticket_idx) + the reference lengths, runs the
+  # coverage-filtered woltka_ogu recipe, and emits `ogu_table.parquet`. That
+  # output is the action's terminus — it is NOT registered into DuckLake (the
+  # table is computed on demand), so there is no register-files step.
+  - step: estimate_feature_table
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.estimate_feature_table
+    inputs: [genome_map_path]
+    params: {coverage_threshold: coverage_threshold}
+    outputs: [ogu_table]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT4H
+
+# NO success_status / failure_status: this action mints no identity and flips no
+# reference/sample state — it only emits a transient Parquet. A failed ticket is
+# just FAILED; there is nothing reference-wide to roll back.
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 64
+  walltime: PT8H

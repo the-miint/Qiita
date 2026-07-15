@@ -20,10 +20,13 @@ from contextlib import asynccontextmanager, contextmanager
 
 import httpx
 import pytest
-from qiita_common.api_paths import URL_REFERENCE_DOGET
+from qiita_common.api_paths import URL_ALIGNMENT_DOGET, URL_REFERENCE_DOGET
 
 import qiita_compute_orchestrator.data_plane_client as dpc
-from qiita_compute_orchestrator.data_plane_client import fetch_reference_doget_ticket
+from qiita_compute_orchestrator.data_plane_client import (
+    fetch_alignment_doget_ticket,
+    fetch_reference_doget_ticket,
+)
 
 
 def _client(handler) -> httpx.AsyncClient:
@@ -191,3 +194,130 @@ async def test_open_reference_chunk_stream_passes_none_feature_idx(monkeypatch):
     async with dpc.open_reference_chunk_stream(object(), reference_idx=3, feature_idx=None) as rel:
         assert rel == "reference_chunks"
     assert captured["feature_idx"] is None
+
+
+# ---------------------------------------------------------------------------
+# Alignment DoGet (feature-table job) — mints by work_ticket_idx only; the CP
+# derives alignment_idx + the cohort from the ticket's action_context.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_alignment_doget_sends_work_ticket_idx_and_returns_raw_bytes():
+    """The body carries ONLY {work_ticket_idx} (no table / alignment_idx / cohort
+    — the CP reads those from action_context); the base64 ticket is decoded back
+    to the raw signed bytes."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _ticket_response()
+
+    async with _client(handler) as http:
+        result = await fetch_alignment_doget_ticket(http=http, work_ticket_idx=42)
+
+    assert result == _RAW_TICKET
+    assert len(captured) == 1
+    assert captured[0].url.path == URL_ALIGNMENT_DOGET
+    assert json.loads(captured[0].content) == {"work_ticket_idx": 42}
+
+
+@pytest.mark.parametrize("status", [404, 422, 403, 500])
+async def test_fetch_alignment_doget_raises_on_non_2xx(status):
+    """Any non-2xx (missing 404, bad-scope 422, missing-scope 403, 5xx) raises
+    HTTPStatusError for the caller to map to a BackendFailure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=json.dumps({"detail": "nope"}))
+
+    async with _client(handler) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_alignment_doget_ticket(http=http, work_ticket_idx=42)
+
+
+async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
+    """The composed seam fetches a work-ticket-scoped alignment ticket (over a CP
+    client closed BEFORE the stream opens), then streams that ticket against the
+    settings' data_plane_url, yielding the registered relation."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        captured["cp_client_open"] = True
+        yield object()
+        captured["cp_client_closed"] = True
+
+    async def fake_fetch(*, http, work_ticket_idx):
+        captured["work_ticket_idx"] = work_ticket_idx
+        return b"signed-alignment-ticket"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["stream"] = {
+            "conn": conn,
+            "data_plane_url": data_plane_url,
+            "ticket_bytes": ticket_bytes,
+            "relation": relation,
+        }
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_alignment_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "stream_reference_chunks", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    sentinel_conn = object()
+    async with dpc.open_alignment_stream(sentinel_conn, work_ticket_idx=42) as rel:
+        assert rel == "alignment"
+        assert captured["cp_client_closed"] is True
+
+    assert captured["work_ticket_idx"] == 42
+    assert captured["stream"]["conn"] is sentinel_conn
+    assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
+    assert captured["stream"]["ticket_bytes"] == b"signed-alignment-ticket"
+    assert captured["stream"]["relation"] == "alignment"
+
+
+async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch):
+    """The lengths stream mints a `reference_sequences` ticket for the WHOLE
+    reference (feature_idx=None — coverage needs every contig's length, including
+    unaligned ones) and streams it as `reference_lengths`."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        yield object()
+
+    async def fake_fetch(*, http, reference_idx, table, feature_idx):
+        captured["fetch"] = {
+            "reference_idx": reference_idx,
+            "table": table,
+            "feature_idx": feature_idx,
+        }
+        return b"signed-lengths-ticket"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["relation"] = relation
+        captured["ticket_bytes"] = ticket_bytes
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_reference_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "stream_reference_chunks", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    async with dpc.open_reference_sequences_stream(object(), reference_idx=9) as rel:
+        assert rel == "reference_lengths"
+
+    assert captured["fetch"] == {
+        "reference_idx": 9,
+        "table": "reference_sequences",
+        "feature_idx": None,
+    }
+    assert captured["ticket_bytes"] == b"signed-lengths-ticket"

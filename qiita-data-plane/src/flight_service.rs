@@ -198,6 +198,12 @@ const ALLOWED_TABLES: &[&str] = &[
     "reference_placements",
     "reference_annotation",
     "read_masked",
+    // The alignment sink's read-side, for the feature-table (OGU) consumer. It
+    // holds host-depleted, derived per-read alignments (not raw human reads), so
+    // — unlike read_masked — it is not the human-read privacy surface. Reads are
+    // projected to the coverage/OGU columns and always scoped by alignment_idx +
+    // prep_sample_idx (see build_query / ALIGNMENT_DOGET_PROJECTION).
+    "alignment",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -211,7 +217,24 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "node_index",
     "mask_idx",
     "prep_sample_idx",
+    // Scopes an alignment DoGet to a single alignment run (feature-table consumer).
+    "alignment_idx",
 ];
+
+/// Columns the `alignment` DoGet projects — exactly what the coverage +
+/// `woltka_ogu` feature-table computation needs, out of the ~20-column alignment
+/// row. Projection pushdown: the wide `tag_*` / `mate_*` columns never cross the
+/// wire. The OGU key (`genome_idx`) is derived compute-side from `feature_idx`
+/// via the reference's feature→genome map, so the raw `feature_idx` suffices here.
+///
+/// Coverage is breadth via miint `genome_coverage(alignments, ...)`, whose
+/// `alignments` relation needs only `reference (=feature_idx), position,
+/// stop_position` — it merges alignment spans per contig, so `cigar` is NOT
+/// required (unlike `compute_coverage_depth`, which we do not use). `alignment_idx`
+/// is intentionally absent: the DoGet is enforced to a single alignment run
+/// (see build_query), so every streamed row shares it and the consumer carries it.
+const ALIGNMENT_DOGET_PROJECTION: &str =
+    "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position";
 
 /// DoAction variants that are safe to replay — the accepted-risk registry.
 ///
@@ -2423,12 +2446,31 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         // The reference_* tables are broadly readable by design (this mirrors
         // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
         // legitimate there — reject empty filters only for the read surface.
-        if table == "read_masked" {
-            return Err(Status::invalid_argument(
-                "read_masked requires a non-empty filter (refusing full-table read)",
-            ));
+        // `alignment` is likewise never read unscoped — the CP always scopes it
+        // to (alignment_idx, prep_sample_idx). An empty filter would dump the
+        // whole sink (and bypass the projection), so refuse it here too.
+        if table == "read_masked" || table == "alignment" {
+            return Err(Status::invalid_argument(format!(
+                "{table} requires a non-empty filter (refusing full-table read)"
+            )));
         }
         return Ok((format!("SELECT * FROM {full_table}"), full_table));
+    }
+
+    // A feature-table DoGet builds a table for exactly ONE alignment run, and
+    // alignment_idx is dropped from the projection (ALIGNMENT_DOGET_PROJECTION),
+    // so require it present and single-valued. Otherwise a ticket could omit the
+    // scope or pass several alignment_idx values and blend rows from
+    // heterogeneous runs into one indistinguishable stream. Fail loud.
+    if table == "alignment" {
+        match filter.get("alignment_idx") {
+            Some(values) if values.len() == 1 => {}
+            _ => {
+                return Err(Status::invalid_argument(
+                    "alignment DoGet requires exactly one alignment_idx value",
+                ));
+            }
+        }
     }
 
     // reference_sequences and reference_sequence_chunks have no reference_idx
@@ -2493,7 +2535,14 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
              WHERE {where_str}"
         )
     } else {
-        format!("SELECT * FROM {full_table} WHERE {where_str}")
+        // Most tables stream every column; `alignment` is projected to just the
+        // feature-table columns (projection pushdown — see ALIGNMENT_DOGET_PROJECTION).
+        let projection = if table == "alignment" {
+            ALIGNMENT_DOGET_PROJECTION
+        } else {
+            "*"
+        };
+        format!("SELECT {projection} FROM {full_table} WHERE {where_str}")
     };
     Ok((sql, full_table))
 }
@@ -4359,6 +4408,186 @@ mod tests {
             result.is_err(),
             "empty filter on read_masked must be rejected"
         );
+    }
+
+    #[test]
+    fn alignment_is_doget_allowed() {
+        // The feature-table consumer reads the alignment sink over DoGet; do_get
+        // gates on ALLOWED_TABLES, and the (alignment_idx, prep_sample_idx)
+        // scoping predicate needs alignment_idx as an allowed filter column.
+        assert!(
+            ALLOWED_TABLES.contains(&"alignment"),
+            "alignment must be DoGet-readable for the feature-table consumer"
+        );
+        assert!(
+            ALLOWED_FILTER_COLUMNS.contains(&"alignment_idx"),
+            "alignment_idx must be an allowed filter column"
+        );
+    }
+
+    #[test]
+    fn build_query_alignment_projects_and_scopes() {
+        // The feature-table DoGet scopes the alignment sink to one alignment_idx
+        // + an explicit prep_sample_idx set, projected to only the columns the
+        // coverage + woltka_ogu computation needs. Projection pushdown: the wide
+        // tag_* / mate_* columns never cross the wire. alignment has native
+        // alignment_idx / prep_sample_idx columns, so there is no membership JOIN.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(7)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3), serde_json::Value::from(4)],
+        );
+        let (sql, table) = build_query("alignment", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.alignment");
+        assert!(
+            sql.starts_with(
+                "SELECT prep_sample_idx, sequence_idx, feature_idx, flags, position, \
+                 stop_position FROM qiita_lake.alignment WHERE"
+            ),
+            "expected a projected select of the coverage/OGU columns, got: {sql}"
+        );
+        assert!(sql.contains("alignment_idx IN (7)"), "got: {sql}");
+        assert!(sql.contains("prep_sample_idx IN (3,4)"), "got: {sql}");
+        assert!(
+            !sql.contains("JOIN"),
+            "alignment has native columns, no membership JOIN, got: {sql}"
+        );
+        assert!(
+            !sql.contains("SELECT *"),
+            "must project, not SELECT *, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_alignment_rejects_empty_filter() {
+        // An unscoped alignment DoGet would dump the entire sink; the CP always
+        // scopes to (alignment_idx, prep_sample_idx), so refuse an empty filter
+        // (defense-in-depth, matching read_masked).
+        let empty = auth::TicketFilter::new();
+        assert!(
+            build_query("alignment", &empty).is_err(),
+            "empty filter on alignment must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_alignment_requires_alignment_idx() {
+        // A feature table is built for ONE alignment run. `alignment_idx` is
+        // dropped from the projection, so a ticket that omits it would blend rows
+        // from multiple runs with no column to tell them apart — refuse it.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3)],
+        );
+        assert!(
+            build_query("alignment", &filter).is_err(),
+            "alignment DoGet without alignment_idx must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_alignment_rejects_multivalued_alignment_idx() {
+        // Same rationale: several alignment_idx values would blend heterogeneous
+        // runs into one projected, indistinguishable stream — refuse it.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(7), serde_json::Value::from(8)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3)],
+        );
+        assert!(
+            build_query("alignment", &filter).is_err(),
+            "alignment DoGet with multi-valued alignment_idx must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn build_query_alignment_streams_projected_columns() {
+        // End-to-end: the projected column list must match the real alignment
+        // schema, and the prep_sample_idx scope must exclude out-of-cohort rows.
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let align: i64 = 962_000;
+        let prep_a: i64 = 962_010;
+        let prep_b: i64 = 962_011;
+        let prep_other: i64 = 962_012;
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_alignment_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
+                 INSERT INTO qiita_lake.alignment \
+                     (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, \
+                      flags, position, stop_position) VALUES \
+                     ({align}, {prep_a}, 1, 10, 0, 100, 200), \
+                     ({align}, {prep_b}, 2, 11, 0, 300, 400), \
+                     ({align}, {prep_other}, 3, 12, 0, 500, 600);"
+            ))
+            .unwrap();
+        }
+
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(align)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![
+                serde_json::Value::from(prep_a),
+                serde_json::Value::from(prep_b),
+            ],
+        );
+        let (sql, table) = build_query("alignment", &filter).unwrap();
+        let batches: Vec<arrow_array::RecordBatch> =
+            stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item should be Ok"))
+                .collect();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "prep_other must be excluded by the prep_sample_idx scope"
+        );
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "prep_sample_idx",
+                "sequence_idx",
+                "feature_idx",
+                "flags",
+                "position",
+                "stop_position"
+            ],
+            "only the projected coverage/OGU columns stream, in order"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};"
+        ));
     }
 
     #[test]

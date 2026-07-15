@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from qiita_common.auth_constants import API_PREFIX
 
 from .admin import router as admin_router
-from .alignment import alignment_definition_router
+from .alignment import alignment_definition_router, alignment_router
 from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
 from .biosample import router as biosample_router
@@ -40,6 +40,7 @@ api_router.include_router(sequence_range_router)
 api_router.include_router(mask_definition_router)
 api_router.include_router(read_masked_router)
 api_router.include_router(alignment_definition_router)
+api_router.include_router(alignment_router)
 api_router.include_router(prep_protocol_router)
 api_router.include_router(prep_sample_router)
 api_router.include_router(study_router)

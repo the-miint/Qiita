@@ -137,6 +137,10 @@ from ._dispatch import (
     _result_with_infra_retry,
     _shard_fanout_owns_finalize,
 )
+from ._feature_table import (
+    GENOME_MAP_PATH_BINDING,
+    _resolve_feature_table_bindings,
+)
 from ._mask import (
     _QC_RESOLVED_FILTER_TAIL,
     _QC_RESOLVED_MIN_LENGTH,
@@ -238,6 +242,7 @@ __all__: list[str] = [
     "HOST_FILTER_INDEX_TYPE_MINIMAP2",
     "HOST_FILTER_INDEX_TYPE_RYPE",
     "IllegalStatusTransition",
+    "GENOME_MAP_PATH_BINDING",
     "LIBRARY",
     "LibraryPrimitive",
     "PROCESSING_IDX_BINDING",
@@ -336,6 +341,7 @@ __all__: list[str] = [
     "_resolve_qc_adapters",
     "_resolve_reference_index_path",
     "_resolve_required_host_index",
+    "_resolve_feature_table_bindings",
     "_resolve_sample_map",
     "_resolve_staged_masked_reads",
     "_resolve_staged_reads",

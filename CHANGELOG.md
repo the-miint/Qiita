@@ -505,6 +505,29 @@ _None yet._
 
 ### Added
 
+- **Metagenomic OGU feature-table estimation (compute-on-demand) (#TBD).** Adds
+  the `estimate-feature-table` reference-scoped workflow: given one `alignment_idx`
+  and an explicit `prep_sample_idx` cohort (on the ticket's `action_context`), the
+  native `estimate_feature_table` job builds a genome-keyed OGU feature table via
+  duckdb-miint `woltka_ogu`, filtered to genomes whose breadth of coverage —
+  POOLED over the cohort — meets a user-provided `coverage_threshold`, and emits a
+  single `ogu_table.parquet` (v2+zstd). The OGU key is `genome_idx` (counts +
+  coverage roll `feature_idx → genome_idx`, so multi-contig genomes are handled
+  natively). The table is **computed on demand and never persisted** (deterministic
+  but cohort-dependent), so no `processing_idx`/identity is minted and no DuckLake
+  row is written. Mechanism: the DuckLake `alignment` table is now DoGet-readable
+  (new projected DP `alignment` DoGet, scoped `{alignment_idx, prep_sample_idx[]}`);
+  a CP mint route (`POST /alignment/ticket/doget`, service-account `ticket:doget`)
+  signs that ticket at job runtime, deriving the scope from the work ticket's
+  `action_context`; a runner resolver stages the reference's `feature_idx →
+  genome_idx` map from Postgres and refuses an incomplete cohort; the job streams
+  the alignment slice + per-feature lengths from the data plane over Arrow Flight
+  (no disk) and runs `genome_coverage` + `woltka_ogu`. All identifier columns pass
+  as native `BIGINT` with no `::VARCHAR` casts (requires the woltka_ogu id-type
+  preservation fix in the miint build). No new scope, migration, or enum. Deferred:
+  the user-facing REST trigger, BIOM export, persistence/identity, and downstream
+  diversity (the consumer this feeds).
+
 - **Sharded-reference alignment consumer (C2b).** Wires the C1 `align_sharded`
   native job into a runnable `align` workflow: an operator submits an align run
   for a sequenced-pool against an ACTIVE sharded reference + an aligner, the CP
