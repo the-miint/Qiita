@@ -28,8 +28,19 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import asyncpg
+from qiita_common.host_filter_plan import (
+    PoolPlanRefusal,
+    SampleHostFilter,
+    plan_pool_host_filter,
+)
+from qiita_common.models import (
+    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+    HOST_FILTER_INDEX_TYPE_RYPE,
+    Platform,
+)
 
 from .dispatch import schedule_dispatch
+from .host_filter_resolver import resolve_host_filter_many
 from .repositories.block import (
     add_block_members,
     create_block,
@@ -37,7 +48,12 @@ from .repositories.block import (
     set_block_work_ticket,
 )
 from .repositories.mask_definition import mint_mask_definition
-from .runner import _build_mask_params
+from .repositories.sequencing_run import fetch_sequencing_run_platform
+from .runner import (
+    ReferenceNotFound,
+    _build_mask_params,
+    _resolve_reference_index_path,
+)
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -242,9 +258,11 @@ async def resolve_block_mask_adapter_hash(
 
 class _PlanSample(NamedTuple):
     """A pool sample resolved for planning: its prep_sample_idx, the
-    prep_protocol_idx feeding the mask identity, and its full read range."""
+    biosample_idx its host filtering resolves from, the prep_protocol_idx feeding
+    the mask identity, and its full read range."""
 
     prep_sample_idx: int
+    biosample_idx: int
     prep_protocol_idx: int | None
     sample_range: SampleRange
 
@@ -262,7 +280,7 @@ async def _enumerate_pool_samples(
     Unordered: `tile_partition` sorts by sequence_idx_start itself, so it owns the
     tiling determinism and a producer-side ORDER BY would be redundant DB work."""
     rows = await conn.fetch(
-        "SELECT ss.prep_sample_idx, ps.prep_protocol_idx,"
+        "SELECT ss.prep_sample_idx, ps.biosample_idx, ps.prep_protocol_idx,"
         "       sr.sequence_idx_start, sr.sequence_idx_stop"
         "  FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
@@ -274,6 +292,7 @@ async def _enumerate_pool_samples(
     return [
         _PlanSample(
             prep_sample_idx=r["prep_sample_idx"],
+            biosample_idx=r["biosample_idx"],
             prep_protocol_idx=r["prep_protocol_idx"],
             sample_range=SampleRange(
                 r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]
@@ -283,14 +302,193 @@ async def _enumerate_pool_samples(
     ]
 
 
+class PoolHostFilterRefusal(RuntimeError):
+    """A pool cannot be planned because its per-sample host-filter resolution
+    refuses: one or more samples are UNRESOLVED, or the pool spans more than one
+    host (its blanks have no single reference, and the multi-host union is not
+    built). The block/align routes map this to a 422 that names the offending
+    samples, mirroring the per-sample submit-host-filter-pool abort. `reasons`
+    carries the resolver's own message for the first few offenders so the operator
+    sees WHY, not just WHICH."""
+
+    def __init__(
+        self,
+        refusal: PoolPlanRefusal,
+        offending: tuple[int, ...],
+        *,
+        reasons: dict[int, str] | None = None,
+        pool_host_term_idx: int | None = None,
+    ) -> None:
+        self.refusal = refusal
+        self.offending = offending
+        self.reasons = reasons or {}
+        self.pool_host_term_idx = pool_host_term_idx
+        super().__init__(f"{refusal.value}: {len(offending)} offending sample(s)")
+
+
+class HostReferenceNotReady(RuntimeError):
+    """A host reference the resolved plan points at is not usable: the reference
+    row is missing, is not ACTIVE, or has no index of the required type built yet.
+    Caught before any mask is minted so the whole plan is refused with one
+    actionable error rather than fanning out into N failed blocks. The route maps
+    it to a 422 — it is a host_filter_profile / reference-build config problem, not
+    a client typo (the caller never named the reference; resolution did)."""
+
+
+async def resolve_pool_sample_decisions(
+    pool: asyncpg.Pool,
+    *,
+    samples: Sequence[_PlanSample],
+    platform: Platform,
+    force_decision: SampleHostFilter | None,
+) -> dict[int, SampleHostFilter]:
+    """Resolve each sample's host-filter decision, keyed by `prep_sample_idx`.
+
+    THE shared seam between the block-mask and align planners: both must derive the
+    identical per-sample answer, so the resolution lives here once rather than as
+    two parallel implementations that could drift (the same reason
+    `resolve_host_filter` and `resolve_host_filter_many` share a `_classify` core).
+
+    `force_decision` is the `--force` override: when set, every sample gets it
+    verbatim, bypassing resolution (the operator applies one reference pool-wide,
+    blanks included). Otherwise each sample is resolved from its own
+    `host_taxon_id` metadata + `platform` (`resolve_host_filter_many`), then the
+    pool-level blank join + refusals run through the shared
+    `plan_pool_host_filter`. A refusal raises `PoolHostFilterRefusal` (the route
+    turns it into a 422); success returns one `SampleHostFilter` per sample.
+    """
+    if force_decision is not None:
+        return {s.prep_sample_idx: force_decision for s in samples}
+
+    resolutions_by_biosample = await resolve_host_filter_many(
+        pool,
+        biosample_idxs=[s.biosample_idx for s in samples],
+        platform=platform,
+    )
+    # Re-key by prep_sample_idx: that is the unit the planner tiles and gates, and
+    # it is what the refusal message should name. Two prep_samples sharing a
+    # biosample resolve identically, which is correct.
+    resolutions = {s.prep_sample_idx: resolutions_by_biosample[s.biosample_idx] for s in samples}
+    plan = plan_pool_host_filter(resolutions)
+    if plan.refusal is not None:
+        raise PoolHostFilterRefusal(
+            plan.refusal,
+            plan.offending,
+            reasons={key: resolutions[key].reason for key in plan.offending[:3]},
+            pool_host_term_idx=plan.pool_host_term_idx,
+        )
+    return plan.decisions
+
+
+def force_decision_from(
+    *, force: bool, host_rype_reference_idx: int | None, host_minimap2_reference_idx: int | None
+) -> SampleHostFilter | None:
+    """Build the `--force` override decision a plan applies pool-wide, or None when
+    not forcing (the normal resolve-per-sample path).
+
+    The request's host refs are a force-only override — the model already rejects a
+    host ref without `force` — so `force=False` returns None regardless. When
+    forcing, the given references become one decision applied to every sample,
+    blanks included (host filtering enabled exactly when a rype ref is given)."""
+    if not force:
+        return None
+    return SampleHostFilter(
+        enabled=host_rype_reference_idx is not None,
+        rype_reference_idx=host_rype_reference_idx,
+        minimap2_reference_idx=host_minimap2_reference_idx,
+    )
+
+
+def _mask_params_for(
+    decision: SampleHostFilter,
+    *,
+    prep_protocol_idx: int | None,
+    instrument_model: str | None,
+    adapter_set_hash: str | None,
+) -> dict[str, Any]:
+    """The mask-identity params for one `(decision, prep_protocol)` combination.
+
+    Wraps the shared `_build_mask_params` so the block-mask mint and the align
+    lookup derive the SAME hash for the same effective filter — the host refs come
+    from the sample's resolved `decision` (None when it disables filtering), not
+    from a pool-wide flag. The block workflow is `qc -> host_filter` only, so lima
+    and syndna are always absent (passed explicitly, not defaulted, so adding a
+    block-path stage has to come here and say so)."""
+    return _build_mask_params(
+        action_id=_MASK_FILTER_WORKFLOW,
+        action_version=_MASK_FILTER_VERSION,
+        prep_protocol_idx=prep_protocol_idx,
+        instrument_model=instrument_model,
+        adapter_set_hash=adapter_set_hash,
+        host_rype_reference_idx=decision.rype_reference_idx if decision.enabled else None,
+        host_minimap2_reference_idx=decision.minimap2_reference_idx if decision.enabled else None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+
+
+async def _assert_pool_references_ready(
+    pool: asyncpg.Pool, decisions: Sequence[SampleHostFilter]
+) -> None:
+    """Fail the whole plan (before any mint) if a reference the resolved plan
+    points at is not ACTIVE with its index built.
+
+    The per-sample submit path preflighted this client-side
+    (`_assert_resolved_references_ready`); once resolution moved server-side that
+    check has to move here too, or a bad profile would fail every block at the
+    runner's submission stage instead of once, actionably, up front. Deduped across
+    the pool: a single-host pool checks one rype (+ optional minimap2) pair no
+    matter how many samples it has. A decision that disables filtering checks
+    nothing."""
+    rype = {d.rype_reference_idx for d in decisions if d.enabled}
+    minimap2 = {
+        d.minimap2_reference_idx for d in decisions if d.enabled and d.minimap2_reference_idx
+    }
+    checks = [(idx, HOST_FILTER_INDEX_TYPE_RYPE) for idx in sorted(rype)]
+    checks += [(idx, HOST_FILTER_INDEX_TYPE_MINIMAP2) for idx in sorted(minimap2)]
+    for reference_idx, index_type in checks:
+        try:
+            await _resolve_reference_index_path(pool, reference_idx, index_type)
+        # ReferenceIndexNotBuilt is a ValueError subclass (index not built); the
+        # bare ValueError also covers a non-active reference.
+        except (ReferenceNotFound, ValueError) as exc:
+            raise HostReferenceNotReady(
+                f"reference {reference_idx} resolved by the pool's host_filter_profile is not"
+                f" usable for its {index_type!r} index: {exc}. Fix the profile or build the"
+                " reference index; the reference was chosen by resolution, not passed by you."
+            ) from exc
+
+
+def _block_action_context(
+    decision: SampleHostFilter, instrument_model: str | None
+) -> dict[str, Any]:
+    """The `action_context` a block ticket carries for one partition's decision.
+
+    read-mask-block is `qc -> host_filter` only (no lima chain, no syndna step), so
+    those gates are always off. host filtering is on exactly when this partition's
+    resolved decision enables it, and it carries THAT decision's refs — not a
+    pool-wide flag. Keys match the read-mask-block `context_schema`."""
+    context: dict[str, Any] = {
+        "host_filter_enabled": decision.enabled,
+        "lima_enabled": False,
+        "syndna_enabled": False,
+    }
+    if decision.enabled:
+        context["host_rype_reference_idx"] = decision.rype_reference_idx
+        if decision.minimap2_reference_idx is not None:
+            context["host_minimap2_reference_idx"] = decision.minimap2_reference_idx
+    if instrument_model is not None:
+        context["instrument_model"] = instrument_model
+    return context
+
+
 async def plan_and_submit_blocks(
     pool: asyncpg.Pool,
     *,
     app: FastAPI,
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
-    host_rype_reference_idx: int | None,
-    host_minimap2_reference_idx: int | None,
+    force_decision: SampleHostFilter | None,
     only_missing: bool,
     adapter_set_hash: str | None,
     originator_principal_idx: int,
@@ -311,24 +509,40 @@ async def plan_and_submit_blocks(
     canonical adapter set) and threaded into the mask identity so it matches what
     a per-sample read-mask would mint. `only_missing` drops samples already
     carrying a `mask_sample` row for their resolved mask (an interrupted plan is
-    re-runnable without duplicating work). Host filtering is pool-wide: a rype
-    reference (optional minimap2) depletes every sample, or none is a QC-only
-    pass-through — the same `action_context` shape the per-sample path uses.
+    re-runnable without duplicating work).
 
-    Returns a JSON-able summary (partitions, blocks + their tickets, counts).
-    Raises asyncpg errors on a genuine DB fault (fail loud); a sample without a
-    sequence_range is reported in `samples_skipped_no_reads`, not raised.
+    Host filtering is resolved PER SAMPLE from each sample's `host_taxon_id`
+    metadata + the run's platform (`resolve_pool_sample_decisions`), not chosen
+    pool-wide: samples that resolve differently get different `mask_idx`, fall into
+    different partitions, and each block's `action_context` carries ITS partition's
+    host refs. `force_decision` (the `--force` override) bypasses resolution and
+    applies one decision to every sample. A pool that cannot resolve (an
+    UNRESOLVED sample, or >1 host) raises `PoolHostFilterRefusal`; a resolved
+    reference that is not built raises `HostReferenceNotReady` — both before any
+    mask is minted.
+
+    Returns a JSON-able summary (partitions with their host refs, blocks + their
+    tickets, counts). Raises asyncpg errors on a genuine DB fault (fail loud); a
+    sample without a sequence_range is reported in `samples_skipped_no_reads`.
     """
-    host_filter_enabled = host_rype_reference_idx is not None
-
-    # instrument_model gates QC's polyG and is part of the mask identity; read it
-    # once from the run (server is the source of truth; nullable).
+    # platform is the resolver's second input; instrument_model gates QC's polyG
+    # and is part of the mask identity. Both are pool-constant, read once.
+    platform = await fetch_sequencing_run_platform(pool, sequencing_run_idx)
     instrument_model = await pool.fetchval(
         "SELECT instrument_model FROM qiita.sequencing_run WHERE idx = $1",
         sequencing_run_idx,
     )
 
     all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
+
+    # Per-sample host-filter decision (keyed by prep_sample_idx). Refuses an
+    # UNRESOLVED / multi-host pool up front; `force_decision` bypasses resolution.
+    decision_by_prep_sample = await resolve_pool_sample_decisions(
+        pool, samples=all_samples, platform=platform, force_decision=force_decision
+    )
+    # Preflight the references the plan resolved to — one actionable error instead
+    # of a whole plan's worth of failed blocks.
+    await _assert_pool_references_ready(pool, list(decision_by_prep_sample.values()))
 
     # ACTIVE pool samples whose reads were never ingested (no sequence_range)
     # can't be tiled — report them so the operator sees the gap rather than a
@@ -343,35 +557,37 @@ async def plan_and_submit_blocks(
         sequenced_pool_idx,
     )
 
-    # Resolve mask_idx per sample. Everything but prep_protocol_idx is
-    # pool-constant, so memoize by prep_protocol_idx — one mint per distinct
-    # protocol (the "prep-protocol over-partitioning" v1 choice), not per sample.
-    mask_by_protocol: dict[int | None, int] = {}
+    # Mint mask_idx per sample. The identity now depends on BOTH the prep_protocol
+    # AND the sample's resolved host-filter decision, so memoize by that pair — one
+    # mint per distinct (protocol, decision), not per sample. A uniform pool
+    # collapses to one mint per protocol exactly as before; a heterogeneous pool
+    # mints one per distinct decision and the partitions fall out naturally.
+    mask_by_prep_sample: dict[int, int] = {}
+    decision_by_mask: dict[int, SampleHostFilter] = {}
+    mask_by_key: dict[tuple[int | None, SampleHostFilter], int] = {}
     async with pool.acquire() as conn:
-        for protocol_idx in {s.prep_protocol_idx for s in all_samples}:
-            params = _build_mask_params(
-                action_id=_MASK_FILTER_WORKFLOW,
-                action_version=_MASK_FILTER_VERSION,
-                prep_protocol_idx=protocol_idx,
-                instrument_model=instrument_model,
-                adapter_set_hash=adapter_set_hash,
-                host_rype_reference_idx=host_rype_reference_idx,
-                host_minimap2_reference_idx=host_minimap2_reference_idx,
-                # The block workflow (read-mask-block) is `qc -> host_filter`
-                # only: it has no lima chain and no syndna step, so a block mask
-                # never carries either. Passed explicitly rather than defaulted so
-                # adding a block-path feature has to come here and say so.
-                resolved_lima=None,
-                resolved_syndna=None,
-            )
-            mask_row = await mint_mask_definition(
-                conn,
-                filter_workflow=_MASK_FILTER_WORKFLOW,
-                filter_version=_MASK_FILTER_VERSION,
-                params=params,
-                principal_idx=originator_principal_idx,
-            )
-            mask_by_protocol[protocol_idx] = mask_row["mask_idx"]
+        for s in all_samples:
+            decision = decision_by_prep_sample[s.prep_sample_idx]
+            key = (s.prep_protocol_idx, decision)
+            mask_idx = mask_by_key.get(key)
+            if mask_idx is None:
+                params = _mask_params_for(
+                    decision,
+                    prep_protocol_idx=s.prep_protocol_idx,
+                    instrument_model=instrument_model,
+                    adapter_set_hash=adapter_set_hash,
+                )
+                mask_row = await mint_mask_definition(
+                    conn,
+                    filter_workflow=_MASK_FILTER_WORKFLOW,
+                    filter_version=_MASK_FILTER_VERSION,
+                    params=params,
+                    principal_idx=originator_principal_idx,
+                )
+                mask_idx = mask_row["mask_idx"]
+                mask_by_key[key] = mask_idx
+                decision_by_mask[mask_idx] = decision
+            mask_by_prep_sample[s.prep_sample_idx] = mask_idx
 
     # only_missing: drop samples already gated under their resolved mask (a prior
     # plan reached them) so an interrupted plan re-runs only the gap. One batched
@@ -384,7 +600,7 @@ async def plan_and_submit_blocks(
             "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
             "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
             "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx",
-            [mask_by_protocol[s.prep_protocol_idx] for s in all_samples],
+            [mask_by_prep_sample[s.prep_sample_idx] for s in all_samples],
             [s.prep_sample_idx for s in all_samples],
         )
         gated_prep_sample_idxs = {r["prep_sample_idx"] for r in gated}
@@ -411,7 +627,7 @@ async def plan_and_submit_blocks(
             "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
             "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
             "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx",
-            [mask_by_protocol[s.prep_protocol_idx] for s in to_plan],
+            [mask_by_prep_sample[s.prep_sample_idx] for s in to_plan],
             [s.prep_sample_idx for s in to_plan],
         )
         if conflicting:
@@ -420,24 +636,7 @@ async def plan_and_submit_blocks(
     # Partition the to-plan samples by resolved mask_idx.
     partitions: dict[int, list[_PlanSample]] = {}
     for s in to_plan:
-        partitions.setdefault(mask_by_protocol[s.prep_protocol_idx], []).append(s)
-
-    # `when:` is DEFAULT-ON, and this INSERTs the ticket directly (bypassing the
-    # REST route's context_schema `required:` check), so the gate keys must be
-    # written here explicitly. read-mask-block is `qc -> host_filter` only: it has
-    # neither the lima chain nor the syndna step.
-    action_context = {
-        "host_filter_enabled": host_filter_enabled,
-        "lima_enabled": False,
-        "syndna_enabled": False,
-    }
-    if host_filter_enabled:
-        action_context["host_rype_reference_idx"] = host_rype_reference_idx
-        if host_minimap2_reference_idx is not None:
-            action_context["host_minimap2_reference_idx"] = host_minimap2_reference_idx
-    if instrument_model is not None:
-        action_context["instrument_model"] = instrument_model
-    action_context_json = json.dumps(action_context)
+        partitions.setdefault(mask_by_prep_sample[s.prep_sample_idx], []).append(s)
 
     # Persist the whole plan in ONE transaction — a partial plan must roll back
     # (the masks minted above are idempotent and survive a rollback harmlessly).
@@ -445,6 +644,12 @@ async def plan_and_submit_blocks(
     partition_summaries: list[dict[str, Any]] = []
     async with pool.acquire() as conn, conn.transaction():
         for mask_idx, samples in sorted(partitions.items()):
+            # Each partition carries ITS OWN host refs — the decision that minted
+            # this mask_idx, not a pool-wide flag. `when:` is DEFAULT-ON and this
+            # INSERTs the ticket directly (bypassing the REST route's
+            # context_schema check), so the gate keys are written here explicitly.
+            decision = decision_by_mask[mask_idx]
+            action_context_json = json.dumps(_block_action_context(decision, instrument_model))
             await create_mask_sample_pending(
                 conn,
                 mask_idx=mask_idx,
@@ -487,11 +692,21 @@ async def plan_and_submit_blocks(
                         ),
                     }
                 )
+            # Each partition's host refs are the truth for its samples (the same
+            # `decision` bound above) — there is no single pool-wide answer any
+            # more, so they live per partition.
             partition_summaries.append(
                 {
                     "mask_idx": mask_idx,
                     "sample_count": len(samples),
                     "block_count": len(blocks),
+                    "host_filter_enabled": decision.enabled,
+                    "host_rype_reference_idx": (
+                        decision.rype_reference_idx if decision.enabled else None
+                    ),
+                    "host_minimap2_reference_idx": (
+                        decision.minimap2_reference_idx if decision.enabled else None
+                    ),
                 }
             )
 
@@ -503,9 +718,6 @@ async def plan_and_submit_blocks(
         "sequencing_run_idx": sequencing_run_idx,
         "sequenced_pool_idx": sequenced_pool_idx,
         "instrument_model": instrument_model,
-        "host_filter_enabled": host_filter_enabled,
-        "host_rype_reference_idx": host_rype_reference_idx if host_filter_enabled else None,
-        "host_minimap2_reference_idx": host_minimap2_reference_idx if host_filter_enabled else None,
         "samples_planned": len(to_plan),
         "samples_skipped_existing": skipped_existing,
         "samples_skipped_no_reads": skipped_no_reads,

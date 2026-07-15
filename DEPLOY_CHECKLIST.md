@@ -180,6 +180,16 @@ verification passes, the OLD build's config is the rollback path.
 
 ### Notes (no host action)
 
+- (#305) **The bulk-block `block-mask-plan` / `align-plan` paths now resolve host filtering
+  per sample too** — the same live behaviour as the #303 submit-path swap, extended to the
+  block-compute paths, so it rides the SAME #299-backfill dependency (bucket 5): a pool
+  block-masked before the backfill would abort UNRESOLVED. Soft API-contract change for any
+  direct caller of these endpoints: both gain a `force: bool`, their `host_*_reference_idx`
+  become a **force-only override** (a host ref without `force` is now 422), an UNRESOLVED /
+  multi-host pool is refused 422, and the pool-wide host fields moved from the response top
+  level onto each partition (align's dropped entirely). No env/migration/scope/workflow
+  change — CP + wire-model + CLI code only; `read-mask-block` `context_schema` is unchanged.
+
 - (#303) **`submit-host-filter-pool` now resolves host filtering per sample from
   `host_taxon_id` metadata — the `--host-*-reference-idx` flags are gone as inputs.** This is
   a LIVE behaviour change, and it is why the #299 backfill (bucket 5) is not optional: run

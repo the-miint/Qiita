@@ -54,6 +54,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
     AlignPlanRequest,
     AlignPlanResponse,
@@ -125,6 +126,32 @@ from ..repositories.sequencing_run import (
 from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
+
+
+def _host_filter_refusal_http(exc: block_planner.PoolHostFilterRefusal) -> HTTPException:
+    """Turn a per-sample host-filter refusal into a 422 that NAMES the offending
+    prep_samples — the same fail-closed abort the CLI submit path prints, now on the
+    server surface both the block-mask and align plans share. UNRESOLVED lists the
+    samples and the resolver's reason for the first few; MULTI_HOST names the
+    prep_samples that established the competing hosts."""
+    if exc.refusal is PoolPlanRefusal.UNRESOLVED_SAMPLES:
+        reasons = "; ".join(f"{idx}: {why}" for idx, why in exc.reasons.items())
+        detail = (
+            f"{len(exc.offending)} sample(s) have no resolvable host"
+            f" (e.g. {list(exc.offending[:5])}); refusing to submit — a sample whose"
+            " host we cannot determine would be masked against the wrong thing, or"
+            f" against nothing. {reasons}. Fix the samples' host_taxon_id metadata"
+            " (qiita-admin backfill host-taxon-id), or force an explicit reference."
+        )
+    else:  # MULTI_HOST
+        detail = (
+            f"pool spans more than one host (established by e.g."
+            f" {list(exc.offending[:5])}); its blanks have no single reference to be"
+            " depleted against, and filtering against the union of the pool's hosts"
+            " is not supported yet. Submit a single-host subset, or force an explicit"
+            " reference."
+        )
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 @router.post(PATH_SEQUENCING_RUN_ROOT, status_code=201)
@@ -715,14 +742,23 @@ async def submit_block_mask_plan(
             app=request.app,
             sequencing_run_idx=sequencing_run_idx,
             sequenced_pool_idx=sequenced_pool_idx,
-            host_rype_reference_idx=body.host_rype_reference_idx,
-            host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            force_decision=block_planner.force_decision_from(
+                force=body.force,
+                host_rype_reference_idx=body.host_rype_reference_idx,
+                host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            ),
             only_missing=body.only_missing,
             adapter_set_hash=adapter_set_hash,
             originator_principal_idx=user.principal_idx,
             block_action_id=block_planner.BLOCK_MASK_ACTION_ID,
             block_action_version=block_planner.BLOCK_MASK_ACTION_VERSION,
         )
+    except block_planner.PoolHostFilterRefusal as exc:
+        raise _host_filter_refusal_http(exc) from exc
+    except block_planner.HostReferenceNotReady as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
     except block_planner.BlockMaskResubmitError as exc:
         # A sample already gated for the resolved mask would be re-masked
         # (completed → read_mask double-write) or wedged (pending → duplicate
@@ -833,14 +869,27 @@ async def submit_align_plan(
             sequencing_run_idx=sequencing_run_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             reference_idx=body.reference_idx,
-            host_rype_reference_idx=body.host_rype_reference_idx,
-            host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            force_decision=block_planner.force_decision_from(
+                force=body.force,
+                host_rype_reference_idx=body.host_rype_reference_idx,
+                host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            ),
             only_missing=body.only_missing,
             adapter_set_hash=adapter_set_hash,
             originator_principal_idx=user.principal_idx,
             align_action_id=align_planner.ALIGN_ACTION_ID,
             align_action_version=align_planner.ALIGN_ACTION_VERSION,
         )
+    except block_planner.PoolHostFilterRefusal as exc:
+        # Same per-sample resolution as block-mask-plan: an UNRESOLVED / multi-host
+        # pool cannot name each sample's mask to look up.
+        raise _host_filter_refusal_http(exc) from exc
+    except align_planner.AlignNoMasksFound as exc:
+        # The whole pool misses the resolved mask (never masked, or a --force
+        # mismatch between block-mask and align) — loud 422, not a silent 202/0.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
     except align_planner.AlignReferenceNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except align_planner.AlignUnsupportedPlatform as exc:

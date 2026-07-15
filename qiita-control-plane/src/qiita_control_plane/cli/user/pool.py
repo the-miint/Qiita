@@ -1325,101 +1325,39 @@ def _handle_submit_block_mask_pool(
     """Bulk-block variant of submit-host-filter-pool: mask a whole pool as fixed
     ~10M-read BLOCKS instead of one ticket per sample.
 
-    Same filtering semantics and the same client-side preflight as
-    submit-host-filter-pool — per-sample resolution, the pool-level blank join, and
-    the up-front host-reference ACTIVE+index readiness check — but the actual
-    submission is a SINGLE server call to the
-    block-mask-plan endpoint, not a per-sample fan-out. The server resolves each
-    sample's mask identity, partitions by mask, tiles each partition into blocks,
-    and dispatches one block work-ticket per block; per-sample completion is
-    reconciled afterward. This collapses the fan-out surface (few fat blocks
-    instead of one ticket per sample) and gives each job a predictable ~10M-read
-    envelope.
+    Same filtering semantics as submit-host-filter-pool — host filtering is
+    resolved PER SAMPLE from each sample's own host_taxon_id metadata, blanks
+    joined against the pool's host — but the resolution happens SERVER-side and the
+    submission is a SINGLE call to the block-mask-plan endpoint, not a per-sample
+    fan-out. The server resolves each sample's mask identity, partitions by mask
+    (a heterogeneous pool tiles into several partitions, each with its own host
+    refs), tiles each partition into blocks, and dispatches one block work-ticket
+    per block; per-sample completion is reconciled afterward. This collapses the
+    fan-out surface (few fat blocks instead of one ticket per sample) and gives
+    each job a predictable ~10M-read envelope.
 
-    `--only-missing` is applied SERVER-side (skip samples already carrying a
-    completion gate for their resolved mask), so an interrupted plan re-runs only
-    the gap. instrument_model is read server-side (the endpoint owns it), so
-    there is no per-run GET here."""
+    Because resolution and the reference-readiness check are server-side, this is a
+    thin client: it validates host-ref argument coherence, then POSTs. The server
+    refuses an UNRESOLVED / multi-host pool (422) naming the offending samples.
+    `--force` applies an explicit reference pool-wide, bypassing resolution.
+    `--only-missing` is applied server-side; instrument_model is read server-side."""
     # Host-ref argument coherence, validated before any network call (mirrors
-    # submit-host-filter-pool): minimap2 is the optional second stage.
+    # submit-host-filter-pool): minimap2 needs rype, and a host ref without --force
+    # is a rejected override (resolution is server-side now).
     _validate_host_ref_override_args(args, parser)
 
     def _run(token: str) -> dict:
-        # Step 1: enumerate the pool's active samples for the intent preflight.
-        pool_list_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
-            sequencing_run_idx=args.sequencing_run_idx,
-            sequenced_pool_idx=args.sequenced_pool_idx,
-        )
-        roster = _common.call(
-            "GET",
-            args.base_url,
-            token,
-            f"{PATH_SEQUENCING_RUN_PREFIX}{pool_list_path}",
-        )
-        samples = roster["samples"]
-        if not samples:
-            print(
-                f"sequenced_pool {args.sequenced_pool_idx} has no active"
-                " sequenced_samples to process",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        # Step 1.5: resolve the pool, then require the answer to be UNIFORM.
-        #
-        # The block path masks a whole pool under ONE recipe — the planner takes a
-        # single host reference and applies it to every block. That is still correct
-        # whenever the resolved plan happens to be uniform, which is the normal case:
-        # a single-host pool's blanks inherit that host, so "apply H to everything"
-        # IS the per-sample answer. It stops being correct the moment a pool mixes
-        # samples that filter with samples that pass through, because pool-wide would
-        # then deplete a host-less sample.
-        #
-        # So: resolve, and refuse a non-uniform pool rather than flatten it. Driving
-        # the planner off the per-sample plan properly is server-side work
-        # (block_planner takes pool-wide references today) and is tracked separately;
-        # until then this refuses instead of silently doing the wrong thing.
-        if args.force:
-            block_decision = SampleHostFilter(
-                enabled=args.host_rype_reference_idx is not None,
-                rype_reference_idx=args.host_rype_reference_idx,
-                minimap2_reference_idx=args.host_minimap2_reference_idx,
-            )
-        else:
-            decisions = _resolved_decisions(samples, parser, args.sequenced_pool_idx)
-            distinct = set(decisions.values())
-            if len(distinct) > 1:
-                print(
-                    f"sequenced_pool {args.sequenced_pool_idx} resolves to"
-                    f" {len(distinct)} different host-filter decisions across its"
-                    " samples, but block masking applies ONE recipe to the whole"
-                    " pool. Submit per-sample with `submit-host-filter-pool`"
-                    " instead, or pass --force with an explicit"
-                    " --host-rype-reference-idx to apply one reference pool-wide.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            block_decision = next(iter(distinct))
-
-        # Step 2: pre-flight the reference(s) the pool RESOLVED to — one actionable
-        # error instead of a whole plan's worth of failed blocks. A pool that
-        # resolves to no filtering checks nothing.
-        _assert_resolved_references_ready(args.base_url, token, {"pool": block_decision})
-
-        # Step 3: one call plans + submits the whole pool. The server tiles,
-        # persists the cover-map + gate, creates one block ticket per block, and
-        # dispatches; it returns the plan summary (blocks + tickets + counts).
+        # One call plans + submits the whole pool. The server resolves per sample,
+        # tiles, persists the cover-map + gate, creates one block ticket per block,
+        # and dispatches; it returns the plan summary (blocks + tickets + counts).
         plan_path = PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN.format(
             sequencing_run_idx=args.sequencing_run_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
         )
         body = BlockMaskPlanRequest(
-            host_rype_reference_idx=block_decision.rype_reference_idx
-            if block_decision.enabled
-            else None,
-            host_minimap2_reference_idx=block_decision.minimap2_reference_idx
-            if block_decision.enabled
-            else None,
+            host_rype_reference_idx=args.host_rype_reference_idx,
+            host_minimap2_reference_idx=args.host_minimap2_reference_idx,
+            force=args.force,
             only_missing=args.only_missing,
         ).model_dump(mode="json")
         return _common.call(

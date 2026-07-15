@@ -18,12 +18,21 @@ import secrets
 import pytest
 import pytest_asyncio
 from qiita_common.api_paths import URL_SEQUENCED_POOL_ALIGN_PLAN
+from qiita_common.models import MISSING_REASON_NOT_APPLICABLE
 
 from qiita_control_plane import align_planner
+from qiita_control_plane.repositories._sample_helpers import (
+    _get_or_create_globally_linked_study_field,
+    insert_entity_to_study,
+)
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.runner import _build_mask_params
-from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+from qiita_control_plane.testing.db_seeds import (
+    fetch_missing_value_reason_idx,
+    seed_biosample_with_sequenced_prep_sample,
+)
 
 pytestmark = pytest.mark.db
 
@@ -142,8 +151,34 @@ async def planned(ctx, monkeypatch):
     )
     reference_idx = await _seed_active_sharded_reference(db, owner, suffix)
 
+    # Host-filter resolution infra: the align POST carries no host ref, so the
+    # planner resolves each sample per its host_taxon_id metadata (the SAME
+    # resolution the block-mask plan minted under). Tag every sample `not
+    # applicable` (→ PASS_THROUGH, host filtering off) so resolution succeeds AND
+    # reconstructs the no-host-ref mask identity the fixture mints below.
+    study_idx = await db.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        owner,
+        f"alignplan-study-{suffix}",
+    )
+    host_gf_idx = await db.fetchval(
+        "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'host_taxon_id'"
+    )
+    async with db.acquire() as conn, conn.transaction():
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=host_gf_idx,
+            display_name="host taxon id",
+            created_by_idx=owner,
+        )
+    not_applicable_idx = await fetch_missing_value_reason_idx(db, MISSING_REASON_NOT_APPLICABLE)
+
     prep_samples: list[int] = []
     biosamples: list[int] = []
+    meta_idxs: list[int] = []
     mask_idxs: set[int] = set()
     for _ in range(2):
         bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
@@ -162,6 +197,24 @@ async def planned(ctx, monkeypatch):
             await mint_sequence_range(
                 conn, prep_sample_idx=ps, count=150, principal_idx=owner, work_ticket_idx=None
             )
+        async with db.acquire() as conn, conn.transaction():
+            await insert_entity_to_study(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=bs,
+                study_idx=study_idx,
+                created_by_idx=owner,
+            )
+        meta_idx = await db.fetchval(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx, created_by_idx)"
+            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            bs,
+            field_idx,
+            not_applicable_idx,
+            owner,
+        )
+        meta_idxs.append(meta_idx)
         # Mint the sample's read-mask with the EXACT params the align planner
         # reconstructs (adapter_set_hash None; no host refs), then flip its gate
         # COMPLETED so the planner considers it.
@@ -204,6 +257,11 @@ async def planned(ctx, monkeypatch):
         "mask_idxs": mask_idxs,
         "dispatched": dispatched,
         "owner": owner,
+        # Host-filter infra, exposed so a test that adds an extra pool sample can
+        # tag it with a resolvable host_taxon_id (else resolution refuses the pool).
+        "study_idx": study_idx,
+        "host_field_idx": field_idx,
+        "not_applicable_idx": not_applicable_idx,
     }
 
     # Cleanup (FK-reverse, id-scoped).
@@ -230,6 +288,11 @@ async def planned(ctx, monkeypatch):
     await db.execute(
         "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
     )
+    # Host-filter infra teardown (before the biosamples are deleted below).
+    await db.execute(
+        "DELETE FROM qiita.biosample_metadata WHERE idx = ANY($1::bigint[])", meta_idxs
+    )
+    await db.execute("DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx)
     await db.execute(
         "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
     )
@@ -240,6 +303,8 @@ async def planned(ctx, monkeypatch):
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_samples)
     await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", biosamples)
+    await db.execute("DELETE FROM qiita.biosample_study_field WHERE idx = $1", field_idx)
+    await db.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
     await db.execute("DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx)
     await db.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
@@ -305,6 +370,19 @@ async def test_align_plan_happy_path(ctx, planned):
     assert gate == 2
 
 
+async def test_align_plan_all_masks_miss_422(ctx, planned):
+    """When NOT ONE sample resolves to a minted mask, align refuses with 422 rather
+    than a silent 202/0. Here the pool was block-masked under `not applicable` (no
+    host refs), but align is forced against a host reference it was never masked
+    under — the exact `--force` mismatch the loud refusal exists to catch."""
+    await _seed_align_action(planned["db"])
+    resp = await ctx["wet"].post(
+        _url(planned), json=_body(planned, host_rype_reference_idx=999999, force=True)
+    )
+    assert resp.status_code == 422, resp.text
+    assert "nothing to align" in resp.json()["detail"]
+
+
 async def test_align_plan_long_read_platform_selects_minimap2(ctx, planned):
     """A long-read platform (pacbio_smrt) resolves the aligner to minimap2 — the
     aligner is derived from the run's platform, not the caller."""
@@ -360,6 +438,7 @@ async def test_align_plan_skips_unmasked_sample(ctx, planned):
     bs, ps = await seed_biosample_with_sequenced_prep_sample(
         db, owner_idx=owner, protocol_name="short_read_amplicon"
     )
+    meta_idx = None
     try:
         await db.execute(
             "INSERT INTO qiita.sequenced_sample"
@@ -374,6 +453,26 @@ async def test_align_plan_skips_unmasked_sample(ctx, planned):
             await mint_sequence_range(
                 conn, prep_sample_idx=ps, count=150, principal_idx=owner, work_ticket_idx=None
             )
+        # Tag the extra sample `not applicable` too, so resolution succeeds for it
+        # (a host-less amplicon control) and the test isolates the no_mask skip —
+        # otherwise the missing host_taxon_id would refuse the whole pool (422).
+        async with db.acquire() as conn, conn.transaction():
+            await insert_entity_to_study(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=bs,
+                study_idx=planned["study_idx"],
+                created_by_idx=owner,
+            )
+        meta_idx = await db.fetchval(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx, created_by_idx)"
+            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            bs,
+            planned["host_field_idx"],
+            planned["not_applicable_idx"],
+            owner,
+        )
 
         resp = await ctx["wet"].post(_url(planned), json=_body(planned))
         assert resp.status_code == 202, resp.text
@@ -392,6 +491,9 @@ async def test_align_plan_skips_unmasked_sample(ctx, planned):
             " (SELECT block_idx FROM qiita.block_member WHERE prep_sample_idx = $1)",
             ps,
         )
+        if meta_idx is not None:
+            await db.execute("DELETE FROM qiita.biosample_metadata WHERE idx = $1", meta_idx)
+        await db.execute("DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1", bs)
         await db.execute("DELETE FROM qiita.sequence_range WHERE prep_sample_idx = $1", ps)
         await db.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", ps)
         await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
@@ -450,3 +552,37 @@ async def test_align_plan_minimap2_body_minimap2_requires_rype_422(ctx, planned)
     await _seed_align_action(planned["db"])
     resp = await ctx["wet"].post(_url(planned), json=_body(planned, host_minimap2_reference_idx=9))
     assert resp.status_code == 422, resp.text
+
+
+async def test_align_plan_unresolved_pool_422(ctx, planned):
+    """A pool sample the planner cannot resolve host filtering for (a sample with
+    reads but NO host_taxon_id metadata) refuses the whole align plan with 422 —
+    the same per-sample resolution the block-mask plan runs, so an unresolvable
+    pool can't name each sample's mask to look up."""
+    await _seed_align_action(planned["db"])
+    db = planned["db"]
+    owner = planned["owner"]
+    # An extra in-pool sample WITH reads (so it is enumerated) but no host_taxon_id
+    # → UNRESOLVED → PoolHostFilterRefusal → 422.
+    bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
+    try:
+        await db.execute(
+            "INSERT INTO qiita.sequenced_sample"
+            "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            ps,
+            planned["pool_idx"],
+            f"unresolved-{ps}",
+            owner,
+        )
+        async with db.acquire() as conn, conn.transaction():
+            await mint_sequence_range(
+                conn, prep_sample_idx=ps, count=150, principal_idx=owner, work_ticket_idx=None
+            )
+        resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+        assert resp.status_code == 422, resp.text
+    finally:
+        await db.execute("DELETE FROM qiita.sequence_range WHERE prep_sample_idx = $1", ps)
+        await db.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", ps)
+        await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
+        await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs)

@@ -145,6 +145,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **The bulk-block mask + align planners now resolve host filtering per sample, not
+  pool-wide (#305).** `block_planner.plan_and_submit_blocks` and
+  `align_planner.plan_and_submit_alignments` no longer take
+  `host_rype_reference_idx` / `host_minimap2_reference_idx` pool-wide arguments;
+  each sample's decision comes from its own `host_taxon_id` metadata via the shared
+  `resolve_pool_sample_decisions` (the same `plan_pool_host_filter` seam the #303
+  submit path uses), so a heterogeneous pool tiles into several mask partitions and
+  each block's `action_context` carries ITS partition's host refs. This closes the
+  drift where a pool masked through the block path ignored the per-sample plan the
+  fan-out path already honoured.
+  - `POST .../block-mask-plan` and `POST .../align-plan` gain a `force: bool`; their
+    `host_*_reference_idx` become a **force-only override** (a host ref without
+    `force` is a 422, mirroring the CLI). An UNRESOLVED / multi-host pool (or a
+    resolved reference whose index isn't built) is refused **422**, naming the
+    offending samples, before anything is minted. `align-plan` additionally
+    refuses **422** when NONE of the pool's samples resolves to a minted mask
+    (never block-masked, or a `--force` mismatch between the two plans) rather than
+    returning a silent 202/0.
+  - Response shape: the pool-wide `host_filter_enabled` / `host_rype_reference_idx` /
+    `host_minimap2_reference_idx` move from the top level of `BlockMaskPlanResponse`
+    onto each `BlockPlanPartition` (there is no single pool-wide answer any more);
+    the align response's top-level host refs are dropped.
+  - `submit-block-mask-pool` becomes a thin client: it POSTs the pool and lets the
+    server resolve, instead of resolving client-side and refusing a non-uniform pool.
+    Multi-host union stays deferred (#298); a mixed-host pool is still refused.
+
 - **Host filtering is now resolved per sample from metadata, not chosen on the command
   line (#303).** `submit-host-filter-pool` and `submit-block-mask-pool` drive each sample's
   read mask from its own `host_taxon_id` metadata (via the resolver and roster added in
