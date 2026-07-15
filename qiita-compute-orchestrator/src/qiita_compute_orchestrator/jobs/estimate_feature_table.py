@@ -189,54 +189,63 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     out_path = workspace / OGU_TABLE_FILENAME
 
-    with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
-        apply_duckdb_settings(
-            conn,
-            duckdb_tmp,
-            memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
-            threads=_DUCKDB_THREADS,
-        )
-
-        # The feature -> genome map (Postgres-derived, resolver-staged). A real
-        # TABLE: reused by both the genome_coverage macro (subject_genome_id) and
-        # the ogu_input join. Inner-consistent BIGINT ids (int64 Parquet).
-        map_sql = validate_parquet_path(inputs.genome_map_path)
-        conn.execute(
-            f"CREATE TABLE {_MAP_TABLE} AS "
-            f"SELECT feature_idx AS contig_id, genome_idx AS genome_id "
-            f"FROM read_parquet('{map_sql}')"
-        )
-
-        # Per-feature lengths -> per-genome length denominators. These feed ONLY the
-        # genome_coverage calc, so at coverage_threshold == 0 (the calc is skipped)
-        # the stream is skipped too — "avoid the coverage calculation entirely".
-        # Whole-reference stream (every contig, incl. unaligned) so the denominator is
-        # the FULL genome length. Consumed inside the stream `with` (the GROUP BY
-        # drains it) so the Flight client closes before the compute.
-        if inputs.coverage_threshold > 0.0:
-            async with open_reference_sequences_stream(
-                conn, reference_idx=inputs.reference_idx
-            ) as lengths_rel:
-                conn.execute(
-                    f"CREATE TABLE {_GENOME_LENGTHS_TABLE} AS "
-                    f"SELECT m.genome_id AS genome_id, SUM(l.sequence_length_bp) AS total_length "
-                    f"FROM {lengths_rel} l JOIN {_MAP_TABLE} m ON l.feature_idx = m.contig_id "
-                    f"GROUP BY m.genome_id"
-                )
-
-        # The alignment slice (all cohort samples pooled). Materialized to a real
-        # TABLE — woltka_ogu resolves its source on a separate connection, which
-        # cannot see a registered stream relation; the CREATE TABLE also drains
-        # the stream so the Flight client closes before the compute.
-        async with open_alignment_stream(
-            conn, work_ticket_idx=inputs.work_ticket_idx
-        ) as alignment_rel:
-            conn.execute(
-                f"CREATE TABLE {_ALIGNMENT_TABLE} AS SELECT "
-                "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position "
-                f"FROM {alignment_rel}"
+    success = False
+    try:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
+                threads=_DUCKDB_THREADS,
             )
 
-        _write_ogu_table(conn, coverage_threshold=inputs.coverage_threshold, out_path=out_path)
+            # The feature -> genome map (Postgres-derived, resolver-staged). A real
+            # TABLE: reused by both the genome_coverage macro (subject_genome_id) and
+            # the ogu_input join. Inner-consistent BIGINT ids (int64 Parquet).
+            map_sql = validate_parquet_path(inputs.genome_map_path)
+            conn.execute(
+                f"CREATE TABLE {_MAP_TABLE} AS "
+                f"SELECT feature_idx AS contig_id, genome_idx AS genome_id "
+                f"FROM read_parquet('{map_sql}')"
+            )
+
+            # Per-feature lengths -> per-genome length denominators. These feed ONLY
+            # the genome_coverage calc, so at coverage_threshold == 0 (the calc is
+            # skipped) the stream is skipped too — "avoid the coverage calculation
+            # entirely". Whole-reference stream (every contig, incl. unaligned) so the
+            # denominator is the FULL genome length. Consumed inside the stream `with`
+            # (the GROUP BY drains it) so the Flight client closes before the compute.
+            if inputs.coverage_threshold > 0.0:
+                async with open_reference_sequences_stream(
+                    conn, reference_idx=inputs.reference_idx
+                ) as lengths_rel:
+                    conn.execute(
+                        f"CREATE TABLE {_GENOME_LENGTHS_TABLE} AS "
+                        f"SELECT m.genome_id AS genome_id, "
+                        f"SUM(l.sequence_length_bp) AS total_length "
+                        f"FROM {lengths_rel} l JOIN {_MAP_TABLE} m ON l.feature_idx = m.contig_id "
+                        f"GROUP BY m.genome_id"
+                    )
+
+            # The alignment slice (all cohort samples pooled). Materialized to a real
+            # TABLE — woltka_ogu resolves its source on a separate connection, which
+            # cannot see a registered stream relation; the CREATE TABLE also drains
+            # the stream so the Flight client closes before the compute.
+            async with open_alignment_stream(
+                conn, work_ticket_idx=inputs.work_ticket_idx
+            ) as alignment_rel:
+                conn.execute(
+                    f"CREATE TABLE {_ALIGNMENT_TABLE} AS SELECT "
+                    "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position "
+                    f"FROM {alignment_rel}"
+                )
+
+            _write_ogu_table(conn, coverage_threshold=inputs.coverage_threshold, out_path=out_path)
+        success = True
+    finally:
+        # On failure remove a partial COPY output so the SLURM launcher's manifest
+        # walker (which runs after execute()) can't promote it as the result.
+        if not success:
+            out_path.unlink(missing_ok=True)
 
     return {OGU_TABLE_OUTPUT_KEY: out_path}

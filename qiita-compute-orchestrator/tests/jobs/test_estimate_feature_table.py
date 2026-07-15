@@ -363,6 +363,31 @@ def test_threshold_zero_admits_all_and_skips_coverage(tmp_path, monkeypatch):
     assert _read_ogu(out["ogu_table"]) == [(1, 200, 1.0)]
 
 
+def test_partial_output_removed_on_failure(tmp_path, monkeypatch):
+    """A failure mid-compute removes any partial COPY output, so the SLURM launcher's
+    manifest walker (which runs after execute()) can't promote a half-written file as
+    the result — the `success`/`finally: unlink` guard the sibling jobs use."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    align_pq = _write_alignment_parquet(tmp_path / "alignment.parquet", [(1, 1, 20, 0, 0, 50)])
+    lengths_pq = _write_lengths_parquet(tmp_path / "lengths.parquet", [(20, 100)])
+    map_pq = _write_map_parquet(tmp_path / "map.parquet", [(20, 200)])
+    _install_fakes(m, monkeypatch, alignment_parquet=align_pq, lengths_parquet=lengths_pq)
+
+    def boom(conn, *, coverage_threshold, out_path):
+        out_path.write_bytes(b"partial")  # a half-written COPY output
+        raise RuntimeError("compute blew up")
+
+    monkeypatch.setattr(m, "_write_ogu_table", boom)
+
+    inputs = m.Inputs(
+        reference_idx=7, work_ticket_idx=42, coverage_threshold=0.01, genome_map_path=map_pq
+    )
+    with pytest.raises(RuntimeError, match="compute blew up"):
+        asyncio.run(m.execute(inputs, tmp_path / "ws"))
+    assert not (tmp_path / "ws" / m.OGU_TABLE_FILENAME).exists()
+
+
 @pytest.mark.parametrize("bad", [-0.1, 1.1])
 def test_inputs_coverage_threshold_bounds(bad, tmp_path):
     """coverage_threshold is a proportion in [0, 1]; out-of-range is rejected."""

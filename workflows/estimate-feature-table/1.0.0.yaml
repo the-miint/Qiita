@@ -32,8 +32,7 @@ description: >
 
 # reference:read — this action only READS reference metadata + the (host-depleted,
 # derived) alignment table to compute a transient table; it writes no reference
-# data and mints no identity. Both audience roles already hold it. No REST trigger
-# is wired this cut, so the scope is not yet load-bearing (adjust when one lands).
+# data and mints no identity. Both audience roles already hold it.
 scopes:
   - reference:read
 
@@ -66,8 +65,7 @@ context_schema:
         minimum: 1
     # Minimum pooled breadth of coverage a genome must meet to appear in the table
     # (proportion of the FULL genome length covered, incl. unaligned contigs).
-    # Recommended default 0.01 (1%); required here (user-provided) since no REST
-    # trigger supplies a default this cut.
+    # Recommended 0.01 (1%); required (caller-provided).
     coverage_threshold:
       type: number
       minimum: 0
