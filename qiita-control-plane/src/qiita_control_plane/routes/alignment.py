@@ -136,7 +136,7 @@ async def create_alignment_doget_ticket(
     """Sign a DoGet ticket scoped to one alignment run + its explicit
     prep_sample_idx cohort on the data plane's ``alignment`` table.
 
-    Service-account-only (``tickets:doget``) — the feature-table (OGU) compute job
+    Service-account-only (``ticket:doget``) — the feature-table (OGU) compute job
     mints this at runtime (short TTL; a SLURM queue can outlive a submit-time
     ticket). The body carries only ``work_ticket_idx``; ``alignment_idx`` and the
     cohort are read from that ticket's ``action_context`` (set at plan time),
@@ -158,8 +158,18 @@ async def create_alignment_doget_ticket(
     route — so this route trusts the validated ``action_context`` cohort rather
     than re-querying the gate.
 
+    One residual race the monotonicity argument does NOT cover: a concurrent
+    ``DELETE /alignment-definition/{idx}`` landing between submit and this mint
+    cascade-deletes the ``alignment_sample`` gate and purges the DuckLake
+    ``alignment`` rows, so the ticket signed here then streams an empty slice and the
+    job produces a valid 0-row OGU table (compute-on-demand — an empty result is
+    legitimate), not an error. This is accepted rather than re-checked: DELETE is an
+    admin-only sharp primitive whose own route documents this class of edge
+    (disallow-without-delete directs re-aligns there), and a re-check here would
+    still race a DELETE that lands immediately after it.
+
     Authorization is scope-only at this layer (matching the reference/read_masked
-    doget routes): any service account holding ``tickets:doget`` can request a
+    doget routes): any service account holding ``ticket:doget`` can request a
     ticket; row-level visibility is not enforced here.
     """
     raw = await pool.fetchval(

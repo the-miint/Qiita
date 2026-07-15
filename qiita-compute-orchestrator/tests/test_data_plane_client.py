@@ -3,7 +3,7 @@
 Exercises the CO→CP ticket-fetch adapter with httpx.MockTransport so no real
 HTTP server is needed — the wire shape (URL, JSON body with/without feature_idx,
 the base64-encoded `ticket` response field) is captured here; the CP-side route
-has its own DB-tier tests upstream. The streaming half (stream_reference_chunks)
+has its own DB-tier tests upstream. The streaming half (open_doget_stream)
 is exercised end-to-end against a live data plane in the integration suite.
 
 `open_reference_chunk_stream` (the composed seam the shard builders import) is
@@ -50,7 +50,7 @@ def _ticket_response() -> httpx.Response:
 
 async def test_fetch_with_feature_idx_sends_subset_and_returns_raw_bytes():
     """feature_idx present → body carries {table, feature_idx}; the base64 ticket
-    is decoded back to the raw signed bytes stream_reference_chunks wraps."""
+    is decoded back to the raw signed bytes open_doget_stream wraps."""
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -144,7 +144,7 @@ async def test_open_reference_chunk_stream_composes_ticket_and_stream(monkeypatc
 
     monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
     monkeypatch.setattr(dpc, "fetch_reference_doget_ticket", fake_fetch)
-    monkeypatch.setattr(dpc, "stream_reference_chunks", fake_stream)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
     sentinel_conn = object()
@@ -188,7 +188,7 @@ async def test_open_reference_chunk_stream_passes_none_feature_idx(monkeypatch):
 
     monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
     monkeypatch.setattr(dpc, "fetch_reference_doget_ticket", fake_fetch)
-    monkeypatch.setattr(dpc, "stream_reference_chunks", fake_stream)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
     async with dpc.open_reference_chunk_stream(object(), reference_idx=3, feature_idx=None) as rel:
@@ -265,7 +265,7 @@ async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
 
     monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
     monkeypatch.setattr(dpc, "fetch_alignment_doget_ticket", fake_fetch)
-    monkeypatch.setattr(dpc, "stream_reference_chunks", fake_stream)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
     sentinel_conn = object()
@@ -309,7 +309,7 @@ async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch
 
     monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
     monkeypatch.setattr(dpc, "fetch_reference_doget_ticket", fake_fetch)
-    monkeypatch.setattr(dpc, "stream_reference_chunks", fake_stream)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
     async with dpc.open_reference_sequences_stream(object(), reference_idx=9) as rel:

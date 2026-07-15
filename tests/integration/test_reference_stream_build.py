@@ -8,7 +8,7 @@ without reading staging Parquet.
 
 The builder's `open_reference_chunk_stream` (which would hop to the CP for a
 ticket) is monkeypatched with a fake that signs the ticket DIRECTLY with the
-fixture data plane's HMAC secret and calls the real `stream_reference_chunks`
+fixture data plane's HMAC secret and calls the real `open_doget_stream`
 against the live `data_plane` — the CP route that mints the ticket has its own
 DB-tier tests; what's exercised here is the DP DoGet + the builder's real
 streaming build. Mirrors test_reference_stream.py's seeding + direct-sign trick.
@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 
 from qiita_common.api_paths import LOOPBACK_HOST
 
-from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
+from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.jobs import (
     build_bowtie2_index,
     build_minimap2_index,
@@ -86,7 +86,7 @@ def _write_roster(path, rows):
 def _fake_open_stream(data_plane):
     """A drop-in `open_reference_chunk_stream` that signs a feature_idx-scoped
     ticket with the fixture DP secret and streams via the real
-    `stream_reference_chunks` — bypassing the CP hop."""
+    `open_doget_stream` — bypassing the CP hop."""
     from qiita_control_plane.auth.tickets import sign_ticket
 
     @asynccontextmanager
@@ -97,7 +97,7 @@ def _fake_open_stream(data_plane):
             secret=data_plane["secret"],
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-        with stream_reference_chunks(
+        with open_doget_stream(
             conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
         ) as rel:
             yield rel

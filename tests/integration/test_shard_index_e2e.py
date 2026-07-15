@@ -173,8 +173,8 @@ async def sharded_reference(postgres_pool, human_admin_session, data_plane):
 def _fake_open_stream(data_plane):
     """A drop-in `open_reference_chunk_stream` that signs a feature_idx-scoped
     chunk ticket with the fixture DP secret and streams via the real
-    `stream_reference_chunks` — bypassing the CP hop (which needs a running CP)."""
-    from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
+    `open_doget_stream` — bypassing the CP hop (which needs a running CP)."""
+    from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 
     from qiita_control_plane.auth.tickets import sign_ticket
 
@@ -186,7 +186,7 @@ def _fake_open_stream(data_plane):
             secret=data_plane["secret"],
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-        with stream_reference_chunks(
+        with open_doget_stream(
             conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
         ) as rel:
             yield rel

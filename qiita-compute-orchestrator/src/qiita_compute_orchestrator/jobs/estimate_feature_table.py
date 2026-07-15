@@ -108,54 +108,68 @@ def _write_ogu_table(
     out_path: Path,
 ) -> None:
     """Run the coverage-filtered OGU recipe over the already-staged working tables
-    (`_MAP_TABLE`, `_GENOME_LENGTHS_TABLE`, `_ALIGNMENT_TABLE`) and COPY the result
-    to `out_path` as Parquet (v2 + zstd).
+    (`_MAP_TABLE`, `_ALIGNMENT_TABLE`, and — only when a threshold applies —
+    `_GENOME_LENGTHS_TABLE`) and COPY the result to `out_path` as Parquet (v2 + zstd).
 
     Steps mirror the qiita-verified analytic:
-      1. `cov_alignments(reference=feature_idx, position, stop_position)` — the
-         cohort's aligned intervals, POOLED across all samples (breadth is a
-         cohort property here). NULL coordinates cannot contribute an interval and
-         would poison the interval merge, so they are excluded. A VIEW, not a
-         TABLE: it is only ever read by the `genome_coverage` macro (same
-         connection), so materializing it would just duplicate the alignment slice
-         in RAM.
-      2. survivors — genomes whose pooled `proportion_covered` meets the threshold,
-         via the `genome_coverage` macro (full genome length denominator, incl.
-         unaligned contigs, comes from `_GENOME_LENGTHS_TABLE`).
-      3. `ogu_input(sequence_idx, prep_sample_idx, flags, reference=genome_idx)` —
+      1. survivors — genomes whose POOLED `proportion_covered` meets the threshold,
+         via the `genome_coverage` macro over `cov_alignments` (a VIEW of the
+         cohort's non-NULL aligned intervals pooled across all samples — breadth is a
+         cohort property; NULL coordinates cannot contribute an interval and would
+         poison the merge). The denominator is the FULL genome length incl. unaligned
+         contigs, from `_GENOME_LENGTHS_TABLE`. `cov_alignments` is a VIEW because it
+         is only read by the macro on this connection — materializing it would just
+         duplicate the alignment slice in RAM. **When `coverage_threshold == 0` every
+         genome with any alignment trivially qualifies, so this whole step is SKIPPED
+         (no `genome_coverage`, and the caller does not even stream the lengths).**
+      2. `ogu_input(sequence_idx, prep_sample_idx, flags, reference=genome_idx)` —
          the alignment pre-mapped to the genome level so woltka counts at genome
-         granularity: a read hitting two contigs of ONE genome is one unique
-         `reference` (counted once), a read hitting two genomes is two (0.5 each).
-         The INNER JOIN drops alignments to no-genome features (not OGUs). A real
+         granularity, and (when a threshold applies) INNER-JOINed to the survivor set
+         so non-surviving genomes are removed BEFORE woltka. This ordering is
+         load-bearing: `woltka_ogu` fractionally splits a multi-mapped read by its
+         number of UNIQUE `reference` values, so a read hitting a surviving + a
+         dropped genome must lose the dropped one FIRST to renormalize to 1.0 on the
+         survivor — filtering woltka's OUTPUT instead would strand it at 0.5. The map
+         INNER JOIN also drops alignments to no-genome features (not OGUs). A real
          non-temp TABLE — `woltka_ogu` resolves its source on a separate connection.
-      4. `woltka_ogu(..., sample_id := 'prep_sample_idx')` per-sample, INNER-joined
-         to the pooled survivor set, `feature_id` (= genome_idx) renamed for the
-         output. Deterministic ORDER BY.
+      3. `woltka_ogu(..., sample_id := 'prep_sample_idx')` per-sample, `feature_id`
+         (= genome_idx) renamed for the output. No post-woltka survivor join (done in
+         step 2) and no ORDER BY — the reader sorts; the file need not.
 
-    Empty `ogu_input` (no alignment maps to any genome — e.g. an all-16S cohort or
-    a reference with no genome-tagged features) is a legitimate compute-on-demand
-    result, but `woltka_ogu` rejects an all-NULL `sample_id` source, so this
-    short-circuits to a valid 0-row Parquet with the output schema instead of
-    calling woltka on nothing.
+    Empty `ogu_input` (no alignment maps to a surviving genome — e.g. an all-16S
+    cohort, a reference with no genome-tagged features, or every genome dropped by
+    the threshold) is a legitimate compute-on-demand result, but `woltka_ogu` rejects
+    an all-NULL `sample_id` source, so this short-circuits to a valid 0-row Parquet
+    with the output schema instead of calling woltka on nothing.
     """
     out_sql = validate_parquet_path(out_path)
-    conn.execute(
-        f"CREATE VIEW cov_alignments AS "
-        f"SELECT feature_idx AS reference, position, stop_position "
-        f"FROM {_ALIGNMENT_TABLE} "
-        f"WHERE position IS NOT NULL AND stop_position IS NOT NULL"
-    )
-    conn.execute(
-        "CREATE TABLE survivor_genome AS SELECT genome_id "
-        f"FROM genome_coverage(cov_alignments, {_GENOME_LENGTHS_TABLE}, {_MAP_TABLE}) "
-        "WHERE proportion_covered >= ?",
-        [coverage_threshold],
-    )
-    conn.execute(
-        f"CREATE TABLE ogu_input AS "
+
+    # ogu_input pre-maps the alignment to genome level (so woltka counts per genome);
+    # the map INNER JOIN drops no-genome features. When a breadth threshold applies it
+    # is ALSO filtered to survivors HERE — before woltka — so a read on a surviving +
+    # a dropped genome renormalizes to the survivor (see docstring, step 2).
+    ogu_input_sql = (
         f"SELECT a.sequence_idx, a.prep_sample_idx, a.flags, m.genome_id AS reference "
-        f"FROM {_ALIGNMENT_TABLE} a JOIN {_MAP_TABLE} m ON a.feature_idx = m.contig_id"
+        f"FROM {_ALIGNMENT_TABLE} a "
+        f"JOIN {_MAP_TABLE} m ON a.feature_idx = m.contig_id"
     )
+    if coverage_threshold > 0.0:
+        conn.execute(
+            f"CREATE VIEW cov_alignments AS "
+            f"SELECT feature_idx AS reference, position, stop_position "
+            f"FROM {_ALIGNMENT_TABLE} "
+            f"WHERE position IS NOT NULL AND stop_position IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE TABLE survivor_genome AS SELECT genome_id "
+            f"FROM genome_coverage(cov_alignments, {_GENOME_LENGTHS_TABLE}, {_MAP_TABLE}) "
+            "WHERE proportion_covered >= ?",
+            [coverage_threshold],
+        )
+        ogu_input_sql += " JOIN survivor_genome s ON m.genome_id = s.genome_id"
+    # else coverage_threshold == 0: no coverage calc; every mapped genome qualifies.
+    conn.execute(f"CREATE TABLE ogu_input AS {ogu_input_sql}")
+
     if conn.execute("SELECT count(*) FROM ogu_input").fetchone()[0] == 0:
         conn.execute(
             f"COPY (SELECT CAST(NULL AS BIGINT) AS prep_sample_idx, "
@@ -166,9 +180,7 @@ def _write_ogu_table(
     conn.execute(
         f"COPY ("
         f"SELECT w.prep_sample_idx, w.feature_id AS genome_idx, w.value "
-        f"FROM woltka_ogu('ogu_input', 'sequence_idx', sample_id := 'prep_sample_idx') w "
-        f"JOIN survivor_genome s ON w.feature_id = s.genome_id "
-        f"ORDER BY w.prep_sample_idx, w.feature_id"
+        f"FROM woltka_ogu('ogu_input', 'sequence_idx', sample_id := 'prep_sample_idx') w"
         f") TO '{out_sql}' ({PARQUET_OPTS})"
     )
 
@@ -195,19 +207,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             f"FROM read_parquet('{map_sql}')"
         )
 
-        # Per-feature lengths -> per-genome length denominators. Whole-reference
-        # stream (every contig, incl. unaligned) so the coverage denominator is
+        # Per-feature lengths -> per-genome length denominators. These feed ONLY the
+        # genome_coverage calc, so at coverage_threshold == 0 (the calc is skipped)
+        # the stream is skipped too — "avoid the coverage calculation entirely".
+        # Whole-reference stream (every contig, incl. unaligned) so the denominator is
         # the FULL genome length. Consumed inside the stream `with` (the GROUP BY
         # drains it) so the Flight client closes before the compute.
-        async with open_reference_sequences_stream(
-            conn, reference_idx=inputs.reference_idx
-        ) as lengths_rel:
-            conn.execute(
-                f"CREATE TABLE {_GENOME_LENGTHS_TABLE} AS "
-                f"SELECT m.genome_id AS genome_id, SUM(l.sequence_length_bp) AS total_length "
-                f"FROM {lengths_rel} l JOIN {_MAP_TABLE} m ON l.feature_idx = m.contig_id "
-                f"GROUP BY m.genome_id"
-            )
+        if inputs.coverage_threshold > 0.0:
+            async with open_reference_sequences_stream(
+                conn, reference_idx=inputs.reference_idx
+            ) as lengths_rel:
+                conn.execute(
+                    f"CREATE TABLE {_GENOME_LENGTHS_TABLE} AS "
+                    f"SELECT m.genome_id AS genome_id, SUM(l.sequence_length_bp) AS total_length "
+                    f"FROM {lengths_rel} l JOIN {_MAP_TABLE} m ON l.feature_idx = m.contig_id "
+                    f"GROUP BY m.genome_id"
+                )
 
         # The alignment slice (all cohort samples pooled). Materialized to a real
         # TABLE — woltka_ogu resolves its source on a separate connection, which

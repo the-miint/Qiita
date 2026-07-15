@@ -9,8 +9,8 @@ narrower test covers together:
     `alignment_sample`, and stages the `feature_idx -> genome_idx` map Parquet from
     Postgres — binding `genome_map_path` the job then reads (the resolver->job
     handoff);
-  - `estimate_feature_table` streams the `alignment` slice (the Phase-1 DP
-    `alignment` DoGet, over Arrow Flight) + the reference `sequence_length_bp`
+  - `estimate_feature_table` streams the `alignment` slice (the DP `alignment`
+    DoGet, over Arrow Flight) + the reference `sequence_length_bp`
     (`reference_sequences` DoGet) from the live DP, and runs the REAL miint
     `genome_coverage` + `woltka_ogu` to write `ogu_table.parquet`.
 
@@ -26,8 +26,9 @@ genome A survives on POOLED coverage (0.6% in each of two samples, extending to
 A for both samples and never B.
 
 Real miint required: passes native BIGINT id columns with NO ::VARCHAR casts, so
-it needs the woltka_ogu id-type fix in the installed miint build (local override
-via MIINT_EXTENSION_REPO until the team mirror carries it).
+it needs the woltka_ogu id-type fix, which the team mirror now carries (the
+conftest installs from the mirror; `MIINT_EXTENSION_REPO` can still override to a
+local build).
 """
 
 import json
@@ -254,8 +255,8 @@ async def feature_table_scenario(postgres_pool, data_plane):
 def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
     """Drop-in `open_alignment_stream` that signs the `alignment` DoGet ticket
     directly with the fixture DP secret (the scope the CP route would derive from
-    action_context) and streams via the real `stream_reference_chunks`."""
-    from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
+    action_context) and streams via the real `open_doget_stream`."""
+    from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 
     from qiita_control_plane.auth.tickets import sign_ticket
 
@@ -270,7 +271,7 @@ def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
             secret=data_plane["secret"],
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-        with stream_reference_chunks(
+        with open_doget_stream(
             conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
         ) as rel:
             yield rel
@@ -281,7 +282,7 @@ def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
 def _fake_lengths_stream(data_plane):
     """Drop-in `open_reference_sequences_stream` that signs a whole-reference
     `reference_sequences` DoGet ticket directly with the fixture DP secret."""
-    from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
+    from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 
     from qiita_control_plane.auth.tickets import sign_ticket
 
@@ -293,7 +294,7 @@ def _fake_lengths_stream(data_plane):
             secret=data_plane["secret"],
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-        with stream_reference_chunks(
+        with open_doget_stream(
             conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
         ) as rel:
             yield rel

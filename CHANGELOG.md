@@ -526,7 +526,12 @@ _None yet._
   as native `BIGINT` with no `::VARCHAR` casts (requires the woltka_ogu id-type
   preservation fix in the miint build). No new scope, migration, or enum. Deferred:
   the user-facing REST trigger, BIOM export, persistence/identity, and downstream
-  diversity (the consumer this feeds).
+  diversity (the consumer this feeds). Also hardens the (not-yet-deployed)
+  `align_sharded` persist filter so this breadth estimate is sound at the source:
+  minimap2 placements must now clear a query-coverage floor (0.90, via
+  `cigar_query_coverage`) in addition to sequence identity, so a soft-clipped
+  high-identity long read can no longer contribute a low-coverage placement (bowtie2
+  aligns end-to-end, so its query coverage is ~1.0 and it is unaffected).
 
 - **Sharded-reference alignment consumer (C2b).** Wires the C1 `align_sharded`
   native job into a runnable `align` workflow: an operator submits an align run

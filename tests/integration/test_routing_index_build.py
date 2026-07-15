@@ -25,7 +25,7 @@ import duckdb
 import pytest
 
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
+from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.jobs import build_routing_index
 from qiita_compute_orchestrator.miint import open_miint_conn
 
@@ -74,7 +74,7 @@ def _seed_reference_rows(data_plane):
 def _fake_open_whole_reference_stream(data_plane):
     """A drop-in `open_reference_chunk_stream` that signs a WHOLE-REFERENCE chunk
     ticket (reference_idx only, no feature_idx) with the fixture DP secret and
-    streams via the real `stream_reference_chunks` — bypassing the CP hop. The DP
+    streams via the real `open_doget_stream` — bypassing the CP hop. The DP
     resolves the reference to its features via `reference_membership`."""
     from qiita_control_plane.auth.tickets import sign_ticket
 
@@ -87,7 +87,7 @@ def _fake_open_whole_reference_stream(data_plane):
             secret=data_plane["secret"],
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-        with stream_reference_chunks(
+        with open_doget_stream(
             conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
         ) as rel:
             yield rel

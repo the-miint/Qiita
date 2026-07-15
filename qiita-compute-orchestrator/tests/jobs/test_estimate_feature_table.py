@@ -320,6 +320,49 @@ def test_no_mapped_features_writes_valid_empty_table(tmp_path, monkeypatch):
     assert _read_ogu(out_path) == []
 
 
+def test_dropped_genome_renormalizes_survivor_before_woltka(tmp_path, monkeypatch):
+    """A read hitting a SURVIVING genome and a DROPPED genome renormalizes to 1.0 on
+    the survivor. Non-surviving genomes are removed from woltka's INPUT (not its
+    output), so the read maps to a single unique reference and is counted whole —
+    filtering woltka's output instead would strand it at 0.5."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, _ = _run(
+        m,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        # read 1 hits feature 20 (genome 200) AND feature 30 (genome 300).
+        alignment=[(1, 1, 20, 0, 0, 60), (1, 1, 30, 0, 0, 30)],
+        # genome 200: 60/100 = 60% -> survives; genome 300: 30/100000 = 0.03% -> dropped.
+        lengths=[(20, 100), (30, 100000)],
+        mapping=[(20, 200), (30, 300)],
+        threshold=0.01,
+    )
+    # Renormalized to the survivor: 1.0, not 0.5.
+    assert _read_ogu(out["ogu_table"]) == [(1, 200, 1.0)]
+
+
+def test_threshold_zero_admits_all_and_skips_coverage(tmp_path, monkeypatch):
+    """coverage_threshold == 0 admits every genome with any alignment and SKIPS the
+    coverage calc entirely — the reference-lengths stream (its only input) is never
+    opened. The same 0.1%-coverage genome `test_below_threshold_genome_is_dropped`
+    drops at 1% is RETAINED here."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, captured = _run(
+        m,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        alignment=[(1, 1, 20, 0, 0, 10)],  # 10 bp of a 10000 bp genome = 0.1%
+        lengths=[(20, 10000)],  # present but never read — the lengths stream is skipped
+        mapping=[(20, 200)],
+        threshold=0.0,
+    )
+    # The lengths stream (the sole coverage-calc input) is never opened at threshold 0.
+    assert "reference_idx" not in captured
+    assert _read_ogu(out["ogu_table"]) == [(1, 200, 1.0)]
+
+
 @pytest.mark.parametrize("bad", [-0.1, 1.1])
 def test_inputs_coverage_threshold_bounds(bad, tmp_path):
     """coverage_threshold is a proportion in [0, 1]; out-of-range is rejected."""
