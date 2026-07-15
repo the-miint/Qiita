@@ -74,23 +74,36 @@ def _run(tmp_path, reads, index):
 
 
 def _stub_hits(monkeypatch, hits: list[int]):
-    """Stub align_minimap2: insert the flagged sequence_idx set directly.
+    """Stub align_minimap2: materialise an ALIGNMENT for the flagged reads.
 
-    The real seam applies the identity floor itself (see `_MIN_IDENTITY`), so what
-    reaches `dest_table` is already the >= threshold set — the stub therefore models
-    the POST-threshold hits. The threshold arithmetic is pinned in the smoke test
-    against a real `.mmi`."""
+    The seam no longer returns a boolean hit set — it returns the alignment, and the
+    identity + aligned-fraction gate is applied downstream (in `_coverage`, shared with
+    the coverage-depth step so the two can never disagree about which reads count). So the
+    stub emits alignment rows that PASS that gate: a perfect end-to-end CIGAR, which scores
+    identity 1.0 and aligned fraction 1.0. The real threshold arithmetic is pinned in the
+    smoke test against a real `.mmi`."""
     from qiita_compute_orchestrator.jobs import syndna
 
-    def fake(conn, index_path, query_table, dest_table, *, preset, min_identity):
-        # Only reads visible in the query view may be flagged — mirrors the real
-        # function, which aligns exactly that relation (here: every raw read).
+    def fake(conn, index_path, query_table, dest_table, *, preset):
         assert preset == syndna._MM2_PRESET
-        assert min_identity == syndna._MIN_IDENTITY
-        visible = {r[0] for r in conn.execute(f"SELECT read_id FROM {query_table}").fetchall()}
+        visible = {
+            r[0]: r[1]
+            for r in conn.execute(
+                f"SELECT read_id, length(sequence1) FROM {query_table}"
+            ).fetchall()
+        }
+        conn.execute(
+            f"CREATE OR REPLACE TABLE {dest_table} ("
+            "  sequence_idx BIGINT, parent_feature_idx BIGINT, flags USMALLINT, "
+            "  position BIGINT, stop_position BIGINT, cigar VARCHAR)"
+        )
         for sidx in hits:
             assert sidx in visible, f"stub flagged {sidx}, not in the query view"
-            conn.execute(f"INSERT INTO {dest_table} VALUES (?)", [sidx])
+            n = visible[sidx]
+            conn.execute(
+                f"INSERT INTO {dest_table} VALUES (?, 900, 0, 1, ?, ?)",
+                [sidx, n + 1, f"{n}="],
+            )
 
     monkeypatch.setattr(syndna, "_run_align_minimap2", fake)
 
@@ -99,7 +112,7 @@ def test_syndna_marks_hits_and_passes_the_rest(tmp_path, monkeypatch):
     reads = _write_reads(tmp_path / "reads.parquet", [(1, "ACGT", None), (2, "TTTT", None)])
     _stub_hits(monkeypatch, [1])
     out = _run(tmp_path, reads, _index(tmp_path))
-    assert set(out) == {"partial_mask"}
+    assert set(out) == {"partial_mask", "alignment"}
     assert _rows(out["partial_mask"]) == [(1, _SPIKEIN), (2, _PASS)]
 
 

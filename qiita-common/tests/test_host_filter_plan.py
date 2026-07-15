@@ -19,11 +19,16 @@ from qiita_common.host_filter_plan import (
 )
 from qiita_common.models import HostFilterOutcome, HostFilterResolution
 
-_HUMAN = 9606
-_MOUSE = 10090
+# These are `host_term_idx` values — the surrogate `terminology_term.idx` (a BIGINT) the
+# resolver emits and the plan groups on, NOT NCBI taxon ids. A taxon id is a STRING natural
+# key elsewhere (`biosample.NCBI_TAXONOMY_HUMAN_TERM_ID == "9606"`, a VARCHAR `term_id`);
+# the surrogate is an int. Deliberately not 9606/10090 here so the two never collide in a
+# reader's eye — conflating them is the bug this whole arc exists to prevent.
+_HUMAN_TERM_IDX = 11
+_MOUSE_TERM_IDX = 22
 
 
-def _filter(host=_HUMAN, rype=1, minimap2=2):
+def _filter(host=_HUMAN_TERM_IDX, rype=1, minimap2=2):
     return HostFilterResolution(
         outcome=HostFilterOutcome.FILTER,
         host_term_idx=host,
@@ -55,7 +60,7 @@ def test_blank_is_depleted_against_the_pools_sole_host():
     plan = plan_pool_host_filter({"S1": _filter(), "S2": _filter(), "BLANK.1": _CONTROL})
 
     assert plan.refusal is None
-    assert plan.pool_host_term_idx == _HUMAN
+    assert plan.pool_host_term_idx == _HUMAN_TERM_IDX
     assert plan.decisions["BLANK.1"] == SampleHostFilter(
         enabled=True, rype_reference_idx=1, minimap2_reference_idx=2
     )
@@ -71,7 +76,7 @@ def test_blanks_do_not_vote_on_the_pools_host():
     plan = plan_pool_host_filter({"S1": _filter(), **{f"BLANK.{i}": _CONTROL for i in range(20)}})
 
     assert plan.refusal is None
-    assert plan.pool_host_term_idx == _HUMAN
+    assert plan.pool_host_term_idx == _HUMAN_TERM_IDX
     assert all(plan.decisions[f"BLANK.{i}"].enabled for i in range(20))
 
 
@@ -126,7 +131,11 @@ def test_unresolved_is_checked_before_the_host_union():
     multi-host is a feature request. Reporting the wrong one sends the operator
     down the wrong path."""
     plan = plan_pool_host_filter(
-        {"S1": _filter(host=_HUMAN), "S2": _filter(host=_MOUSE), "S3": _UNRESOLVED}
+        {
+            "S1": _filter(host=_HUMAN_TERM_IDX),
+            "S2": _filter(host=_MOUSE_TERM_IDX),
+            "S3": _UNRESOLVED,
+        }
     )
 
     assert plan.refusal is PoolPlanRefusal.UNRESOLVED_SAMPLES
@@ -140,7 +149,11 @@ def test_a_multi_host_pool_refuses_and_names_the_samples_that_caused_it():
     the blanks — the blanks are the victims, and telling an operator to go look at
     a blank would be a wild goose chase."""
     plan = plan_pool_host_filter(
-        {"HUMAN.1": _filter(host=_HUMAN), "MOUSE.1": _filter(host=_MOUSE), "BLANK.1": _CONTROL}
+        {
+            "HUMAN.1": _filter(host=_HUMAN_TERM_IDX),
+            "MOUSE.1": _filter(host=_MOUSE_TERM_IDX),
+            "BLANK.1": _CONTROL,
+        }
     )
 
     assert plan.refusal is PoolPlanRefusal.MULTI_HOST
@@ -153,7 +166,9 @@ def test_multi_host_refuses_even_with_no_blanks_to_protect():
     still outside what the mask identity and the host-filter chain express, so it
     refuses regardless. Submitting it would produce two mask identities for one
     pool with no way to say which is which."""
-    plan = plan_pool_host_filter({"HUMAN.1": _filter(host=_HUMAN), "MOUSE.1": _filter(host=_MOUSE)})
+    plan = plan_pool_host_filter(
+        {"HUMAN.1": _filter(host=_HUMAN_TERM_IDX), "MOUSE.1": _filter(host=_MOUSE_TERM_IDX)}
+    )
 
     assert plan.refusal is PoolPlanRefusal.MULTI_HOST
 
