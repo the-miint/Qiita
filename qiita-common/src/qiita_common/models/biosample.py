@@ -450,9 +450,8 @@ class SequencedSampleListItem(BaseModel):
     Only the pool-scoped list route populates it (it needs the run's platform,
     and the resolution is per-pool work); the run-scoped list leaves it None.
 
-    It replaces the intake `human_filtering` intent the roster used to carry: a
-    sample's host is a property of the SAMPLE, not of the project it was booked
-    under, so the decision now comes from its own metadata.
+    A sample's host is a property of the SAMPLE, not of the project it was booked
+    under, so the decision comes from its own metadata.
     """
 
     sequenced_sample_idx: int

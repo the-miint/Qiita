@@ -8,18 +8,12 @@ them to derive each sample's read-mask gates.
 
 What lives here is PROTOCOL facts (`PacbioProtocol`: sheet_type /
 twist_adaptor_id / syndna_is_twisted) — library-prep truths about how the sample
-was built, which drive `lima_enabled` / `syndna_enabled`. The pre-flight is their
-only home and will stay so.
+was built, which drive `lima_enabled` / `syndna_enabled`. `host_filter_enabled` is
+deliberately NOT among them: a sample's host is a property of the sample, resolved
+from its own `host_taxon_id` metadata, not of the project it was booked under.
 
-Host-filtering intent (`human_filtering`) used to live here too, as a second kind
-of fact with a different lifetime: policy, not prep. It is gone. `host_filter_enabled`
-now comes from the sample's own `host_taxon_id` metadata, resolved server-side —
-so a sample's host is a property of the sample, not of the project it was booked
-under. Keeping the two kinds of fact in SEPARATE readers is what made that removal
-an excision rather than surgery.
-
-The CONTROL reader (`control_samples`) is the one host-filter-adjacent thing that
-stays: a blank is a prep fact (there was nothing in the well), not a policy one.
+The CONTROL reader (`control_samples`) is the one host-filter-adjacent thing here:
+a blank is a prep fact (there was nothing in the well), not a policy one.
 
 The PacBio facts come from kl-run-preflight's own `get_pacbio_sample_info` — the
 same accessor `cli/user/pacbio.py::_read_pacbio_preflight_rows` uses at ingest, so

@@ -3300,9 +3300,9 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, cap
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", True)])),
+            (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
             (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
             (200, _both_indexes_body()),  # its index list (carries rype)
-            (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
@@ -3357,9 +3357,9 @@ def test_submit_host_filter_pool_one_failure_does_not_strand_the_rest(monkeypatc
                     ]
                 ),
             ),
+            (200, _seq_run_body()),  # run metadata (read before the ref preflight)
             (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
             (200, _both_indexes_body()),  # its index list
-            (200, _seq_run_body()),  # run metadata
             (202, {"work_ticket_idx": 900}),  # sample 1000 → ok
             (502, {"detail": "bad gateway"}),  # sample 1001 → transient 5xx
             (202, {"work_ticket_idx": 902}),  # sample 1002 → ok (NOT stranded)
@@ -3401,9 +3401,9 @@ def test_submit_host_filter_pool_only_missing_skips_ticketed_samples(monkeypatch
                     ]
                 ),
             ),
+            (200, _seq_run_body()),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
-            (200, _seq_run_body()),
             (202, {"work_ticket_idx": 900}),  # only the one missing sample
         ],
     )
@@ -3453,11 +3453,11 @@ def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch):
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", _hf_filter(rype=7, minimap2=8))])),
+            (200, _seq_run_body(instrument_model="NovaSeq 6000")),
             (200, _ref_active_body(reference_idx=7)),  # rype reference
             (200, [_both_indexes_body()[0]]),  # rype-only index list
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference
             (200, [_both_indexes_body(reference_idx=8)[1]]),  # minimap2-only index list
-            (200, _seq_run_body(instrument_model="NovaSeq 6000")),
             (202, {"work_ticket_idx": 900}),
         ],
     )
@@ -3509,9 +3509,9 @@ def test_submit_host_filter_pool_applies_ref_to_every_sample(monkeypatch):
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", True)])),
+            (200, _seq_run_body(instrument_model="NextSeq 550")),
             (200, _ref_active_body()),  # rype reference 7
             (200, _both_indexes_body()),
-            (200, _seq_run_body(instrument_model="NextSeq 550")),
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
@@ -3542,9 +3542,9 @@ def test_submit_host_filter_pool_instrument_model_absent_omitted(monkeypatch):
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _seq_run_body(instrument_model=None)),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
-            (200, _seq_run_body(instrument_model=None)),
             (202, {"work_ticket_idx": 900}),
         ],
     )
@@ -3574,7 +3574,11 @@ def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, caps
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _pool_samples_body([(100, 1000, "10", True)])), (200, inactive)],
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _seq_run_body()),
+            (200, inactive),
+        ],
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -3594,6 +3598,7 @@ def test_submit_host_filter_pool_rype_ref_missing_rype_index_no_posts(monkeypatc
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _seq_run_body()),
             (200, _ref_active_body()),
             (200, minimap2_only),
         ],
@@ -3620,6 +3625,7 @@ def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(mo
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", _hf_filter(rype=7, minimap2=8))])),
+            (200, _seq_run_body()),  # run GET (read before the ref preflight)
             (200, _ref_active_body(reference_idx=7)),  # rype reference OK
             (200, [_both_indexes_body()[0]]),  # rype index present
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference active
@@ -3716,9 +3722,9 @@ def test_submit_host_filter_pool_force_overrides_resolution_pool_wide(monkeypatc
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", False), (101, 1001, "11", _HF_CONTROL)])),
+            (200, _seq_run_body()),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
-            (200, _seq_run_body()),
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
@@ -3737,13 +3743,16 @@ def test_submit_host_filter_pool_force_overrides_resolution_pool_wide(monkeypatc
 
 def test_submit_host_filter_pool_dry_run_resolves_but_posts_nothing(monkeypatch, capsys):
     """--dry-run resolves the pool and prints the plan, then exits before any
-    write — no host-ref pre-flight GET, no POST. The way to look before leaping."""
+    write — the roster GET and the run GET happen (both reads, needed to resolve and
+    to run the PacBio no-facts refusal), but NO host-ref pre-flight GET and NO POST.
+    The way to look before leaping."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11", _HF_CONTROL)])),
+            (200, _seq_run_body()),  # the run GET, now read before the dry-run return
         ],
     )
 
@@ -3752,6 +3761,8 @@ def test_submit_host_filter_pool_dry_run_resolves_but_posts_nothing(monkeypatch,
     err = capsys.readouterr().err
     assert "DRY RUN" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
+    # Reads only — no reference readiness GET (that is a write-path preflight).
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
     assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
 
 
@@ -4598,7 +4609,7 @@ def test_pacbio_submission_rejects_a_resolved_minimap2_stage(capsys):
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "rype-only" in err
-    assert "host_filter_profile" in err
+    assert "minimap2" in err
 
 
 def test_pacbio_submission_allows_a_mixed_filtered_unfiltered_pool(capsys):

@@ -72,10 +72,8 @@ class HostFilterResolution(BaseModel):
     reads it. It is the SAMPLE'S OWN view, derived from its `host_taxon_id`
     metadata plus the run's platform.
 
-    It replaced the intake `human_filtering` intent (a per-project policy flag in
-    the pre-flight blob) the roster used to carry. That flag answered the same
-    question from the wrong end: a sample's host is a property of the SAMPLE, not
-    of the project it was booked under.
+    A sample's host is a property of the SAMPLE — this is derived from its own
+    metadata, not from the project it was booked under.
 
     NOTE this is only PART of the answer for a control/blank, which resolves
     CONTROL — a blank has no host of its own, so what it gets depleted against

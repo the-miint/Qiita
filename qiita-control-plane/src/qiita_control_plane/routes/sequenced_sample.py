@@ -364,15 +364,10 @@ async def _pool_sample_facts_by_item_id(
 ) -> dict[str, PacbioProtocol]:
     """Return the pool's PacBio protocol facts, keyed on ``sequenced_pool_item_id``.
 
-    The single seam where the roster sources its per-sample PRE-FLIGHT facts. It used
-    to return a second map as well — each sample's intake ``human_filtering`` intent —
-    and it was platform-aware for that reason alone (the Illumina and PacBio blobs
-    store the flag under different tables). That intent is gone: host filtering now
-    resolves from the sample's own ``host_taxon_id`` metadata, so the blob is asked
-    only for what it is genuinely the source of, which is library prep.
-
-    What is left is PacBio-only — Illumina has no protocol facts — so an Illumina pool
-    simply gets ``{}``.
+    The single seam where the roster sources its per-sample PRE-FLIGHT facts. The
+    blob is asked only for what it is genuinely the source of — library prep — which
+    is PacBio-only, so an Illumina pool simply gets ``{}``. (Host filtering is a
+    separate matter: it resolves from the sample's own ``host_taxon_id`` metadata.)
 
     Degrades to ``{}`` on an unparseable blob: the roster must not 500 because a pool's
     pre-flight is corrupt. The submit path refuses separately when a PacBio pool's facts

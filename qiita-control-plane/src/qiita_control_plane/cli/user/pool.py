@@ -81,9 +81,8 @@ class _PreflightRow(NamedTuple):
     `secondary_project_accessions` is empty for non-control samples; controls carry
     one entry per non-primary plate project, sorted by accession value.
 
-    The project's `human_filtering` flag used to ride here too. It no longer does:
-    host filtering is resolved per sample from the sample's own `host_taxon_id`
-    metadata, so intake policy is not an input to it any more.
+    Host filtering is NOT read from the pre-flight: a sample's host is resolved from
+    its own `host_taxon_id` metadata, not from the project it was booked under.
     """
 
     illumina_sample_idx: int
@@ -785,6 +784,31 @@ def _abort(message: str) -> None:
     sys.exit(1)
 
 
+def _validate_host_ref_override_args(args, parser: argparse.ArgumentParser) -> bool:
+    """Shared host-ref argument coherence for both pool submitters. Returns
+    `overriding` (whether a rype reference was supplied).
+
+    minimap2 is the optional second stage and never runs without rype. And the
+    references are no longer INPUTS to the decision — each sample's host is
+    resolved from its own metadata — so a bare `--host-rype-reference-idx` is an
+    OVERRIDE that requires `--force`. Without it the flag would either be silently
+    dropped (block path) or silently ignored (fan-out path); an override that does
+    nothing is the worst outcome, so it errors. Both submitters must enforce this
+    identically, which is why it lives here.
+    """
+    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
+        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
+    overriding = args.host_rype_reference_idx is not None
+    if overriding and not args.force:
+        parser.error(
+            "--host-rype-reference-idx / --host-minimap2-reference-idx are overrides:"
+            " host filtering is normally resolved per sample from its host_taxon_id"
+            " metadata. Pass --force to apply the given reference(s) pool-wide"
+            " instead, bypassing resolution."
+        )
+    return overriding
+
+
 def _assert_resolved_references_ready(
     base_url: str,
     token: str,
@@ -922,12 +946,15 @@ def _assert_pacbio_submission_coherent(
         if d.enabled and d.minimap2_reference_idx is not None
     ]
     if with_minimap2:
+        # The stage can come from a resolved profile OR from a forced
+        # --host-minimap2-reference-idx; name both remedies rather than assuming
+        # the profile, because --force could be how we got here.
         _abort(
             f"sequenced_pool {sequenced_pool_idx}: long-read host filtering is"
-            " rype-only, but the resolved host_filter_profile declares a minimap2"
-            f" stage for {len(with_minimap2)} sample(s) (e.g. {with_minimap2[:3]})."
-            " The long-read chain cannot bind it. Fix the pacbio_smrt profile (its"
-            " minimap2_reference_idx should be NULL), or override with --force."
+            " rype-only, but a minimap2 stage is set for"
+            f" {len(with_minimap2)} sample(s) (e.g. {with_minimap2[:3]}). The long-read"
+            " chain cannot bind it. Drop --host-minimap2-reference-idx, or NULL the"
+            " pacbio_smrt profile's minimap2_reference_idx if it came from resolution."
         )
     gates = [g for g in (_pacbio_gates(s) for s in samples) if g is not None]
     if any(g["syndna_enabled"] for g in gates) and syndna_reference_idx is None:
@@ -999,23 +1026,7 @@ def _handle_submit_host_filter_pool(
     deliberate re-submit against a different host reference still fans out
     pool-wide.
     """
-    # Host-ref argument coherence, validated before any network call: minimap2 is
-    # the optional second stage and never runs without rype.
-    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
-        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
-
-    # The host references are no longer INPUTS to the decision — each sample's host
-    # is resolved from its own metadata. They are an OVERRIDE, and an override that
-    # silently did nothing would be the worst of both worlds, so supplying one
-    # without --force is an error rather than a no-op.
-    overriding = args.host_rype_reference_idx is not None
-    if overriding and not args.force:
-        parser.error(
-            "--host-rype-reference-idx / --host-minimap2-reference-idx are overrides:"
-            " host filtering is normally resolved per sample from its host_taxon_id"
-            " metadata. Pass --force to apply the given reference(s) pool-wide"
-            " instead, bypassing resolution."
-        )
+    overriding = _validate_host_ref_override_args(args, parser)
 
     def _run(token: str) -> dict:
         # Step 1: enumerate the pool's active samples (single round trip). The
@@ -1115,15 +1126,55 @@ def _handle_submit_host_filter_pool(
                 syndna_reference_idx=args.syndna_reference_idx,
             )
 
+        # Step 1.6: the run's metadata, read once. Its instrument_model gates QC's
+        # polyG (forwarded per sample below); its platform drives the PacBio
+        # no-facts refusal just below. Read BEFORE the dry-run return so a dry run
+        # refuses exactly what a real submit would.
+        run = _common.call(
+            "GET",
+            args.base_url,
+            token,
+            f"{PATH_SEQUENCING_RUN_PREFIX}"
+            f"{PATH_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=args.sequencing_run_idx)}",
+        )
+        instrument_model = run.get("instrument_model")
+
+        # Step 1.7: a PacBio run whose roster carries NO protocol facts means the
+        # server could not parse the pool's stored pre-flight — NOT that the pool is
+        # Illumina. Refuse, before any ticket AND before the dry-run preview.
+        #
+        # The direction of this check is the whole point. `is_pacbio_pool` above is
+        # derived from `any(sheet_type)`, i.e. it infers "not PacBio" from ABSENCE —
+        # so an unparseable blob silently takes the Illumina branch and writes
+        # `lima_enabled: false, syndna_enabled: false` onto every ticket. That is a
+        # case-5 pool masked with no lima and no syndna, whose spike-in count is then
+        # structurally zero: exactly what the chain's step order exists to prevent.
+        #
+        # This keys on the run's `platform` column, which is authoritative and depends
+        # on neither the blob nor the host-filter resolution. --force does NOT bypass
+        # it: forcing host filtering off is a choice, masking a PacBio pool with the
+        # long-read chain silently off is not.
+        if run.get("platform") == Platform.PACBIO_SMRT.value:
+            no_facts = [s["sequenced_pool_item_id"] for s in samples if not s.get("sheet_type")]
+            if no_facts:
+                _abort(
+                    f"sequencing_run {args.sequencing_run_idx} is PacBio, but"
+                    f" {len(no_facts)} sample(s) carry no protocol facts on the roster"
+                    f" (e.g. {no_facts[:3]}). The pool's stored pre-flight could not be"
+                    " parsed server-side, so lima and syndna cannot be gated. Refusing:"
+                    " masking a PacBio pool with the long-read chain silently off would"
+                    " leave its spike-in count structurally zero. Check the pool's"
+                    " run_preflight_blob. (--force does not bypass this.)"
+                )
+
         # Step 1.75: --dry-run stops here, after everything that could REFUSE has
         # run and before anything that could WRITE.
         #
         # This is the only way to see a pool's plan before fanning out hundreds of
         # tickets against it. It matters more than a preview usually would: host
-        # filtering used to be a thing the operator chose on the command line, so
-        # they knew what they were getting. It is now derived from each sample's
-        # metadata, and this is where they get to look at that derivation before it
-        # acts.
+        # filtering is now derived from each sample's metadata rather than chosen on
+        # the command line, and this is where an operator sees that derivation before
+        # it acts.
         if args.dry_run:
             return _dry_run_summary(samples, decisions, args.sequenced_pool_idx)
 
@@ -1147,50 +1198,6 @@ def _handle_submit_host_filter_pool(
                 HOST_FILTER_INDEX_TYPE_MINIMAP2,
                 "--syndna-reference-idx",
             )
-
-        # Step 3: the run's instrument_model gates QC's polyG; read it once and
-        # forward per sample. Nullable (a non-bcl run may not record it).
-        run = _common.call(
-            "GET",
-            args.base_url,
-            token,
-            f"{PATH_SEQUENCING_RUN_PREFIX}"
-            f"{PATH_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=args.sequencing_run_idx)}",
-        )
-        instrument_model = run.get("instrument_model")
-
-        # Step 3.5: a PacBio run whose roster carries NO protocol facts means the
-        # server could not parse the pool's stored pre-flight — NOT that the pool is
-        # Illumina. Refuse, before any ticket.
-        #
-        # The direction of this check is the whole point. `is_pacbio_pool` above is
-        # derived from `any(sheet_type)`, i.e. it infers "not PacBio" from ABSENCE —
-        # so an unparseable blob silently takes the Illumina branch and writes
-        # `lima_enabled: false, syndna_enabled: false` onto every ticket. That is a
-        # case-5 pool masked with no lima and no syndna, whose spike-in count is then
-        # structurally zero: exactly what the chain's step order exists to prevent.
-        #
-        # This keys on the run's `platform` column, which is authoritative and depends
-        # on neither the blob nor the host-filter resolution. (It used to be caught
-        # only incidentally, because an unparseable blob also nulled the old
-        # `human_filtering` intent and tripped its guard — but that intent is gone
-        # now, and host filtering resolves from sample metadata whether or not the
-        # blob reads.) --force does NOT bypass it: forcing host filtering off is a
-        # choice, masking a PacBio pool with the long-read chain silently off is not.
-        if run.get("platform") == Platform.PACBIO_SMRT.value:
-            no_facts = [s["sequenced_pool_item_id"] for s in samples if not s.get("sheet_type")]
-            if no_facts:
-                print(
-                    f"sequencing_run {args.sequencing_run_idx} is PacBio, but"
-                    f" {len(no_facts)} sample(s) carry no protocol facts on the roster"
-                    f" (e.g. {no_facts[:3]}). The pool's stored pre-flight could not be"
-                    " parsed server-side, so lima and syndna cannot be gated. Refusing:"
-                    " masking a PacBio pool with the long-read chain silently off would"
-                    " leave its spike-in count structurally zero. Check the pool's"
-                    " run_preflight_blob. (--force does not bypass this.)",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
 
         # Step 5: one read-mask ticket per sample — always-on QC plus that sample's
         # OWN host-filter decision, taken from the plan resolved above. Host
@@ -1335,8 +1342,7 @@ def _handle_submit_block_mask_pool(
     there is no per-run GET here."""
     # Host-ref argument coherence, validated before any network call (mirrors
     # submit-host-filter-pool): minimap2 is the optional second stage.
-    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
-        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
+    _validate_host_ref_override_args(args, parser)
 
     def _run(token: str) -> dict:
         # Step 1: enumerate the pool's active samples for the intent preflight.
