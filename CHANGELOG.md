@@ -505,7 +505,7 @@ _None yet._
 
 ### Added
 
-- **Metagenomic OGU feature-table estimation (compute-on-demand) (#TBD).** Adds
+- **Metagenomic OGU feature-table estimation (compute-on-demand) (#304).** Adds
   the `estimate-feature-table` reference-scoped workflow: given one `alignment_idx`
   and an explicit `prep_sample_idx` cohort (on the ticket's `action_context`), the
   native `estimate_feature_table` job builds a genome-keyed OGU feature table via
