@@ -143,8 +143,12 @@ steps:
     # `alignment` is the alignment the step used to build the mask, emitted verbatim
     # rather than discarded — the old step reduced each read to a boolean and threw the
     # coordinates away, which is exactly what made per-insert quantification impossible.
-    # The binding is named generically because align_sharded emits the SAME name, so
-    # coverage_depth consumes either without knowing which produced it.
+    # Emitted as groundwork for a coverage-measurement consumer (deferred): no step
+    # consumes this binding yet. The name is shared with align_sharded's `alignment`
+    # output so a future consumer can bind either — but the SCHEMAS differ (syndna's
+    # subject is the whole plasmid, so it carries `parent_feature_idx` and no mate/
+    # alignment_idx columns; align_sharded's subject is the feature itself), so that
+    # consumer still has to know which producer it is reading.
     outputs: [partial_mask, alignment]
     baseline_resources:
       cpu: 4
@@ -282,52 +286,6 @@ steps:
   # Moves the parquet out of staging — keep this last (see persist-read-metrics).
   - action: register-files
     inputs: [read_mask_staging_dir]
-    outputs: []
-
-  # ---- Per-feature coverage depth, gated on `syndna_enabled` -----------------
-  #
-  # The quantification the spike-ins exist for: mean coverage depth per annotated
-  # interval (per SynDNA insert), keyed by the CP-minted coverage_idx.
-  #
-  # Runs under the SAME gate as syndna, because it consumes syndna's alignment. It is a
-  # separate step, not folded into syndna, so the mechanism stays generic — a genome
-  # path feeds the identical job an alignment against a genome reference (windows = that
-  # reference's genes) and gets the same feature table out. Folding it into syndna would
-  # be the SynDNA-shaped design that has to be rebuilt for genomes.
-  #
-  # `reference_idx` is the ANNOTATED reference being quantified (the spike-in plasmids).
-  # It rides in `params:` rather than as a scope scalar because a read-mask ticket is
-  # scoped to a prep_sample, not to a reference.
-  - step: coverage_depth
-    step_type: singleton
-    module: qiita_compute_orchestrator.jobs.coverage_depth
-    when: syndna_enabled
-    inputs: [alignment]
-    # `params:` maps action_context/binding key -> Inputs field.
-    params:
-      syndna_reference_idx: reference_idx
-      coverage_idx: coverage_idx
-    outputs: [coverage, coverage_staging_dir]
-    baseline_resources:
-      cpu: 4
-      mem_gb: 16
-      walltime: PT2H
-
-  # Idempotent REPLACE. DuckLake has no uniqueness constraint, so re-running this ticket
-  # would APPEND a second set of coverage rows under the same coverage_idx — and the
-  # duplicate is undetectable: every row is individually well-formed, so a consumer
-  # summing or averaging them just reads a silently doubled number. Deletes exactly this
-  # (coverage_idx, prep_sample) footprint, so a first run deletes nothing. MUST run
-  # immediately before register-files.
-  - action: delete-coverage
-    when: syndna_enabled
-    inputs: []
-    outputs: []
-
-  # coverage.parquet -> the DuckLake `coverage` table (basename IS the table name).
-  - action: register-files
-    when: syndna_enabled
-    inputs: [coverage_staging_dir]
     outputs: []
 
 action_ceiling:

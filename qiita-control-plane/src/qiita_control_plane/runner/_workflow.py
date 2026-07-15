@@ -60,12 +60,10 @@ from ._mask import (
     ALIGNMENT_IDX_BINDING,
     LIMA_ARGS_BINDING,
     MASK_IDX_BINDING,
-    _mint_coverage,
     _mint_read_mask,
     _persist_mask_idx,
     _resolved_lima,
     _resolved_syndna,
-    _workflow_needs_coverage,
     _workflow_needs_mask,
 )
 from ._processing import (
@@ -95,7 +93,6 @@ from ._reconstruct import (
 )
 from ._reference import (
     QC_ADAPTER_BINDING,
-    _coerce_reference_idx,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
     _resolve_sharded_align_index_bindings,
@@ -486,29 +483,6 @@ async def run_workflow(
                     "a workflow that masks reads (threads mask_idx) must be "
                     f"prep_sample- or block-scoped; got {scope_target['kind']!r}"
                 )
-
-        # The coverage measurement's identity. Minted AFTER the mask, because mask_idx is
-        # part of it — the same reads measured under a different mask are a different
-        # measurement. Idempotent (config-hash upsert), so a resume resolves to the same
-        # coverage_idx and the re-run REPLACES its rows rather than double-counting.
-        if _workflow_needs_coverage(action.steps):
-            coverage_reference_idx = bound.get("syndna_reference_idx")
-            if coverage_reference_idx is None:
-                raise _submission_bad_input(
-                    "a workflow that measures coverage (threads coverage_idx) requires the "
-                    "annotated reference to quantify against; got no syndna_reference_idx "
-                    "in action_context"
-                )
-            bound.update(
-                await _mint_coverage(
-                    pool,
-                    reference_idx=_coerce_reference_idx(
-                        coverage_reference_idx, "syndna_reference_idx"
-                    ),
-                    mask_idx=bound.get(MASK_IDX_BINDING),
-                    originator_principal_idx=work_ticket["originator_principal_idx"],
-                )
-            )
 
         # Processing identity: when a step threads `processing_idx` (the assembly
         # membership + load steps), mint the run's processing_idx before the loop —

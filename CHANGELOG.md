@@ -22,36 +22,6 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **Per-feature coverage depth: the SynDNA quantification, built generic (#269, part 2).**
-  Mean read-coverage depth per annotated interval, landing in a new DuckLake `coverage`
-  table — the first per-`(prep_sample_idx, feature_idx)` value table in the system. The
-  mechanism takes *alignments* + *feature windows* and produces a *feature table*, so it
-  knows nothing about SynDNA: the spike-in path feeds it reads aligned to the plasmids
-  (windows = the inserts); a genome path feeds it an alignment against a genome reference
-  (windows = its genes) and gets the same table out.
-  - The `syndna` step **keeps its alignment** instead of reducing each read to a boolean
-    and discarding the coordinates. It aligns to the **plasmids**, not the bare inserts,
-    and the identity + aligned-fraction gate (0.95 / 0.90, settled with the assay owner)
-    now lives in **one place** shared with the measurement — so the reads masked as
-    spike-in and the reads counted toward depth cannot drift apart.
-  - A new native `coverage_depth` job pulls the annotation windows over a `reference_idx`-
-    scoped Flight DoGet ticket, gates the alignment against the whole plasmid (pre-window,
-    which is what keeps a junction-spanning read that is only ~60% inside the insert), and
-    computes depth via miint's `compute_coverage_depth`. A feature that occurs at several
-    windows (a 16S gene in its 5–7 identical copies) is summed, not averaged.
-  - Keyed by a CP-minted `coverage_idx` (the params-hash identity `mask_idx` /
-    `alignment_idx` use): every knob that moves the number — reference, aligner, preset,
-    both gate thresholds, depth mode, `mask_idx` — is in the hash, each asserted to
-    re-mint individually against Postgres, so a threshold change cannot silently reuse an
-    idx whose stored params describe the old measurement.
-  - The write is an idempotent **replace**: a `delete-coverage` DoAction removes this
-    ticket's exact `(coverage_idx, prep_sample_idx)` footprint before `register-files`.
-    DuckLake has no uniqueness constraint, so without it a re-run would append a second,
-    undetectable set of rows and a consumer would read a silently doubled number.
-  - Verified end-to-end against the real SynDNA plasmids + a GFF3 derived from the real
-    insert FASTA (`mean_depth = 2.471143`); the smoke tests reproduce that number against
-    the real miint build.
-
 - **Reference feature annotations: GFF3 in, typed interval rows out (#269).** A
   reference can now carry per-interval ANNOTATIONS — a SynDNA insert on its
   plasmid, a gene on a chromosome — supplied as a GFF3 (`qiita reference load
@@ -174,6 +144,21 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **SynDNA read-masking keeps its alignment and gates on the whole plasmid (#269, part 2).**
+  The `syndna` step no longer reduces each read to a boolean and discards the alignment
+  coordinates — it materializes the alignment and emits it as a second output, groundwork
+  for a coverage-measurement consumer (see the deferral below). The spike-in gate (identity
+  ≥ 0.95 AND aligned fraction ≥ 0.90, settled with the assay owner) is now single-sourced
+  in `jobs/_coverage` and shared by the masking predicate; the aligned-fraction threshold
+  enters the mask identity hash so a change re-mints. Inert until the SynDNA reference is
+  re-ingested as plasmids + a per-insert GFF3 — a read-mask run without `syndna_enabled` is
+  byte-identical to today.
+  - **Per-feature coverage depth itself is deferred to a follow-up (tracked in #306).** Per
+    review, it will land with its first consumer (the cell-count / BIOM path) as a
+    **compute-on-demand** model — no persisted DuckLake `coverage` table, no minted
+    `coverage_idx` — keyed by the **annotated element** (interval coordinates) rather than a
+    per-feature sum, so copy-number variation among occurrences is preserved.
 
 - **Sharded-alignment review revisions (#268).** Reworked the sharded-alignment
   path per review: the aligner is now derived from the run's sequencing platform

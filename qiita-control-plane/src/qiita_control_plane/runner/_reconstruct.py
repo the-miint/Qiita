@@ -41,7 +41,7 @@ from ..shard_orchestration import (
     plan_and_submit_shards,
 )
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
-from ._mask import ALIGNMENT_IDX_BINDING, COVERAGE_IDX_BINDING, MASK_IDX_BINDING
+from ._mask import ALIGNMENT_IDX_BINDING, MASK_IDX_BINDING
 from ._processing import PROCESSING_IDX_BINDING
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
@@ -617,27 +617,6 @@ async def _run_action_primitive(
             pool,
             block_idx=scope_target["block_idx"],
             alignment_idx=bound[ALIGNMENT_IDX_BINDING],
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
-        )
-        return {}
-
-    if entry.name == LibraryPrimitive.DELETE_COVERAGE:
-        # Idempotent replace for the coverage feature table: delete this ticket's exact
-        # (coverage_idx, prep_sample) footprint BEFORE register-files writes the new one.
-        # DuckLake has no uniqueness, so without this a re-run holds BOTH row sets and
-        # nothing downstream can tell — every row is well-formed, and a consumer just
-        # reads a doubled number. Scoped to the sample, never the whole coverage_idx,
-        # which is shared across every sample measured the same way.
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                "delete-coverage requires a prep_sample-scoped ticket; got "
-                f"{scope_target['kind']!r}"
-            )
-        await LIBRARY[LibraryPrimitive.DELETE_COVERAGE](
-            pool,
-            scope_target["prep_sample_idx"],
-            bound[COVERAGE_IDX_BINDING],
             signing_key=signing_key,
             data_plane_url=data_plane_url,
         )

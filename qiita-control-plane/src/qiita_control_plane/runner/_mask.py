@@ -9,10 +9,6 @@ from typing import Any
 
 import asyncpg
 
-from ..repositories.coverage_definition import (
-    build_coverage_params,
-    mint_coverage_definition,
-)
 from ..repositories.mask_definition import mint_mask_definition
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
@@ -35,10 +31,6 @@ from ._upload import _submission_bad_input
 # signals the runner to mint the mask before the step loop and carries the value
 # into the step.
 MASK_IDX_BINDING = "mask_idx"
-
-# The CP-minted identity of the coverage measurement, threaded into the coverage_depth
-# step's `params:` so every emitted row carries it.
-COVERAGE_IDX_BINDING = "coverage_idx"
 
 # The align run's alignment_idx (mask-style identity), read off an align block
 # ticket's `work_ticket.alignment_idx` and threaded into the align_sharded step's
@@ -397,47 +389,3 @@ async def _materialize_backfill_adapter_set_hash(
         workspace=workspace,
     )
     return _adapter_set_hash(bound[QC_ADAPTER_BINDING])
-
-
-# Mirrors of jobs/coverage_depth's constants. The CP cannot import the orchestrator, so
-# these are hand-copied and pinned by tests/test_coverage_pins.py — the same arrangement
-# the syndna constants use, and for the same reason: a knob that moves the NUMBER must
-# reach the identity hash, or new rows land under a coverage_idx describing the old
-# measurement.
-_COVERAGE_ALIGNER = "minimap2"
-_COVERAGE_PRESET = "map-hifi"
-_COVERAGE_MIN_IDENTITY = 0.95
-_COVERAGE_MIN_ALIGNED_FRACTION = 0.90
-_COVERAGE_DEPTH_MODE = "include_deletions"
-
-
-def _workflow_needs_coverage(steps: list[Any]) -> bool:
-    """True iff some entry declares `coverage_idx` as a param — the signal the runner must
-    mint a coverage_idx before the step loop. Mirrors `_workflow_needs_mask`."""
-    return any(COVERAGE_IDX_BINDING in (getattr(entry, "params", None) or {}) for entry in steps)
-
-
-async def _mint_coverage(
-    pool: asyncpg.Pool,
-    *,
-    reference_idx: int,
-    mask_idx: int | None,
-    originator_principal_idx: int,
-) -> dict[str, int]:
-    """Mint (or resolve) the coverage_idx for this measurement and return its binding.
-
-    Idempotent: the config-hash upsert means a resume, or a second ticket with the same
-    config, resolves to the SAME coverage_idx rather than minting a second one — which is
-    what makes a re-run replace its rows instead of double-counting them.
-    """
-    params = build_coverage_params(
-        reference_idx=reference_idx,
-        aligner=_COVERAGE_ALIGNER,
-        preset=_COVERAGE_PRESET,
-        min_identity=_COVERAGE_MIN_IDENTITY,
-        min_aligned_fraction=_COVERAGE_MIN_ALIGNED_FRACTION,
-        depth_mode=_COVERAGE_DEPTH_MODE,
-        mask_idx=mask_idx,
-    )
-    row = await mint_coverage_definition(pool, params, originator_principal_idx)
-    return {COVERAGE_IDX_BINDING: row["coverage_idx"]}

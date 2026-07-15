@@ -106,48 +106,6 @@ def stream_reference_chunks(
 
 
 @asynccontextmanager
-async def open_reference_table_stream(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    reference_idx: int,
-    table: str,
-    feature_idx: list[int] | None = None,
-    relation: str,
-) -> AsyncIterator[str]:
-    """Mint a DoGet ticket for one reference table (CO→CP) and stream its rows
-    (CO→DP Flight) into `conn` as `relation`, yielding the registered relation name.
-
-    The generic form. `table` must be in the CP's DoGet allowlist
-    (`routes/reference._DOGET_ALLOWED_TABLES`, which is pinned to the data plane's
-    `ALLOWED_TABLES`) — `reference_sequence_chunks` for a shard builder's sequences,
-    `reference_annotation` for the coverage job's feature windows, and so on.
-
-    The CP client is closed as soon as the ticket is minted — nothing in the body calls
-    the CP. Only the Flight client/stream stays open for the body (DuckDB pulls it lazily
-    as the query scans `relation`); it is torn down and the relation unregistered on exit.
-
-    `feature_idx` scopes the ticket to a subset (a shard's roster); pass None for the whole
-    reference — never `[]`, which the CP rejects. The ticket always carries `reference_idx`,
-    so a table with its own `reference_idx` column (like `reference_annotation`) is scoped
-    for free, with no membership join.
-    """
-    async with make_cp_client() as http:
-        ticket = await fetch_reference_doget_ticket(
-            http=http,
-            reference_idx=reference_idx,
-            table=table,
-            feature_idx=feature_idx,
-        )
-    with stream_reference_chunks(
-        conn,
-        data_plane_url=get_settings().data_plane_url,
-        ticket_bytes=ticket,
-        relation=relation,
-    ) as rel:
-        yield rel
-
-
-@asynccontextmanager
 async def open_reference_chunk_stream(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -155,17 +113,36 @@ async def open_reference_chunk_stream(
     feature_idx: list[int] | None,
     relation: str = "reference_chunks",
 ) -> AsyncIterator[str]:
-    """`open_reference_table_stream` fixed to `reference_sequence_chunks`.
+    """Compose the two seams into one: mint a `feature_idx`-scoped DoGet
+    ticket (CO→CP) and stream that roster's `reference_sequence_chunks` rows
+    (CO→DP Flight) into `conn` as `relation`, yielding the registered relation
+    name for the caller to reassemble from inside the `async with` body.
 
-    Kept as its own name because it is the seam the shard builders import and
-    monkeypatch in their tests; the generic form underneath is what a new consumer
-    (the coverage job's annotation windows) should use.
+    This is the seam a shard builder imports and monkeypatches in tests. The two
+    underlying seams (`fetch_reference_doget_ticket`, `stream_reference_chunks`)
+    stay separate so the integration test can bypass the CP hop and sign a ticket
+    directly against the fixture data plane's HMAC secret.
+
+    The CP client is closed as soon as the ticket is minted — it is NOT held open
+    for the body (nothing in the body calls the CP). Only the Flight client/stream
+    stays open for the body's duration (the stream is pulled lazily by DuckDB as
+    the reassembly query scans `relation`); it is torn down and the relation
+    unregistered on exit. `feature_idx` scopes the ticket to a shard's roster; pass
+    None only for a whole-reference stream (never `[]` — the CP rejects it).
+    `data_plane_url` resolves from `get_settings()` (the lifespan-installed value on
+    the service, the propagated `DATA_PLANE_URL` on a compute node).
     """
-    async with open_reference_table_stream(
+    async with make_cp_client() as http:
+        ticket = await fetch_reference_doget_ticket(
+            http=http,
+            reference_idx=reference_idx,
+            table="reference_sequence_chunks",
+            feature_idx=feature_idx,
+        )
+    with stream_reference_chunks(
         conn,
-        reference_idx=reference_idx,
-        table="reference_sequence_chunks",
-        feature_idx=feature_idx,
+        data_plane_url=get_settings().data_plane_url,
+        ticket_bytes=ticket,
         relation=relation,
     ) as rel:
         yield rel

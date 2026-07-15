@@ -118,12 +118,21 @@ _MM2_PRESET = "map-hifi"
 # so one structural deletion flips the call. Whether a real spike-in molecule is
 # expected to carry such an event — and therefore which method the assay wants — is
 # with the assay owner alongside the open questions below.
+#
+# NOTE: this is now a RECORDED-INVARIANT constant, not a live query parameter. The gate
+# computes identity via `cigar_sequence_identity` (from `_coverage`), which reproduces
+# blast identity on an eqx CIGAR; `_IDENTITY_METHOD` no longer parameterizes any call. It
+# survives only so the mask-identity hash and `test_syndna_pins` record the method the gate
+# is understood to implement. Editing it to another method would re-mint the mask without
+# changing what the job computes — to actually change the computation, change the expression
+# in `_coverage`.
 _IDENTITY_METHOD = "blast"
 # The gate's thresholds are single-sourced in `_coverage` (MIN_IDENTITY /
 # MIN_ALIGNED_FRACTION) and imported above — NOT redefined here. That is the whole point:
-# syndna masks a read as spike-in and coverage_depth counts it toward depth, so if the two
-# used different cutoffs a read could be masked out of `biological` yet contribute no depth
-# (or the reverse), silently. One definition guarantees they can't.
+# syndna masks a read as spike-in and a coverage-measurement consumer (deferred — see the
+# alignment emit below) will count the same reads toward depth, so if the two used
+# different cutoffs a read could be masked out of `biological` yet contribute no depth (or
+# the reverse), silently. One definition guarantees they can't.
 
 # =============================================================================
 # PRIMARY alignments only — matching coverm
@@ -352,17 +361,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
 
-            # The alignment itself, for the coverage-depth step. Carries prep_sample_idx
-            # so the downstream job needs nothing else to key its output. Emitted UNGATED
-            # (mapped-primary only) — the measurement gate is applied by the consumer, so
-            # it lives in one place.
+            # The alignment itself, emitted as groundwork for a coverage-measurement
+            # consumer (deferred — no step consumes this binding yet). Carries
+            # prep_sample_idx so that consumer needs nothing else to key its output.
+            # Emitted UNGATED (mapped-primary only) — the measurement gate is applied by the
+            # consumer, so it lives in one place. No ORDER BY: nothing reads this today, and
+            # a future consumer aggregates rather than relying on row order.
             conn.execute(
                 "COPY (SELECT "
                 f"        {prep_sample_sql} AS prep_sample_idx, "
                 "         sequence_idx, parent_feature_idx, "
                 "         flags, position, stop_position, cigar "
-                f"      FROM {_ALIGNMENT} "
-                "      ORDER BY prep_sample_idx, parent_feature_idx, position) "
+                f"      FROM {_ALIGNMENT}) "
                 f"TO '{alignment_sql}' ({PARQUET_OPTS})"
             )
         success = True

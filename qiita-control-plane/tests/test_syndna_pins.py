@@ -123,13 +123,19 @@ def test_every_filter_knob_in_the_job_is_pinned():
     OLD filter. That is the same defect class the syndna mask identity was introduced to
     fix, one level up.
 
-    Caught exactly this: `_MIN_ALIGNED_FRACTION` was added to the job and every test still
-    passed. So the guard is a NAME-shaped one — anything that looks like a filter knob has
-    to be pinned deliberately, or explicitly excluded here with a reason.
+    Caught exactly this: the aligned-fraction floor was added to the job and every test
+    still passed. So the guard is a NAME-shaped one — anything that looks like a filter knob
+    has to be pinned deliberately, or explicitly excluded here with a reason.
+
+    The un-prefixed `MIN_` / `MAX_` forms are here because the shared gate thresholds now
+    live in `_coverage.py` in that module's PUBLIC style (`MIN_IDENTITY`,
+    `MIN_ALIGNED_FRACTION`) — without them a new public threshold added to the shared gate
+    would slip past this guard.
     """
     # Constants that describe the FILTER (what gets called a spike-in) rather than the
-    # execution environment (memory, threads, table names).
-    knob_prefixes = ("_MIN_", "_MAX_", "_IDENTITY_", "_PRIMARY_", "_MM2_PRESET")
+    # execution environment (memory, threads, table names). Both the syndna-job private
+    # form (`_MIN_`) and the shared-gate public form (`MIN_`) are caught.
+    knob_prefixes = ("_MIN_", "_MAX_", "MIN_", "MAX_", "_IDENTITY_", "_PRIMARY_", "_MM2_PRESET")
     not_filter_knobs = {
         # Resource caps — they change how the job RUNS, never which reads it calls.
         "_MM2_RESERVE_GB",

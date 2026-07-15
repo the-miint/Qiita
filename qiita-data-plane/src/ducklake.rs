@@ -367,66 +367,6 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Create the coverage table in DuckLake — the first per-(prep_sample, feature)
-/// VALUE table in the system (the "feature table" the analysis side has been
-/// waiting on).
-///
-/// One row per (coverage_idx, prep_sample_idx, feature_idx): the mean depth of
-/// read coverage over that feature, in that sample, under that coverage
-/// definition. The quantified `feature_idx` is generally NOT the thing reads
-/// aligned to — for a SynDNA spike-in it is the INSERT, while reads align to the
-/// plasmid that carries it. The parent is deliberately NOT a column here: a feature
-/// with several occurrences can sit on more than one parent, so the value would not
-/// be single-valued. It is reference metadata (recoverable from
-/// `reference_annotation`), not part of the measurement.
-///
-/// Keyed by a CP-minted `coverage_idx` (a params-hash identity, exactly like
-/// `alignment_idx` / `mask_idx`), NOT by the deferred
-/// processing_idx / processed_prep_sample_idx hierarchy — the same call
-/// `alignment` made.
-///
-/// **`mean_depth` is stored alongside the two numbers it is derived from, on
-/// purpose.** It is the quantity consumers want, but a mean cannot be re-derived
-/// by averaging means: a feature can occur MORE THAN ONCE in a reference (a
-/// bacterial 16S rRNA gene occurs in 5-7 byte-identical copies, which share one
-/// feature_idx — see reference_annotation), and aggregating across those
-/// occurrences requires summing `covered_bases` and dividing by summed
-/// `feature_length`. Keeping all three makes that correct aggregation possible
-/// and the headline number auditable.
-///
-/// NOT exposed via Flight yet (absent from flight_service::ALLOWED_TABLES), for the
-/// same reason `alignment` isn't: it is a sink this milestone. A read-side needs its
-/// own ticket route — `coverage` is keyed by prep_sample, not by reference, so the
-/// reference DoGet route cannot sign for it (this is exactly the split `read_masked`
-/// already has). Deferred until the first consumer (BIOM export / the cell-count
-/// model) actually needs it.
-pub fn ensure_coverage_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.coverage (
-            coverage_idx    BIGINT NOT NULL,
-            prep_sample_idx BIGINT NOT NULL,
-            -- The feature being QUANTIFIED (a SynDNA insert; a gene). ONE row per
-            -- (coverage_idx, prep_sample_idx, feature_idx).
-            feature_idx     BIGINT NOT NULL,
-            -- Bases of aligned read covering the feature, and the feature's length,
-            -- both SUMMED over the feature's occurrences (see `occurrences`).
-            -- mean_depth = covered_bases / feature_length.
-            covered_bases   BIGINT NOT NULL,
-            feature_length  BIGINT NOT NULL,
-            -- How many annotated OCCURRENCES of this feature contributed. A feature is a
-            -- SEQUENCE and an annotation is an occurrence of it at a place, so one
-            -- feature_idx can sit at N windows -- a bacterial 16S rRNA gene occurs in 5-7
-            -- byte-identical copies, which hash to one feature_idx. The depth of that
-            -- SEQUENCE is sum(bases)/sum(lengths) across them, NOT the mean of their
-            -- means (which would weight a short occurrence like a long one). Emitted so
-            -- the multiplicity is visible rather than silently folded away.
-            occurrences     BIGINT NOT NULL,
-            mean_depth      DOUBLE NOT NULL
-        );",
-    )?;
-    Ok(())
-}
-
 /// Create the assembly-result tables in DuckLake — the assembly analogue of the
 /// reference-sequence tables, following the SAME chunked + content-hashed model.
 ///
