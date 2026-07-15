@@ -52,7 +52,11 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      `_MIN_SEQUENCE_IDENTITY_BOWTIE2` 0.99 for short reads,
      `_MIN_SEQUENCE_IDENTITY_MINIMAP2` 0.90 for long reads — scored from the =/X
      CIGAR that bowtie2 `xeq` / minimap2 `eqx` emit) so noisy off-target hits don't
-     bloat storage.
+     bloat storage. minimap2 placements must ALSO clear a query-coverage floor
+     (`_MIN_QUERY_COVERAGE_MINIMAP2` 0.90, from `cigar_query_coverage`) — a
+     soft-clipped long read can be high-identity over a short aligned span, and that
+     low-coverage placement would otherwise persist and inflate a downstream
+     breadth-of-coverage estimate; bowtie2 aligns end-to-end so needs no such gate.
      For bowtie2 (paired-end) the two mates of a concordant placement are POOLED and
      scored as a unit, so a pair is kept or dropped together and a mate is never
      orphaned; for minimap2 (long-read, single-end) each alignment is scored on its
@@ -185,6 +189,16 @@ _MINIMAP2_MAX_SECONDARY = 100
 # an ONT block from silently dropping every read were it ever enabled.
 _MIN_SEQUENCE_IDENTITY_BOWTIE2 = 0.99
 _MIN_SEQUENCE_IDENTITY_MINIMAP2 = 0.90
+
+# Minimum query coverage (the aligned fraction of the read, scored from the CIGAR
+# via miint's `cigar_query_coverage`) a surviving minimap2 placement must clear.
+# Identity alone is over the ALIGNED columns only, so a long read that soft-clips
+# most of itself can be high-identity over a short aligned span; this floor drops
+# those low-coverage placements before they are persisted (and before they inflate
+# a downstream breadth-of-coverage estimate). minimap2-only: bowtie2 aligns
+# END-TO-END (`score_min 'L,0,-0.05'`, no local mode) so query coverage is ~1.0 by
+# construction and a separate gate would be a no-op.
+_MIN_QUERY_COVERAGE_MINIMAP2 = 0.90
 
 # The bowtie2 align-time parameter set (the "modified SHOGUN" configuration): collect
 # ALL concordant paired-end placements (`report_all`, replacing the historical `-k 16`
@@ -506,11 +520,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     conn, _QUERY, inputs.shard_directory, _READ_TO_SHARD, _ALIGNMENTS
                 )
 
-            # The high-identity filter, applied as the COPY's QUALIFY so it runs
-            # over the joined rows just before the sort. Both forms score identity
-            # from the =/X CIGAR via `cigar_sequence_identity`; they differ in the
-            # identity FLOOR (bowtie2 0.99, minimap2 0.90 — see the module constants)
-            # and in how a read's placement is grouped:
+            # The high-identity filter — plus, for minimap2, a query-coverage floor —
+            # applied as the COPY's QUALIFY so it runs over the joined rows just before
+            # the sort. Both forms score identity from the =/X CIGAR via
+            # `cigar_sequence_identity`; they differ in the identity FLOOR (bowtie2
+            # 0.99, minimap2 0.90 — see the module constants) and in how a read's
+            # placement is grouped:
             #   * bowtie2 (paired-end): POOL the two mates of each concordant
             #     placement and judge the pair as a unit, so a pair is kept or
             #     dropped together and a mate is never orphaned. The two mates store
@@ -518,9 +533,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             #     LEAST/GREATEST(position, mate_position) gives both the same key;
             #     including `reference` keeps a read's distinct placements (report_all
             #     emits each as its own 2-record pair) separate, each judged alone.
+            #     No query-coverage gate — bowtie2 aligns end-to-end (qcov ~1.0).
             #   * minimap2 (long-read, single-end): no mate to pool, so each
-            #     alignment is its own partition (keyed by position) and judged on
-            #     its own CIGAR.
+            #     alignment is its own partition (keyed by position) and judged on its
+            #     own CIGAR — on identity AND query coverage (>= 0.90), since a
+            #     soft-clipped long read can be high-identity over a short aligned span.
             if inputs.aligner == "bowtie2":
                 identity_partition = (
                     "a.read_id, a.reference, "
@@ -528,9 +545,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "GREATEST(a.position, a.mate_position)"
                 )
                 min_identity = _MIN_SEQUENCE_IDENTITY_BOWTIE2
+                coverage_clause = ""
             else:
                 identity_partition = "a.read_id, a.reference, a.position"
                 min_identity = _MIN_SEQUENCE_IDENTITY_MINIMAP2
+                # Same pooled-CIGAR expression as identity; for a single-end record
+                # the partition is one row, so this is per-record query coverage.
+                coverage_clause = (
+                    " AND cigar_query_coverage("
+                    f"string_agg(a.cigar, '') OVER (PARTITION BY {identity_partition})"
+                    f") >= {_MIN_QUERY_COVERAGE_MINIMAP2}"
+                )
 
             # Stream a sorted COPY. Prepend the CP-minted `alignment_idx` as the
             # LEADING column (a constant for this align run — the block ticket
@@ -565,7 +590,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"JOIN {_READ_META} rm ON rm.sequence_idx = a.read_id "
                 "QUALIFY cigar_sequence_identity("
                 f"string_agg(a.cigar, '') OVER (PARTITION BY {identity_partition})"
-                f") >= {min_identity} "
+                f") >= {min_identity}{coverage_clause} "
                 "ORDER BY alignment_idx, rm.prep_sample_idx, a.read_id, feature_idx, "
                 "a.position, a.flags) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"

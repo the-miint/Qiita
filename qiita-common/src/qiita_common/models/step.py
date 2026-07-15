@@ -248,3 +248,19 @@ class DoGetTicketRequest(BaseModel):
 
 class DoGetTicketResponse(BaseModel):
     ticket: str  # base64-encoded signed ticket bytes
+
+
+class AlignmentDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/alignment/ticket/doget.
+
+    Signs a Flight DoGet ticket scoped to a single alignment run + its explicit
+    prep_sample_idx cohort on the data plane's ``alignment`` table, for the
+    feature-table (OGU) compute job. The body carries only ``work_ticket_idx``;
+    the route reads ``alignment_idx`` and the ``prep_sample_idx`` cohort from
+    that ticket's ``action_context`` (set at plan time), so the potentially large
+    sample list never rides the request body or a ``params:`` scalar.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]

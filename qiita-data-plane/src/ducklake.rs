@@ -328,9 +328,11 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
-/// stamps feature_idx). NOT exposed via Flight (absent from
-/// flight_service::ALLOWED_TABLES): the alignment table is a sink this milestone;
-/// a Flight read-side is deferred until a downstream consumer needs it.
+/// stamps feature_idx). Exposed via Flight DoGet (in flight_service::ALLOWED_TABLES)
+/// for the feature-table (OGU) consumer: reads are always scoped to a single
+/// alignment_idx + an explicit prep_sample_idx set and projected to the
+/// coverage/OGU columns (see ALIGNMENT_DOGET_PROJECTION); an unscoped read is
+/// refused. This is host-depleted derived data, not raw human reads.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.alignment (

@@ -343,6 +343,34 @@ async def finalize_alignment_sample(
     return updated is not None
 
 
+async def list_incomplete_alignment_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    alignment_idx: int,
+    prep_sample_idxs: Sequence[int],
+) -> list[int]:
+    """Return the `prep_sample_idx` values (from `prep_sample_idxs`) that are NOT
+    'completed' for `alignment_idx` — those carrying a 'pending' gate row OR no
+    `qiita.alignment_sample` row at all (never part of this alignment).
+
+    The feature-table resolver calls this at SUBMIT to refuse building an OGU table
+    over an incomplete cohort. alignment rows are NOT 1:1 with reads, so presence
+    of rows is never 'done' — completion is a first-class state (see
+    qiita.alignment_sample). Accepts a pool or a connection so it composes inside a
+    transaction. Result is sorted for a deterministic error message; empty input
+    returns []."""
+    if not prep_sample_idxs:
+        return []
+    rows = await pool_or_conn.fetch(
+        "SELECT prep_sample_idx FROM qiita.alignment_sample"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
+        "   AND state = 'completed'",
+        alignment_idx,
+        list(prep_sample_idxs),
+    )
+    completed = {r["prep_sample_idx"] for r in rows}
+    return sorted(set(prep_sample_idxs) - completed)
+
+
 async def has_incomplete_covering_alignment_block(
     conn: asyncpg.Connection,
     *,

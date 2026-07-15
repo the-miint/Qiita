@@ -851,6 +851,62 @@ def test_load_actions_loads_on_disk_read_mask_block_yaml():
     assert BLOCK_MASK_ACTION_VERSION == rmb.version == "1.0.0"
 
 
+def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
+    """The on-disk `workflows/estimate-feature-table/1.0.0.yaml` loads as a valid
+    ActionDefinition with the compute-on-demand OGU shape:
+
+      * target_kind reference (so the framework injects `reference_idx` as a scope
+        scalar), NO target_processing_kinds;
+      * a single native step `estimate_feature_table`, `inputs: [genome_map_path]`
+        (the resolver-staged map — this is also the input the runner's resolver
+        gate keys on), `params: {coverage_threshold: coverage_threshold}`,
+        `outputs: [ogu_table]`;
+      * `reference_idx` is NOT in `params` — it is the framework-injected scope
+        scalar, and binding it via params would collide at flatten_native_inputs;
+      * no success_status / failure_status (compute-on-demand mints no identity and
+        flips no reference/sample state), so no register/status step;
+      * admin-only audience + `reference:read` (read-only reference/alignment
+        compute — both audience roles already hold it);
+      * context_schema requires the three action_context scalars the mint route +
+        resolver read (alignment_idx, prep_sample_idx, coverage_threshold)."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    assert "estimate-feature-table" in by_id, (
+        "workflows/estimate-feature-table/1.0.0.yaml must load"
+    )
+    eft = by_id["estimate-feature-table"]
+
+    assert eft.version == "1.0.0"
+    assert eft.target_kind == ScopeTargetKind.REFERENCE
+    assert eft.target_processing_kinds == []
+    assert eft.scopes == ["reference:read"]
+    assert eft.audience.service is False
+    assert set(eft.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+    # No identity/state to flip — the table is computed on demand.
+    assert eft.success_status is None
+    assert eft.failure_status is None
+
+    assert [s.name for s in eft.steps] == ["estimate_feature_table"]
+    step = eft.steps[0]
+    assert step.module == "qiita_compute_orchestrator.jobs.estimate_feature_table"
+    assert step.inputs == ["genome_map_path"]
+    assert step.params == {"coverage_threshold": "coverage_threshold"}
+    assert step.outputs == ["ogu_table"]
+    # reference_idx is framework-injected (REFERENCE scope scalar); binding it via
+    # params would collide with that injection at flatten_native_inputs.
+    assert "reference_idx" not in step.params
+
+    required = set(eft.context_schema.get("required", []))
+    assert {"alignment_idx", "prep_sample_idx", "coverage_threshold"} <= required
+
+
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
     """Different versions of the same action_id are distinct rows, not
     duplicates."""

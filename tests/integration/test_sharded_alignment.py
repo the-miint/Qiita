@@ -45,7 +45,7 @@ import duckdb
 import pytest
 
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_compute_orchestrator.data_plane_client import stream_reference_chunks
+from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.derived_store import (
     shard_bowtie2_dir,
     shard_minimap2_dir,
@@ -137,7 +137,7 @@ def _fake_stream(data_plane):
             table="reference_sequence_chunks", filter=flt, secret=data_plane["secret"]
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-        with stream_reference_chunks(
+        with open_doget_stream(
             conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
         ) as rel:
             yield rel

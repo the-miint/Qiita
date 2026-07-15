@@ -36,7 +36,7 @@ def stage_subject(
 
     `source` is any FROM-able relation operand carrying `(feature_idx,
     chunk_index, chunk_data)` columns: a registered stream relation NAME (the
-    `stream_reference_chunks` relation) OR a `read_parquet('…')` expression (the
+    `open_doget_stream` relation) OR a `read_parquet('…')` expression (the
     host-mode staging path). The chunks are reassembled per feature via
     `string_agg(chunk_data ORDER BY chunk_index)` (`reassemble_chunks_expr`, the
     single-sourced inverse of the chunking split), so the subject is independent

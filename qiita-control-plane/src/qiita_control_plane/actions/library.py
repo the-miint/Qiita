@@ -1031,12 +1031,15 @@ def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_pat
     return out_path
 
 
-async def _export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path: Path) -> None:
+async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path: Path) -> None:
     """Stream this reference's (feature_idx, genome_idx) pairs from Postgres to a
     Parquet at `out_path`, in `_CHUNK_SIZE` batches (a GG2-scale reference has
     millions of members — never one giant array). The INNER JOIN to
     feature_genome drops features with no genome, which is deliberate: no-genome
     features (16S / deferred) never enter a shard and keep shard_id NULL.
+
+    Public (used by both the reference-load plan-shards step here and the
+    feature-table runner resolver, runner/_feature_table.py).
 
     An empty result still writes a valid two-column Parquet (schema created up
     front) so DuckDB's read_parquet doesn't fail on a zero-genome reference."""
@@ -1152,7 +1155,7 @@ async def plan_shards(
     member_parquet = workspace / "member_genome.parquet"
     taxonomy_parquet = workspace / "taxonomy.parquet"
 
-    await _export_member_genome(pool, reference_idx, member_parquet)
+    await export_member_genome(pool, reference_idx, member_parquet)
 
     ticket = sign_ticket(
         table=_REFERENCE_TAXONOMY_TABLE,

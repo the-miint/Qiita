@@ -267,6 +267,8 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_ALIGNMENT_DEFINITION_PREFIX",
         "PATH_ALIGNMENT_DEFINITION_BY_IDX",
     ),
+    # /alignment (Flight DoGet ticket for the alignment sink)
+    ("URL_ALIGNMENT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_DOGET"),
 ]
 
 

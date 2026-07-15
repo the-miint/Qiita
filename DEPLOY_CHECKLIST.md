@@ -100,6 +100,11 @@ _None yet._
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id IN ('align','build-shard-index') ORDER BY action_id"
   # expect: align|1.0.0|block  and  build-shard-index|1.0.0|reference
   ```
+- Confirm the new `estimate-feature-table` workflow synced into `qiita.action` (synced by `qiita-admin actions sync` inside `activate.sh`; covered by `make verify-deploy`'s `qiita.action` list): (#304)
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id = 'estimate-feature-table'"
+  # expect: estimate-feature-table|1.0.0|reference
+  ```
 - Confirm the compute service account's live token now carries `ticket:doget` (the bucket-2 grant), so sharded builds can mint the reference-chunk DoGet ticket: (#268)
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT sa.name, t.scopes FROM qiita.service_account sa JOIN qiita.api_token t ON t.principal_idx = sa.principal_idx WHERE t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now()) ORDER BY sa.name"
@@ -225,6 +230,9 @@ verification passes, the OLD build's config is the rollback path.
 
 - **Reference sharding + sharded alignment are opt-in and inert until an operator runs them.** Sharded indexing is enabled per reference by a `shard_index` context flag on `reference-add` / `local-reference-add` (absent ⇒ byte-identical to today's whole-reference `loading → active`, no build); the alignment consumer (`align/1.0.0`, `POST …/sequenced-pool/{P}/align-plan`, `DELETE /alignment-definition/{idx}`) needs a sharded, ACTIVE reference plus completed masks to do anything. Existing reference and read-mask flows are unchanged. (#268)
 - **The DuckLake `alignment` table is created automatically at data-plane startup** by `ensure_alignment_tables` (idempotent, runs every DP boot) — **no data-plane action**. It is a sink (not in `ALLOWED_TABLES`); there is no Flight read-side yet. (#268)
+- **The DuckLake `alignment` table is now DoGet-readable** (supersedes the #268 note above): the data plane serves a projected `alignment` DoGet scoped `{alignment_idx, prep_sample_idx[]}` for the feature-table job. Read-only, reuses the generic ticket verifier + `ticket:doget` (already granted to the compute account in bucket 2) — **no new scope, migration, or host action**. (#304)
+- **`estimate-feature-table` is opt-in and inert until run.** No REST trigger this cut — an admin constructs the reference-scoped work ticket directly (`action_context = {alignment_idx, prep_sample_idx[], coverage_threshold}`); the OGU table is computed on demand and never persisted (no `processing_idx`, no DuckLake write). Nothing else changes behavior. (#304)
+- **`estimate-feature-table` requires a miint build carrying the `woltka_ogu` id-type-preservation fix** (BIGINT/UUID `reference`/`sample_id`). It is staged from the team mirror at deploy like every other miint function, so there is no host action — but until the mirror carries the fix, the job fails at `woltka_ogu` bind. Inert until an operator runs it. (#304)
 - **New scope `alignment_definition:delete` is granted automatically to `system_admin`** via `ROLE_IMPLIED_SCOPES` (the disallow-without-delete escape hatch for alignments) — no host action, never granted to service accounts. (#268)
 - **The DuckLake `reference_annotation` table is likewise created automatically at data-plane startup** by `ensure_reference_tables` (idempotent, every DP boot) — **no data-plane action, no migration**. It holds annotated INTERVALS of a reference sequence (a SynDNA insert on its plasmid, a gene on a chromosome), each minted its own `feature_idx`. Unlike `alignment` it IS readable (it is in `ALLOWED_TABLES`), and `delete_reference` purges it. (#269)
 - **All four `reference-add` workflows gain an optional GFF3 companion (`--gff`) and one new in-process action (`mint-annotation-features`)** — reaches `qiita.action` via the `qiita-admin actions sync` that `activate.sh` already runs, so **no host action**. A reference ingested WITHOUT a `--gff` behaves byte-identically to today apart from one extra zero-row `reference_annotation` staging file; no additional SLURM job is scheduled (the new action runs in-process on the control plane). (#269)

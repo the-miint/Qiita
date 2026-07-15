@@ -56,6 +56,10 @@ from ._dispatch import (
     _patch_resource_status,
     _shard_fanout_owns_finalize,
 )
+from ._feature_table import (
+    GENOME_MAP_PATH_BINDING,
+    _resolve_feature_table_bindings,
+)
 from ._mask import (
     ALIGNMENT_IDX_BINDING,
     LIMA_ARGS_BINDING,
@@ -425,6 +429,25 @@ async def run_workflow(
                     work_ticket["shard_id"],
                     data_plane_url=data_plane_url,
                     signing_key=signing_key,
+                    workspace=workspace,
+                )
+            )
+
+        # Feature-table (OGU) genome-map staging (estimate-feature-table workflow):
+        # when a step consumes `genome_map_path`, stage the reference's
+        # feature->genome map and validate the cohort's alignment_sample
+        # completeness + reference/scope consistency at SUBMIT. reference_idx is the
+        # scope scalar (reference-scoped ticket). Same inside-try placement as the
+        # resolvers above so a bad cohort / mismatched reference FAILs the ticket
+        # cleanly instead of leaving it stuck in PROCESSING.
+        if scope_target["kind"] == ScopeTargetKind.REFERENCE.value and _workflow_declares_input(
+            action.steps, GENOME_MAP_PATH_BINDING
+        ):
+            bound.update(
+                await _resolve_feature_table_bindings(
+                    pool,
+                    action_context=bound,
+                    reference_idx=scope_target["reference_idx"],
                     workspace=workspace,
                 )
             )

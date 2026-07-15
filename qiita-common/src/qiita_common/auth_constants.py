@@ -45,10 +45,15 @@ class Scope(StrEnum):
     REFERENCE_DELETE = "reference:delete"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
+    # Sign DoGet tickets for the data plane's reference-data surfaces AND the
+    # per-sample `alignment` slice (host-depleted derived data, the feature-table
+    # OGU job's input — see routes/alignment.py). Deliberately NOT split out the way
+    # READ_MASKED_DOGET is below: alignment is not raw human/host reads, so it rides
+    # the generic scope rather than a privacy-sensitive one.
     TICKET_DOGET = "ticket:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
-    # Deliberately distinct from the generic TICKET_DOGET (which signs
-    # reference-data tickets): masked reads are privacy-sensitive (the lake
+    # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
+    # and alignment tickets): masked reads are privacy-sensitive (the lake
     # retains human/host reads, excluded only by the read_masked view), so the
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
