@@ -223,3 +223,34 @@ def test_syndna_smoke_high_identity_supplementary_alignment_is_not_a_spikein(tmp
     reads = _write_reads(tmp_path / "reads.parquet", [(1, _READ_EXACT_A), (2, _READ_CHIMERA)])
     out = _run(tmp_path, reads, _build_syndna_index(tmp_path))
     assert _reasons(out) == [(1, _SPIKEIN), (2, _PASS)]
+
+
+def test_mapped_primary_predicate():
+    """`_coverage.MAPPED_PRIMARY_EXPR` (the shared gate's mapped-primary filter) uses
+    miint's `alignment_is_mapped_primary`. Pin it equivalent to the explicit
+    `alignment_is_primary AND NOT alignment_is_unmapped` form across the SAM flag space,
+    so a mirror build that changes the function's semantics is caught here — not silently
+    in which reads get masked as spike-in / counted toward depth.
+
+    `alignment_is_primary` alone is TRUE for an unmapped read (SAM makes unmapped
+    implicitly primary), so the single-call form must still exclude the unmapped bit.
+    """
+    from qiita_compute_orchestrator.jobs._coverage import MAPPED_PRIMARY_EXPR
+
+    # 0 mapped-primary, 4 unmapped, 16 mapped-primary(reverse), 20 unmapped(reverse),
+    # 256 secondary, 260 unmapped+secondary, 2048 supplementary, 2052 unmapped+supp,
+    # 2304 secondary+supplementary.
+    flags = [0, 4, 16, 20, 256, 260, 2048, 2052, 2304]
+    reference = "alignment_is_primary(flags) AND NOT alignment_is_unmapped(flags)"
+    with open_miint_conn() as conn:
+        rows = conn.execute(
+            f"SELECT ({MAPPED_PRIMARY_EXPR}) AS got, ({reference}) AS want "
+            "FROM (SELECT UNNEST(?::USMALLINT[]) AS flags)",
+            [flags],
+        ).fetchall()
+    assert rows, "probe produced no rows"
+    assert all(got == want for got, want in rows), (
+        f"alignment_is_mapped_primary diverged from primary-AND-mapped: {rows}"
+    )
+    # And it must actually discriminate — only the two mapped-primary flags are TRUE.
+    assert [got for got, _ in rows] == [True, False, True, False, False, False, False, False, False]

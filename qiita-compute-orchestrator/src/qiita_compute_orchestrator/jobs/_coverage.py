@@ -34,8 +34,10 @@ MIN_ALIGNED_FRACTION = 0.90
 # align to several of them at high identity. Counting secondaries would multi-count the
 # same molecule across inserts.
 #
-# `alignment_is_primary` is TRUE for an UNMAPPED read (the SAM spec makes unmapped
-# implicitly primary), so the second conjunct is not redundant. miint has since added
-# `alignment_is_mapped_primary` for exactly this confusion; adopt it once the mirror build
-# carries it.
-MAPPED_PRIMARY_EXPR = "alignment_is_primary(flags) AND NOT alignment_is_unmapped(flags)"
+# `alignment_is_mapped_primary` is "primary AND mapped" in one call. The single-predicate
+# form matters: `alignment_is_primary` alone is TRUE for an UNMAPPED read (the SAM spec
+# makes unmapped implicitly primary), so it does not imply mappedness. Probed equivalent to
+# `alignment_is_primary(flags) AND NOT alignment_is_unmapped(flags)` across mapped, unmapped,
+# secondary, and supplementary flags — pinned in test_mapped_primary_predicate so a mirror
+# build that changes the semantics is caught rather than silently masking the wrong reads.
+MAPPED_PRIMARY_EXPR = "alignment_is_mapped_primary(flags)"
