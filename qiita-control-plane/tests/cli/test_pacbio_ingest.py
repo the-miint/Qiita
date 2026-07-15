@@ -85,7 +85,6 @@ def _row(barcode: str, idx: int = 1):
         biosample_accession="BIO",
         primary_project_accession="99999",
         secondary_project_accessions=[],
-        human_filtering=False,
         sheet_type="pacbio_absquant",
         twist_adaptor_id="t",
         syndna_is_twisted=False,
@@ -140,7 +139,6 @@ def test_validate_protocol_rejects_twisted_without_adapter():
         biosample_accession="B",
         primary_project_accession="9",
         secondary_project_accessions=[],
-        human_filtering=False,
         sheet_type="pacbio_absquant",
         twist_adaptor_id=None,
         syndna_is_twisted=True,
@@ -159,7 +157,6 @@ def test_validate_protocol_allows_untwisted_without_adapter():
         biosample_accession="B",
         primary_project_accession="9",
         secondary_project_accessions=[],
-        human_filtering=False,
         sheet_type="pacbio_absquant",
         twist_adaptor_id=None,
         syndna_is_twisted=False,
@@ -184,10 +181,6 @@ def test_read_preflight_rows_case5(build_case5_preflight):
     conn.execute(
         "UPDATE pacbio_sample SET smrt_cell_well_sample_id = '1_A01' WHERE barcode_id = 'bc3011'"
     )
-    # Flip the project's human_filtering (fixture default False) so the assertion
-    # proves the row reads the PROJECT flag — including the control (sample.3),
-    # which inherits it via the view's plate-primary resolution — not a constant.
-    conn.execute("UPDATE project SET human_filtering = 1")
     conn.commit()
     conn.close()
 
@@ -198,7 +191,6 @@ def test_read_preflight_rows_case5(build_case5_preflight):
     assert [r.barcode for r in rows] == ["bc3011", "bc0112", "bc9992"]
     assert [r.biosample_accession for r in rows] == ["BIO_sample.1", "BIO_sample.2", "BIO_sample.3"]
     assert [r.smrt_cell for r in rows] == ["1_A01", None, None]
-    assert [r.human_filtering for r in rows] == [True, True, True]
     for r in rows:
         assert r.primary_project_accession == "PRJNA99999"  # control resolves to plate primary
         assert r.secondary_project_accessions == []
@@ -608,7 +600,6 @@ def test_validate_protocol_rejects_twisted_on_metag():
         biosample_accession="B",
         primary_project_accession="9",
         secondary_project_accessions=[],
-        human_filtering=False,
         sheet_type="pacbio_metag",
         twist_adaptor_id="t",
         syndna_is_twisted=True,

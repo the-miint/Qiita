@@ -145,6 +145,27 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **Host filtering is now resolved per sample from metadata, not chosen on the command
+  line (#303).** `submit-host-filter-pool` and `submit-block-mask-pool` drive each sample's
+  read mask from its own `host_taxon_id` metadata (via the resolver and roster added in
+  #293/#294) instead of a pool-wide `--host-rype-reference-idx` flag. A blank's host comes
+  from its pool (the shared `qiita_common.host_filter_plan`): one host → blanks inherit it;
+  no host → pass through; more than one → refuse (multi-host union is not built). Anything
+  UNRESOLVED aborts rather than masking against the wrong thing.
+  - `--host-*-reference-idx` become an **override**: a bare flag is now an error, and
+    `--force` applies it pool-wide (blanks included), bypassing resolution.
+  - `--dry-run` prints the resolved per-sample plan and exits without submitting — the way
+    to see what a pool would do before fanning out hundreds of tickets.
+  - The Illumina and PacBio submit paths collapse to one: they differed only in where the
+    decision came from, and now share it.
+
+- **`host_taxon_id` is enforced at biosample import (#303).** The field was marked
+  `required` in the schema but never checked, which is how every sample we hold came to lack
+  it. An import that omits it is now rejected (422) before any write; a missing-value marker
+  ('not applicable', 'missing: control sample') counts as supplied, since declining to
+  answer is a decision the resolver understands. Deliberately narrow — only `host_taxon_id`
+  is enforced, not every schema-required field.
+
 - **SynDNA read-masking keeps its alignment and gates on the whole plasmid (#269, part 2).**
   The `syndna` step no longer reduces each read to a boolean and discards the alignment
   coordinates — it materializes the alignment and emits it as a second output, groundwork
@@ -262,6 +283,14 @@ duplicates further down are historical strata; leave them where they are.
   archived block records that this deploy already followed that order. `redeploy.md`
   (source of truth for bucket order), `/deploy-note` and `/deploy-archive` updated
   to match. (#276)
+
+
+### Removed
+
+- **The intake `human_filtering` policy flag (#303).** Host filtering no longer reads a
+  per-project intent recorded at intake — a sample's host is a property of the sample, not
+  of the project it was booked under. The pre-flight readers, the roster field, the
+  submit-time intent cross-check, and the CLI mismatch flags are gone; nothing stored it.
 
 ### Fixed
 

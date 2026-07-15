@@ -39,8 +39,6 @@ can satisfy require_role_at_least.
 
 import logging
 import sqlite3
-import tempfile
-from pathlib import Path
 from typing import Annotated
 
 import asyncpg
@@ -90,7 +88,6 @@ from ..host_filter_resolver import resolve_host_filter_many
 from ..preflight import (
     PacbioProtocol,
     open_blob,
-    pacbio_human_filtering_by_sample_idx,
     pacbio_protocol_by_sample_idx,
 )
 from ..repositories._sample_helpers import (
@@ -349,68 +346,14 @@ async def list_sequenced_sample_idxs_in_run(
     )
 
 
-def _human_filtering_by_item_id(blob: bytes) -> dict[str, bool]:
-    """Map each illumina_sample's ``sequenced_pool_item_id`` to its intake
-    human_filtering intent, read from a run-preflight SQLite blob.
-
-    The intent is the sample's effective project's per-project ``human_filtering``
-    flag (the preflight exposes no per-sample accessor), keyed by
-    ``str(illumina_sample_idx)`` — which equals the ``sequenced_pool_item_id`` the
-    bcl-convert composer assigns. Mirrors the CLI's ``_read_preflight_rows`` join
-    but returns only the boolean map the pool roster needs.
-
-    The blob is materialized to a private temp file because run_preflight operates
-    on a file-backed sqlite3 connection (matching
-    ``routes/sequencing_run.py::_apply_preflight_lane_update``); the run_preflight
-    import is lazy and local so the git-pinned dependency only loads on this path.
-
-    Raises ``sqlite3.DatabaseError`` (blob is not a readable SQLite) or
-    ``ValueError`` (not a single-run kl-run-preflight, or a run_preflight
-    schema-version skew) — the caller degrades those to "intent unknown" rather
-    than failing the listing (see ``_pool_human_filtering_by_item_id``).
-    """
-    from run_preflight import db as run_preflight_db  # noqa: PLC0415
-    from run_preflight import open_db_file  # noqa: PLC0415
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "preflight.db"
-        db_path.write_bytes(blob)
-        conn = open_db_file(str(db_path))
-        try:
-            project_by_idx = {
-                row[0]: row[4] for row in run_preflight_db.get_illumina_sample_rows(conn)
-            }
-            filtering_by_project = {
-                name: bool(flag)
-                for name, flag in conn.execute(
-                    "SELECT project_name, human_filtering FROM project"
-                ).fetchall()
-            }
-        finally:
-            conn.close()
-    return {
-        str(idx): filtering_by_project[project_name]
-        for idx, project_name in project_by_idx.items()
-        if project_name in filtering_by_project
-    }
-
-
-def _pacbio_facts_by_item_id(blob: bytes) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
-    """Return ``(human_filtering, protocol_facts)`` for a PacBio blob, both keyed on
-    ``str(pacbio_sample_idx)`` — which IS the ``sequenced_pool_item_id`` the PacBio
-    composer assigns (the barcode is only the BAM-locating key). ``({}, {})`` for a
-    non-PacBio blob, so the caller can probe both platforms without branching.
-
-    Two readers, one blob open. They are separate in ``qiita_control_plane.preflight``
-    on purpose: ``human_filtering`` is host-filtering POLICY whose source is moving to
-    sample metadata, while the protocol facts stay pre-flight-sourced. When that lands,
-    the ``pacbio_human_filtering_by_sample_idx`` call below is what gets deleted.
+def _pacbio_facts_by_item_id(blob: bytes) -> dict[str, PacbioProtocol]:
+    """Return the PacBio protocol facts for a blob, keyed on ``str(pacbio_sample_idx)``
+    — which IS the ``sequenced_pool_item_id`` the PacBio composer assigns (the barcode
+    is only the BAM-locating key). ``{}`` for a non-PacBio blob, so the caller can
+    probe without branching on platform.
     """
     with open_blob(blob) as conn:
-        protocol = pacbio_protocol_by_sample_idx(conn)
-        if not protocol:
-            return {}, {}
-        return pacbio_human_filtering_by_sample_idx(conn), protocol
+        return pacbio_protocol_by_sample_idx(conn)
 
 
 async def _pool_sample_facts_by_item_id(
@@ -418,77 +361,19 @@ async def _pool_sample_facts_by_item_id(
     *,
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
-) -> tuple[dict[str, bool], dict[str, PacbioProtocol]]:
-    """Return ``(human_filtering_by_item_id, pacbio_facts_by_item_id)`` for a pool.
+) -> dict[str, PacbioProtocol]:
+    """Return the pool's PacBio protocol facts, keyed on ``sequenced_pool_item_id``.
 
-    PLATFORM-AWARE, and the SINGLE seam where the roster sources its per-sample
-    intake facts. Both maps key on the pool's ``sequenced_pool_item_id``:
-    ``str(illumina_sample_idx)`` for Illumina, ``str(pacbio_sample_idx)`` for PacBio.
-    A pool is one or the other (a pre-flight carries a single run-level
-    ``sheet_type``), so at most one platform's facts are populated — but both are
-    returned so the roster route itself stays branch-free.
+    The single seam where the roster sources its per-sample PRE-FLIGHT facts. The
+    blob is asked only for what it is genuinely the source of — library prep — which
+    is PacBio-only, so an Illumina pool simply gets ``{}``. (Host filtering is a
+    separate matter: it resolves from the sample's own ``host_taxon_id`` metadata.)
 
-    For PacBio, ``human_filtering`` needs its own reader: the Illumina one walks
-    ``run_illumina_sample``, which PacBio has no analogue for, and would return
-    ``{}`` — leaving every PacBio sample's intent null and aborting
-    ``submit-host-filter-pool`` before it starts.
-
-    THIS is the function the sample-metadata migration repoints: when
-    ``human_filtering`` stops coming from the blob, both readers below lose their
-    first return value and it comes from sample metadata instead. The roster still
-    carries the field and the CLI still reads it off the roster row, so nothing
-    downstream changes.
-
-    Degrades to ``({}, {})`` on an unparseable blob (see the warning below).
+    Degrades to ``{}`` on an unparseable blob: the roster must not 500 because a pool's
+    pre-flight is corrupt. The submit path refuses separately when a PacBio pool's facts
+    are missing (it keys on the run's ``platform`` column, not on this), so a blob that
+    will not parse cannot silently mask a PacBio pool with its long-read chain off.
     """
-    row = await fetch_sequenced_pool_preflight(
-        pool,
-        sequencing_run_idx=sequencing_run_idx,
-        sequenced_pool_idx=sequenced_pool_idx,
-    )
-    if row is None or row["run_preflight_blob"] is None:
-        return {}, {}
-    blob = bytes(row["run_preflight_blob"])
-    # The PacBio read is a PROBE: a blob it cannot parse is simply not PacBio, and
-    # must not take the Illumina reader down with it. One `try` around both would do
-    # exactly that — every Illumina pool's intents would go null the moment the
-    # PacBio read raised. Only the Illumina failure warns, because by then the blob
-    # has failed BOTH readers.
-    try:
-        pacbio_filtering, pacbio = _pacbio_facts_by_item_id(blob)
-    except sqlite3.DatabaseError, ValueError:
-        pacbio_filtering, pacbio = {}, {}
-    if pacbio:
-        return pacbio_filtering, pacbio
-    try:
-        return _human_filtering_by_item_id(blob), {}
-    except (sqlite3.DatabaseError, ValueError) as exc:
-        _log.warning(
-            "could not parse stored run-preflight for sequenced_pool %s (run %s);"
-            " human_filtering will be null for its samples: %s",
-            sequenced_pool_idx,
-            sequencing_run_idx,
-            exc,
-        )
-        return {}, {}
-
-
-async def _pool_human_filtering_by_item_id(
-    pool: asyncpg.Pool,
-    *,
-    sequencing_run_idx: int,
-    sequenced_pool_idx: int,
-) -> dict[str, bool]:
-    """Return the pool's per-item intake human_filtering map, or ``{}`` when the
-    pool has no preflight populated or its stored blob cannot be parsed into
-    intents. Reads the stored run-preflight blob (the single source of truth) and
-    parses it via ``_human_filtering_by_item_id``.
-
-    An unparseable stored blob (corrupt, a non-bcl pool, or a run_preflight
-    schema-version skew) degrades to ``{}`` — None per sample — rather than
-    failing this passive listing. The host-filter-pool guard turns a null intent
-    into an actionable abort at submit time, which is the right place to be loud;
-    a corrupt preflight must not take down an unrelated sample listing."""
     row = await fetch_sequenced_pool_preflight(
         pool,
         sequencing_run_idx=sequencing_run_idx,
@@ -497,16 +382,11 @@ async def _pool_human_filtering_by_item_id(
     if row is None or row["run_preflight_blob"] is None:
         return {}
     try:
-        return _human_filtering_by_item_id(bytes(row["run_preflight_blob"]))
+        return _pacbio_facts_by_item_id(bytes(row["run_preflight_blob"]))
     except (sqlite3.DatabaseError, ValueError) as exc:
-        # Degrade to "intent unknown" but log loudly: a stored preflight that the
-        # server can't parse (corrupt, non-bcl, or a run_preflight schema-version
-        # skew that would silently null EVERY pool's intents deploy-wide) is a
-        # real problem the operator-facing guard's message can't diagnose on its
-        # own. Parentheses are required with `as` even under PEP 758.
         _log.warning(
             "could not parse stored run-preflight for sequenced_pool %s (run %s);"
-            " human_filtering will be null for its samples: %s",
+            " its PacBio protocol facts will be absent: %s",
             sequenced_pool_idx,
             sequencing_run_idx,
             exc,
@@ -540,16 +420,9 @@ async def list_sequenced_samples_in_pool(
     `truncated` flag indicates the underlying set exceeded the hard cap;
     callers hitting it should narrow their scope.
 
-    Each sample also carries `human_filtering` — its intake host-filter intent,
-    derived here from the pool's stored run-preflight blob (the single source of
-    truth) — so `submit-host-filter-pool` can run its pool-wide host-filter guard
-    without an operator-supplied preflight file. It is None when the pool has no
-    preflight populated or the blob carries no row for that pool item.
-
-    And each sample carries `host_filter` — what host filtering it WOULD get,
-    resolved from its own `host_taxon_id` metadata plus the run's platform.
-    Read-only: nothing acts on it, and the submit path still reads
-    `human_filtering`. See HostFilterResolution for why both are reported.
+    Each sample carries `host_filter` — what host filtering it WOULD get, resolved
+    from its own `host_taxon_id` metadata plus the run's platform. This is what the
+    submit path reads (there is no intake host-filter flag any more).
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
     # truncation; the route slices back to the cap before returning.
@@ -561,10 +434,10 @@ async def list_sequenced_samples_in_pool(
     truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
     if truncated:
         rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
-    # Derive each sample's intake human_filtering intent from the pool's stored
-    # preflight blob and attach it by sequenced_pool_item_id; None per sample
-    # when the pool has no preflight or the blob omits its row.
-    human_filtering_by_item_id, pacbio_by_item_id = await _pool_sample_facts_by_item_id(
+    # PacBio protocol facts from the pool's stored pre-flight, keyed by
+    # sequenced_pool_item_id. Empty for an Illumina pool (it has none) and for a
+    # pool whose blob cannot be parsed.
+    pacbio_by_item_id = await _pool_sample_facts_by_item_id(
         pool,
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
@@ -587,7 +460,6 @@ async def list_sequenced_samples_in_pool(
     for r in rows:
         item = dict(r)
         item_id = item["sequenced_pool_item_id"]
-        item["human_filtering"] = human_filtering_by_item_id.get(item_id)
         # PacBio protocol facts; absent (None) for an Illumina pool. The read-mask
         # submit derives lima_enabled / syndna_enabled from these.
         facts = pacbio_by_item_id.get(item_id)

@@ -185,7 +185,20 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
     dict must additionally call `_track_global_metadata_outputs` to pick up
     the globally-linked field rows and per-key metadata rows the route
     auto-creates; this helper only tracks the owner-id surface.
+
+    `host_taxon_id` is a REQUIRED field the import now enforces, so it is injected
+    (as 'not applicable' — a missing-value marker, which counts as supplied and
+    needs no seeded NCBI term) unless the test already set it. A test that means to
+    exercise the gate passes `metadata` WITHOUT it. The injection auto-creates one
+    globally-linked study field plus one metadata row; both are tracked below (via
+    `_track_global_metadata_outputs`) so FK-reverse cleanup sweeps them — otherwise
+    the untracked host_taxon_id metadata row would block the biosample delete.
     """
+    metadata = dict(body.get("metadata") or {})
+    injected_host_taxon = "host taxon id" not in metadata
+    if injected_host_taxon:
+        metadata["host taxon id"] = "not applicable"
+    body["metadata"] = metadata
     resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
         rj = resp.json()
@@ -200,6 +213,11 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
         )
         if meta_idx is not None:
             ctx["created"]["biosample_metadata"].append(meta_idx)
+        if injected_host_taxon:
+            host_gf_idx = await ctx["pool"].fetchval(
+                "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'host_taxon_id'"
+            )
+            await _track_global_metadata_outputs(ctx, rj["biosample_idx"], study_idx, [host_gf_idx])
     return resp
 
 
@@ -824,13 +842,16 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
     bs_idx = resp.json()["biosample_idx"]
     await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [date_global, num_global])
 
-    # Verify the metadata rows landed with the correct typed values.
+    # Verify the metadata rows landed with the correct typed values. Scoped to the
+    # two fields under test — _post_biosample injects the required host_taxon_id,
+    # whose own non-owner-id row is not what this asserts.
     rows = await ctx["pool"].fetch(
         "SELECT global_field_idx, value_text, value_numeric, value_date"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        " WHERE biosample_idx = $1 AND global_field_idx = ANY($2::bigint[])"
         " ORDER BY global_field_idx",
         bs_idx,
+        sorted([date_global, num_global]),
     )
     expected = sorted(
         [
@@ -1100,13 +1121,16 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # Verify every metadata row landed in the correct typed value_* column:
     # typed scalars in value_text/value_numeric/value_date, ENVO terms in
     # value_terminology_term_idx.
+    # Scoped to the six seeded fields under test; the required host_taxon_id that
+    # _post_biosample injects writes its own row, which this assertion is not about.
     rows = await ctx["pool"].fetch(
         "SELECT global_field_idx, value_text, value_numeric, value_date,"
         " value_terminology_term_idx"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        " WHERE biosample_idx = $1 AND global_field_idx = ANY($2::bigint[])"
         " ORDER BY global_field_idx",
         bs_idx,
+        sorted(display_to_idx.values()),
     )
     expected = sorted(
         [
@@ -1628,6 +1652,9 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
         },
         "caller_system_role": "wet_lab_admin",
     }
+    # _post_biosample injects the enforced-required host_taxon_id; it is not what
+    # this test is about, so drop it before the whole-response comparison.
+    rj["global_metadata"].pop("host_taxon_id", None)
     assert rj == expected
 
 
@@ -1709,6 +1736,7 @@ async def test_get_biosample_carries_terminology_term(ctx):
         },
         "caller_system_role": "wet_lab_admin",
     }
+    rj["global_metadata"].pop("host_taxon_id", None)
     assert rj == expected
 
 
@@ -1831,6 +1859,7 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
             "value": "HOST-99",
         }
     }
+    rj["global_metadata"].pop("host_taxon_id", None)
     assert rj["global_metadata"] == expected_metadata
 
 

@@ -28,7 +28,6 @@ import pytest
 from qiita_control_plane.preflight import (
     SHEET_TYPE_PACBIO_ABSQUANT,
     is_pacbio_sheet_type,
-    pacbio_human_filtering_from_blob,
     pacbio_protocol_from_blob,
 )
 
@@ -57,31 +56,6 @@ def test_pacbio_protocol_carries_the_case5_signature(build_case5_preflight):
         assert (bool(p.twist_adaptor_id) and p.syndna_is_twisted is False) is True  # lima_enabled
 
 
-def test_human_filtering_is_a_separate_reader(build_case5_preflight):
-    """`human_filtering` is host-filtering POLICY, not a prep fact, and its source is
-    moving to sample metadata — so it is read on its own and is NOT a field of
-    `PacbioProtocol`. This test guards that separation: fusing it back into the
-    protocol type is what would make that migration surgery instead of an excision.
-
-    Both readers must still cover the same sample set, keyed identically, or the
-    roster would attach one sample's filtering intent to another's protocol facts."""
-    db = build_case5_preflight()
-    conn = sqlite3.connect(db)
-    # Flip the project flag (fixture default False) so this proves the reader reads
-    # the PROJECT flag — including the control (sample.3), which inherits it via the
-    # view's plate-primary resolution — rather than returning a constant.
-    conn.execute("UPDATE project SET human_filtering = 1")
-    conn.commit()
-    conn.close()
-
-    filtering = pacbio_human_filtering_from_blob(db.read_bytes())
-    protocol = pacbio_protocol_from_blob(db.read_bytes())
-
-    assert set(filtering) == set(protocol), "the two readers must cover the same samples"
-    assert filtering == {"1": True, "2": True, "3": True}
-    assert not hasattr(next(iter(protocol.values())), "human_filtering")
-
-
 def test_cli_and_route_readers_agree_on_case5(build_case5_preflight):
     """PARITY PIN. The ingest CLI validates the protocol facts at submit; the roster
     route reports them at read-back. They must be the same values, or the roster
@@ -94,7 +68,6 @@ def test_cli_and_route_readers_agree_on_case5(build_case5_preflight):
     db = build_case5_preflight()
     rows = _read_pacbio_preflight_rows(db, argparse.ArgumentParser())
     protocol = pacbio_protocol_from_blob(db.read_bytes())
-    filtering = pacbio_human_filtering_from_blob(db.read_bytes())
 
     assert rows, "case-5 fixture produced no CLI rows"
     # The CLI's pool_item_id (str(pacbio_sample_idx)) is exactly the roster map's key.
@@ -106,7 +79,6 @@ def test_cli_and_route_readers_agree_on_case5(build_case5_preflight):
         assert p.sheet_type == row.sheet_type, key
         assert p.twist_adaptor_id == row.twist_adaptor_id, key
         assert p.syndna_is_twisted == row.syndna_is_twisted, key
-        assert filtering[key] == row.human_filtering, key
 
 
 def test_pacbio_readers_decline_a_non_pacbio_blob(build_case5_preflight):
@@ -119,7 +91,6 @@ def test_pacbio_readers_decline_a_non_pacbio_blob(build_case5_preflight):
     database is not a "non-PacBio blob" — it is an unopenable one."""
     db = build_case5_preflight(sheet_type="bclconvert")
     assert pacbio_protocol_from_blob(db.read_bytes()) == {}
-    assert pacbio_human_filtering_from_blob(db.read_bytes()) == {}
 
 
 def test_pacbio_protocol_raises_on_an_unreadable_blob():

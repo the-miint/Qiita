@@ -68,15 +68,16 @@ class HostFilterResolution(BaseModel):
     """What host filtering one sample would get — the resolver's answer.
 
     One type, used both as the resolver's return value inside the control plane
-    and as the wire shape on the pool roster. It says what a submission *would*
-    do, without doing it; nothing acts on it yet.
+    and as the wire shape on the pool roster — which is where the submit path
+    reads it. It is the SAMPLE'S OWN view, derived from its `host_taxon_id`
+    metadata plus the run's platform.
 
-    Note this is the SAMPLE'S OWN view, derived from its `host_taxon_id`
-    metadata. The roster reports it alongside `human_filtering`, the host-filter
-    INTENT recorded at intake as a per-project policy flag. The two answer the
-    same question from opposite ends and will disagree until the metadata is
-    backfilled — which is exactly what an operator needs to see before the submit
-    path switches from the flag to the resolution.
+    A sample's host is a property of the SAMPLE — this is derived from its own
+    metadata, not from the project it was booked under.
+
+    NOTE this is only PART of the answer for a control/blank, which resolves
+    CONTROL — a blank has no host of its own, so what it gets depleted against
+    comes from its pool. `qiita_common.host_filter_plan` does that join.
 
     Frozen: a resolution is a computed answer, not a mutable accumulator. `reason`
     is always populated and is written for a human — it is the explanation an

@@ -21,6 +21,7 @@ from ._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     SampleEntityKind,
     _get_or_create_local_study_field,
+    assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
     preflight_global_metadata,
@@ -361,6 +362,14 @@ async def import_biosample_from_owner_biosample_id(
         raise BiosampleOwnerIdMissingValueError(
             owner_biosample_id_value, known_missing_reasons[stripped_owner_id]
         )
+
+    # Pre-flight: every REQUIRED global field must be supplied. Declining to give
+    # a value (a missing-value marker) counts as supplied; silence does not. This is
+    # what stops a sample arriving with no `host_taxon_id`, which would resolve
+    # UNRESOLVED and abort its pool at submit.
+    await assert_required_global_fields_supplied(
+        conn, spec=BIOSAMPLE_METADATA_SPEC, metadata=metadata
+    )
 
     # Pre-flight: type-resolve every metadata entry against
     # biosample_global_field; unknown-name, parse-failure, and
