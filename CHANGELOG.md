@@ -166,7 +166,20 @@ duplicates further down are historical strata; leave them where they are.
   answer is a decision the resolver understands. Deliberately narrow — only `host_taxon_id`
   is enforced, not every schema-required field.
 
-
+- **SynDNA read-masking keeps its alignment and gates on the whole plasmid (#269, part 2).**
+  The `syndna` step no longer reduces each read to a boolean and discards the alignment
+  coordinates — it materializes the alignment and emits it as a second output, groundwork
+  for a coverage-measurement consumer (see the deferral below). The spike-in gate (identity
+  ≥ 0.95 AND aligned fraction ≥ 0.90, settled with the assay owner) is now single-sourced
+  in `jobs/_coverage` and shared by the masking predicate; the aligned-fraction threshold
+  enters the mask identity hash so a change re-mints. Inert until the SynDNA reference is
+  re-ingested as plasmids + a per-insert GFF3 — a read-mask run without `syndna_enabled` is
+  byte-identical to today.
+  - **Per-feature coverage depth itself is deferred to a follow-up (tracked in #306).** Per
+    review, it will land with its first consumer (the cell-count / BIOM path) as a
+    **compute-on-demand** model — no persisted DuckLake `coverage` table, no minted
+    `coverage_idx` — keyed by the **annotated element** (interval coordinates) rather than a
+    per-feature sum, so copy-number variation among occurrences is preserved.
 
 - **Sharded-alignment review revisions (#268).** Reworked the sharded-alignment
   path per review: the aligner is now derived from the run's sequencing platform

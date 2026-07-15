@@ -403,6 +403,11 @@ def test_resolved_syndna_carries_the_effective_alignment_config():
         "preset": "map-hifi",
         "identity_method": "blast",
         "min_identity": 0.95,
+        # The aligned-fraction gate. Correct for masking only because the reference is
+        # PLASMID-level: a junction-spanning read is fully aligned against the plasmid.
+        # Against an insert-only index the same read looks ~60% aligned, which is why the
+        # old reference could carry no such filter at all.
+        "min_aligned_fraction": 0.90,
         "primary_only": True,
     }
 

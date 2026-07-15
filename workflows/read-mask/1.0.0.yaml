@@ -140,7 +140,16 @@ steps:
     module: qiita_compute_orchestrator.jobs.syndna
     when: syndna_enabled
     inputs: [reads, syndna_minimap2_path]
-    outputs: [partial_mask]
+    # `alignment` is the alignment the step used to build the mask, emitted verbatim
+    # rather than discarded — the old step reduced each read to a boolean and threw the
+    # coordinates away, which is exactly what made per-insert quantification impossible.
+    # Emitted as groundwork for a coverage-measurement consumer (deferred): no step
+    # consumes this binding yet. The name is shared with align_sharded's `alignment`
+    # output so a future consumer can bind either — but the SCHEMAS differ (syndna's
+    # subject is the whole plasmid, so it carries `parent_feature_idx` and no mate/
+    # alignment_idx columns; align_sharded's subject is the feature itself), so that
+    # consumer still has to know which producer it is reading.
+    outputs: [partial_mask, alignment]
     baseline_resources:
       cpu: 4
       mem_gb: 32
