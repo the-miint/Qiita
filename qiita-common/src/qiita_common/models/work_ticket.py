@@ -286,42 +286,80 @@ class WorkTicketResponse(BaseModel):
     state: WorkTicketState
 
 
+def _check_host_ref_override(
+    *, host_rype_reference_idx: int | None, host_minimap2_reference_idx: int | None, force: bool
+) -> None:
+    """Shared host-ref coherence for the block/align plan requests.
+
+    Host filtering is resolved per sample server-side, so the request's host
+    references are a `force`-only override. Enforce the same rule the CLI does:
+    minimap2 is the optional second stage (needs rype), and a host reference set
+    WITHOUT `force` is an error rather than a silent no-op. Kept here so both plan
+    requests validate identically and the server surface cannot disagree with the
+    CLI guard (`_validate_host_ref_override_args`)."""
+    if host_minimap2_reference_idx is not None and host_rype_reference_idx is None:
+        raise ValueError(
+            "host_minimap2_reference_idx requires host_rype_reference_idx"
+            " (minimap2 is the optional second host-filter stage)"
+        )
+    if host_rype_reference_idx is not None and not force:
+        raise ValueError(
+            "host_rype_reference_idx / host_minimap2_reference_idx are a force-only"
+            " override: host filtering is resolved per sample from each sample's"
+            " host_taxon_id metadata. Set force=true to apply the given reference(s)"
+            " pool-wide instead, bypassing resolution."
+        )
+
+
 class BlockMaskPlanRequest(BaseModel):
     """Request body for `POST .../sequenced-pool/{P}/block-mask-plan` — the
     bulk-block read-masking entrypoint (the block-compute analog of the
     per-sample submit-host-filter-pool fan-out).
 
-    Host filtering is a property of the filtering config, not the sample: a rype
-    reference (with an optional second-stage minimap2 reference) depletes EVERY
-    sample in the pool, or neither runs the whole pool QC-only (a pass-through).
-    minimap2 is the optional second stage and never runs without rype.
+    Host filtering is resolved PER SAMPLE, server-side, from each sample's own
+    `host_taxon_id` metadata + the run's platform — not chosen on the request.
+    Samples that resolve to different hosts get different masks and tile into
+    different blocks. So the normal request carries NO host reference at all.
+
+    `host_rype_reference_idx` (with the optional second-stage
+    `host_minimap2_reference_idx`) is a `--force` OVERRIDE only: it applies the
+    given reference(s) pool-wide, blanks included, BYPASSING resolution. Supplying
+    a host reference without `force=True` is rejected — an override that silently
+    did nothing is the worst outcome. minimap2 is the optional second stage and
+    never runs without rype.
 
     `only_missing` drops samples already carrying a completion gate for their
     resolved mask, so an interrupted plan re-runs only the gap; off by default so
-    a deliberate re-plan against a different host reference still tiles pool-wide.
+    a deliberate re-plan still tiles pool-wide.
     """
 
     host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
     host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
+    force: bool = False
     only_missing: bool = False
 
     @model_validator(mode="after")
-    def _minimap2_requires_rype(self) -> BlockMaskPlanRequest:
-        if self.host_minimap2_reference_idx is not None and self.host_rype_reference_idx is None:
-            raise ValueError(
-                "host_minimap2_reference_idx requires host_rype_reference_idx"
-                " (minimap2 is the optional second host-filter stage)"
-            )
+    def _validate_host_ref_override(self) -> BlockMaskPlanRequest:
+        _check_host_ref_override(
+            host_rype_reference_idx=self.host_rype_reference_idx,
+            host_minimap2_reference_idx=self.host_minimap2_reference_idx,
+            force=self.force,
+        )
         return self
 
 
 class BlockPlanPartition(BaseModel):
     """One mask-partition of a block plan: the samples sharing a resolved
-    `mask_idx` and how many blocks they tiled into."""
+    `mask_idx`, the host filtering THIS partition resolved to (its own refs, not a
+    pool-wide flag — a heterogeneous pool yields several partitions differing by
+    host), and how many blocks they tiled into."""
 
     mask_idx: Annotated[int, Field(gt=0)]
     sample_count: Annotated[int, Field(ge=0)]
     block_count: Annotated[int, Field(ge=0)]
+    host_filter_enabled: bool
+    host_rype_reference_idx: int | None
+    host_minimap2_reference_idx: int | None
 
 
 class BlockPlanBlock(BaseModel):
@@ -338,16 +376,15 @@ class BlockPlanBlock(BaseModel):
 class BlockMaskPlanResponse(BaseModel):
     """Returned (HTTP 202) by `POST .../block-mask-plan`: the plan the server
     persisted + dispatched. `blocks` lists every created block with its
-    dispatched work_ticket; `partitions` summarizes the per-mask tiling; the
-    `samples_*` counts reconcile the pool's samples (planned + skipped-existing +
-    skipped-no-reads). A pool with nothing to do returns 202 with zero counts."""
+    dispatched work_ticket; `partitions` summarizes the per-mask tiling and the
+    host filtering EACH partition resolved to (there is no single pool-wide host
+    answer any more — it is per sample); the `samples_*` counts reconcile the
+    pool's samples (planned + skipped-existing + skipped-no-reads). A pool with
+    nothing to do returns 202 with zero counts."""
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     instrument_model: str | None
-    host_filter_enabled: bool
-    host_rype_reference_idx: int | None
-    host_minimap2_reference_idx: int | None
     samples_planned: Annotated[int, Field(ge=0)]
     samples_skipped_existing: Annotated[int, Field(ge=0)]
     samples_skipped_no_reads: Annotated[int, Field(ge=0)]
@@ -364,12 +401,17 @@ class AlignPlanRequest(BaseModel):
     block-mask-plan produced) against a sharded `reference_idx`. The aligner is NOT
     a caller choice — the server derives it from the run's sequencing platform
     (short-read Illumina → bowtie2, long-read PacBio HiFi / Nanopore → minimap2) and
-    reports it in the response. The host references identify WHICH mask the reads
-    were depleted under — the same `(host_rype_reference_idx[,
-    host_minimap2_reference_idx])` shape block-mask-plan takes — so the planner can
-    LOOK UP each sample's already-minted mask_idx (it never mints a mask). A pool
-    QC-only masked (no host filtering) is aligned by omitting both host refs.
-    minimap2 is the optional second host stage and never rides without rype.
+    reports it in the response.
+
+    Which mask each sample's reads were depleted under is resolved PER SAMPLE,
+    server-side — the SAME resolution the block-mask-plan minted under — so the
+    planner looks up each sample's already-minted mask_idx (it never mints a mask)
+    for that sample's own decision. So the normal request carries NO host reference.
+    `host_rype_reference_idx` (+ optional `host_minimap2_reference_idx`) is a
+    `--force` OVERRIDE only, mirroring block-mask-plan: it looks the mask up under
+    the given reference(s) pool-wide, bypassing resolution (use it to align a pool
+    that was block-masked with `force`). A host reference without `force=True` is
+    rejected. minimap2 is the optional second host stage and never rides without rype.
 
     `only_missing` drops samples already carrying a completion gate for their
     resolved alignment, so an interrupted plan re-runs only the gap; off by default
@@ -379,15 +421,16 @@ class AlignPlanRequest(BaseModel):
     reference_idx: Annotated[int, Field(gt=0)]
     host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
     host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
+    force: bool = False
     only_missing: bool = False
 
     @model_validator(mode="after")
-    def _minimap2_requires_rype(self) -> AlignPlanRequest:
-        if self.host_minimap2_reference_idx is not None and self.host_rype_reference_idx is None:
-            raise ValueError(
-                "host_minimap2_reference_idx requires host_rype_reference_idx"
-                " (minimap2 is the optional second host-filter stage)"
-            )
+    def _validate_host_ref_override(self) -> AlignPlanRequest:
+        _check_host_ref_override(
+            host_rype_reference_idx=self.host_rype_reference_idx,
+            host_minimap2_reference_idx=self.host_minimap2_reference_idx,
+            force=self.force,
+        )
         return self
 
 
@@ -426,8 +469,6 @@ class AlignPlanResponse(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     reference_idx: Annotated[int, Field(gt=0)]
     aligner: Literal["minimap2", "bowtie2"]
-    host_rype_reference_idx: int | None
-    host_minimap2_reference_idx: int | None
     samples_planned: Annotated[int, Field(ge=0)]
     # Dropped by only_missing (already carry an alignment_sample gate).
     samples_skipped_existing: Annotated[int, Field(ge=0)]

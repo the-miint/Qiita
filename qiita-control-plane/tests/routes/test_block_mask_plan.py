@@ -17,10 +17,20 @@ import secrets
 import pytest
 import pytest_asyncio
 from qiita_common.api_paths import URL_SEQUENCED_POOL_BLOCK_MASK_PLAN
+from qiita_common.models import HOST_FILTER_INDEX_TYPE_RYPE, MISSING_REASON_NOT_APPLICABLE
 
 from qiita_control_plane import block_planner
+from qiita_control_plane.repositories._sample_helpers import (
+    _get_or_create_globally_linked_study_field,
+    insert_entity_to_study,
+)
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
-from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+from qiita_control_plane.testing.db_seeds import (
+    fetch_missing_value_reason_idx,
+    seed_biosample_with_sequenced_prep_sample,
+    seed_host_reference,
+)
 
 pytestmark = pytest.mark.db
 
@@ -87,8 +97,48 @@ async def planned(ctx, monkeypatch):
         run_idx,
         owner,
     )
+
+    # Host-filter resolution infra: the happy-path POST carries no host ref, so the
+    # planner resolves each sample per its host_taxon_id metadata. Seed a study with
+    # a globally-linked host_taxon_id field and tag every sample `not applicable`
+    # (→ PASS_THROUGH, no profile needed) so resolution succeeds with host filtering
+    # off. A ready host reference is seeded for the `force` test.
+    study_idx = await db.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        owner,
+        f"blkplan-study-{suffix}",
+    )
+    host_gf_idx = await db.fetchval(
+        "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'host_taxon_id'"
+    )
+    async with db.acquire() as conn, conn.transaction():
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=host_gf_idx,
+            display_name="host taxon id",
+            created_by_idx=owner,
+        )
+    not_applicable_idx = await fetch_missing_value_reason_idx(db, MISSING_REASON_NOT_APPLICABLE)
+    ready_reference_idx = await seed_host_reference(
+        db, name=f"blkplan-rype-{suffix}", created_by_idx=owner
+    )
+    await db.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", ready_reference_idx
+    )
+    await db.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " VALUES ($1, $2, $3, '{}'::jsonb, NULL)",
+        ready_reference_idx,
+        HOST_FILTER_INDEX_TYPE_RYPE,
+        f"/derived/references/{ready_reference_idx}/rype.ryxdi",
+    )
+
     prep_samples: list[int] = []
     biosamples: list[int] = []
+    meta_idxs: list[int] = []
     for _ in range(2):
         bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
         biosamples.append(bs)
@@ -110,12 +160,31 @@ async def planned(ctx, monkeypatch):
                 principal_idx=owner,
                 work_ticket_idx=None,
             )
+        async with db.acquire() as conn, conn.transaction():
+            await insert_entity_to_study(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=bs,
+                study_idx=study_idx,
+                created_by_idx=owner,
+            )
+        meta_idx = await db.fetchval(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx, created_by_idx)"
+            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            bs,
+            field_idx,
+            not_applicable_idx,
+            owner,
+        )
+        meta_idxs.append(meta_idx)
 
     yield {
         "db": db,
         "run_idx": run_idx,
         "pool_idx": pool_idx,
         "prep_samples": prep_samples,
+        "ready_reference_idx": ready_reference_idx,
         "dispatched": dispatched,
         "owner": owner,
     }
@@ -135,6 +204,11 @@ async def planned(ctx, monkeypatch):
     await db.execute(
         "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
     )
+    # Host-filter infra teardown (before the biosamples are deleted below).
+    await db.execute(
+        "DELETE FROM qiita.biosample_metadata WHERE idx = ANY($1::bigint[])", meta_idxs
+    )
+    await db.execute("DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx)
     await db.execute(
         "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
     )
@@ -145,6 +219,12 @@ async def planned(ctx, monkeypatch):
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_samples)
     await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", biosamples)
+    await db.execute("DELETE FROM qiita.biosample_study_field WHERE idx = $1", field_idx)
+    await db.execute(
+        "DELETE FROM qiita.reference_index WHERE reference_idx = $1", ready_reference_idx
+    )
+    await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ready_reference_idx)
+    await db.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
     await db.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
         block_planner.BLOCK_MASK_ACTION_ID,
@@ -176,9 +256,12 @@ async def test_block_mask_plan_happy_path(ctx, planned):
     assert body["sequenced_pool_idx"] == planned["pool_idx"]
     assert body["samples_planned"] == 2
     assert body["blocks_created"] == 1
-    assert body["host_filter_enabled"] is False
     assert body["instrument_model"] == "NovaSeq 6000"
     assert len(body["partitions"]) == 1
+    # host_filter_enabled is now PER PARTITION (the top-level field was removed);
+    # both samples are `not applicable` → PASS_THROUGH → host filtering disabled.
+    assert body["partitions"][0]["host_filter_enabled"] is False
+    assert body["partitions"][0]["host_rype_reference_idx"] is None
     assert len(body["blocks"]) == 1
     assert body["blocks"][0]["read_count"] == 300
     # The block's ticket was dispatched.
@@ -200,12 +283,28 @@ async def test_block_mask_plan_happy_path(ctx, planned):
 
 
 async def test_block_mask_plan_host_filter_context(ctx, planned):
+    """A `force` override applies the given (ready) rype reference pool-wide,
+    bypassing resolution; the per-partition summary carries that ref (the removed
+    top-level host_filter_enabled / host_rype_reference_idx now live per
+    partition)."""
     await _seed_block_action(planned["db"])
-    resp = await ctx["wet"].post(_url(planned), json={"host_rype_reference_idx": 7})
+    rype = planned["ready_reference_idx"]
+    resp = await ctx["wet"].post(
+        _url(planned), json={"host_rype_reference_idx": rype, "force": True}
+    )
     assert resp.status_code == 202, resp.text
     body = resp.json()
-    assert body["host_filter_enabled"] is True
-    assert body["host_rype_reference_idx"] == 7
+    assert len(body["partitions"]) == 1
+    assert body["partitions"][0]["host_filter_enabled"] is True
+    assert body["partitions"][0]["host_rype_reference_idx"] == rype
+
+
+async def test_block_mask_plan_host_ref_without_force_422(ctx, planned):
+    """A host reference without `force` is a rejected override (an override that
+    silently did nothing is the worst outcome) — 422 at the model validator."""
+    await _seed_block_action(planned["db"])
+    resp = await ctx["wet"].post(_url(planned), json={"host_rype_reference_idx": 7})
+    assert resp.status_code == 422, resp.text
 
 
 async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):

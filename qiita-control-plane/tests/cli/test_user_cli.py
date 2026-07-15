@@ -3769,11 +3769,10 @@ def test_submit_host_filter_pool_dry_run_resolves_but_posts_nothing(monkeypatch,
 # ---------------------------------------------------------------------------
 # submit-block-mask-pool
 # ---------------------------------------------------------------------------
-# Same client-side preflight as submit-host-filter-pool (host-ref coherence +
-# intent check + host-ref readiness), but the submission is ONE POST to the
-# block-mask-plan endpoint, not a per-sample fan-out. instrument_model + the
-# only-missing filter are server-side, so there is no GET /sequencing-run and no
-# client-side sample skipping.
+# A THIN client: host filtering is resolved PER SAMPLE server-side, so the CLI does
+# NO roster GET, no client-side resolution, no uniformity refusal, and no host-ref
+# readiness preflight. It validates host-ref argument coherence (minimap2⇒rype; a
+# host ref requires --force) and POSTs ONE BlockMaskPlanRequest to block-mask-plan.
 
 
 def _run_submit_block_mask_pool(
@@ -3800,16 +3799,14 @@ def _run_submit_block_mask_pool(
 
 
 def test_submit_block_mask_pool_single_plan_call_passthrough(monkeypatch, capsys):
-    """No host reference (a pass-through): after the roster GET, exactly ONE POST
-    to the block-mask-plan endpoint (no per-sample fan-out, no host-ref GETs, no
-    GET /sequencing-run), carrying only_missing + null host refs."""
+    """No host reference: exactly ONE POST to the block-mask-plan endpoint (no
+    roster GET, no per-sample fan-out, no host-ref preflight), carrying the null
+    host refs + force=False + only_missing. The server resolves per sample."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            # Pass-through intent (human_filtering=False) matches "no host ref".
-            (200, _pool_samples_body([(100, 1000, "10", False), (101, 1001, "11", False)])),
             (202, {"blocks_created": 1, "samples_planned": 2, "partitions": [], "blocks": []}),
         ],
     )
@@ -3822,33 +3819,27 @@ def test_submit_block_mask_pool_single_plan_call_passthrough(monkeypatch, capsys
     assert posts[0]["json"] == {
         "host_rype_reference_idx": None,
         "host_minimap2_reference_idx": None,
+        "force": False,
         "only_missing": False,
     }
-    # No host-ref preflight GETs and no GET /sequencing-run for a pass-through.
+    # Thin client: no roster GET, no host-ref preflight GETs at all.
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
     assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
 
 
-def test_submit_block_mask_pool_host_filtered_preflights_and_posts(monkeypatch, capsys):
-    """A pool that resolves uniformly to a single host: the reference is
-    pre-flighted (GET /reference/{idx} + its index list), then ONE plan POST
-    carrying that host ref for the whole pool."""
+def test_submit_block_mask_pool_force_posts_override(monkeypatch, capsys):
+    """--force with a host reference: ONE POST carrying the override host ref +
+    force=True. The server (not the CLI) checks reference readiness, so there is
+    still no client-side reference preflight GET."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (
-                200,
-                _pool_samples_body(
-                    [(100, 1000, "10", _hf_filter(rype=7)), (101, 1001, "11", _hf_filter(rype=7))]
-                ),
-            ),
-            (200, _ref_active_body()),  # rype reference 7
-            (200, _both_indexes_body()),  # its index list (carries rype)
             (202, {"blocks_created": 2, "samples_planned": 2, "partitions": [], "blocks": []}),
         ],
     )
-    rc = _run_submit_block_mask_pool(only_missing=True)
+    rc = _run_submit_block_mask_pool(rype=7, force=True, only_missing=True)
     assert rc == 0
 
     posts = [r for r in captured["requests"] if r["method"] == "POST"]
@@ -3856,29 +3847,22 @@ def test_submit_block_mask_pool_host_filtered_preflights_and_posts(monkeypatch, 
     assert posts[0]["json"] == {
         "host_rype_reference_idx": 7,
         "host_minimap2_reference_idx": None,
+        "force": True,
         "only_missing": True,
     }
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
 
 
-def test_submit_block_mask_pool_non_uniform_pool_aborts_no_post(monkeypatch, capsys):
-    """The block path masks a whole pool under ONE recipe, so it resolves and then
-    requires the answer to be uniform. A pool that resolves to a mix (one filtered,
-    one pass-through) aborts before any POST and points at submit-host-filter-pool
-    for the per-sample path."""
+def test_submit_block_mask_pool_host_ref_without_force_errors(monkeypatch, capsys):
+    """A host reference without --force is a rejected override (parser.error → exit
+    2), before any network call — resolution is per-sample server-side now, so a
+    bare reference override that would silently do nothing is refused."""
     captured: dict = {}
-    _stub_multi_response(
-        monkeypatch,
-        captured,
-        # One sample resolves to FILTER, the other to PASS_THROUGH — not uniform.
-        responses=[(200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", False)]))],
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        _run_submit_block_mask_pool()
-    assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    assert "different host-filter decisions" in err
-    assert "submit-host-filter-pool" in err
-    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+    _stub_multi_response(monkeypatch, captured, responses=[])
+    with pytest.raises(SystemExit):
+        _run_submit_block_mask_pool(rype=7)
+    assert not captured["requests"]
 
 
 def test_submit_block_mask_pool_minimap2_without_rype_errors(capsys):

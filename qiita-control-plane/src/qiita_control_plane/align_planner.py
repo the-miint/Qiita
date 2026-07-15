@@ -32,13 +32,15 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
+from qiita_common.host_filter_plan import SampleHostFilter
+from qiita_common.models import Platform
 
 from .actions.reference import ReferenceNotFound
 from .block_planner import (
     _BLOCK_TARGET_READS,
-    _MASK_FILTER_VERSION,
-    _MASK_FILTER_WORKFLOW,
     _enumerate_pool_samples,
+    _mask_params_for,
+    resolve_pool_sample_decisions,
     tile_partition,
 )
 from .dispatch import schedule_dispatch
@@ -53,7 +55,6 @@ from .repositories.mask_definition import lookup_mask_idx_by_params
 from .repositories.reference_membership import reference_shard_ids
 from .runner import (
     ReferenceIndexNotBuilt,
-    _build_mask_params,
     _resolve_sharded_align_indexes,
 )
 
@@ -138,6 +139,23 @@ class AlignResubmitError(RuntimeError):
         )
 
 
+class AlignNoMasksFound(RuntimeError):
+    """NOT ONE of the pool's samples has a host-mask minted under the resolved
+    filtering config, so there is nothing this plan could align.
+
+    A partially-masked pool is normal (its unmasked samples are reported
+    `samples_skipped_no_mask` and the rest align); this fires only when the WHOLE
+    pool misses, which is never a benign no-op — either the pool was never
+    block-masked, or it was masked under a DIFFERENT config than align resolved to.
+    The commonest cause of the latter is a `--force` mismatch: a pool block-masked
+    with `--force <ref>` must be aligned with the same `--force <ref>`, or align
+    re-resolves per sample, hashes a different mask identity, and finds nothing.
+    Surfaced as a 422 rather than a silent 202/0 so that override-does-nothing
+    outcome is loud. Distinct from `samples_skipped_mask_incomplete` (a mask
+    EXISTS but its masking hasn't finished — a legitimate in-flight state that
+    stays a 202)."""
+
+
 async def plan_and_submit_alignments(
     pool: asyncpg.Pool,
     *,
@@ -145,8 +163,7 @@ async def plan_and_submit_alignments(
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
     reference_idx: int,
-    host_rype_reference_idx: int | None,
-    host_minimap2_reference_idx: int | None,
+    force_decision: SampleHostFilter | None,
     only_missing: bool,
     adapter_set_hash: str | None,
     originator_principal_idx: int,
@@ -164,6 +181,14 @@ async def plan_and_submit_alignments(
     sample, and one block `work_ticket` per block (scope `block`, carrying the
     partition's `mask_idx` + `alignment_idx` + the align `action_context`),
     back-filling `block.work_ticket_idx`. After commit each ticket is dispatched.
+
+    Each sample's host-depletion mask is the one the block-mask plan minted under
+    its PER-SAMPLE resolved decision (`resolve_pool_sample_decisions`), so the
+    lookup key varies by decision — a heterogeneous pool finds each sample's own
+    mask, not one pool-wide answer. `force_decision` (the `--force` override)
+    bypasses resolution to look up the forced mask, exactly as the block plan
+    minted it under `--force`. A pool that cannot resolve (UNRESOLVED / multi-host)
+    raises `PoolHostFilterRefusal` (the route maps it to 422).
 
     `adapter_set_hash` is resolved by the caller (matching the per-sample read-mask
     mint) so the mask LOOKUP finds the same mask the block-mask plan minted.
@@ -225,36 +250,57 @@ async def plan_and_submit_alignments(
         sequenced_pool_idx,
     )
 
-    # LOOK UP mask_idx per sample (never mint). Memoize by prep_protocol_idx — the
-    # only per-sample input to the mask identity (everything else is pool-constant).
-    mask_by_protocol: dict[int | None, int | None] = {}
-    for protocol_idx in {s.prep_protocol_idx for s in all_samples}:
-        params = _build_mask_params(
-            action_id=_MASK_FILTER_WORKFLOW,
-            action_version=_MASK_FILTER_VERSION,
-            prep_protocol_idx=protocol_idx,
-            instrument_model=instrument_model,
-            adapter_set_hash=adapter_set_hash,
-            host_rype_reference_idx=host_rype_reference_idx,
-            host_minimap2_reference_idx=host_minimap2_reference_idx,
-            # Align looks up BLOCK masks (it aligns block-masked reads), and the
-            # block read-mask workflow is `qc -> host_filter` only — it has no lima
-            # chain and no syndna step, so a block mask never carries either. This
-            # MUST mirror block_planner's mint call exactly or the reconstructed
-            # hash won't match the mask the block path minted.
-            resolved_lima=None,
-            resolved_syndna=None,
-        )
-        mask_by_protocol[protocol_idx] = await lookup_mask_idx_by_params(pool, params)
+    # Resolve each sample's host-filter decision the SAME way block_planner minted
+    # under (the shared seam), so the mask lookup below reconstructs the identity
+    # the block plan wrote. Refuses an UNRESOLVED / multi-host pool; `force_decision`
+    # bypasses resolution.
+    decision_by_prep_sample = await resolve_pool_sample_decisions(
+        pool,
+        samples=all_samples,
+        platform=Platform(run_row["platform"]),
+        force_decision=force_decision,
+    )
+
+    # LOOK UP mask_idx per sample (never mint). The identity depends on the
+    # prep_protocol AND the sample's resolved decision, so memoize by that pair —
+    # mirroring block_planner's mint memoization exactly, or the reconstructed hash
+    # won't match the mask the block path minted.
+    mask_by_key: dict[tuple[int | None, SampleHostFilter], int | None] = {}
+    mask_by_prep_sample: dict[int, int | None] = {}
+    for s in all_samples:
+        decision = decision_by_prep_sample[s.prep_sample_idx]
+        key = (s.prep_protocol_idx, decision)
+        if key not in mask_by_key:
+            params = _mask_params_for(
+                decision,
+                prep_protocol_idx=s.prep_protocol_idx,
+                instrument_model=instrument_model,
+                adapter_set_hash=adapter_set_hash,
+            )
+            mask_by_key[key] = await lookup_mask_idx_by_params(pool, params)
+        mask_by_prep_sample[s.prep_sample_idx] = mask_by_key[key]
 
     # A sample with no minted mask for its config was never block-masked under this
     # host config — skip it (align only masked samples).
     samples_with_mask = [
-        (s, mask_by_protocol[s.prep_protocol_idx])
+        (s, mask_by_prep_sample[s.prep_sample_idx])
         for s in all_samples
-        if mask_by_protocol[s.prep_protocol_idx] is not None
+        if mask_by_prep_sample[s.prep_sample_idx] is not None
     ]
     skipped_no_mask = len(all_samples) - len(samples_with_mask)
+
+    # If the pool has samples to align but NONE resolved to a minted mask, refuse
+    # loudly rather than return a silent 202/0. A partial miss is normal (those
+    # samples are just skipped_no_mask); a total miss means the pool was never
+    # block-masked, or was masked under a different config than align resolved to —
+    # most often a `--force` mismatch between the two plans.
+    if all_samples and not samples_with_mask:
+        raise AlignNoMasksFound(
+            f"none of the pool's {len(all_samples)} sample(s) has a host-mask minted under the"
+            " resolved filtering config; there is nothing to align. Block-mask the pool first,"
+            " and if it was masked with --force, pass the same --force so the mask identity"
+            " matches."
+        )
 
     # Require the sample's mask to be COMPLETED (the read-mask-block milestone flips
     # mask_sample once every covering block is done). Align only fully-masked
@@ -425,8 +471,6 @@ async def plan_and_submit_alignments(
         "sequenced_pool_idx": sequenced_pool_idx,
         "reference_idx": reference_idx,
         "aligner": aligner,
-        "host_rype_reference_idx": host_rype_reference_idx,
-        "host_minimap2_reference_idx": host_minimap2_reference_idx,
         "samples_planned": len(to_plan),
         "samples_skipped_existing": skipped_existing,
         "samples_skipped_no_mask": skipped_no_mask,
