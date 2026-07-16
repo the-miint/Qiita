@@ -31,10 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- **`read-mask` and `read-mask-block` re-synced.** Both YAMLs are edited in place
-  (the qc step's `adapter_parquet` moved to `optional_inputs`) and re-synced by
-  `qiita-admin actions sync` inside `activate.sh`, not migrated. Confirm both are
-  present at 1.0.0 in the `qiita.action` list `make verify-deploy` prints. (#310)
+_None yet._
 
 ### 6. After the deploy verifies green
 
@@ -42,18 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **PacBio read-mask now skips QC adapter trimming (#310).** QC no longer fetches or
-  applies the default (Illumina TruSeq) adapter set on a PacBio mask —
-  `submit-host-filter-pool` sets `qc_adapter_enabled=False` per PacBio sample and the
-  runner skips the adapter fetch, so the `qc` step runs polyG + the length/quality
-  filter only. Short-read masks are unchanged (the gate defaults true). No
-  env/migration/scope change; the workflow re-syncs automatically (bucket 5).
-- **Data-plane DuckLake concurrency fix + retriable classification (#310).** The DP
-  binary now sets catalog Parquet options once at boot (not on every Flight attach),
-  fixing the SQLSTATE 40001 serialization crash on a concurrent read-mask fan-out; the
-  control plane now records that serialization error as retriable rather than permanent.
-  Code-only — picked up by the standard DP rebuild + CP/orchestrator redeploy, no host
-  action.
+_None yet._
 
 ---
 
