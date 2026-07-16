@@ -137,6 +137,7 @@ def test_step_submit_requires_bearer_token(http_client):
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
         },
     )
     assert resp.status_code == 401
@@ -159,6 +160,7 @@ def test_step_submit_dispatches_and_returns_handle(http_client, cp_to_co_token, 
             "work_ticket_idx": 99,
             "attempt": 2,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
         },
     )
     assert resp.status_code == 200, resp.text
@@ -245,6 +247,7 @@ def test_step_submit_serializes_backend_failure(http_client, cp_to_co_token, tmp
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
         },
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
@@ -680,6 +683,7 @@ def test_step_submit_forwards_derived_inputs(http_client, cp_to_co_token, tmp_pa
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": 7},
             "work_ticket_idx": 99,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
             "derived_inputs": {"QIITA_CHECKM_DB": "checkm_data"},
         },
     )
@@ -705,6 +709,7 @@ def test_step_submit_rejects_absolute_derived_input(http_client, cp_to_co_token,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": 7},
             "work_ticket_idx": 99,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
             "derived_inputs": {"QIITA_CHECKM_DB": "/etc"},
         },
     )

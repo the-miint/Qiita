@@ -40,6 +40,7 @@ def _build_action(*, context_schema: dict) -> ActionDefinition:
                 "name": "noop",
                 "step_type": StepType.SINGLETON,
                 "container": "qiita/noop:1.0.0",
+                "entrypoint": "/opt/qiita/entrypoint.sh",
                 "baseline_resources": {
                     "cpu": 1,
                     "mem_gb": 1,

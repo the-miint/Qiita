@@ -310,6 +310,7 @@ def _minimal_step_submit_kwargs() -> dict:
         scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
         container=REFERENCE_HASH_CONTAINER,
+        entrypoint="/opt/qiita/hash.sh",
     )
 
 
@@ -326,6 +327,7 @@ def test_step_submit_request_module_form_validates():
 
     kwargs = _minimal_step_submit_kwargs()
     del kwargs["container"]
+    del kwargs["entrypoint"]  # entrypoint requires container; native form has neither
     kwargs["module"] = FASTQ_TO_PARQUET_MODULE
     req = StepSubmitRequest(**kwargs)
     assert req.module == FASTQ_TO_PARQUET_MODULE
@@ -347,9 +349,24 @@ def test_step_submit_request_rejects_neither_container_nor_module():
 
     kwargs = _minimal_step_submit_kwargs()
     del kwargs["container"]
+    del kwargs["entrypoint"]
     with pytest.raises(ValidationError) as exc_info:
         StepSubmitRequest(**kwargs)
     assert "exactly one" in str(exc_info.value)
+
+
+def test_step_submit_request_rejects_container_without_entrypoint():
+    """The shared runtime validator enforces container-requires-entrypoint at the
+    wire boundary too (not just the YAML `WorkflowStep`): `apptainer exec <image>`
+    with no command is rejected by apptainer, so a container step must carry an
+    entrypoint. Mirrors test_actions.py::test_workflow_step_container_requires_entrypoint."""
+    from qiita_common.models import StepSubmitRequest
+
+    kwargs = _minimal_step_submit_kwargs()
+    del kwargs["entrypoint"]
+    with pytest.raises(ValidationError) as exc_info:
+        StepSubmitRequest(**kwargs)
+    assert "'container' without 'entrypoint'" in str(exc_info.value)
 
 
 def test_step_submit_request_defaults_attempt_and_validates_runtime():
@@ -454,6 +471,7 @@ def test_step_submit_request_scope_target_prep_sample_validates():
     # Native form pairs naturally with the prep_sample target shape
     # (fastq_to_parquet is the canonical native+prep_sample step).
     del kwargs["container"]
+    del kwargs["entrypoint"]  # entrypoint requires container
     kwargs["module"] = FASTQ_TO_PARQUET_MODULE
     req = StepSubmitRequest(**kwargs)
     assert req.scope_target == {"kind": "prep_sample", "prep_sample_idx": 42}

@@ -33,6 +33,22 @@ def check_exactly_one_runtime(
         raise ValueError(f"{owner} must declare exactly one of 'container' or 'module'")
     if entrypoint is not None and container is None:
         raise ValueError("'entrypoint' requires 'container'")
+    # ...and the symmetric rule: a container step is launched as
+    # `apptainer exec <image> <entrypoint>`; exec has NO command without an
+    # entrypoint (it does not fall back to the image's runscript/ENTRYPOINT), so
+    # apptainer rejects it with "exec requires at least 2 arg(s)". Enforce it at
+    # BOTH model layers here — the gap that let the read-mask `lima` step ship
+    # without an entrypoint and fail only at SLURM runtime. slurm/payload.py
+    # re-checks at command assembly for direct (non-model) callers.
+    # `not entrypoint` (not `is None`) so an empty string is rejected here too,
+    # matching `_build_script`'s own `if not entrypoint` guard — the two layers
+    # agree on what "no entrypoint" means.
+    if container is not None and not entrypoint:
+        raise ValueError(
+            f"{owner} declares 'container' without 'entrypoint'; every container step "
+            "is run as `apptainer exec <image> <entrypoint>` and needs the in-container "
+            "launcher path (e.g. /opt/qiita/<step>.sh)"
+        )
 
 
 def check_derived_inputs(

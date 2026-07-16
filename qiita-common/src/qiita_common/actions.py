@@ -203,8 +203,10 @@ class WorkflowStep(BaseModel):
     a backend concern; the schema describes what's expressible.
 
     - `container` form: the step's image is executed via apptainer (or
-      in-process via LocalBackend in dev/test). `entrypoint` may override
-      the container's default ENTRYPOINT.
+      in-process via LocalBackend in dev/test). `entrypoint` (REQUIRED for a
+      container step) is the in-container launcher path — the image is run as
+      `apptainer exec <image> <entrypoint>`, and exec does NOT fall back to the
+      image's runscript, so a container without an entrypoint fails to launch.
     - `module` form (native step): the named Python module lives under
       `qiita_compute_orchestrator.jobs.*` and runs in the orchestrator's
       Python environment — either in-process via LocalBackend or under

@@ -31,7 +31,12 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **`read-mask` re-synced with the `lima` entrypoint fix.** The `lima` container
+  step now carries `entrypoint: /opt/qiita/lima.sh` (it was missing, so PacBio masks
+  died at the lima step with an apptainer arg error). The YAML is re-synced by
+  `qiita-admin actions sync` inside `activate.sh`, not migrated. Confirm `read-mask`
+  is present at 1.0.0 in the `qiita.action` list `make verify-deploy` prints. No SIF
+  rebuild is needed — only the step's entrypoint changed, not lima.def/lima.sh. (#311)
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +44,10 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **PacBio read-mask fetch UNAVAILABLE is now retriable (#311).** A transient
+  data-plane gRPC UNAVAILABLE during read materialization is recorded retriable
+  (`DATA_PLANE_TRANSIENT`) rather than permanently failing the ticket. Code-only —
+  rides the standard CP redeploy, no host action.
 
 ---
 

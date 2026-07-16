@@ -89,12 +89,20 @@ def _build_script(
     followed. Quoting here covers every arg at the one place they become shell
     text, rather than trusting each producer to sanitize its own.
     """
+    # `apptainer exec <image>` with no command is rejected by apptainer ("exec
+    # requires at least 2 arg(s)"). A container step must carry an entrypoint;
+    # the wire validator enforces this, but re-check here — the one place the
+    # command is actually assembled — so a hand-built payload can't emit a broken
+    # `apptainer exec`.
+    if not entrypoint:
+        raise ValueError(
+            "container step requires an entrypoint: `apptainer exec` has no command "
+            "without one and does not fall back to the image's runscript"
+        )
     extra = " ".join(shlex.quote(a) for a in (apptainer_extra_args or []))
     if extra:
         extra = f" {extra}"
-    cmd = f"apptainer exec --containall{extra} {shlex.quote(container)}"
-    if entrypoint:
-        cmd = f"{cmd} {shlex.quote(entrypoint)}"
+    cmd = f"apptainer exec --containall{extra} {shlex.quote(container)} {shlex.quote(entrypoint)}"
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
@@ -184,9 +192,12 @@ def build_job_submit_payload(
             script invokes the shared `python -m` launcher instead of
             `apptainer exec`; bind mounts are not emitted because
             there's no container to bind into.
-        entrypoint: optional binary inside the container. None means
-            the container's own ENTRYPOINT runs. Meaningful only when
-            `container` is set.
+        entrypoint: the in-container launcher path, run as
+            `apptainer exec <image> <entrypoint>`. REQUIRED whenever
+            `container` is set — exec has no command without it and does
+            NOT fall back to the image's runscript (the wire validator
+            `check_exactly_one_runtime` enforces this upstream; `_build_script`
+            re-checks defensively). Meaningful only when `container` is set.
         baseline_resources: CPU / memory / walltime from the YAML step.
             Used as-is — there is no originator-profile multiplier
             applied here. Caller is responsible for clamping against

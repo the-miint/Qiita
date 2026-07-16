@@ -198,6 +198,10 @@ steps:
   - step: lima
     step_type: singleton
     container: lima-2.13.0.sif
+    # The image is run as `apptainer exec <sif> <entrypoint>` (exec has no
+    # command without one — it does NOT fall back to the image's runscript, which
+    # lima.def leaves undefined). This must name the in-container launcher.
+    entrypoint: /opt/qiita/lima.sh
     when: lima_enabled
     inputs: [lima_in_fastq, lima_config]
     outputs: [lima_out_fastq]

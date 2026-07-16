@@ -174,11 +174,16 @@ def test_payload_script_invokes_apptainer_with_bind_mounts(common_kwargs):
     assert script.rstrip().endswith(common_kwargs["entrypoint"])
 
 
-def test_payload_script_without_entrypoint(common_kwargs):
+def test_payload_rejects_container_without_entrypoint(common_kwargs):
+    """A container step with no entrypoint is rejected by the builder: the script
+    would be `apptainer exec <image>` with no command, which apptainer refuses
+    ("exec requires at least 2 arg(s)") — exec does NOT fall back to the image's
+    runscript. The wire validator (WorkflowStep) catches this upstream; the
+    builder's own check protects direct callers, the way the exactly-one and
+    empty-container checks above do."""
     common_kwargs["entrypoint"] = None
-    payload = build_job_submit_payload(**common_kwargs)
-    # No trailing entrypoint — container's own ENTRYPOINT runs.
-    assert payload["script"].rstrip().endswith(common_kwargs["container"])
+    with pytest.raises(ValueError, match="entrypoint"):
+        build_job_submit_payload(**common_kwargs)
 
 
 def test_payload_walltime_rounds_up(common_kwargs):
