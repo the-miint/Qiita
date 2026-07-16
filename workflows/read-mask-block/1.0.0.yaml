@@ -81,12 +81,15 @@ steps:
   # (qc_mask: per read, reason + per-end trims) keyed by sequence_idx — order- and
   # owner-independent, so a multi-sample block is fine. `reads` is runner-bound
   # from the block's member sub-ranges (_resolve_staged_reads_block);
-  # `adapter_parquet` is materialized by the runner before the loop.
-  # `instrument_model` rides through `params:` to gate polyG.
+  # `adapter_parquet` is materialized by the runner before the loop when QC
+  # adapter trimming is enabled (short-read) and left unbound for a long-read /
+  # PacBio block (no adapter trim). `instrument_model` rides through `params:` to
+  # gate polyG.
   - step: qc
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.qc
-    inputs: [reads, adapter_parquet]
+    inputs: [reads]
+    optional_inputs: [adapter_parquet]
     params: {instrument_model: instrument_model}
     outputs: [qc_mask]
     baseline_resources:

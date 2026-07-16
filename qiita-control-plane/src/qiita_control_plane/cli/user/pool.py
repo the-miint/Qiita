@@ -1219,6 +1219,11 @@ def _handle_submit_host_filter_pool(
                 "lima_enabled": False,
                 "syndna_enabled": False,
                 "host_filter_enabled": host.enabled,
+                # Short-read masks run QC's fastp-equivalent adapter trim against the
+                # deploy's default adapter set; a PacBio mask (gates present) does NOT
+                # — SMRTbell + Twist adapters are handled by the instrument and lima,
+                # so QC skips the adapter trim and only length/quality-filters.
+                "qc_adapter_enabled": gates is None,
             }
             if host.enabled:
                 action_context["host_rype_reference_idx"] = host.rype_reference_idx

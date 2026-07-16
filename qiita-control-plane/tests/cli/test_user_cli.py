@@ -3328,6 +3328,8 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, cap
         assert body["scope_target"] == {"kind": "prep_sample", "prep_sample_idx": prep_idx}
         ctx = body["action_context"]
         assert ctx["host_filter_enabled"] is True
+        # Illumina (short-read): QC trims adapters against the default set.
+        assert ctx["qc_adapter_enabled"] is True
         assert ctx["host_rype_reference_idx"] == 7
         # minimap2 not recorded → its key is omitted (rype-only host filter).
         assert "host_minimap2_reference_idx" not in ctx
@@ -3467,6 +3469,7 @@ def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch):
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     ctx = post["json"]["action_context"]
     assert ctx["host_filter_enabled"] is True
+    assert ctx["qc_adapter_enabled"] is True  # Illumina short-read: QC adapter trim on
     assert ctx["host_rype_reference_idx"] == 7
     assert ctx["host_minimap2_reference_idx"] == 8
     assert ctx["instrument_model"] == "NovaSeq 6000"

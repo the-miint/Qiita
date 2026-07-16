@@ -274,12 +274,18 @@ async def run_workflow(
             bound.update(await _resolve_sharded_align_index_bindings(pool, action_context=bound))
 
         # QC adapter materialization: when any step needs `adapter_parquet` (the
-        # qc step), DoGet the configured artifact_sequence_set reference's
-        # sequences and stage them as a local Parquet in the ticket workspace.
-        # Same pre-loop, inside-try placement as host-filter resolution so a
-        # failure (unconfigured / non-active / empty adapter set) lands in the
-        # outer FAILED handler rather than leaving the ticket stuck in PROCESSING.
-        if _workflow_needs_adapters(action.steps):
+        # qc step) AND the mask enables QC adapter trimming, DoGet the configured
+        # artifact_sequence_set reference's sequences and stage them as a local
+        # Parquet in the ticket workspace. Same pre-loop, inside-try placement as
+        # host-filter resolution so a failure (unconfigured / non-active / empty
+        # adapter set) lands in the outer FAILED handler rather than leaving the
+        # ticket stuck in PROCESSING.
+        #
+        # `qc_adapter_enabled` defaults True (absent ⇒ short-read, unchanged). A
+        # long-read / PacBio mask sets it False: no adapter set is fetched or bound,
+        # so the qc step runs the length/quality filter with no adapter trim (its
+        # `adapter_parquet` is an optional input — see the read-mask workflows).
+        if _workflow_needs_adapters(action.steps) and bound.get("qc_adapter_enabled", True):
             bound.update(
                 await _resolve_qc_adapters(
                     pool,

@@ -183,8 +183,11 @@ class Inputs(BaseModel):
     `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`.
     `adapter_parquet` is the canonical adapter set the runner materializes
-    (`_resolve_qc_adapters`) — REQUIRED (QC is always-on; an empty set is a
-    misconfiguration). `instrument_model` gates polyG trimming (None -> OFF);
+    (`_resolve_qc_adapters`) — OPTIONAL. Unbound (None) means NO adapter trim: the
+    QC chain runs polyG + length/quality filter only. Long-read / PacBio masks
+    bind no adapter set (SMRTbell + Twist adapters are handled by the instrument
+    and the lima step, not here); a bound but empty *file* stays a misconfiguration.
+    `instrument_model` gates polyG trimming (None -> OFF);
     it is forwarded from qiita.sequencing_run per sample. `work_ticket_idx` is the
     framework-injected scope scalar.
 
@@ -203,7 +206,7 @@ class Inputs(BaseModel):
     """
 
     reads: Path
-    adapter_parquet: Path
+    adapter_parquet: Path | None = None
     partial_mask: Path | None = None
     instrument_model: str | None = None
     prep_sample_idx: int | None = None
@@ -454,7 +457,7 @@ def _qc_carry_select(incoming_view: str) -> str:
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.reads.exists():
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
-    if not inputs.adapter_parquet.exists():
+    if inputs.adapter_parquet is not None and not inputs.adapter_parquet.exists():
         raise FileNotFoundError(f"adapter_parquet not found: {inputs.adapter_parquet}")
     if inputs.partial_mask is not None and not inputs.partial_mask.exists():
         raise FileNotFoundError(f"partial_mask not found: {inputs.partial_mask}")
@@ -481,9 +484,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # Read + render the adapter set from the staged Parquet (fail fast on
-            # an empty/unreadable set). The constant VARCHAR[] is inlined into the
-            # QC SQL — miint requires a bind-time constant adapter list.
-            adapters_sql = _adapters_sql(_read_adapter_parquet(conn, inputs.adapter_parquet))
+            # an empty/unreadable *file*). The constant VARCHAR[] is inlined into
+            # the QC SQL — miint requires a bind-time constant adapter list. No
+            # bound set (long-read / PacBio) -> an empty list, which miint's
+            # trim_adapters treats as a no-op (0 trims; pinned in the qc contract
+            # test), so only polyG + the length/quality filter run.
+            adapters = (
+                _read_adapter_parquet(conn, inputs.adapter_parquet)
+                if inputs.adapter_parquet is not None
+                else []
+            )
+            adapters_sql = _adapters_sql(adapters)
 
             # Route by layout: SE (sequence2 IS NULL) and PE rows take different
             # miint overloads. The qual columns ride along (QC needs decoded
