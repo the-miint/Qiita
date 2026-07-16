@@ -35,21 +35,32 @@ with two columns:
   empty rank is the bare prefix `d__`, not `""`). The loader hard-validates the
   prefix order.
 
-SynDNA inserts are **synthetic constructs** (NCBI `32630`), so the honest lineage
-is the construct at the species rank with empty higher ranks:
-`d__; p__; c__; o__; f__; g__; s__synthetic construct`. Because `--no-rype-index`
-skips the rype build, this taxonomy is stored as feature metadata only (not a
-classification authority), so the label is about provenance, not behavior.
+SynDNA inserts are **synthetic constructs** — NCBI places them under *artificial
+sequences* (`32630`). Do **not** put the construct at the species rank with empty
+higher ranks: a reference taxonomy must populate EVERY parent rank (a species
+implies a genus implies a family, …), so an empty-parent lineage is a hierarchy
+violation. Use an artificial lineage, one species per construct so the inserts stay
+distinct:
 
-Generate it from the FASTA headers with pyarrow:
+```
+d__Artificial; p__Artificialota; c__Artificialia; o__Artificiales; f__Artificialaceae; g__synDNA; s__synDNA <id>
+```
+
+Because `--no-rype-index` skips the rype build, this taxonomy is stored as feature
+metadata only (not a classification authority) — but keep the hierarchy valid so a
+consumer that later DOES read it isn't handed a species with no genus.
+
+Generate it from the FASTA headers with pyarrow (one species per construct, keyed
+by its `feature_id`):
 
 ```python
 import pyarrow as pa, pyarrow.parquet as pq
 ids = [l[1:].split()[0] for l in open("plasmids.fasta") if l.startswith(">")]
-lineage = "d__; p__; c__; o__; f__; g__; s__synthetic construct"
+_prefix = "d__Artificial; p__Artificialota; c__Artificialia; o__Artificiales; f__Artificialaceae; g__synDNA"
+tax = [f"{_prefix}; s__synDNA {i}" for i in ids]
 pq.write_table(
     pa.table({"feature_id": pa.array(ids, pa.string()),
-              "taxonomy":  pa.array([lineage] * len(ids), pa.string())}),
+              "taxonomy":  pa.array(tax, pa.string())}),
     "syndna_taxonomy.parquet",
 )
 ```
