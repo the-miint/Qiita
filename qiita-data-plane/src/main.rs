@@ -23,6 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.ducklake_catalog_connstr,
         &cfg.path_persistent_ducklake,
     )?;
+    // Catalog-global Parquet defaults (zstd + v2). Set ONCE here at boot, NOT on
+    // every per-request attach: a per-attach write races on ducklake_metadata
+    // under concurrent Flight load and fails with SQLSTATE 40001. See
+    // set_catalog_options.
+    ducklake::set_catalog_options(&setup_conn)?;
     ducklake::ensure_reference_tables(&setup_conn)?;
     ducklake::ensure_read_tables(&setup_conn)?;
     ducklake::ensure_alignment_tables(&setup_conn)?;
