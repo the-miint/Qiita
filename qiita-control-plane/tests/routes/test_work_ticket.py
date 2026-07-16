@@ -272,6 +272,7 @@ _TEST_STEPS = [
         "name": "noop",
         "step_type": "singleton",
         "container": "qiita/noop:1.0.0",
+        "entrypoint": "/opt/qiita/noop.sh",
         "inputs": [],
         "outputs": [],
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},

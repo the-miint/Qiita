@@ -16,6 +16,7 @@ from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import (
     _is_dp_serialization_conflict,
+    _is_dp_unavailable,
     _submission_dp_fetch_failure,
 )
 
@@ -31,6 +32,18 @@ _REAL_40001 = (
 )
 
 
+# A representative stringified pyarrow FlightUnavailableError — the DP briefly
+# unreachable (saturated by a read-mask fan-out, restarting during a deploy),
+# captured verbatim from a real read-mask failure_reason. gRPC UNAVAILABLE is
+# transient by definition; a redrive self-heals once the DP is back.
+_REAL_UNAVAILABLE = (
+    "could not materialize reads for prep_sample 30451 from the data plane: "
+    "FlightUnavailableError: Flight returned unavailable error, with message: failed "
+    "to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051: "
+    "connection attempt timed out before receiving SETTINGS frame"
+)
+
+
 def test_serialization_conflict_is_detected():
     assert _is_dp_serialization_conflict(Exception(_REAL_40001)) is True
 
@@ -40,12 +53,33 @@ def test_non_serialization_error_is_not_detected():
     assert _is_dp_serialization_conflict(FileNotFoundError("missing file")) is False
 
 
+def test_unavailable_is_detected():
+    assert _is_dp_unavailable(Exception(_REAL_UNAVAILABLE)) is True
+
+
+def test_non_unavailable_error_is_not_detected():
+    # A serialization conflict is retriable, but NOT via the unavailable path.
+    assert _is_dp_unavailable(Exception(_REAL_40001)) is False
+    assert _is_dp_unavailable(Exception("some other flight error")) is False
+
+
 def test_serialization_conflict_classified_retriable():
     f = _submission_dp_fetch_failure(
         "could not fetch adapter sequences ...", Exception(_REAL_40001)
     )
     assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
     assert f.transient is True  # a redrive self-heals
+    assert f.stage is WorkTicketFailureStage.SUBMISSION
+    assert f.step_name is None
+
+
+def test_unavailable_classified_retriable():
+    f = _submission_dp_fetch_failure(
+        "could not materialize reads for prep_sample 30451 ...",
+        Exception(_REAL_UNAVAILABLE),
+    )
+    assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert f.transient is True  # DP was briefly unreachable; a redrive self-heals
     assert f.stage is WorkTicketFailureStage.SUBMISSION
     assert f.step_name is None
 

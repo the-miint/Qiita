@@ -22,6 +22,7 @@ steps:
   - step: hash
     step_type: singleton
     container: qiita/reference-hash:1.0.0
+    entrypoint: /opt/qiita/entrypoint.sh
     baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
   - action: mint-features
     inputs: [hash.manifest]
@@ -40,6 +41,7 @@ steps:
   - step: denoise
     step_type: map
     container: qiita/deblur:0.1.0
+    entrypoint: /opt/qiita/entrypoint.sh
     baseline_resources: {cpu: 8, mem_gb: 16, walltime: PT2H}
 action_ceiling: {cpu: 32, mem_gb: 128, walltime: PT8H}
 """

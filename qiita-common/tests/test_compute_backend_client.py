@@ -132,6 +132,7 @@ async def test_submit_step_posts_to_submit_endpoint_and_returns_handle():
         work_ticket_idx=99,
         attempt=2,
         container=REFERENCE_HASH_CONTAINER,
+        entrypoint="/opt/qiita/hash.sh",
     )
     assert len(captured) == 1
     assert captured[0].url.path == URL_STEP_SUBMIT
@@ -308,6 +309,7 @@ async def test_submit_step_reconstructs_backend_failure():
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_HASH_CONTAINER,
+            entrypoint="/opt/qiita/hash.sh",
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert ComputeTarget  # imported to keep parity with the handle-shaped tests
@@ -372,6 +374,7 @@ async def test_submit_step_transport_error_becomes_orchestrator_unreachable():
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_HASH_CONTAINER,
+            entrypoint="/opt/qiita/hash.sh",
         )
     assert ei.value.kind is FailureKind.ORCHESTRATOR_UNREACHABLE
     assert ei.value.transient is True

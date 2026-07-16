@@ -51,6 +51,21 @@ def _submission_bad_input(reason: str) -> BackendFailure:
 # message. See FailureKind.DATA_PLANE_TRANSIENT.
 _DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent update"
 
+# gRPC UNAVAILABLE signatures. A data-plane fetch that can't reach the DP surfaces
+# as a pyarrow FlightUnavailableError — the DP momentarily saturated by a fan-out,
+# restarting during a deploy, or briefly unreachable. This is transient by
+# definition (gRPC's own retriable status): a redrive self-heals once the DP is
+# back, so it must NOT be filed as a permanent bad-input. Matched by message for
+# the same reason as the serialization signature (no typed exception at this
+# layer). Three overlapping substrings so a stringification variant still matches:
+# the pyarrow error CLASS name, its message PREFIX, and gRPC's canonical
+# connect-failure text — any one is sufficient.
+_DP_UNAVAILABLE_SIGNATURES = (
+    "flightunavailableerror",
+    "flight returned unavailable",
+    "failed to connect to all addresses",
+)
+
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is a transient, retriable serialization
@@ -58,19 +73,33 @@ def _is_dp_serialization_conflict(exc: BaseException) -> bool:
     return _DP_SERIALIZATION_SIGNATURE in str(exc)
 
 
+def _is_dp_unavailable(exc: BaseException) -> bool:
+    """True if a data-plane Flight failure is a transient gRPC UNAVAILABLE (the DP
+    could not be reached), rather than a permanent bad-input error."""
+    text = str(exc).lower()
+    return any(sig in text for sig in _DP_UNAVAILABLE_SIGNATURES)
+
+
+def _is_retriable_dp_error(exc: BaseException) -> bool:
+    """True if a data-plane Flight fetch failed for a transient, retriable reason —
+    a serialization conflict (concurrent DuckLake attach) or the DP being briefly
+    unreachable — either of which a redrive self-heals. Everything else is a
+    permanent bad-input an operator must resolve."""
+    return _is_dp_serialization_conflict(exc) or _is_dp_unavailable(exc)
+
+
 def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
     """A SUBMISSION failure for a data-plane Flight fetch (adapters, reads).
 
     Classifies by cause: a transient serialization conflict (concurrent DuckLake
-    attach) is DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything
-    else keeps the BAD_INPUT/permanent shape of `_submission_bad_input` (a genuine
-    bad reference, missing data, or DP-down that an operator must resolve). Same
-    SUBMISSION/step_name=None shape either way, so it stays a drop-in for the
-    existing `except` translation in `run_workflow`."""
+    attach) or a transient DP-unreachable (gRPC UNAVAILABLE) is
+    DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything else keeps
+    the BAD_INPUT/permanent shape of `_submission_bad_input` (a genuine bad
+    reference or missing data an operator must resolve). Same SUBMISSION/
+    step_name=None shape either way, so it stays a drop-in for the existing
+    `except` translation in `run_workflow`."""
     kind = (
-        FailureKind.DATA_PLANE_TRANSIENT
-        if _is_dp_serialization_conflict(exc)
-        else FailureKind.BAD_INPUT
+        FailureKind.DATA_PLANE_TRANSIENT if _is_retriable_dp_error(exc) else FailureKind.BAD_INPUT
     )
     return BackendFailure(
         kind=kind,

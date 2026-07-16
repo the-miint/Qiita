@@ -31,6 +31,7 @@ def _minimal_action_kwargs() -> dict:
                 "step": "hash",
                 "step_type": StepType.SINGLETON,
                 "container": REFERENCE_HASH_CONTAINER,
+                "entrypoint": "/opt/qiita/entrypoint.sh",
                 "baseline_resources": {
                     "cpu": 4,
                     "mem_gb": 8,
@@ -75,6 +76,7 @@ def test_step_and_action_shorthand_normalize():
             "step": "hash",
             "step_type": StepType.SINGLETON,
             "container": "img:1",
+            "entrypoint": "/opt/qiita/x.sh",
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         },
         {"action": "mint-features", "inputs": ["hash.manifest"]},
@@ -108,6 +110,7 @@ def test_duplicate_step_names_rejected():
     step = {
         "step_type": StepType.SINGLETON,
         "container": "img:1",
+        "entrypoint": "/opt/qiita/x.sh",
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
     }
     kwargs["steps"] = [
@@ -131,6 +134,7 @@ def test_duplicate_action_names_allowed():
             "step": "build",
             "step_type": StepType.SINGLETON,
             "container": "img:1",
+            "entrypoint": "/opt/qiita/x.sh",
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         },
         {"action": "register-index", "inputs": ["rype_index_meta"]},
@@ -541,6 +545,25 @@ def test_workflow_step_rejects_neither_container_nor_module():
     with pytest.raises(ValidationError) as exc_info:
         ActionDefinition(**kwargs)
     assert "exactly one" in str(exc_info.value)
+
+
+def test_workflow_step_container_requires_entrypoint():
+    """A `container:` step with no `entrypoint:` is rejected at YAML-author /
+    actions-sync time. Every container step is run as `apptainer exec <image>
+    <entrypoint>`, and exec has no command without one (it does NOT fall back to
+    the image's runscript), so apptainer would fail the SLURM job with "exec
+    requires at least 2 arg(s)". Rejecting it here surfaces the mistake before any
+    ticket runs — the gap that let the read-mask `lima` step ship without an
+    entrypoint."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    del kwargs["steps"][0]["entrypoint"]
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    msg = str(exc_info.value)
+    assert "'container' without 'entrypoint'" in msg
+    assert "apptainer exec" in msg
 
 
 def test_workflow_step_rejects_entrypoint_without_container():

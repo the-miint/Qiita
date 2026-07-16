@@ -49,6 +49,7 @@ def _build_action(*, action_id: str, version: str) -> ActionDefinition:
                 "name": "noop",
                 "step_type": StepType.SINGLETON,
                 "container": "qiita/noop:1.0.0",
+                "entrypoint": "/opt/qiita/noop.sh",
                 "baseline_resources": {
                     "cpu": 1,
                     "mem_gb": 1,

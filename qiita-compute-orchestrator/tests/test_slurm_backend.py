@@ -233,7 +233,7 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=None,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -263,7 +263,7 @@ async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, 
             scope_target={"kind": "block", "block_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -566,7 +566,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
         scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
         container="docker://qiita/hash:1.0.0",
-        entrypoint=None,
+        entrypoint="/opt/qiita/hash.sh",
         baseline_resources=baseline,
     )
     params_text = (tmp_path / "input" / "params.json").read_text()
@@ -618,7 +618,7 @@ async def test_run_step_terminal_states_map_to_kinds(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == expected_kind
@@ -749,7 +749,7 @@ async def test_run_step_falls_back_to_state_based_kind_when_no_launcher_line(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     # State-based classification stands.
@@ -787,7 +787,7 @@ async def test_run_step_completed_but_missing_manifest_is_contract_violation(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -814,7 +814,7 @@ async def test_run_step_submit_5xx_is_unreachable(jwt_path, baseline, tmp_path):
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -836,7 +836,7 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -874,7 +874,7 @@ async def test_run_step_submit_200_with_error_code_is_contract_violation(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -898,7 +898,7 @@ async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -922,7 +922,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -997,7 +997,7 @@ async def test_submit_step_classifies_submit_error(jwt_path, baseline, tmp_path)
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -1408,6 +1408,7 @@ async def test_derived_input_value_cannot_inject_shell(jwt_path, baseline, tmp_p
         scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
         work_ticket_idx=99,
         container="docker://qiita/checkm:1.0.0",
+        entrypoint="/opt/qiita/checkm.sh",
         baseline_resources=baseline,
         derived_inputs={"QIITA_CHECKM_DB": "evil; touch pwned"},
     )
@@ -1448,6 +1449,7 @@ async def test_container_tmpdir_points_at_the_workspace_not_the_tmpfs(jwt_path, 
         scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
         work_ticket_idx=99,
         container="docker://qiita/assemble:1.0.0",
+        entrypoint="/opt/qiita/assemble.sh",
         baseline_resources=baseline,
     )
 

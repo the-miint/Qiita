@@ -60,6 +60,7 @@ def _step(baseline_resources: BaselineResources, *, name: str = "demux") -> Work
         name=name,
         step_type=StepType.SINGLETON,
         container="bcl-convert-4.5.4.sif",
+        entrypoint="/opt/qiita/entrypoint.sh",
         baseline_resources=baseline_resources,
     )
 

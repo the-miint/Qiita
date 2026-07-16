@@ -94,6 +94,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **read-mask `lima` container step was missing its `entrypoint` (#311).** The step
+  declared `container: lima-2.13.0.sif` but no `entrypoint:`, so the SLURM job ran
+  `apptainer exec <sif>` with no command and died with "exec requires at least 2
+  arg(s), only received 1" — `apptainer exec` does not fall back to the image's
+  runscript. Added `entrypoint: /opt/qiita/lima.sh` (the launcher lima.def already
+  bakes in), and closed the gap that let it ship: a `container:` step with no
+  `entrypoint:` is now rejected at `actions sync` (the `WorkflowStep` validator) and
+  again when the SLURM payload is assembled (`_build_script`), instead of failing
+  opaquely in a job.
+- **Data-plane UNAVAILABLE on a read-mask fetch is now retriable, not permanent (#311).**
+  A DP read-materialization that failed with a transient gRPC UNAVAILABLE
+  (`FlightUnavailableError` — the DP briefly unreachable during a fan-out or a deploy
+  restart) was filed as permanent `BAD_INPUT`, failing the ticket for good. It is now
+  classified `DATA_PLANE_TRANSIENT` (retriable, a redrive self-heals) alongside the
+  existing SQLSTATE 40001 case.
 - **DuckLake concurrent-attach serialization crash on read-mask fan-out (#310).**
   `connect_ducklake` ran two `set_option()` calls (parquet compression/version) on
   every per-request attach, each persisting to the catalog-global `ducklake_metadata`

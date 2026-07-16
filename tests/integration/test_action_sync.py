@@ -240,6 +240,7 @@ async def test_sync_transaction_rolls_back_on_failure(
                     "step": "x",
                     "step_type": "singleton",
                     "container": "img:1",
+                    "entrypoint": "/opt/qiita/x.sh",
                     "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
                 }
             ],
@@ -292,6 +293,7 @@ steps:
   - step: hash
     step_type: singleton
     container: qiita/reference-hash:2.0.0
+    entrypoint: /opt/qiita/hash.sh
     target_status: hashing
     baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
   - action: mint-features
