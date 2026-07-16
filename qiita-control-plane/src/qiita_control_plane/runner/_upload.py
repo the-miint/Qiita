@@ -52,7 +52,7 @@ def _submission_bad_input(reason: str) -> BackendFailure:
 _DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent update"
 
 
-def _is_transient_dp_error(exc: BaseException) -> bool:
+def _is_dp_serialization_conflict(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is a transient, retriable serialization
     conflict (SQLSTATE 40001) rather than a permanent bad-input / DP-down error."""
     return _DP_SERIALIZATION_SIGNATURE in str(exc)
@@ -68,7 +68,9 @@ def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFail
     SUBMISSION/step_name=None shape either way, so it stays a drop-in for the
     existing `except` translation in `run_workflow`."""
     kind = (
-        FailureKind.DATA_PLANE_TRANSIENT if _is_transient_dp_error(exc) else FailureKind.BAD_INPUT
+        FailureKind.DATA_PLANE_TRANSIENT
+        if _is_dp_serialization_conflict(exc)
+        else FailureKind.BAD_INPUT
     )
     return BackendFailure(
         kind=kind,

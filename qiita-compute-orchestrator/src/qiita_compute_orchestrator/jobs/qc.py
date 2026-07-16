@@ -71,8 +71,10 @@ Adapters: the canonical adapter set is materialized by the runner
 Parquet), read here with `read_parquet` — the same columnar format the rest of
 the pipeline uses, so no FASTA parsing — and rendered into a constant SQL `VARCHAR[]`
 (miint's QC functions require bind-time constants — the adapter list cannot be a
-column/parameter). QC is always-on in this path, so `adapter_parquet` is a
-REQUIRED input and an empty one is fail-fast.
+column/parameter). QC is always-on, but `adapter_parquet` is OPTIONAL: unbound
+(None) renders an empty `VARCHAR[]`, which miint's `trim_adapters` no-ops (0 trims),
+so a long-read / PacBio mask runs the length/quality filter with no adapter trim. A
+bound but empty *file* stays fail-fast (a misconfigured short-read adapter set).
 """
 
 from __future__ import annotations

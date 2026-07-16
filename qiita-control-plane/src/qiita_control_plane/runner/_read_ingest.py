@@ -119,10 +119,11 @@ async def _stage_shard_roster(
     roster path) and `shard_id` so the build steps' `Inputs` resolve.
 
     Like the other pre-loop resolvers, a Flight failure is wrapped as a
-    SUBMISSION-attributed BAD_INPUT so it lands in the outer FAILED handler
-    instead of escaping as an untyped exception (which would violate the
-    step-name CHECK). An empty membership shard is a misconfiguration — fail
-    loud rather than build an empty index."""
+    SUBMISSION-attributed failure (via `_submission_dp_fetch_failure`: a DuckLake
+    serialization conflict is retriable, everything else BAD_INPUT) so it lands in
+    the outer FAILED handler instead of escaping as an untyped exception (which
+    would violate the step-name CHECK). An empty membership shard is a
+    misconfiguration — fail loud rather than build an empty index."""
     rows = await pool.fetch(
         "SELECT feature_idx FROM qiita.reference_membership"
         " WHERE reference_idx = $1 AND shard_id = $2",
@@ -151,9 +152,10 @@ async def _stage_shard_roster(
             roster_path,
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not fetch reference_sequences for reference {reference_idx} "
-            f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}"
+            f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}",
+            exc,
         ) from exc
     return {SHARD_FEATURES_BINDING: roster_path, SHARD_ID_BINDING: shard_id}
 

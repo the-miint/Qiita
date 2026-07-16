@@ -499,9 +499,11 @@ mod tests {
         std::fs::create_dir_all(&data_path).unwrap();
         connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
-        // Match the production boot connection: catalog options are set once at
-        // startup (main.rs), no longer by connect_ducklake. Tests that exercise
-        // DuckLake writes need the same zstd/v2 defaults set here.
+        // This helper mirrors the production BOOT connection (main.rs): it creates
+        // the tables AND sets the catalog-global Parquet options once. connect_ducklake
+        // no longer does. The options persist in the shared Postgres catalog, so
+        // per-request connections (flight_service, in tests as in production) inherit
+        // them and correctly do NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
     }

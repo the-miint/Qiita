@@ -18,8 +18,8 @@ description: >
   over the one `read` row set. Run it for host reference 2 now and host
   reference 4 later — neither re-runs ingest.
 
-  QC (`qc`) is the same fastp-equivalent transform (adapter trim → optional
-  polyG → length/quality filter, fastp `-l 100`), ALWAYS ON, dropping nothing:
+  QC (`qc`) is the same fastp-equivalent transform (adapter trim [short-read only]
+  → optional polyG → length/quality filter, fastp `-l 100`), ALWAYS ON, dropping nothing:
   it emits a partial mask (per read: reason + per-end trims) keyed by
   sequence_idx. Listing `adapter_parquet` in its optional_inputs signals the
   runner to materialize the canonical adapter set before the step loop — but only

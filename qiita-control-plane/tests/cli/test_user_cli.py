@@ -3209,7 +3209,15 @@ def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
 
 
 def _run_submit_host_filter_pool(
-    *, run=3, pool=5, rype=None, minimap2=None, force=False, only_missing=False, dry_run=False
+    *,
+    run=3,
+    pool=5,
+    rype=None,
+    minimap2=None,
+    syndna=None,
+    force=False,
+    only_missing=False,
+    dry_run=False,
 ):
     from qiita_control_plane.cli.user import main
 
@@ -3224,6 +3232,8 @@ def _run_submit_host_filter_pool(
         argv += ["--host-rype-reference-idx", str(rype)]
     if minimap2 is not None:
         argv += ["--host-minimap2-reference-idx", str(minimap2)]
+    if syndna is not None:
+        argv += ["--syndna-reference-idx", str(syndna)]
     if force:
         argv += ["--force"]
     if only_missing:
@@ -3285,6 +3295,42 @@ def test_submit_host_filter_pool_pacbio_no_facts_not_bypassable_by_force(monkeyp
     assert exc.value.code == 1
     assert "--force does not bypass this" in capsys.readouterr().err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_pacbio_sets_qc_adapter_enabled_false(monkeypatch):
+    """A PacBio absquant pool: each read-mask ticket carries qc_adapter_enabled=False
+    — HiFi carries no Illumina adapters, so QC skips the adapter trim (SMRTbell +
+    Twist are handled by the instrument and lima). syndna_enabled is True (absquant),
+    lima_enabled False (no twist adaptor). The Illumina case (qc_adapter_enabled=True)
+    is covered by the fan-out test below."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    # Seawater pass-through host; absquant sheet_type; no twist adaptor (lima off).
+    roster = _pool_samples_body([(100, 1000, "1", False)])
+    for row in roster["samples"]:
+        row["sheet_type"] = "pacbio_absquant"
+        row["twist_adaptor_id"] = None
+        row["syndna_is_twisted"] = None
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, roster),
+            (200, run_body),
+            (200, _ref_active_body(reference_idx=14)),  # syndna reference (readiness check)
+            (200, [_both_indexes_body(reference_idx=14)[1]]),  # its minimap2 index
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+    rc = _run_submit_host_filter_pool(syndna=14)
+    assert rc == 0
+    post = next(r for r in captured["requests"] if r["method"] == "POST")
+    ctx = post["json"]["action_context"]
+    assert ctx["qc_adapter_enabled"] is False  # PacBio: QC does not trim adapters
+    assert ctx["syndna_enabled"] is True  # absquant
+    assert ctx["lima_enabled"] is False  # no twist adaptor
+    assert ctx["host_filter_enabled"] is False  # seawater pass-through
 
 
 def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, capsys):
