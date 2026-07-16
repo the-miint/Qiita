@@ -95,6 +95,23 @@ def test_trim_adapters_se_removes_3p_adapter():
         assert r["trimmed_3p"] == len(_ADAPTER)
 
 
+def test_trim_adapters_se_empty_adapters_is_noop():
+    """SE `trim_adapters(seq, qual, [])` with an EMPTY adapter list is a no-op:
+    0 trims, sequence unchanged — even when an adapter IS present in the read. This
+    is the PacBio / long-read QC path: the `qc` job binds no adapter set and renders
+    `[]::VARCHAR[]`, so QC runs the length/quality filter with no adapter trim. Pins
+    the miint behavior the optional-`adapter_parquet` design relies on (a bump that
+    started trimming on an empty set would silently clip HiFi reads)."""
+    read = _INSERT + _ADAPTER
+    with open_miint_conn() as conn:
+        r = conn.execute(
+            f"SELECT trim_adapters('{read}', {_q(len(read))}, []::VARCHAR[])"
+        ).fetchone()[0]
+        assert r["sequence"] == read
+        assert r["trimmed_5p"] == 0
+        assert r["trimmed_3p"] == 0
+
+
 def test_trim_adapters_pe_11arg_empty_adapters_equals_4arg():
     """The 11-arg form with an empty adapter list and the fastp overlap defaults
     (30, 5, 20, false, 0, false) reproduces the 4-arg overlap-only result — pins

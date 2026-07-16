@@ -22,6 +22,11 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Spike-in reference load runbook (#310).** `docs/runbooks/spike-in-reference.md`
+  documents loading a SynDNA/spike-in reference for `--syndna-reference-idx`: plasmids
+  (not bare inserts) so the 0.90 aligned-fraction gate is correct, the required
+  GTDB-prefixed **Parquet** taxonomy (not a TSV), and why `--host --no-rype-index
+  --minimap2-preset map-hifi` is the sanctioned way to build the map-hifi `.mmi`.
 - **Reference feature annotations: GFF3 in, typed interval rows out (#269).** A
   reference can now carry per-interval ANNOTATIONS — a SynDNA insert on its
   plasmid, a gene on a chromosome — supplied as a GFF3 (`qiita reference load
@@ -89,6 +94,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **DuckLake concurrent-attach serialization crash on read-mask fan-out (#310).**
+  `connect_ducklake` ran two `set_option()` calls (parquet compression/version) on
+  every per-request attach, each persisting to the catalog-global `ducklake_metadata`
+  row. A burst of concurrent Flight requests (a 26-way read-mask submit, each doing a
+  DP fetch) all UPDATE'd that one row and failed with Postgres SQLSTATE 40001
+  (`could not serialize access due to concurrent update`). The options are now set
+  **once at boot** (`set_catalog_options` in `main.rs`); per-request attaches only
+  `LOAD` + `ATTACH`.
+- **Data-plane serialization failures are now retriable, not permanent (#310).** A DP
+  Flight fetch (adapter sequences, read materialization) that hit the DuckLake 40001
+  conflict was wrapped as a permanent `BAD_INPUT`, failing the read-mask ticket for
+  good. New `FailureKind.DATA_PLANE_TRANSIENT` (retriable) + `_submission_dp_fetch_failure`
+  classify a serialization conflict as retriable (a redrive self-heals) while keeping
+  every other DP-fetch failure permanent.
+- **PacBio read-mask no longer trims Illumina adapters (#310).** QC always fetched the
+  deploy's default (Illumina TruSeq) adapter set and trimmed against it, including on
+  PacBio HiFi (which carries no TruSeq adapters — SMRTbell is instrument-removed, Twist
+  is handled by lima), which was also the fetch that hit the crash above. A new
+  `qc_adapter_enabled` gate (default true) is set false for PacBio by
+  `submit-host-filter-pool`; the runner then skips the adapter fetch, and the `qc` step
+  (its `adapter_parquet` now optional) runs polyG + the length/quality filter with no
+  adapter trim.
 - **`--gff` was unusable on prokka and bakta output (#269).** Both annotators always
   append the genome to their GFF3 as a `##FASTA` section, and miint's `read_gff` does
   not stop there — it returns one row per line of the embedded FASTA, with the

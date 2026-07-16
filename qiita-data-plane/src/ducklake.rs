@@ -50,13 +50,23 @@ pub fn connect_ducklake(
     conn.execute_batch(&format!(
         "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake (DATA_PATH '{data_path}');"
     ))?;
-    // Align DuckLake's OWN parquet writes (compaction, merge, any future direct
-    // insert) with how register_files writes our files. DuckLake's defaults are
-    // snappy + Parquet v1; qiita_common.parquet.PARQUET_OPTS writes zstd + v2, so
-    // without this DuckLake's maintenance rewrites would drift from the
-    // register-time format. Persisted in ducklake_metadata (a catalog-global
-    // default; the per-chunks-table row-group override is set alongside each table).
-    // Idempotent — re-set on every boot. Keep the values in sync with PARQUET_OPTS.
+    Ok(())
+}
+
+/// Set the catalog-global Parquet options DuckLake uses for its OWN writes
+/// (compaction, merge, any future direct insert), aligning them with how
+/// register_files writes our files: `qiita_common.parquet.PARQUET_OPTS` is
+/// zstd + Parquet v2, whereas DuckLake defaults to snappy + v1. Without this,
+/// DuckLake's maintenance rewrites would drift from the register-time format.
+///
+/// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
+/// only need to be set ONCE per catalog. Call this on the PROCESS-START
+/// connection only — NEVER on a per-request attach. Setting it on every attach
+/// made each concurrent Flight request UPDATE the same `ducklake_metadata` row,
+/// which serialized and failed under load with Postgres SQLSTATE 40001
+/// (`could not serialize access due to concurrent update`). Keep the values in
+/// sync with PARQUET_OPTS.
+pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CALL qiita_lake.set_option('parquet_compression', 'zstd');
          CALL qiita_lake.set_option('parquet_version', 2);",
@@ -489,6 +499,12 @@ mod tests {
         std::fs::create_dir_all(&data_path).unwrap();
         connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
+        // This helper mirrors the production BOOT connection (main.rs): it creates
+        // the tables AND sets the catalog-global Parquet options once. connect_ducklake
+        // no longer does. The options persist in the shared Postgres catalog, so
+        // per-request connections (flight_service, in tests as in production) inherit
+        // them and correctly do NOT re-set them.
+        set_catalog_options(&conn).expect("failed to set catalog options");
         conn
     }
 

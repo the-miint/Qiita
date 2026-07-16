@@ -23,7 +23,7 @@ from ..actions.reference import (
 )
 from ..auth.tickets import sign_ticket
 from ._read_ingest import _workflow_declares_input
-from ._upload import _submission_bad_input
+from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 # =============================================================================
 # Reference-index resolution
@@ -616,17 +616,20 @@ async def _resolve_qc_adapters(
     # work_ticket_failure_step_name_consistent CHECK (step_run ⇒ step_name NOT
     # NULL) — the failure transition itself would throw and strand the ticket in
     # PROCESSING. Wrap it as a SUBMISSION failure like every other pre-loop
-    # resolver. (Not retried in place: the operator resubmits if the data plane
-    # was down.)
+    # resolver via _submission_dp_fetch_failure, which classifies a transient
+    # serialization conflict (concurrent DuckLake attach, SQLSTATE 40001) as
+    # RETRIABLE (a redrive self-heals) and anything else — DP down / errored — as
+    # permanent (the operator resubmits).
     try:
         rows = await asyncio.get_event_loop().run_in_executor(
             None, _runner_pkg._do_get_reference_sequence_chunks, data_plane_url, ticket
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not fetch adapter sequences for reference "
             f"{default_adapter_reference_idx} from the data plane: "
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: {exc}",
+            exc,
         ) from exc
     workspace.mkdir(parents=True, exist_ok=True)
     adapter_parquet = workspace / "adapters.parquet"

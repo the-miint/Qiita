@@ -94,6 +94,12 @@ class FailureKind(StrEnum):
     # the (idempotent) step rather than discarding hours of demux over one blip.
     CONTROL_PLANE_UNREACHABLE = "control_plane_unreachable"
     PROCESS_RESTARTED = "process_restarted"  # CP drain cancelled a task
+    # The data plane returned a transient, retriable error over Flight — e.g. a
+    # DuckLake catalog write that lost a Postgres serialization race under
+    # concurrent attaches (SQLSTATE 40001, "could not serialize access due to
+    # concurrent update"). NOT a malformed request: the same call succeeds once
+    # the contention clears, so a redrive self-heals.
+    DATA_PLANE_TRANSIENT = "data_plane_transient"
 
     # ---- Permanent: workflow / input / contract issues -------------------
     BAD_INPUT = "bad_input"
@@ -122,6 +128,7 @@ _RETRIABLE: frozenset[FailureKind] = frozenset(
         FailureKind.ORCHESTRATOR_UNREACHABLE,
         FailureKind.CONTROL_PLANE_UNREACHABLE,
         FailureKind.PROCESS_RESTARTED,
+        FailureKind.DATA_PLANE_TRANSIENT,
     }
 )
 

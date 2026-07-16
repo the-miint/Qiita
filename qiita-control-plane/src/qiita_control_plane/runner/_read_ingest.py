@@ -20,7 +20,7 @@ import qiita_control_plane.runner as _runner_pkg
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import connect_with_miint
 from ..repositories.block import fetch_mask_sample_state
-from ._upload import _submission_bad_input
+from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
 
@@ -119,10 +119,11 @@ async def _stage_shard_roster(
     roster path) and `shard_id` so the build steps' `Inputs` resolve.
 
     Like the other pre-loop resolvers, a Flight failure is wrapped as a
-    SUBMISSION-attributed BAD_INPUT so it lands in the outer FAILED handler
-    instead of escaping as an untyped exception (which would violate the
-    step-name CHECK). An empty membership shard is a misconfiguration — fail
-    loud rather than build an empty index."""
+    SUBMISSION-attributed failure (via `_submission_dp_fetch_failure`: a DuckLake
+    serialization conflict is retriable, everything else BAD_INPUT) so it lands in
+    the outer FAILED handler instead of escaping as an untyped exception (which
+    would violate the step-name CHECK). An empty membership shard is a
+    misconfiguration — fail loud rather than build an empty index."""
     rows = await pool.fetch(
         "SELECT feature_idx FROM qiita.reference_membership"
         " WHERE reference_idx = $1 AND shard_id = $2",
@@ -151,9 +152,10 @@ async def _stage_shard_roster(
             roster_path,
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not fetch reference_sequences for reference {reference_idx} "
-            f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}"
+            f"shard {shard_id} from the data plane: {type(exc).__name__}: {exc}",
+            exc,
         ) from exc
     return {SHARD_FEATURES_BINDING: roster_path, SHARD_ID_BINDING: shard_id}
 
@@ -417,9 +419,10 @@ async def _resolve_staged_reads(
             None, _runner_pkg._do_action_export_read, data_plane_url, token
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not materialize reads for prep_sample {prep_sample_idx} from "
-            f"the data plane: {type(exc).__name__}: {exc}"
+            f"the data plane: {type(exc).__name__}: {exc}",
+            exc,
         ) from exc
 
     # `count` is already an int (coerced in `_do_action_export_read`).
@@ -501,9 +504,10 @@ async def _resolve_staged_masked_reads(
             None, _runner_pkg._stream_masked_reads_to_fastq, data_plane_url, ticket, dest
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not stream masked reads for prep_sample {prep_sample_idx} "
-            f"(mask_idx {mask_idx}) from the data plane: {type(exc).__name__}: {exc}"
+            f"(mask_idx {mask_idx}) from the data plane: {type(exc).__name__}: {exc}",
+            exc,
         ) from exc
 
     if count == 0:
@@ -589,9 +593,10 @@ async def _resolve_staged_reads_block(
             None, _runner_pkg._do_action_export_read_block, data_plane_url, token
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not materialize reads for the block from the data plane: "
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: {exc}",
+            exc,
         ) from exc
 
     # `count` is already an int (coerced in `_do_action_export`).
@@ -688,9 +693,10 @@ async def _resolve_staged_masked_reads_block(
             None, _runner_pkg._do_action_export_read_masked_block, data_plane_url, token
         )
     except Exception as exc:
-        raise _submission_bad_input(
+        raise _submission_dp_fetch_failure(
             f"could not materialize masked reads for the block from the data plane: "
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: {exc}",
+            exc,
         ) from exc
 
     if result.get("count", 0) == 0:

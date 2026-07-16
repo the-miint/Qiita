@@ -18,11 +18,13 @@ description: >
   over the one `read` row set. Run it for host reference 2 now and host
   reference 4 later — neither re-runs ingest.
 
-  QC (`qc`) is the same fastp-equivalent transform (adapter trim → optional
-  polyG → length/quality filter, fastp `-l 100`), ALWAYS ON, dropping nothing:
+  QC (`qc`) is the same fastp-equivalent transform (adapter trim [short-read only]
+  → optional polyG → length/quality filter, fastp `-l 100`), ALWAYS ON, dropping nothing:
   it emits a partial mask (per read: reason + per-end trims) keyed by
-  sequence_idx. Listing `adapter_parquet` in its inputs signals the runner to
-  materialize the canonical adapter set before the step loop.
+  sequence_idx. Listing `adapter_parquet` in its optional_inputs signals the
+  runner to materialize the canonical adapter set before the step loop — but only
+  when the mask enables QC adapter trimming (short-read); a long-read / PacBio
+  mask leaves it unbound and QC runs the length/quality filter with no adapter trim.
 
   Host filtering (`host_filter`) merges its rype/minimap2 host hits into the QC
   mask under a privacy precedence (host wins over pass; a QC-failed read keeps
@@ -225,8 +227,9 @@ steps:
   # Always-on QC over the stored reads. Emits a PARTIAL read mask (qc_mask: per
   # read, reason + per-end trims) — it drops nothing. `reads` is runner-bound
   # from the prep_sample's stored reads (_resolve_staged_reads); `adapter_parquet`
-  # is materialized by the runner before the loop. `instrument_model` rides
-  # through `params:` to gate polyG.
+  # is materialized by the runner before the loop when QC adapter trimming is
+  # enabled (short-read) and left unbound for a long-read / PacBio mask (no
+  # adapter trim). `instrument_model` rides through `params:` to gate polyG.
   #
   # `partial_mask` is OPTIONAL: bound when syndna and/or lima ran (last writer
   # wins, so QC sees whichever ran latest). When bound, QC re-classifies only its
@@ -236,8 +239,8 @@ steps:
   - step: qc
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.qc
-    inputs: [reads, adapter_parquet]
-    optional_inputs: [partial_mask]
+    inputs: [reads]
+    optional_inputs: [adapter_parquet, partial_mask]
     params: {instrument_model: instrument_model}
     outputs: [qc_mask]
     baseline_resources:
