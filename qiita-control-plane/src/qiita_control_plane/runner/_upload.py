@@ -43,6 +43,41 @@ def _submission_bad_input(reason: str) -> BackendFailure:
     )
 
 
+# Postgres SQLSTATE 40001 signature. The data plane's DuckLake catalog writes run
+# under serializable isolation, so a concurrent-attach race surfaces this exact
+# text — but stringified through the pyarrow FlightError the DP returns, so there
+# is no typed asyncpg exception to isinstance against at this layer (unlike
+# `_is_transient_db_error`, which matches the CP's OWN asyncpg errors). Match the
+# message. See FailureKind.DATA_PLANE_TRANSIENT.
+_DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent update"
+
+
+def _is_transient_dp_error(exc: BaseException) -> bool:
+    """True if a data-plane Flight failure is a transient, retriable serialization
+    conflict (SQLSTATE 40001) rather than a permanent bad-input / DP-down error."""
+    return _DP_SERIALIZATION_SIGNATURE in str(exc)
+
+
+def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
+    """A SUBMISSION failure for a data-plane Flight fetch (adapters, reads).
+
+    Classifies by cause: a transient serialization conflict (concurrent DuckLake
+    attach) is DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything
+    else keeps the BAD_INPUT/permanent shape of `_submission_bad_input` (a genuine
+    bad reference, missing data, or DP-down that an operator must resolve). Same
+    SUBMISSION/step_name=None shape either way, so it stays a drop-in for the
+    existing `except` translation in `run_workflow`."""
+    kind = (
+        FailureKind.DATA_PLANE_TRANSIENT if _is_transient_dp_error(exc) else FailureKind.BAD_INPUT
+    )
+    return BackendFailure(
+        kind=kind,
+        stage=WorkTicketFailureStage.SUBMISSION,
+        step_name=None,
+        reason=reason,
+    )
+
+
 async def _resolve_upload_handles(
     pool: asyncpg.Pool,
     *,
