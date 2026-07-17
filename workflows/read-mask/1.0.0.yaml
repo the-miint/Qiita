@@ -175,8 +175,9 @@ steps:
   # `_resolve_staged_masked_reads` needs an already-completed mask, and this chain
   # is what builds it; the raw `read` table is not Flight-reachable. It must be a
   # BAM and not a FASTQ — lima selects its CCS path from the input FORMAT, and the
-  # CLR path a FASTQ forces hangs rather than finishing. `lima_zmw_map` carries the
-  # `zmw -> sequence_idx` key channel lima's record names cannot (see the job).
+  # CLR path a FASTQ forces hangs rather than finishing. The BAM's record name is
+  # the lake's `read_id` (PacBio's `<movie>/<zmw>/ccs`), which lima round-trips, so
+  # `lima_mask` keys straight back on `read_id` — no separate map binding.
   - step: lima_export
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.lima_export
@@ -187,7 +188,7 @@ steps:
     # `lima_preset`; it is never client-supplied (it would otherwise let a caller
     # forge mask identity and pass arbitrary flags to a container).
     params: {lima_args: lima_args}
-    outputs: [lima_in_bam, lima_zmw_map, lima_config]
+    outputs: [lima_in_bam, lima_config]
     baseline_resources:
       cpu: 2
       mem_gb: 8
@@ -221,7 +222,7 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.lima_mask
     when: lima_enabled
-    inputs: [reads, lima_out_fastq, lima_zmw_map]
+    inputs: [reads, lima_out_fastq]
     optional_inputs: [partial_mask]
     outputs: [partial_mask]
     baseline_resources:

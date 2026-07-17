@@ -403,7 +403,6 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pyarrow" },
-    { name = "pysam" },
     { name = "qiita-common" },
     { name = "run-preflight" },
     { name = "uvicorn", extra = ["standard"] },
@@ -412,6 +411,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "pysam" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -423,7 +423,6 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pyarrow", specifier = ">=19" },
-    { name = "pysam", specifier = ">=0.23" },
     { name = "qiita-common", directory = "../qiita-common" },
     { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=366e381a72b9b7ef8b9842735cf5d7d80906194c" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
@@ -432,6 +431,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx", specifier = ">=0.28" },
+    { name = "pysam", specifier = ">=0.23" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "ruff", specifier = ">=0.15" },

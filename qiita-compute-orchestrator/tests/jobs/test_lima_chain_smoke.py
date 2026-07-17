@@ -3,20 +3,27 @@
 The container step between them is not exercised here (lima is a binary in a SIF;
 `LocalBackend` refuses container steps and `make test-workflows` is Linux-only).
 Instead lima is SIMULATED by writing the FASTQ it would emit — which is the point:
-the fragile part of this chain is not lima itself but the `sequence_idx` round-trip
+the fragile part of this chain is not lima itself but the read-key round-trip
 through lima's output, and the `infer_trim` contract layered on it.
 
 The simulation mirrors what lima 2.13.0 was PROBED to do, not what it plausibly
-does (`test_sam_bam_writer_miint_contract.py` pins why that BAM is written with
-pysam rather than a miint COPY): it emits `<movie>/<zmw>/ccs` names, rewritten from
-each record's `zm` tag, with its BAM tags appended after one space.
+does: it emits the record name VERBATIM (which for our BAM is the lake's
+`read_id`), with its own BAM tags appended after one space.
+
+**The uBAM write itself is not exercised yet.** `lima_export` writes the CCS BAM
+with miint's `COPY ... TO (FORMAT UBAM)`, requested in duckdb-miint#156 and not in
+the mirror build yet, so the cases that inspect the produced BAM SKIP until it
+lands (the `requires_ubam` fixture) — they are the ones to re-run first when it
+does. Everything else runs today: the input GUARDS all raise before the COPY (so
+`execute` reaches them without the writer), and the whole `lima_mask` side is plain
+DuckDB.
 
 Pinned here:
-  - `lima_export` writes a CCS uBAM whose record names carry a DENSE ZMW counter,
-    with `lima_zmw_map` carrying `zmw -> sequence_idx` — the key channel, since a
-    lake-wide `sequence_idx` cannot ride in lima's int32 `zm` tag;
-  - the ZMW counter is dense even when `sequence_idx` is astronomically large —
-    the case that silently corrupted the mask if the idx were used as the ZMW;
+  - `lima_export` writes the lake's `read_id` as the record name — the key channel,
+    since lima round-trips the name and `lima_mask` joins straight back on it;
+  - the ZMW rides in an int32 `zm` tag, so a `read_id` whose hole number exceeds
+    int32, a read set spanning >1 movie, or a non-PacBio `read_id` each fail LOUD
+    rather than silently masking the wrong read;
   - lima's appended BAM tags (`bc=`/`bl=`/…) land in `read_fastx`'s `comment`
     column and never pollute the key;
   - emitted trims are relative to the RAW read, so applying them to the raw read
@@ -24,8 +31,8 @@ Pinned here:
   - a read lima omitted becomes `twist_no_adaptor` with zero trims;
   - an EMPTY lima output is handled rather than crashing `read_fastx` — a guard on
     an external tool's file, NOT the adapter-free-sample path (lima FATALs there);
-  - a ZMW that is not in the map, a resolved key that is not an input read, or a
-    duplicated one, fails loud rather than silently dropping / duplicating a row;
+  - a name that is not a known `read_id`, a resolved key that is not an exported
+    read, or a duplicated one, fails loud rather than silently dropping / duplicating;
   - lima editing internal bases (not pure end-trimming) fails loud via `infer_trim`.
 """
 
@@ -44,6 +51,18 @@ _LEAD = "TTTTTTTTTT"
 _TRAIL = "CCCCCCCC"
 _LIMA_ARGS = "--hifi-preset ASYMMETRIC --neighbors --peek-guess"
 
+# A realistic PacBio movie, and a hole-number base kept DISTINCT from sequence_idx
+# (and int32-safe for the small sidx values here) so the join is genuinely on
+# `read_id` and never on a sidx==hole coincidence.
+_MOVIE = "m84137_260623_040906_s1"
+_HOLE_BASE = 100_000_000
+
+
+def _rid(sidx: int, *, hole: int | None = None, movie: str = _MOVIE) -> str:
+    """The `read_id` for a given sequence_idx — PacBio's `<movie>/<zmw>/ccs`, the
+    shape `bam_to_parquet` keeps verbatim from the instrument BAM."""
+    return f"{movie}/{_HOLE_BASE + sidx if hole is None else hole}/ccs"
+
 
 def _q(seq: str, val: int = 35) -> list[int]:
     return [val] * len(seq)
@@ -57,30 +76,25 @@ def _mask_rows(path: Path) -> list[tuple]:
         ).fetchall()
 
 
-def _zmw_map(path: Path) -> dict[int, int]:
-    """`sequence_idx -> zmw`, the inverse of what lima_export writes."""
-    with duckdb.connect(":memory:") as conn:
-        rows = conn.execute(f"SELECT sequence_idx, zmw FROM read_parquet('{path}')").fetchall()
-    return {sidx: zmw for sidx, zmw in rows}
-
-
-def _write_lima_output(path: Path, records: list[tuple[int, str]], *, tags: bool = True) -> Path:
-    """Simulate lima: name rewritten from the record's `zm` tag as
-    `<movie>/<zmw>/ccs`, BAM tags appended after one space, sequence end-clipped.
-    Reads lima dropped simply do not appear. `records` is (zmw, clipped_sequence)."""
-    from qiita_compute_orchestrator.jobs.lima_export import _MOVIE
-
+def _write_lima_output(
+    path: Path, kept: list[tuple[int, str]], *, tags: bool = True, read_id_of=_rid
+) -> Path:
+    """Simulate lima: record name emitted VERBATIM (lima round-trips it, probed),
+    BAM tags appended after one space, sequence end-clipped. Reads lima dropped
+    simply do not appear. `kept` is (sequence_idx, clipped_sequence)."""
     suffix = " bc=3,3 bl=AACC bq=100" if tags else ""
     path.write_text(
-        "".join(
-            f"@{_MOVIE}/{zmw}/ccs{suffix}\n{seq}\n+\n{'I' * len(seq)}\n" for zmw, seq in records
-        )
+        "".join(f"@{read_id_of(sidx)}{suffix}\n{seq}\n+\n{'I' * len(seq)}\n" for sidx, seq in kept)
     )
     return path
 
 
-def _reads(tmp_path: Path, rows: list[tuple[int, str]], *, paired: bool = False) -> Path:
-    """A raw read.parquet in the fastq_to_parquet 7-column shape."""
+def _reads(
+    tmp_path: Path, rows: list[tuple[int, str]], *, paired: bool = False, read_id_of=_rid
+) -> Path:
+    """A raw read.parquet in the fastq_to_parquet 7-column shape, `read_id` in
+    PacBio `<movie>/<zmw>/ccs` form (what `bam_to_parquet` produces)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     out = tmp_path / "reads.parquet"
     values = ", ".join(
         "(CAST(? AS BIGINT), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR), "
@@ -89,7 +103,7 @@ def _reads(tmp_path: Path, rows: list[tuple[int, str]], *, paired: bool = False)
     )
     params: list = []
     for sidx, seq in rows:
-        params.extend([5, sidx, f"r{sidx}", seq, _q(seq), seq if paired else None])
+        params.extend([5, sidx, read_id_of(sidx), seq, _q(seq), seq if paired else None])
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             f"COPY (SELECT * FROM (VALUES {values}) AS t("
@@ -98,6 +112,22 @@ def _reads(tmp_path: Path, rows: list[tuple[int, str]], *, paired: bool = False)
             params,
         )
     return out
+
+
+@pytest.fixture
+def requires_ubam(tmp_path):
+    """Skip when the loaded miint build cannot write an unaligned reads BAM.
+
+    Only the cases that INSPECT the produced BAM need it; the input guards and the
+    whole `lima_mask` side run without it. Gated rather than xfail-ed so the reason
+    is legible, and so these light up on their own the day the mirror ships
+    duckdb-miint#156 — no one has to remember to unskip."""
+    from qiita_compute_orchestrator.jobs.lima_export import miint_supports_ubam
+    from qiita_compute_orchestrator.miint import open_miint_conn
+
+    with open_miint_conn() as conn:
+        if not miint_supports_ubam(conn, tmp_path / "ubam_probe.bam"):
+            pytest.skip("miint build cannot write a uBAM yet — duckdb-miint#156")
 
 
 def _export(tmp_path: Path, reads: Path, args: str = _LIMA_ARGS):
@@ -111,53 +141,48 @@ def _export(tmp_path: Path, reads: Path, args: str = _LIMA_ARGS):
     )
 
 
-def _mask(tmp_path: Path, reads: Path, lima_out: Path, zmw_map: Path):
+def _mask(tmp_path: Path, reads: Path, lima_out: Path):
     from qiita_compute_orchestrator.jobs import lima_mask
 
     return asyncio.run(
         lima_mask.execute(
-            lima_mask.Inputs(
-                reads=reads,
-                lima_out_fastq=lima_out,
-                lima_zmw_map=zmw_map,
-                work_ticket_idx=1,
-            ),
+            lima_mask.Inputs(reads=reads, lima_out_fastq=lima_out, work_ticket_idx=1),
             tmp_path / "wm",
         )
     )
 
 
 def _roundtrip(tmp_path: Path, rows: list[tuple[int, str]], kept: list[tuple[int, str]], **kw):
-    """Export -> simulate lima keeping `kept` (sequence_idx, clipped) -> mask."""
+    """`_reads` -> simulate lima keeping `kept` (sequence_idx, clipped) -> `_mask`.
+    The mask side is plain DuckDB, so this runs without the uBAM writer."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     reads = _reads(tmp_path, rows)
-    out = _export(tmp_path, reads)
-    zmw_of = _zmw_map(out["lima_zmw_map"])
-    lima_out = _write_lima_output(
-        tmp_path / "lima_out.fastq", [(zmw_of[sidx], seq) for sidx, seq in kept], **kw
-    )
-    return _mask(tmp_path, reads, lima_out, out["lima_zmw_map"])
+    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", kept, **kw)
+    return _mask(tmp_path, reads, lima_out)
 
 
-def test_export_names_records_movie_zmw_ccs_not_a_bare_sequence_idx(tmp_path):
-    """lima requires PacBio's `<movie>/<zmw>/ccs` convention. A bare-integer record
-    name — the obvious way to carry `sequence_idx` — does not merely degrade: lima
-    HANGS on it (probed). The name shape is therefore a hard contract, not a style."""
+# --------------------------------------------------------------------------- #
+# lima_export — the produced BAM (needs the uBAM writer)                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_export_names_records_with_the_lake_read_id(tmp_path, requires_ubam):
+    """The record name IS `read_id`, verbatim — that is the key lima round-trips and
+    `lima_mask` joins back on. Nothing is synthesized."""
     import pysam
 
     reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
     out = _export(tmp_path, reads)
     with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        names = [rec.query_name for rec in bam]
-    assert all(n.count("/") == 2 and n.endswith("/ccs") for n in names), names
-    assert {n.split("/")[1] for n in names} == {"0", "1"}
+        names = {rec.query_name for rec in bam}
+    assert names == {_rid(11), _rid(22)}
 
 
-def test_export_bam_carries_the_ccs_read_type(tmp_path):
+def test_export_bam_carries_the_ccs_read_type(tmp_path, requires_ubam):
     """`DS:READTYPE=CCS` is the field lima keys on: probed, an @RG whose DS says
-    READTYPE=UNKNOWN is accepted but demoted to SubreadSets. (What selects the CCS
-    path in the first place is the input FORMAT being BAM at all; PL is asserted
-    because we ship it, not because it was independently varied.)"""
+    READTYPE=UNKNOWN is accepted but demoted to SubreadSets. `PU` carries the read
+    set's real movie (parsed from read_id) — lima names each record from `zm` + the
+    read group, so `PU` is what makes the output name match `read_id`."""
     import pysam
 
     reads = _reads(tmp_path, [(11, _INSERT)])
@@ -166,11 +191,12 @@ def test_export_bam_carries_the_ccs_read_type(tmp_path):
         (rg,) = bam.header.to_dict()["RG"]
     assert "READTYPE=CCS" in rg["DS"]
     assert rg["PL"] == "PACBIO"
+    assert rg["PU"] == _MOVIE
 
 
-def test_export_sets_the_zm_tag_lima_rewrites_the_name_from(tmp_path):
-    """lima does not preserve the input name: it REBUILDS each emitted record's name
-    from the `zm` tag. With no `zm` the ZMW comes back as `?` and the key is gone."""
+def test_export_sets_zm_to_the_hole_number_in_read_id(tmp_path, requires_ubam):
+    """lima rebuilds each emitted name from `zm` + the read group, so `zm` must be
+    the hole number parsed out of `read_id` for the name to round-trip."""
     import pysam
 
     reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
@@ -180,10 +206,11 @@ def test_export_sets_the_zm_tag_lima_rewrites_the_name_from(tmp_path):
             assert rec.get_tag("zm") == int(rec.query_name.split("/")[1])
 
 
-def test_export_bam_carries_the_reads_themselves(tmp_path):
-    """The anti-vacuity check on the writer swap. miint's `COPY ... (FORMAT BAM)`
-    silently emits `*` for SEQ/QUAL — a BAM that lima accepts and finds no reads in
-    would look like a working chain that masks everything `twist_no_adaptor`."""
+def test_export_bam_carries_the_reads_themselves(tmp_path, requires_ubam):
+    """The anti-vacuity check on the writer. miint's `COPY ... (FORMAT BAM)` silently
+    emits `*` for SEQ/QUAL — a BAM that lima accepts and finds no reads in would look
+    like a working chain that masks everything `twist_no_adaptor`. `FORMAT UBAM` must
+    actually put the bases in the file."""
     import pysam
 
     raw = _LEAD + _INSERT
@@ -195,12 +222,11 @@ def test_export_bam_carries_the_reads_themselves(tmp_path):
     assert list(rec.query_qualities) == _q(raw)
 
 
-def test_export_bam_quals_track_their_own_read(tmp_path):
-    """The phred scores are sliced out of Arrow's values buffer by a running offset
-    rather than materialized per read (`to_pylist` on HiFi quals is the step's whole
-    runtime). A mis-walked offset would not crash — it would hand read N read N-1's
-    tail, silently. So: reads of DIFFERENT lengths, each with a distinct score
-    pattern, every one checked. Constant-quality reads could not fail this."""
+def test_export_bam_quals_track_their_own_read(tmp_path, requires_ubam):
+    """The `zm` tag and the SEQ/QUAL must belong to the SAME read — a wrong TAGS or
+    column binding would put read N's quals on read M silently. Reads of DIFFERENT
+    lengths, each a distinct score pattern, every one checked. Constant-quality reads
+    could not fail this."""
     import pysam
 
     rows = [(11, "ACGT" * 3), (22, "TTTT" * 7), (33, "GG"), (44, "ACGTAC" * 5)]
@@ -213,7 +239,7 @@ def test_export_bam_quals_track_their_own_read(tmp_path):
     )
     params: list = []
     for sidx, seq in rows:
-        params.extend([5, sidx, f"r{sidx}", seq, quals[sidx]])
+        params.extend([5, sidx, _rid(sidx), seq, quals[sidx]])
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             f"COPY (SELECT * FROM (VALUES {values}) AS t("
@@ -222,61 +248,17 @@ def test_export_bam_quals_track_their_own_read(tmp_path):
             params,
         )
     out = _export(tmp_path, reads)
-    zmw_of = _zmw_map(out["lima_zmw_map"])
-    by_zmw = {zmw: sidx for sidx, zmw in zmw_of.items()}
+    hole_to_sidx = {_HOLE_BASE + sidx: sidx for sidx, _ in rows}
     seen = 0
     with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
         for rec in bam:
-            sidx = by_zmw[int(rec.query_name.split("/")[1])]
+            sidx = hole_to_sidx[int(rec.query_name.split("/")[1])]
             assert list(rec.query_qualities) == quals[sidx], f"quals crossed reads at {sidx}"
             seen += 1
     assert seen == len(rows)
 
 
-def test_export_rejects_a_read_with_no_qualities(tmp_path):
-    """A NULL `qual1` would break the running offset for every read after it, so it
-    is rejected rather than allowed to shift the file silently."""
-    reads = tmp_path / "reads.parquet"
-    with duckdb.connect(":memory:") as conn:
-        conn.execute(
-            "COPY (SELECT 5::BIGINT AS prep_sample_idx, 11::BIGINT AS sequence_idx, "
-            "'r11' AS read_id, 'ACGT' AS sequence1, NULL::UTINYINT[] AS qual1, "
-            "NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2) "
-            f"TO '{reads}' (FORMAT PARQUET)"
-        )
-    with pytest.raises(ValueError, match="qual1 contains NULL"):
-        _export(tmp_path, reads)
-
-
-def test_export_zmw_is_dense_even_for_a_huge_sequence_idx(tmp_path):
-    """THE corruption guard. `zm` is an int32 BAM tag and `sequence_idx` is
-    lake-wide-unique BIGINT. Using the idx as the ZMW does not raise — lima returns
-    it TRUNCATED (probed: 5000000000 -> 705032704), i.e. a mask silently attributed
-    to the wrong read. The ZMW must be a per-file counter, mapped back via the map."""
-    import pysam
-
-    huge = 5_000_000_000
-    reads = _reads(tmp_path, [(huge, _INSERT), (huge + 1, _INSERT)])
-    out = _export(tmp_path, reads)
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        zmws = [rec.get_tag("zm") for rec in bam]
-    assert sorted(zmws) == [0, 1], "ZMW must be a dense counter, never the sequence_idx"
-    mapping = _zmw_map(out["lima_zmw_map"])
-    assert sorted(mapping) == [huge, huge + 1]
-    assert sorted(mapping.values()) == [0, 1]
-
-
-def test_export_zmw_map_round_trips_every_read(tmp_path):
-    """The map IS the key channel — every exported read must be in it exactly once."""
-    rows = [(11, _INSERT), (22, _INSERT), (33, _INSERT)]
-    reads = _reads(tmp_path, rows)
-    out = _export(tmp_path, reads)
-    mapping = _zmw_map(out["lima_zmw_map"])
-    assert sorted(mapping) == [11, 22, 33]
-    assert sorted(mapping.values()) == [0, 1, 2], "dense, collision-free"
-
-
-def test_export_writes_the_cp_resolved_args_to_a_file(tmp_path):
+def test_export_writes_the_cp_resolved_args_to_a_file(tmp_path, requires_ubam):
     """A scalar cannot ride a container step's inputs (the runner treats every
     container input as a bind-mount path), so lima's args arrive as a file."""
     import json
@@ -284,6 +266,11 @@ def test_export_writes_the_cp_resolved_args_to_a_file(tmp_path):
     reads = _reads(tmp_path, [(11, _INSERT)])
     out = _export(tmp_path, reads)
     assert json.loads(out["lima_config"].read_text()) == {"args": _LIMA_ARGS}
+
+
+# --------------------------------------------------------------------------- #
+# lima_export — input guards (raise BEFORE the COPY, so they run without it)   #
+# --------------------------------------------------------------------------- #
 
 
 def test_export_rejects_paired_end(tmp_path):
@@ -296,6 +283,44 @@ def test_export_rejects_empty_lima_args(tmp_path):
     reads = _reads(tmp_path, [(11, _INSERT)])
     with pytest.raises(ValueError, match="lima_args"):
         _export(tmp_path, reads, args="   ")
+
+
+def test_export_rejects_a_read_id_that_is_not_pacbio_ccs(tmp_path):
+    """A FASTQ-ingested sample carries whatever the FASTQ said. lima needs the
+    `<movie>/<zmw>/ccs` shape and hangs without it, so this must fail loud at export,
+    where the cause is legible, not deep inside a hung SLURM job."""
+    reads = _reads(tmp_path, [(11, _INSERT)], read_id_of=lambda s: f"plain_read_{s}")
+    with pytest.raises(ValueError, match="not PacBio"):
+        _export(tmp_path, reads)
+
+
+def test_export_rejects_reads_spanning_more_than_one_movie(tmp_path):
+    """A single @RG stamps ONE movie on every record, and lima names each record from
+    `zm` + that read group — so a second movie's reads would come back under the
+    first movie's name, a wrong-but-plausible read_id. Fail loud rather than
+    mis-join."""
+    reads = _reads(
+        tmp_path,
+        [(11, _INSERT), (22, _INSERT)],
+        read_id_of=lambda s: _rid(s, movie=("movieA" if s == 11 else "movieB")),
+    )
+    with pytest.raises(ValueError, match="span"):
+        _export(tmp_path, reads)
+
+
+def test_export_rejects_a_hole_number_over_int32(tmp_path):
+    """The `zm` tag is int32. A hole number past it does not error in the tag — it
+    TRUNCATES into a valid-looking ZMW (probed: 5000000000 -> 705032704) and the mask
+    lands on the wrong read. A real PacBio hole cannot exceed int32; a corrupt one is
+    rejected rather than trusted."""
+    reads = _reads(tmp_path, [(11, _INSERT)], read_id_of=lambda s: _rid(s, hole=5_000_000_000))
+    with pytest.raises(ValueError, match="over the"):
+        _export(tmp_path, reads)
+
+
+# --------------------------------------------------------------------------- #
+# lima_mask — the read_id round-trip and infer_trim contract (plain DuckDB)    #
+# --------------------------------------------------------------------------- #
 
 
 def test_mask_trims_are_relative_to_the_raw_read(tmp_path):
@@ -318,9 +343,10 @@ def test_mask_marks_reads_lima_dropped_as_twist_no_adaptor(tmp_path):
     assert rows[1] == (22, ReadMaskReason.TWIST_NO_ADAPTOR.value, 0, 0, None, None)
 
 
-def test_mask_resolves_a_huge_sequence_idx_through_the_map(tmp_path):
-    """The end-to-end of the int32 guard: an idx far past 2^31 must come back as
-    ITSELF, not as a truncated near-miss that would mask an unrelated read."""
+def test_mask_resolves_a_huge_sequence_idx(tmp_path):
+    """A `sequence_idx` far past 2^31 is FINE now — it is a lookup value keyed by
+    `read_id`, never a value that rides in the int32 `zm` tag. It must come back as
+    ITSELF on the mask."""
     huge = 5_000_000_000
     raw = _LEAD + _INSERT
     rows = _mask_rows(_roundtrip(tmp_path, [(huge, raw)], [(huge, _INSERT)])["partial_mask"])
@@ -339,48 +365,69 @@ def test_mask_handles_an_empty_lima_output(tmp_path):
 
 
 def test_mask_tolerates_limas_appended_bam_tags(tmp_path):
-    """lima appends `bc=`/`bl=`/`bq=` after one space; `read_fastx` parses those
-    into `comment`, leaving `read_id` the bare `<movie>/<zmw>/ccs` name."""
+    """lima appends `bc=`/`bl=`/`bq=` after one space; `read_fastx` parses those into
+    `comment`, leaving `read_id` the bare name."""
     with_tags = _roundtrip(tmp_path / "a", [(11, _INSERT)], [(11, _INSERT)], tags=True)
     without = _roundtrip(tmp_path / "b", [(11, _INSERT)], [(11, _INSERT)], tags=False)
     assert _mask_rows(with_tags["partial_mask"]) == _mask_rows(without["partial_mask"])
 
 
-def test_mask_rejects_a_zmw_that_is_not_in_the_map(tmp_path):
-    """The sharpest failure: lima names records from the `zm` tag, so an unmappable
-    ZMW means the key channel itself broke (a truncated ZMW, a map from another run).
-    The LEFT JOIN must surface it, never let the read vanish into twist_no_adaptor."""
+def test_mask_rejects_a_name_that_is_not_a_known_read_id(tmp_path):
+    """The sharpest failure: lima rebuilds the name from `zm`, so a name that is not a
+    known `read_id` means the key channel itself broke (a truncated ZMW, a stale
+    output). The LEFT JOIN must surface it, never let the read vanish into
+    twist_no_adaptor."""
     reads = _reads(tmp_path, [(11, _INSERT)])
-    out = _export(tmp_path, reads)
-    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(4242, _INSERT)])
-    with pytest.raises(ValueError, match="lima_zmw_map"):
-        _mask(tmp_path, reads, lima_out, out["lima_zmw_map"])
+    # A record whose name is not any input read's read_id.
+    lima_out = _write_lima_output(
+        tmp_path / "lima_out.fastq", [(999, _INSERT)], read_id_of=lambda s: _rid(s, hole=424242)
+    )
+    with pytest.raises(ValueError, match="read_id round-trip is broken"):
+        _mask(tmp_path, reads, lima_out)
 
 
-def test_mask_rejects_a_resolved_key_that_is_not_an_input_read(tmp_path):
-    """infer_trim LEFT JOINs original→clipped, so an unknown clipped key would be
-    silently dropped — a stale or mismatched map must fail loud."""
-    reads = _reads(tmp_path, [(11, _INSERT)])
-    # A map that resolves ZMW 0 to a sequence_idx the reads do not contain.
-    bad_map = tmp_path / "bad_map.parquet"
+def test_mask_rejects_a_read_lima_should_not_have_emitted(tmp_path):
+    """The ANTI-JOIN check, distinct from the unknown-name one. With an upstream mask
+    bound, only its `pass` reads are exported; a read_id that resolves (it IS in the
+    reads) but was NOT among the exported set means lima emitted a read we excluded —
+    e.g. a carried spike-in. It must fail loud, not overwrite the spike-in verdict."""
+    from qiita_compute_orchestrator.jobs import lima_mask
+
+    reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
+    # partial_mask: 11 pass (exported), 22 spikein_syndna (NOT exported to lima).
+    partial = tmp_path / "partial.parquet"
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT 0::UINTEGER AS zmw, 999::BIGINT AS sequence_idx) "
-            f"TO '{bad_map}' (FORMAT PARQUET)"
+            f"COPY (SELECT * FROM (VALUES "
+            f"  (11::BIGINT, '{ReadMaskReason.PASS.value}', 0::UINTEGER, 0::UINTEGER, "
+            "   NULL::UINTEGER, NULL::UINTEGER), "
+            f"  (22::BIGINT, '{ReadMaskReason.SPIKEIN_SYNDNA.value}', 0::UINTEGER, 0::UINTEGER, "
+            "   NULL::UINTEGER, NULL::UINTEGER)) AS t("
+            "sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)) "
+            f"TO '{partial}' (FORMAT PARQUET)"
         )
-    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(0, _INSERT)])
-    with pytest.raises(ValueError, match="not an input read"):
-        _mask(tmp_path, reads, lima_out, bad_map)
+    # lima wrongly emits BOTH reads, including the excluded spike-in 22.
+    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT), (22, _INSERT)])
+    with pytest.raises(ValueError, match="not an exported read"):
+        asyncio.run(
+            lima_mask.execute(
+                lima_mask.Inputs(
+                    reads=reads,
+                    lima_out_fastq=lima_out,
+                    partial_mask=partial,
+                    work_ticket_idx=1,
+                ),
+                tmp_path / "wm",
+            )
+        )
 
 
 def test_mask_rejects_a_duplicated_record_name(tmp_path):
     """A duplicate key fans the join out and emits two mask rows for one read."""
     reads = _reads(tmp_path, [(11, _INSERT)])
-    out = _export(tmp_path, reads)
-    zmw = _zmw_map(out["lima_zmw_map"])[11]
-    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(zmw, _INSERT), (zmw, _INSERT)])
+    lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT), (11, _INSERT)])
     with pytest.raises(ValueError, match="duplicate"):
-        _mask(tmp_path, reads, lima_out, out["lima_zmw_map"])
+        _mask(tmp_path, reads, lima_out)
 
 
 def test_mask_fails_loud_when_lima_edited_internal_bases(tmp_path):

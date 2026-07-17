@@ -1,9 +1,8 @@
 """Native job: stage a sample's raw reads as a CCS uBAM for the `lima` container.
 
-`read.parquet -> lima_in.bam + lima_zmw_map.parquet` + `lima_config.json`. First
-entry of the long-read adapter chain (`lima_export -> lima -> lima_mask`), which
-runs BEFORE `qc` so the Twist adaptor is stripped before QC's length/quality
-filter sees the insert.
+`read.parquet -> lima_in.bam` + `lima_config.json`. First entry of the long-read
+adapter chain (`lima_export -> lima -> lima_mask`), which runs BEFORE `qc` so the
+Twist adaptor is stripped before QC's length/quality filter sees the insert.
 
 **Why a BAM and not a FASTQ.** lima decides CCS-vs-CLR from the input FORMAT, not
 from `--hifi-preset`: handed a FASTQ it declares the reads non-CCS ("CLR
@@ -13,30 +12,27 @@ Probed at lima 2.13.0 on the vendored Twist adapter set: the FASTQ run produced
 zero bytes and had to be killed at a timeout, while the BYTE-IDENTICAL reads as a
 CCS BAM completed in ~2 s; dropping preset flags did not change it. So there is
 nothing to parallelize or scale here. The lake stores reads as plain sequences —
-the instrument's CCS BAM and its ZMW tags are long gone — so the BAM lima needs is
-synthesized here from `sequence1` / `qual1`, which is sufficient: lima needs an
-`@RG` carrying `DS:READTYPE=CCS` and nothing about the original instrument BAM.
+the instrument's CCS BAM is not retained — so the BAM lima needs is rebuilt here
+from `read_id` / `sequence1` / `qual1`. That is sufficient: lima needs an `@RG`
+carrying `DS:READTYPE=CCS` and nothing else about the original BAM. (Probed: a BAM
+carrying the full real CCS tag set and one carrying only `@RG` + `zm` produce
+byte-identical clipped output — same reads kept, same dropped, same clip
+positions. The `np`/`rq` the lake discards do not change lima's answer.)
 
-**Why pysam and not miint.** miint's `COPY … TO (FORMAT BAM)` is an ALIGNMENT
-writer, not a reads writer: it never emits SEQ/QUAL (every record lands `… * *`,
-confirmed against a mapped-record control), it requires a non-empty
-`REFERENCE_LENGTHS` @SQ header a uBAM does not have, and it exposes no read-group
-option — so it cannot express `@RG DS:READTYPE=CCS`. This is the one place in the
-repo that writes sequences without a miint writer; it is not a miint-first
-oversight. See `docs/duckdb-miint.md`.
+**The key is `read_id`, which is already PacBio's `<movie>/<zmw>/ccs`.** Nothing
+is invented here. `bam_to_parquet` keeps the BAM's QNAME verbatim, so the lake
+still holds the instrument's own name; this job writes it back as the record name,
+sets `zm` to the hole number parsed out of it, and points the `@RG`'s `PU` at the
+movie parsed out of it. lima then reconstructs the emitted name from `zm` + the
+read group — byte-identically to `read_id` (probed on real production names) — so
+`lima_mask` joins its output straight back on `read_id`.
 
-**The ZMW is a dense counter, NOT the `sequence_idx`.** The record name must be
-`<movie>/<zmw>/ccs` — a bare integer name sends lima back into the hang. lima
-rewrites the name of every read it emits from the per-read `zm` tag (with no `zm`
-the name returns as `<movie>/?/ccs`, destroying the key), and `zm` is an int32 BAM
-tag while `sequence_idx` is a lake-wide-unique BIGINT. An out-of-range
-`sequence_idx` does not error — it comes back TRUNCATED (5000000000 -> 705032704),
-i.e. a mask silently attributed to the wrong read. So the ZMW is a per-file
-counter that cannot overflow, and `lima_zmw_map.parquet` carries `zmw ->
-sequence_idx` for `lima_mask` to join back. The counter is assigned as the rows
-stream past, so no ORDER BY / window function is needed: a blocking sort over
-`sequence1` + `qual1` (~20 kB x millions of HiFi rows) is exactly what this job
-must not do.
+Two properties come free from that, and both are why the key is `read_id` and NOT
+`sequence_idx`: the hole number is int32 **by provenance** (it came out of a real
+PacBio BAM, where `zm` is int32) whereas a lake-wide `sequence_idx` would silently
+TRUNCATE in that tag (5000000000 -> 705032704, a mask attributed to the wrong
+read); and `read_id` is unique **by an invariant already enforced upstream** —
+`bam_to_parquet` rejects any input whose `read_id` is not unique.
 
 **`lima_config.json` carries the argument string.** A scalar cannot ride a
 container step's `inputs` — the runner treats every container input as a
@@ -47,13 +43,10 @@ trick `long-read-assembly`'s `assembly_run_config` uses for its `assembler`.
 
 from __future__ import annotations
 
-import array
 import json
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-import pysam
+import duckdb
 from pydantic import BaseModel
 from qiita_common.models import ReadMaskReason
 from qiita_common.parquet import validate_parquet_path
@@ -68,87 +61,95 @@ from ._partial_mask import assert_single_end
 
 YAML_STEP_NAME = "lima_export"
 
-# Off-SLURM fallback cap; under SLURM the real cap is sized to the cgroup. This step
-# STREAMS a projection of the reads parquet straight out — no sort, no accumulator
-# — so its peak footprint is flat in READ COUNT: it is bounded by one batch, not by
-# the sample.
+# Off-SLURM fallback cap; under SLURM the real cap is sized to the cgroup. The
+# write is a miint COPY — no per-row Python, no in-process co-consumer — so this
+# step is a streaming scan and its footprint is flat in read count.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
-# Carved out of the cgroup for the BAM writer, which — unlike the `COPY ... FORMAT
-# FASTQ` this step used to be — is an in-process co-consumer DuckDB's `memory_limit`
-# does not account for: one batch of Arrow reads, their per-read phred arrays, and
-# pysam/htslib's own buffers all live outside it (the sibling pattern — see syndna's
-# `_MM2_RESERVE_GB`).
-#
-# BE EXPLICIT ABOUT THE ARITHMETIC, because this SHRINKS DuckDB rather than growing
-# the step: `resolve_duckdb_memory_gb` computes `alloc - headroom(threads) - reserve`,
-# so at the YAML's unchanged `mem_gb: 8` DuckDB goes 8 - 4 - 2 = **2 GB**, down from
-# 4 GB before this reserve existed. That is deliberate and measured, not incidental:
-# peak RSS for the WHOLE step is ~0.6 GB on 15 kB HiFi reads, and the query is a
-# streaming scan whose only blocking build is the small `partial_mask` hash side, so
-# 2 GB is ample and a bigger SLURM slot would just idle. A `plan()` cannot express
-# this — plan composition is down-only, so it can lower the allocation but never
-# raise it. If a future read length ever does need more, raise `mem_gb` in the
-# workflow YAML; do not quietly drop the reserve.
-_WRITER_RESERVE_GB = 2
-
-# Synthetic movie name. lima requires the PacBio `<movie>/<zmw>/ccs` record-name
-# convention (a bare integer name hangs), but nothing downstream reads the movie
-# field — `lima_mask` keys on the ZMW alone. It is a fixed, obviously-synthetic
-# constant rather than a per-run value precisely so it cannot be mistaken for the
-# instrument's real movie name: these reads come from the lake, not from a movie.
-_MOVIE = "qiita_synthetic_ccs"
-
-# Read-group ID for the synthesized @RG, carried per-read as an `RG` tag (pbbam
-# errors out on a record without one: "tag RG was requested but is missing").
+# Read-group ID for the rebuilt @RG, carried per-read as an `RG` tag (pbbam errors
+# out on a record without one: "tag RG was requested but is missing").
 # `DS:READTYPE=CCS` is the load-bearing FIELD: probed, an @RG whose DS says
 # READTYPE=UNKNOWN is accepted but demoted ("Unknown read type ... will generate
-# use SubreadSets"). `PL`/`PU`/`SM` follow PacBio convention and were not varied
-# independently — do not read them as established requirements.
+# use SubreadSets"). `PL` follows PacBio convention and was not varied
+# independently — do not read it as an established requirement. `PU`/`SM` carry the
+# read set's real movie, parsed from `read_id`: lima names each emitted record from
+# `zm` + its read group, so `PU` is what makes the output name match `read_id`.
 _READ_GROUP_ID = "qiita"
-
-# Rows per streamed batch — the step's memory peak, since nothing accumulates
-# across batches. A batch holds whole HiFi reads (~15-20 kB of bases plus one phred
-# byte per base), so 4096 of them is a few hundred MB of Arrow + Python: measured
-# ~0.6 GB peak RSS for the whole step at 15 kB reads, inside `_WRITER_RESERVE_GB`.
-# Lower this before raising the step's `mem_gb` if a longer-read sample ever pushes
-# it — the batch size is the knob, the sample size is not.
-_BATCH_ROWS = 4096
 
 _INCOMING = "lima_export_incoming"
 
-# `lima_zmw_map.parquet`'s schema. The ZMW rides in an int32 `zm` BAM tag, so
-# `_MAX_ZMW` — not this type's ceiling — is the real bound; UINT32 is simply the
-# narrowest Arrow type that holds it. `sequence_idx` stays INT64, the lake-wide key
-# it maps back to.
-_ZMW_MAP_SCHEMA = pa.schema([("zmw", pa.uint32()), ("sequence_idx", pa.int64())])
+# PacBio CCS read names are `<movie>/<zmw>/ccs`, which is exactly what the lake's
+# `read_id` holds for a BAM-ingested sample. Both halves are needed: the movie for
+# the @RG, the hole number for the `zm` tag lima rebuilds the name from.
+_MOVIE_FROM_READ_ID = "split_part(read_id, '/', 1)"
+_ZMW_FROM_READ_ID = "TRY_CAST(split_part(read_id, '/', 2) AS BIGINT)"
 
-# The BAM `zm` tag is int32. The dense counter cannot realistically reach this (it
-# would need >2^31 reads in ONE sample), but the whole point of the counter is that
-# an over-range ZMW corrupts silently rather than failing — so it is asserted, not
-# assumed.
+# The BAM `zm` tag is int32. A hole number from a real PacBio BAM cannot exceed it
+# (it was an int32 there), so this should never fire — but an over-range value would
+# be TRUNCATED into a valid-looking ZMW rather than rejected, and the mask would
+# land on the wrong read. Asserted, not assumed.
 _MAX_ZMW = 2**31 - 1
 
+# THE ONE PLACE THE uBAM WRITER'S CALL SHAPE LIVES.
+#
+# miint's `COPY ... TO (FORMAT UBAM)` — requested in duckdb-miint#156 and pinned
+# from the qiita side by `tests/jobs/test_sam_bam_writer_miint_contract.py`, which
+# documents why the pre-existing `FORMAT SAM|BAM` cannot serve (it is an ALIGNMENT
+# writer: it never emits SEQ/QUAL, demands a non-empty REFERENCE_LENGTHS @SQ header
+# a uBAM has none of, and exposes no read-group option).
+#
+# `read_id` is the record name (the same column `FORMAT FASTQ` names records from);
+# `zmw` is an ordinary column of this projection, which `TAGS` binds to the `zm`
+# tag — it is not a lake column and miint is not reaching into a schema.
+#
+# Kept as one formattable statement so that if the shipped option syntax differs
+# from the requested shape, the fix is this string and nothing else.
+_UBAM_COPY_SQL = """
+COPY (
+    SELECT read_id,
+           sequence1,
+           qual1,
+           {zmw_expr} AS zmw
+    FROM {source}
+) TO '{out}' (
+    FORMAT UBAM,
+    READ_GROUP {{ID: '{rg}', PL: 'PACBIO', PU: '{movie}', SM: '{movie}', DS: 'READTYPE=CCS'}},
+    TAGS {{zm: zmw}}
+)
+"""
 
-def _bam_header() -> dict:
-    """The minimal CCS-uBAM header. `DS:READTYPE=CCS` is the field lima keys on
-    (see `_READ_GROUP_ID`). The instrument metadata a real CCS header carries
-    (BINDINGKIT, SEQUENCINGKIT, BASECALLERVERSION, FRAMERATEHZ) is deliberately
-    absent: probed, lima does not need it, and we do not have it — these reads come
-    from the lake, not from a movie. Per-read `np`/`rq` are likewise not needed."""
-    return {
-        "HD": {"VN": "1.6", "SO": "unknown", "pb": "5.0.0"},
-        "RG": [
-            {
-                "ID": _READ_GROUP_ID,
-                "PL": "PACBIO",
-                "PU": _MOVIE,
-                "SM": _MOVIE,
-                "DS": "READTYPE=CCS",
-            }
-        ],
-    }
+
+def miint_supports_ubam(conn: duckdb.DuckDBPyConnection, probe_path: Path) -> bool:
+    """Whether the loaded miint build can write an unaligned reads BAM.
+
+    False on every build up to and including the one this job was written against
+    — the writer is requested in duckdb-miint#156. Exists so the test suite can
+    skip the writer-dependent cases with a legible reason instead of failing
+    opaquely, and so `execute` can name the missing capability rather than surface
+    a bare BinderException. Delete it (and this branch) once the floor build ships
+    the format.
+    """
+    # Exercise the REAL statement against one throwaway read, so the probe answers
+    # "can this build run the call this job makes" rather than an approximation.
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE lima_ubam_probe AS "
+        "SELECT 'm/1/ccs' AS read_id, 'ACGT' AS sequence1, "
+        "       [40,40,40,40]::UTINYINT[] AS qual1"
+    )
+    try:
+        conn.execute(
+            _UBAM_COPY_SQL.format(
+                zmw_expr=_ZMW_FROM_READ_ID,
+                source="lima_ubam_probe",
+                out=probe_path,
+                rg=_READ_GROUP_ID,
+                movie="m",
+            )
+        )
+        return True
+    except duckdb.Error:
+        return False
 
 
 class Inputs(BaseModel):
@@ -172,88 +173,50 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-def _phred_arrays(qual_column: pa.Array) -> list[array.array]:
-    """One `array.array('B')` of phred scores per read, read straight off Arrow's
-    values buffer.
+def _resolve_movie(conn: duckdb.DuckDBPyConnection, source: str) -> str:
+    """The read set's movie, plus the three checks that make `read_id` a safe key.
 
-    pysam takes the phred ints directly, so there is no encode step here — and the
-    obvious `qual_column.to_pylist()` must be avoided: it turns every base's score
-    into a Python object, which on HiFi reads (~15-20 kB each) is both the step's
-    memory peak and the bulk of its runtime. Measured on 15 kB reads it is ~9x the
-    cost of this slicing, which is the difference between this step fitting its PT2H
-    walltime on a real Revio sample and not (the FASTQ path it replaces was a pure
-    DuckDB COPY, i.e. all of this ran in C++). `array.array` copies from the
-    memoryview at C speed, and only the one read's worth.
+    One scan answers all of it, because each failure is silent in a different way:
 
-    Slice-safe: `flatten()` / `value_lengths()` are taken from the column itself, so
-    a batch DuckDB hands us as a slice of a larger buffer walks the right bytes.
+    - **A `read_id` that is not `<movie>/<zmw>/ccs`.** A FASTQ-ingested sample
+      carries whatever the FASTQ said. lima would then be handed a bare-ish name
+      and HANG (probed), so this is rejected here where the cause is legible.
+    - **More than one movie.** A single `@RG` stamps ONE `PU` on every read, and
+      lima names each record from `zm` + its read group — so a second movie's reads
+      would come back under the first movie's name: a wrong-but-plausible `read_id`
+      that mis-joins or vanishes. The lake is single-movie per prep_sample today
+      (verified on real data); this fails loud rather than trusting that forever.
+      Supporting it would need one `@RG` per movie plus a per-read `RG` column.
+    - **A hole number over int32.** Cannot happen for a name that came out of a real
+      PacBio BAM, but an over-range `zm` truncates into a valid-looking ZMW rather
+      than erroring, so it is checked rather than trusted.
     """
-    if qual_column.null_count:
-        # The running offset below assumes one contiguous run of scores per read; a
-        # NULL list would silently shift every subsequent read's qualities.
-        raise ValueError("qual1 contains NULL; every exported read must carry qualities")
-    flat = qual_column.flatten()
-    buf = memoryview(flat.buffers()[1])[flat.offset : flat.offset + len(flat)]
-    out: list[array.array] = []
-    pos = 0
-    for length in qual_column.value_lengths().to_pylist():
-        out.append(array.array("B", buf[pos : pos + length]))
-        pos += length
-    return out
-
-
-def _write_bam_and_map(conn, source: str, lima_in_bam: Path, zmw_map: Path) -> None:
-    """Stream `source`'s reads into the CCS uBAM, emitting the `zmw -> sequence_idx`
-    map alongside.
-
-    Both files are written from ONE pass, batch by batch: the ZMW is the row's
-    position in that stream, so the map is just the batch's `sequence_idx` column
-    against a counter range — no sort, no window function, and nothing accumulated
-    across batches.
-    """
-    reader = conn.execute(f"SELECT sequence_idx, sequence1, qual1 FROM {source}").to_arrow_reader(
-        _BATCH_ROWS
-    )
-
-    zmw = 0
-    with (
-        pysam.AlignmentFile(str(lima_in_bam), "wb", header=_bam_header()) as bam,
-        pq.ParquetWriter(zmw_map, _ZMW_MAP_SCHEMA, compression="zstd") as map_writer,
-    ):
-        for batch in reader:
-            sequences = batch.column("sequence1").to_pylist()
-            quals = _phred_arrays(batch.column("qual1"))
-            n = len(sequences)
-            if zmw + n - 1 > _MAX_ZMW:
-                raise ValueError(
-                    f"read count exceeds the {_MAX_ZMW} ZMWs addressable by the BAM "
-                    "`zm` tag; lima would truncate it and mask the wrong reads"
-                )
-            for i in range(n):
-                record = pysam.AlignedSegment()
-                # `<movie>/<zmw>/ccs`: lima hangs on a bare-integer name, and
-                # rewrites this name from the `zm` tag below on the way out.
-                record.query_name = f"{_MOVIE}/{zmw + i}/ccs"
-                record.flag = 4  # unmapped: these reads were never aligned
-                # ORDER MATTERS: pysam resets query_qualities when query_sequence
-                # is assigned, so the qualities must be set after the bases.
-                record.query_sequence = sequences[i]
-                record.query_qualities = quals[i]
-                record.set_tag("RG", _READ_GROUP_ID, "Z")
-                # The one tag lima reads back out: it rebuilds the emitted record's
-                # name from `zm`. `np`/`rq` are not required (probed).
-                record.set_tag("zm", zmw + i, "i")
-                bam.write(record)
-            map_writer.write_batch(
-                pa.record_batch(
-                    [
-                        pa.array(range(zmw, zmw + n), type=pa.uint32()),
-                        batch.column("sequence_idx").cast(pa.int64()),
-                    ],
-                    schema=_ZMW_MAP_SCHEMA,
-                )
-            )
-            zmw += n
+    movies, bad_names, max_zmw = conn.execute(
+        f"SELECT count(DISTINCT {_MOVIE_FROM_READ_ID}), "
+        f"       count(*) FILTER (WHERE {_ZMW_FROM_READ_ID} IS NULL "
+        f"                          OR split_part(read_id, '/', 3) <> 'ccs'), "
+        f"       max({_ZMW_FROM_READ_ID}) "
+        f"FROM {source}"
+    ).fetchone()
+    if bad_names:
+        raise ValueError(
+            f"{bad_names} read(s) have a read_id that is not PacBio's "
+            "'<movie>/<zmw>/ccs'; lima needs that name shape and hangs without it. "
+            "The lima chain expects a BAM-ingested CCS read set."
+        )
+    if movies and movies > 1:
+        raise ValueError(
+            f"reads span {movies} movies; a single @RG would stamp one movie on every "
+            "record and lima would rebuild the wrong read_id for the rest. Supporting "
+            "this needs one @RG per movie plus a per-read RG tag."
+        )
+    if max_zmw is not None and max_zmw > _MAX_ZMW:
+        raise ValueError(
+            f"read_id carries a ZMW ({max_zmw}) over the {_MAX_ZMW} addressable by the "
+            "BAM `zm` tag; lima would truncate it and mask the wrong read"
+        )
+    (movie,) = conn.execute(f"SELECT {_MOVIE_FROM_READ_ID} FROM {source} LIMIT 1").fetchone()
+    return movie
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -266,10 +229,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     lima_in_bam = workspace / "lima_in.bam"
-    zmw_map = workspace / "lima_zmw_map.parquet"
     lima_config = workspace / "lima_config.json"
 
     reads_sql = validate_parquet_path(inputs.reads)
+    bam_sql = validate_parquet_path(lima_in_bam)
 
     success = False
     try:
@@ -277,9 +240,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=resolve_duckdb_memory_gb(
-                    _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_WRITER_RESERVE_GB
-                ),
+                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
             assert_single_end(conn, reads_sql, "reads", inputs.reads)
@@ -296,7 +257,26 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"USING (sequence_idx) WHERE m.reason = '{ReadMaskReason.PASS.value}'"
                 )
                 source = "lima_export_pass"
-            _write_bam_and_map(conn, source, lima_in_bam, zmw_map)
+            movie = _resolve_movie(conn, source)
+            try:
+                conn.execute(
+                    _UBAM_COPY_SQL.format(
+                        zmw_expr=_ZMW_FROM_READ_ID,
+                        source=source,
+                        out=bam_sql,
+                        rg=_READ_GROUP_ID,
+                        movie=movie,
+                    )
+                )
+            except duckdb.Error as exc:
+                # Name the missing capability rather than surface a bare binder
+                # error four layers down in a SLURM log.
+                raise RuntimeError(
+                    "the loaded miint build cannot write an unaligned reads BAM "
+                    "(COPY ... TO (FORMAT UBAM)); lima requires a CCS BAM and does not "
+                    "finish on a FASTQ. See duckdb-miint#156 and "
+                    f"tests/jobs/test_sam_bam_writer_miint_contract.py. Underlying error: {exc}"
+                ) from exc
         lima_config.write_text(json.dumps({"args": inputs.lima_args}) + "\n")
         success = True
     finally:
@@ -304,11 +284,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # (which runs after execute()) cannot promote them as the result.
         if not success:
             lima_in_bam.unlink(missing_ok=True)
-            zmw_map.unlink(missing_ok=True)
             lima_config.unlink(missing_ok=True)
 
-    return {
-        "lima_in_bam": lima_in_bam,
-        "lima_zmw_map": zmw_map,
-        "lima_config": lima_config,
-    }
+    return {"lima_in_bam": lima_in_bam, "lima_config": lima_config}

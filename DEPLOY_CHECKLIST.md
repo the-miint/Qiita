@@ -51,10 +51,12 @@ _None yet._
 - **The read-mask `lima` SIF auto-rebuilds on this deploy (#313).** `lima.sh` changed
   (it now hands lima a `.bam` instead of a `.fastq`), so `build-sifs.sh`'s
   build-inputs content hash rebuilds the image before the restart. No manual step.
-- **`pysam` is a new `qiita-compute-orchestrator` dependency (#313).** `lima_export`
-  synthesizes the CCS BAM with it — miint's `COPY … (FORMAT BAM)` is an alignment
-  writer and cannot emit reads or an `@RG`. Installed by `local-deploy.sh`'s
-  `uv sync`; no operator action, but it is why the CO venv grows a wheel this deploy.
+- **`lima_export` needs a miint build with `COPY … (FORMAT UBAM)` (#313).** Requested
+  in duckdb-miint#156. The deploy stages miint (`stage-miint-extension.sh`), so this
+  arrives with the mirror — no separate operator step — but the read-mask lima chain
+  FAILS LOUD (naming that issue) on a build without it. The PR is held unmerged until
+  it lands, so this line should never reach a deploy unsatisfied; if you are reading
+  it on the host, check the mirror build first. No new runtime Python dependency.
 - **The parked pool-25016 read-mask tickets can be redriven once this is green (#313).**
   They were cancelled because lima could not finish; a redrive before this deploy hits
   the identical wall. Their ~33 GB `lima_export` FASTQs under

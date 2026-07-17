@@ -1,8 +1,9 @@
 """Real-miint contract pins for the `COPY ... TO ... (FORMAT SAM|BAM)` writer.
 
 The headline: it is an **alignment** writer, not a reads writer — it does not put
-the bases in the file. Anything needing sequences in a SAM/BAM must look elsewhere
-(today: `lima_export`, which is why that job carries a pysam dependency).
+the bases in the file. That is why `lima_export` cannot use it for the CCS uBAM
+lima needs, and why `COPY ... TO (FORMAT UBAM)` was requested separately
+(duckdb-miint#156) rather than as a fix to this writer.
 
 These run against the team-mirror miint build (staged by the session-autouse
 `_stage_miint_extension` fixture in tests/conftest.py; `open_miint_conn` is
@@ -11,12 +12,11 @@ LOAD-only). Everything here was verified empirically against the build on
 describes the writer only as taking "HTSlib-style columns" and does not say that
 the reads themselves are not among them.
 
-**Why this file exists.** `CLAUDE.local.md` says to reach for a miint writer before
-hand-rolling one, and `COPY ... TO (FORMAT BAM)` looks exactly like the tool for
-the job. It is not: it is an ALIGNMENT writer. Without this pin, the next person to
-read `lima_export` sees a non-miint sequence writer and a `pysam` dependency and
-"fixes" it back to a miint COPY — which would produce a BAM lima happily reads and
-finds no bases in, i.e. a chain that silently masks every read `twist_no_adaptor`.
+**Why this file exists.** `FORMAT BAM` looks exactly like the tool for `lima_export`'s
+job, and it is not. Without this pin, the next person to touch that job "simplifies"
+`FORMAT UBAM` to the `FORMAT BAM` sitting right there — which would produce a BAM
+lima happily reads and finds no bases in, i.e. a chain that silently masks every
+read `twist_no_adaptor`. This is the evidence behind duckdb-miint#156.
 
 Pinned here:
   * The writer NEVER emits SEQ/QUAL — not for an unmapped record and not for a
@@ -27,8 +27,10 @@ Pinned here:
   * There is no read-group option, so `@RG ... DS:READTYPE=CCS` — the field lima
     keys on to treat the reads as CCS — cannot be written at all.
 
-If a future miint build fixes any of these, this file fails. That is the signal to
-revisit `lima_export`'s pysam writer (and drop the dep), not a spurious failure.
+If a future miint build changes any of these, this file fails. That is a signal to
+re-check `lima_export`'s writer against the shipped semantics, not a spurious
+failure. (Note the requested `FORMAT UBAM` is a NEW format, so these limits on the
+ALIGNMENT writer may well remain true after it lands — they are not in conflict.)
 """
 
 from __future__ import annotations
@@ -83,7 +85,7 @@ def _records(path) -> list[str]:
     ],
 )
 def test_sam_writer_never_emits_seq_or_qual(conn, tmp_path, seq_col, qual_col):
-    """The finding that forces pysam. The writer ACCEPTS a sequence column without
+    """The finding that forces a separate uBAM writer. It ACCEPTS a sequence column without
     complaint and then drops it: SEQ and QUAL both land as `*`. There is no column
     naming that carries the bases through."""
     out = tmp_path / f"{seq_col}.sam"

@@ -19,6 +19,7 @@ import random
 from pathlib import Path
 
 import duckdb
+import pytest
 from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
 from qiita_common.models import ReadMaskReason
 
@@ -56,6 +57,16 @@ def _build_syndna_index(tmp_path: Path) -> Path:
     return mmi
 
 
+# PacBio movie, and a hole-number base distinct from sequence_idx (so the join is on
+# read_id, not a sidx==hole coincidence) — the lima chain keys on the lake's read_id.
+_MOVIE = "m84137_260623_040906_s1"
+_HOLE_BASE = 100_000_000
+
+
+def _rid(sidx: int) -> str:
+    return f"{_MOVIE}/{_HOLE_BASE + sidx}/ccs"
+
+
 def _write_reads(path: Path, rows: list[tuple[int, str]]) -> Path:
     values = ", ".join(
         "(CAST(5 AS BIGINT), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR), "
@@ -64,7 +75,7 @@ def _write_reads(path: Path, rows: list[tuple[int, str]]) -> Path:
     )
     params: list = []
     for sidx, seq in rows:
-        params.extend([sidx, f"r{sidx}", seq, _q(seq)])
+        params.extend([sidx, _rid(sidx), seq, _q(seq)])
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             f"COPY (SELECT * FROM (VALUES {values}) AS t("
@@ -84,6 +95,24 @@ def _adapters(tmp_path: Path) -> Path:
     return p
 
 
+def _ubam_available() -> bool:
+    """Whether the loaded miint build can write an unaligned reads BAM.
+
+    This chain test runs syndna -> lima_export -> lima_mask -> qc for real, so it
+    needs the writer end to end; there is no partial form worth keeping. It lights
+    up on its own once the mirror ships duckdb-miint#156."""
+    import tempfile
+
+    from qiita_compute_orchestrator.jobs.lima_export import miint_supports_ubam
+    from qiita_compute_orchestrator.miint import open_miint_conn
+
+    try:
+        with tempfile.TemporaryDirectory() as d, open_miint_conn() as conn:
+            return miint_supports_ubam(conn, Path(d) / "probe.bam")
+    except Exception:
+        return False
+
+
 def _reasons(path: Path) -> dict[int, str]:
     with duckdb.connect(":memory:") as conn:
         return dict(
@@ -91,9 +120,15 @@ def _reasons(path: Path) -> dict[int, str]:
         )
 
 
+@pytest.mark.skipif(
+    not _ubam_available(),
+    reason="lima_export writes its CCS uBAM with miint's COPY ... (FORMAT UBAM), "
+    "not in the mirror build yet — duckdb-miint#156",
+)
 def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path):
+    import pysam
+
     from qiita_compute_orchestrator.jobs import lima_export, lima_mask, qc, syndna
-    from qiita_compute_orchestrator.jobs.lima_export import _MOVIE
 
     # read 1: biological — adaptor + insert. read 2: spike-in — a slice of the
     # reference, carrying NO Twist adaptor (the case-5 signature).
@@ -114,7 +149,8 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
         2: ReadMaskReason.SPIKEIN_SYNDNA.value,
     }
 
-    # lima_export: only the still-`pass` read reaches lima (spike-in excluded).
+    # lima_export: only the still-`pass` read reaches lima (spike-in excluded). The
+    # exported BAM's record names are the lake's read_id, verbatim.
     exported = asyncio.run(
         lima_export.execute(
             lima_export.Inputs(
@@ -126,19 +162,14 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
             tmp_path / "ws_export",
         )
     )
-    # The `zmw -> sequence_idx` map IS the exported set: lima's record names carry a
-    # dense ZMW, not the sequence_idx (see jobs/lima_export).
-    with duckdb.connect(":memory:") as conn:
-        exported_map = conn.execute(
-            f"SELECT sequence_idx, zmw FROM read_parquet('{exported['lima_zmw_map']}')"
-        ).fetchall()
-    assert [sidx for sidx, _ in exported_map] == [1], "the spike-in must NOT be exported to lima"
+    with pysam.AlignmentFile(exported["lima_in_bam"], "rb", check_sq=False) as bam:
+        exported_names = [rec.query_name for rec in bam]
+    assert exported_names == [_rid(1)], "only the pass read (read_id 1) reaches lima"
 
     # simulate lima: it kept read 1 and clipped the adaptor down to the insert. lima
-    # rebuilds the emitted name from the record's `zm` tag as `<movie>/<zmw>/ccs`.
-    zmw = exported_map[0][1]
+    # round-trips the record name, so the output name is read 1's read_id verbatim.
     lima_out = tmp_path / "lima_out.fastq"
-    lima_out.write_text(f"@{_MOVIE}/{zmw}/ccs bc=3,3\n{_BIO_INSERT}\n+\n{'I' * len(_BIO_INSERT)}\n")
+    lima_out.write_text(f"@{_rid(1)} bc=3,3\n{_BIO_INSERT}\n+\n{'I' * len(_BIO_INSERT)}\n")
 
     # lima_mask: read 1 -> pass (adaptor trimmed); read 2 carried as spikein_syndna.
     partial = asyncio.run(
@@ -146,7 +177,6 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
             lima_mask.Inputs(
                 reads=reads,
                 lima_out_fastq=lima_out,
-                lima_zmw_map=exported["lima_zmw_map"],
                 partial_mask=partial,
                 work_ticket_idx=1,
             ),

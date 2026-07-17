@@ -13,13 +13,14 @@ the tool omitted. It fails loud if a kept read is not a contiguous substring of 
 original (i.e. the tool edited internal bases rather than end-trimming). lima is a
 pure end-trimmer, so that contract holds; do not suppress the failure.
 
-**The join key is the record name's ZMW, resolved through `lima_zmw_map`.**
-`lima_export` cannot put `sequence_idx` in the record name: lima requires the
-PacBio `<movie>/<zmw>/ccs` convention and rewrites the name of every read it emits
-from the per-read `zm` tag, which is an int32 — a lake-wide `sequence_idx` over
-2^31 would come back silently TRUNCATED. So the ZMW is a per-file dense counter
-and `lima_zmw_map` carries `zmw -> sequence_idx`; the key is recovered by parsing
-the ZMW out of the name and joining. (`read_fastx`'s own `sequence_index` is
+**The join key is `read_id` — the instrument's own name, nothing invented.**
+`lima_export` writes the lake's `read_id` (PacBio's `<movie>/<zmw>/ccs`, kept
+verbatim by `bam_to_parquet`) as the record name and sets `zm` to the hole number
+inside it; lima rebuilds each emitted name from `zm` + the read group, so the name
+comes back byte-identical to `read_id` (probed on real production names) and this
+job joins straight back on it. `sequence_idx` deliberately does NOT ride in the
+name: lima's `zm` is int32 and a lake-wide `sequence_idx` would come back silently
+TRUNCATED, masking the wrong read. (`read_fastx`'s own `sequence_index` is
 POSITIONAL and resets per file, so it is NOT our `sequence_idx` either.)
 
 **Reads lima dropped become `twist_no_adaptor`.** A HiFi read carrying no Twist
@@ -77,18 +78,7 @@ _DUCKDB_THREADS = 4
 _ORIG = "lima_orig"
 _QCD = "lima_qcd"
 _INCOMING = "lima_mask_incoming"
-_ZMW_MAP = "lima_zmw_map"
-
-# lima emits `<movie>/<zmw>/ccs`, then its own BAM tags after a space (`read_fastx`
-# parses those into a separate `comment` column, so `read_id` is just the name).
-# The ZMW is field 2 — the key into `lima_zmw_map`.
-#
-# TRY_CAST, not `::UINTEGER`: a name whose ZMW is not an integer is exactly the
-# shape lima emits when a record reaches it without a `zm` tag (`<movie>/?/ccs`).
-# A hard cast aborts the query with a raw DuckDB ConversionException; TRY_CAST
-# yields NULL and routes it into `_assert_lima_reads_are_known`'s unresolved-ZMW
-# error, which names the actual problem. Both fail loud — only one explains itself.
-_ZMW_FROM_READ_ID = "TRY_CAST(split_part(f.read_id, '/', 2) AS UINTEGER)"
+_LOOKUP = "lima_mask_lookup"
 
 
 def _carry_select(incoming_view: str) -> str:
@@ -107,10 +97,9 @@ def _carry_select(incoming_view: str) -> str:
 class Inputs(BaseModel):
     """Typed input contract for lima_mask.
 
-    `reads` is the raw `read.parquet` lima_export exported; `lima_out_fastq` is
-    lima's clipped output; `lima_zmw_map` is lima_export's `zmw -> sequence_idx`
-    map, without which lima's output cannot be keyed back to the lake (see the
-    module docstring). `partial_mask` is the OPTIONAL upstream mask (today:
+    `reads` is the raw `read.parquet` lima_export exported — and also the lookup
+    that keys lima's output back to the lake, since both sides carry `read_id`.
+    `lima_out_fastq` is lima's clipped output. `partial_mask` is the OPTIONAL upstream mask (today:
     syndna's) — when bound, only its `pass` reads went to lima, and its non-`pass`
     rows (the spike-ins) are carried through unchanged. `prep_sample_idx` is
     accepted but unused — the mask keys on the globally-unique `sequence_idx`, so a
@@ -119,7 +108,6 @@ class Inputs(BaseModel):
 
     reads: Path
     lima_out_fastq: Path
-    lima_zmw_map: Path
     partial_mask: Path | None = None
     prep_sample_idx: int | None = None
     work_ticket_idx: int
@@ -143,11 +131,11 @@ def _assert_lima_reads_are_known(conn: duckdb.DuckDBPyConnection, lima_out_fastq
     emits two mask rows for one read. A wrong mask would ship looking like a right
     one. One aggregate scan is a cheap price for turning that into a loud failure.
 
-    The unresolved-ZMW check is the sharpest of the three: lima writes the record
-    name from the `zm` tag, so a name whose ZMW is not in `lima_zmw_map` means the
-    key channel itself broke (a truncated ZMW, a mismatched map from another run).
-    That must never be papered over — the join would drop the read and the mask
-    would call it `twist_no_adaptor`.
+    The unresolved-name check is the sharpest of the three: lima rebuilds the record
+    name from the `zm` tag, so a name that is not a known `read_id` means the key
+    channel itself broke (a truncated ZMW, a stale output from another run). That
+    must never be papered over — the join would drop the read and the mask would
+    call it `twist_no_adaptor`.
 
     All three are counted in ONE pass: `_QCD` is a view over `read_fastx`, so a
     scan per check would re-parse lima's whole output three times.
@@ -159,16 +147,16 @@ def _assert_lima_reads_are_known(conn: duckdb.DuckDBPyConnection, lima_out_fastq
     ).fetchone()
     if unresolved:
         raise ValueError(
-            f"lima output ({lima_out_fastq}) has {unresolved} record(s) whose ZMW is not "
-            "in lima_zmw_map; the sequence_idx round-trip is broken"
+            f"lima output ({lima_out_fastq}) has {unresolved} record(s) whose name is not "
+            "a read_id of the input reads; the read_id round-trip is broken"
         )
     (unknown,) = conn.execute(
         f"SELECT count(*) FROM {_QCD} q ANTI JOIN {_ORIG} o USING (sequence_index)"
     ).fetchone()
     if unknown:
         raise ValueError(
-            f"lima output ({lima_out_fastq}) has {unknown} record(s) whose ZMW resolves to "
-            "a sequence_idx that is not an input read; the map does not match these reads"
+            f"lima output ({lima_out_fastq}) has {unknown} record(s) whose read_id resolves "
+            "to a sequence_idx that is not an exported read"
         )
     if n != distinct:
         raise ValueError(
@@ -182,8 +170,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     if not inputs.lima_out_fastq.exists():
         raise FileNotFoundError(f"lima_out_fastq not found: {inputs.lima_out_fastq}")
-    if not inputs.lima_zmw_map.exists():
-        raise FileNotFoundError(f"lima_zmw_map not found: {inputs.lima_zmw_map}")
     if inputs.partial_mask is not None and not inputs.partial_mask.exists():
         raise FileNotFoundError(f"partial_mask not found: {inputs.partial_mask}")
 
@@ -192,7 +178,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     reads_sql = validate_parquet_path(inputs.reads)
     lima_sql = validate_parquet_path(inputs.lima_out_fastq)
-    zmw_map_sql = validate_parquet_path(inputs.lima_zmw_map)
     out_sql = validate_parquet_path(partial_mask)
 
     success = False
@@ -228,10 +213,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 carry_select = _carry_select(_INCOMING)
 
             # infer_trim requires both relations to expose `sequence_index` +
-            # `sequence`. On the clipped side the key is the ZMW parsed out of
-            # lima's record name and resolved through `lima_zmw_map` — never
-            # read_fastx's positional `sequence_index`.
-            conn.execute(f"CREATE VIEW {_ZMW_MAP} AS SELECT * FROM read_parquet('{zmw_map_sql}')")
+            # `sequence`. On the clipped side the key is lima's record name, which
+            # IS the lake's `read_id` — never read_fastx's positional
+            # `sequence_index`. `reads` is the lookup: it carries both columns.
+            conn.execute(
+                f"CREATE VIEW {_LOOKUP} AS "
+                f"SELECT read_id, sequence_idx FROM read_parquet('{reads_sql}')"
+            )
             if is_empty_sequence_file(inputs.lima_out_fastq):
                 # A GUARD, not the adapter-free path: probed, lima FATALs rather than
                 # emitting an empty output, so the step fails before reaching here (see
@@ -244,14 +232,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "WHERE false"
                 )
             else:
-                # LEFT JOIN, not JOIN: an unresolvable ZMW must surface as a NULL
-                # key for `_assert_lima_reads_are_known` to raise on, not vanish
-                # from the relation and silently become `twist_no_adaptor`.
+                # LEFT JOIN, not JOIN: a record name that is not a known `read_id`
+                # must surface as a NULL key for `_assert_lima_reads_are_known` to
+                # raise on, not vanish from the relation and silently become
+                # `twist_no_adaptor`.
                 conn.execute(
                     f"CREATE VIEW {_QCD} AS "
                     "SELECT m.sequence_idx AS sequence_index, f.sequence1 AS sequence "
                     f"FROM read_fastx('{lima_sql}') f "
-                    f"LEFT JOIN {_ZMW_MAP} m ON m.zmw = {_ZMW_FROM_READ_ID}"
+                    f"LEFT JOIN {_LOOKUP} m ON m.read_id = f.read_id"
                 )
             _assert_lima_reads_are_known(conn, inputs.lima_out_fastq)
             # One row per ORIGINAL (pass) read. `infer_trim` returns NULL/NULL for a
