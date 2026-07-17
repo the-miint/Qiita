@@ -94,6 +94,31 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **PacBio read-mask: lima now gets a CCS BAM, not a multi-GB FASTQ (#313).** lima
+  decides CCS-vs-CLR from the input FORMAT, not from `--hifi-preset`: handed the
+  ~33.5 GB FASTQ `lima_export` used to write, it warned "non CCS data … will
+  proceed to demultiplex each sequence individually" and never finished. Probed at
+  lima 2.13.0, that CLR path **does not finish** — it is not merely slow: the FASTQ
+  run produced zero bytes until killed at a timeout while the byte-identical reads
+  as a CCS BAM completed in ~2 s, so there was nothing to parallelize.
+  `lima_export` now synthesizes a minimal CCS unaligned BAM from the lake's
+  `sequence1`/`qual1` (an `@RG` carrying `DS:READTYPE=CCS`, the field lima keys on)
+  and feeds it to lima,
+  which completes in seconds. lima's output stays FASTQ, so `lima_mask` still reads
+  it with miint's `read_fastx`. No FASTQ is written at all now, so the landed
+  intermediate shrinks to the BAM. Three findings changed the shape of the fix:
+  miint's `COPY … TO (FORMAT BAM)` **cannot** write this file (it is an alignment
+  writer — it never emits SEQ/QUAL, even for a mapped record, requires a non-empty
+  `REFERENCE_LENGTHS` @SQ header, and has no read-group option), so the BAM is
+  written with **pysam**, a new `qiita-compute-orchestrator` dependency; lima
+  requires PacBio's `<movie>/<zmw>/ccs` record naming and **hangs** on the bare
+  `sequence_idx` name the old FASTQ used; and lima rewrites every emitted record's
+  name from its **int32** `zm` tag, so a lake-wide `sequence_idx` past 2^31 would
+  come back silently TRUNCATED (5000000000 → 705032704) and mask the wrong read.
+  The ZMW is therefore a dense per-file counter, with a new `lima_zmw_map` binding
+  carrying `zmw -> sequence_idx` for `lima_mask` to join back. Pinned by
+  `tests/jobs/test_sam_bam_writer_miint_contract.py` (the miint-writer limits, with a
+  mapped-record anti-vacuity control) and the rewritten `test_lima_chain_smoke.py`.
 - **read-mask `lima` container step was missing its `entrypoint` (#311).** The step
   declared `container: lima-2.13.0.sif` but no `entrypoint:`, so the SLURM job ran
   `apptainer exec <sif>` with no command and died with "exec requires at least 2

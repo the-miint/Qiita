@@ -93,6 +93,7 @@ def _reasons(path: Path) -> dict[int, str]:
 
 def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path):
     from qiita_compute_orchestrator.jobs import lima_export, lima_mask, qc, syndna
+    from qiita_compute_orchestrator.jobs.lima_export import _MOVIE
 
     # read 1: biological — adaptor + insert. read 2: spike-in — a slice of the
     # reference, carrying NO Twist adaptor (the case-5 signature).
@@ -125,20 +126,29 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
             tmp_path / "ws_export",
         )
     )
-    names = [
-        ln[1:] for ln in exported["lima_in_fastq"].read_text().splitlines() if ln.startswith("@")
-    ]
-    assert names == ["1"], "the spike-in must NOT be exported to lima"
+    # The `zmw -> sequence_idx` map IS the exported set: lima's record names carry a
+    # dense ZMW, not the sequence_idx (see jobs/lima_export).
+    with duckdb.connect(":memory:") as conn:
+        exported_map = conn.execute(
+            f"SELECT sequence_idx, zmw FROM read_parquet('{exported['lima_zmw_map']}')"
+        ).fetchall()
+    assert [sidx for sidx, _ in exported_map] == [1], "the spike-in must NOT be exported to lima"
 
-    # simulate lima: it kept read 1 and clipped the adaptor down to the insert.
+    # simulate lima: it kept read 1 and clipped the adaptor down to the insert. lima
+    # rebuilds the emitted name from the record's `zm` tag as `<movie>/<zmw>/ccs`.
+    zmw = exported_map[0][1]
     lima_out = tmp_path / "lima_out.fastq"
-    lima_out.write_text(f"@1 bc=3,3\n{_BIO_INSERT}\n+\n{'I' * len(_BIO_INSERT)}\n")
+    lima_out.write_text(f"@{_MOVIE}/{zmw}/ccs bc=3,3\n{_BIO_INSERT}\n+\n{'I' * len(_BIO_INSERT)}\n")
 
     # lima_mask: read 1 -> pass (adaptor trimmed); read 2 carried as spikein_syndna.
     partial = asyncio.run(
         lima_mask.execute(
             lima_mask.Inputs(
-                reads=reads, lima_out_fastq=lima_out, partial_mask=partial, work_ticket_idx=1
+                reads=reads,
+                lima_out_fastq=lima_out,
+                lima_zmw_map=exported["lima_zmw_map"],
+                partial_mask=partial,
+                work_ticket_idx=1,
             ),
             tmp_path / "ws_limamask",
         )

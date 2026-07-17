@@ -1,21 +1,29 @@
 #!/bin/bash
 # Clip the Twist adapter from each end of a sample's HiFi reads.
 #
-# Input  `lima_in_fastq`  — one record per read, the FASTQ record NAME being the
-#                           read's `sequence_idx` (written by jobs/lima_export.py).
+# Input  `lima_in_bam`    — a synthesized CCS unaligned BAM, one record per read,
+#                           named `<movie>/<zmw>/ccs` (written by
+#                           jobs/lima_export.py). It MUST be a BAM, not a FASTQ:
+#                           lima decides CCS-vs-CLR from the input FORMAT, not from
+#                           --hifi-preset, and the CLR path a FASTQ forces does not
+#                           finish (it hangs, it is not merely slow).
 #        `lima_config`    — {"args": "--hifi-preset ASYMMETRIC --neighbors …"},
 #                           the control-plane-resolved argument string. A scalar
 #                           cannot ride a container step's inputs (the runner
 #                           would treat it as a bind-mount path), so it arrives as
 #                           a file — the same trick long-read-assembly's
 #                           assembly_run_config step uses for its `assembler`.
-# Output `lima_out_fastq` — the surviving reads, adapter-clipped, names preserved.
+# Output `lima_out_fastq` — the surviving reads, adapter-clipped. FASTQ out from
+#                           BAM in is fine (only the INPUT format selects the CCS
+#                           path), and it keeps lima_mask on miint's read_fastx.
 #
-# lima preserves the record name VERBATIM and appends its BAM tags after a single
-# space, so `sequence_idx` round-trips and miint's `read_fastx` parses the tags
-# into a separate `comment` column. Reads lima drops simply do not appear in the
-# output; jobs/lima_mask.py turns their absence into a `twist_no_adaptor` mask row
-# via `infer_trim`, which returns NULL/NULL for an omitted read.
+# lima rewrites each emitted record's name from its `zm` tag, so the name comes back
+# as `<movie>/<zmw>/ccs` and jobs/lima_mask.py resolves the ZMW to a `sequence_idx`
+# through lima_export's `lima_zmw_map`. lima appends its BAM tags after a single
+# space, which miint's `read_fastx` parses into a separate `comment` column. Reads
+# lima drops simply do not appear in the output; jobs/lima_mask.py turns their
+# absence into a `twist_no_adaptor` mask row via `infer_trim`, which returns
+# NULL/NULL for an omitted read.
 #
 # The adapter FASTA is baked into the image (see lima.def) and its path is
 # exported as QIITA_LIMA_ADAPTER_FASTA. Its RECORD ORDER is load-bearing: the
@@ -23,7 +31,7 @@
 # best-scoring barcode pair are adjacent records in the file.
 source /opt/qiita/_lib.sh
 
-READS_FASTQ="$(qiita_input lima_in_fastq)"
+READS_BAM="$(qiita_input lima_in_bam)"
 LIMA_CONFIG="$(qiita_input lima_config)"
 LIMA_ARGS="$(jq -er '.args' "${LIMA_CONFIG}")"
 
@@ -39,7 +47,7 @@ OUT="${QIITA_OUTPUT_PATH}/lima_out.fastq"
 # splitting is intended: the flags must reach lima as separate argv entries.
 # shellcheck disable=SC2086
 micromamba run -n lima lima \
-    "${READS_FASTQ}" \
+    "${READS_BAM}" \
     "${QIITA_LIMA_ADAPTER_FASTA}" \
     "${OUT}" \
     --num-threads "${THREADS}" \

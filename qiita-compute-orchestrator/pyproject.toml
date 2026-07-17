@@ -20,6 +20,16 @@ dependencies = [
     # deps that ship here, so pyarrow is declared directly — not relied upon as a
     # transitive of qiita-common. The control plane pins the same floor.
     "pyarrow>=19",
+    # `lima_export` synthesizes the CCS unaligned BAM lima requires as input.
+    # This is the one sequence writer in the repo that is NOT a miint COPY, and
+    # deliberately so: miint's `COPY ... TO (FORMAT BAM)` is an ALIGNMENT writer —
+    # it never emits SEQ/QUAL (verified against a mapped-record control), it
+    # requires a non-empty REFERENCE_LENGTHS @SQ header that a uBAM has none of,
+    # and it exposes no read-group option, so it cannot write the `@RG` with
+    # `DS:READTYPE=CCS` that is the entire difference between lima's CCS path and
+    # the CLR path that hangs. Native steps may only use deps that ship here, so
+    # pysam is declared directly. Drop it the day miint grows a uBAM writer.
+    "pysam>=0.23",
     # bcl_convert_prep imports `save_bclconvert_v1_csv` from
     # run_preflight at execute() time. SHA pin is required so a
     # re-vendor of the upstream is explicit. To bump: read the
