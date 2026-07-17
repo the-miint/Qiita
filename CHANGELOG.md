@@ -95,7 +95,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **read-mask `lima` SIF was missing `python3`, failing every step after lima
-  succeeded (#313 follow-up).** `_lib.sh`'s `qiita_finish` — the last line of every
+  succeeded (#320, follow-up to #313).** `_lib.sh`'s `qiita_finish` — the last line of every
   container step — runs `python3 manifest_writer.py`, but `lima.def` (a
   micromamba base) installed only `jq`/`gawk`/… and no `python`, so the step died
   `exit 127 python3: command not found`. It was latent until now: the old FASTQ
