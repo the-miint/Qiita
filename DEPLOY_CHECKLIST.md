@@ -31,7 +31,16 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **read-mask synced with lima's BAM input (#313).** The generic `qiita.action` list is
+  already covered by `make verify-deploy`; this asserts the re-`sync` actually took (a
+  stale `lima_in_fastq` here means lima still gets a FASTQ and never finishes). The SQL
+  deliberately carries no quotes — grep does the filtering, so this survives a
+  copy-paste through `sudo -u ... bash -c`:
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a; psql "$DATABASE_URL" -Atc "SELECT action_id, version, steps FROM qiita.action"' \
+    | grep read-mask | grep -q lima_in_bam \
+    && echo "OK: lima takes lima_in_bam" || echo "FAIL: read-mask not synced (still lima_in_fastq?)"
+  ```
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +48,20 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **The read-mask `lima` SIF auto-rebuilds on this deploy (#313).** `lima.sh` changed
+  (it now hands lima a `.bam` instead of a `.fastq`), so `build-sifs.sh`'s
+  build-inputs content hash rebuilds the image before the restart. No manual step.
+- **`lima_export` needs a miint build with `COPY … (FORMAT UBAM)` (#313).** Shipped
+  in duckdb-miint#157 (mirror build `5509321`). The deploy stages miint
+  (`stage-miint-extension.sh`), so it arrives with the mirror — no separate operator
+  step. If the staged build predates it, the read-mask lima chain FAILS LOUD (a raw
+  DuckDB "FORMAT UBAM does not exist" error at the export step) rather than corrupting
+  a mask, so a stale stage is caught, not silent. Re-run the stage step on deploy to
+  be sure. No new runtime Python dependency.
+- **The parked pool-25016 read-mask tickets can be redriven once this is green (#313).**
+  They were cancelled because lima could not finish; a redrive before this deploy hits
+  the identical wall. Their ~33 GB `lima_export` FASTQs under
+  `<scratch>/ticket/48{35..60}/` are dead weight once the replacements complete.
 
 ---
 

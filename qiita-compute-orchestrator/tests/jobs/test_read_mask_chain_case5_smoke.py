@@ -22,6 +22,8 @@ import duckdb
 from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
 from qiita_common.models import ReadMaskReason
 
+from qiita_compute_orchestrator.miint import open_miint_conn
+
 # Kilobase-scale, as real HiFi is: syndna aligns with minimap2's `map-hifi` preset,
 # which is tuned for long reads and will not align a short toy sequence. Seeded, so
 # the alignment is deterministic.
@@ -56,6 +58,16 @@ def _build_syndna_index(tmp_path: Path) -> Path:
     return mmi
 
 
+# PacBio movie, and a hole-number base distinct from sequence_idx (so the join is on
+# read_id, not a sidx==hole coincidence) — the lima chain keys on the lake's read_id.
+_MOVIE = "m84137_260623_040906_s1"
+_HOLE_BASE = 100_000_000
+
+
+def _rid(sidx: int) -> str:
+    return f"{_MOVIE}/{_HOLE_BASE + sidx}/ccs"
+
+
 def _write_reads(path: Path, rows: list[tuple[int, str]]) -> Path:
     values = ", ".join(
         "(CAST(5 AS BIGINT), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR), "
@@ -64,7 +76,7 @@ def _write_reads(path: Path, rows: list[tuple[int, str]]) -> Path:
     )
     params: list = []
     for sidx, seq in rows:
-        params.extend([sidx, f"r{sidx}", seq, _q(seq)])
+        params.extend([sidx, _rid(sidx), seq, _q(seq)])
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             f"COPY (SELECT * FROM (VALUES {values}) AS t("
@@ -113,7 +125,8 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
         2: ReadMaskReason.SPIKEIN_SYNDNA.value,
     }
 
-    # lima_export: only the still-`pass` read reaches lima (spike-in excluded).
+    # lima_export: only the still-`pass` read reaches lima (spike-in excluded). The
+    # exported BAM's record names are the lake's read_id, verbatim.
     exported = asyncio.run(
         lima_export.execute(
             lima_export.Inputs(
@@ -125,20 +138,28 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
             tmp_path / "ws_export",
         )
     )
-    names = [
-        ln[1:] for ln in exported["lima_in_fastq"].read_text().splitlines() if ln.startswith("@")
-    ]
-    assert names == ["1"], "the spike-in must NOT be exported to lima"
+    with open_miint_conn() as conn:
+        exported_names = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT read_id FROM read_sequences_sam('{exported['lima_in_bam']}')"
+            ).fetchall()
+        ]
+    assert exported_names == [_rid(1)], "only the pass read (read_id 1) reaches lima"
 
-    # simulate lima: it kept read 1 and clipped the adaptor down to the insert.
+    # simulate lima: it kept read 1 and clipped the adaptor down to the insert. lima
+    # round-trips the record name, so the output name is read 1's read_id verbatim.
     lima_out = tmp_path / "lima_out.fastq"
-    lima_out.write_text(f"@1 bc=3,3\n{_BIO_INSERT}\n+\n{'I' * len(_BIO_INSERT)}\n")
+    lima_out.write_text(f"@{_rid(1)} bc=3,3\n{_BIO_INSERT}\n+\n{'I' * len(_BIO_INSERT)}\n")
 
     # lima_mask: read 1 -> pass (adaptor trimmed); read 2 carried as spikein_syndna.
     partial = asyncio.run(
         lima_mask.execute(
             lima_mask.Inputs(
-                reads=reads, lima_out_fastq=lima_out, partial_mask=partial, work_ticket_idx=1
+                reads=reads,
+                lima_out_fastq=lima_out,
+                partial_mask=partial,
+                work_ticket_idx=1,
             ),
             tmp_path / "ws_limamask",
         )

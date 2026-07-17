@@ -170,10 +170,14 @@ steps:
   # overwritten by `twist_no_adaptor`. When syndna is off, lima runs on all raw
   # reads and produces `partial_mask` itself.
   #
-  # Serializing the reads to FASTQ is an on-disk hand-off to a container binary
-  # (called out, not silently entrenched). It cannot be streamed:
+  # Serializing the reads to a CCS uBAM is an on-disk hand-off to a container
+  # binary (called out, not silently entrenched). It cannot be streamed:
   # `_resolve_staged_masked_reads` needs an already-completed mask, and this chain
-  # is what builds it; the raw `read` table is not Flight-reachable.
+  # is what builds it; the raw `read` table is not Flight-reachable. It must be a
+  # BAM and not a FASTQ — lima selects its CCS path from the input FORMAT, and the
+  # CLR path a FASTQ forces hangs rather than finishing. The BAM's record name is
+  # the lake's `read_id` (PacBio's `<movie>/<zmw>/ccs`), which lima round-trips, so
+  # `lima_mask` keys straight back on `read_id` — no separate map binding.
   - step: lima_export
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.lima_export
@@ -184,7 +188,7 @@ steps:
     # `lima_preset`; it is never client-supplied (it would otherwise let a caller
     # forge mask identity and pass arbitrary flags to a container).
     params: {lima_args: lima_args}
-    outputs: [lima_in_fastq, lima_config]
+    outputs: [lima_in_bam, lima_config]
     baseline_resources:
       cpu: 2
       mem_gb: 8
@@ -203,7 +207,7 @@ steps:
     # lima.def leaves undefined). This must name the in-container launcher.
     entrypoint: /opt/qiita/lima.sh
     when: lima_enabled
-    inputs: [lima_in_fastq, lima_config]
+    inputs: [lima_in_bam, lima_config]
     outputs: [lima_out_fastq]
     baseline_resources:
       cpu: 8

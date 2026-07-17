@@ -94,6 +94,36 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **PacBio read-mask: lima now gets a CCS BAM, not a multi-GB FASTQ (#313).** lima
+  decides CCS-vs-CLR from the input FORMAT, not from `--hifi-preset`: handed the
+  ~33.5 GB FASTQ `lima_export` used to write, it warned "non CCS data … will
+  proceed to demultiplex each sequence individually" and never finished. Probed at
+  lima 2.13.0, that CLR path **does not finish** — it is not merely slow: the FASTQ
+  run produced zero bytes until killed at a timeout while the byte-identical reads
+  as a CCS BAM completed in ~2 s, so there was nothing to parallelize.
+  `lima_export` now rebuilds a minimal CCS unaligned BAM from the lake reads with
+  miint's `COPY … TO (FORMAT UBAM)` (duckdb-miint#156, shipped in #157) — an `@RG`
+  carrying `DS:READTYPE=CCS`, the field lima keys on — and feeds it to lima, which
+  completes in seconds. lima's output stays FASTQ, so `lima_mask` still reads it with
+  miint's `read_fastx`. No FASTQ is written at all now, so the landed intermediate
+  shrinks to the BAM. Verified end-to-end: real `lima_export` → real lima 2.13.0
+  (2 s, no CLR warning) → real `lima_mask`, every read correct at `sequence_idx >
+  2^31`. **The key is the lake's `read_id`, not `sequence_idx`.** `bam_to_parquet`
+  keeps the instrument's PacBio `<movie>/<zmw>/ccs` name verbatim, so `lima_export`
+  writes it back as the record name with `zm` = the hole number parsed out of it;
+  lima reconstructs that name byte-identically (probed on real production names), and
+  `lima_mask` joins its output straight back on `read_id` — no map file, no synthetic
+  name. `sequence_idx` cannot serve: lima rewrites the name from the **int32** `zm`
+  tag, so a lake-wide idx past 2^31 would come back TRUNCATED (5000000000 →
+  705032704) and mask the wrong read. `lima_export` rejects at export — where the
+  cause is legible — a `read_id` whose hole number exceeds int32, a read set spanning
+  more than one movie (multi-movie / block-scoped read-mask is not yet supported:
+  miint's `FORMAT UBAM` has no per-read `@RG`), or a non-PacBio `read_id` (whose
+  strict `[A-Za-z0-9_]+/[0-9]+/ccs` shape also keeps the movie safe to interpolate
+  into the `@RG`). Also corrected: `lima_mask`'s claim that an empty lima output is a
+  legitimate all-`twist_no_adaptor` mask — probed, an adapter-free BAM makes lima
+  exit 1 (`Could not find matching barcodes!`), so that branch is unreachable and is
+  now documented as the guard it is. Pinned by `test_lima_chain_smoke.py`.
 - **read-mask `lima` container step was missing its `entrypoint` (#311).** The step
   declared `container: lima-2.13.0.sif` but no `entrypoint:`, so the SLURM job ran
   `apptainer exec <sif>` with no command and died with "exec requires at least 2
