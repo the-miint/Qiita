@@ -285,11 +285,23 @@ def test_export_rejects_empty_lima_args(tmp_path):
         _export(tmp_path, reads, args="   ")
 
 
-def test_export_rejects_a_read_id_that_is_not_pacbio_ccs(tmp_path):
-    """A FASTQ-ingested sample carries whatever the FASTQ said. lima needs the
-    `<movie>/<zmw>/ccs` shape and hangs without it, so this must fail loud at export,
-    where the cause is legible, not deep inside a hung SLURM job."""
-    reads = _reads(tmp_path, [(11, _INSERT)], read_id_of=lambda s: f"plain_read_{s}")
+@pytest.mark.parametrize(
+    "bad_read_id",
+    [
+        "plain_read_11",  # FASTQ-ingested: no movie/zmw/ccs shape
+        "/123/ccs",  # empty movie
+        "mov/123",  # no /ccs suffix
+        "a/b/c/ccs",  # non-numeric hole + extra field
+        "mov/-3000000000/ccs",  # negative hole (would wrap in the int32 zm tag)
+        "m'x/123/ccs",  # SINGLE QUOTE in movie — would break/inject the COPY @RG SQL
+    ],
+)
+def test_export_rejects_a_read_id_that_is_not_pacbio_ccs(tmp_path, bad_read_id):
+    """The read_id shape is enforced strictly. lima needs `<movie>/<zmw>/ccs` and
+    hangs without it, so a FASTQ-ingested / malformed name fails loud at export. The
+    strict movie charset (`[A-Za-z0-9_]`) is also what keeps the movie safe to
+    interpolate into the COPY's @RG — a `'` in the movie must NOT reach the SQL."""
+    reads = _reads(tmp_path, [(11, _INSERT)], read_id_of=lambda s: bad_read_id)
     with pytest.raises(ValueError, match="not PacBio"):
         _export(tmp_path, reads)
 

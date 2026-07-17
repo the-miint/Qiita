@@ -83,10 +83,20 @@ _INCOMING = "lima_export_incoming"
 # `read_id` holds for a BAM-ingested sample. Both halves are needed: the movie for
 # the @RG, the hole number for the `zm` tag lima rebuilds the name from.
 _MOVIE_FROM_READ_ID = "split_part(read_id, '/', 1)"
-# TRY_CAST to BIGINT (not INTEGER): the guard must tell "not a number" (a non-PacBio
-# read_id -> NULL) apart from "over int32" (a large BIGINT). An INTEGER cast collapses
-# both to NULL and the over-range case would be misreported as a bad name shape.
+# TRY_CAST to BIGINT (not INTEGER): the guard must tell "not a number" from "over
+# int32" (a large BIGINT). An INTEGER cast collapses both to NULL and the over-range
+# case would be misreported. Only reached for a read_id that already matched the
+# strict shape below, so field 2 is a run of digits.
 _ZMW_FROM_READ_ID = "TRY_CAST(split_part(read_id, '/', 2) AS BIGINT)"
+
+# The full read_id shape lima requires, enforced as ONE check. The movie charset is
+# constrained to `[A-Za-z0-9_]` (real PacBio movie names — `m84137_260623_040906_s1`
+# — are exactly that): this is both a correctness guard (a FASTQ-ingested read_id, an
+# empty movie, a negative/non-numeric hole, or an extra field all fail) AND what
+# keeps the movie safe to interpolate into the COPY's @RG — a `'`, `/`, or whitespace
+# cannot pass. The magnitude bound (int32) is a separate numeric check; a regex
+# cannot express it.
+_READ_ID_SHAPE = r"^[A-Za-z0-9_]+/[0-9]+/ccs$"
 
 # Header @RG movie for a degenerate EMPTY export (no read references it). Obviously
 # synthetic so it can never be mistaken for a real movie in a header-only BAM.
@@ -130,12 +140,12 @@ COPY (
 def miint_supports_ubam(conn: duckdb.DuckDBPyConnection, probe_path: Path) -> bool:
     """Whether the loaded miint build can write an unaligned reads BAM.
 
-    False on every build up to and including the one this job was written against
-    — the writer is requested in duckdb-miint#156. Exists so the test suite can
-    skip the writer-dependent cases with a legible reason instead of failing
-    opaquely, and so `execute` can name the missing capability rather than surface
-    a bare BinderException. Delete it (and this branch) once the floor build ships
-    the format.
+    False on a build without the writer (requested in duckdb-miint#156, shipped in
+    #157). Used ONLY by the test skip fixtures, so a build that predates the writer
+    skips the writer-dependent cases with a legible reason instead of failing
+    opaquely. (`execute` does not call this — it names the missing capability from
+    its own `except duckdb.Error` block.) Delete it (and the skips) once the floor
+    build is guaranteed to ship the format.
     """
     # Exercise the REAL statement against one throwaway read, so the probe answers
     # "can this build run the call this job makes" rather than an approximation.
@@ -187,7 +197,9 @@ def _resolve_movie(conn: duckdb.DuckDBPyConnection, source: str) -> str:
 
     - **A `read_id` that is not `<movie>/<zmw>/ccs`.** A FASTQ-ingested sample
       carries whatever the FASTQ said. lima would then be handed a bare-ish name
-      and HANG (probed), so this is rejected here where the cause is legible.
+      and HANG (probed), so this is rejected here where the cause is legible. The
+      strict shape also excludes a movie carrying a `'` / `/` / space, which is what
+      makes the movie safe to interpolate into the COPY's @RG (see `_READ_ID_SHAPE`).
     - **More than one movie.** A single `@RG` stamps ONE `PU` on every read, and
       lima names each record from `zm` + its read group — so a second movie's reads
       would come back under the first movie's name: a wrong-but-plausible `read_id`
@@ -196,20 +208,21 @@ def _resolve_movie(conn: duckdb.DuckDBPyConnection, source: str) -> str:
       Supporting it would need one `@RG` per movie plus a per-read `RG` column.
     - **A hole number over int32.** Cannot happen for a name that came out of a real
       PacBio BAM, but an over-range `zm` truncates into a valid-looking ZMW rather
-      than erroring, so it is checked rather than trusted.
+      than erroring, so it is checked rather than trusted. (A negative or non-numeric
+      hole is already rejected by the shape check above.)
     """
     movies, bad_names, max_zmw = conn.execute(
         f"SELECT count(DISTINCT {_MOVIE_FROM_READ_ID}), "
-        f"       count(*) FILTER (WHERE {_ZMW_FROM_READ_ID} IS NULL "
-        f"                          OR split_part(read_id, '/', 3) <> 'ccs'), "
+        f"       count(*) FILTER (WHERE NOT regexp_full_match(read_id, '{_READ_ID_SHAPE}')), "
         f"       max({_ZMW_FROM_READ_ID}) "
         f"FROM {source}"
     ).fetchone()
     if bad_names:
         raise ValueError(
             f"{bad_names} read(s) have a read_id that is not PacBio's "
-            "'<movie>/<zmw>/ccs'; lima needs that name shape and hangs without it. "
-            "The lima chain expects a BAM-ingested CCS read set."
+            "'<movie>/<zmw>/ccs' (movie [A-Za-z0-9_], numeric hole); lima needs that "
+            "name shape and hangs without it. The lima chain expects a BAM-ingested "
+            "CCS read set."
         )
     if movies and movies > 1:
         raise ValueError(

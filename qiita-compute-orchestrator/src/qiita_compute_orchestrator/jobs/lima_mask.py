@@ -137,8 +137,10 @@ def _assert_lima_reads_are_known(conn: duckdb.DuckDBPyConnection, lima_out_fastq
     must never be papered over — the join would drop the read and the mask would
     call it `twist_no_adaptor`.
 
-    All three are counted in ONE pass: `_QCD` is a view over `read_fastx`, so a
-    scan per check would re-parse lima's whole output three times.
+    Two of the three — unresolved and duplicate — ride ONE aggregate scan of `_QCD`
+    (a view over `read_fastx`), so lima's output is not re-parsed for each. The
+    unknown-key check needs an ANTI JOIN against `_ORIG`, so it is a second scan;
+    it runs only after the first two pass.
     """
     unresolved, n, distinct = conn.execute(
         "SELECT count(*) FILTER (WHERE q.sequence_index IS NULL), count(*), "
