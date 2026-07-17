@@ -83,7 +83,14 @@ _INCOMING = "lima_export_incoming"
 # `read_id` holds for a BAM-ingested sample. Both halves are needed: the movie for
 # the @RG, the hole number for the `zm` tag lima rebuilds the name from.
 _MOVIE_FROM_READ_ID = "split_part(read_id, '/', 1)"
+# TRY_CAST to BIGINT (not INTEGER): the guard must tell "not a number" (a non-PacBio
+# read_id -> NULL) apart from "over int32" (a large BIGINT). An INTEGER cast collapses
+# both to NULL and the over-range case would be misreported as a bad name shape.
 _ZMW_FROM_READ_ID = "TRY_CAST(split_part(read_id, '/', 2) AS BIGINT)"
+
+# Header @RG movie for a degenerate EMPTY export (no read references it). Obviously
+# synthetic so it can never be mistaken for a real movie in a header-only BAM.
+_EMPTY_SOURCE_MOVIE = "qiita_no_reads"
 
 # The BAM `zm` tag is int32. A hole number from a real PacBio BAM cannot exceed it
 # (it was an int32 there), so this should never fire — but an over-range value would
@@ -215,7 +222,15 @@ def _resolve_movie(conn: duckdb.DuckDBPyConnection, source: str) -> str:
             f"read_id carries a ZMW ({max_zmw}) over the {_MAX_ZMW} addressable by the "
             "BAM `zm` tag; lima would truncate it and mask the wrong read"
         )
-    (movie,) = conn.execute(f"SELECT {_MOVIE_FROM_READ_ID} FROM {source} LIMIT 1").fetchone()
+    # `max`, not `LIMIT 1`, so an EMPTY source (an all-spike-in sample, whose reads
+    # were all excluded upstream) does not crash on unpacking `None`: it yields NULL,
+    # coalesced to a placeholder the header carries but no read references. The
+    # single-movie check above guarantees `max` == the one movie when non-empty. An
+    # empty export writes a header-only BAM; lima FATALs on it downstream, an
+    # empty-input outcome not settled here (see lima_mask).
+    (movie,) = conn.execute(
+        f"SELECT coalesce(max({_MOVIE_FROM_READ_ID}), '{_EMPTY_SOURCE_MOVIE}') FROM {source}"
+    ).fetchone()
     return movie
 
 

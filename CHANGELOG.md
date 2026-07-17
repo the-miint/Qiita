@@ -110,10 +110,11 @@ duplicates further down are historical strata; leave them where they are.
   alignment writer: it never emits SEQ/QUAL (even for a mapped record), requires a
   non-empty `REFERENCE_LENGTHS` @SQ header a uBAM has none of, and has no
   read-group option, so it cannot express the `@RG` lima keys on. The BAM is
-  written with miint's `COPY … TO (FORMAT UBAM)`, **requested in duckdb-miint#156**
-  and not yet on the mirror; until it lands `lima_export` fails loud naming that
-  issue, the writer-dependent tests skip, and this is **not deployable** (the key
-  channel and the input guards below are plain DuckDB and are covered today).
+  written with miint's `COPY … TO (FORMAT UBAM)` (duckdb-miint#156, shipped in
+  duckdb-miint#157, mirror build `5509321`), verified end-to-end: real `lima_export`
+  → real lima 2.13.0 (2 s, no CLR warning) → real `lima_mask`, every read correct at
+  `sequence_idx > 2^31`. `lima_export` still fails loud naming the issue on an older
+  build without the writer, and the writer-dependent tests skip there.
   **The key is the lake's `read_id`, not `sequence_idx`.** `bam_to_parquet` keeps
   the instrument's PacBio `<movie>/<zmw>/ccs` name verbatim, so `lima_export` writes
   it back as the record name with `zm` = the hole number parsed out of it; lima

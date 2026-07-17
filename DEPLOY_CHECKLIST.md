@@ -51,12 +51,12 @@ _None yet._
 - **The read-mask `lima` SIF auto-rebuilds on this deploy (#313).** `lima.sh` changed
   (it now hands lima a `.bam` instead of a `.fastq`), so `build-sifs.sh`'s
   build-inputs content hash rebuilds the image before the restart. No manual step.
-- **`lima_export` needs a miint build with `COPY … (FORMAT UBAM)` (#313).** Requested
-  in duckdb-miint#156. The deploy stages miint (`stage-miint-extension.sh`), so this
-  arrives with the mirror — no separate operator step — but the read-mask lima chain
-  FAILS LOUD (naming that issue) on a build without it. The PR is held unmerged until
-  it lands, so this line should never reach a deploy unsatisfied; if you are reading
-  it on the host, check the mirror build first. No new runtime Python dependency.
+- **`lima_export` needs a miint build with `COPY … (FORMAT UBAM)` (#313).** Shipped
+  in duckdb-miint#157 (mirror build `5509321`). The deploy stages miint
+  (`stage-miint-extension.sh`), so it arrives with the mirror — no separate operator
+  step. If the staged build predates it, the read-mask lima chain FAILS LOUD (naming
+  duckdb-miint#156) rather than corrupting a mask, so a stale stage is caught, not
+  silent. Re-run the stage step on deploy to be sure. No new runtime Python dependency.
 - **The parked pool-25016 read-mask tickets can be redriven once this is green (#313).**
   They were cancelled because lima could not finish; a redrive before this deploy hits
   the identical wall. Their ~33 GB `lima_export` FASTQs under

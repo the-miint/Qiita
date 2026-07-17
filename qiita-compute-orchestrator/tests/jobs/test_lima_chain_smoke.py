@@ -318,6 +318,38 @@ def test_export_rejects_a_hole_number_over_int32(tmp_path):
         _export(tmp_path, reads)
 
 
+def test_export_handles_an_empty_source(tmp_path, requires_ubam):
+    """An all-spike-in sample exports ZERO reads (partial_mask leaves nothing `pass`).
+    `_resolve_movie` must not crash unpacking a missing row — it yields a header-only
+    BAM. (lima FATALs on it downstream, an empty-input outcome not settled here; the
+    point of this test is only that EXPORT does not raise a TypeError.)"""
+    import pysam
+
+    reads = _reads(tmp_path, [(11, _INSERT)])
+    # A partial_mask that marks the one read non-`pass`, so no read reaches lima.
+    partial = tmp_path / "partial.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            f"COPY (SELECT 11::BIGINT AS sequence_idx, "
+            f"'{ReadMaskReason.SPIKEIN_SYNDNA.value}' AS reason, 0::UINTEGER AS left_trim1, "
+            "0::UINTEGER AS right_trim1, NULL::UINTEGER AS left_trim2, NULL::UINTEGER AS "
+            f"right_trim2) TO '{partial}' (FORMAT PARQUET)"
+        )
+    from qiita_compute_orchestrator.jobs import lima_export
+
+    out = asyncio.run(
+        lima_export.execute(
+            lima_export.Inputs(
+                reads=reads, lima_args=_LIMA_ARGS, partial_mask=partial, work_ticket_idx=1
+            ),
+            tmp_path / "we",
+        )
+    )
+    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
+        assert list(bam) == [], "no reads exported"
+        assert bam.header.to_dict()["RG"], "header @RG still present"
+
+
 # --------------------------------------------------------------------------- #
 # lima_mask — the read_id round-trip and infer_trim contract (plain DuckDB)    #
 # --------------------------------------------------------------------------- #
