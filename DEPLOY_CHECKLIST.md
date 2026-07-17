@@ -44,13 +44,29 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- **Redrive the read-mask pool once the rebuilt `lima` SIF is live (#313 + python3 fix).**
+  The lima tickets that reached `lima` before this deploy FAILED terminally at
+  `qiita_finish` (`exit 127 python3: command not found`) — a `127` is not the
+  retriable class, so the SIF rebuild fixes *future* runs but does NOT recover the
+  stuck ones. Re-fan-out the pool (which mints fresh tickets; the failed ones are
+  inert history):
+  ```bash
+  uv run qiita --base-url https://<fqdn> submit-host-filter-pool \
+    --sequencing-run-idx <run> --sequenced-pool-idx <pool> --syndna-reference-idx <idx>
+  ```
+  Then watch a ticket through `lima_export → lima → qc`; `lima` should complete in
+  seconds. (Do NOT pass `--only-missing` — every sample already has a failed ticket,
+  so it would skip them all.)
 
 ### Notes (no host action)
 
-- **The read-mask `lima` SIF auto-rebuilds on this deploy (#313).** `lima.sh` changed
-  (it now hands lima a `.bam` instead of a `.fastq`), so `build-sifs.sh`'s
-  build-inputs content hash rebuilds the image before the restart. No manual step.
+- **The read-mask `lima` SIF auto-rebuilds on this deploy (#313, and again for the
+  python3 fix).** `lima.sh` changed for #313 (it now hands lima a `.bam`), and
+  `lima.def` changed to add `python3` (the `qiita_finish` manifest writer needs it —
+  without it every lima step failed `127` *after* lima succeeded). Both flip
+  `build-sifs.sh`'s build-inputs content hash, so the image rebuilds before the
+  restart. No manual step; the def's new `%test` fails the build if `python3` is
+  absent.
 - **`lima_export` needs a miint build with `COPY … (FORMAT UBAM)` (#313).** Shipped
   in duckdb-miint#157 (mirror build `5509321`). The deploy stages miint
   (`stage-miint-extension.sh`), so it arrives with the mirror — no separate operator

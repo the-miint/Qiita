@@ -43,8 +43,11 @@ From: mambaorg/micromamba:1.5.8
     set -e
     export MAMBA_ROOT_PREFIX=/opt/conda
     # jq (params.json) + the base utilities the entrypoint relies on outside the
-    # tool env. Mirrors long-read-assembly's per-tool images.
-    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils
+    # tool env. Mirrors long-read-assembly's per-tool images. `python` provides the
+    # `python3` that `_lib.sh`'s `qiita_finish` runs `manifest_writer.py` under at
+    # the END of the step — without it the step fails 127 (`python3: command not
+    # found`) only AFTER lima succeeds, which is why the old FASTQ-hang masked it.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python
 
     # lima is PINNED, not floated. It decides where the adapter clip lands, so a
     # version bump changes the effective filter — the control plane carries this
@@ -54,3 +57,19 @@ From: mambaorg/micromamba:1.5.8
     # 2.13.0 is the version qp-pacbio validated against (pbbam 2.8.0 / pbcopper
     # 2.7.0 / htslib 1.17). Bumping is a deliberate act: update the constant too.
     micromamba create -y -n lima -c bioconda -c conda-forge lima=2.13.0
+
+%test
+    # `qiita_finish` (in the staged _lib.sh) runs `python3 manifest_writer.py` as the
+    # last line of every container step. lima itself does not need python, so a
+    # missing interpreter fails ONLY after lima succeeds — the failure this guard
+    # exists to make impossible to ship. `apptainer build` runs %test after %post, so
+    # a failure here fails the build instead of shipping a broken SIF.
+    set -e
+    command -v python3
+    # Execute the module body under the shipped interpreter (matching bcl-convert and
+    # the long-read-assembly images). manifest_writer.py has no `from __future__
+    # import annotations`, so its `list[str]`/`dict[str, str]` annotations evaluate at
+    # def-time — a too-old Python raises TypeError on import, which ast/py_compile
+    # would miss. exec_module runs the body (imports + annotation evaluation) WITHOUT
+    # tripping the `__main__` guard, so argv is never read.
+    python3 -c "import importlib.util as u; s = u.spec_from_file_location('mw', '/opt/qiita/manifest_writer.py'); m = u.module_from_spec(s); s.loader.exec_module(m)"
