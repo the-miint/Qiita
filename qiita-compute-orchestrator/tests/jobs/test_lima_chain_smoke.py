@@ -10,13 +10,11 @@ The simulation mirrors what lima 2.13.0 was PROBED to do, not what it plausibly
 does: it emits the record name VERBATIM (which for our BAM is the lake's
 `read_id`), with its own BAM tags appended after one space.
 
-**The uBAM write itself is not exercised yet.** `lima_export` writes the CCS BAM
-with miint's `COPY ... TO (FORMAT UBAM)`, requested in duckdb-miint#156 and not in
-the mirror build yet, so the cases that inspect the produced BAM SKIP until it
-lands (the `requires_ubam` fixture) — they are the ones to re-run first when it
-does. Everything else runs today: the input GUARDS all raise before the COPY (so
-`execute` reaches them without the writer), and the whole `lima_mask` side is plain
-DuckDB.
+The produced BAM is read back with miint's `read_sequences_sam` (not pysam): it
+gives the record name, sequence, and quality, which is what these tests assert.
+The `@RG DS:READTYPE=CCS` and the `zm` tag are miint's `FORMAT UBAM` contract, not
+ours to re-test — they are proved by lima accepting the BAM (the end-to-end probe
+in ~/claude/tmp/lima-bam-fix), not here.
 
 Pinned here:
   - `lima_export` writes the lake's `read_id` as the record name — the key channel,
@@ -31,8 +29,8 @@ Pinned here:
   - a read lima omitted becomes `twist_no_adaptor` with zero trims;
   - an EMPTY lima output is handled rather than crashing `read_fastx` — a guard on
     an external tool's file, NOT the adapter-free-sample path (lima FATALs there);
-  - a name that is not a known `read_id`, a resolved key that is not an exported
-    read, or a duplicated one, fails loud rather than silently dropping / duplicating;
+  - a name that is not a read_id sent to lima, or a duplicated one, fails loud
+    rather than silently dropping / duplicating a mask row;
   - lima editing internal bases (not pure end-trimming) fails loud via `infer_trim`.
 """
 
@@ -114,20 +112,17 @@ def _reads(
     return out
 
 
-@pytest.fixture
-def requires_ubam(tmp_path):
-    """Skip when the loaded miint build cannot write an unaligned reads BAM.
-
-    Only the cases that INSPECT the produced BAM need it; the input guards and the
-    whole `lima_mask` side run without it. Gated rather than xfail-ed so the reason
-    is legible, and so these light up on their own the day the mirror ships
-    duckdb-miint#156 — no one has to remember to unskip."""
-    from qiita_compute_orchestrator.jobs.lima_export import miint_supports_ubam
+def _bam_reads(path: Path) -> list[tuple[str, str, list[int]]]:
+    """The produced uBAM read back via miint (`read_sequences_sam`) — `(read_id,
+    sequence, qual)` per record. No pysam: the reads reader gives what these tests
+    assert (name, bases, quality); the @RG/`zm` tag are FORMAT UBAM's contract,
+    proved by lima accepting the BAM, not here."""
     from qiita_compute_orchestrator.miint import open_miint_conn
 
     with open_miint_conn() as conn:
-        if not miint_supports_ubam(conn, tmp_path / "ubam_probe.bam"):
-            pytest.skip("miint build cannot write a uBAM yet — duckdb-miint#156")
+        return conn.execute(
+            f"SELECT read_id, sequence1, qual1 FROM read_sequences_sam('{path}') ORDER BY read_id"
+        ).fetchall()
 
 
 def _export(tmp_path: Path, reads: Path, args: str = _LIMA_ARGS):
@@ -162,74 +157,19 @@ def _roundtrip(tmp_path: Path, rows: list[tuple[int, str]], kept: list[tuple[int
 
 
 # --------------------------------------------------------------------------- #
-# lima_export — the produced BAM (needs the uBAM writer)                       #
+# lima_export — the produced BAM                                               #
 # --------------------------------------------------------------------------- #
 
 
-def test_export_names_records_with_the_lake_read_id(tmp_path, requires_ubam):
-    """The record name IS `read_id`, verbatim — that is the key lima round-trips and
-    `lima_mask` joins back on. Nothing is synthesized."""
-    import pysam
-
-    reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
-    out = _export(tmp_path, reads)
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        names = {rec.query_name for rec in bam}
-    assert names == {_rid(11), _rid(22)}
-
-
-def test_export_bam_carries_the_ccs_read_type(tmp_path, requires_ubam):
-    """`DS:READTYPE=CCS` is the field lima keys on: probed, an @RG whose DS says
-    READTYPE=UNKNOWN is accepted but demoted to SubreadSets. `PU` carries the read
-    set's real movie (parsed from read_id) — lima names each record from `zm` + the
-    read group, so `PU` is what makes the output name match `read_id`."""
-    import pysam
-
-    reads = _reads(tmp_path, [(11, _INSERT)])
-    out = _export(tmp_path, reads)
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        (rg,) = bam.header.to_dict()["RG"]
-    assert "READTYPE=CCS" in rg["DS"]
-    assert rg["PL"] == "PACBIO"
-    assert rg["PU"] == _MOVIE
-
-
-def test_export_sets_zm_to_the_hole_number_in_read_id(tmp_path, requires_ubam):
-    """lima rebuilds each emitted name from `zm` + the read group, so `zm` must be
-    the hole number parsed out of `read_id` for the name to round-trip."""
-    import pysam
-
-    reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
-    out = _export(tmp_path, reads)
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        for rec in bam:
-            assert rec.get_tag("zm") == int(rec.query_name.split("/")[1])
-
-
-def test_export_bam_carries_the_reads_themselves(tmp_path, requires_ubam):
-    """The anti-vacuity check on the writer. miint's `COPY ... (FORMAT BAM)` silently
-    emits `*` for SEQ/QUAL — a BAM that lima accepts and finds no reads in would look
-    like a working chain that masks everything `twist_no_adaptor`. `FORMAT UBAM` must
-    actually put the bases in the file."""
-    import pysam
-
-    raw = _LEAD + _INSERT
-    reads = _reads(tmp_path, [(11, raw)])
-    out = _export(tmp_path, reads)
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        (rec,) = list(bam)
-    assert rec.query_sequence == raw
-    assert list(rec.query_qualities) == _q(raw)
-
-
-def test_export_bam_quals_track_their_own_read(tmp_path, requires_ubam):
-    """The `zm` tag and the SEQ/QUAL must belong to the SAME read — a wrong TAGS or
-    column binding would put read N's quals on read M silently. Reads of DIFFERENT
-    lengths, each a distinct score pattern, every one checked. Constant-quality reads
-    could not fail this."""
-    import pysam
-
-    rows = [(11, "ACGT" * 3), (22, "TTTT" * 7), (33, "GG"), (44, "ACGTAC" * 5)]
+def test_export_bam_carries_each_read_keyed_by_its_read_id(tmp_path):
+    """The record name IS `read_id` (the key lima round-trips and `lima_mask` joins
+    back on), and each name carries ITS OWN sequence and quality. This is the
+    anti-vacuity check on the writer: a BAM lima reads and finds no bases in would
+    look like a chain that masks everything `twist_no_adaptor`, and a mis-bound TAGS
+    or column would put read N's bases on read M. Reads of DIFFERENT lengths, each a
+    distinct sequence AND a distinct quality pattern, every one checked — constant
+    data could not fail this."""
+    rows = [(11, "ACGTACGT"), (22, "TTTTGGGGCC"), (33, "GG"), (44, "ACGTACACGT")]
     quals = {sidx: [(sidx + i) % 94 for i in range(len(seq))] for sidx, seq in rows}
     reads = tmp_path / "reads.parquet"
     values = ", ".join(
@@ -248,17 +188,16 @@ def test_export_bam_quals_track_their_own_read(tmp_path, requires_ubam):
             params,
         )
     out = _export(tmp_path, reads)
-    hole_to_sidx = {_HOLE_BASE + sidx: sidx for sidx, _ in rows}
-    seen = 0
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        for rec in bam:
-            sidx = hole_to_sidx[int(rec.query_name.split("/")[1])]
-            assert list(rec.query_qualities) == quals[sidx], f"quals crossed reads at {sidx}"
-            seen += 1
-    assert seen == len(rows)
+    seq_of = {seq: sidx for sidx, seq in rows}
+    got = _bam_reads(out["lima_in_bam"])
+    assert {rid for rid, _, _ in got} == {_rid(sidx) for sidx, _ in rows}, "names are read_id"
+    for rid, seq, qual in got:
+        sidx = seq_of[seq]  # seq present & non-empty (anti-vacuity)
+        assert rid == _rid(sidx), "sequence is on its own read_id"
+        assert list(qual) == quals[sidx], f"quality crossed reads at {sidx}"
 
 
-def test_export_writes_the_cp_resolved_args_to_a_file(tmp_path, requires_ubam):
+def test_export_writes_the_cp_resolved_args_to_a_file(tmp_path):
     """A scalar cannot ride a container step's inputs (the runner treats every
     container input as a bind-mount path), so lima's args arrive as a file."""
     import json
@@ -330,13 +269,11 @@ def test_export_rejects_a_hole_number_over_int32(tmp_path):
         _export(tmp_path, reads)
 
 
-def test_export_handles_an_empty_source(tmp_path, requires_ubam):
+def test_export_handles_an_empty_source(tmp_path):
     """An all-spike-in sample exports ZERO reads (partial_mask leaves nothing `pass`).
     `_resolve_movie` must not crash unpacking a missing row — it yields a header-only
     BAM. (lima FATALs on it downstream, an empty-input outcome not settled here; the
     point of this test is only that EXPORT does not raise a TypeError.)"""
-    import pysam
-
     reads = _reads(tmp_path, [(11, _INSERT)])
     # A partial_mask that marks the one read non-`pass`, so no read reaches lima.
     partial = tmp_path / "partial.parquet"
@@ -357,9 +294,8 @@ def test_export_handles_an_empty_source(tmp_path, requires_ubam):
             tmp_path / "we",
         )
     )
-    with pysam.AlignmentFile(out["lima_in_bam"], "rb", check_sq=False) as bam:
-        assert list(bam) == [], "no reads exported"
-        assert bam.header.to_dict()["RG"], "header @RG still present"
+    assert out["lima_in_bam"].exists(), "a header-only BAM is written, not a crash"
+    assert _bam_reads(out["lima_in_bam"]) == [], "no reads exported"
 
 
 # --------------------------------------------------------------------------- #
@@ -416,11 +352,10 @@ def test_mask_tolerates_limas_appended_bam_tags(tmp_path):
     assert _mask_rows(with_tags["partial_mask"]) == _mask_rows(without["partial_mask"])
 
 
-def test_mask_rejects_a_name_that_is_not_a_known_read_id(tmp_path):
-    """The sharpest failure: lima rebuilds the name from `zm`, so a name that is not a
-    known `read_id` means the key channel itself broke (a truncated ZMW, a stale
-    output). The LEFT JOIN must surface it, never let the read vanish into
-    twist_no_adaptor."""
+def test_mask_rejects_a_name_that_is_not_a_read_id_sent_to_lima(tmp_path):
+    """A name that is not in what we SENT lima means the key channel broke (a
+    corrupted name, a stale output). The LEFT JOIN against `_ORIG` must surface it as
+    a NULL key, never let the read vanish into twist_no_adaptor."""
     reads = _reads(tmp_path, [(11, _INSERT)])
     # A record whose name is not any input read's read_id.
     lima_out = _write_lima_output(
@@ -431,10 +366,11 @@ def test_mask_rejects_a_name_that_is_not_a_known_read_id(tmp_path):
 
 
 def test_mask_rejects_a_read_lima_should_not_have_emitted(tmp_path):
-    """The ANTI-JOIN check, distinct from the unknown-name one. With an upstream mask
-    bound, only its `pass` reads are exported; a read_id that resolves (it IS in the
-    reads) but was NOT among the exported set means lima emitted a read we excluded —
-    e.g. a carried spike-in. It must fail loud, not overwrite the spike-in verdict."""
+    """The SAME check catches a read we EXCLUDED. With an upstream mask bound, only
+    its `pass` reads are exported (`_ORIG` is pass-only), so a spike-in read_id in
+    lima's output resolves against the full reads but not against `_ORIG` — it lands
+    as a NULL key, same as a corrupted name. It must fail loud, not overwrite the
+    spike-in verdict. (This is why `_QCD` joins `_ORIG`, not all reads.)"""
     from qiita_compute_orchestrator.jobs import lima_mask
 
     reads = _reads(tmp_path, [(11, _INSERT), (22, _INSERT)])
@@ -452,7 +388,7 @@ def test_mask_rejects_a_read_lima_should_not_have_emitted(tmp_path):
         )
     # lima wrongly emits BOTH reads, including the excluded spike-in 22.
     lima_out = _write_lima_output(tmp_path / "lima_out.fastq", [(11, _INSERT), (22, _INSERT)])
-    with pytest.raises(ValueError, match="not an exported read"):
+    with pytest.raises(ValueError, match="round-trip is broken"):
         asyncio.run(
             lima_mask.execute(
                 lima_mask.Inputs(

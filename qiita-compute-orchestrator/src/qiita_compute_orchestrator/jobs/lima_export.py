@@ -108,20 +108,12 @@ _EMPTY_SOURCE_MOVIE = "qiita_no_reads"
 # land on the wrong read. Asserted, not assumed.
 _MAX_ZMW = 2**31 - 1
 
-# THE ONE PLACE THE uBAM WRITER'S CALL SHAPE LIVES.
-#
-# miint's `COPY ... TO (FORMAT UBAM)` — requested in duckdb-miint#156 and pinned
-# from the qiita side by `tests/jobs/test_sam_bam_writer_miint_contract.py`, which
-# documents why the pre-existing `FORMAT SAM|BAM` cannot serve (it is an ALIGNMENT
-# writer: it never emits SEQ/QUAL, demands a non-empty REFERENCE_LENGTHS @SQ header
-# a uBAM has none of, and exposes no read-group option).
-#
-# `read_id` is the record name (the same column `FORMAT FASTQ` names records from);
-# `zmw` is an ordinary column of this projection, which `TAGS` binds to the `zm`
-# tag — it is not a lake column and miint is not reaching into a schema.
-#
-# Kept as one formattable statement so that if the shipped option syntax differs
-# from the requested shape, the fix is this string and nothing else.
+# miint's `COPY ... TO (FORMAT UBAM)` (duckdb-miint#156, shipped in #157). The
+# pre-existing `FORMAT SAM|BAM` is an ALIGNMENT writer and cannot serve — it never
+# emits SEQ/QUAL, demands a non-empty REFERENCE_LENGTHS @SQ header, and exposes no
+# read-group option. `read_id` is the record name (the column `FORMAT FASTQ` names
+# records from); `zmw` is an ordinary column of this projection that `TAGS` binds to
+# the `zm` tag.
 _UBAM_COPY_SQL = """
 COPY (
     SELECT read_id,
@@ -135,38 +127,6 @@ COPY (
     TAGS {{zm: zmw}}
 )
 """
-
-
-def miint_supports_ubam(conn: duckdb.DuckDBPyConnection, probe_path: Path) -> bool:
-    """Whether the loaded miint build can write an unaligned reads BAM.
-
-    False on a build without the writer (requested in duckdb-miint#156, shipped in
-    #157). Used ONLY by the test skip fixtures, so a build that predates the writer
-    skips the writer-dependent cases with a legible reason instead of failing
-    opaquely. (`execute` does not call this — it names the missing capability from
-    its own `except duckdb.Error` block.) Delete it (and the skips) once the floor
-    build is guaranteed to ship the format.
-    """
-    # Exercise the REAL statement against one throwaway read, so the probe answers
-    # "can this build run the call this job makes" rather than an approximation.
-    conn.execute(
-        "CREATE OR REPLACE TEMP TABLE lima_ubam_probe AS "
-        "SELECT 'm/1/ccs' AS read_id, 'ACGT' AS sequence1, "
-        "       [40,40,40,40]::UTINYINT[] AS qual1"
-    )
-    try:
-        conn.execute(
-            _UBAM_COPY_SQL.format(
-                zmw_expr=_ZMW_FROM_READ_ID,
-                source="lima_ubam_probe",
-                out=probe_path,
-                rg=_READ_GROUP_ID,
-                movie="m",
-            )
-        )
-        return True
-    except duckdb.Error:
-        return False
 
 
 class Inputs(BaseModel):
@@ -200,12 +160,15 @@ def _resolve_movie(conn: duckdb.DuckDBPyConnection, source: str) -> str:
       and HANG (probed), so this is rejected here where the cause is legible. The
       strict shape also excludes a movie carrying a `'` / `/` / space, which is what
       makes the movie safe to interpolate into the COPY's @RG (see `_READ_ID_SHAPE`).
-    - **More than one movie.** A single `@RG` stamps ONE `PU` on every read, and
-      lima names each record from `zm` + its read group — so a second movie's reads
-      would come back under the first movie's name: a wrong-but-plausible `read_id`
-      that mis-joins or vanishes. The lake is single-movie per prep_sample today
-      (verified on real data); this fails loud rather than trusting that forever.
-      Supporting it would need one `@RG` per movie plus a per-read `RG` column.
+    - **More than one movie — NOT YET SUPPORTED.** A single `@RG` stamps ONE `PU` on
+      every read, and lima names each record from `zm` + its read group, so a second
+      movie's reads would come back under the first movie's name: a wrong-but-plausible
+      `read_id` that mis-joins. A per-SAMPLE mask is single-movie, but a BLOCK-scoped
+      ticket (`target_kind: block`) spans multiple prep_samples and so may legitimately
+      carry several movies. Supporting that needs one `@RG` per movie plus a per-read
+      `RG` column, which miint's `FORMAT UBAM` does not offer yet (only a single
+      `READ_GROUP` struct — probed). Until it does, this fails loud HERE, legibly,
+      rather than letting lima rebuild wrong names that fail obscurely in `lima_mask`.
     - **A hole number over int32.** Cannot happen for a name that came out of a real
       PacBio BAM, but an over-range `zm` truncates into a valid-looking ZMW rather
       than erroring, so it is checked rather than trusted. (A negative or non-numeric
@@ -226,9 +189,10 @@ def _resolve_movie(conn: duckdb.DuckDBPyConnection, source: str) -> str:
         )
     if movies and movies > 1:
         raise ValueError(
-            f"reads span {movies} movies; a single @RG would stamp one movie on every "
-            "record and lima would rebuild the wrong read_id for the rest. Supporting "
-            "this needs one @RG per movie plus a per-read RG tag."
+            f"reads span {movies} movies (a block-scoped ticket over several "
+            "prep_samples?); lima_export's single @RG cannot round-trip more than one "
+            "movie's read_id, and miint's FORMAT UBAM has no per-read RG yet. "
+            "Multi-movie read-mask is not yet supported."
         )
     if max_zmw is not None and max_zmw > _MAX_ZMW:
         raise ValueError(
@@ -286,25 +250,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 )
                 source = "lima_export_pass"
             movie = _resolve_movie(conn, source)
-            try:
-                conn.execute(
-                    _UBAM_COPY_SQL.format(
-                        zmw_expr=_ZMW_FROM_READ_ID,
-                        source=source,
-                        out=bam_sql,
-                        rg=_READ_GROUP_ID,
-                        movie=movie,
-                    )
+            conn.execute(
+                _UBAM_COPY_SQL.format(
+                    zmw_expr=_ZMW_FROM_READ_ID,
+                    source=source,
+                    out=bam_sql,
+                    rg=_READ_GROUP_ID,
+                    movie=movie,
                 )
-            except duckdb.Error as exc:
-                # Name the missing capability rather than surface a bare binder
-                # error four layers down in a SLURM log.
-                raise RuntimeError(
-                    "the loaded miint build cannot write an unaligned reads BAM "
-                    "(COPY ... TO (FORMAT UBAM)); lima requires a CCS BAM and does not "
-                    "finish on a FASTQ. See duckdb-miint#156 and "
-                    f"tests/jobs/test_sam_bam_writer_miint_contract.py. Underlying error: {exc}"
-                ) from exc
+            )
         lima_config.write_text(json.dumps({"args": inputs.lima_args}) + "\n")
         success = True
     finally:

@@ -37,14 +37,6 @@ dev = [
     "pytest-asyncio>=0.25",
     "httpx>=0.28",
     "ruff>=0.15",
-    # TEST-ONLY, and deliberately not a runtime dep: `lima_export` writes its CCS
-    # uBAM with miint, so nothing that ships to a compute node imports pysam. The
-    # tests need it to READ the produced BAM back and assert the two things the
-    # whole chain hinges on — the `@RG` carrying `DS:READTYPE=CCS`, and the per-read
-    # `zm` tag lima rebuilds its output names from. miint cannot serve here:
-    # `read_sequences_sam` emits reads WITHOUT tags, so it can verify the bases but
-    # is blind to exactly the fields that matter.
-    "pysam>=0.23",
 ]
 
 [tool.uv.sources]

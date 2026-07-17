@@ -19,9 +19,10 @@ import random
 from pathlib import Path
 
 import duckdb
-import pytest
 from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
 from qiita_common.models import ReadMaskReason
+
+from qiita_compute_orchestrator.miint import open_miint_conn
 
 # Kilobase-scale, as real HiFi is: syndna aligns with minimap2's `map-hifi` preset,
 # which is tuned for long reads and will not align a short toy sequence. Seeded, so
@@ -95,24 +96,6 @@ def _adapters(tmp_path: Path) -> Path:
     return p
 
 
-def _ubam_available() -> bool:
-    """Whether the loaded miint build can write an unaligned reads BAM.
-
-    This chain test runs syndna -> lima_export -> lima_mask -> qc for real, so it
-    needs the writer end to end; there is no partial form worth keeping. It lights
-    up on its own once the mirror ships duckdb-miint#156."""
-    import tempfile
-
-    from qiita_compute_orchestrator.jobs.lima_export import miint_supports_ubam
-    from qiita_compute_orchestrator.miint import open_miint_conn
-
-    try:
-        with tempfile.TemporaryDirectory() as d, open_miint_conn() as conn:
-            return miint_supports_ubam(conn, Path(d) / "probe.bam")
-    except Exception:
-        return False
-
-
 def _reasons(path: Path) -> dict[int, str]:
     with duckdb.connect(":memory:") as conn:
         return dict(
@@ -120,14 +103,7 @@ def _reasons(path: Path) -> dict[int, str]:
         )
 
 
-@pytest.mark.skipif(
-    not _ubam_available(),
-    reason="lima_export writes its CCS uBAM with miint's COPY ... (FORMAT UBAM), "
-    "not in the mirror build yet — duckdb-miint#156",
-)
 def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path):
-    import pysam
-
     from qiita_compute_orchestrator.jobs import lima_export, lima_mask, qc, syndna
 
     # read 1: biological — adaptor + insert. read 2: spike-in — a slice of the
@@ -162,8 +138,13 @@ def test_case5_chain_spike_in_survives_as_spikein_not_twist_no_adaptor(tmp_path)
             tmp_path / "ws_export",
         )
     )
-    with pysam.AlignmentFile(exported["lima_in_bam"], "rb", check_sq=False) as bam:
-        exported_names = [rec.query_name for rec in bam]
+    with open_miint_conn() as conn:
+        exported_names = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT read_id FROM read_sequences_sam('{exported['lima_in_bam']}')"
+            ).fetchall()
+        ]
     assert exported_names == [_rid(1)], "only the pass read (read_id 1) reaches lima"
 
     # simulate lima: it kept read 1 and clipped the adaptor down to the insert. lima

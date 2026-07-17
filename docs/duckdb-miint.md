@@ -135,15 +135,9 @@ The fastp-equivalent read-QC functions, consumed by the `qc` native job (the bcl
 - `qc_version()` → `VARCHAR` — QC-port version sanity probe.
 
 ### COPY writers — `docs/copy-formats.md`
-`COPY <query> TO 'path' (FORMAT { FASTQ | FASTA | SAM | BAM | BIOM | NEWICK })` — see the doc for required column shapes (e.g. SAM/BAM expects HTSlib-style columns; BIOM expects a feature table layout).
+`COPY <query> TO 'path' (FORMAT { FASTQ | FASTA | SAM | BAM | UBAM | BIOM | NEWICK })` — see the doc for required column shapes (e.g. SAM/BAM expects HTSlib-style columns; BIOM expects a feature table layout).
 
-**⚠️ `FORMAT SAM` / `FORMAT BAM` is an ALIGNMENT writer, NOT a reads writer — qiita-verified 2026-07-16 by probe** (mirror build `ee7015b`, DuckDB v1.5.4; pinned by `qiita-compute-orchestrator/tests/jobs/test_sam_bam_writer_miint_contract.py`). It is **not** a way to write an unaligned BAM, and the miint-first rule does not apply to that job:
-- **It never emits SEQ/QUAL.** Every record lands with `*` in both fields, under every column naming tried (`sequence1`/`qual1`, `sequence`/`quality`, `seq`/`qual`, `sequence`/`qual`). Established with an anti-vacuity **mapped-record control** (real `@SQ` reference + `10M` cigar), so it is not an artifact of an unmapped record. The reads themselves are simply not part of this writer's output.
-- Required columns are the alignment ones, verbatim: `read_id`, `flags` (`USMALLINT`), `reference`, `position` (**BIGINT**), `mapq`, `cigar`, `mate_reference`, `mate_position`, `template_length`.
-- `REFERENCE_LENGTHS '<table>'` is **mandatory** (it builds the `@SQ` header) and the table must be non-empty — so a header-less / reference-less uBAM is not expressible.
-- There is **no read-group option**: `READ_GROUP` / `RG` / `HEADER` / `EXTRA_HEADER` all raise `Unknown option for COPY FORMAT SAM`.
-
-Consequence: a CCS uBAM cannot be written with this writer — it needs `@RG … DS:READTYPE=CCS` (the field lima keys on) and it needs SEQ/QUAL to actually be in the file. `COPY … TO (FORMAT UBAM)` is requested in **duckdb-miint#156**; `lima_export` calls it (see `_UBAM_COPY_SQL`, the single place its call shape lives) and fails loud naming that issue on a build without it.
+**Reads BAM vs alignment BAM — use the right one.** `FORMAT SAM` / `FORMAT BAM` is an ALIGNMENT writer: it takes HTSlib-style alignment columns and does **not** put SEQ/QUAL in the file, so it cannot write a reads/uBAM. For an **unaligned reads BAM** use **`FORMAT UBAM`** (duckdb-miint#156, shipped in #157): it writes `read_id`/`sequence1`/`qual1` as name/SEQ/QUAL with no `@SQ` header, takes a `READ_GROUP {…}` struct and a `TAGS {tag: column}` map for per-read integer tags. `lima_export` uses it to build the CCS BAM lima needs (`@RG … DS:READTYPE=CCS`, a per-read `zm` tag); its call is `_UBAM_COPY_SQL`, the single place that shape lives.
 
 **`FORMAT FASTQ` writer — qiita-verified 2026-06-25** (probes + `qiita-compute-orchestrator/tests/jobs/test_masked_export_fastq_contract.py`, build `eca0e79`; consumed by the `qiita-admin masked-read-export` CLI writing the data plane's `read_masked` view to per-sample FASTQ):
 - Requires the **verbatim** columns `read_id`, `sequence1`, `qual1` (and `sequence2`, `qual2` for paired) — the exact names `read_masked` emits. Aliasing `read_id` away raises a `BinderException`; select the view's columns by name.

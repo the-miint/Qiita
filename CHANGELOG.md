@@ -101,37 +101,29 @@ duplicates further down are historical strata; leave them where they are.
   lima 2.13.0, that CLR path **does not finish** — it is not merely slow: the FASTQ
   run produced zero bytes until killed at a timeout while the byte-identical reads
   as a CCS BAM completed in ~2 s, so there was nothing to parallelize.
-  `lima_export` now rebuilds a minimal CCS unaligned BAM from the lake reads (an
-  `@RG` carrying `DS:READTYPE=CCS`, the field lima keys on) and feeds it to lima,
-  which completes in seconds. lima's output stays FASTQ, so `lima_mask` still reads
-  it with miint's `read_fastx`. No FASTQ is written at all now, so the landed
-  intermediate shrinks to the BAM. Three findings shaped the fix.
-  **The existing `COPY … TO (FORMAT BAM)` cannot write this file** — it is an
-  alignment writer: it never emits SEQ/QUAL (even for a mapped record), requires a
-  non-empty `REFERENCE_LENGTHS` @SQ header a uBAM has none of, and has no
-  read-group option, so it cannot express the `@RG` lima keys on. The BAM is
-  written with miint's `COPY … TO (FORMAT UBAM)` (duckdb-miint#156, shipped in
-  duckdb-miint#157, mirror build `5509321`), verified end-to-end: real `lima_export`
-  → real lima 2.13.0 (2 s, no CLR warning) → real `lima_mask`, every read correct at
-  `sequence_idx > 2^31`. `lima_export` still fails loud naming the issue on an older
-  build without the writer, and the writer-dependent tests skip there.
-  **The key is the lake's `read_id`, not `sequence_idx`.** `bam_to_parquet` keeps
-  the instrument's PacBio `<movie>/<zmw>/ccs` name verbatim, so `lima_export` writes
-  it back as the record name with `zm` = the hole number parsed out of it; lima
-  reconstructs that name byte-identically (probed on real production names), and
+  `lima_export` now rebuilds a minimal CCS unaligned BAM from the lake reads with
+  miint's `COPY … TO (FORMAT UBAM)` (duckdb-miint#156, shipped in #157) — an `@RG`
+  carrying `DS:READTYPE=CCS`, the field lima keys on — and feeds it to lima, which
+  completes in seconds. lima's output stays FASTQ, so `lima_mask` still reads it with
+  miint's `read_fastx`. No FASTQ is written at all now, so the landed intermediate
+  shrinks to the BAM. Verified end-to-end: real `lima_export` → real lima 2.13.0
+  (2 s, no CLR warning) → real `lima_mask`, every read correct at `sequence_idx >
+  2^31`. **The key is the lake's `read_id`, not `sequence_idx`.** `bam_to_parquet`
+  keeps the instrument's PacBio `<movie>/<zmw>/ccs` name verbatim, so `lima_export`
+  writes it back as the record name with `zm` = the hole number parsed out of it;
+  lima reconstructs that name byte-identically (probed on real production names), and
   `lima_mask` joins its output straight back on `read_id` — no map file, no synthetic
   name. `sequence_idx` cannot serve: lima rewrites the name from the **int32** `zm`
   tag, so a lake-wide idx past 2^31 would come back TRUNCATED (5000000000 →
-  705032704) and mask the wrong read. A `read_id` whose hole number exceeds int32, a
-  read set spanning more than one movie (one `@RG` would stamp the wrong movie on the
-  rest), or a non-PacBio `read_id` (a FASTQ-ingested sample) is rejected at export
-  where the cause is legible. Also corrected: `lima_mask`'s claim that an empty lima
-  output is a legitimate all-`twist_no_adaptor` mask — probed, an adapter-free BAM
-  makes lima exit 1 (`Could not find matching barcodes!`), so that branch is
-  unreachable and is now documented as the guard it is. Pinned by
-  `tests/jobs/test_sam_bam_writer_miint_contract.py` (the alignment writer's limits,
-  with a mapped-record anti-vacuity control — the evidence behind duckdb-miint#156)
-  and the rewritten `test_lima_chain_smoke.py`.
+  705032704) and mask the wrong read. `lima_export` rejects at export — where the
+  cause is legible — a `read_id` whose hole number exceeds int32, a read set spanning
+  more than one movie (multi-movie / block-scoped read-mask is not yet supported:
+  miint's `FORMAT UBAM` has no per-read `@RG`), or a non-PacBio `read_id` (whose
+  strict `[A-Za-z0-9_]+/[0-9]+/ccs` shape also keeps the movie safe to interpolate
+  into the `@RG`). Also corrected: `lima_mask`'s claim that an empty lima output is a
+  legitimate all-`twist_no_adaptor` mask — probed, an adapter-free BAM makes lima
+  exit 1 (`Could not find matching barcodes!`), so that branch is unreachable and is
+  now documented as the guard it is. Pinned by `test_lima_chain_smoke.py`.
 - **read-mask `lima` container step was missing its `entrypoint` (#311).** The step
   declared `container: lima-2.13.0.sif` but no `entrypoint:`, so the SLURM job ran
   `apptainer exec <sif>` with no command and died with "exec requires at least 2

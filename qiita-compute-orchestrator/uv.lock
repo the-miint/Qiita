@@ -294,20 +294,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pysam"
-version = "0.24.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/09/9b/e856ad525ed0847810cca936ee551b8e0a709525fea34e0e0e723173f62d/pysam-0.24.0.tar.gz", hash = "sha256:db0f86c15532ef5dad263748324f45d9a639668e3497d8cabce54ef47a1a78d9", size = 5201690, upload-time = "2026-04-27T12:26:50.879Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/38/1940157ce6fcfb85e8658292f6736f3cbdefb51c3d4069ec64236c40b1e1/pysam-0.24.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:9591893006458ce834e861dab1603db7047bff0ddf201b354fcd3dbd50ded899", size = 8688741, upload-time = "2026-04-27T12:26:04.864Z" },
-    { url = "https://files.pythonhosted.org/packages/72/65/a4559d4ff4a210d2a26d7ca0712e4e738cbfc963135f86e8ae807ca420eb/pysam-0.24.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f6f95d44efb4ee1dcfd18fcd11b26ba00bc1afaba9128a1b56c4c8887208fb07", size = 8445198, upload-time = "2026-04-27T12:26:06.859Z" },
-    { url = "https://files.pythonhosted.org/packages/d3/11/93cb13e523ef57d2224ce41a6fc1842626f2088adf299cbc611528de84c5/pysam-0.24.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1ee1af44c630f5e97d4c1bca708cd42e2f5b036b126bea374c3442c832c6ac43", size = 24961719, upload-time = "2026-04-27T12:26:09.072Z" },
-    { url = "https://files.pythonhosted.org/packages/67/68/23e35297fa8906040f33db2908baf20e7f79a767a150cc6cc068b3135e89/pysam-0.24.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6617456dbafd38216bdbfeccb2ac4cdd9dcca024c6e362076e6bbf32a54ec58d", size = 25538974, upload-time = "2026-04-27T12:26:11.782Z" },
-    { url = "https://files.pythonhosted.org/packages/0f/61/8a4c6af099d7d5e0026bc4cdbf9479efa396ef6a53d814e8e0faaed05f2a/pysam-0.24.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:7572b2c40c449286e22b8ca0c9fa1edaf67c663ac77178af728c4bc9927b7f1f", size = 24853456, upload-time = "2026-04-27T12:26:14.696Z" },
-    { url = "https://files.pythonhosted.org/packages/14/6d/106e39a8ed7f3cce18e819c475d15828f6bb67202410e61b8d0e5c966e2b/pysam-0.24.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:6bb3ba818e1075c849302301b84c674c3994bc53a40a71213a01058ef9ffa284", size = 25179876, upload-time = "2026-04-27T12:26:17.855Z" },
-]
-
-[[package]]
 name = "pytest"
 version = "9.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -411,7 +397,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
-    { name = "pysam" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -431,7 +416,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx", specifier = ">=0.28" },
-    { name = "pysam", specifier = ">=0.23" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "ruff", specifier = ">=0.15" },

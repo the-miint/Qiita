@@ -78,7 +78,6 @@ _DUCKDB_THREADS = 4
 _ORIG = "lima_orig"
 _QCD = "lima_qcd"
 _INCOMING = "lima_mask_incoming"
-_LOOKUP = "lima_mask_lookup"
 
 
 def _carry_select(incoming_view: str) -> str:
@@ -114,51 +113,35 @@ class Inputs(BaseModel):
 
 
 def _assert_lima_reads_are_known(conn: duckdb.DuckDBPyConnection, lima_out_fastq: Path) -> None:
-    """Every record lima emitted must correspond to exactly one input read.
+    """Every record lima emitted must correspond to exactly one read we SENT it.
 
     lima's output should be a SUBSET of what we sent it (it only drops reads and
-    clips ends), so all three conditions checked here — a ZMW that is not in the
-    map, a resolved key that is not an input read, or a duplicated one — would
-    indeed be a lima bug, or a stale/mismatched output file. None has been
-    observed; this is a boundary check, not a workaround.
+    clips ends), so both conditions checked here — a name that is not in `_ORIG`, or
+    a duplicated one — would be a lima bug or a stale/mismatched output file. Neither
+    has been observed; this is a boundary check, not a workaround.
 
     It is here, and not deleted as over-defensive, for one reason: lima is an EXTERNAL
     container binary, so its output is not an invariant our own code establishes (the
     shape of an incoming `partial_mask` IS — see `_partial_mask`, where the equivalent
     checks were dropped for exactly that reason). And if the contract does break, it
-    breaks SILENTLY: `infer_trim` LEFT JOINs original→clipped, so an unknown clipped
+    breaks SILENTLY: `infer_trim` LEFT JOINs original→clipped, so an unmatched clipped
     key is dropped rather than erroring, and a duplicate key fans the join out and
-    emits two mask rows for one read. A wrong mask would ship looking like a right
-    one. One aggregate scan is a cheap price for turning that into a loud failure.
+    emits two mask rows for one read. A wrong mask would ship looking like a right one.
 
-    The unresolved-name check is the sharpest of the three: lima rebuilds the record
-    name from the `zm` tag, so a name that is not a known `read_id` means the key
-    channel itself broke (a truncated ZMW, a stale output from another run). That
-    must never be papered over — the join would drop the read and the mask would
-    call it `twist_no_adaptor`.
-
-    Two of the three — unresolved and duplicate — ride ONE aggregate scan of `_QCD`
-    (a view over `read_fastx`), so lima's output is not re-parsed for each. The
-    unknown-key check needs an ANTI JOIN against `_ORIG`, so it is a second scan;
-    it runs only after the first two pass.
+    `_QCD` already LEFT JOINed lima's output against `_ORIG` on `read_id`, so an
+    unmatched name arrives here as a NULL `sequence_index` — that ONE column covers
+    both "unknown name" and "a read we excluded upstream" (a spike-in): both are
+    read_ids not in `_ORIG`. Both checks ride a single aggregate scan.
     """
-    unresolved, n, distinct = conn.execute(
+    unmatched, n, distinct = conn.execute(
         "SELECT count(*) FILTER (WHERE q.sequence_index IS NULL), count(*), "
         "       count(DISTINCT q.sequence_index) "
         f"FROM {_QCD} q"
     ).fetchone()
-    if unresolved:
+    if unmatched:
         raise ValueError(
-            f"lima output ({lima_out_fastq}) has {unresolved} record(s) whose name is not "
-            "a read_id of the input reads; the read_id round-trip is broken"
-        )
-    (unknown,) = conn.execute(
-        f"SELECT count(*) FROM {_QCD} q ANTI JOIN {_ORIG} o USING (sequence_index)"
-    ).fetchone()
-    if unknown:
-        raise ValueError(
-            f"lima output ({lima_out_fastq}) has {unknown} record(s) whose read_id resolves "
-            "to a sequence_idx that is not an exported read"
+            f"lima output ({lima_out_fastq}) has {unmatched} record(s) whose name is not "
+            "a read_id of the reads sent to lima; the read_id round-trip is broken"
         )
     if n != distinct:
         raise ValueError(
@@ -196,11 +179,19 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # reads (the spike-ins were never exported). A spike-in must NOT reach
             # infer_trim: absent from lima's output, it would come back NULL/NULL and
             # be mislabelled twist_no_adaptor. Its row is carried verbatim instead.
+            # `_ORIG` is exactly the reads lima_export sent to lima: every raw read,
+            # or — when an upstream mask is bound — only its `pass` reads (spike-ins
+            # were never exported). It exposes `read_id` (the key lima's output is
+            # matched on) plus `sequence_index` + `sequence` (what `infer_trim`
+            # requires). `sequence_index` here is the LAKE `sequence_idx`, NOT
+            # read_fastx's positional one — the clipped side takes its `sequence_index`
+            # FROM `_ORIG` via the read_id join below, so both sides mean the same key
+            # by construction.
             carry_select: str | None = None
             if inputs.partial_mask is None:
                 conn.execute(
                     f"CREATE VIEW {_ORIG} AS "
-                    "SELECT sequence_idx AS sequence_index, sequence1 AS sequence "
+                    "SELECT sequence_idx AS sequence_index, read_id, sequence1 AS sequence "
                     f"FROM read_parquet('{reads_sql}')"
                 )
             else:
@@ -208,20 +199,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
                 conn.execute(
                     f"CREATE VIEW {_ORIG} AS "
-                    "SELECT r.sequence_idx AS sequence_index, r.sequence1 AS sequence "
+                    "SELECT r.sequence_idx AS sequence_index, r.read_id, r.sequence1 AS sequence "
                     f"FROM read_parquet('{reads_sql}') r JOIN {_INCOMING} m USING (sequence_idx) "
                     f"WHERE m.reason = '{ReadMaskReason.PASS.value}'"
                 )
                 carry_select = _carry_select(_INCOMING)
 
-            # infer_trim requires both relations to expose `sequence_index` +
-            # `sequence`. On the clipped side the key is lima's record name, which
-            # IS the lake's `read_id` — never read_fastx's positional
-            # `sequence_index`. `reads` is the lookup: it carries both columns.
-            conn.execute(
-                f"CREATE VIEW {_LOOKUP} AS "
-                f"SELECT read_id, sequence_idx FROM read_parquet('{reads_sql}')"
-            )
             if is_empty_sequence_file(inputs.lima_out_fastq):
                 # A GUARD, not the adapter-free path: probed, lima FATALs rather than
                 # emitting an empty output, so the step fails before reaching here (see
@@ -234,15 +217,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "WHERE false"
                 )
             else:
-                # LEFT JOIN, not JOIN: a record name that is not a known `read_id`
-                # must surface as a NULL key for `_assert_lima_reads_are_known` to
-                # raise on, not vanish from the relation and silently become
-                # `twist_no_adaptor`.
+                # Match lima's output back to what we SENT it, on `read_id`. LEFT
+                # JOIN, not JOIN: a record whose name is not in `_ORIG` — a corrupted
+                # name, a stale output, or a read we deliberately excluded (a
+                # spike-in) — must surface as a NULL key for the guard to raise on,
+                # not vanish and silently become `twist_no_adaptor`. `sequence_index`
+                # comes from `_ORIG`, so it pairs with the same-named column there.
                 conn.execute(
                     f"CREATE VIEW {_QCD} AS "
-                    "SELECT m.sequence_idx AS sequence_index, f.sequence1 AS sequence "
+                    "SELECT o.sequence_index AS sequence_index, f.sequence1 AS sequence "
                     f"FROM read_fastx('{lima_sql}') f "
-                    f"LEFT JOIN {_LOOKUP} m ON m.read_id = f.read_id"
+                    f"LEFT JOIN {_ORIG} o ON o.read_id = f.read_id"
                 )
             _assert_lima_reads_are_known(conn, inputs.lima_out_fastq)
             # One row per ORIGINAL (pass) read. `infer_trim` returns NULL/NULL for a
