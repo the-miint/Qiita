@@ -127,11 +127,9 @@ def miint_job_env() -> dict[str, str]:
     missing = [v for v in MIINT_REQUIRED_JOB_VARS if not os.environ.get(v)]
     if missing:
         raise RuntimeError(
-            "miint is a core dependency but required env var(s) are unset: "
-            f"{', '.join(missing)}. Both MIINT_EXTENSION_DIRECTORY (the staged "
-            "extension) and MIINT_GPL_BOUNDARY_PATH (the GPL-boundary binary) must "
-            "be set for any SLURM job — set them in compute-orchestrator.env. See "
-            "CLAUDE.md 'miint is a core dependency'."
+            "miint is a core dependency; these required env var(s) are unset and "
+            "must be set in compute-orchestrator.env for any SLURM job: "
+            f"{', '.join(missing)}. See CLAUDE.md 'miint is a core dependency'."
         )
     return {v: os.environ[v] for v in MIINT_REQUIRED_JOB_VARS}
 

@@ -90,8 +90,9 @@ def _stage_miint_extension():
     # point the var there so the sharded-alignment / bowtie2 smokes and any submit
     # path resolve the same boundary a real job would. setdefault → an explicit
     # override still wins. Kept in step with the CO conftest's identical fixture.
-    if row and row[0]:
-        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", row[0]["path"])
+    boundary_path = row[0].get("path") if row and row[0] else None
+    if boundary_path:
+        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", boundary_path)
 
 
 POSTGRES_URL = resolve_postgres_url()

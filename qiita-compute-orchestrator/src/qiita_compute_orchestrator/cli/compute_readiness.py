@@ -437,11 +437,12 @@ try:
         "CREATE TABLE bt2_subject AS SELECT 1::BIGINT AS read_id, "
         "'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT' AS sequence1"
     )
-    out = os.path.join(tempfile.mkdtemp(), "index")
-    row = conn.execute(
-        "SELECT success FROM save_bowtie2_index('bt2_subject', ?)", [out]
-    ).fetchone()
-    assert row is not None and row[0], "save_bowtie2_index did not report success"
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "index")
+        row = conn.execute(
+            "SELECT success FROM save_bowtie2_index('bt2_subject', ?)", [out]
+        ).fetchone()
+        assert row is not None and row[0], "save_bowtie2_index did not report success"
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:500])

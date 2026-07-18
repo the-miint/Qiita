@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from qiita_common.duckdb_miint import MIINT_REQUIRED_JOB_VARS
+
 from .slurm import DEFAULT_SLURMRESTD_API_VERSION
 
 # Default install location for the shared CP↔CO bearer token in
@@ -221,15 +223,14 @@ def _resolve_slurm_settings() -> SlurmSettings:
         return v
 
     # miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
-    # dependency"): a SLURM deploy MUST have both the staged extension dir and the
-    # GPL-boundary binary configured, or every native job dies at `LOAD miint` /
-    # the first GPL-boundary call. Fail the boot (keep the unit DOWN) rather than
-    # submit doomed jobs. The values are read from os.environ by
-    # qiita_common.duckdb_miint.miint_job_env() (which also raises, as the runtime
-    # backstop); here we assert presence at startup, alongside the other required
-    # SLURM vars, so a forgotten var is caught before the unit reaches Ready.
-    _required("MIINT_EXTENSION_DIRECTORY")
-    _required("MIINT_GPL_BOUNDARY_PATH")
+    # dependency"): a SLURM deploy MUST have every miint job var configured, or
+    # native jobs die at `LOAD miint` / the first GPL-boundary call. Fail the boot
+    # (keep the unit DOWN) rather than submit doomed jobs. Driven off the SAME
+    # MIINT_REQUIRED_JOB_VARS that miint_job_env() enforces at submit (the runtime
+    # backstop) so the boot check can't drift from it; the values themselves are
+    # read from os.environ by miint_job_env(), here we only assert presence.
+    for _miint_var in MIINT_REQUIRED_JOB_VARS:
+        _required(_miint_var)
 
     return SlurmSettings(
         base_url=_required("SLURMRESTD_URL"),

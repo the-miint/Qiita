@@ -52,8 +52,9 @@ def _stage_miint_extension():
     # reports where it installed the binary; point the var there so submit/probe
     # tests resolve exactly the boundary a real job would. setdefault → an explicit
     # override (e.g. a real deploy env) still wins.
-    if row and row[0]:
-        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", row[0]["path"])
+    boundary_path = row[0].get("path") if row and row[0] else None
+    if boundary_path:
+        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", boundary_path)
 
 
 @pytest.fixture
