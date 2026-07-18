@@ -92,13 +92,26 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 
 /// Stream a DuckLake query's RecordBatches over a bounded channel.
 ///
-/// `query_arrow` yields an iterator that borrows the `Statement`, which borrows
-/// the `Connection`; the `DoGetStream` we return must be `'static`, so the
-/// DuckDB iterator cannot be streamed directly. Instead a blocking task owns the
-/// connection for the query's lifetime and pushes each `RecordBatch` into a
-/// bounded channel, and the returned stream drains the receiver. This replaces
-/// the old `.collect()` that buffered the entire result set in memory; peak
-/// memory is now bounded by `DOGET_BATCH_CHANNEL_DEPTH` (see above).
+/// Memory is bounded on BOTH sides of the handoff:
+///
+///   * DuckDB executes in STREAMING mode (`stream_arrow` →
+///     `duckdb_execute_prepared_streaming`), fetching one data chunk at a time
+///     rather than computing the whole result set into memory first. This is the
+///     load-bearing half: the earlier materialized `query_arrow` buffered the
+///     ENTIRE result inside DuckDB before the first batch was drainable, so a
+///     whole-reference DoGet (the rype router streaming every genome's
+///     `chunk_data`) OOM-killed the data plane at ~374 GB. A bounded channel
+///     alone could never have caught that — the blow-up was upstream of it.
+///   * The `Arrow`/`ArrowStream` iterator borrows the `Statement`, which borrows
+///     the `Connection`; the `DoGetStream` we return must be `'static`, so the
+///     DuckDB iterator cannot be handed out directly. A blocking task owns the
+///     connection for the query's lifetime and pushes each `RecordBatch` into a
+///     bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the returned stream drains
+///     the receiver, applying backpressure to the streaming producer.
+///
+/// `stream_arrow` needs the result schema up front (streaming execution doesn't
+/// surface it until a chunk is fetched), so we first probe it with a zero-row
+/// prepare — see the body.
 ///
 /// A zero-row result still emits one empty `RecordBatch` carrying the schema, so
 /// the client always receives a valid (possibly empty) Arrow table — the same
@@ -139,19 +152,48 @@ fn stream_ducklake_batches(
     tokio::task::spawn_blocking(move || {
         let produce = || -> Result<(), Status> {
             let conn = open_ducklake(&catalog_connstr, &data_path)?;
+
+            // Obtain the result schema WITHOUT materializing the result. DuckDB's
+            // streaming execution (below) doesn't expose the schema until the
+            // first chunk is fetched, and `stream_arrow` needs it up front, so
+            // probe with a zero-row prepare: `LIMIT 0` plans the query and returns
+            // its column schema having produced no rows (trivial memory).
+            let schema = {
+                let mut probe = conn
+                    .prepare(&format!("SELECT * FROM ({sql}) AS _schema_probe LIMIT 0"))
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "schema probe preparation failed for {table}: {e}"
+                        ))
+                    })?;
+                probe
+                    .query_arrow([])
+                    .map_err(|e| {
+                        Status::internal(format!("schema probe execution failed for {table}: {e}"))
+                    })?
+                    .get_schema()
+            };
+
             let mut stmt = conn.prepare(&sql).map_err(|e| {
                 Status::internal(format!("query preparation failed for {table}: {e}"))
             })?;
-            let arrow_result = stmt.query_arrow([]).map_err(|e| {
+            // STREAMING execution (duckdb_execute_prepared_streaming): DuckDB
+            // fetches one data chunk at a time instead of materializing the whole
+            // result set. This is load-bearing — the materialized `query_arrow`
+            // buffered the ENTIRE result in DuckDB before the first batch, which
+            // OOM-killed the data plane (~374 GB) on a whole-reference DoGet (the
+            // rype router streaming every genome's `chunk_data`). Peak memory is
+            // now the streaming query's working set (a small hash-join build side
+            // + a few vectors) plus DOGET_BATCH_CHANNEL_DEPTH batches in flight.
+            let stream = stmt.stream_arrow([], schema.clone()).map_err(|e| {
                 Status::internal(format!("query execution failed for {table}: {e}"))
             })?;
-            let schema = arrow_result.get_schema();
             let mut produced = false;
-            // `arrow_result`'s Item is a bare `RecordBatch`, not a `Result` — a
-            // failure once iteration has begun cannot be observed here; the loop
-            // just ends and the consumer sees a clean EOF (see the fn-level
-            // caveat). Nothing to do about it until the duckdb API is fallible.
-            for batch in arrow_result {
+            // `stream`'s Item is a bare `RecordBatch`, not a `Result` — a failure
+            // once iteration has begun cannot be observed here; the loop just ends
+            // and the consumer sees a clean EOF (see the fn-level caveat). Nothing
+            // to do about it until the duckdb API is fallible.
+            for batch in stream {
                 produced = true;
                 // Receiver dropped (client hung up) — stop early, don't error.
                 if tx.blocking_send(Ok(batch)).is_err() {

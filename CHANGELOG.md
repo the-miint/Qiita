@@ -94,6 +94,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Data plane: DoGet now streams instead of materializing the whole result (#328).**
+  `stream_ducklake_batches` executed queries with DuckDB's MATERIALIZED
+  `query_arrow`, which computes the ENTIRE result set into memory before the
+  first RecordBatch is drainable — so the bounded batch channel it fed could
+  never cap peak memory. Harmless for feature-scoped shard rosters (small), but a
+  **whole-reference** DoGet (the rype router's stream over every genome's
+  `chunk_data`) OOM-killed the data plane at ~374 GB, aborting the WOL3 router
+  build mid-stream (`RST_STREAM`). Switched to STREAMING execution
+  (`stream_arrow` → `duckdb_execute_prepared_streaming`), which fetches one chunk
+  at a time; peak memory is now the streaming query's working set plus the
+  channel depth. The same one shared path backs the `alignment` (OGU
+  feature-table) and `read_masked` whole-scope DoGets, so all three are fixed at
+  once. A zero-row schema probe supplies the schema `stream_arrow` needs up front.
 - **read-mask `lima` SIF was missing `python3`, failing every step after lima
   succeeded (#320, follow-up to #313).** `_lib.sh`'s `qiita_finish` — the last line of every
   container step — runs `python3 manifest_writer.py`, but `lima.def` (a
