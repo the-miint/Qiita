@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **Control-plane throttle for fan-out dispatch (#NNN).** A fan-out action
+- **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
   1000-shard reference opened ~1000 concurrent data-plane streams and took down

@@ -62,7 +62,7 @@ _None yet._
   They were cancelled because lima could not finish; a redrive before this deploy hits
   the identical wall. Their ~33 GB `lima_export` FASTQs under
   `<scratch>/ticket/48{35..60}/` are dead weight once the replacements complete.
-- **Fan-out dispatch is now throttled — no required host action (#NNN).** The new
+- **Fan-out dispatch is now throttled — no required host action (#329).** The new
   `work_ticket.dispatch_held` column is a plain additive migration, so the standard
   `make migrate` (bucket 3 gate) applies it with no out-of-band setup. `FANOUT_MAX_INFLIGHT`
   (optional, default 8) caps concurrent fan-out children per cohort; add it to
