@@ -25,6 +25,7 @@ from qiita_common.models import (
 )
 
 from .. import step_progress
+from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.block import fetch_block_members
 from ._base import (
     _STEP_POLL_INTERVAL_SECONDS,
@@ -124,6 +125,7 @@ async def run_workflow(
     poll_interval_seconds: float = _STEP_POLL_INTERVAL_SECONDS,
     resume: bool = False,
     dispatch_cb: Callable[[int], Any] | None = None,
+    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> None:
     """Execute (or resume) the workflow attached to one work ticket.
 
@@ -641,6 +643,7 @@ async def run_workflow(
                 prior_progress=progress,
                 resume=resume,
                 dispatch_cb=dispatch_cb,
+                max_inflight=max_inflight,
             )
             bound.update(outputs)
 
@@ -812,6 +815,7 @@ async def _run_entry_with_retry(
     prior_progress: list[step_progress.StepProgressRow],
     resume: bool = False,
     dispatch_cb: Callable[[int], Any] | None = None,
+    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
     `BackendFailure`. Returns the entry's output map on success; raises
@@ -941,6 +945,7 @@ async def _run_entry_with_retry(
                     signing_key=signing_key,
                     data_plane_url=data_plane_url,
                     dispatch_cb=dispatch_cb,
+                    max_inflight=max_inflight,
                 )
             # WorkflowEntry is a closed union; the discriminator on
             # ActionDefinition guarantees one of the two arms above.

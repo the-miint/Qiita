@@ -22,6 +22,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
+  (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
+  block) no longer dispatches all of its child work_tickets at once — which for a
+  1000-shard reference opened ~1000 concurrent data-plane streams and took down
+  the WOL3 (reference 16) build (fd exhaustion + submit-time ticket-expiry from
+  the backlog). Each fan-out now INSERTs its children `dispatch_held` and a
+  per-cohort "pump" (`fanout_dispatch.top_up_dispatch`) releases only
+  `FANOUT_MAX_INFLIGHT` (default 8) at a time, refilling as each child reaches a
+  terminal state. A single child failure **fail-stops** the cohort (releases
+  nothing further) so a sick backend halts the fan-out instead of burning through
+  every shard; the operator redrives the failed child(ren) and the pump resumes.
+  Startup reconcile re-dispatches only non-held in-flight tickets and re-pumps
+  cohorts with held tickets, so a CP restart doesn't blow the throttle open. New
+  `work_ticket.dispatch_held` column (metadata-only migration) and
+  `FANOUT_MAX_INFLIGHT` env var.
 - **Spike-in reference load runbook (#310).** `docs/runbooks/spike-in-reference.md`
   documents loading a SynDNA/spike-in reference for `--syndna-reference-idx`: plasmids
   (not bare inserts) so the 0.90 aligned-fraction gate is correct, the required

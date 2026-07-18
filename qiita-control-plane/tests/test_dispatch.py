@@ -34,6 +34,7 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
         settings=SimpleNamespace(
             flight_signing_key=b"x" * 32,
             data_plane_url="grpc://unused",
+            fanout_max_inflight=8,
             # _run_and_log reads both before dispatching to run_workflow.
             # Real Paths keep the defensive None-check happy without
             # making the test reach any filesystem operation (run_workflow

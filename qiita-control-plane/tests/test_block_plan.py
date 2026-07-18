@@ -60,7 +60,15 @@ async def planapp(monkeypatch):
         dispatched.append(work_ticket_idx)
 
     monkeypatch.setattr(block_planner, "schedule_dispatch", _record)
-    app = types.SimpleNamespace(state=types.SimpleNamespace(compute_backend_client=object()))
+    # fanout_max_inflight is set large so the throttle never holds a block back
+    # in these existing block-planner tests (they assert every block dispatches);
+    # the held/pump behaviour is covered in test_fanout_dispatch.py.
+    app = types.SimpleNamespace(
+        state=types.SimpleNamespace(
+            compute_backend_client=object(),
+            settings=types.SimpleNamespace(fanout_max_inflight=1000),
+        )
+    )
     return app, dispatched
 
 
