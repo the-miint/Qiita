@@ -32,6 +32,7 @@ from ..actions.library import (
     MINT_ANNOTATION_MAP_OUTPUT_BASENAME,
     MINT_FEATURES_OUTPUT_BASENAME,
 )
+from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
@@ -219,6 +220,7 @@ async def _dispatch_action(
     signing_key: bytes,
     data_plane_url: str,
     dispatch_cb: Callable[[int], Any] | None = None,
+    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> dict[str, Any]:
     """Run one in-process `action:` entry and record its progress.
 
@@ -253,6 +255,7 @@ async def _dispatch_action(
             signing_key=signing_key,
             data_plane_url=data_plane_url,
             dispatch_cb=dispatch_cb,
+            max_inflight=max_inflight,
         )
     except BackendFailure as exc:
         await _best_effort_record_failed(
@@ -294,6 +297,7 @@ async def _run_action_primitive(
     signing_key: bytes,
     data_plane_url: str,
     dispatch_cb: Callable[[int], Any] | None = None,
+    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> dict[str, Any]:
     """Translate a workflow `action:` entry into the matching LIBRARY call.
     Per-primitive logic lives here because each primitive has its own
@@ -474,6 +478,7 @@ async def _run_action_primitive(
             build_action_version=BUILD_SHARD_INDEX_ACTION_VERSION,
             action_context=shard_context,
             dispatch_cb=dispatch_cb,
+            max_inflight=max_inflight,
         )
         # N == 0 here means an EXPLICIT shard_index=true request (the :416 guard
         # already returned for the absent/false case) produced zero shard-bearing

@@ -8,6 +8,8 @@ from pathlib import Path
 
 from qiita_common.config import require_env
 
+from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+
 # Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
 # the real test is whether mail reaches the address. See from_env().
 _CONTACT_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -38,6 +40,17 @@ _DEFAULT_MAX_SEQUENCE_MINT_COUNT = 10_000_000_000
 
 
 _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
+
+
+# Per-cohort cap on how many fan-out child work_tickets (sharded reference-index
+# build, bulk read-mask block, bulk sharded-alignment block) the control-plane
+# "pump" dispatches at once. A fan-out INSERTs all its children `dispatch_held`
+# and the pump releases only this many per cohort, refilling as each finishes —
+# so a 1000-shard build can't open ~1000 concurrent data-plane streams (the WOL3
+# incident). The default (mirrors the operator throttle that recovered reference
+# 16) lives in fanout_dispatch as the single source of truth; tune per deploy via
+# FANOUT_MAX_INFLIGHT once the data plane's headroom is known.
+_DEFAULT_FANOUT_MAX_INFLIGHT = DEFAULT_FANOUT_MAX_INFLIGHT
 
 
 # Email-notification defaults. SMTP_HOST is deliberately unset by default so a
@@ -154,6 +167,8 @@ class Settings:
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     cli_login_code_sweep_interval_seconds: int = _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
+    # Per-cohort cap on concurrently-dispatched fan-out child work_tickets.
+    fanout_max_inflight: int = _DEFAULT_FANOUT_MAX_INFLIGHT
     # Per-ticket workspace root the workflow runner mints under
     # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). Derived in from_env()
     # as `PATH_SCRATCH/ticket`. The CP creates the subdir; the path is
@@ -337,6 +352,10 @@ class Settings:
             max_sequence_mint_count=_parse_positive_int_env(
                 "QIITA_MAX_SEQUENCE_MINT_COUNT",
                 _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
+            ),
+            fanout_max_inflight=_parse_positive_int_env(
+                "FANOUT_MAX_INFLIGHT",
+                _DEFAULT_FANOUT_MAX_INFLIGHT,
             ),
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,

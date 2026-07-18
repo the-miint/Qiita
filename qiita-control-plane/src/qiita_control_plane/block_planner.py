@@ -40,6 +40,7 @@ from qiita_common.models import (
 )
 
 from .dispatch import schedule_dispatch
+from .fanout_dispatch import read_mask_block_cohort, top_up_dispatch
 from .host_filter_resolver import resolve_host_filter_many
 from .repositories.block import (
     add_block_members,
@@ -668,8 +669,8 @@ async def plan_and_submit_blocks(
                 work_ticket_idx = await conn.fetchval(
                     "INSERT INTO qiita.work_ticket ("
                     "  action_id, action_version, originator_principal_idx,"
-                    "  scope_target_kind, block_idx, mask_idx, action_context"
-                    ") VALUES ($1, $2, $3, 'block', $4, $5, $6::jsonb)"
+                    "  scope_target_kind, block_idx, mask_idx, action_context, dispatch_held"
+                    ") VALUES ($1, $2, $3, 'block', $4, $5, $6::jsonb, true)"
                     " RETURNING work_ticket_idx",
                     block_action_id,
                     block_action_version,
@@ -710,9 +711,18 @@ async def plan_and_submit_blocks(
                 }
             )
 
-    # Post-commit, fire-and-forget dispatch of each fresh PENDING block ticket.
-    for b in block_summaries:
-        schedule_dispatch(app, b["work_ticket_idx"])
+    # Every block ticket was INSERTed `dispatch_held`; the pump releases up to
+    # FANOUT_MAX_INFLIGHT per mask-partition cohort and refills as each block
+    # finishes (dispatch._run_and_log completion hook). Post-commit, so a
+    # released ticket is durable before its background task starts.
+    max_inflight = app.state.settings.fanout_max_inflight
+    for cohort_mask_idx in {b["mask_idx"] for b in block_summaries}:
+        await top_up_dispatch(
+            pool,
+            read_mask_block_cohort(cohort_mask_idx),
+            max_inflight=max_inflight,
+            dispatch_cb=lambda idx: schedule_dispatch(app, idx),
+        )
 
     return {
         "sequencing_run_idx": sequencing_run_idx,

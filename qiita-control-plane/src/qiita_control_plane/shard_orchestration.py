@@ -36,6 +36,7 @@ from qiita_common.models import (
 
 from .actions.library import plan_shards
 from .actions.reference import IllegalStatusTransition, transition_reference_status
+from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT, shard_cohort, top_up_dispatch
 from .shard_planner import _SHARD_COUNT
 
 # The build-shard-index workflow each fan-out ticket runs. Pinned here (the YAML
@@ -89,10 +90,11 @@ async def plan_and_submit_shards(
     build_action_version: str,
     action_context: dict[str, Any],
     dispatch_cb: Callable[[int], Any],
+    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
     num_shards: int = _SHARD_COUNT,
 ) -> dict[str, Any]:
     """Assign this reference's features to shards, then fan out one build ticket
-    per shard.
+    per shard — THROTTLED.
 
     Runs `plan_shards` (assignment onto `reference_membership.shard_id`) → N. If
     N == 0 (a reference explicitly asked to shard but with no genomes / no genome
@@ -100,19 +102,27 @@ async def plan_and_submit_shards(
     or fanning out; the plan-shards runner arm treats a zero-shard result as an
     error and fails the ticket, since an unroutable `active` reference must never
     be finalized. If N > 0 it transitions the reference `loading -> indexing`
-    and, in one transaction, INSERTs one PENDING build `work_ticket` per shard
-    (scope `reference`, carrying `shard_id=k` and the index-selection
-    `action_context` copied from the parent), then dispatches each fresh ticket
-    via `dispatch_cb` post-commit.
+    and, in one transaction, INSERTs one build `work_ticket` per shard (scope
+    `reference`, carrying `shard_id=k` and the index-selection `action_context`
+    copied from the parent), each `dispatch_held` — then hands off to the pump.
+
+    Throttle: every shard ticket is inserted HELD (`dispatch_held = true`, NOT
+    dispatched). `top_up_dispatch` then releases only up to `max_inflight` of
+    them; each child's terminal transition re-pumps the cohort and refills the
+    freed slots (`dispatch._run_and_log`). So a 1000-shard reference opens at
+    most `max_inflight` concurrent data-plane streams instead of ~1000 (the WOL3
+    incident: fd exhaustion + ticket-expiry from the backlog). A single shard
+    failure fail-stops the cohort (see `fanout_dispatch`).
 
     Idempotent on redrive: the per-shard INSERT is `ON CONFLICT DO NOTHING`
     against `work_ticket_one_in_flight_per_shard`, so a re-run over
-    still-in-flight shard tickets creates no duplicates and dispatches only the
-    ones it actually inserted. Crash between commit and dispatch is covered for
-    free: the tickets are left PENDING and startup `reconcile_inflight_tickets`
-    re-dispatches them.
+    still-in-flight shard tickets creates no duplicates. The pump's release is
+    likewise idempotent (it counts running-and-not-held, so already-in-flight
+    shards occupy their slots). Crash between commit and the pump is covered:
+    the tickets are left held + PENDING and startup `reconcile_inflight_tickets`
+    re-pumps every cohort with held tickets.
 
-    Returns a JSON-able summary (shard count, the fresh ticket idxs).
+    Returns a JSON-able summary (shard count, the fresh held ticket idxs).
     """
     n = await plan_shards(
         pool,
@@ -150,8 +160,8 @@ async def plan_and_submit_shards(
         rows = await conn.fetch(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx,"
-            "  scope_target_kind, reference_idx, shard_id, action_context"
-            ") SELECT $1, $2, $3, 'reference', $4, s.shard_id, $6::jsonb"
+            "  scope_target_kind, reference_idx, shard_id, action_context, dispatch_held"
+            ") SELECT $1, $2, $3, 'reference', $4, s.shard_id, $6::jsonb, true"
             "    FROM generate_series(0, $5 - 1) AS s(shard_id)"
             " ON CONFLICT (action_id, action_version, reference_idx, shard_id)"
             "   WHERE shard_id IS NOT NULL"
@@ -167,7 +177,15 @@ async def plan_and_submit_shards(
         )
         fresh_tickets.extend(r["work_ticket_idx"] for r in rows)
 
-    for work_ticket_idx in fresh_tickets:
-        dispatch_cb(work_ticket_idx)
+    # Every fresh ticket is HELD. Release the first `max_inflight` now; each
+    # child's terminal transition re-pumps this cohort and refills the freed
+    # slots. On a redrive the pump counts already-in-flight shards and releases
+    # only the difference (or nothing under fail-stop).
+    await top_up_dispatch(
+        pool,
+        shard_cohort(reference_idx),
+        max_inflight=max_inflight,
+        dispatch_cb=dispatch_cb,
+    )
 
     return {"reference_idx": reference_idx, "shards": n, "tickets": fresh_tickets}

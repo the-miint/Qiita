@@ -44,6 +44,7 @@ from .block_planner import (
     tile_partition,
 )
 from .dispatch import schedule_dispatch
+from .fanout_dispatch import align_block_cohort, top_up_dispatch
 from .repositories.alignment_definition import mint_alignment_definition
 from .repositories.block import (
     add_block_members,
@@ -427,8 +428,9 @@ async def plan_and_submit_alignments(
                 work_ticket_idx = await conn.fetchval(
                     "INSERT INTO qiita.work_ticket ("
                     "  action_id, action_version, originator_principal_idx,"
-                    "  scope_target_kind, block_idx, mask_idx, alignment_idx, action_context"
-                    ") VALUES ($1, $2, $3, 'block', $4, $5, $6, $7::jsonb)"
+                    "  scope_target_kind, block_idx, mask_idx, alignment_idx,"
+                    "  action_context, dispatch_held"
+                    ") VALUES ($1, $2, $3, 'block', $4, $5, $6, $7::jsonb, true)"
                     " RETURNING work_ticket_idx",
                     align_action_id,
                     align_action_version,
@@ -462,9 +464,18 @@ async def plan_and_submit_alignments(
                 }
             )
 
-    # Post-commit, fire-and-forget dispatch of each fresh PENDING block ticket.
-    for b in block_summaries:
-        schedule_dispatch(app, b["work_ticket_idx"])
+    # Every block ticket was INSERTed `dispatch_held`; the pump releases up to
+    # FANOUT_MAX_INFLIGHT per alignment cohort and refills as each block finishes
+    # (dispatch._run_and_log completion hook). Post-commit, so a released ticket
+    # is durable before its background task starts.
+    max_inflight = app.state.settings.fanout_max_inflight
+    for cohort_alignment_idx in {b["alignment_idx"] for b in block_summaries}:
+        await top_up_dispatch(
+            pool,
+            align_block_cohort(cohort_alignment_idx),
+            max_inflight=max_inflight,
+            dispatch_cb=lambda idx: schedule_dispatch(app, idx),
+        )
 
     return {
         "sequencing_run_idx": sequencing_run_idx,
