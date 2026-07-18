@@ -76,6 +76,10 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. `CHANGELOG.md` is long for the same reason: its header says where to add an entry, so you never need to read the body.
 
+## miint is a core dependency
+
+The duckdb-miint extension is the **foundation** of the compute/data system, not optional — every bioinformatics primitive (read_fastx, hashing/chunking, minimap2/bowtie2, host-filter, phylogeny, feature tables) runs through it. On the cluster it is **fail-loud, never fail-soft**: `config._resolve_slurm_settings()` keeps the CO **down** at boot, and `miint_job_env()` **raises** (never a silent empty dict), unless BOTH required job vars are set — `MIINT_EXTENSION_DIRECTORY` (the staged extension) and `MIINT_GPL_BOUNDARY_PATH` (the GPL-boundary binary for bowtie2/vsearch/MAFFT/SortMeRNA). The boundary can't ride `$HOME` — native jobs get an ephemeral per-ticket HOME — so it must be **forwarded into the job** (the slurmrestd env is an allowlist), and the compute-readiness `miint-gpl-boundary` probe fails the *deploy* if it's unreachable. Carve-out: the client `qiita reference load` CLI runs with these unset (installs into its own cache) via `miint_connect_config()`.
+
 ## Workflow runtimes
 
 A step in a workflow YAML must declare **exactly one** of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and may only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier (bioinformatics deps, system packages) belongs in a container.

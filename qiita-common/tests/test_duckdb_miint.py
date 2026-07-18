@@ -9,6 +9,8 @@ cluster runtime LOADs a pre-staged build rather than installing per job.
 
 from __future__ import annotations
 
+import pytest
+
 from qiita_common.duckdb_miint import (
     MIINT_MIRROR_URL,
     miint_connect_config,
@@ -64,16 +66,43 @@ def test_connect_config_sets_extension_directory_when_present(monkeypatch):
     assert config["allow_unsigned_extensions"] == "true"
 
 
-def test_job_env_propagates_extension_directory_when_set(monkeypatch):
-    """A remote (SLURM) job carries MIINT_EXTENSION_DIRECTORY so it can LOAD the
-    deploy-staged build. MIINT_EXTENSION_REPO is deliberately NOT propagated: the
-    cluster path is LOAD-only, so the install repo is irrelevant on a node."""
+def test_job_env_propagates_both_required_vars_when_set(monkeypatch):
+    """A remote (SLURM) job carries MIINT_EXTENSION_DIRECTORY (to LOAD the
+    deploy-staged build) AND MIINT_GPL_BOUNDARY_PATH (to reach the GPL-boundary
+    host). MIINT_EXTENSION_REPO is deliberately NOT propagated: the cluster path
+    is LOAD-only, so the install repo is irrelevant on a node."""
     monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", "/scratch/derived/duckdb-ext")
+    monkeypatch.setenv("MIINT_GPL_BOUNDARY_PATH", "/scratch/derived/gpl-boundary")
     monkeypatch.setenv("MIINT_EXTENSION_REPO", "/local/repo")
-    assert miint_job_env() == {"MIINT_EXTENSION_DIRECTORY": "/scratch/derived/duckdb-ext"}
+    assert miint_job_env() == {
+        "MIINT_EXTENSION_DIRECTORY": "/scratch/derived/duckdb-ext",
+        "MIINT_GPL_BOUNDARY_PATH": "/scratch/derived/gpl-boundary",
+    }
 
 
-def test_job_env_empty_when_extension_directory_unset(monkeypatch):
-    """Unset → empty dict (dev/test runs that rely on the DuckDB default dir)."""
+def test_job_env_raises_when_extension_directory_unset(monkeypatch):
+    """miint is a CORE dependency: a missing extension dir must fail LOUD (not a
+    silent empty dict), naming the missing var — a job submitted without it dies
+    at `LOAD miint`."""
     monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
-    assert miint_job_env() == {}
+    monkeypatch.setenv("MIINT_GPL_BOUNDARY_PATH", "/scratch/derived/gpl-boundary")
+    with pytest.raises(RuntimeError, match="MIINT_EXTENSION_DIRECTORY"):
+        miint_job_env()
+
+
+def test_job_env_raises_when_gpl_boundary_unset(monkeypatch):
+    """miint is a CORE dependency: a missing GPL-boundary path must fail LOUD —
+    it was the exact bug (bowtie2 shards died `gpl-boundary not installed` because
+    the var never reached the job)."""
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", "/scratch/derived/duckdb-ext")
+    monkeypatch.delenv("MIINT_GPL_BOUNDARY_PATH", raising=False)
+    with pytest.raises(RuntimeError, match="MIINT_GPL_BOUNDARY_PATH"):
+        miint_job_env()
+
+
+def test_job_env_raises_lists_all_missing(monkeypatch):
+    """Both unset → the error names both, so an operator fixes them in one pass."""
+    monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
+    monkeypatch.delenv("MIINT_GPL_BOUNDARY_PATH", raising=False)
+    with pytest.raises(RuntimeError, match="MIINT_EXTENSION_DIRECTORY.*MIINT_GPL_BOUNDARY_PATH"):
+        miint_job_env()

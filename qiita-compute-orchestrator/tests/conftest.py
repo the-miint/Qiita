@@ -43,7 +43,18 @@ def _stage_miint_extension():
     with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
-        conn.execute("SELECT install_gpl_boundary()")
+        row = conn.execute("SELECT install_gpl_boundary()").fetchone()
+
+    # miint is a CORE dependency (see CLAUDE.md): miint_job_env() — used by the
+    # SlurmBackend and the compute-readiness probe — now REQUIRES
+    # MIINT_GPL_BOUNDARY_PATH, mirroring the deploy (native jobs get an ephemeral
+    # HOME, so the boundary must be pointed at explicitly). install_gpl_boundary()
+    # reports where it installed the binary; point the var there so submit/probe
+    # tests resolve exactly the boundary a real job would. setdefault → an explicit
+    # override (e.g. a real deploy env) still wins.
+    boundary_path = row[0].get("path") if row and row[0] else None
+    if boundary_path:
+        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", boundary_path)
 
 
 @pytest.fixture

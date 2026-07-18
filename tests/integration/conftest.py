@@ -70,6 +70,8 @@ def _stage_miint_extension():
     `stage_miint_extension` (bowtie2 alignment runs behind it), so the sharded-
     alignment smoke finds it pre-installed as a native job does. Kept in step with
     qiita-compute-orchestrator/tests/conftest.py's identical fixture."""
+    import os
+
     import duckdb
     from qiita_common.duckdb_miint import (
         miint_connect_config,
@@ -80,7 +82,17 @@ def _stage_miint_extension():
     with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
-        conn.execute("SELECT install_gpl_boundary()")
+        row = conn.execute("SELECT install_gpl_boundary()").fetchone()
+
+    # miint is a CORE dependency: miint_job_env() now REQUIRES MIINT_GPL_BOUNDARY_PATH
+    # (native jobs get an ephemeral HOME, so the boundary must be pointed at
+    # explicitly). install_gpl_boundary() reports where it installed the binary;
+    # point the var there so the sharded-alignment / bowtie2 smokes and any submit
+    # path resolve the same boundary a real job would. setdefault → an explicit
+    # override still wins. Kept in step with the CO conftest's identical fixture.
+    boundary_path = row[0].get("path") if row and row[0] else None
+    if boundary_path:
+        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", boundary_path)
 
 
 POSTGRES_URL = resolve_postgres_url()

@@ -16,6 +16,7 @@ import pytest
 
 from qiita_compute_orchestrator.config import (
     Settings,
+    _resolve_slurm_settings,
     _resolve_token,
     _settings_ctx,
     get_settings,
@@ -209,3 +210,24 @@ def test_resolve_cp_to_co_token_permission_denied_does_not_misdirect_to_qiita_or
     assert "qiita-services" in msg
     assert "qiita-orch" not in msg
     assert "sudo -u qiita-orch" not in msg
+
+
+def test_resolve_slurm_settings_requires_miint_extension_directory(monkeypatch):
+    """miint is a CORE dependency: COMPUTE_BACKEND=slurm must fail at boot without
+    MIINT_EXTENSION_DIRECTORY. The miint presence checks run BEFORE the SLURM vars,
+    so no SLURM env is needed to reach the raise. (conftest sets both miint vars
+    globally, so the test explicitly clears the one under test.)"""
+    monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
+    monkeypatch.setenv("MIINT_GPL_BOUNDARY_PATH", "/scratch/derived/gpl-boundary")
+    with pytest.raises(RuntimeError, match="MIINT_EXTENSION_DIRECTORY"):
+        _resolve_slurm_settings()
+
+
+def test_resolve_slurm_settings_requires_miint_gpl_boundary_path(monkeypatch):
+    """miint is a CORE dependency: COMPUTE_BACKEND=slurm must fail at boot without
+    MIINT_GPL_BOUNDARY_PATH — the exact var whose absence stranded the bowtie2
+    shard builds. Regression guard for the boot-time enforcement."""
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", "/scratch/derived/duckdb-ext")
+    monkeypatch.delenv("MIINT_GPL_BOUNDARY_PATH", raising=False)
+    with pytest.raises(RuntimeError, match="MIINT_GPL_BOUNDARY_PATH"):
+        _resolve_slurm_settings()

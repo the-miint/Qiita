@@ -485,9 +485,11 @@ class SlurmBackend(ComputeBackend):
         if self._data_plane_url:
             extra_env["DATA_PLANE_URL"] = self._data_plane_url
         # Native jobs LOAD miint from the deploy-staged MIINT_EXTENSION_DIRECTORY
-        # (open_miint_conn); the compute node sees it only if we propagate it.
-        # Single-sourced with the compute-readiness probe via miint_job_env() so
-        # the diagnostic and the real jobs can't drift.
+        # and reach the GPL-boundary host via MIINT_GPL_BOUNDARY_PATH; the compute
+        # node sees these only if we propagate them (the slurmrestd environment is
+        # an allowlist, not inherited). miint is a core dependency, so miint_job_env()
+        # RAISES if either is unset — a doomed job is never submitted. Single-sourced
+        # with the compute-readiness probe so the diagnostic and real jobs can't drift.
         extra_env.update(miint_job_env())
 
         # For container steps, expose the parent directory of every

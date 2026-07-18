@@ -93,18 +93,45 @@ def miint_load_sql() -> str:
     return "LOAD miint;"
 
 
-def miint_job_env() -> dict[str, str]:
-    """The miint env vars a remote (SLURM) job must carry to LOAD the
-    deploy-staged extension. Both the orchestrator's SlurmBackend (real jobs)
-    and the compute-readiness probe inject exactly this into the job's slurmrestd
-    `environment` — single-sourced here so the two can't drift.
+# miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
+# dependency"). Every native SLURM job needs BOTH of these to function:
+#   * MIINT_EXTENSION_DIRECTORY — the deploy-staged extension the job LOADs;
+#   * MIINT_GPL_BOUNDARY_PATH   — the GPL-boundary host binary miint shells out
+#                                 to (bowtie2 index/align, vsearch, MAFFT, …).
+# The compute node receives ONLY what we explicitly forward (the slurmrestd
+# `environment` is an allowlist, not an inherited copy — see SlurmBackend and
+# payload.build_job_submit_payload), so an unforwarded var is simply absent at
+# job runtime.
+MIINT_REQUIRED_JOB_VARS = ("MIINT_EXTENSION_DIRECTORY", "MIINT_GPL_BOUNDARY_PATH")
 
-    Only `MIINT_EXTENSION_DIRECTORY` is propagated: the cluster path is LOAD-only
-    (it reads the pre-staged dir), so `MIINT_EXTENSION_REPO` — which only selects
-    where an *install* downloads from — is irrelevant on a compute node. Returns
-    empty when unset (dev/test runs that rely on the DuckDB default dir)."""
-    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
-    return {"MIINT_EXTENSION_DIRECTORY": ext_dir} if ext_dir else {}
+
+def miint_job_env() -> dict[str, str]:
+    """The miint env vars a remote (SLURM) job MUST carry to LOAD the
+    deploy-staged extension AND reach the GPL-boundary host. Both the
+    orchestrator's SlurmBackend (real jobs) and the compute-readiness probe
+    inject exactly this into the job's slurmrestd `environment` — single-sourced
+    here so the two can't drift.
+
+    miint is a CORE dependency, not optional: this RAISES if either
+    `MIINT_EXTENSION_DIRECTORY` or `MIINT_GPL_BOUNDARY_PATH` is unset. A silent
+    empty dict was the bug — it let a job submit that then died at `LOAD miint`
+    or the first GPL-boundary call (the bowtie2-shard `gpl-boundary not
+    installed` incident), and it hid a broken boundary through a green deploy.
+    Fail loud instead. `MIINT_EXTENSION_REPO` is deliberately NOT propagated: the
+    cluster path is LOAD-only, so the install repo is irrelevant on a node.
+
+    This is the CLUSTER/JOB path. The client-side `qiita reference load` CLI
+    legitimately runs with these unset (it INSTALLs into its own cache) and uses
+    `miint_connect_config()`, which stays optional — this requirement is scoped
+    to job submission on purpose."""
+    missing = [v for v in MIINT_REQUIRED_JOB_VARS if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(
+            "miint is a core dependency; these required env var(s) are unset and "
+            "must be set in compute-orchestrator.env for any SLURM job: "
+            f"{', '.join(missing)}. See CLAUDE.md 'miint is a core dependency'."
+        )
+    return {v: os.environ[v] for v in MIINT_REQUIRED_JOB_VARS}
 
 
 def is_empty_sequence_file(path: Path) -> bool:
