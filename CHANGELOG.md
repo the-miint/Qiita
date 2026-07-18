@@ -94,7 +94,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **Data plane: DoGet now streams instead of materializing the whole result (#NNN).**
+- **Data plane: DoGet now streams instead of materializing the whole result (#328).**
   `stream_ducklake_batches` executed queries with DuckDB's MATERIALIZED
   `query_arrow`, which computes the ENTIRE result set into memory before the
   first RecordBatch is drainable — so the bounded batch channel it fed could
