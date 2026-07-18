@@ -107,6 +107,15 @@ duplicates further down are historical strata; leave them where they are.
   channel depth. The same one shared path backs the `alignment` (OGU
   feature-table) and `read_masked` whole-scope DoGets, so all three are fixed at
   once. A zero-row schema probe supplies the schema `stream_arrow` needs up front.
+- **read-mask `lima` SIF was missing `python3`, failing every step after lima
+  succeeded (#320, follow-up to #313).** `_lib.sh`'s `qiita_finish` — the last line of every
+  container step — runs `python3 manifest_writer.py`, but `lima.def` (a
+  micromamba base) installed only `jq`/`gawk`/… and no `python`, so the step died
+  `exit 127 python3: command not found`. It was latent until now: the old FASTQ
+  hang meant lima never reached `qiita_finish`, so the fix that made lima complete
+  is what exposed it. Added `python` to the base install and a `%test` guard that
+  fails the build if `python3` or the staged `manifest_writer.py` is not resolvable.
+  lima itself needs no python; nothing else in the read-mask chain is a container.
 - **PacBio read-mask: lima now gets a CCS BAM, not a multi-GB FASTQ (#313).** lima
   decides CCS-vs-CLR from the input FORMAT, not from `--hifi-preset`: handed the
   ~33.5 GB FASTQ `lima_export` used to write, it warned "non CCS data … will
