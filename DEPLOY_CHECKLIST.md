@@ -15,7 +15,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- **`MIINT_GPL_BOUNDARY_PATH` (CO, required when `COMPUTE_BACKEND=slurm`) (#NNN).** Absolute
+  path to the miint GPL-boundary host binary (bowtie2/vsearch/MAFFT/SortMeRNA run
+  out-of-process behind it). miint is a core dependency: after this deploy the CO
+  **refuses to boot** and every job submit raises unless BOTH this and
+  `MIINT_EXTENSION_DIRECTORY` are set. It is not covered by `MIINT_EXTENSION_DIRECTORY`
+  and cannot ride `$HOME` — native jobs get an ephemeral per-ticket `HOME`, so an
+  interactive `install_gpl_boundary()` (cached under `~/.cache/miint/bin`) is invisible
+  to them; the orchestrator forwards this var into each job's environment. Install the
+  boundary once via miint's `SELECT install_gpl_boundary()` (it reports the installed
+  path) onto a shared, compute-node-visible filesystem, then set it before the restart:
+  ```bash
+  sudo bash -c 'echo "MIINT_GPL_BOUNDARY_PATH=/scratch/persistent/miint/bin/gpl-boundary" >> /etc/qiita/compute-orchestrator.env'
+  ```
+  Post-deploy this is asserted by the compute-readiness `miint-gpl-boundary` probe (part
+  of `make verify-deploy`) — a tiny bowtie2 index built on a compute node; a `fail` there
+  means the boundary isn't reachable from the job (wrong path, or not on the shared FS).
 
 ### 2. One-time host setup
 

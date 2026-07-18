@@ -109,6 +109,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Native SLURM jobs can now reach the miint GPL-boundary host (#NNN).** The
+  boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
+  under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
+  `HOME`, and the slurmrestd job environment is an allowlist that only forwarded
+  `MIINT_EXTENSION_DIRECTORY` — so every `build_bowtie2_index` step died
+  `gpl-boundary not installed` (the WOL3 reference-16 sharded build). `miint_job_env()`
+  now also forwards `MIINT_GPL_BOUNDARY_PATH`. miint is a core dependency, so this is
+  enforced fail-loud, not fail-soft: `miint_job_env()` **raises** if either miint var
+  is unset (was a silent empty dict), `_resolve_slurm_settings()` keeps the CO **down**
+  at boot without them, and a new compute-readiness `miint-gpl-boundary` probe builds a
+  tiny bowtie2 index to fail the *deploy* if the boundary is unreachable. New required
+  env var `MIINT_GPL_BOUNDARY_PATH` (CO, `COMPUTE_BACKEND=slurm`).
 - **Data plane: DoGet now streams instead of materializing the whole result (#328).**
   `stream_ducklake_batches` executed queries with DuckDB's MATERIALIZED
   `query_arrow`, which computes the ENTIRE result set into memory before the

@@ -314,6 +314,21 @@ def test_probe_script_checks_miint_host_filter_functions():
     assert "miint-host-filter-fns=fail" in script
 
 
+def test_probe_script_checks_gpl_boundary():
+    """The probe INVOKES `save_bowtie2_index`, which shells to the GPL-boundary
+    host — the one miint surface no other probe exercised, and the exact thing
+    that got a WOL3 sharded build to the compute nodes with the boundary
+    unreachable (every bowtie2 shard died `gpl-boundary not installed`) through a
+    green deploy. Running in the job env, it also verifies MIINT_GPL_BOUNDARY_PATH
+    is forwarded (native jobs get an ephemeral HOME, so the boundary is reachable
+    only via that var). Registration alone wouldn't prove the out-of-process
+    binary works, so it builds a tiny index rather than checking duckdb_functions()."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "save_bowtie2_index" in script
+    assert "miint-gpl-boundary=ok" in script
+    assert "miint-gpl-boundary=fail" in script
+
+
 def test_parse_probe_log_unknown_value_defaults_to_fail():
     """If the probe emits a value the parser doesn't recognize, it
     should be reported as a failure rather than silently passed —

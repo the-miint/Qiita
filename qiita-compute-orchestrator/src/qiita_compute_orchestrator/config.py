@@ -220,6 +220,17 @@ def _resolve_slurm_settings() -> SlurmSettings:
             raise RuntimeError(f"orchestrator: COMPUTE_BACKEND=slurm requires {name} to be set")
         return v
 
+    # miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
+    # dependency"): a SLURM deploy MUST have both the staged extension dir and the
+    # GPL-boundary binary configured, or every native job dies at `LOAD miint` /
+    # the first GPL-boundary call. Fail the boot (keep the unit DOWN) rather than
+    # submit doomed jobs. The values are read from os.environ by
+    # qiita_common.duckdb_miint.miint_job_env() (which also raises, as the runtime
+    # backstop); here we assert presence at startup, alongside the other required
+    # SLURM vars, so a forgotten var is caught before the unit reaches Ready.
+    _required("MIINT_EXTENSION_DIRECTORY")
+    _required("MIINT_GPL_BOUNDARY_PATH")
+
     return SlurmSettings(
         base_url=_required("SLURMRESTD_URL"),
         jwt_path=Path(_required("SLURMRESTD_JWT_PATH")),
