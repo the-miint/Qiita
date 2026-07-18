@@ -109,7 +109,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **Native SLURM jobs can now reach the miint GPL-boundary host (#NNN).** The
+- **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
   `HOME`, and the slurmrestd job environment is an allowlist that only forwarded

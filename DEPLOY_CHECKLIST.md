@@ -15,7 +15,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-- **`MIINT_GPL_BOUNDARY_PATH` (CO, required when `COMPUTE_BACKEND=slurm`) (#NNN).** Absolute
+- **`MIINT_GPL_BOUNDARY_PATH` (CO, required when `COMPUTE_BACKEND=slurm`) (#331).** Absolute
   path to the miint GPL-boundary host binary (bowtie2/vsearch/MAFFT/SortMeRNA run
   out-of-process behind it). miint is a core dependency: after this deploy the CO
   **refuses to boot** and every job submit raises unless BOTH this and
