@@ -278,6 +278,16 @@ duplicates further down are historical strata; leave them where they are.
   every other HTTP error keeps the generic body echo. Closes the last direction
   of #161 — PAT authority stays immutable-once-minted (no auto-widening); this is
   the reactive re-login nudge, not a capability grant.
+- **`qiita pool-completion` reads accurately and answers "done and clean?" at a
+  glance (#217).** The subcommand's `--help`/description still described the command
+  in the retired `fastq-to-parquet` / `prep-generation` / `GenPrepFileJob` terms
+  (the API surfaces were corrected earlier but the parser text was missed); it now
+  says demux (bcl-convert) + host-masking (read-mask), matching `PoolCompletionStatus`.
+  The handler also gained a `render=` that, alongside the full JSON, prints a
+  one-line human summary to stderr surfacing the three questions an operator asks —
+  `fully_processed` (a DONE-and-clean verdict), `demux_state`, and
+  `samples_not_submitted` (stranded samples) — so the answer no longer has to be
+  picked out of the raw body. No route/schema change.
 - **The bulk-block mask + align planners now resolve host filtering per sample, not
   pool-wide (#305).** `block_planner.plan_and_submit_blocks` and
   `align_planner.plan_and_submit_alignments` no longer take

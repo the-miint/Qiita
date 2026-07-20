@@ -1252,18 +1252,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pool_completion = sub.add_parser(
         "pool-completion",
         help=(
-            "Read a sequenced-pool's prep-generation completion rollup: how many"
-            " of its samples have a COMPLETED fastq-to-parquet ticket."
+            "Read a sequenced-pool's end-to-end processing rollup: its demux"
+            " (bcl-convert) state and how many samples finished host-masking"
+            " (read-mask)."
         ),
         description=(
-            "GET the pool's completion status: each non-retired sequenced_sample"
-            " is classified by the state of its fastq-to-parquet work tickets"
-            " (completed / in-flight / failed / not-submitted) and tallied into"
-            " pool-level counts, with a `complete` flag set when every sample is"
-            " COMPLETED. The SPP GenPrepFileJob end-state equivalent: it tells the"
-            " operator whether the per-sample fan-out from submit-host-filter-pool"
-            " has finished. Compute-on-read over the work tickets — it never"
-            " drifts when a sample is re-processed or deleted."
+            "GET the pool's completion status. Reports the pool-scoped demux"
+            " (bcl-convert) `demux_state`, then classifies each non-retired"
+            " sequenced_sample by the state of its read-mask (host-masking) work"
+            " tickets (completed / in-flight / no-data / failed / not-submitted)"
+            " into pool-level counts, with a `complete` flag set when every sample"
+            " reached a terminal-accounted state (COMPLETED or NO_DATA) and a"
+            " `fully_processed` flag set when demux COMPLETED and host-masking is"
+            " complete. It tells the operator whether the per-sample fan-out from"
+            " submit-host-filter-pool has finished — including samples a partial"
+            " fan-out never submitted (`samples_not_submitted`). Compute-on-read"
+            " over the work tickets — it never drifts when a sample is re-processed"
+            " or deleted."
         ),
     )
     p_pool_completion.add_argument(
