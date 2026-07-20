@@ -378,7 +378,12 @@ async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample
     (host_taxon_id == "missing: control sample"). Resolves prep_sample → biosample,
     then defers the control classification to `is_control_sample` so the definition
     of "control" stays shared with the host-filter resolver. Fail-safe on a missing
-    prep_sample (returns False → the zero-read ticket FAILs as a data well)."""
+    prep_sample (returns False → the zero-read ticket FAILs as a data well).
+
+    Covers BOTH positive and negative controls, because the persisted control
+    marker cannot yet tell them apart — see the KNOWN LIMITATION in
+    `is_control_sample`: a positive control (katharoseq) that yields zero reads is
+    currently classified `no_data` too, though it is really a failure."""
     biosample_idx = await fetch_biosample_idx_for_prep_sample(pool, prep_sample_idx)
     if biosample_idx is None:
         return False

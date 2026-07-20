@@ -367,6 +367,31 @@ async def test_is_control_sample_true_for_control_marker(ctx):
     assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is True
 
 
+async def test_is_control_sample_does_not_distinguish_positive_from_negative_control(ctx):
+    """KNOWN LIMITATION (see is_control_sample's docstring): the persisted control
+    marker is set from `is_control` alone, so a POSITIVE control (katharoseq — a
+    known spiked organism that SHOULD yield reads, whose zero-read outcome is really
+    a FAILURE) is represented IDENTICALLY to a NEGATIVE control (a blank). Both carry
+    `MISSING_REASON_CONTROL_SAMPLE` and there is no positive/negative field to key
+    on, so both classify as expected-empty here.
+
+    This test pins that collapse: a positive control cannot be told apart at this
+    layer and currently reads as expected-empty (→ `no_data` on zero reads, not a
+    failure). When the positive-vs-negative control policy lands a persisted signal,
+    this is the seam that must start returning False for a positive control — update
+    this test then. It is deliberately assay-policy-deferred, not an oversight."""
+    # There is only one way to represent ANY control at this layer today — the
+    # control missing-reason — so a "positive control" is byte-identical to a blank.
+    positive_control_marked_like_any_control = await _make_biosample(ctx)
+    await _set_host_missing_reason(
+        ctx, positive_control_marked_like_any_control, MISSING_REASON_CONTROL_SAMPLE
+    )
+    assert (
+        await is_control_sample(ctx["pool"], biosample_idx=positive_control_marked_like_any_control)
+        is True
+    )
+
+
 async def test_is_control_sample_false_for_non_control_states(ctx):
     """Everything that is NOT a control reads False: a named host, a deliberate
     'not applicable' (a real hostless sample, not a control), an uninformative

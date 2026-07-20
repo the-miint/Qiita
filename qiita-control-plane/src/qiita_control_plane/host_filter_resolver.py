@@ -166,6 +166,19 @@ async def is_control_sample(
     zero reads (a benign terminal `no_data`), whereas a data well with zero reads
     is a genuine failure — so the two must be told apart before disposing of a
     zero-read ticket.
+
+    KNOWN LIMITATION — positive vs. negative controls. The control missing-reason
+    is set by the control-sample backfill from `is_control` (`project_idx IS NULL`)
+    alone, which COLLAPSES the two control kinds the pre-flight actually
+    distinguishes: an `extraction_blank` (a NEGATIVE control — expected empty) and a
+    `katharoseq_cells_positive_control` (a POSITIVE control — a known spiked
+    organism that SHOULD yield reads). So this returns True for both, and a positive
+    control that yields zero reads is classified `no_data` (benign) when it is really
+    a failure. Distinguishing them needs a persisted positive/negative signal that
+    does not exist yet (the pre-flight's `input_sample.sample_type` is not carried
+    into biosample metadata) — the same collapse the host-filter policy defers to the
+    positive-vs-negative control follow-up. This classifier deliberately matches the
+    resolver's existing CONTROL treatment rather than pre-empting that policy.
     """
     row = await _fetch_host_taxon_metadata_row(conn, biosample_idx)
     if row is None or row["value_terminology_term_idx"] is not None:
