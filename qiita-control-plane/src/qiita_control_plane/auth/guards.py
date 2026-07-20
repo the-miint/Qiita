@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 import asyncpg
 from fastapi import Depends, HTTPException
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER, SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
@@ -149,30 +149,48 @@ _STALE_TOKEN_HINT = (
 )
 
 
-def _stale_token_hint(p: Principal, scopes: tuple[str, ...]) -> str:
-    """Actionable suffix for a scope 403 when the caller's role grants the scope
-    but their token doesn't carry it.
+def _is_stale_token_scope(p: Principal, scopes: tuple[str, ...]) -> bool:
+    """True when a scope 403's real cause is a stale token, not a genuine lack
+    of entitlement.
 
     A human's PAT scopes are fixed at mint time, so a scope that's in the
     caller's live `role_ceiling` but absent from the token yields a confusing
     "missing required scope" 403 even though the role grants it. Two states land
     here — a scope added to the ceiling *after* the token was minted (the token
     predates the grant), or a PAT deliberately minted below the ceiling — and the
-    condition can't tell them apart, so the hint describes the state and points
-    at re-login rather than asserting a cause. When any of the checked `scopes`
-    is in the caller's live ceiling but absent from the token, return the hint;
-    otherwise ''. Non-human principals (service accounts, anonymous) don't use
-    the role ceiling, so they never get the hint.
+    condition can't tell them apart; either way re-login is the fix. True when
+    any of the checked `scopes` is in the caller's live ceiling but absent from
+    the token. Non-human principals (service accounts, anonymous) don't use the
+    role ceiling, so they never qualify.
     """
     if not isinstance(p, HumanUser):
-        return ""
+        return False
     try:
         ceiling = role_ceiling(p.system_role)
     except ValueError:
-        return ""
-    if any(s in ceiling and not p.has_scope(s) for s in scopes):
-        return _STALE_TOKEN_HINT
-    return ""
+        return False
+    return any(s in ceiling and not p.has_scope(s) for s in scopes)
+
+
+def _stale_token_hint(p: Principal, scopes: tuple[str, ...]) -> str:
+    """Actionable detail suffix for a stale-scope 403 (see `_is_stale_token_scope`
+    for the condition), or '' when the 403 is a genuine lack of entitlement that
+    re-login wouldn't fix.
+    """
+    return _STALE_TOKEN_HINT if _is_stale_token_scope(p, scopes) else ""
+
+
+def _stale_token_headers(p: Principal, scopes: tuple[str, ...]) -> dict[str, str] | None:
+    """Machine-readable marker header for a stale-scope 403, or None otherwise.
+
+    Twin of `_stale_token_hint`: the hint carries the human-readable prose in the
+    detail, this carries the structured signal the CLI keys off so it doesn't have
+    to string-match the prose (or keep its own copy of the role ceiling). Returned
+    as an `HTTPException(headers=...)` kwarg value.
+    """
+    if _is_stale_token_scope(p, scopes):
+        return {STALE_TOKEN_SCOPE_HEADER: "1"}
+    return None
 
 
 def require_scope(scope: str) -> Callable[..., Principal]:
@@ -193,6 +211,7 @@ def require_scope(scope: str) -> Callable[..., Principal]:
             raise HTTPException(
                 status_code=403,
                 detail=f"missing required scope {scope_str!r}" + _stale_token_hint(p, (scope_str,)),
+                headers=_stale_token_headers(p, (scope_str,)),
             )
         return p
 
@@ -221,6 +240,7 @@ def require_any_scope(*scopes: str) -> Callable[..., Principal]:
                 status_code=403,
                 detail=f"missing one of required scopes {list(scope_strs)!r}"
                 + _stale_token_hint(p, scope_strs),
+                headers=_stale_token_headers(p, scope_strs),
             )
         return p
 

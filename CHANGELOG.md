@@ -266,6 +266,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
+  PAT predates a scope its principal's role now grants (or was deliberately
+  minted below the ceiling), a scope-gated route 403s even though the role
+  allows it. The scope guards now flag that condition with a machine-readable
+  `X-Qiita-Stale-Token-Scope` response header (twin of the existing #258 detail
+  hint), and the CLI's single HTTP-error chokepoint (`run_http_subcommand`) keys
+  off it to print a clean "your token predates a scope your role now grants — run
+  `qiita login`" message instead of the raw JSON error envelope. Structured
+  signal, so the CLI needs no drift-prone client-side copy of the role ceiling;
+  every other HTTP error keeps the generic body echo. Closes the last direction
+  of #161 — PAT authority stays immutable-once-minted (no auto-widening); this is
+  the reactive re-login nudge, not a capability grant.
 - **The bulk-block mask + align planners now resolve host filtering per sample, not
   pool-wide (#305).** `block_planner.plan_and_submit_blocks` and
   `align_planner.plan_and_submit_alignments` no longer take
