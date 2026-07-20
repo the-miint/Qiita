@@ -1386,7 +1386,11 @@ def _render_pool_completion(body: dict | list) -> None:
     stderr-summary pattern in `cli/admin/mask.py`.
     """
     print(json.dumps(body, indent=2))
-    if not isinstance(body, dict):
+    # Only summarize a recognized PoolCompletionStatus body — gate on its
+    # discriminating computed field so an unexpected/partial shape gets the JSON
+    # but no verdict-full-of-None. Mirrors the discriminating-key guard in
+    # `cli/admin/mask.py`.
+    if not (isinstance(body, dict) and "fully_processed" in body):
         return
     verdict = "DONE and clean" if body.get("fully_processed") else "NOT fully processed"
     print(

@@ -4122,6 +4122,24 @@ def test_render_pool_completion_flags_incomplete_and_stranded(capsys):
     assert "195 never-submitted" in err
 
 
+def test_render_pool_completion_stays_quiet_on_unrecognized_body(capsys):
+    """The render only summarizes a recognized PoolCompletionStatus body: an
+    unexpected shape (a list, or a dict missing the discriminating
+    `fully_processed` field) still gets its JSON on stdout but no verdict line on
+    stderr, and never raises."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    _render_pool_completion(["not", "a", "completion", "body"])
+    cap = capsys.readouterr()
+    assert "not" in cap.out  # JSON is still printed
+    assert cap.err == ""  # no verdict on an unrecognized shape
+
+    _render_pool_completion({"unexpected": "shape"})
+    cap = capsys.readouterr()
+    assert "unexpected" in cap.out
+    assert cap.err == ""
+
+
 # ---------------------------------------------------------------------------
 # study get / biosample get / biosample list-idxs (read subcommands)
 # ---------------------------------------------------------------------------
