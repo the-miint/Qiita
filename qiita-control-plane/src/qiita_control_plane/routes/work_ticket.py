@@ -835,8 +835,8 @@ _WORK_TICKET_SUMMARY_FROM = (
     "   LIMIT 1"
     " ) cur ON true"
 )
-# The summary read also nests the ticket's prep_sample read outcome (issue #236
-# ask 5): a LEFT JOIN to the sequenced_sample of wt.prep_sample_idx (1:1 with the
+# The summary read also nests the ticket's prep_sample read outcome: a LEFT JOIN
+# to the sequenced_sample of wt.prep_sample_idx (1:1 with the
 # prep_sample), so a read-mask ticket is assessable without a separate lookup. The
 # join is NULL for a non-prep_sample-scoped ticket (prep_sample_idx NULL) or a
 # prep_sample with no sequenced_sample; `ro_present` (ss.idx) distinguishes "no

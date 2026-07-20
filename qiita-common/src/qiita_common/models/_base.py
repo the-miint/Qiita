@@ -25,11 +25,10 @@ def _fraction_passing_quality_filter(
     """quality_filtered / raw — the share of raw reads surviving the full QC +
     host-filter pipeline. Computed on read so it can never drift from the counts.
     None when either bound is absent or raw is 0 (no division). Lives here (the
-    dependency-free base module) so every read-metric surface — per-sample
-    (SequencedSampleResponse), pool / run rollup (PoolReadMetrics), and per-ticket
-    (WorkTicketReadOutcome) — shares ONE definition without an import cycle. A
-    pool passes its SUMMED counts here, so its fraction is recomputed from the
-    sums, never a mean of per-sample fractions."""
+    dependency-free base module) so every read-metric surface shares ONE
+    definition without an import cycle. A pool passes its SUMMED counts here, so
+    its fraction is recomputed from the sums, never a mean of per-sample
+    fractions."""
     if raw_read_count_r1r2 is None or quality_filtered_read_count_r1r2 is None:
         return None
     if raw_read_count_r1r2 == 0:

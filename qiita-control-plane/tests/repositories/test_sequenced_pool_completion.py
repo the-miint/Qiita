@@ -424,3 +424,50 @@ async def test_reference_scoped_matches_rype_or_minimap2(pool_ctx):
     )
     assert scoped["samples_completed"] == 1
     assert scoped["samples_not_submitted"] == 0
+
+
+async def test_reference_scope_matches_real_build_mask_params_keys(pool_ctx):
+    """Pin the producer<->consumer JSONB-key contract. The reference-scoped
+    completion SQL reads md.params->>'host_rype_reference_idx' /
+    'host_minimap2_reference_idx'; those keys are produced by
+    runner._mask._build_mask_params (the single source of the mask identity
+    shape). Mint a mask with its REAL output and assert the scope matches — so a
+    future key rename there fails loudly here instead of silently reading every
+    sample as not_submitted."""
+    from qiita_control_plane.runner._mask import _build_mask_params
+
+    ref = 777
+    params = _build_mask_params(
+        action_id="read-mask",
+        action_version="1.0.0",
+        prep_protocol_idx=None,
+        instrument_model=None,
+        adapter_set_hash=None,
+        host_rype_reference_idx=ref,
+        host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+    db = pool_ctx["pool"]
+    mask_idx = await db.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        "  (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, $2, $3, $4::jsonb,"
+        "  (SELECT created_by_idx FROM qiita.sequenced_pool WHERE idx = $5))"
+        " RETURNING mask_idx",
+        secrets.token_bytes(32),
+        params["filter_workflow"],
+        params["filter_version"],
+        json.dumps(params),
+        pool_ctx["pool_idx"],
+    )
+    try:
+        ps = await pool_ctx["add_sample"]()
+        await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask_idx)
+        scoped = await fetch_sequenced_pool_completion(db, pool_ctx["pool_idx"], reference_idx=ref)
+        assert scoped["samples_completed"] == 1
+        assert scoped["samples_not_submitted"] == 0
+    finally:
+        # mask_idx on work_ticket is ON DELETE SET NULL, so deleting the mask
+        # clears the ticket's ref; the ticket itself is cleaned by the fixture.
+        await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
