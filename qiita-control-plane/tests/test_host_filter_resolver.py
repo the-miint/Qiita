@@ -352,7 +352,7 @@ async def test_control_sample_is_a_marker_not_a_decision(ctx):
 
 
 # ---------------------------------------------------------------------------
-# is_control_sample — the zero-read read-mask classifier (#177)
+# is_control_sample — the zero-read read-mask classifier
 # ---------------------------------------------------------------------------
 # Shares _RECOGNISED_MISSING_REASON + the metadata read with resolve_host_filter,
 # so the "is this a control" answer here can never drift from the CONTROL outcome

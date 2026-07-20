@@ -164,8 +164,7 @@ def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, m
 def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatch):
     """Durable absent, the data plane returns 0 rows, and the well IS an
     expected-empty control (blank / NTC) → StepNoData (terminal no_data), NOT a
-    failure. This is the #177 fix: an empty control must not land in the pool's
-    samples_failed."""
+    failure — an empty control must not land in the pool's samples_failed."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(True))
     with pytest.raises(StepNoData) as exc:
