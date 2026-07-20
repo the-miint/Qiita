@@ -1376,10 +1376,40 @@ def _handle_submit_block_mask_pool(
     return _common.run_http_subcommand(_run)
 
 
+def _render_pool_completion(body: dict | list) -> None:
+    """Print the PoolCompletionStatus JSON, then a one-line human summary that
+    surfaces the three questions an operator actually asks — is the pool done and
+    clean (`fully_processed`), what is the demux stage at (`demux_state`), and how
+    many samples were never submitted (`samples_not_submitted`) — so the answer
+    doesn't have to be picked out of the raw body. JSON to stdout (the
+    machine-readable channel); the summary to stderr. Mirrors the render= +
+    stderr-summary pattern in `cli/admin/mask.py`.
+    """
+    print(json.dumps(body, indent=2))
+    # Only summarize a recognized PoolCompletionStatus body — gate on its
+    # discriminating computed field so an unexpected/partial shape gets the JSON
+    # but no verdict-full-of-None. Mirrors the discriminating-key guard in
+    # `cli/admin/mask.py`.
+    if not (isinstance(body, dict) and "fully_processed" in body):
+        return
+    verdict = "DONE and clean" if body.get("fully_processed") else "NOT fully processed"
+    print(
+        f"pool {body.get('sequenced_pool_idx')}: {verdict}"
+        f" — demux {body.get('demux_state')};"
+        f" host-masking {body.get('samples_completed')}/{body.get('sample_count')} completed,"
+        f" {body.get('samples_no_data')} no-data,"
+        f" {body.get('samples_in_flight')} in-flight,"
+        f" {body.get('samples_failed')} failed,"
+        f" {body.get('samples_not_submitted')} never-submitted",
+        file=sys.stderr,
+    )
+
+
 def _handle_pool_completion(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """GET the pool's end-to-end processing rollup and print its JSON body:
-    the demux (bcl-convert) `demux_state`, the per-sample read-mask buckets with
-    the host-masking `complete` flag, and `fully_processed` (demux + masking).
+    """GET the pool's end-to-end processing rollup and print its JSON body plus a
+    human summary line: the demux (bcl-convert) `demux_state`, the per-sample
+    read-mask buckets with the host-masking `complete` flag, and `fully_processed`
+    (demux + masking).
 
     Dedicated (rather than the generic `read` command) because the route is keyed
     on two ids — sequencing_run_idx and sequenced_pool_idx — which `read` (single
@@ -1389,4 +1419,7 @@ def _handle_pool_completion(args: argparse.Namespace, parser: argparse.ArgumentP
         sequencing_run_idx=args.sequencing_run_idx,
         sequenced_pool_idx=args.sequenced_pool_idx,
     )
-    return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
+    return _common.run_http_subcommand(
+        lambda t: _common.call("GET", args.base_url, t, path),
+        render=_render_pool_completion,
+    )
