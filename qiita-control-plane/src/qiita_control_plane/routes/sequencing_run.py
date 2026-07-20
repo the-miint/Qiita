@@ -37,7 +37,7 @@ from typing import Annotated, Any
 
 import asyncpg
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_ALIGN_PLAN,
@@ -633,6 +633,15 @@ async def get_sequenced_pool_completion(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    reference_idx: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Optional host reference to scope host-masking completion to: the"
+            " buckets then count only masks that used this reference, so"
+            " samples_not_submitted means 'not masked against THIS reference'."
+        ),
+    ),
 ) -> PoolCompletionStatus:
     """Read the pool's end-to-end processing rollup: the demux (bcl-convert)
     stage state plus the host-masking stage. `demux_state` is the pool-scoped
@@ -651,11 +660,14 @@ async def get_sequenced_pool_completion(
     and system_role at least wet_lab_admin. `require_sequenced_pool_in_run` fronts
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
     samples reads as all-zero counts and `complete=False`."""
-    row = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    row = await fetch_sequenced_pool_completion(
+        pool, sequenced_pool_idx, reference_idx=reference_idx
+    )
     demux_state = await fetch_sequenced_pool_demux_state(pool, sequenced_pool_idx)
     return PoolCompletionStatus(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,
+        reference_idx=reference_idx,
         demux_state=demux_state,
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],

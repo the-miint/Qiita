@@ -438,6 +438,11 @@ class PoolCompletionStatus(BaseModel):
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
+    # Echo of the optional host-reference scope: when set, the host-masking
+    # buckets count only masks that used this reference, so `samples_not_submitted`
+    # means "not masked against THIS reference" (vs. the reference-agnostic "not
+    # masked at all" when None). The demux stage is pool-wide, unaffected.
+    reference_idx: Annotated[int, Field(gt=0)] | None = None
     demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]

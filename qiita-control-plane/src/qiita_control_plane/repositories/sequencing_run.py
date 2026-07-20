@@ -529,6 +529,8 @@ async def fetch_sequenced_pool_sample_qc_reports(
 async def fetch_sequenced_pool_completion(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
+    *,
+    reference_idx: int | None = None,
 ) -> asyncpg.Record:
     """Return the pool's host-masking completion rollup: counts of its
     non-retired sequenced_samples bucketed by the state of their read-mask
@@ -562,7 +564,17 @@ async def fetch_sequenced_pool_completion(
     bound from NON_TERMINAL_WORK_TICKET_STATES; it appears only inside a bool_or
     in the target list, never in a WHERE, so no partial-index predicate depends
     on its spelling. Retired samples are excluded (`ps.retired IS NOT TRUE`) to match the other pool
-    rollups' sample set."""
+    rollups' sample set.
+
+    `reference_idx` optionally scopes the read-mask ticket match to tickets whose
+    mask (`work_ticket.mask_idx` → `mask_definition`) used that host reference —
+    as its rype OR its minimap2 reference, read from the mask's `params` JSONB. So
+    a per-host-reference completion answers "masked against THIS reference?"
+    instead of the reference-agnostic "masked at all?": a sample masked only
+    against a DIFFERENT reference reads `not_submitted` here (`ticket_count = 0`),
+    which the pool-wide (`reference_idx=None`) form cannot distinguish. None keeps
+    the reference-agnostic behavior — the `$4 IS NULL` short-circuit includes every
+    read-mask ticket."""
     return await pool_or_conn.fetchrow(
         "WITH sample_state AS ("
         "  SELECT ss.prep_sample_idx,"
@@ -576,6 +588,13 @@ async def fetch_sequenced_pool_completion(
         "  LEFT JOIN qiita.work_ticket wt"
         "    ON wt.prep_sample_idx = ss.prep_sample_idx"
         "   AND wt.action_id = $2"
+        # Reference scoping rides the JOIN's ON (not a WHERE) so a sample whose
+        # only read-mask ticket targets another reference keeps its row with 0
+        # matching tickets → not_submitted, rather than being dropped entirely.
+        "   AND ($4::bigint IS NULL OR wt.mask_idx IN ("
+        "     SELECT md.mask_idx FROM qiita.mask_definition md"
+        "     WHERE (md.params->>'host_rype_reference_idx')::bigint = $4"
+        "        OR (md.params->>'host_minimap2_reference_idx')::bigint = $4))"
         "  WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
         "  GROUP BY ss.prep_sample_idx"
         ")"
@@ -594,6 +613,7 @@ async def fetch_sequenced_pool_completion(
         sequenced_pool_idx,
         READ_MASK_ACTION_ID,
         list(NON_TERMINAL_WORK_TICKET_STATES),
+        reference_idx,
     )
 
 
