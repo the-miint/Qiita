@@ -173,6 +173,18 @@ API_PREFIX = "/api/v1"
 BEARER_PREFIX = "Bearer "
 
 
+# Machine-readable marker the scope guards set on a *stale-scope* 403 — one
+# whose real cause is a PAT minted before the missing scope entered the
+# caller's live role ceiling (or a PAT deliberately narrowed below it). The
+# server is the authoritative place to decide this (it holds the live
+# `role_ceiling`), so it flags the condition here as a response header rather
+# than in the detail prose. The CLI's single HTTP-error chokepoint keys off
+# this header to surface a clean "run `qiita login`" prompt, without the CLI
+# needing its own (drift-prone) copy of the role ceiling. Presence is the
+# signal; the value is unspecified beyond being truthy.
+STALE_TOKEN_SCOPE_HEADER = "X-Qiita-Stale-Token-Scope"
+
+
 # Pydantic Field max_length policy values. 255 is the historical "name-ish"
 # default that lines up with VARCHAR(255) in DB columns; 100 covers reference
 # version strings; 64 caps DuckLake / DB table names per Postgres identifier

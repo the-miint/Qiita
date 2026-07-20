@@ -249,6 +249,10 @@ def test_require_scope_403_stale_token_hints_relogin():
         dep(h)
     assert exc.value.status_code == 403
     assert "qiita login" in exc.value.detail
+    # ...and the machine-readable marker header the CLI keys off.
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    assert (exc.value.headers or {}).get(STALE_TOKEN_SCOPE_HEADER) is not None
 
 
 def test_require_scope_403_no_hint_when_scope_outside_ceiling():
@@ -263,6 +267,10 @@ def test_require_scope_403_no_hint_when_scope_outside_ceiling():
         dep(_human(role=SystemRole.USER, scopes=frozenset({Scope.SELF_PROFILE})))
     assert exc.value.status_code == 403
     assert "qiita login" not in exc.value.detail
+    # No stale marker either — re-login wouldn't grant a scope outside the ceiling.
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    assert (exc.value.headers or {}).get(STALE_TOKEN_SCOPE_HEADER) is None
 
 
 def test_require_scope_403_no_hint_for_service_account():
@@ -287,6 +295,9 @@ def test_require_any_scope_403_stale_token_hints_relogin():
         dep(h)
     assert exc.value.status_code == 403
     assert "qiita login" in exc.value.detail
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    assert (exc.value.headers or {}).get(STALE_TOKEN_SCOPE_HEADER) is not None
 
 
 # ---------------------------------------------------------------------------

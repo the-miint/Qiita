@@ -546,6 +546,7 @@ def _stub_post(
     response_json: dict,
     status: int = 201,
     whoami_idx: int | None = None,
+    response_headers: dict | None = None,
 ):
     """Patch `_common.httpx.request` to capture every call and return canned
     responses. Each call appends to `captured['requests']` (full list); the
@@ -585,7 +586,12 @@ def _stub_post(
                 json={"kind": "human", "principal_idx": whoami_idx},
                 request=_httpx.Request(method, url),
             )
-        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
+        return _httpx.Response(
+            status,
+            json=response_json,
+            headers=response_headers,
+            request=_httpx.Request(method, url),
+        )
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
@@ -2048,6 +2054,54 @@ def test_http_error_response_prints_to_stderr_and_exits_1(monkeypatch, capsys):
     assert "http error 403" in err
     # The server's response body is echoed so the user sees the reason.
     assert "requires study access" in err
+
+
+def test_stale_scope_403_prints_clean_relogin_prompt(monkeypatch, capsys):
+    """A 403 the server flags with the stale-token-scope marker header —
+    the token predates a scope the caller's role now grants — surfaces a
+    clean, actionable `qiita login` prompt instead of the raw JSON envelope."""
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "missing required scope 'sequenced_pool:delete' (...)"},
+        status=403,
+        response_headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "qiita login" in err
+    # The clean prompt replaces the raw JSON dump — no braces/quotes leak.
+    assert "{" not in err
+    assert '"detail"' not in err
+
+
+def test_plain_403_without_marker_still_echoes_body(monkeypatch, capsys):
+    """A 403 that is *not* a stale-scope case (no marker header) keeps the
+    generic body echo — the clean prompt is reserved for the stale case so an
+    ordinary authorization denial isn't misdescribed as a re-login fix."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "requires study access at tier 'admin' or higher"},
+        status=403,
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 403" in err
+    assert "requires study access" in err
+    assert "qiita login" not in err
 
 
 def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsys):

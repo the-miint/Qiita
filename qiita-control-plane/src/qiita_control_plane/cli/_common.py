@@ -50,7 +50,11 @@ from pathlib import Path
 
 import httpx
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.auth_constants import API_PREFIX, BEARER_PREFIX
+from qiita_common.auth_constants import (
+    API_PREFIX,
+    BEARER_PREFIX,
+    STALE_TOKEN_SCOPE_HEADER,
+)
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -401,6 +405,22 @@ def run_http_subcommand(
     try:
         body = fn(token)
     except httpx.HTTPStatusError as exc:
+        # A stale-scope 403 — the token predates a scope the caller's role now
+        # grants (or was deliberately minted below the ceiling) — is flagged by
+        # the server with a machine-readable header. Recognize it and surface a
+        # clean, actionable re-login prompt instead of dumping the raw JSON
+        # envelope. Every other HTTP error keeps the generic body echo.
+        if (
+            exc.response.status_code == 403
+            and exc.response.headers.get(STALE_TOKEN_SCOPE_HEADER) is not None
+        ):
+            print(
+                "error: your access token predates a scope your role now grants.\n"
+                "Run `qiita login` to mint a fresh token with your full role scopes,"
+                " then retry.",
+                file=sys.stderr,
+            )
+            return 1
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
     except httpx.RequestError as exc:
