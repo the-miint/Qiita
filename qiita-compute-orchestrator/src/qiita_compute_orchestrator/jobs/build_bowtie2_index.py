@@ -25,10 +25,13 @@ row `(success BOOLEAN, index_path VARCHAR, num_subjects BIGINT)`. Unlike
 `save_minimap2_index` it takes **no `preset`** — a bowtie2 index is
 preset-independent (presets apply at align time via `align_bowtie2_sharded`), so
 this builder has no preset knob. The subject `read_id` may be BIGINT (it is here,
-the feature_idx). `save_bowtie2_index` shells out to a GPL-licensed `gpl-boundary`
-helper; that boundary is installed ONCE at deploy time by
-`miint.stage_miint_extension`, not per job, so this builder just LOADs miint and
-relies on it being present (the same discipline used for the extension itself).
+the feature_idx). `save_bowtie2_index` streams the subject as Apache Arrow over
+shared memory to the GPL-licensed `gpl-boundary` host, which embeds bowtie2 and
+drives it via API calls — there is no `bowtie2-build` subprocess and no FASTA;
+sequence data stays in memory and only the `.bt2` index touches disk. The
+boundary is installed ONCE at deploy time by `miint.stage_miint_extension`, not
+per job, so this builder just LOADs miint and relies on it being present (the
+same discipline used for the extension itself).
 
 **Multi-file output.** bowtie2 writes SIX files under the shared prefix
 (`index.1.bt2 … index.4.bt2`, `index.rev.1.bt2`, `index.rev.2.bt2`), so
@@ -64,18 +67,21 @@ from . import JobPlan, JobResourcePlan
 
 YAML_STEP_NAME = "build_bowtie2_index"
 
-# Co-consumer step: DuckDB reassembles the per-feature subject and hands the TABLE
-# to bowtie2-build, which does the heavy indexing in-process from the cgroup
-# remainder. `_DUCKDB_MEMORY_GB` is the OFF-SLURM fallback; under SLURM the limit
-# tracks the real cgroup via `resolve_duckdb_memory_gb()` with
-# `_BOWTIE2_RESERVE_GB` carved out for bowtie2's in-process build. Mirrors
-# build_minimap2_index's split.
+# Co-consumer step: DuckDB reassembles the per-feature subject TABLE, which
+# save_bowtie2_index streams as Arrow over shared memory to the out-of-process
+# gpl-boundary host; that host embeds bowtie2 and builds the index in memory.
+# (This is the ONE difference from build_minimap2_index, where minimap2 is
+# embedded directly in duckdb-miint and builds in the DuckDB process.)
+# `_DUCKDB_MEMORY_GB` is the OFF-SLURM fallback; under SLURM the limit tracks the
+# real cgroup via `resolve_duckdb_memory_gb()` with `_BOWTIE2_RESERVE_GB` carved
+# out of the job cgroup for the boundary host's bowtie2 build.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
-# Cgroup reserved for bowtie2's in-process index build. bowtie2's BWT build is
-# lighter than a genome-scale minimap2 index, so 16 GB (matching minimap2's
-# reserve) is a conservative starting envelope — the tuning knob to refine against
-# a real genome-scale build's MaxRSS (sacct).
+# Cgroup reserved for the gpl-boundary host's bowtie2 index build (bowtie2 runs
+# in that out-of-process host, fed Arrow over shm — NOT in the DuckDB process).
+# bowtie2's BWT build is lighter than a genome-scale minimap2 index, so 16 GB
+# (matching minimap2's reserve) is a conservative starting envelope — the tuning
+# knob to refine against a real genome-scale build's MaxRSS (sacct).
 _BOWTIE2_RESERVE_GB = 16
 
 # In-DuckDB name handed to save_bowtie2_index (resolved by its separate
@@ -144,12 +150,13 @@ def _run_save_bowtie2_index(
     The function always emits exactly one status row, so a missing row is a
     structural contract violation (not a clean `success=false`) — raise loudly.
 
-    `save_bowtie2_index` shells out to the GPL-licensed `gpl-boundary` helper
-    (bowtie2 is GPL). The boundary is installed ONCE at deploy time by
-    `miint.stage_miint_extension` (the general miint staging), not per job, so the
-    seam just LOADs miint (via `open_miint_conn`) and relies on the boundary being
-    present — the same discipline every native job follows for the extension
-    itself."""
+    `save_bowtie2_index` streams the subject as Arrow over shared memory to the
+    GPL-licensed `gpl-boundary` host, which embeds bowtie2 (bowtie2 is GPL; the
+    extension is BSD) and drives it via API calls. The boundary is installed ONCE
+    at deploy time by `miint.stage_miint_extension` (the general miint staging),
+    not per job, so the seam just LOADs miint (via `open_miint_conn`) and relies
+    on the boundary being present — the same discipline every native job follows
+    for the extension itself."""
     row = conn.execute(
         "SELECT success FROM save_bowtie2_index(?, ?)",
         [subject_table, output_path],
@@ -250,7 +257,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # Self-check the multi-file write: at least one bowtie2 index file must exist.
     # A `success=true` with no files would be a silent miint contract break. The
     # glob matches both the normal `.bt2` set and the LARGE-index `.bt2l` set
-    # bowtie2-build auto-emits when the reference exceeds ~4 Gbp (a big
+    # bowtie2's index build auto-emits when the reference exceeds ~4 Gbp (a big
     # whole-reference build) — `*.bt2*` covers both; the downstream aligner
     # auto-detects the format from the same prefix.
     produced = list(index_dir.glob(f"{index_prefix.name}*.bt2*"))

@@ -96,8 +96,9 @@ def miint_load_sql() -> str:
 # miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
 # dependency"). Every native SLURM job needs BOTH of these to function:
 #   * MIINT_EXTENSION_DIRECTORY — the deploy-staged extension the job LOADs;
-#   * MIINT_GPL_BOUNDARY_PATH   — the GPL-boundary host binary miint shells out
-#                                 to (bowtie2 index/align, vsearch, MAFFT, …).
+#   * MIINT_GPL_BOUNDARY_PATH   — the GPL-boundary host binary (bowtie2 index/
+#                                 align, vsearch, MAFFT, … run inside it; miint
+#                                 streams sequences to it as Arrow over shm).
 # The compute node receives ONLY what we explicitly forward (the slurmrestd
 # `environment` is an allowlist, not an inherited copy — see SlurmBackend and
 # payload.build_job_submit_payload), so an unforwarded var is simply absent at
