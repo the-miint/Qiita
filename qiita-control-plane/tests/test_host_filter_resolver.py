@@ -18,10 +18,11 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
-from qiita_common.models import Platform
+from qiita_common.models import MISSING_REASON_CONTROL_SAMPLE, Platform
 
 from qiita_control_plane.host_filter_resolver import (
     HostFilterOutcome,
+    is_control_sample,
     resolve_host_filter,
     resolve_host_filter_many,
 )
@@ -348,6 +349,80 @@ async def test_control_sample_is_a_marker_not_a_decision(ctx):
     assert res.outcome is HostFilterOutcome.CONTROL
     assert res.rype_reference_idx is None
     assert res.minimap2_reference_idx is None
+
+
+# ---------------------------------------------------------------------------
+# is_control_sample — the zero-read read-mask classifier (#177)
+# ---------------------------------------------------------------------------
+# Shares _RECOGNISED_MISSING_REASON + the metadata read with resolve_host_filter,
+# so the "is this a control" answer here can never drift from the CONTROL outcome
+# above. These pin that the read-mask reads binder can tell a blank apart from an
+# unexpected-empty data well when a sample yields zero stored reads.
+
+
+async def test_is_control_sample_true_for_control_marker(ctx):
+    """The control missing-reason marks an expected-empty control — True."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, bs_idx, MISSING_REASON_CONTROL_SAMPLE)
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is True
+
+
+async def test_is_control_sample_false_for_non_control_states(ctx):
+    """Everything that is NOT a control reads False: a named host, a deliberate
+    'not applicable' (a real hostless sample, not a control), an uninformative
+    'not collected', and a biosample that never set host_taxon_id at all. A
+    zero-read data well in any of these states is a genuine failure, not a benign
+    no_data."""
+    host = await _make_biosample(ctx)
+    await _set_host_term(ctx, host, ctx["human_term_idx"])
+    assert await is_control_sample(ctx["pool"], biosample_idx=host) is False
+
+    not_applicable = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, not_applicable, "not applicable")
+    assert await is_control_sample(ctx["pool"], biosample_idx=not_applicable) is False
+
+    not_collected = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, not_collected, "not collected")
+    assert await is_control_sample(ctx["pool"], biosample_idx=not_collected) is False
+
+    absent = await _make_biosample(ctx)
+    assert await is_control_sample(ctx["pool"], biosample_idx=absent) is False
+
+
+async def test_prep_sample_expected_empty_control_end_to_end(ctx):
+    """The read-mask seam's full prep_sample → biosample → control lookup: a
+    prep_sample prepped from a control biosample is an expected-empty control; one
+    from a data biosample is not; a non-existent prep_sample is fail-safe False
+    (disposed as a data well, never silently benign)."""
+    from qiita_control_plane.runner._read_ingest import (
+        _prep_sample_is_expected_empty_control,
+    )
+    from qiita_control_plane.testing.db_seeds import seed_sequenced_prep_sample
+
+    pool = ctx["pool"]
+    control_bs = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, control_bs, MISSING_REASON_CONTROL_SAMPLE)
+    data_bs = await _make_biosample(ctx)
+    await _set_host_term(ctx, data_bs, ctx["human_term_idx"])
+
+    control_ps = await seed_sequenced_prep_sample(
+        pool, biosample_idx=control_bs, owner_idx=ctx["principal_idx"]
+    )
+    data_ps = await seed_sequenced_prep_sample(
+        pool, biosample_idx=data_bs, owner_idx=ctx["principal_idx"]
+    )
+    try:
+        assert await _prep_sample_is_expected_empty_control(pool, control_ps) is True
+        assert await _prep_sample_is_expected_empty_control(pool, data_ps) is False
+        # A prep_sample_idx that doesn't exist → fail-safe False.
+        assert await _prep_sample_is_expected_empty_control(pool, 9_999_999_999) is False
+    finally:
+        # Delete the prep_samples so the fixture's biosample teardown (ON DELETE
+        # RESTRICT) isn't blocked.
+        await pool.execute(
+            "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
+            [control_ps, data_ps],
+        )
 
 
 # ---------------------------------------------------------------------------

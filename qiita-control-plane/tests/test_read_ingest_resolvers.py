@@ -70,6 +70,22 @@ def test_resolve_sample_map_rejects_empty_roster(tmp_path):
 
 
 _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"
+# The zero-read control-split lookup, monkeypatched so these pure-unit tests
+# exercise the routing decision without a DB. The seam's real DB behavior
+# (prep_sample -> biosample -> control marker) is pinned by the DB-bound tests
+# in test_host_filter_resolver.py.
+_CONTROL_LOOKUP = "qiita_control_plane.runner._read_ingest._prep_sample_is_expected_empty_control"
+# `_resolve_staged_reads` now takes a pool first; the branches these tests reach
+# either don't touch it or monkeypatch the one helper that would, so a sentinel
+# stands in for it.
+_FAKE_POOL = object()
+
+
+def _control_lookup(is_control: bool):
+    async def _fn(_pool, _prep_sample_idx):
+        return is_control
+
+    return _fn
 
 
 def _staged_kwargs(tmp_path):
@@ -94,7 +110,9 @@ def test_resolve_staged_reads_binds_existing(tmp_path, monkeypatch):
     monkeypatch.setattr(_EXPORT_READ, _boom)
 
     bound = asyncio.run(
-        _resolve_staged_reads({"prep_sample_idx": 42}, staging_root, **_staged_kwargs(tmp_path))
+        _resolve_staged_reads(
+            _FAKE_POOL, {"prep_sample_idx": 42}, staging_root, **_staged_kwargs(tmp_path)
+        )
     )
     assert bound[STAGED_READS_BINDING] == reads
 
@@ -115,6 +133,7 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
 
     bound = asyncio.run(
         _resolve_staged_reads(
+            _FAKE_POOL,
             {"prep_sample_idx": 42},
             tmp_path / "staging",
             data_plane_url="grpc://unused",
@@ -126,18 +145,37 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
     assert dest.exists()
 
 
-def test_resolve_staged_reads_empty_export_fails_must_be_ingested(tmp_path, monkeypatch):
-    """Durable absent and the data plane returns 0 rows → BAD_INPUT 'must be
-    ingested' — the no-stored-reads semantics are preserved."""
+def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, monkeypatch):
+    """Durable absent, the data plane returns 0 rows, and the well is NOT a control
+    → BAD_INPUT 'must be ingested' — an unexpected-empty data well is a real
+    failure, the no-stored-reads semantics preserved."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(False))
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_reads(
-                {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
             )
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "must be ingested" in exc.value.reason
+
+
+def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatch):
+    """Durable absent, the data plane returns 0 rows, and the well IS an
+    expected-empty control (blank / NTC) → StepNoData (terminal no_data), NOT a
+    failure. This is the #177 fix: an empty control must not land in the pool's
+    samples_failed."""
+    monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(True))
+    with pytest.raises(StepNoData) as exc:
+        asyncio.run(
+            _resolve_staged_reads(
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+            )
+        )
+    assert "expected-empty control" in exc.value.reason
+    assert "7" in exc.value.reason
 
 
 def test_resolve_staged_reads_export_failure_is_bad_input(tmp_path, monkeypatch):
@@ -151,7 +189,7 @@ def test_resolve_staged_reads_export_failure_is_bad_input(tmp_path, monkeypatch)
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_reads(
-                {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
             )
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
@@ -168,6 +206,7 @@ def test_resolve_staged_reads_missing_file_is_bad_input(tmp_path, monkeypatch):
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_reads(
+                _FAKE_POOL,
                 {"prep_sample_idx": 7},
                 tmp_path / "staging",
                 data_plane_url="grpc://unused",

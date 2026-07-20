@@ -109,6 +109,20 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Empty control wells end `no_data`, not `samples_failed`, on the live read-mask
+  path (#177).** On the live `bcl-convert → ingest_reads → read-mask` pipeline an
+  empty well produces zero stored reads; the per-sample read-mask ticket then failed
+  at input binding (`_resolve_staged_reads` → `BAD_INPUT` → FAILED), so *every* empty
+  well — a legitimate blank / no-template control included — landed in the pool's
+  `samples_failed`, burying real failures among blanks doing their job (the #164
+  defect re-manifested after the store-once/mask-many split orphaned the old
+  `fastq_to_parquet` `no_data` path). The zero-read branch now splits on the persisted
+  biosample control marker (`host_taxon_id == "missing: control sample"`, reused via
+  the host-filter resolver's `is_control_sample` so "what is a control" stays defined
+  once): an expected-empty **control** raises `StepNoData` → terminal `no_data`
+  (counted under `samples_no_data`); an unexpected-empty **data** well keeps the
+  `BAD_INPUT` → failure it gets today. No schema or rollup change — the completion
+  rollup already buckets `no_data` separately from `failed`.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
