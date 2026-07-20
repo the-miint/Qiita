@@ -2104,6 +2104,30 @@ def test_plain_403_without_marker_still_echoes_body(monkeypatch, capsys):
     assert "qiita login" not in err
 
 
+def test_marker_header_on_non_403_still_echoes_body(monkeypatch, capsys):
+    """The clean prompt is gated on `status_code == 403`, not the header alone:
+    a non-403 response that happens to carry the marker keeps the generic body
+    echo. Pins that the status half of the guard is load-bearing."""
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "conflict"},
+        status=409,
+        response_headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 409" in err
+    assert "qiita login" not in err
+
+
 def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsys):
     """A transport-level failure (control plane down, wrong --base-url) raises
     httpx.RequestError, which has no HTTP response. run_http_subcommand catches

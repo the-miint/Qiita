@@ -410,10 +410,7 @@ def run_http_subcommand(
         # the server with a machine-readable header. Recognize it and surface a
         # clean, actionable re-login prompt instead of dumping the raw JSON
         # envelope. Every other HTTP error keeps the generic body echo.
-        if (
-            exc.response.status_code == 403
-            and exc.response.headers.get(STALE_TOKEN_SCOPE_HEADER) is not None
-        ):
+        if exc.response.status_code == 403 and exc.response.headers.get(STALE_TOKEN_SCOPE_HEADER):
             print(
                 "error: your access token predates a scope your role now grants.\n"
                 "Run `qiita login` to mint a fresh token with your full role scopes,"
