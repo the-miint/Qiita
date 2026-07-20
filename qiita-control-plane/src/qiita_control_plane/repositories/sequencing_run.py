@@ -638,6 +638,75 @@ async def fetch_sequenced_pool_demux_state(
     return "not_submitted"
 
 
+async def fetch_sequenced_pool_sample_exceptions(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> list[asyncpg.Record]:
+    """Return one row per ANOMALOUS non-retired sequenced_sample in the pool — no
+    usable reads (raw NULL, i.e. unprocessed, or processed with 0 quality-filtered),
+    missing any of the four submission accessions, or a genuinely-failed read-mask
+    ticket (a FAILED ticket with no COMPLETED one, matching the completion rollup's
+    precedence). Each row carries the raw fields the route's flag computation reads;
+    the SQL WHERE is exactly "at least one flag would fire", so the two stay in
+    agreement. A clean pool yields []. Retired samples excluded, matching the other
+    pool rollups. Uncapped per-pool fetch, like fetch_sequenced_pool_sample_qc_reports
+    — the anomalous set is a subset of the pool's bounded roster."""
+    return await pool_or_conn.fetch(
+        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
+        " bs.biosample_accession, bs.ena_sample_accession,"
+        " ss.ena_experiment_accession, ss.ena_run_accession,"
+        " ss.raw_read_count_r1r2, ss.quality_filtered_read_count_r1r2,"
+        " EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "   ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'failed') AS has_failed,"
+        " EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "   ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'completed') AS has_completed"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        "   AND ("
+        "     ss.raw_read_count_r1r2 IS NULL"
+        "     OR COALESCE(ss.quality_filtered_read_count_r1r2, 0) = 0"
+        "     OR bs.biosample_accession IS NULL"
+        "     OR bs.ena_sample_accession IS NULL"
+        "     OR ss.ena_experiment_accession IS NULL"
+        "     OR ss.ena_run_accession IS NULL"
+        "     OR (EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "           ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'failed')"
+        "         AND NOT EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "           ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'completed'))"
+        "   )"
+        " ORDER BY ss.idx",
+        sequenced_pool_idx,
+        READ_MASK_ACTION_ID,
+    )
+
+
+async def fetch_sequenced_pool_read_mask_ticket_state_counts(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> dict[str, int]:
+    """Return per-STATE counts of the pool's non-retired samples' READ-MASK work
+    tickets — tickets as the denominator (a sample with three read-mask tickets
+    contributes three), the raw view `PoolCompletionStatus`'s per-sample buckets
+    (which collapse each sample by precedence) deliberately does not give. States
+    with zero tickets are absent from the map; the route fills them in from the
+    WorkTicketState enum. Scoped to read-mask (`READ_MASK_ACTION_ID`) so it
+    reconciles with the completion rollup, not the all-actions delete/edit gate."""
+    rows = await pool_or_conn.fetch(
+        "SELECT wt.state, count(*) AS n"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " JOIN qiita.work_ticket wt ON wt.prep_sample_idx = ss.prep_sample_idx"
+        "   AND wt.action_id = $2"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        " GROUP BY wt.state",
+        sequenced_pool_idx,
+        READ_MASK_ACTION_ID,
+    )
+    return {r["state"]: r["n"] for r in rows}
+
+
 async def fetch_sequenced_pool_created_by(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,

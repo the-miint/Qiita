@@ -467,6 +467,74 @@ class PoolCompletionStatus(BaseModel):
         return self.demux_state == "completed" and self.complete
 
 
+# One anomaly a sequenced-sample can carry in the exceptions drill-down. `no_reads`
+# is processed-but-zero-survived; `unprocessed` is no-metrics-yet (mutually
+# exclusive with no_reads). `failed_ticket` is a FAILED read-mask ticket with no
+# COMPLETED one (a genuinely-failed sample, not one that succeeded on retry).
+SequencedSampleExceptionFlag = Literal[
+    "unprocessed",
+    "no_reads",
+    "missing_biosample_accession",
+    "missing_ena_sample_accession",
+    "missing_ena_experiment_accession",
+    "missing_ena_run_accession",
+    "failed_ticket",
+]
+
+
+class SequencedSampleException(BaseModel):
+    """One anomalous sequenced_sample in a pool's exceptions drill-down: its ids,
+    its biosample accession (for operator lookup), the quality-filtered read count
+    (None when unprocessed), and the non-empty `flags` list naming each anomaly."""
+
+    sequenced_sample_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None
+    quality_filtered_read_count_r1r2: int | None
+    flags: list[SequencedSampleExceptionFlag] = Field(min_length=1)
+
+
+class PoolExceptionsResponse(BaseModel):
+    """Returned by GET .../sequenced-pool/{P}/sequenced-sample/exceptions.
+
+    Only the anomalous non-retired sequenced_samples — no usable reads
+    (unprocessed or zero survived), missing any of the four submission accessions,
+    or a genuinely-failed read-mask ticket — so an operator sees the actionable
+    set without scanning the full roster. Compute-on-read; `count` is
+    `len(samples)`. A clean pool returns `count=0`, `samples=[]`."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    count: Annotated[int, Field(ge=0)]
+    samples: list[SequencedSampleException]
+
+
+class PoolReadMaskCoverage(BaseModel):
+    """Read-mask ticket coverage for a pool: how many non-retired samples have a
+    read-mask work ticket (any state) vs. none. `with + without == sample_count`."""
+
+    samples_with_read_mask_ticket: Annotated[int, Field(ge=0)]
+    samples_without_read_mask_ticket: Annotated[int, Field(ge=0)]
+
+
+class PoolWorkTicketSummary(BaseModel):
+    """Returned by GET .../sequenced-pool/{P}/work-ticket/summary.
+
+    The pool's read-mask work-ticket rollup with TICKETS (not samples) as the
+    denominator — distinct from `PoolCompletionStatus`, whose per-sample buckets
+    collapse each sample's tickets by precedence. `read_mask` reconciles with the
+    completion rollup (`samples_with_read_mask_ticket` == `sample_count -
+    samples_not_submitted`); `ticket_state_counts` maps each work_ticket_state to
+    the number of the pool's read-mask tickets in it (states with zero tickets are
+    present with a 0 value). Compute-on-read."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sample_count: Annotated[int, Field(ge=0)]
+    read_mask: PoolReadMaskCoverage
+    ticket_state_counts: dict[str, Annotated[int, Field(ge=0)]]
+
+
 class SequencedPoolPreflightResponse(BaseModel):
     """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
 

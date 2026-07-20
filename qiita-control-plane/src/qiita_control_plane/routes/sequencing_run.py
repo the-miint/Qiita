@@ -47,6 +47,8 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_PREFLIGHT,
     PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     PATH_SEQUENCED_POOL_QC_REPORT,
+    PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY,
+    PATH_SEQUENCED_SAMPLE_EXCEPTIONS,
     PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
@@ -61,8 +63,11 @@ from qiita_common.models import (
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
     PoolCompletionStatus,
+    PoolExceptionsResponse,
     PoolQCReport,
+    PoolReadMaskCoverage,
     PoolReadMetrics,
+    PoolWorkTicketSummary,
     SampleQCReport,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
@@ -71,11 +76,13 @@ from qiita_common.models import (
     SequencedPoolPreflightUpdateLaneRequest,
     SequencedPoolPreflightUpdateLaneResponse,
     SequencedPoolResponse,
+    SequencedSampleException,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
+    WorkTicketState,
     merge_qc_reports,
 )
 
@@ -115,7 +122,9 @@ from ..repositories.sequencing_run import (
     fetch_sequenced_pool_completion,
     fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_preflight,
+    fetch_sequenced_pool_read_mask_ticket_state_counts,
     fetch_sequenced_pool_read_metrics,
+    fetch_sequenced_pool_sample_exceptions,
     fetch_sequenced_pool_sample_qc_reports,
     fetch_sequencing_run,
     fetch_sequencing_run_idxs_by_instrument_run_id,
@@ -654,6 +663,108 @@ async def get_sequenced_pool_completion(
         samples_no_data=row["samples_no_data"],
         samples_failed=row["samples_failed"],
         samples_not_submitted=row["samples_not_submitted"],
+    )
+
+
+def _sequenced_sample_exception_flags(row: Mapping[str, Any]) -> list[str]:
+    """Derive the ordered exception flags for one anomalous sample row. Mirrors the
+    SQL WHERE in `fetch_sequenced_pool_sample_exceptions`, so every row that query
+    returns yields at least one flag. `unprocessed` (no metrics) and `no_reads`
+    (processed, 0 survived) are mutually exclusive; `failed_ticket` is a FAILED
+    read-mask ticket with no COMPLETED one (same precedence as the completion
+    rollup)."""
+    flags: list[str] = []
+    if row["raw_read_count_r1r2"] is None:
+        flags.append("unprocessed")
+    elif (row["quality_filtered_read_count_r1r2"] or 0) == 0:
+        flags.append("no_reads")
+    if row["biosample_accession"] is None:
+        flags.append("missing_biosample_accession")
+    if row["ena_sample_accession"] is None:
+        flags.append("missing_ena_sample_accession")
+    if row["ena_experiment_accession"] is None:
+        flags.append("missing_ena_experiment_accession")
+    if row["ena_run_accession"] is None:
+        flags.append("missing_ena_run_accession")
+    if row["has_failed"] and not row["has_completed"]:
+        flags.append("failed_ticket")
+    return flags
+
+
+@router.get(PATH_SEQUENCED_SAMPLE_EXCEPTIONS)
+async def get_sequenced_pool_exceptions(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolExceptionsResponse:
+    """Read the pool's exception drill-down: only the anomalous non-retired
+    sequenced_samples — no usable reads (unprocessed or zero survived), missing any
+    of the four submission accessions, or a genuinely-failed read-mask ticket —
+    each with the `flags` naming why. The actionable subset of the roster, so an
+    operator sees what needs attention without scanning every sample.
+
+    Compute-on-read; `count` is `len(samples)` and a clean pool returns
+    `count=0, samples=[]`. Same read gate and 404/422 fronting as the pool
+    metadata / completion endpoints."""
+    rows = await fetch_sequenced_pool_sample_exceptions(pool, sequenced_pool_idx)
+    samples = [
+        SequencedSampleException(
+            sequenced_sample_idx=r["sequenced_sample_idx"],
+            prep_sample_idx=r["prep_sample_idx"],
+            biosample_accession=r["biosample_accession"],
+            quality_filtered_read_count_r1r2=r["quality_filtered_read_count_r1r2"],
+            flags=_sequenced_sample_exception_flags(r),
+        )
+        for r in rows
+    ]
+    return PoolExceptionsResponse(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=sequencing_run_idx,
+        count=len(samples),
+        samples=samples,
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY)
+async def get_sequenced_pool_work_ticket_summary(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolWorkTicketSummary:
+    """Read the pool's read-mask work-ticket rollup: coverage (samples with vs.
+    without a read-mask ticket) plus per-STATE ticket counts (tickets as the
+    denominator — no per-sample precedence collapse, unlike the completion
+    rollup's buckets).
+
+    Coverage is taken from the completion rollup so the two reconcile by
+    construction (`samples_with_read_mask_ticket` == `sample_count -
+    samples_not_submitted`). `ticket_state_counts` carries every WorkTicketState
+    (states with no tickets read 0). Compute-on-read; same read gate and 404/422
+    fronting as the pool completion endpoint."""
+    completion = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
+        pool, sequenced_pool_idx
+    )
+    sample_count = completion["sample_count"]
+    without = completion["samples_not_submitted"]
+    return PoolWorkTicketSummary(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=sequencing_run_idx,
+        sample_count=sample_count,
+        read_mask=PoolReadMaskCoverage(
+            samples_with_read_mask_ticket=sample_count - without,
+            samples_without_read_mask_ticket=without,
+        ),
+        # Fill every state so the map is complete regardless of which appear in the DB.
+        ticket_state_counts={s.value: state_counts.get(s.value, 0) for s in WorkTicketState},
     )
 
 
