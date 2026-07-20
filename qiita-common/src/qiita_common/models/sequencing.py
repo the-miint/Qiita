@@ -59,6 +59,11 @@ class SequencingRunResponse(BaseModel):
     `idx` surfaced as `sequencing_run_idx`). `instrument_model` is the field the
     `submit-host-filter-pool` fan-out reads to forward QC's polyG gate per sample;
     it is nullable (non-bcl runs may not record it).
+
+    `read_metrics` is the run-level twin of the pool rollup — the identical
+    `PoolReadMetrics` shape summed across every pool in the run (compute-on-read,
+    so it never drifts). `sample_count` there is the run's total non-retired
+    sequenced_samples, not a pool count.
     """
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -74,6 +79,10 @@ class SequencingRunResponse(BaseModel):
     retired_by_idx: Annotated[int, Field(gt=0)] | None = None
     retired_at: AwareDatetime | None = None
     retire_reason: str | None = None
+    # Genuine forward ref: PoolReadMetrics is defined below, so the quotes are
+    # load-bearing (removing them NameErrors at class definition). Resolved by the
+    # explicit `SequencingRunResponse.model_rebuild()` right after that class.
+    read_metrics: "PoolReadMetrics"  # noqa: UP037
 
 
 # same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionRequest
@@ -151,7 +160,23 @@ class PoolReadMetrics(BaseModel):
     is None when raw is absent or 0. `sample_count` is the pool's non-retired
     sequenced_sample total; `samples_with_metrics` is how many of those carry
     read counts, so a partial rollup (some samples still unprocessed) is
-    interpretable rather than looking complete."""
+    interpretable rather than looking complete.
+
+    The read-outcome breakdown splits `samples_with_metrics`'s implicit
+    "processed" set so an operator can tell "no metrics yet" from "processed but
+    everything filtered out". The three partition every non-retired sample:
+    `samples_unprocessed` + `samples_zero_reads` + `samples_with_reads` ==
+    `sample_count` (and `samples_unprocessed` == `sample_count -
+    samples_with_metrics`). "Processed" means the sample carries a raw read count;
+    among processed samples the split keys on `quality_filtered_read_count_r1r2`
+    (the terminal survived-reads count, the same numerator
+    `fraction_passing_quality_filter` uses) — a processed sample whose quality-
+    filtered count is 0 or NULL is a `zero_reads` sample.
+
+    The accession-coverage counts are how many non-retired samples carry each of
+    the four submission accessions (biosample + ENA sample on the biosample, ENA
+    experiment + run on the sequenced_sample subtype); `samples_fully_submitted_to_ena`
+    requires all four. All are compute-on-read, like the read-count sums."""
 
     raw_read_count_r1r2: int | None
     biological_read_count_r1r2: int | None
@@ -161,6 +186,16 @@ class PoolReadMetrics(BaseModel):
     spikein_read_count_r1r2: int | None
     sample_count: int
     samples_with_metrics: int
+    # Read-outcome breakdown (partition of sample_count).
+    samples_unprocessed: int
+    samples_zero_reads: int
+    samples_with_reads: int
+    # Accession-coverage counts.
+    samples_with_biosample_accession: int
+    samples_with_ena_sample_accession: int
+    samples_with_ena_experiment_accession: int
+    samples_with_ena_run_accession: int
+    samples_fully_submitted_to_ena: int
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -170,6 +205,11 @@ class PoolReadMetrics(BaseModel):
         return _fraction_passing_quality_filter(
             self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
         )
+
+
+# SequencingRunResponse.read_metrics is a forward ref to PoolReadMetrics (defined
+# above but after that class); resolve it now that the target exists.
+SequencingRunResponse.model_rebuild()
 
 
 class SequencedPoolResponse(BaseModel):

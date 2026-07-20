@@ -390,6 +390,66 @@ async def fetch_sequenced_pool(
     )
 
 
+# The compute-on-read read-metric aggregate column list — the SAME expressions
+# for the pool rollup and the run-level rollup, factored here so the two report an
+# IDENTICAL PoolReadMetrics shape and can never drift. Every aggregate references
+# only the `ss`/`ps`/`bs` aliases (sequenced_sample / prep_sample / biosample),
+# which both callers provide by the same LEFT-JOIN chain; the callers differ only
+# in where the chain is rooted (a single pool vs. every pool in a run) and in the
+# non-aggregate metadata columns the pool caller also selects. No leading/trailing
+# comma so a caller splices it between its own SELECT list and FROM.
+#
+# Each aggregate carries `FILTER (WHERE ps.retired IS NOT TRUE)` so a retired
+# prep_sample contributes to no sum or count. The SUMs cast `::bigint` (SUM of
+# BIGINT is NUMERIC in Postgres) so asyncpg hands back plain ints. The read-outcome
+# breakdown partitions sample_count — count(ss.idx) (not count(*)) so a zero-sample
+# scope's LEFT-JOIN'd all-NULL phantom row contributes 0 to every bucket; "processed"
+# = raw IS NOT NULL (the indicator samples_with_metrics counts), and among processed
+# the split keys on quality_filtered (COALESCE NULL->0 so a processed-but-null count
+# lands in zero_reads, keeping the three buckets summing to sample_count).
+_READ_METRIC_AGGREGATE_COLUMNS = (
+    " SUM(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS raw_read_count_r1r2,"
+    " SUM(ss.biological_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS biological_read_count_r1r2,"
+    " SUM(ss.quality_filtered_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS quality_filtered_read_count_r1r2,"
+    " SUM(ss.spikein_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS spikein_read_count_r1r2,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE) AS sample_count,"
+    " count(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)"
+    "   AS samples_with_metrics,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.raw_read_count_r1r2 IS NULL) AS samples_unprocessed,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.raw_read_count_r1r2 IS NOT NULL"
+    "   AND COALESCE(ss.quality_filtered_read_count_r1r2, 0) = 0) AS samples_zero_reads,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.raw_read_count_r1r2 IS NOT NULL"
+    "   AND COALESCE(ss.quality_filtered_read_count_r1r2, 0) > 0) AS samples_with_reads,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND bs.biosample_accession IS NOT NULL) AS samples_with_biosample_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND bs.ena_sample_accession IS NOT NULL) AS samples_with_ena_sample_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.ena_experiment_accession IS NOT NULL) AS samples_with_ena_experiment_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.ena_run_accession IS NOT NULL) AS samples_with_ena_run_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND bs.biosample_accession IS NOT NULL AND bs.ena_sample_accession IS NOT NULL"
+    "   AND ss.ena_experiment_accession IS NOT NULL AND ss.ena_run_accession IS NOT NULL)"
+    "   AS samples_fully_submitted_to_ena"
+)
+
+# The LEFT-JOIN chain sequenced_sample -> prep_sample -> biosample the aggregates
+# above resolve their `ss`/`ps`/`bs` aliases against. LEFT joins so a scope with no
+# samples keeps its anchor row (all-NULL ss/ps/bs -> NULL sums, 0 counts).
+_READ_METRIC_SAMPLE_JOINS = (
+    " LEFT JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+    " LEFT JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+)
+
+
 async def fetch_sequenced_pool_read_metrics(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
@@ -397,40 +457,47 @@ async def fetch_sequenced_pool_read_metrics(
     """Return the pool's caller-visible metadata (minus the BYTEA preflight
     blob) plus the compute-on-read read-metric rollup, or None on a missing pool.
 
-    The three `SUM(...)::bigint` columns aggregate the per-stage read counts
-    over the pool's sequenced_samples; `count(ss.idx)` is the pool's sample
-    total and `count(ss.raw_read_count_r1r2)` is how many of those carry metrics.
-    Every aggregate uses `FILTER (WHERE ps.retired IS NOT TRUE)` so a retired
-    prep_sample contributes to neither the sums nor the counts (matching the
-    roster route's retired exclusion). `prep_sample.retired` is `NOT NULL`, so on
-    a real sample `IS NOT TRUE` is equivalent to the roster's `= false`; the
-    NULL-tolerant form is just defensive against the LEFT-JOIN'd all-NULL `ps` of
-    a zero-sample pool (whose row the LEFT JOIN keeps regardless — sums NULL,
-    counts 0). `SUM` of BIGINT is NUMERIC in Postgres, so
-    the explicit `::bigint` cast hands asyncpg a clean int (a single pool's read
-    total is far below the BIGINT ceiling). The passing fraction is recomputed
-    from these sums in PoolReadMetrics — never a mean of per-sample fractions."""
+    The aggregate columns are the shared `_READ_METRIC_AGGREGATE_COLUMNS` (the same
+    expressions the run-level rollup uses, so the two report an identical
+    PoolReadMetrics shape). The passing fraction is recomputed from these sums in
+    PoolReadMetrics — never a mean of per-sample fractions."""
     return await pool_or_conn.fetchrow(
         "SELECT sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
         " sp.extra_metadata, sp.created_by_idx, sp.created_at,"
-        " SUM(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS raw_read_count_r1r2,"
-        " SUM(ss.biological_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS biological_read_count_r1r2,"
-        " SUM(ss.quality_filtered_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS quality_filtered_read_count_r1r2,"
-        " SUM(ss.spikein_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS spikein_read_count_r1r2,"
-        " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE) AS sample_count,"
-        " count(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)"
-        "   AS samples_with_metrics"
-        " FROM qiita.sequenced_pool sp"
+        + _READ_METRIC_AGGREGATE_COLUMNS
+        + " FROM qiita.sequenced_pool sp"
         " LEFT JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = sp.idx"
-        " LEFT JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        " WHERE sp.idx = $1"
+        + _READ_METRIC_SAMPLE_JOINS
+        + " WHERE sp.idx = $1"
         " GROUP BY sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
         " sp.extra_metadata, sp.created_by_idx, sp.created_at",
         sequenced_pool_idx,
+    )
+
+
+async def fetch_sequencing_run_read_metrics(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+) -> asyncpg.Record | None:
+    """Return the run-level compute-on-read read-metric rollup — the same
+    PoolReadMetrics shape as `fetch_sequenced_pool_read_metrics`, summed across
+    every pool in the run — or None on a missing run.
+
+    Same aggregate expressions (`_READ_METRIC_AGGREGATE_COLUMNS`), rooted at the
+    run and walking run -> sequenced_pool -> sequenced_sample -> prep_sample ->
+    biosample by LEFT joins, so a run with no samples reads as NULL sums / 0
+    counts (its row is kept by the LEFT joins) rather than None. None is returned
+    only for a run idx that does not exist. No pool metadata columns — the caller
+    reads run metadata via `fetch_sequencing_run` and nests this under
+    `read_metrics`."""
+    return await pool_or_conn.fetchrow(
+        "SELECT" + _READ_METRIC_AGGREGATE_COLUMNS + " FROM qiita.sequencing_run sr"
+        " LEFT JOIN qiita.sequenced_pool sp ON sp.sequencing_run_idx = sr.idx"
+        " LEFT JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = sp.idx"
+        + _READ_METRIC_SAMPLE_JOINS
+        + " WHERE sr.idx = $1"
+        " GROUP BY sr.idx",
+        sequencing_run_idx,
     )
 
 

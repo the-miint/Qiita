@@ -119,6 +119,7 @@ from ..repositories.sequencing_run import (
     fetch_sequenced_pool_sample_qc_reports,
     fetch_sequencing_run,
     fetch_sequencing_run_idxs_by_instrument_run_id,
+    fetch_sequencing_run_read_metrics,
     insert_sequenced_pool,
     insert_sequencing_run,
     update_sequenced_pool_preflight_blob,
@@ -215,10 +216,11 @@ async def get_sequencing_run(
 
     Returns the run's caller-visible columns (see `fetch_sequencing_run`),
     notably `instrument_model` — the field `qiita submit-host-filter-pool` reads
-    to forward QC's polyG gate per sample. Same read gate as the pool roster
-    route (`list_sequenced_samples_in_pool`): a HumanUser with
-    `Scope.PREP_SAMPLE_READ` and system_role at least wet_lab_admin. 404 when the
-    run does not exist.
+    to forward QC's polyG gate per sample — plus `read_metrics`, the run-level
+    twin of the pool rollup (the identical PoolReadMetrics shape summed across the
+    run's pools, compute-on-read). Same read gate as the pool roster route
+    (`list_sequenced_samples_in_pool`): a HumanUser with `Scope.PREP_SAMPLE_READ`
+    and system_role at least wet_lab_admin. 404 when the run does not exist.
     """
     row = await fetch_sequencing_run(pool, sequencing_run_idx)
     if row is None:
@@ -231,6 +233,12 @@ async def get_sequencing_run(
     # carries an object, matching the study GET route's handling.
     if isinstance(data["extra_metadata"], str):
         data["extra_metadata"] = json.loads(data["extra_metadata"])
+    # Run-level read-metric twin: same PoolReadMetrics shape as the pool rollup,
+    # summed across the run's pools. The run existence is already established by the
+    # metadata fetch above; the aggregate row is always present (a run with no
+    # samples reads as NULL sums / 0 counts).
+    metrics_row = await fetch_sequencing_run_read_metrics(pool, sequencing_run_idx)
+    data["read_metrics"] = _pool_read_metrics(metrics_row)
     return SequencingRunResponse.model_validate(data)
 
 
