@@ -14,10 +14,21 @@ priority resolve from the originator, not the executor.
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    model_validator,
+)
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
-from qiita_common.models._base import ComputeTarget, ScopeTarget
+from qiita_common.models._base import (
+    ComputeTarget,
+    ScopeTarget,
+    _fraction_passing_quality_filter,
+)
 
 
 class StepType(StrEnum):
@@ -499,6 +510,28 @@ class AlignPlanResponse(BaseModel):
     blocks: list[AlignPlanBlock]
 
 
+class WorkTicketReadOutcome(BaseModel):
+    """The read outcome of a work ticket's prep_sample — the same per-stage read
+    counts the sequenced_sample carries, so a read-mask ticket can be assessed
+    without joining sequenced_sample by hand. `fraction_passing_quality_filter`
+    is recomputed from the counts (shared `_fraction_passing_quality_filter`).
+    Present only on a prep_sample-scoped ticket whose prep_sample has a
+    sequenced_sample row; the counts are individually None until the sample is
+    processed."""
+
+    raw_read_count_r1r2: int | None
+    biological_read_count_r1r2: int | None
+    quality_filtered_read_count_r1r2: int | None
+    spikein_read_count_r1r2: int | None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fraction_passing_quality_filter(self) -> float | None:
+        return _fraction_passing_quality_filter(
+            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
+        )
+
+
 class WorkTicketSummary(WorkTicket):
     """A WorkTicket plus a snapshot of its *current* step entry's compute
     placement. Returned by `GET /api/v1/work-ticket` (the list view) so a
@@ -530,6 +563,11 @@ class WorkTicketSummary(WorkTicket):
     # entry (the spine's StepProgressState, NOT a live SLURM-native state —
     # see the class docstring on staleness).
     step_state: StepProgressState | None = None
+    # The read outcome of this ticket's prep_sample (per-stage read counts +
+    # passing fraction), so a read-mask ticket is assessable without a separate
+    # sequenced_sample lookup. None for a non-prep_sample-scoped ticket (block /
+    # pool / reference / study) or a prep_sample with no sequenced_sample row.
+    read_outcome: WorkTicketReadOutcome | None = None
 
 
 class WorkTicketStepLogs(BaseModel):

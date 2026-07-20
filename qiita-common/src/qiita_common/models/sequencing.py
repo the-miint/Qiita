@@ -21,7 +21,7 @@ from pydantic import (
 from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel
+from qiita_common.models._base import PatchRequestModel, _fraction_passing_quality_filter
 from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
@@ -704,22 +704,6 @@ class SequencedSampleCreateResponse(BaseModel):
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
-
-
-def _fraction_passing_quality_filter(
-    raw_read_count_r1r2: int | None, quality_filtered_read_count_r1r2: int | None
-) -> float | None:
-    """quality_filtered / raw — the share of raw reads surviving the full QC +
-    host-filter pipeline. Computed on read so it can never drift from the counts.
-    None when either bound is absent or raw is 0 (no division). Shared
-    by the per-sample (SequencedSampleResponse) and pool-rollup (PoolReadMetrics)
-    surfaces; the pool passes its SUMMED counts here, so the pool fraction is
-    recomputed from the sums, never a mean of per-sample fractions."""
-    if raw_read_count_r1r2 is None or quality_filtered_read_count_r1r2 is None:
-        return None
-    if raw_read_count_r1r2 == 0:
-        return None
-    return quality_filtered_read_count_r1r2 / raw_read_count_r1r2
 
 
 class SequencedSampleResponse(BaseModel):
