@@ -6,7 +6,7 @@ import pytest
 
 @pytest.mark.parametrize(
     "accession",
-    ["PRJEB11419", "PRJNA555783", "ERP012803", "SRP012345"],
+    ["PRJEB11419", "PRJNA555783", "PRJDB4321", "ERP012803", "SRP012345", "DRP001234"],
 )
 def test_detect_accession_kind_study(accession):
     from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
@@ -16,7 +16,7 @@ def test_detect_accession_kind_study(accession):
 
 @pytest.mark.parametrize(
     "accession",
-    ["SAMEA3610311", "SAMN01821487", "SAME1234567", "ERS1234567"],
+    ["SAMEA3610311", "SAMN01821487", "SAME1234567", "SAMD00123456"],
 )
 def test_detect_accession_kind_sample(accession):
     from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
@@ -31,11 +31,27 @@ def test_detect_accession_kind_run(accession):
     assert detect_accession_kind(accession) is EnaAccessionKind.RUN
 
 
-@pytest.mark.parametrize("accession", ["ERX1111111", "SRX1234567"])
+@pytest.mark.parametrize("accession", ["ERX1111111", "SRX1234567", "DRX1234567"])
 def test_detect_accession_kind_experiment(accession):
     from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
 
     assert detect_accession_kind(accession) is EnaAccessionKind.EXPERIMENT
+
+
+def test_detect_accession_kind_rejects_ers():
+    """`ERS*` is NOT a sample prefix in miint's `ENAParser::DetectAccessionType`
+    (`duckdb-miint/src/ena_parser.cpp`, sample case only matches SAMN/SAME/SAMD)
+    — accepting it here would let a pre-flight-validated accession fail later,
+    opaquely, once handed to `read_ena`. This is a corrected-parity regression
+    test: an earlier version of `_ACCESSION_PREFIXES` wrongly classified this
+    as SAMPLE."""
+    from qiita_control_plane.ena_import.accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="does not match a known"):
+        detect_accession_kind("ERS1234567")
 
 
 def test_detect_accession_kind_rejects_empty():

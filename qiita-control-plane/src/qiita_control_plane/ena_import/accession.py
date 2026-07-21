@@ -5,15 +5,21 @@ empty, malformed, or wrong-kind accession instead of handing it to
 `read_ena`/`read_ena_attributes` (or the HTTP fallback) and getting back an
 opaque zero-row result. Accepted prefixes per kind:
 
-- study: PRJEB, PRJNA, ERP, SRP
-- sample: SAMEA, SAMN, SAME, ERS
-- run: ERR, SRR, DRR
-- experiment: ERX, SRX
+- study: PRJNA, PRJEB, PRJDB, ERP, SRP, DRP
+- sample: SAMN, SAME, SAMD
+- run: SRR, ERR, DRR
+- experiment: SRX, ERX, DRX
 
-This is a validation-only mirror of (a subset of) `duckdb-miint`'s own
-`ENAParser::DetectAccessionType` (`duckdb-miint/src/ena_parser.cpp`) — it
-exists so a bad accession fails here, in Python, with an actionable message,
-before any network/DuckDB call.
+This is a validation-only mirror of `duckdb-miint`'s own
+`ENAParser::DetectAccessionType` (`duckdb-miint/src/ena_parser.cpp`) — the
+prefix sets above are exactly its `rfind(..., 0) == 0` checks per accession
+type (INSDC/ENA/DDBJ), no more and no fewer. It exists so a bad accession
+fails here, in Python, with an actionable message, before any
+network/DuckDB call. Notably this does NOT accept `ERS` as a sample
+prefix — `ENAParser::DetectAccessionType` doesn't recognize it either, so a
+Qiita user passing `ERS*` would be an accession miint itself can't resolve;
+rejecting it here (rather than silently forwarding it to `read_ena`) is the
+correct pre-flight behavior.
 """
 
 from __future__ import annotations
@@ -36,10 +42,10 @@ class InvalidEnaAccessionError(ValueError):
 
 
 _ACCESSION_PREFIXES: dict[EnaAccessionKind, tuple[str, ...]] = {
-    EnaAccessionKind.STUDY: ("PRJEB", "PRJNA", "ERP", "SRP"),
-    EnaAccessionKind.SAMPLE: ("SAMEA", "SAMN", "SAME", "ERS"),
-    EnaAccessionKind.RUN: ("ERR", "SRR", "DRR"),
-    EnaAccessionKind.EXPERIMENT: ("ERX", "SRX"),
+    EnaAccessionKind.STUDY: ("PRJNA", "PRJEB", "PRJDB", "ERP", "SRP", "DRP"),
+    EnaAccessionKind.SAMPLE: ("SAMN", "SAME", "SAMD"),
+    EnaAccessionKind.RUN: ("SRR", "ERR", "DRR"),
+    EnaAccessionKind.EXPERIMENT: ("SRX", "ERX", "DRX"),
 }
 
 
