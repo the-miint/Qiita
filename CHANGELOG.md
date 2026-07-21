@@ -123,7 +123,7 @@ duplicates further down are historical strata; leave them where they are.
   (counted under `samples_no_data`); an unexpected-empty **data** well keeps the
   `BAD_INPUT` → failure it gets today. No schema or rollup change — the completion
   rollup already buckets `no_data` separately from `failed`.
-- **`long-read-assembly` could never stream a sample's masked reads (#350).**
+- **`long-read-assembly` could never stream a sample's masked reads (#352).**
   Every ticket failed at submission with DuckDB's `IO Error: Can't find the home
   directory at '/dev/null'`. The CP runner's masked-read streamer
   (`_stream_masked_reads_to_fastq`) called `connect_with_miint()` — the helper
@@ -145,7 +145,7 @@ duplicates further down are historical strata; leave them where they are.
   `LOAD` writes nothing. `make verify-deploy` gains a `cp-miint` check, since a
   missing var takes nothing down at boot and would otherwise stay invisible until
   the next assembly submission.
-- **The staged-directory requirement is single-sourced (#350)** as
+- **The staged-directory requirement is single-sourced (#352)** as
   `qiita_common.duckdb_miint.require_staged_extension_directory`, and
   `MIINT_EXTENSION_DIRECTORY` is now named once (`MIINT_EXTENSION_DIRECTORY_VAR`)
   instead of spelled as a literal across the connect config, the job-env
@@ -158,7 +158,7 @@ duplicates further down are historical strata; leave them where they are.
   while breaking local development. The helper is pure Python; qiita-common
   imports no duckdb, so each component keeps its own connect.
 - **`make preflight` now checks `MIINT_EXTENSION_DIRECTORY` byte-identity across
-  the CP/DP/CO env files (#350)**, the way it already did for `PATH_SCRATCH` —
+  the CP/DP/CO env files (#352)**, the way it already did for `PATH_SCRATCH` —
   both name a shared path every component must resolve identically, so a per-file
   typo was a silent divergence. The comparison is now a helper called twice
   rather than a copied loop.
