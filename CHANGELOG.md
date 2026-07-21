@@ -123,6 +123,24 @@ duplicates further down are historical strata; leave them where they are.
   (counted under `samples_no_data`); an unexpected-empty **data** well keeps the
   `BAD_INPUT` → failure it gets today. No schema or rollup change — the completion
   rollup already buckets `no_data` separately from `failed`.
+- **`long-read-assembly` could never stream a sample's masked reads.** Every
+  ticket failed at submission with DuckDB's `IO Error: Can't find the home
+  directory at '/dev/null'`. The CP runner's masked-read streamer
+  (`_stream_masked_reads_to_fastq`) called `connect_with_miint()` — the helper
+  documented for the **client** CLI, which runs `INSTALL miint` then `LOAD`.
+  `INSTALL` resolves DuckDB's extension directory, defaulting to
+  `$HOME/.duckdb/extensions`, and the `qiita-api` service account's home is
+  `/dev/null`. This was the control plane's first *service-side* miint consumer;
+  the helper's only other callers (`qiita reference load`,
+  `qiita-admin masked-read-export`) are human CLIs run from hosts with a real
+  `$HOME`, so it had never surfaced. Service-side miint is now LOAD-only from the
+  deploy-staged directory via a new `connect_with_miint_staged()`, mirroring the
+  cluster paths (which are LOAD-only precisely so no node "depends on mirror
+  reachability, or needs a writable `$HOME`"). Requires `MIINT_EXTENSION_DIRECTORY`
+  in the control plane's env, byte-identical to the CO's and DP's; unset or
+  non-directory now fails with a message naming the variable and the service
+  instead of a DuckDB IOException. A read-only staged directory is sufficient —
+  `LOAD` writes nothing.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
