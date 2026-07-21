@@ -28,7 +28,7 @@ _None yet._
   `ALTER TYPE … ADD VALUE 'cancelled'`), then the notify owed-set index recreate pair
   `20260721000001_drop_email_owed_idx.sql` + `20260721000002_email_owed_idx_with_cancelled.sql`
   (CONCURRENTLY drop+create widening the partial index to the new terminal state — so a
-  cancelled ticket's originator still gets the digest). (#349)
+  cancelled ticket's originator still gets the digest). (#350)
 
 ### 4. Deploy
 
@@ -47,7 +47,7 @@ _None yet._
 - New `work_ticket:cancel` scope (system_admin) gates `qiita-admin ticket cancel`.
   PATs minted before this deploy are frozen and won't carry it, so an admin must
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel
-  command works — a stale-scope 403 otherwise names the fix. (#349)
+  command works — a stale-scope 403 otherwise names the fix. (#350)
 
 ---
 
