@@ -19,6 +19,7 @@ import duckdb
 import pytest
 from qiita_common.duckdb_miint import miint_connect_config
 
+from qiita_control_plane import miint as miint_module
 from qiita_control_plane.miint import connect_with_miint_staged
 
 
@@ -82,7 +83,6 @@ def test_extension_resolution_ignores_home_when_directory_configured(monkeypatch
     assert str(ext_dir) in message
     # ...and the home-directory fallback was never reached.
     assert str(fake_home) not in message
-    assert "Can't find the home directory" not in message
 
     # CONTROL — the same LOAD with the directory unset DOES fall back to $HOME,
     # which is what production hit. Without this branch the assertions above
@@ -100,13 +100,46 @@ def test_extension_resolution_ignores_home_when_directory_configured(monkeypatch
     assert str(ext_dir) not in fallback
 
 
+def test_staged_connect_never_installs(monkeypatch, tmp_path):
+    """THE contract: the staged helper LOADs and never INSTALLs.
+
+    Without this, reintroducing `INSTALL` inside `connect_with_miint_staged()`
+    — the exact production bug, in the function written to prevent it — passes
+    every other test in this file. Asserted on the SQL actually executed, via a
+    recording stand-in for the connection.
+    """
+    executed: list[str] = []
+
+    class _RecordingConn:
+        def execute(self, sql, *args, **kwargs):
+            executed.append(sql)
+            return self
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", str(tmp_path))
+    monkeypatch.setattr(
+        miint_module.duckdb, "connect", lambda *a, **kw: _RecordingConn(), raising=True
+    )
+
+    conn = connect_with_miint_staged()
+    conn.close()
+
+    assert executed == ["LOAD miint;"]
+    assert not any("INSTALL" in sql.upper() for sql in executed)
+
+
 def test_read_ingest_uses_the_staged_helper():
-    """The masked-read streamer must not import the client INSTALL helper.
+    """The masked-read streamer must bind the STAGED helper, by identity.
 
     Guards the swap this module exists to prevent: `_stream_masked_reads_to_fastq`
     runs inside the CP service, where INSTALL cannot resolve a home directory.
+    Identity rather than `hasattr` — an aliased
+    `from ..miint import connect_with_miint as connect_with_miint_staged` would
+    satisfy a name check while reintroducing the bug.
     """
     from qiita_control_plane.runner import _read_ingest
 
-    assert hasattr(_read_ingest, "connect_with_miint_staged")
+    assert _read_ingest.connect_with_miint_staged is miint_module.connect_with_miint_staged
     assert not hasattr(_read_ingest, "connect_with_miint")

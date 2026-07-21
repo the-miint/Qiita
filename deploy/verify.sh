@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Consolidated post-deploy verification for an established qiita-miint host.
 #
-# Runs the three generic post-deploy checks — health aggregate, workflow
-# actions list, and compute-readiness — each with the account + env file it
+# Runs the generic post-deploy checks — health aggregate, workflow actions
+# list, compute-readiness, CP miint LOAD — each with the account + env file it
 # actually needs baked in, so neither operators nor PR authors hand-copy the
 # individual invocations. (Hand-copying is how the compute-readiness run-as bug
 # recurred across deploys. The correct run-as is qiita-orch sourcing
@@ -14,8 +14,8 @@
 #
 # Read-only. Exit non-zero iff any ATTEMPTED check failed; absent env files
 # (first deploy) degrade to skip rows. Hatches: SKIP_HEALTH, SKIP_ACTIONS,
-# SKIP_COMPUTE_READINESS, SKIP_SLURM_PROBE, SKIP_PREFLIGHT (the last passes
-# through to preflight.sh). See docs/runbooks/redeploy.md.
+# SKIP_COMPUTE_READINESS, SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_PREFLIGHT (the
+# last passes through to preflight.sh). See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -28,6 +28,8 @@ require_root "deploy/verify.sh must be run as root (sudo) — it sudo's per serv
 # The deployed orchestrator venv. The module-direct form below is PATH-independent
 # and is exactly what `qiita-admin compute-readiness` subprocesses into.
 ORCHESTRATOR_VENV="${ORCHESTRATOR_VENV:-/opt/qiita/compute-orchestrator/.venv}"
+# The deployed CP venv (NOT the /home/qiita build checkout local-deploy.sh rsyncs from).
+CONTROL_PLANE_VENV="${CONTROL_PLANE_VENV:-/opt/qiita/control-plane/.venv}"
 
 n_pass=0 n_fail=0 n_skip=0
 
@@ -106,7 +108,35 @@ else
     skip "compute-readiness" "$CO_ENV absent (first deploy)"
 fi
 
-# --- 4. Config/secret fingerprint summary (preflight) -----------------------
+# --- 4. CP miint LOAD (as qiita-api, control-plane.env) ---------------------
+# The CP runner LOADs miint in-process to stream a sample's masked reads (the
+# long-read-assembly input binding). Service-side miint is LOAD-only from the
+# deploy-staged MIINT_EXTENSION_DIRECTORY: with it unset DuckDB falls back to
+# $HOME/.duckdb/extensions and qiita-api's home is /dev/null, so the whole
+# workflow dies at submission. Nothing else fails when it is missing — the CP
+# boots and serves every other route — so without this check the gap is
+# invisible until someone submits an assembly.
+if [ -n "${SKIP_CP_MIINT:-}" ]; then
+    skip "cp-miint" "SKIP_CP_MIINT=1"
+elif [ -r "$CP_ENV" ]; then
+    # cd / first: qiita-api may not be able to traverse the invoking operator's
+    # cwd (deploys are run from NFS home dirs), and a bash -c that cannot resolve
+    # its cwd fails before it reaches the python.
+    if out=$(cd / && sudo -u "$QIITA_API_USER" bash -c "
+        set -a
+        # shellcheck disable=SC1091
+        source /etc/qiita/control-plane.env; set +a
+        exec '${CONTROL_PLANE_VENV}/bin/python' -c 'from qiita_control_plane.miint import connect_with_miint_staged; connect_with_miint_staged().close()'
+    " 2>&1); then
+        pass "cp-miint" "control plane can LOAD miint (run as $QIITA_API_USER)"
+    else
+        fail "cp-miint" "control plane cannot LOAD miint — long-read-assembly will fail at submission: ${out}"
+    fi
+else
+    skip "cp-miint" "$CP_ENV absent (first deploy)"
+fi
+
+# --- 5. Config/secret fingerprint summary (preflight) -----------------------
 echo "verify-deploy: config/secret fingerprints —"
 if "$HERE/preflight.sh"; then
     pass "preflight" "config/secret consistency OK"

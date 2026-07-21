@@ -16,7 +16,11 @@ extension directory, which defaults to `$HOME/.duckdb/extensions` when
 `MIINT_EXTENSION_DIRECTORY` is unset — and the service accounts have no usable
 `$HOME` (`qiita-api` / `qiita-orch` are `/dev/null`), so a service-side INSTALL
 dies with `IO Error: Can't find the home directory at '/dev/null'`. Service-side
-code must therefore never reach the INSTALL path. This mirrors the reasoning
+code must therefore never reach the INSTALL path. Note this is a property of
+where the code RUNS, not of which CLI it belongs to: `qiita-admin` subcommands
+are run as `qiita-api` on the deploy host (see `deploy/verify.sh`), so an
+admin-CLI path that INSTALLs is only safe while it stays off the service
+accounts. This mirrors the reasoning
 already spelled out in `qiita_common.duckdb_miint.miint_load_sql`: cluster
 runtime LOADs from a pre-staged directory so no node "depends on mirror
 reachability, or needs a writable `$HOME`". The control plane is no different.
@@ -28,7 +32,6 @@ via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 
@@ -81,7 +84,10 @@ def connect_with_miint_staged() -> duckdb.DuckDBPyConnection:
     alternative is DuckDB's `Can't find the home directory at '/dev/null'`,
     which names neither the variable to set nor the service that needs it. The
     caller owns the connection and must close it."""
-    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+    # Validate the value DuckDB will actually receive, not a second read of the
+    # environment: miint_connect_config() is the one that reaches `connect()`.
+    config = miint_connect_config()
+    ext_dir = config.get("extension_directory")
     if not ext_dir:
         raise RuntimeError(
             "MIINT_EXTENSION_DIRECTORY is not set for the control-plane service. "
@@ -96,6 +102,6 @@ def connect_with_miint_staged() -> duckdb.DuckDBPyConnection:
             "at the deploy-staged miint extension directory, byte-identical to the "
             "compute orchestrator's and data plane's."
         )
-    conn = _connect()
+    conn = duckdb.connect(":memory:", config=config)
     conn.execute(miint_load_sql())
     return conn
