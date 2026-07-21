@@ -227,11 +227,22 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 
 /// Allowed table names for DoGet queries. Reject anything else.
 ///
-/// PRIVACY: `read` and `read_mask` are deliberately absent. Reads are only
-/// reachable through the `read_masked` view, which excludes host/human and
-/// QC-failed rows by construction (`WHERE m.reason = 'pass'`). Raw read access
-/// is via direct DB tooling on the host, never Flight. Do not add `read` or
-/// `read_mask` here.
+/// PRIVACY: the bare `read` and `read_mask` tables are deliberately absent, and
+/// must stay absent. A whole-table name here would make an unscoped raw-read
+/// SELECT representable; `read_masked` is the only *unrestricted* read surface,
+/// and it excludes host/human and QC-failed rows by construction (`WHERE
+/// m.reason = 'pass'`).
+///
+/// `read_block` is the one path to raw `read` rows over Flight, and it is
+/// admissible only because it CANNOT express an unscoped read: it is not a table
+/// name, it is a block-read *selector* form that `build_query` rejects unless the
+/// ticket carries a non-empty `members` list (see `BLOCK_READ_SOURCES`). The
+/// bytes it streams are exactly the bytes the retired `export_read_block`
+/// DoAction used to write to shared scratch, so this widens no privacy boundary —
+/// it changes the transport from "data plane writes a human-readable Parquet onto
+/// a shared filesystem" to "data plane streams to one authenticated compute job",
+/// which is the narrower of the two. Direct DB tooling on the host remains the
+/// path for anything unscoped.
 const ALLOWED_TABLES: &[&str] = &[
     "reference_sequences",
     "reference_sequence_chunks",
@@ -240,6 +251,9 @@ const ALLOWED_TABLES: &[&str] = &[
     "reference_placements",
     "reference_annotation",
     "read_masked",
+    // Block-read selectors — members-scoped by construction (BLOCK_READ_SOURCES).
+    "read_block",
+    "read_masked_block",
     // The alignment sink's read-side, for the feature-table (OGU) consumer. It
     // holds host-depleted, derived per-read alignments (not raw human reads), so
     // — unlike read_masked — it is not the human-read privacy surface. Reads are
@@ -277,6 +291,35 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 /// (see build_query), so every streamed row shares it and the consumer carries it.
 const ALIGNMENT_DOGET_PROJECTION: &str =
     "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position";
+
+/// The block-read DoGet selectors, mapped to the DuckLake relation each streams.
+///
+/// These are ticket `table` values, not table names: a block is a set of
+/// `(prep_sample_idx, sequence_idx sub-range)` members, which the flat
+/// column/value `TicketFilter` cannot express, so the ticket carries `members`
+/// and `build_query` translates them through the shared `block_read_where_clause`
+/// — the same selector the block DELETE actions use, so a block's read footprint
+/// and its delete footprint can never drift.
+///
+/// * `read_block` → raw `read` rows: the reads a read-mask block masks.
+/// * `read_masked_block` → `read_masked` rows (trimmed, host/QC-`pass`-filtered),
+///   additionally scoped to one `mask_idx`: the reads an align block aligns.
+///
+/// Both REQUIRE a non-empty `members` list; `read_masked_block` additionally
+/// requires exactly one `mask_idx`. That requirement is what makes `read_block`
+/// safe to expose at all (see the PRIVACY note on `ALLOWED_TABLES`): there is no
+/// ticket shape that reaches raw reads without naming the exact sub-ranges.
+const BLOCK_READ_SOURCES: &[(&str, &str)] =
+    &[("read_block", "read"), ("read_masked_block", "read_masked")];
+
+/// The DuckLake relation a block-read selector streams, or `None` if `table` is
+/// not one. Single lookup point for both the guard and the query build.
+fn block_read_source(table: &str) -> Option<&'static str> {
+    BLOCK_READ_SOURCES
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, source)| *source)
+}
 
 /// DoAction variants that are safe to replay — the accepted-risk registry.
 ///
@@ -351,7 +394,7 @@ impl FlightService for QiitaFlightService {
         }
 
         // Build query from filter
-        let (sql, table) = build_query(&payload.table, &payload.filter)?;
+        let (sql, table) = build_query(&payload.table, &payload.filter, &payload.members)?;
 
         // Stream the result incrementally. Each request gets its own DuckDB
         // connection + DuckLake snapshot, opened on a blocking task that feeds
@@ -1540,7 +1583,7 @@ fn export_read_to_parquet(
 fn export_read_block_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
-    members: &[auth::ExportReadBlockMember],
+    members: &[auth::BlockReadMember],
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
@@ -1578,7 +1621,7 @@ fn export_read_masked_block_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
     mask_idx: i64,
-    members: &[auth::ExportReadBlockMember],
+    members: &[auth::BlockReadMember],
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
@@ -1612,7 +1655,7 @@ fn export_read_masked_block_to_parquet(
 /// rows (independent of tiling order). The coarse pair is a superset of the OR,
 /// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
 /// all integers are signature-verified i64s, safe to inline.
-fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
+fn block_read_where_clause(members: &[auth::BlockReadMember]) -> String {
     let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
     preps.sort_unstable();
     preps.dedup();
@@ -1641,14 +1684,18 @@ fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
     )
 }
 
-/// Pull exactly one i64 out of a ticket filter column. The count path needs a
-/// single `prep_sample_idx` / `mask_idx`, not an IN-set, so a missing, empty,
-/// multi-valued, or non-integer column is a malformed-ticket error — the export
-/// ticket always signs a one-element list per column. Input is signature-verified
-/// (set by the control plane), but we validate anyway for defense in depth.
+/// Pull exactly one i64 out of a ticket filter column. Several paths need a
+/// single-valued scope rather than an IN-set — the count/metrics aggregates on
+/// `prep_sample_idx` / `mask_idx`, and the `read_masked_block` DoGet on
+/// `mask_idx` — so a missing, empty, multi-valued, or non-integer column is a
+/// malformed-ticket error; the control plane always signs a one-element list for
+/// these. Input is signature-verified (set by the control plane), but we validate
+/// anyway for defense in depth.
 fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Status> {
     let values = filter.get(col).ok_or_else(|| {
-        Status::invalid_argument(format!("count_masked ticket missing filter column {col:?}"))
+        Status::invalid_argument(format!(
+            "ticket missing single-valued filter column {col:?}"
+        ))
     })?;
     match values.as_slice() {
         [v] => v.as_i64().ok_or_else(|| {
@@ -2214,7 +2261,7 @@ fn delete_read_mask_block(
     catalog_connstr: &str,
     data_path: &str,
     mask_idx: i64,
-    members: &[auth::ExportReadBlockMember],
+    members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
     if members.is_empty() {
         return Ok(serde_json::json!({
@@ -2340,7 +2387,7 @@ fn delete_alignment_block(
     catalog_connstr: &str,
     data_path: &str,
     alignment_idx: i64,
-    members: &[auth::ExportReadBlockMember],
+    members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
     if members.is_empty() {
         return Ok(serde_json::json!({
@@ -2471,7 +2518,24 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// DuckDB does not support parameterized identifiers (table/column names), so
 /// whitelisting is the correct defense. Values could be parameterized but are
 /// already safe as parsed integers.
-fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+fn build_query(
+    table: &str,
+    filter: &auth::TicketFilter,
+    members: &[auth::BlockReadMember],
+) -> Result<(String, String), Status> {
+    // Block-read selectors resolve to a different relation than their ticket name
+    // and are scoped by `members`, not by a column filter — handle them first, and
+    // reject `members` on any other table so a stray selector can never silently
+    // widen a normal ticket into an unscoped read.
+    if let Some(source) = block_read_source(table) {
+        return build_block_read_query(table, source, filter, members);
+    }
+    if !members.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "table {table:?} does not accept a block `members` selector"
+        )));
+    }
+
     let full_table = format!("qiita_lake.{table}");
 
     if filter.is_empty() {
@@ -2587,6 +2651,66 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         format!("SELECT {projection} FROM {full_table} WHERE {where_str}")
     };
     Ok((sql, full_table))
+}
+
+/// Build the SELECT for a block-read DoGet (`read_block` / `read_masked_block`).
+///
+/// The streaming twin of the retired `export_read_block` /
+/// `export_read_masked_block` DoActions: identical source relation, identical
+/// `block_read_where_clause` selector, identical `EXPORT_READ_COLUMNS`
+/// projection — only the sink differs (a Flight stream to the compute node rather
+/// than a Parquet on shared scratch). Sharing the selector and the projection with
+/// the delete path is deliberate: a block's read footprint and its delete
+/// footprint are the same footprint, and one translator means they cannot drift.
+///
+/// Guards, all fail-loud (a violation is a control-plane bug, and the ticket is
+/// signature-verified, so these are defense in depth):
+///
+/// * `members` must be non-empty. This is the invariant that makes `read_block`
+///   admissible at all — an empty selector must never degrade to "all reads"
+///   (see the PRIVACY note on `ALLOWED_TABLES`).
+/// * `read_masked_block` must carry exactly one `mask_idx` and nothing else;
+///   `read_block` must carry no filter at all. A masked block without its mask
+///   scope would stream every mask's rows for those ranges, blending pass-sets
+///   from different filtering identities into one indistinguishable stream — the
+///   same class of error the single-`alignment_idx` guard prevents.
+fn build_block_read_query(
+    table: &str,
+    source: &str,
+    filter: &auth::TicketFilter,
+    members: &[auth::BlockReadMember],
+) -> Result<(String, String), Status> {
+    if members.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{table} requires a non-empty `members` selector (refusing an unscoped read)"
+        )));
+    }
+    let full_table = format!("qiita_lake.{source}");
+    let member_clause = block_read_where_clause(members);
+
+    let where_str = if table == "read_masked_block" {
+        let mask_idx = single_i64_filter(filter, "mask_idx")?;
+        if filter.len() != 1 {
+            return Err(Status::invalid_argument(format!(
+                "{table} accepts only a mask_idx filter, got {} columns",
+                filter.len()
+            )));
+        }
+        format!("mask_idx = {mask_idx} AND ({member_clause})")
+    } else {
+        if !filter.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "{table} accepts no filter columns (scope it with `members`), got {} columns",
+                filter.len()
+            )));
+        }
+        member_clause
+    };
+
+    Ok((
+        format!("SELECT {EXPORT_READ_COLUMNS} FROM {full_table} WHERE {where_str}"),
+        full_table,
+    ))
 }
 
 #[cfg(test)]
@@ -2856,12 +2980,12 @@ mod tests {
         // whole. block_min=100, block_max=201 spans prep_a's 102-103 too, so the
         // per-member OR is what keeps block 2's sub-range intact.
         let members = vec![
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_a,
                 sequence_idx_start: 100,
                 sequence_idx_stop: 101,
             },
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_b,
                 sequence_idx_start: 200,
                 sequence_idx_stop: 201,
@@ -3010,12 +3134,12 @@ mod tests {
         // whole. block_min=100, block_max=201 spans prep_a's 102-103 too, so the
         // per-member OR is what keeps block 2's sub-range intact.
         let members = vec![
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_a,
                 sequence_idx_start: 100,
                 sequence_idx_stop: 101,
             },
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_b,
                 sequence_idx_start: 200,
                 sequence_idx_stop: 201,
@@ -3309,7 +3433,7 @@ mod tests {
 
         // Helper that mirrors do_get's query body for read_masked.
         let run = |filter: &auth::TicketFilter| -> Vec<arrow_array::RecordBatch> {
-            let (sql, _) = build_query("read_masked", filter).unwrap();
+            let (sql, _) = build_query("read_masked", filter, &[]).unwrap();
             let mut stmt = conn.prepare(&sql).unwrap();
             let arrow_result = stmt.query_arrow([]).unwrap();
             let schema = arrow_result.get_schema();
@@ -3415,7 +3539,7 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(prep)],
         );
-        let (sql, table) = build_query("read_masked", &filter).unwrap();
+        let (sql, table) = build_query("read_masked", &filter, &[]).unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -3453,7 +3577,7 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(prep)],
         );
-        let (esql, etable) = build_query("read_masked", &empty_filter).unwrap();
+        let (esql, etable) = build_query("read_masked", &empty_filter, &[]).unwrap();
         let empty: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), esql, etable)
                 .collect::<Vec<_>>()
@@ -3997,12 +4121,12 @@ mod tests {
         // aligned split). block_min=941010, block_max=941031 spans prep_gap's
         // window (941020-941021), so the IN(prep) clause is what excludes it.
         let members = vec![
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_a,
                 sequence_idx_start: 941010,
                 sequence_idx_stop: 941012,
             },
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_c,
                 sequence_idx_start: 941030,
                 sequence_idx_stop: 941031,
@@ -4117,7 +4241,7 @@ mod tests {
         ))
         .unwrap();
 
-        let members = vec![auth::ExportReadBlockMember {
+        let members = vec![auth::BlockReadMember {
             prep_sample_idx: prep_a,
             sequence_idx_start: 100,
             sequence_idx_stop: 102,
@@ -4240,12 +4364,12 @@ mod tests {
         // pull prep_x rows 942014..942019 (in [942010,942051], prep in IN-set);
         // the per-member predicate must exclude them.
         let members = vec![
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_x,
                 sequence_idx_start: 942010,
                 sequence_idx_stop: 942013,
             },
-            auth::ExportReadBlockMember {
+            auth::BlockReadMember {
                 prep_sample_idx: prep_y,
                 sequence_idx_start: 942050,
                 sequence_idx_stop: 942051,
@@ -4284,7 +4408,7 @@ mod tests {
 
     #[test]
     fn build_query_no_filter() {
-        let (sql, _) = build_query("reference_sequences", &auth::TicketFilter::new()).unwrap();
+        let (sql, _) = build_query("reference_sequences", &auth::TicketFilter::new(), &[]).unwrap();
         assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
     }
 
@@ -4299,7 +4423,7 @@ mod tests {
                 serde_json::Value::from(3),
             ],
         );
-        let (sql, _) = build_query("reference_sequences", &filter).unwrap();
+        let (sql, _) = build_query("reference_sequences", &filter, &[]).unwrap();
         assert!(sql.contains("feature_idx IN (1,2,3)"));
     }
 
@@ -4310,7 +4434,7 @@ mod tests {
             "'; DROP TABLE".to_string(),
             vec![serde_json::Value::from(1)],
         );
-        let result = build_query("reference_sequences", &filter);
+        let result = build_query("reference_sequences", &filter, &[]);
         assert!(result.is_err());
     }
 
@@ -4321,7 +4445,7 @@ mod tests {
             "feature_idx".to_string(),
             vec![serde_json::Value::from("not_an_int")],
         );
-        let result = build_query("reference_sequences", &filter);
+        let result = build_query("reference_sequences", &filter, &[]);
         assert!(result.is_err());
     }
 
@@ -4329,7 +4453,7 @@ mod tests {
     fn build_query_rejects_empty_values() {
         let mut filter = auth::TicketFilter::new();
         filter.insert("feature_idx".to_string(), vec![]);
-        let result = build_query("reference_sequences", &filter);
+        let result = build_query("reference_sequences", &filter, &[]);
         assert!(result.is_err());
     }
 
@@ -4340,7 +4464,7 @@ mod tests {
             "reference_idx".to_string(),
             vec![serde_json::Value::from(42)],
         );
-        let (sql, _) = build_query("reference_sequences", &filter).unwrap();
+        let (sql, _) = build_query("reference_sequences", &filter, &[]).unwrap();
         assert!(
             sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
             "expected JOIN for reference_sequences + reference_idx, got: {sql}"
@@ -4367,7 +4491,7 @@ mod tests {
                 serde_json::Value::from(800002),
             ],
         );
-        let (sql, _) = build_query("reference_sequence_chunks", &filter).unwrap();
+        let (sql, _) = build_query("reference_sequence_chunks", &filter, &[]).unwrap();
         assert!(
             sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
             "expected membership JOIN, got: {sql}"
@@ -4391,7 +4515,7 @@ mod tests {
             "reference_idx".to_string(),
             vec![serde_json::Value::from(42)],
         );
-        let (sql, _) = build_query("reference_taxonomy", &filter).unwrap();
+        let (sql, _) = build_query("reference_taxonomy", &filter, &[]).unwrap();
         assert!(
             sql.contains("reference_idx IN (42)"),
             "expected direct filter, got: {sql}"
@@ -4412,7 +4536,7 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(11), serde_json::Value::from(12)],
         );
-        let (sql, table) = build_query("read_masked", &filter).unwrap();
+        let (sql, table) = build_query("read_masked", &filter, &[]).unwrap();
         assert_eq!(table, "qiita_lake.read_masked");
         assert!(
             sql.starts_with("SELECT * FROM qiita_lake.read_masked WHERE"),
@@ -4432,7 +4556,7 @@ mod tests {
         // column, so a ticket filtering on it must be rejected.
         let mut filter = auth::TicketFilter::new();
         filter.insert("sequence_idx".to_string(), vec![serde_json::Value::from(1)]);
-        let result = build_query("read_masked", &filter);
+        let result = build_query("read_masked", &filter, &[]);
         assert!(
             result.is_err(),
             "sequence_idx is not an allowed filter column"
@@ -4445,11 +4569,176 @@ mod tests {
         // sample's pass-reads across all studies — refuse it (the CP always
         // scopes read_masked tickets, this is defense-in-depth).
         let empty = auth::TicketFilter::new();
-        let result = build_query("read_masked", &empty);
+        let result = build_query("read_masked", &empty, &[]);
         assert!(
             result.is_err(),
             "empty filter on read_masked must be rejected"
         );
+    }
+
+    // --- block-read DoGet selectors (read_block / read_masked_block) ---
+
+    fn block_members() -> Vec<auth::BlockReadMember> {
+        vec![
+            auth::BlockReadMember {
+                prep_sample_idx: 11,
+                sequence_idx_start: 100,
+                sequence_idx_stop: 199,
+            },
+            auth::BlockReadMember {
+                prep_sample_idx: 12,
+                sequence_idx_start: 500,
+                sequence_idx_stop: 549,
+            },
+        ]
+    }
+
+    #[test]
+    fn build_query_read_block_streams_the_export_projection_from_raw_read() {
+        // The streaming twin of the retired export_read_block DoAction: same
+        // source relation, same EXPORT_READ_COLUMNS projection, same selector.
+        let members = block_members();
+        let (sql, table) = build_query("read_block", &auth::TicketFilter::new(), &members).unwrap();
+        assert_eq!(
+            table, "qiita_lake.read",
+            "read_block is a selector name; it must resolve to the raw read table"
+        );
+        assert!(
+            sql.starts_with(&format!(
+                "SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read WHERE"
+            )),
+            "expected the shared export projection, got: {sql}"
+        );
+        // The exact selector the block DELETE path emits — one translator, so a
+        // block's read footprint and its delete footprint cannot drift.
+        assert!(
+            sql.contains(&block_read_where_clause(&members)),
+            "expected the shared block_read_where_clause selector, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_read_masked_block_scopes_to_one_mask() {
+        let members = block_members();
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
+        let (sql, table) = build_query("read_masked_block", &filter, &members).unwrap();
+        assert_eq!(table, "qiita_lake.read_masked");
+        assert!(
+            sql.contains("mask_idx = 7 AND ("),
+            "the mask scope must conjoin the member selector, got: {sql}"
+        );
+        assert!(
+            sql.contains(&block_read_where_clause(&members)),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_block_read_rejects_empty_members() {
+        // THE load-bearing guard: an empty selector must never degrade to "all
+        // reads". This is what makes exposing raw `read` via read_block
+        // admissible at all (see the PRIVACY note on ALLOWED_TABLES).
+        assert!(
+            build_query("read_block", &auth::TicketFilter::new(), &[]).is_err(),
+            "read_block with no members must be rejected"
+        );
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
+        assert!(
+            build_query("read_masked_block", &filter, &[]).is_err(),
+            "read_masked_block with no members must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_read_masked_block_requires_exactly_one_mask_idx() {
+        let members = block_members();
+        // Absent: would blend every mask's pass-set for those ranges.
+        assert!(
+            build_query("read_masked_block", &auth::TicketFilter::new(), &members).is_err(),
+            "a masked block without its mask scope must be rejected"
+        );
+        // Multi-valued: same blending, just spelled differently.
+        let mut multi = auth::TicketFilter::new();
+        multi.insert(
+            "mask_idx".to_string(),
+            vec![serde_json::Value::from(7), serde_json::Value::from(8)],
+        );
+        assert!(
+            build_query("read_masked_block", &multi, &members).is_err(),
+            "a multi-valued mask_idx must be rejected"
+        );
+        // Extra columns: the ticket shape is pinned, not merely sufficient.
+        let mut extra = auth::TicketFilter::new();
+        extra.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
+        extra.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(11)],
+        );
+        assert!(
+            build_query("read_masked_block", &extra, &members).is_err(),
+            "an unexpected extra filter column must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_query_read_block_rejects_any_filter() {
+        // read_block is scoped by members alone. A filter here would be a
+        // control-plane bug, and silently ignoring it could under-scope.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(11)],
+        );
+        assert!(
+            build_query("read_block", &filter, &block_members()).is_err(),
+            "read_block must reject filter columns"
+        );
+    }
+
+    #[test]
+    fn build_query_rejects_members_on_a_non_block_table() {
+        // A stray selector on a normal ticket must fail loudly rather than be
+        // dropped — a dropped selector is a silently WIDER read than intended.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(11)],
+        );
+        assert!(
+            build_query("read_masked", &filter, &block_members()).is_err(),
+            "read_masked must reject a block members selector"
+        );
+        assert!(
+            build_query(
+                "reference_sequences",
+                &auth::TicketFilter::new(),
+                &block_members()
+            )
+            .is_err(),
+            "a reference table must reject a block members selector"
+        );
+    }
+
+    #[test]
+    fn allowed_tables_excludes_the_bare_raw_read_tables() {
+        // Pins the PRIVACY invariant on ALLOWED_TABLES: raw reads are reachable
+        // only through the members-scoped `read_block` selector, never as a
+        // whole-table name that an empty filter could turn into a full scan.
+        for forbidden in ["read", "read_mask"] {
+            assert!(
+                !ALLOWED_TABLES.contains(&forbidden),
+                "{forbidden:?} must never be a DoGet table name"
+            );
+        }
+        for (selector, _) in BLOCK_READ_SOURCES {
+            assert!(
+                ALLOWED_TABLES.contains(selector),
+                "block-read selector {selector:?} must be in ALLOWED_TABLES to be reachable"
+            );
+        }
     }
 
     #[test]
@@ -4483,7 +4772,7 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(3), serde_json::Value::from(4)],
         );
-        let (sql, table) = build_query("alignment", &filter).unwrap();
+        let (sql, table) = build_query("alignment", &filter, &[]).unwrap();
         assert_eq!(table, "qiita_lake.alignment");
         assert!(
             sql.starts_with(
@@ -4511,7 +4800,7 @@ mod tests {
         // (defense-in-depth, matching read_masked).
         let empty = auth::TicketFilter::new();
         assert!(
-            build_query("alignment", &empty).is_err(),
+            build_query("alignment", &empty, &[]).is_err(),
             "empty filter on alignment must be rejected"
         );
     }
@@ -4527,7 +4816,7 @@ mod tests {
             vec![serde_json::Value::from(3)],
         );
         assert!(
-            build_query("alignment", &filter).is_err(),
+            build_query("alignment", &filter, &[]).is_err(),
             "alignment DoGet without alignment_idx must be rejected"
         );
     }
@@ -4546,7 +4835,7 @@ mod tests {
             vec![serde_json::Value::from(3)],
         );
         assert!(
-            build_query("alignment", &filter).is_err(),
+            build_query("alignment", &filter, &[]).is_err(),
             "alignment DoGet with multi-valued alignment_idx must be rejected"
         );
     }
@@ -4592,7 +4881,7 @@ mod tests {
                 serde_json::Value::from(prep_b),
             ],
         );
-        let (sql, table) = build_query("alignment", &filter).unwrap();
+        let (sql, table) = build_query("alignment", &filter, &[]).unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -4637,7 +4926,7 @@ mod tests {
         // Reference tables are broadly readable by design (mirrors the
         // anonymous REST reference GET), so an unfiltered SELECT is legitimate.
         let empty = auth::TicketFilter::new();
-        let (sql, table) = build_query("reference_sequences", &empty)
+        let (sql, table) = build_query("reference_sequences", &empty, &[])
             .expect("empty filter on a reference table is allowed");
         assert_eq!(table, "qiita_lake.reference_sequences");
         assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
@@ -5167,9 +5456,9 @@ mod tests {
         // V3 is built from the SAME production helper the export uses, so this
         // test can't drift from the query the code actually emits. V1/V2 are
         // hand-written comparison baselines (not production shapes).
-        let member_structs: Vec<auth::ExportReadBlockMember> = members
+        let member_structs: Vec<auth::BlockReadMember> = members
             .iter()
-            .map(|(p, _, s, e)| auth::ExportReadBlockMember {
+            .map(|(p, _, s, e)| auth::BlockReadMember {
                 prep_sample_idx: *p,
                 sequence_idx_start: *s,
                 sequence_idx_stop: *e,
@@ -5358,9 +5647,9 @@ mod tests {
                 seq_base + 95 * reads_per + reads_per - 1,
             ),
         ];
-        let member_structs: Vec<auth::ExportReadBlockMember> = members
+        let member_structs: Vec<auth::BlockReadMember> = members
             .iter()
-            .map(|(p, s, e)| auth::ExportReadBlockMember {
+            .map(|(p, s, e)| auth::BlockReadMember {
                 prep_sample_idx: *p,
                 sequence_idx_start: *s,
                 sequence_idx_stop: *e,

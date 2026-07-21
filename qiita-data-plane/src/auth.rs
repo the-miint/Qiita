@@ -32,10 +32,27 @@ const MAX_TICKET_LIFETIME: u64 = 3600;
 pub type TicketFilter = HashMap<String, Vec<serde_json::Value>>;
 
 /// Parsed ticket payload after verification.
+///
+/// Two scoping mechanisms, and a ticket uses exactly one of them (`build_query`
+/// enforces which tables accept which):
+///
+/// * `filter` — the column/value whitelist form (`{"feature_idx": [1, 2, 3]}`),
+///   used by every reference table, `read_masked`, and `alignment`.
+/// * `members` — the block-read selector: `(prep_sample_idx, sequence_idx
+///   sub-range)` tuples, which a flat column filter cannot express. Only the
+///   block-read tables (`read_block` / `read_masked_block`) accept it, and they
+///   REQUIRE it — see `BLOCK_READ_SOURCES` in `flight_service`.
+///
+/// Both default to empty so each ticket carries only the shape it uses; the
+/// per-table guards in `build_query` reject an under-scoped combination rather
+/// than letting an empty scope mean "everything".
 #[derive(Debug, serde::Deserialize)]
 pub struct TicketPayload {
     pub table: String,
+    #[serde(default)]
     pub filter: TicketFilter,
+    #[serde(default)]
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Errors from ticket verification.
@@ -313,14 +330,20 @@ pub fn verify_export_read(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
-/// One member of an `export_read_block` selector: a prep_sample and the
-/// inclusive `sequence_idx` sub-range of it this block covers. A whole sample
-/// is `[start, stop]` == its `qiita.sequence_range`; a sample split across
-/// blocks contributes a sub-range to each. `deny_unknown_fields` pins the shape
-/// to exactly these three columns.
+/// One member of a block-read selector: a prep_sample and the inclusive
+/// `sequence_idx` sub-range of it this block covers. A whole sample is
+/// `[start, stop]` == its `qiita.sequence_range`; a sample split across blocks
+/// contributes a sub-range to each. `deny_unknown_fields` pins the shape to
+/// exactly these three columns.
+///
+/// Shared by every block-footprint payload — the block-read DoGet tickets
+/// (`read_block` / `read_masked_block`) and the `delete_read_mask_block` /
+/// `delete_alignment_block` actions — so one selector shape describes a block
+/// whether we are reading it or deleting it. `block_read_where_clause` in
+/// `flight_service` is the single translator from these members to SQL.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExportReadBlockMember {
+pub struct BlockReadMember {
     /// `i64`, matching the Postgres `prep_sample` identifier source of truth
     /// and the `read.prep_sample_idx BIGINT` column in the DuckLake table.
     pub prep_sample_idx: i64,
@@ -358,7 +381,7 @@ pub struct ExportReadBlockPayload {
     pub dest: String,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Verify an `export_read_block` DoAction token and return its parsed payload.
@@ -383,7 +406,7 @@ pub fn verify_export_read_block(
 /// host/QC-`pass`-filtered) to `dest` — a per-ticket `reads.parquet` the sharded
 /// `align_sharded` job then consumes, in the SAME column shape `export_read_block`
 /// writes. It is `export_read_block` (dest + members, reusing
-/// `ExportReadBlockMember`) plus the `mask_idx` scope — the raw `read` export
+/// `BlockReadMember`) plus the `mask_idx` scope — the raw `read` export
 /// needs no mask column, a masked export does. `deny_unknown_fields` keeps the
 /// contract tight: any extra field is a design slip surfaced loudly here.
 #[derive(Debug, serde::Deserialize)]
@@ -402,7 +425,7 @@ pub struct ExportReadMaskedBlockPayload {
     pub mask_idx: i64,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Verify an `export_read_masked_block` DoAction token and return its payload.
@@ -428,7 +451,7 @@ pub fn verify_export_read_masked_block(
 /// delete-then-re-register without double-counting or clobbering a sibling
 /// block's rows for a shared sample. The footprint is the SAME
 /// `(prep_sample_idx, sub-range)` member list `export_read_block` carries
-/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member
+/// (reusing `BlockReadMember`); it is exact by construction (per-member
 /// OR residual), so a split member never deletes a sibling block's tail. The
 /// extra `mask_idx` scopes the delete to this filtering identity — the `read`
 /// export needs no such column, `read_mask` does. `deny_unknown_fields` keeps
@@ -444,7 +467,7 @@ pub struct DeleteReadMaskBlockPayload {
     pub mask_idx: i64,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Verify a `delete_read_mask_block` DoAction token and return its parsed payload.
@@ -471,7 +494,7 @@ pub fn verify_delete_read_mask_block(
 /// delete-then-re-register without double-counting or clobbering a sibling
 /// block's rows for a shared sample. The footprint is the SAME
 /// `(prep_sample_idx, sub-range)` member list `export_read_masked_block` carries
-/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member OR
+/// (reusing `BlockReadMember`); it is exact by construction (per-member OR
 /// residual) and feature_idx-agnostic (all of a read's alignment rows go, since a
 /// read produces multiple rows via cross-shard + PE multiplicity). The extra
 /// `alignment_idx` scopes the delete to this align-config identity — the raw
@@ -489,7 +512,7 @@ pub struct DeleteAlignmentBlockPayload {
     pub alignment_idx: i64,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Verify a `delete_alignment_block` DoAction token and return its parsed payload.
