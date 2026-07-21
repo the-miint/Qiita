@@ -117,6 +117,26 @@ duplicates further down are historical strata; leave them where they are.
   `ingest_ena_reads.Inputs` uses), gated on the SAME `run_map`
   declared-input check `_stage_ena_run_roster` uses so it never fires for
   bcl-convert or another `sequenced_pool`-scoped workflow.
+- **ENA-ingest DuckLake parity verification (TASK-05).** New
+  `tests/integration/test_ena_ingest_e2e.py` proves TASK-04's `ingest_ena_reads`
+  storage tail lands in the real DuckLake `read` table through the EXISTING
+  `register-files` action — no product/data-plane code change was needed. Calls
+  `ingest_ena_reads.execute()` directly against two seeded prep_samples (one
+  paired-end, one single-end) with the `read_ena_sequences` fetch monkeypatched
+  at the `_stage_run_reads` seam (no network, no checked-in fixture) and the CP
+  mint routed to the real `qiita.mint_sequence_range` via `postgres_pool`
+  (mirrors `test_native_step_smoke.py`), then drives the real `register-files`
+  YAML entry (parsed from `workflows/download-ena-study/1.0.0.yaml`, mirrors
+  `test_read_mask_e2e.py`'s `_entry_by_name`) into the real data plane. Asserts
+  the `read` table's 7-column schema, total/`DISTINCT prep_sample_idx` row
+  counts, per-sample contiguous minted `sequence_idx` ranges, and the
+  paired/single-end `sequence2` NULL split — plus that a same-work_ticket retry
+  (re-executing the idempotent hardlink-of-durable-copy path, then
+  re-registering) is REFUSED by the data plane's `move_file` AlreadyExists
+  guard rather than silently duplicating rows, leaving the `read` row count
+  unchanged. The bcl-convert/`ingest_reads` parity claim rests on CODE IDENTITY
+  (`read_staging.write_sorted_reads`/`hardlink`, shared verbatim by both jobs),
+  not an existing baseline test — none exists today for either producer.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
