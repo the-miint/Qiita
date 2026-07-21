@@ -78,6 +78,18 @@ class WorkTicketState(StrEnum):
     carries NULL failure_* columns and is tallied in its own pool-
     completion bucket so a plate full of empty wells can still reach a
     "done" signal rather than being stuck behind permanent failures.
+
+    CANCELLED is the terminal outcome for an OPERATOR-stopped ticket (the
+    `qiita-admin ticket cancel` path): the CP flips it terminal so the poll
+    loop aborts and no new attempt is submitted, then reaps its SLURM job(s).
+    It carries NULL failure_* columns — distinct from FAILED so a deliberate
+    stop is legible (in `ticket list`, the pool rollups, the notify digest)
+    rather than masquerading as a genuine failure. Like FAILED it is redrivable
+    in place via /run once the blocker is fixed.
+
+    Mirrored DB-side by qiita.work_ticket_state; the two value sets are kept in
+    lockstep by tests (test_enum_parity + test_work_ticket_state_parity) — change
+    both in the same PR.
     """
 
     PENDING = "pending"
@@ -86,6 +98,7 @@ class WorkTicketState(StrEnum):
     COMPLETED = "completed"
     NO_DATA = "no_data"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 # The terminal/non-terminal split of WorkTicketState, defined once and imported
@@ -111,6 +124,7 @@ TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
     WorkTicketState.COMPLETED.value,
     WorkTicketState.NO_DATA.value,
     WorkTicketState.FAILED.value,
+    WorkTicketState.CANCELLED.value,
 )
 
 NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = tuple(
