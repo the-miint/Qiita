@@ -27,7 +27,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   echo "installed: $line"'
   ```
 
-- **`DATA_PLANE_URL` for the control plane** — point it at the new loopback gRPC balancer so CP-side Flight traffic spreads across data-plane instances instead of pinning to instance #1. Not fail-fast (unset falls back to `grpc://localhost:50051`, so the unit still boots) — but leaving it unset means horizontal scaling has no effect on CP traffic. Compute nodes are unaffected: `compute-orchestrator.env` already points at `grpc+tls://<fqdn>:443`, which nginx balances. (this PR)
+- **`DATA_PLANE_URL` for the control plane** — point it at the new loopback gRPC balancer so CP-side Flight traffic spreads across data-plane instances instead of pinning to instance #1. Not fail-fast (unset falls back to `grpc://localhost:50051`, so the unit still boots) — but leaving it unset means horizontal scaling has no effect on CP traffic. Compute nodes are unaffected: `compute-orchestrator.env` already points at `grpc+tls://<fqdn>:443`, which nginx balances. (#359)
 
   ```bash
   # [admin]
@@ -37,7 +37,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-- **Grant `read:doget` to the compute service account.** Block-scoped compute jobs (`read-mask-block`'s qc/host_filter, `align`'s align_sharded) now stream their reads from the data plane and mint a short-TTL ticket at runtime via `POST /read/ticket/doget`. That route is gated on a NEW scope, deliberately **not** the generic `ticket:doget` the reference/alignment doget routes use: `read_block` streams RAW reads (host/human sequence — a strict superset of the `read_masked` surface, which already has its own `read_masked:doget`), so riding the reference-read scope would have let any account minting reference tickets pull raw reads. Without this grant every block work ticket fails its first streaming step with a 403. (this PR)
+- **Grant `read:doget` to the compute service account.** Block-scoped compute jobs (`read-mask-block`'s qc/host_filter, `align`'s align_sharded) now stream their reads from the data plane and mint a short-TTL ticket at runtime via `POST /read/ticket/doget`. That route is gated on a NEW scope, deliberately **not** the generic `ticket:doget` the reference/alignment doget routes use: `read_block` streams RAW reads (host/human sequence — a strict superset of the `read_masked` surface, which already has its own `read_masked:doget`), so riding the reference-read scope would have let any account minting reference tickets pull raw reads. Without this grant every block work ticket fails its first streaming step with a 403. (#359)
 
   ```bash
   # [operator] — re-mint the compute SA's PAT with the added scope, then install it.
@@ -69,7 +69,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 4. Deploy
 
-- **Optional — scale the data plane out.** The instance set is now a single knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (this PR)
+- **Optional — scale the data plane out.** The instance set is now a single knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (#359)
 
   ```bash
   # [admin] — one instance per ~core you want to give the data plane
@@ -88,7 +88,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 5. Verify
 
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
-- **Per-instance data-plane health + the balancer.** `make verify-deploy` now health-checks every port in `QIITA_DATA_PLANE_PORTS` individually, plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down — and nginx would keep routing a share of every job's traffic into it. Export the same `QIITA_DATA_PLANE_PORTS` you deployed with, or it only checks `50051`. (this PR)
+- **Per-instance data-plane health + the balancer.** `make verify-deploy` now health-checks every port in `QIITA_DATA_PLANE_PORTS` individually, plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down — and nginx would keep routing a share of every job's traffic into it. Export the same `QIITA_DATA_PLANE_PORTS` you deployed with, or it only checks `50051`. (#359)
 
   ```bash
   # [admin]
@@ -105,8 +105,7 @@ _None yet._
   PATs minted before this deploy are frozen and won't carry it, so an admin must
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel
   command works — a stale-scope 403 otherwise names the fix. (#350)
-- **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. No host action: the route reuses the existing `ticket:doget` scope the compute service account already holds, so there is no new scope grant. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces. The per-sample `read-mask` path is unchanged and still stages a Parquet. (this PR)
-- **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. The scope grant this needs is in bucket 2 above. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces — a block job now drains its stream to a short-lived Parquet inside its OWN workspace instead. The per-sample `read-mask` path is unchanged and still stages a Parquet. (this PR)
+- **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. The scope grant this needs is in bucket 2 above. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces — a block job now drains its stream to a short-lived Parquet inside its OWN workspace instead. The per-sample `read-mask` path is unchanged and still stages a Parquet. (#359)
 
 ---
 

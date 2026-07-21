@@ -54,7 +54,7 @@ duplicates further down are historical strata; leave them where they are.
   (`127.0.0.1:50050`) for on-host clients: compute nodes already reach the pool
   through nginx at `grpc+tls://<host>:443`, but the control plane's default
   `DATA_PLANE_URL` addressed instance #1 directly, so CP-side Flight traffic
-  bypassed the balancer entirely.
+  bypassed the balancer entirely. (#359)
 - **Block-read DoGet: block-scoped compute jobs stream their reads.** New
   `read_block` / `read_masked_block` ticket selectors on the data plane, scoped
   by a block's `(prep_sample_idx, sequence_idx sub-range)` members rather than a
@@ -67,7 +67,7 @@ duplicates further down are historical strata; leave them where they are.
   across data-plane instances, and the handoff stops assuming a shared
   filesystem. The selectors reuse the data plane's existing
   `block_read_where_clause` and `EXPORT_READ_COLUMNS`, so a block's read
-  footprint and its delete footprint cannot drift. Gated on a new
+  footprint and its delete footprint cannot drift. (#359) Gated on a new
   `read:doget` scope rather than the generic `ticket:doget`: `read_block`
   streams RAW reads, a strict superset of the `read_masked` surface that
   already carries its own privacy-sensitive scope, so reusing the
@@ -218,7 +218,7 @@ duplicates further down are historical strata; leave them where they are.
   the SHARED `/etc/qiita/data-plane.env` would have overridden the per-instance
   value for every instance and collapsed them all onto one port. Latent until
   now (the live host leaves it unset), and a trap for the first operator to scale
-  out. The per-instance assignment now comes last.
+  out. The per-instance assignment now comes last. (#359)
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
