@@ -109,7 +109,14 @@ duplicates further down are historical strata; leave them where they are.
   extracted into a shared sibling module (`read_staging.py`) so both jobs
   share one implementation. A new pure `ena_import.submit.
   build_download_ena_study_ticket` composes the ticket body for TASK-06's
-  batch driver to submit per `(study, platform)` pool.
+  batch driver to submit per `(study, platform)` pool. The runner's finalize
+  transaction now also closes TASK-02's deferred `qiita.sequenced_sample.
+  transport` column: a new `repositories.sequenced_sample.
+  set_sequenced_pool_transport` stamps every row in the ticket's pool with
+  the ticket's `download_method` (falling back to the same `http` default
+  `ingest_ena_reads.Inputs` uses), gated on the SAME `run_map`
+  declared-input check `_stage_ena_run_roster` uses so it never fires for
+  bcl-convert or another `sequenced_pool`-scoped workflow.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

@@ -400,6 +400,46 @@ async def import_sequenced_prep_sample(
     )
 
 
+async def set_sequenced_pool_transport(
+    conn: asyncpg.Connection,
+    sequenced_pool_idx: int,
+    *,
+    transport: str,
+) -> int:
+    """Stamp every sequenced_sample row in a pool with the transport (http /
+    aspera) used to download its reads.
+
+    Closes the provenance gap `db/migrations/20260721000000_sequenced_
+    sample_ena_provenance.sql` documents: that migration adds the column but
+    leaves it NULL, deferring the write to "TASK-04's download workflow" —
+    this is that write, called from the runner's `download-ena-study`
+    finalize (`runner._workflow.run_workflow`, gated on the RUN_MAP_BINDING
+    declared input so it never fires for bcl-convert or another
+    sequenced_pool-scoped workflow).
+
+    A bulk pool-scoped UPDATE, not `update_sequenced_sample`'s single-row
+    PATCH -- `transport` is an ENA-import provenance column, not a general
+    PATCH field (it is deliberately absent from
+    SEQUENCED_SAMPLE_PATCHABLE_COLUMNS). Scoped by sequenced_pool_idx like
+    `fetch_sequenced_pool_run_roster`, whose roster this download ticket
+    actually fetched. Idempotent: a ticket redrive (resume) re-applies the
+    same value, a no-op change; safe to call unconditionally inside the
+    caller's finalize transaction.
+
+    Returns the number of rows updated. The caller (finalize) does not
+    require a non-zero count here -- an empty pool would already have
+    failed the ticket earlier, at `_stage_ena_run_roster`, before any step
+    ran -- so a 0-row result is not raised as an error in this function.
+    """
+    result = await conn.execute(
+        "UPDATE qiita.sequenced_sample SET transport = $1 WHERE sequenced_pool_idx = $2",
+        transport,
+        sequenced_pool_idx,
+    )
+    # asyncpg's execute() returns a status tag string like "UPDATE 3".
+    return int(result.rsplit(" ", 1)[-1])
+
+
 async def fetch_sequenced_sample_idxs_by_ena_run_accession(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,

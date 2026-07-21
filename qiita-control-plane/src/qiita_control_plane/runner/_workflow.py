@@ -25,8 +25,10 @@ from qiita_common.models import (
 )
 
 from .. import step_progress
+from ..ena_import.submit import DEFAULT_DOWNLOAD_METHOD
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.block import fetch_block_members
+from ..repositories.sequenced_sample import set_sequenced_pool_transport
 from ._base import (
     _STEP_POLL_INTERVAL_SECONDS,
     WorkflowAborted,
@@ -697,6 +699,30 @@ async def run_workflow(
                     conn, scope_target, bound
                 ):
                     await _patch_resource_status(conn, scope_target, action.success_status)
+                # ENA read-download provenance (TASK-04): stamp the pool's
+                # sequenced_sample rows with the transport the download used,
+                # closing the gap `20260721000000_sequenced_sample_ena_
+                # provenance.sql` documents (column added, left NULL, "TASK-04's
+                # download workflow populates it"). Gated on the SAME
+                # declared-input-name check `_stage_ena_run_roster` above uses
+                # (RUN_MAP_BINDING), NOT scope-kind: bcl-convert is ALSO
+                # sequenced_pool-scoped, so keying off scope-kind alone would
+                # fire this for bcl-convert's (and any other sequenced_pool
+                # workflow's) finalize too. `download_method` rides in
+                # action_context from submit
+                # (`ena_import.submit.build_download_ena_study_ticket`); a
+                # raw ticket that omitted it falls back to
+                # DEFAULT_DOWNLOAD_METHOD, matching `ingest_ena_reads.Inputs.
+                # download_method`'s own default so the recorded provenance
+                # always agrees with what the job actually did. Idempotent
+                # (same value on a redrive) and runs inside this same finalize
+                # transaction, so a mid-finalize failure rolls it back too.
+                if _workflow_declares_input(action.steps, RUN_MAP_BINDING):
+                    await set_sequenced_pool_transport(
+                        conn,
+                        scope_target["sequenced_pool_idx"],
+                        transport=bound.get("download_method", DEFAULT_DOWNLOAD_METHOD),
+                    )
                 await _atomic_transition(
                     conn,
                     work_ticket_idx,

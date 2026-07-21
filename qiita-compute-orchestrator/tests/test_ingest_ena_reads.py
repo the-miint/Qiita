@@ -470,10 +470,24 @@ def test_ingests_a_real_public_ena_run_live_smoke(fake_mint, tmp_path):
     `pytest` with no `-m` deselection, unlike qiita-control-plane's `-m 'not
     db'` / the integration suite's `-m 'not system'`, so an unconditional
     `@pytest.mark.system` here would NOT be excluded by `make test`.
-    UNVERIFIED by this change (no network access in this sandbox) — the
-    accession below is a placeholder; replace with a known-small,
-    known-stable public ENA run before relying on this test."""
-    inputs = _inputs(tmp_path, [(10, "ERR000001")])
+
+    Accession: DRR037815 -- verified via the ENA Portal API
+    (`filereport?accession=DRR037815&result=read_run&fields=run_accession,
+    library_layout,fastq_bytes,instrument_platform,instrument_model,
+    fastq_ftp,first_public`) to be SINGLE-layout, `instrument_platform=
+    ILLUMINA` (MiSeq), `fastq_bytes=1774` (~1.7 KB gzipped -- about as small
+    as a real public Illumina run gets), `first_public=2016-04-19` (public
+    for a decade, so not a to-be-embargoed/withdrawn upload), with a live
+    `fastq_ftp` (confirmed reachable: an HTTPS HEAD against
+    `ftp.sra.ebi.ac.uk/vol1/fastq/DRR037/DRR037815/DRR037815.fastq.gz`
+    returned 200 with `Content-Length: 1774`, matching fastq_bytes exactly).
+    A DDBJ-submitted run (DRR prefix), but ENA mirrors and serves it exactly
+    like a native ERR/SRR run through the same Portal API and FTP layout
+    `read_ena_sequences` reads -- there is no smaller/more-stable
+    ENA-servable Illumina run readily discoverable via the Portal
+    `search` endpoint (a `base_count<200000` sweep surfaced only DRR-prefixed
+    hits in this size class)."""
+    inputs = _inputs(tmp_path, [(10, "DRR037815")])
     outputs = _run(inputs, tmp_path / "ws")
     assert fake_mint and fake_mint[0][0] == 10
     assert (outputs["read_staging_dir"] / "read" / "10.parquet").exists()
