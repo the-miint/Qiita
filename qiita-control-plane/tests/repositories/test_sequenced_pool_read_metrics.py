@@ -265,6 +265,33 @@ async def test_retired_sample_excluded_from_sums_and_counts(pool_ctx):
     assert row["samples_with_metrics"] == 1
 
 
+async def test_all_retired_pool_still_returns_a_zeroed_row(pool_ctx):
+    """A pool whose EVERY sample is retired still returns a row of zeros — it does
+    not read as a missing pool.
+
+    This is the one case that distinguishes the per-aggregate
+    `FILTER (WHERE ps.retired IS NOT TRUE)` from the same predicate hoisted into a
+    plain `WHERE`. With `WHERE`, every joined row is eliminated, the `GROUP BY sp.idx`
+    group disappears, `fetchrow` returns None, and the route reports the pool as
+    missing (404) rather than empty. With `FILTER`, the pool row survives and the
+    aggregates zero out. A pool that exists but has been fully retired is the former,
+    not the latter — so the FILTER form is load-bearing, not stylistic.
+
+    (For a pool with NO samples the two forms agree: `ps.retired` is NULL there and
+    `NULL IS NOT TRUE` is true, so the LEFT-JOIN phantom row survives a WHERE too.
+    That case is `test_empty_pool_is_null_sums_zero_counts`.)"""
+    await pool_ctx["add_sample"](raw=1000, biological=900, quality_filtered=850, retired=True)
+    await pool_ctx["add_sample"](raw=2000, biological=1800, quality_filtered=1700, retired=True)
+
+    row = await fetch_sequenced_pool_read_metrics(pool_ctx["pool"], pool_ctx["pool_idx"])
+
+    assert row is not None, "an all-retired pool must not read as a missing pool"
+    assert row["idx"] == pool_ctx["pool_idx"]
+    assert row["raw_read_count_r1r2"] is None  # SUM over zero rows
+    assert row["sample_count"] == 0
+    assert row["samples_with_metrics"] == 0
+
+
 async def test_fraction_recomputes_from_sums_not_mean_of_fractions(pool_ctx):
     """Sample A (100/100 = 1.0) and B (900 raw, 0 qf = 0.0): a mean of per-sample
     fractions would be 0.5, but the pool rollup sums first — 100/1000 = 0.1. We

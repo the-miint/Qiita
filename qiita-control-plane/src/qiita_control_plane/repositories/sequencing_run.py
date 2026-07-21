@@ -20,7 +20,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import BCL_CONVERT_ACTION_ID, READ_MASK_ACTION_ID
-from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, Platform
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, Platform, WorkTicketState
 
 
 class PayloadMismatch(Exception):
@@ -578,10 +578,10 @@ async def fetch_sequenced_pool_completion(
     return await pool_or_conn.fetchrow(
         "WITH sample_state AS ("
         "  SELECT ss.prep_sample_idx,"
-        "    bool_or(wt.state = 'completed') AS has_completed,"
+        "    bool_or(wt.state = $5::qiita.work_ticket_state) AS has_completed,"
         "    bool_or(wt.state = ANY($3::qiita.work_ticket_state[])) AS has_inflight,"
-        "    bool_or(wt.state = 'no_data') AS has_no_data,"
-        "    bool_or(wt.state = 'failed') AS has_failed,"
+        "    bool_or(wt.state = $6::qiita.work_ticket_state) AS has_no_data,"
+        "    bool_or(wt.state = $7::qiita.work_ticket_state) AS has_failed,"
         "    count(wt.work_ticket_idx) AS ticket_count"
         "  FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
@@ -614,6 +614,9 @@ async def fetch_sequenced_pool_completion(
         READ_MASK_ACTION_ID,
         list(NON_TERMINAL_WORK_TICKET_STATES),
         reference_idx,
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.FAILED.value,
     )
 
 
@@ -636,16 +639,19 @@ async def fetch_sequenced_pool_demux_state(
     predicate depends on its spelling."""
     row = await pool_or_conn.fetchrow(
         "SELECT"
-        "  bool_or(state = 'completed') AS has_completed,"
+        "  bool_or(state = $4::qiita.work_ticket_state) AS has_completed,"
         "  bool_or(state = ANY($3::qiita.work_ticket_state[])) AS has_in_flight,"
-        "  bool_or(state = 'no_data') AS has_no_data,"
-        "  bool_or(state = 'failed') AS has_failed,"
+        "  bool_or(state = $5::qiita.work_ticket_state) AS has_no_data,"
+        "  bool_or(state = $6::qiita.work_ticket_state) AS has_failed,"
         "  count(*) AS ticket_count"
         " FROM qiita.work_ticket"
         " WHERE sequenced_pool_idx = $1 AND action_id = $2",
         sequenced_pool_idx,
         BCL_CONVERT_ACTION_ID,
         list(NON_TERMINAL_WORK_TICKET_STATES),
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.FAILED.value,
     )
     if row["has_completed"]:
         return "completed"
@@ -677,9 +683,11 @@ async def fetch_sequenced_pool_sample_exceptions(
         " ss.ena_experiment_accession, ss.ena_run_accession,"
         " ss.raw_read_count_r1r2, ss.quality_filtered_read_count_r1r2,"
         " EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
-        "   ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'failed') AS has_failed,"
+        "   ss.prep_sample_idx AND wt.action_id = $2"
+        "   AND wt.state = $3::qiita.work_ticket_state) AS has_failed,"
         " EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
-        "   ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'completed') AS has_completed"
+        "   ss.prep_sample_idx AND wt.action_id = $2"
+        "   AND wt.state = $4::qiita.work_ticket_state) AS has_completed"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
@@ -692,13 +700,17 @@ async def fetch_sequenced_pool_sample_exceptions(
         "     OR ss.ena_experiment_accession IS NULL"
         "     OR ss.ena_run_accession IS NULL"
         "     OR (EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
-        "           ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'failed')"
+        "           ss.prep_sample_idx AND wt.action_id = $2"
+        "           AND wt.state = $3::qiita.work_ticket_state)"
         "         AND NOT EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
-        "           ss.prep_sample_idx AND wt.action_id = $2 AND wt.state = 'completed'))"
+        "           ss.prep_sample_idx AND wt.action_id = $2"
+        "           AND wt.state = $4::qiita.work_ticket_state))"
         "   )"
         " ORDER BY ss.idx",
         sequenced_pool_idx,
         READ_MASK_ACTION_ID,
+        WorkTicketState.FAILED.value,
+        WorkTicketState.COMPLETED.value,
     )
 
 
