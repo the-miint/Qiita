@@ -336,9 +336,11 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` —
 ///   logical DELETEs; re-running deletes zero rows.
-/// - `export_read` / `export_read_block` / `export_read_masked_block` —
-///   re-materialize the same sample/block bytes to the same ticket path via
-///   atomic publish; a replay reproduces identical output.
+/// - `export_read` — re-materializes the same sample's bytes to the same ticket
+///   path via atomic publish; a replay reproduces identical output. (The block
+///   exports that used to sit beside it are gone: block-scoped compute now
+///   STREAMS its reads over the `read_block` / `read_masked_block` DoGet
+///   selectors, which are read-only and need no replay classification.)
 /// - `count_masked` / `mask_metrics` — read-only aggregates.
 ///
 /// The `do_action` dispatcher rejects any action not in this set, so a **new**
@@ -355,8 +357,6 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_alignment",
     "delete_alignment_block",
     "export_read",
-    "export_read_block",
-    "export_read_masked_block",
     "count_masked",
     "mask_metrics",
 ];
@@ -784,122 +784,6 @@ impl FlightService for QiitaFlightService {
                 })
                 .await
                 .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
-
-                let result_body = serde_json::to_vec(&serde_json::json!({
-                    "count": count,
-                    "dest": payload.dest,
-                }))
-                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-                let result = arrow_flight::Result {
-                    body: result_body.into(),
-                };
-                let output = stream::once(futures::future::ready(Ok(result)));
-                Ok(Response::new(Box::pin(output)))
-            }
-            "export_read_block" => {
-                let payload = auth::verify_export_read_block(&action.body, &self.flight_public_key)
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-                if payload.action != "export_read_block" {
-                    return Err(Status::invalid_argument(format!(
-                        "action type mismatch: header says 'export_read_block', payload says {:?}",
-                        payload.action
-                    )));
-                }
-                // An empty block is a control-plane bug, not a valid ask —
-                // reject it loudly rather than silently writing an empty file.
-                if payload.members.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "export_read_block requires a non-empty members list",
-                    ));
-                }
-
-                // Defense in depth on the signature-trusted destination before it is
-                // inlined into a DuckDB `COPY ... TO` literal and written to.
-                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
-
-                // `COPY` is synchronous and, for a ~10M-read block, long-lived —
-                // run it on the blocking pool so it never starves a tonic async
-                // worker. The closure opens and drops its own connection, so it
-                // is Send and crosses no await (mirrors `export_read`).
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
-                let scratch_root = self.scratch_root.clone();
-                let members = payload.members;
-                let count = tokio::task::spawn_blocking(move || {
-                    export_read_block_to_parquet(
-                        &catalog,
-                        &data_path,
-                        &members,
-                        &dest,
-                        &scratch_root,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("export_read_block task join failed: {e}"))
-                })??;
-
-                let result_body = serde_json::to_vec(&serde_json::json!({
-                    "count": count,
-                    "dest": payload.dest,
-                }))
-                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-                let result = arrow_flight::Result {
-                    body: result_body.into(),
-                };
-                let output = stream::once(futures::future::ready(Ok(result)));
-                Ok(Response::new(Box::pin(output)))
-            }
-            "export_read_masked_block" => {
-                let payload =
-                    auth::verify_export_read_masked_block(&action.body, &self.flight_public_key)
-                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-                if payload.action != "export_read_masked_block" {
-                    return Err(Status::invalid_argument(format!(
-                        "action type mismatch: header says 'export_read_masked_block', \
-                         payload says {:?}",
-                        payload.action
-                    )));
-                }
-                // An empty block is a control-plane bug, not a valid ask —
-                // reject it loudly rather than silently writing an empty file.
-                if payload.members.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "export_read_masked_block requires a non-empty members list",
-                    ));
-                }
-
-                // Defense in depth on the HMAC-trusted destination before it is
-                // inlined into a DuckDB `COPY ... TO` literal and written to.
-                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
-
-                // `COPY` is synchronous and, for a ~10M-read block, long-lived —
-                // run it on the blocking pool so it never starves a tonic async
-                // worker. The closure opens and drops its own connection, so it
-                // is Send and crosses no await (mirrors `export_read_block`).
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
-                let scratch_root = self.scratch_root.clone();
-                let mask_idx = payload.mask_idx;
-                let members = payload.members;
-                let count = tokio::task::spawn_blocking(move || {
-                    export_read_masked_block_to_parquet(
-                        &catalog,
-                        &data_path,
-                        mask_idx,
-                        &members,
-                        &dest,
-                        &scratch_root,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("export_read_masked_block task join failed: {e}"))
-                })??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "count": count,
@@ -1563,88 +1447,11 @@ fn export_read_to_parquet(
     )
 }
 
-/// Re-materialize a block's reads — the union of its `(prep_sample_idx,
-/// sequence_idx sub-range)` members — into a per-ticket `reads.parquet` a
-/// read-mask *block* job consumes. Returns the row count (0 ⇒ no file written).
-///
-/// The WHERE clause is **exact by construction** yet still pushes down. Two
-/// coarse conjuncts do the pruning — each DuckLake `read` data file holds exactly
-/// one sample sorted by `sequence_idx`, so `prep_sample_idx IN (...)` prunes to
-/// the block's files at the catalog level and `sequence_idx BETWEEN block_min AND
-/// block_max` prunes row-groups (both are top-level conjuncts DuckDB pushes to
-/// the scan). A third conjunct — the per-member OR of `(prep_sample_idx = p AND
-/// sequence_idx BETWEEN start AND stop)` — is an exact residual on the already-
-/// pruned rows: it guarantees a split member contributes ONLY its own sub-range,
-/// so the part of that sample living in a sibling block never leaks, independent
-/// of any tiling order or boundary-alignment invariant. The coarse pair is a
-/// superset of the OR, so `coarse AND exact == exact`. All member integers are
-/// signature-verified i64s, safe to inline. An empty `members` list writes no file and
-/// returns 0 (the DoAction arm rejects it earlier too).
-fn export_read_block_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
-    members: &[auth::BlockReadMember],
-    dest: &Path,
-    scratch_root: &Path,
-) -> Result<i64, Status> {
-    if members.is_empty() {
-        return Ok(0);
-    }
-    let where_clause = block_read_where_clause(members);
-    export_select_to_parquet(
-        catalog_connstr,
-        data_path,
-        &format!("SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read WHERE {where_clause}"),
-        dest,
-        scratch_root,
-    )
-}
-
-/// Re-materialize a block's MASKED reads — the union of its `(prep_sample_idx,
-/// sequence_idx sub-range)` members, from the `read_masked` VIEW scoped to
-/// `mask_idx` — into a per-ticket `reads.parquet` the `align_sharded` job
-/// consumes. Returns the row count (0 ⇒ no file written).
-///
-/// The masked sibling of `export_read_block_to_parquet`: same exact-by-
-/// construction member selector (`block_read_where_clause`) and identical
-/// `EXPORT_READ_COLUMNS` output shape, but the source is the `read_masked` VIEW
-/// (trimmed + host/QC-`pass`-filtered) rather than the raw `read` table, and the
-/// selection is further scoped by `mask_idx = ?` so it materializes exactly the
-/// reads that survived THIS host-depletion mask. That means a block's masked
-/// export can be SMALLER than its raw range (masked-out reads drop) — legitimate,
-/// not an under-selection; only a genuinely empty result (no covering pass row)
-/// writes no file. `read_masked` exposes `EXPORT_READ_COLUMNS` verbatim, so
-/// `align_sharded.reads` is unchanged. `mask_idx` + all member integers are
-/// HMAC-verified i64s, safe to inline. See `export_select_to_parquet` for the
-/// shared write/publish.
-fn export_read_masked_block_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
-    mask_idx: i64,
-    members: &[auth::BlockReadMember],
-    dest: &Path,
-    scratch_root: &Path,
-) -> Result<i64, Status> {
-    if members.is_empty() {
-        return Ok(0);
-    }
-    let where_clause = block_read_where_clause(members);
-    export_select_to_parquet(
-        catalog_connstr,
-        data_path,
-        &format!(
-            "SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read_masked \
-             WHERE mask_idx = {mask_idx} AND ({where_clause})"
-        ),
-        dest,
-        scratch_root,
-    )
-}
-
-/// Build the block export's `read` WHERE clause from its members. Factored out of
-/// `export_read_block_to_parquet` so the pushdown performance-assessment test can
-/// exercise the EXACT predicate the export emits, not a hand-written copy that
-/// could silently drift.
+/// Build a block's `read` WHERE clause from its members. The ONE translator from
+/// block members to SQL: the block-read DoGet selectors (`build_block_read_query`)
+/// and the block DELETE actions all go through it, so a block's read footprint and
+/// its delete footprint cannot drift, and the pushdown performance-assessment test
+/// exercises the EXACT predicate they emit rather than a hand-written copy.
 ///
 /// Two coarse conjuncts drive pruning (both are top-level, so DuckDB pushes them
 /// to the scan): `prep_sample_idx IN (...)` prunes DuckLake data files by their
@@ -3990,8 +3797,6 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     fn export_read_writes_sample_parquet() {
-        use std::os::unix::fs::PermissionsExt;
-
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
@@ -4077,6 +3882,34 @@ mod tests {
         ));
     }
 
+    /// Run the SQL a block-read DoGet ticket produces and materialize it into
+    /// `dest_table` on `conn`, returning the row count.
+    ///
+    /// The streaming-path twin of the retired export-to-Parquet helpers: same
+    /// source relation, same `block_read_where_clause` selector, same
+    /// `EXPORT_READ_COLUMNS` projection — only the sink differs. The member
+    /// semantics these tests pin (a gap sample excluded, a split member
+    /// contributing only its sub-range) are properties of the SELECTOR, so they
+    /// are exercised here exactly as they were through the export.
+    #[cfg(feature = "integration")]
+    fn materialize_block_read_doget(
+        conn: &Connection,
+        table: &str,
+        filter: &auth::TicketFilter,
+        members: &[auth::BlockReadMember],
+        dest_table: &str,
+    ) -> i64 {
+        let (sql, _) = build_query(table, filter, members).expect("build_query failed");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE {dest_table} AS {sql}"
+        ))
+        .expect("block-read DoGet SQL failed");
+        conn.query_row(&format!("SELECT count(*) FROM {dest_table}"), [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
     /// `export_read_block` materializes the UNION of its members' `read`
     /// sub-ranges and nothing else: a sample whose `sequence_idx` falls in the
     /// gap between two block members (but whose prep_sample is not a member) is
@@ -4087,8 +3920,6 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     fn export_read_block_writes_union_and_excludes_gap_and_split() {
-        use std::os::unix::fs::PermissionsExt;
-
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
@@ -4133,20 +3964,20 @@ mod tests {
             },
         ];
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("reads.parquet");
-        let count = export_read_block_to_parquet(&connstr, &data_path, &members, &dest, dir.path())
-            .expect("export_read_block_to_parquet failed");
+        let count = materialize_block_read_doget(
+            &conn,
+            "read_block",
+            &auth::TicketFilter::new(),
+            &members,
+            "block_doget_rows",
+        );
         assert_eq!(
             count, 5,
             "3 (prep_a) + 2 (prep_c sub-range) = 5; gap excluded"
         );
-        assert!(dest.exists());
-        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o440, "exported parquet is mode 440");
 
-        let reader = Connection::open_in_memory().unwrap();
-        let dest_str = dest.to_str().unwrap();
+        let reader = &conn;
+        let dest_str = "block_doget_rows";
         // The gap sample must be entirely absent.
         let gap_rows: i64 = reader
             .query_row(
@@ -4184,29 +4015,29 @@ mod tests {
 
         // An empty block writes no file and reports 0 (defense in depth — the
         // DoAction arm also rejects empty members before calling this).
-        let dest_empty = dir.path().join("empty.parquet");
-        let zero = export_read_block_to_parquet(&connstr, &data_path, &[], &dest_empty, dir.path())
-            .expect("empty block should succeed with 0");
-        assert_eq!(zero, 0);
-        assert!(!dest_empty.exists(), "no file written for an empty block");
+        // An empty members list is REFUSED outright on the streaming path (an
+        // unscoped raw read must not be representable), where the retired export
+        // wrote no file and returned 0.
+        assert!(
+            build_query("read_block", &auth::TicketFilter::new(), &[]).is_err(),
+            "an empty members selector must be rejected, not treated as zero rows"
+        );
 
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_gap}, {prep_c});"
         ));
     }
 
-    /// `export_read_masked_block_to_parquet` materializes the block's members from
-    /// the `read_masked` VIEW scoped to `mask_idx`: it excludes non-`pass` reads
-    /// (the view's privacy filter), a different mask's rows, and non-member
-    /// samples — writing the same `EXPORT_READ_COLUMNS` shape as the raw block
-    /// export. Because masked-out reads drop, the masked export can be a proper
+    /// The `read_masked_block` DoGet selector streams the block's members from the
+    /// `read_masked` VIEW scoped to `mask_idx`: it excludes non-`pass` reads (the
+    /// view's privacy filter), a different mask's rows, and non-member samples —
+    /// in the same `EXPORT_READ_COLUMNS` shape the raw `read_block` selector
+    /// yields. Because masked-out reads drop, a masked block can be a proper
     /// subset of the raw range.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     fn export_read_masked_block_writes_only_pass_rows_for_mask() {
-        use std::os::unix::fs::PermissionsExt;
-
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
@@ -4247,28 +4078,23 @@ mod tests {
             sequence_idx_stop: 102,
         }];
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("reads.parquet");
-        let count = export_read_masked_block_to_parquet(
-            &connstr,
-            &data_path,
-            mask_a,
-            &members,
-            &dest,
-            dir.path(),
-        )
-        .expect("export_read_masked_block_to_parquet failed");
-        // seq 100 & 102 pass; seq 101 (host) excluded by the view => 2 rows.
-        assert_eq!(
-            count, 2,
-            "only the 2 pass rows in the member range are exported"
+        let mut mask_filter = auth::TicketFilter::new();
+        mask_filter.insert(
+            "mask_idx".to_string(),
+            vec![serde_json::Value::from(mask_a)],
         );
-        assert!(dest.exists());
-        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o440, "exported parquet is mode 440");
+        let count = materialize_block_read_doget(
+            &conn,
+            "read_masked_block",
+            &mask_filter,
+            &members,
+            "masked_block_doget_rows",
+        );
+        // seq 100 & 102 pass; seq 101 (host) excluded by the view => 2 rows.
+        assert_eq!(count, 2, "only the 2 pass rows in the member range stream");
 
-        let reader = Connection::open_in_memory().unwrap();
-        let dest_str = dest.to_str().unwrap();
+        let reader = &conn;
+        let dest_str = "masked_block_doget_rows";
         // Same column shape as the raw block export (EXPORT_READ_COLUMNS).
         let cols: Vec<String> = {
             let mut stmt = reader
@@ -4313,19 +4139,13 @@ mod tests {
             "host-masked seq 101 excluded; only pass rows"
         );
 
-        // An empty members list writes no file and returns 0.
-        let dest_empty = dir.path().join("empty.parquet");
-        let zero = export_read_masked_block_to_parquet(
-            &connstr,
-            &data_path,
-            mask_a,
-            &[],
-            &dest_empty,
-            dir.path(),
-        )
-        .expect("empty block should succeed with 0");
-        assert_eq!(zero, 0);
-        assert!(!dest_empty.exists(), "no file written for an empty block");
+        // An empty members list is REFUSED outright on the streaming path —
+        // stricter than the retired export, which wrote no file and returned 0.
+        // An unscoped read must not be representable at all (see ALLOWED_TABLES).
+        assert!(
+            build_query("read_masked_block", &mask_filter, &[]).is_err(),
+            "an empty members selector must be rejected, not treated as zero rows"
+        );
 
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_b});
@@ -4376,17 +4196,20 @@ mod tests {
             },
         ];
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("reads.parquet");
-        let count = export_read_block_to_parquet(&connstr, &data_path, &members, &dest, dir.path())
-            .expect("export_read_block_to_parquet failed");
+        let count = materialize_block_read_doget(
+            &conn,
+            "read_block",
+            &auth::TicketFilter::new(),
+            &members,
+            "block_doget_rows",
+        );
         assert_eq!(
             count, 6,
             "4 (prep_x sub-range 942010..942013) + 2 (prep_y) = 6; tail excluded"
         );
 
-        let reader = Connection::open_in_memory().unwrap();
-        let dest_str = dest.to_str().unwrap();
+        let reader = &conn;
+        let dest_str = "block_doget_rows";
         let x_max: i64 = reader
             .query_row(
                 &format!(

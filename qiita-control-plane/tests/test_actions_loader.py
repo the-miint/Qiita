@@ -835,7 +835,13 @@ def test_load_actions_loads_on_disk_read_mask_block_yaml():
 
     host_filter = next(s for s in rmb.steps if s.name == "host_filter")
     assert host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
-    assert host_filter.inputs == ["reads", "qc_mask"]
+    # No `reads` input: a block's steps STREAM their reads from the data plane at
+    # runtime, so the control plane stages nothing at submit time. qc likewise
+    # declares only its optional adapter_parquet.
+    assert host_filter.inputs == ["qc_mask"]
+    qc_step = next(s for s in rmb.steps if s.name == "qc")
+    assert qc_step.inputs == []
+    assert qc_step.optional_inputs == ["adapter_parquet"]
     assert host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
     assert host_filter.params == {"mask_idx": "mask_idx"}
 

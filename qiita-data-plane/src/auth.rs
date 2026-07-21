@@ -353,90 +353,6 @@ pub struct BlockReadMember {
     pub sequence_idx_stop: i64,
 }
 
-/// Parsed payload for the `export_read_block` DoAction — the block-compute
-/// sibling of `export_read`.
-///
-/// Wire shape pinned by `qiita_control_plane.runner._resolve_staged_reads_block`:
-/// `{"action": "export_read_block", "dest": "<abs path>",
-///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
-///                "sequence_idx_stop": b}, ...]}`.
-/// The data plane re-materializes the union of the members' `read` sub-ranges
-/// from its DuckLake `read` table to `dest` (a per-ticket `reads.parquet` a
-/// read-mask *block* job then consumes) — the bulk read bytes never transit the
-/// control plane. Constraining on `prep_sample_idx` (not `sequence_idx` alone)
-/// keeps the selector correct even where the inner index is only locally unique
-/// (the reusable block-compute case). No `work_ticket_idx`: the `dest` path the
-/// CP builds already carries the ticket. `deny_unknown_fields` keeps the
-/// contract tight: any extra field is a design slip surfaced loudly here.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportReadBlockPayload {
-    /// Action discriminator; the gRPC handler also rejects a payload whose
-    /// `action` is not "export_read_block".
-    pub action: String,
-    /// Absolute destination path for the materialized Parquet. The handler
-    /// re-validates it (`validate_export_dest`) before writing — under the
-    /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is Ed25519-signed by the control plane (defense in depth).
-    pub dest: String,
-    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
-    /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<BlockReadMember>,
-}
-
-/// Verify an `export_read_block` DoAction token and return its parsed payload.
-pub fn verify_export_read_block(
-    ticket: &[u8],
-    verifying_key: &VerifyingKey,
-) -> Result<ExportReadBlockPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
-    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
-}
-
-/// Parsed payload for the `export_read_masked_block` DoAction — the MASKED-reads
-/// sibling of `export_read_block`.
-///
-/// Wire shape pinned by
-/// `qiita_control_plane.runner._resolve_staged_masked_reads_block`:
-/// `{"action": "export_read_masked_block", "dest": "<abs path>", "mask_idx": N,
-///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
-///                "sequence_idx_stop": b}, ...]}`.
-/// The data plane re-materializes the union of the members' sub-ranges from its
-/// DuckLake `read_masked` VIEW (filtered `mask_idx = ?`, so already trimmed and
-/// host/QC-`pass`-filtered) to `dest` — a per-ticket `reads.parquet` the sharded
-/// `align_sharded` job then consumes, in the SAME column shape `export_read_block`
-/// writes. It is `export_read_block` (dest + members, reusing
-/// `BlockReadMember`) plus the `mask_idx` scope — the raw `read` export
-/// needs no mask column, a masked export does. `deny_unknown_fields` keeps the
-/// contract tight: any extra field is a design slip surfaced loudly here.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportReadMaskedBlockPayload {
-    /// Action discriminator; the gRPC handler also rejects a payload whose
-    /// `action` is not "export_read_masked_block".
-    pub action: String,
-    /// Absolute destination path for the materialized Parquet. The handler
-    /// re-validates it (`validate_export_dest`) before writing — under the
-    /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is Ed25519-signed by the control plane (defense in depth).
-    pub dest: String,
-    /// `i64`, matching the Postgres `alignment_definition` mask scope and the
-    /// `read_mask.mask_idx BIGINT` column the `read_masked` view filters on.
-    pub mask_idx: i64,
-    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
-    /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<BlockReadMember>,
-}
-
-/// Verify an `export_read_masked_block` DoAction token and return its payload.
-pub fn verify_export_read_masked_block(
-    ticket: &[u8],
-    verifying_key: &VerifyingKey,
-) -> Result<ExportReadMaskedBlockPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
-    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
-}
-
 /// Parsed payload for the `delete_read_mask_block` DoAction — the idempotent
 /// block-replace sibling of `export_read_block`.
 ///
@@ -809,109 +725,59 @@ mod tests {
         }
     }
 
-    // -------------------- export_read_block --------------------
+    // -------------------- block-read DoGet ticket members --------------------
+    //
+    // The `export_read_block` / `export_read_masked_block` ACTION tokens are gone;
+    // block-scoped reads are now a DoGet ticket carrying `members`. The parsing
+    // guarantees those action tests pinned — a member is exactly three fields, and
+    // a smuggled field is a hard error — live on `BlockReadMember`, which the
+    // DoGet payload embeds, so they are re-pinned here rather than dropped.
 
     #[test]
-    fn verify_export_read_block_round_trip() {
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/ticket/900/reads.parquet","members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]}"#;
+    fn verify_ticket_parses_block_read_members() {
+        let payload = br#"{"filter":{},"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}],"table":"read_block"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        let parsed =
-            verify_export_read_block(&ticket, &test_vk()).expect("valid token should verify");
-        assert_eq!(parsed.action, "export_read_block");
+        let parsed = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert_eq!(parsed.table, "read_block");
         assert_eq!(parsed.members.len(), 2);
         assert_eq!(parsed.members[0].prep_sample_idx, 101);
         assert_eq!(parsed.members[1].sequence_idx_stop, 309);
+        assert!(
+            parsed.filter.is_empty(),
+            "read_block scopes by members alone"
+        );
     }
 
     #[test]
-    fn verify_export_read_block_rejects_member_extra_fields() {
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}]}"#;
+    fn verify_ticket_parses_masked_block_members_with_mask_scope() {
+        let payload = br#"{"filter":{"mask_idx":[7]},"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}],"table":"read_masked_block"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
+        let parsed = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert_eq!(parsed.table, "read_masked_block");
+        assert_eq!(parsed.members.len(), 1);
+        assert_eq!(parsed.filter.get("mask_idx").unwrap()[0].as_i64(), Some(7));
+    }
+
+    #[test]
+    fn verify_ticket_rejects_member_extra_fields() {
+        // BlockReadMember is deny_unknown_fields: a member is exactly the three
+        // columns, so a smuggled field is a malformed ticket, not an ignored one.
+        let payload = br#"{"filter":{},"members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}],"table":"read_block"}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_ticket(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
     #[test]
-    fn verify_export_read_block_rejects_extra_fields() {
-        // Top-level deny_unknown_fields (distinct from the member-level guard above).
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}],"smuggled":9}"#;
+    fn verify_ticket_defaults_members_when_absent() {
+        // Every pre-existing (non-block) ticket omits `members` entirely; it must
+        // still parse, with an empty selector.
+        let payload = br#"{"filter":{"feature_idx":[1]},"table":"reference_sequences"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
-            AuthError::MalformedPayload(_) => {}
-            other => panic!("expected MalformedPayload, got {other:?}"),
-        }
-    }
-
-    // --------------------------------------------------------------------
-    // export_read_masked_block action token variant
-    // --------------------------------------------------------------------
-
-    fn make_export_read_masked_block_ticket(
-        dest: &str,
-        mask_idx: i64,
-        members: &str,
-        key: &SigningKey,
-        expiry: u64,
-    ) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace. Top-level keys sorted:
-        // action, dest, mask_idx, members.
-        let payload = format!(
-            r#"{{"action":"export_read_masked_block","dest":"{dest}","mask_idx":{mask_idx},"members":{members}}}"#
-        );
-        build_ticket(payload.as_bytes(), key, expiry)
-    }
-
-    #[test]
-    fn verify_export_read_masked_block_round_trip() {
-        let members =
-            r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}]"#;
-        let ticket = make_export_read_masked_block_ticket(
-            "/scratch/ticket/900/reads.parquet",
-            7,
-            members,
-            &test_signing_key(),
-            future_expiry(300),
-        );
-        let payload = verify_export_read_masked_block(&ticket, &test_vk())
-            .expect("valid token should verify");
-        assert_eq!(payload.action, "export_read_masked_block");
-        assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
-        assert_eq!(payload.mask_idx, 7);
-        assert_eq!(payload.members.len(), 1);
-        assert_eq!(payload.members[0].prep_sample_idx, 101);
-        assert_eq!(payload.members[0].sequence_idx_start, 100);
-        assert_eq!(payload.members[0].sequence_idx_stop, 109);
-    }
-
-    #[test]
-    fn verify_export_read_masked_block_rejects_bad_signature() {
-        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
-        let mut ticket = make_export_read_masked_block_ticket(
-            "/scratch/ticket/1/reads.parquet",
-            3,
-            members,
-            &test_signing_key(),
-            future_expiry(300),
-        );
-        ticket[12] ^= 0xFF;
-        assert_eq!(
-            verify_export_read_masked_block(&ticket, &test_vk()).unwrap_err(),
-            AuthError::InvalidSignature
-        );
-    }
-
-    #[test]
-    fn verify_export_read_masked_block_rejects_extra_fields() {
-        // deny_unknown_fields: a smuggled top-level field (or a missing mask_idx)
-        // is a contract slip surfaced here.
-        let payload = br#"{"action":"export_read_masked_block","dest":"/scratch/x","mask_idx":1,"members":[],"smuggled":9}"#;
-        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        match verify_export_read_masked_block(&ticket, &test_vk()).unwrap_err() {
-            AuthError::MalformedPayload(_) => {}
-            other => panic!("expected MalformedPayload, got {other:?}"),
-        }
+        let parsed = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert!(parsed.members.is_empty());
     }
 
     // -------------------- mask_metrics --------------------

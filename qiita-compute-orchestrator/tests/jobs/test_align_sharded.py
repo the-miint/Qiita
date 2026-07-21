@@ -672,31 +672,20 @@ def test_align_sharded_rejects_unknown_aligner(tmp_path):
         )
 
 
-def test_align_sharded_plan_sizes_walltime_from_read_count(tmp_path):
-    """plan() returns a walltime hint (memory/cpu untouched) that grows with the
-    read-block cardinality."""
+def test_align_sharded_has_no_plan():
+    """align_sharded deliberately exposes NO plan().
+
+    Its reads stream from the data plane, and the walltime model it used to carry
+    was driven by a Parquet-footer read count that a stream cannot supply — and
+    plan() runs at submit time in the orchestrator process, so it must not open a
+    Flight stream to find one. Sizing falls back to the workflow YAML baseline
+    with TIMEOUT escalation as the backstop, matching estimate_feature_table.
+
+    Pinned as a test because the absence is a decision, not an omission: the
+    block's exact read count IS derivable control-plane-side from the block
+    members, so restoring sizing means threading that count through the workflow
+    `params:` — not reinstating a footer read here.
+    """
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    def _walltime(n_rows):
-        reads = _write_reads_parquet(
-            tmp_path / f"reads_{n_rows}.parquet",
-            [(1, i, "ACGT", None) for i in range(n_rows)],
-        )
-        inputs = align_sharded.Inputs(
-            reads=reads,
-            reference_idx=1,
-            alignment_idx=555,
-            aligner="minimap2",
-            router_index_path=tmp_path / "r.ryxdi",
-            shard_directory=tmp_path / "shards",
-            work_ticket_idx=1,
-        )
-        plan = align_sharded.plan(inputs)
-        assert plan.resources is not None
-        assert plan.resources.mem_gb is None and plan.resources.cpu is None
-        return plan.resources.walltime
-
-    small = _walltime(1)
-    big = _walltime(500)
-    assert small is not None and big is not None
-    assert big >= small  # non-decreasing in read count
+    assert not hasattr(align_sharded, "plan")

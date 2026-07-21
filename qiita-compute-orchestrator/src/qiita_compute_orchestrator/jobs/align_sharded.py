@@ -122,9 +122,8 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
-from ..job_resource_plan import count_read_pairs, linear_walltime
 from ..miint import PARQUET_OPTS, apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn
-from . import JobPlan, JobResourcePlan
+from ..read_source import bind_step_reads
 
 YAML_STEP_NAME = "align_sharded"
 
@@ -220,15 +219,16 @@ _BOWTIE2_ALIGN_PARAMS = (
     "no_discordant := true, no_mixed := true"
 )
 
-# plan() walltime model — like qc, alignment STREAMS (per-read classify + align +
-# a spill-to-disk sort), so runtime tracks read count while peak RAM is roughly
-# flat (the out-of-heap indexes dominate and don't grow with the read block).
-# Alignment is heavier per read than qc's scalar transform, so a larger per-million
-# coefficient. Conservative INITIAL estimates to refine against telemetry — the CP
-# only LOWERS walltime to this (never above baseline) and TIMEOUT escalation is the
-# backstop, so a low coefficient costs at most a retry.
-_PLAN_BASE_WALLTIME_SECONDS = 600  # 10 min: process + DuckDB init + index load + fixed I/O
-_PLAN_WALLTIME_SECONDS_PER_MILLION_PAIRS = 600.0
+# No plan(): this job's reads STREAM from the data plane, and the walltime model
+# it used to carry was driven by a Parquet-footer read-count that a stream cannot
+# supply. Sizing therefore falls back to the workflow YAML baseline, with TIMEOUT
+# escalation as the backstop — the same posture estimate_feature_table takes, and
+# for the same reason (input cardinality is not knowable at submit time).
+#
+# This is a deliberate trade, not an oversight: the block's exact read count IS
+# derivable control-plane-side from the block members (sum of the per-member
+# sequence_idx spans), so walltime sizing can come back by threading that count
+# through the workflow `params:`. Left for a follow-up.
 
 # In-DuckDB relation names. The query + read-meta are VIEWs; read_to_shard is a
 # TABLE resolved by align's separate connection; the alignments TABLE is CTAS'd by
@@ -280,12 +280,15 @@ _EMPTY_ALIGNMENT_SELECT = (
 class Inputs(BaseModel):
     """Typed input contract for align_sharded.
 
-    `reads` is the staged read-block Parquet in the `export_read_block` column
-    shape `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
-    qual2)` — the block of reads to align. Under the `align` workflow this is the
-    block's HOST-DEPLETED, QC-passed reads (the runner stages the `read_masked`
-    view via `export_read_masked_block`); the job treats `reads` as an opaque
-    export-shaped file either way, so this is a source change, not a job change.
+    `reads` is left UNBOUND by the `align` workflow, which is the signal to stream
+    the block's reads from the data plane at runtime (`bind_step_reads`, keyed on
+    `work_ticket_idx`). The control plane decides which reads that means — for an
+    align ticket, the block's HOST-DEPLETED, QC-passed `read_masked` rows scoped to
+    the completed mask — so this job cannot request raw reads by mistake. The bound
+    relation carries the same `(prep_sample_idx, sequence_idx, read_id, sequence1,
+    qual1, sequence2, qual2)` shape the staged Parquet used to, so the alignment
+    body is unchanged. The field remains an optional Path so the shared seam has
+    one signature across jobs; binding one is not used by any current workflow.
     `aligner` selects the sharded aligner (`minimap2` or `bowtie2`), which the CP
     picks from the read platform at align-plan time (not a free caller choice);
     `router_index_path` is the whole-reference rype ROUTER `.ryxdi`
@@ -311,7 +314,7 @@ class Inputs(BaseModel):
     like host_filter, each output row's owner is stamped PER ROW from the reads
     Parquet, so a multi-sample block needs no scalar."""
 
-    reads: Path
+    reads: Path | None = None
     reference_idx: int | None = None
     aligner: Literal["minimap2", "bowtie2"]
     router_index_path: Path
@@ -435,8 +438,6 @@ def _run_align_bowtie2_sharded(
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    if not inputs.reads.exists():
-        raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     _validate_router_index(inputs.router_index_path)
     _validate_shard_directory(inputs.shard_directory)
 
@@ -444,7 +445,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # Output basename is the DuckLake-facing table name the register-files step
     # maps: `alignment.parquet` -> the `alignment` table.
     alignment = workspace / "alignment.parquet"
-    reads_sql = validate_parquet_path(inputs.reads)
     out_sql = validate_parquet_path(alignment)
 
     success = False
@@ -454,148 +454,160 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
 
-            # Per-read (sequence_idx -> prep_sample_idx) map, projected to the two
-            # key columns so the final COPY stamps each alignment row's owner PER
-            # ROW (a block spans many prep_samples). sequence_idx is unique, 1:1.
-            conn.execute(
-                f"CREATE VIEW {_READ_META} AS "
-                f"SELECT sequence_idx, prep_sample_idx FROM read_parquet('{reads_sql}')"
-            )
-            # The align query: the WHOLE read set, keyed by sequence_idx AS read_id,
-            # carrying sequence1 + sequence2. ONE query, no SE/PE split — the sharded
-            # aligners handle the mode natively (the host_filter pattern);
-            # `sequence2 IS NULL` marks single-end. A non-temp VIEW so miint's
-            # separate connection can resolve it by name.
-            conn.execute(
-                f"CREATE VIEW {_QUERY} AS "
-                "SELECT sequence_idx AS read_id, sequence1, sequence2 "
-                f"FROM read_parquet('{reads_sql}')"
-            )
-            # read_to_shard (non-temp — align resolves it by name on its own
-            # connection). One rype_classify pass fills it; multi-bucket, so a read
-            # spanning K shards gets K rows and aligns against all K.
-            conn.execute(f"CREATE TABLE {_READ_TO_SHARD} (read_id BIGINT, shard_name VARCHAR)")
-            _build_read_to_shard(
-                conn,
-                inputs.router_index_path,
-                _QUERY,
-                _READ_TO_SHARD,
-                threshold=_ROUTING_THRESHOLD,
-            )
-
-            # If NO read routed to any shard, `read_to_shard` is empty — and miint's
-            # `align_*_sharded` REJECTS an empty `read_to_shard` at bind
-            # ("empty or has no valid shard names"), so it cannot be called at all.
-            # This is a LEGITIMATE no-op, not a failure: a block's reads can route
-            # nowhere because the block is genuinely empty (a completed
-            # host-depletion mask can carry 0 passing reads — a blank/control or
-            # fully host/QC-filtered sample the align planner still tiles) OR because
-            # none of its reads minimise into THIS reference. Either way, emit a
-            # valid empty (schema-correct) alignment.parquet and skip the aligner —
-            # register-files then registers 0 rows and reconcile flips the per-sample
-            # gate with no rows (it has no count-assertion, by design). Verified
-            # against real miint by the empty-batch case in
-            # tests/integration/test_sharded_alignment.py.
-            routed = conn.execute(f"SELECT count(*) FROM {_READ_TO_SHARD}").fetchone()[0]
-            if routed == 0:
-                conn.execute(f"COPY ({_EMPTY_ALIGNMENT_SELECT}) TO '{out_sql}' ({PARQUET_OPTS})")
-                success = True
-                return {"alignment": alignment, "alignment_staging_dir": workspace}
-
-            # ONE sharded-align call. Its FULL output (all SAM columns, verbatim) is
-            # materialised into _ALIGNMENTS by the seam. An empty aligner OUTPUT is
-            # still valid here (every routed read failed to align) — only an empty
-            # read_to_shard INPUT is the case handled above.
-            if inputs.aligner == "minimap2":
-                _run_align_minimap2_sharded(
+            # Bind the block's reads. Under `align` this streams from the data
+            # plane (the workflow binds no `reads` path) and materializes to a
+            # real table — which this job needs regardless of source, because it
+            # builds TWO relations over the reads below and a Flight reader is
+            # consumed once. The DuckDB memory_limit + workspace temp_directory
+            # set above bound that materialization (it spills, it does not grow
+            # the heap).
+            async with bind_step_reads(
+                conn, reads=inputs.reads, work_ticket_idx=inputs.work_ticket_idx
+            ) as reads_rel:
+                # Per-read (sequence_idx -> prep_sample_idx) map, projected to the two
+                # key columns so the final COPY stamps each alignment row's owner PER
+                # ROW (a block spans many prep_samples). sequence_idx is unique, 1:1.
+                conn.execute(
+                    f"CREATE VIEW {_READ_META} AS "
+                    f"SELECT sequence_idx, prep_sample_idx FROM {reads_rel}"
+                )
+                # The align query: the WHOLE read set, keyed by sequence_idx AS read_id,
+                # carrying sequence1 + sequence2. ONE query, no SE/PE split — the sharded
+                # aligners handle the mode natively (the host_filter pattern);
+                # `sequence2 IS NULL` marks single-end. A non-temp VIEW so miint's
+                # separate connection can resolve it by name.
+                conn.execute(
+                    f"CREATE VIEW {_QUERY} AS "
+                    "SELECT sequence_idx AS read_id, sequence1, sequence2 "
+                    f"FROM {reads_rel}"
+                )
+                # read_to_shard (non-temp — align resolves it by name on its own
+                # connection). One rype_classify pass fills it; multi-bucket, so a read
+                # spanning K shards gets K rows and aligns against all K.
+                conn.execute(f"CREATE TABLE {_READ_TO_SHARD} (read_id BIGINT, shard_name VARCHAR)")
+                _build_read_to_shard(
                     conn,
+                    inputs.router_index_path,
                     _QUERY,
-                    inputs.shard_directory,
                     _READ_TO_SHARD,
-                    _ALIGNMENTS,
-                    preset=_MINIMAP2_PRESET,
-                )
-            else:
-                _run_align_bowtie2_sharded(
-                    conn, _QUERY, inputs.shard_directory, _READ_TO_SHARD, _ALIGNMENTS
+                    threshold=_ROUTING_THRESHOLD,
                 )
 
-            # The high-identity filter — plus, for minimap2, a query-coverage floor —
-            # applied as the COPY's QUALIFY so it runs over the joined rows just before
-            # the sort. Both forms score identity from the =/X CIGAR via
-            # `cigar_sequence_identity`; they differ in the identity FLOOR (bowtie2
-            # 0.99, minimap2 0.90 — see the module constants) and in how a read's
-            # placement is grouped:
-            #   * bowtie2 (paired-end): POOL the two mates of each concordant
-            #     placement and judge the pair as a unit, so a pair is kept or
-            #     dropped together and a mate is never orphaned. The two mates store
-            #     their own and their partner's coordinates in SWAPPED order, so
-            #     LEAST/GREATEST(position, mate_position) gives both the same key;
-            #     including `reference` keeps a read's distinct placements (report_all
-            #     emits each as its own 2-record pair) separate, each judged alone.
-            #     No query-coverage gate — bowtie2 aligns end-to-end (qcov ~1.0).
-            #   * minimap2 (long-read, single-end): no mate to pool, so each
-            #     alignment is its own partition (keyed by position) and judged on its
-            #     own CIGAR — on identity AND query coverage (>= 0.90), since a
-            #     soft-clipped long read can be high-identity over a short aligned span.
-            if inputs.aligner == "bowtie2":
-                identity_partition = (
-                    "a.read_id, a.reference, "
-                    "LEAST(a.position, a.mate_position), "
-                    "GREATEST(a.position, a.mate_position)"
-                )
-                min_identity = _MIN_SEQUENCE_IDENTITY_BOWTIE2
-                coverage_clause = ""
-            else:
-                identity_partition = "a.read_id, a.reference, a.position"
-                min_identity = _MIN_SEQUENCE_IDENTITY_MINIMAP2
-                # Same pooled-CIGAR expression as identity; for a single-end record
-                # the partition is one row, so this is per-record query coverage.
-                coverage_clause = (
-                    " AND cigar_query_coverage("
+                # If NO read routed to any shard, `read_to_shard` is empty — and miint's
+                # `align_*_sharded` REJECTS an empty `read_to_shard` at bind
+                # ("empty or has no valid shard names"), so it cannot be called at all.
+                # This is a LEGITIMATE no-op, not a failure: a block's reads can route
+                # nowhere because the block is genuinely empty (a completed
+                # host-depletion mask can carry 0 passing reads — a blank/control or
+                # fully host/QC-filtered sample the align planner still tiles) OR because
+                # none of its reads minimise into THIS reference. Either way, emit a
+                # valid empty (schema-correct) alignment.parquet and skip the aligner —
+                # register-files then registers 0 rows and reconcile flips the per-sample
+                # gate with no rows (it has no count-assertion, by design). Verified
+                # against real miint by the empty-batch case in
+                # tests/integration/test_sharded_alignment.py.
+                routed = conn.execute(f"SELECT count(*) FROM {_READ_TO_SHARD}").fetchone()[0]
+                if routed == 0:
+                    conn.execute(
+                        f"COPY ({_EMPTY_ALIGNMENT_SELECT}) TO '{out_sql}' ({PARQUET_OPTS})"
+                    )
+                    success = True
+                    return {"alignment": alignment, "alignment_staging_dir": workspace}
+
+                # ONE sharded-align call. Its FULL output (all SAM columns, verbatim) is
+                # materialised into _ALIGNMENTS by the seam. An empty aligner OUTPUT is
+                # still valid here (every routed read failed to align) — only an empty
+                # read_to_shard INPUT is the case handled above.
+                if inputs.aligner == "minimap2":
+                    _run_align_minimap2_sharded(
+                        conn,
+                        _QUERY,
+                        inputs.shard_directory,
+                        _READ_TO_SHARD,
+                        _ALIGNMENTS,
+                        preset=_MINIMAP2_PRESET,
+                    )
+                else:
+                    _run_align_bowtie2_sharded(
+                        conn, _QUERY, inputs.shard_directory, _READ_TO_SHARD, _ALIGNMENTS
+                    )
+
+                # The high-identity filter — plus, for minimap2, a query-coverage floor —
+                # applied as the COPY's QUALIFY so it runs over the joined rows just before
+                # the sort. Both forms score identity from the =/X CIGAR via
+                # `cigar_sequence_identity`; they differ in the identity FLOOR (bowtie2
+                # 0.99, minimap2 0.90 — see the module constants) and in how a read's
+                # placement is grouped:
+                #   * bowtie2 (paired-end): POOL the two mates of each concordant
+                #     placement and judge the pair as a unit, so a pair is kept or
+                #     dropped together and a mate is never orphaned. The two mates store
+                #     their own and their partner's coordinates in SWAPPED order, so
+                #     LEAST/GREATEST(position, mate_position) gives both the same key;
+                #     including `reference` keeps a read's distinct placements (report_all
+                #     emits each as its own 2-record pair) separate, each judged alone.
+                #     No query-coverage gate — bowtie2 aligns end-to-end (qcov ~1.0).
+                #   * minimap2 (long-read, single-end): no mate to pool, so each
+                #     alignment is its own partition (keyed by position) and judged on its
+                #     own CIGAR — on identity AND query coverage (>= 0.90), since a
+                #     soft-clipped long read can be high-identity over a short aligned span.
+                if inputs.aligner == "bowtie2":
+                    identity_partition = (
+                        "a.read_id, a.reference, "
+                        "LEAST(a.position, a.mate_position), "
+                        "GREATEST(a.position, a.mate_position)"
+                    )
+                    min_identity = _MIN_SEQUENCE_IDENTITY_BOWTIE2
+                    coverage_clause = ""
+                else:
+                    identity_partition = "a.read_id, a.reference, a.position"
+                    min_identity = _MIN_SEQUENCE_IDENTITY_MINIMAP2
+                    # Same pooled-CIGAR expression as identity; for a single-end record
+                    # the partition is one row, so this is per-record query coverage.
+                    coverage_clause = (
+                        " AND cigar_query_coverage("
+                        f"string_agg(a.cigar, '') OVER (PARTITION BY {identity_partition})"
+                        f") >= {_MIN_QUERY_COVERAGE_MINIMAP2}"
+                    )
+
+                # Stream a sorted COPY. Prepend the CP-minted `alignment_idx` as the
+                # LEADING column (a constant for this align run — the block ticket
+                # carries one), so the DuckLake `alignment` table is keyed by it. Add the
+                # typed identity columns: `prep_sample_idx` (per-row owner via the
+                # _READ_META join, 1:many onto the alignments), `feature_idx`
+                # (`CAST(reference)`), and `mate_feature_idx` (the mate's feature, cast
+                # from `mate_reference`, decoding SAM's RNEXT encoding: `'='` = the same
+                # feature as this row, `'*'`/`''`/NULL = no mapped mate, else the mate's
+                # own feature id). Then pass the rest of the aligner output through, but
+                # DROP the raw VARCHAR `reference`/`mate_reference` (`EXCLUDE`) — their
+                # identity is already carried by `feature_idx`/`mate_feature_idx`, so
+                # persisting the string subject ids too is redundant. The mate columns +
+                # flags still keep a PE read's two mate rows an explicit pair.
+                # `(sequence_idx, feature_idx)` is NOT a key: cross-shard rows carry
+                # distinct feature_idx (a feature is in one shard), and a PE read's two
+                # mate rows share it. `alignment_idx` is a validated int (pydantic
+                # Inputs), safe to inline. Sorted by the identifier order (alignment_idx
+                # leads to match the register-side sort), with position/flags as
+                # tiebreakers so a PE read's mate rows land in a deterministic order — the
+                # column order + this sort match the DuckLake `alignment` table so
+                # register-files schema-matches.
+                conn.execute(
+                    f"COPY (SELECT CAST({inputs.alignment_idx} AS BIGINT) AS alignment_idx, "
+                    "rm.prep_sample_idx, a.read_id AS sequence_idx, "
+                    "CAST(a.reference AS BIGINT) AS feature_idx, "
+                    "CASE WHEN a.mate_reference = '=' THEN CAST(a.reference AS BIGINT) "
+                    "WHEN a.mate_reference IS NULL OR a.mate_reference IN ('*', '') THEN NULL "
+                    "ELSE CAST(a.mate_reference AS BIGINT) END AS mate_feature_idx, "
+                    "a.* EXCLUDE (read_id, reference, mate_reference) "
+                    f"FROM {_ALIGNMENTS} a "
+                    f"JOIN {_READ_META} rm ON rm.sequence_idx = a.read_id "
+                    "QUALIFY cigar_sequence_identity("
                     f"string_agg(a.cigar, '') OVER (PARTITION BY {identity_partition})"
-                    f") >= {_MIN_QUERY_COVERAGE_MINIMAP2}"
+                    f") >= {min_identity}{coverage_clause} "
+                    "ORDER BY alignment_idx, rm.prep_sample_idx, a.read_id, feature_idx, "
+                    "a.position, a.flags) "
+                    f"TO '{out_sql}' ({PARQUET_OPTS})"
                 )
-
-            # Stream a sorted COPY. Prepend the CP-minted `alignment_idx` as the
-            # LEADING column (a constant for this align run — the block ticket
-            # carries one), so the DuckLake `alignment` table is keyed by it. Add the
-            # typed identity columns: `prep_sample_idx` (per-row owner via the
-            # _READ_META join, 1:many onto the alignments), `feature_idx`
-            # (`CAST(reference)`), and `mate_feature_idx` (the mate's feature, cast
-            # from `mate_reference`, decoding SAM's RNEXT encoding: `'='` = the same
-            # feature as this row, `'*'`/`''`/NULL = no mapped mate, else the mate's
-            # own feature id). Then pass the rest of the aligner output through, but
-            # DROP the raw VARCHAR `reference`/`mate_reference` (`EXCLUDE`) — their
-            # identity is already carried by `feature_idx`/`mate_feature_idx`, so
-            # persisting the string subject ids too is redundant. The mate columns +
-            # flags still keep a PE read's two mate rows an explicit pair.
-            # `(sequence_idx, feature_idx)` is NOT a key: cross-shard rows carry
-            # distinct feature_idx (a feature is in one shard), and a PE read's two
-            # mate rows share it. `alignment_idx` is a validated int (pydantic
-            # Inputs), safe to inline. Sorted by the identifier order (alignment_idx
-            # leads to match the register-side sort), with position/flags as
-            # tiebreakers so a PE read's mate rows land in a deterministic order — the
-            # column order + this sort match the DuckLake `alignment` table so
-            # register-files schema-matches.
-            conn.execute(
-                f"COPY (SELECT CAST({inputs.alignment_idx} AS BIGINT) AS alignment_idx, "
-                "rm.prep_sample_idx, a.read_id AS sequence_idx, "
-                "CAST(a.reference AS BIGINT) AS feature_idx, "
-                "CASE WHEN a.mate_reference = '=' THEN CAST(a.reference AS BIGINT) "
-                "WHEN a.mate_reference IS NULL OR a.mate_reference IN ('*', '') THEN NULL "
-                "ELSE CAST(a.mate_reference AS BIGINT) END AS mate_feature_idx, "
-                "a.* EXCLUDE (read_id, reference, mate_reference) "
-                f"FROM {_ALIGNMENTS} a "
-                f"JOIN {_READ_META} rm ON rm.sequence_idx = a.read_id "
-                "QUALIFY cigar_sequence_identity("
-                f"string_agg(a.cigar, '') OVER (PARTITION BY {identity_partition})"
-                f") >= {min_identity}{coverage_clause} "
-                "ORDER BY alignment_idx, rm.prep_sample_idx, a.read_id, feature_idx, "
-                "a.position, a.flags) "
-                f"TO '{out_sql}' ({PARQUET_OPTS})"
-            )
-        success = True
+            success = True
     finally:
         # On failure remove a partial output so the SLURM launcher's manifest
         # walker (which runs after execute()) can't promote it as the result.
@@ -609,19 +621,3 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # binding (not the generic `staging_dir`), mirroring how host_filter exposes
     # `read_mask_staging_dir` for the read-mask register-files step.
     return {"alignment": alignment, "alignment_staging_dir": workspace}
-
-
-def plan(inputs: Inputs) -> JobPlan:
-    """Size the step's WALLTIME down from the YAML baseline by the read-block
-    cardinality (memory/cpu left to baseline — the out-of-heap shard indexes, not
-    row count, dominate RAM; see the module note). Mirrors qc.plan(): a footer-only
-    read-pair count + a linear `base + per-million` estimate. Advisory and
-    down-only — the CP lowers walltime to this when below baseline, and TIMEOUT
-    escalation is the backstop for an under-estimate. Runs at submit time in the
-    orchestrator process (a Parquet footer read, not a data scan)."""
-    walltime = linear_walltime(
-        count_read_pairs(inputs.reads),
-        base_seconds=_PLAN_BASE_WALLTIME_SECONDS,
-        seconds_per_million_pairs=_PLAN_WALLTIME_SECONDS_PER_MILLION_PAIRS,
-    )
-    return JobPlan(resources=JobResourcePlan(walltime=walltime))
