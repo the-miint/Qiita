@@ -3971,13 +3971,11 @@ mod tests {
         );
 
         let reader = &conn;
-        let dest_str = "block_doget_rows";
+        let rows_rel = "block_doget_rows";
         // The gap sample must be entirely absent.
         let gap_rows: i64 = reader
             .query_row(
-                &format!(
-                    "SELECT count(*) FROM read_parquet('{dest_str}') WHERE prep_sample_idx = {prep_gap}"
-                ),
+                &format!("SELECT count(*) FROM {rows_rel} WHERE prep_sample_idx = {prep_gap}"),
                 [],
                 |r| r.get(0),
             )
@@ -3990,7 +3988,7 @@ mod tests {
         let c_max: i64 = reader
             .query_row(
                 &format!(
-                    "SELECT max(sequence_idx) FROM read_parquet('{dest_str}') WHERE prep_sample_idx = {prep_c}"
+                    "SELECT max(sequence_idx) FROM {rows_rel} WHERE prep_sample_idx = {prep_c}"
                 ),
                 [],
                 |r| r.get(0),
@@ -4000,7 +3998,7 @@ mod tests {
         // Per-row prep_sample_idx preserved for both members.
         let distinct_preps: i64 = reader
             .query_row(
-                &format!("SELECT count(DISTINCT prep_sample_idx) FROM read_parquet('{dest_str}')"),
+                &format!("SELECT count(DISTINCT prep_sample_idx) FROM {rows_rel}"),
                 [],
                 |r| r.get(0),
             )
@@ -4088,13 +4086,11 @@ mod tests {
         assert_eq!(count, 2, "only the 2 pass rows in the member range stream");
 
         let reader = &conn;
-        let dest_str = "masked_block_doget_rows";
+        let rows_rel = "masked_block_doget_rows";
         // Same column shape as the raw block export (EXPORT_READ_COLUMNS).
         let cols: Vec<String> = {
             let mut stmt = reader
-                .prepare(&format!(
-                    "DESCRIBE SELECT * FROM read_parquet('{dest_str}')"
-                ))
+                .prepare(&format!("DESCRIBE SELECT * FROM {rows_rel}"))
                 .unwrap();
             stmt.query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
@@ -4119,7 +4115,7 @@ mod tests {
         let seqs: Vec<i64> = {
             let mut stmt = reader
                 .prepare(&format!(
-                    "SELECT sequence_idx FROM read_parquet('{dest_str}') ORDER BY sequence_idx"
+                    "SELECT sequence_idx FROM {rows_rel} ORDER BY sequence_idx"
                 ))
                 .unwrap();
             stmt.query_map([], |r| r.get(0))
@@ -4203,11 +4199,11 @@ mod tests {
         );
 
         let reader = &conn;
-        let dest_str = "block_doget_rows";
+        let rows_rel = "block_doget_rows";
         let x_max: i64 = reader
             .query_row(
                 &format!(
-                    "SELECT max(sequence_idx) FROM read_parquet('{dest_str}') WHERE prep_sample_idx = {prep_x}"
+                    "SELECT max(sequence_idx) FROM {rows_rel} WHERE prep_sample_idx = {prep_x}"
                 ),
                 [],
                 |r| r.get(0),
