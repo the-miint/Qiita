@@ -983,7 +983,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_existing_local_fi
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-LOCAL-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={local_name: "local-value"},
+                metadata={**_REQUIRED_METADATA, local_name: "local-value"},
             )
     bs_idx = result.biosample_idx
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
@@ -992,13 +992,16 @@ async def test_import_biosample_from_owner_biosample_id_writes_existing_local_fi
     )
 
     # The value lands against the purely-local field, so the row's
-    # denormalized global_field_idx is NULL.
+    # denormalized global_field_idx is NULL. Scoped to the field under test so
+    # the separately-supplied required host_taxon_id row is not in view.
     rows = await ctx["pool"].fetch(
         "SELECT biosample_study_field_idx, global_field_idx,"
         " value_text, value_numeric, value_date"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        "   AND biosample_study_field_idx = $2",
         bs_idx,
+        local_idx,
     )
     assert [dict(r) for r in rows] == [
         {
@@ -1046,7 +1049,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_alias_through_to_
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-ALIAS-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={alias_name: "alias-value"},
+                metadata={**_REQUIRED_METADATA, alias_name: "alias-value"},
             )
     bs_idx = result.biosample_idx
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
@@ -1055,11 +1058,15 @@ async def test_import_biosample_from_owner_biosample_id_writes_alias_through_to_
     )
 
     # The value attaches to the alias study field but occupies the global slot.
+    # Scoped to the field under test so the separately-supplied required
+    # host_taxon_id row is not in view.
     rows = await ctx["pool"].fetch(
         "SELECT biosample_study_field_idx, global_field_idx, value_text"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        "   AND biosample_study_field_idx = $2",
         bs_idx,
+        alias_idx,
     )
     assert [dict(r) for r in rows] == [
         {
@@ -1106,7 +1113,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_cross_field_co
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="OWNER-CONFLICT-1",
                     caller_idx=ctx["principal_idx"],
-                    metadata={shared_name: "x"},
+                    metadata={**_REQUIRED_METADATA, shared_name: "x"},
                 )
     assert excinfo.value.display_name == shared_name
 
@@ -1148,7 +1155,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_duplicate_glob
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="OWNER-DUP-1",
                     caller_idx=ctx["principal_idx"],
-                    metadata={global_label: "a", alias_name: "b"},
+                    metadata={**_REQUIRED_METADATA, global_label: "a", alias_name: "b"},
                 )
     assert excinfo.value.global_field_idx == global_idx
 

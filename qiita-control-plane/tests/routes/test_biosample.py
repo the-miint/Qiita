@@ -225,6 +225,38 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
     return resp
 
 
+async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
+    """Track globally-linked study fields (by global field idx) and every
+    non-owner-id metadata row written for this biosample. Use after
+    `_post_biosample` in tests that exercised the metadata dict path so
+    the FK-reverse cleanup picks the new rows up. Mirrors the sibling
+    helper in tests/repositories/test_biosample.py so the two layers stay
+    parallel.
+    """
+    # Pick up every globally-linked study field row at this study tied to
+    # one of the supplied global fields.
+    rows = await ctx["pool"].fetch(
+        "SELECT idx FROM qiita.biosample_study_field"
+        " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
+        study_idx,
+        list(global_idxs),
+    )
+    for r in rows:
+        if r["idx"] not in ctx["created"]["biosample_study_field"]:
+            ctx["created"]["biosample_study_field"].append(r["idx"])
+
+    # Pick up every non-owner-id metadata row for this biosample. The
+    # owner-id row is already tracked by _post_biosample.
+    meta_rows = await ctx["pool"].fetch(
+        "SELECT idx FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        bs_idx,
+    )
+    for r in meta_rows:
+        if r["idx"] not in ctx["created"]["biosample_metadata"]:
+            ctx["created"]["biosample_metadata"].append(r["idx"])
+
+
 # ===========================================================================
 # Happy paths
 # ===========================================================================
@@ -924,11 +956,15 @@ async def test_post_biosample_writes_existing_local_field_201(ctx):
     bs_idx = resp.json()["biosample_idx"]
     await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
 
+    # Scoped to the field under test so the auto-injected required host_taxon_id
+    # row is not in view.
     rows = await ctx["pool"].fetch(
         "SELECT biosample_study_field_idx, global_field_idx, value_text"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        "   AND biosample_study_field_idx = $2",
         bs_idx,
+        local_idx,
     )
     assert [dict(r) for r in rows] == [
         {
@@ -981,11 +1017,15 @@ async def test_post_biosample_writes_alias_through_to_global_201(ctx):
         ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
     )
 
+    # Scoped to the field under test so the auto-injected required host_taxon_id
+    # row is not in view.
     rows = await ctx["pool"].fetch(
         "SELECT biosample_study_field_idx, global_field_idx, value_text"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        "   AND biosample_study_field_idx = $2",
         bs_idx,
+        alias_idx,
     )
     assert [dict(r) for r in rows] == [
         {
