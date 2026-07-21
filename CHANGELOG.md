@@ -22,6 +22,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **ENA/SRA study metadata resolver (`ena_import`, TASK-01).** Adds the
+  control-plane seam for resolving an ENA/SRA study's metadata ahead of
+  ingestion: `qiita_common.models.ena` (`EnaStudyHeader` / `EnaRunRecord` /
+  `EnaSampleAttributes`, coercing `read_ena`'s ALL-VARCHAR numeric fields and
+  failing loud on garbage), `qiita_control_plane.ena_import.accession`
+  (study/sample/run/experiment accession validation), the `EnaResolver`
+  interface, its default `MiintEnaResolver` implementation (DuckDB + miint
+  `read_ena` / `read_ena_attributes`), an experimental `HttpEnaResolver`
+  fallback against the plain ENA Portal/Browser APIs, and a `get_resolver`
+  backend factory. An unresolved/invalid accession always raises
+  (`InvalidEnaAccessionError` / `EnaAccessionNotFoundError`) rather than
+  returning empty. No DB writes or read downloads yet — those land in later
+  tickets of this epic.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
