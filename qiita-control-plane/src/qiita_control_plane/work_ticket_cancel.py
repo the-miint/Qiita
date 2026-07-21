@@ -4,9 +4,18 @@ SLURM job(s).
 The load-bearing ordering is **terminal-state-first, then scancel**. The runner's
 poll loop calls `_raise_if_ticket_terminal` once per iteration and aborts on a
 terminal state (`WorkflowAborted`), so committing the `cancelled` flip BEFORE the
-reap is what stops a new attempt from being submitted between the two. A
-scancel-first (or scancel-without-flip) just gets the job re-submitted as the next
-attempt — exactly the `518262`-past-the-block race the cancel command exists to kill.
+reap is what stops the runner from submitting a *further* attempt — a scancel-first
+(or scancel-without-flip) just gets the job re-submitted as the next attempt, the
+job-past-the-block race the cancel command exists to kill.
+
+The reap is best-effort AT THE INSTANT it runs, and idempotent on re-run — NOT an
+absolute "no job can be in flight" guarantee. One residual window remains: if the
+runner is already mid-`sbatch` when the flip commits (past its terminal check but
+before slurmrestd registers the new job), that attempt can be launched and missed
+by this reap's job-list read, and the runner then aborts on its next iteration,
+leaving it orphaned. Re-running cancel reaps it (the scancel matches by prefix, so
+it catches any attempt now visible); the orphan-reaping direction below is the
+standing sweep that closes it without operator action.
 
 The reap covers ALL attempts by the deterministic `qiita-wt{idx}-` job-name prefix
 (`ComputeBackendClient.cancel`), not just the recorded `slurm_job_id`, because a

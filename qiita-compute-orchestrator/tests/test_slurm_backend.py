@@ -1530,3 +1530,34 @@ async def test_cancel_swallows_404_on_a_job_that_finished_mid_reap(jwt_path):
     backend = _make_backend(httpx.MockTransport(handler), jwt_path)
     # No exception; the id is still reported (we targeted it).
     assert await backend.cancel(42) == [100]
+
+
+@pytest.mark.asyncio
+async def test_cancel_prefix_does_not_match_a_numerically_larger_ticket(jwt_path):
+    """The trailing `-` in `qiita-wt{idx}-` is load-bearing: cancel(5) must NOT
+    reap ticket 50's jobs (`qiita-wt50-...`), whose name shares the `qiita-wt5`
+    stem. This pins that boundary the wt42-vs-wt5 case can't."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {"job_id": 5, "job_state": ["RUNNING"], "name": "qiita-wt5-fastq-a0"},
+                        {"job_id": 50, "job_state": ["RUNNING"], "name": "qiita-wt50-fastq-a0"},
+                    ]
+                },
+            )
+        if request.method == "DELETE" and "/job/" in request.url.path:
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    cancelled = await backend.cancel(5)
+    assert cancelled == [5]  # only ticket 5, NOT 50
+    deletes = [c for c in seen if c.startswith("DELETE")]
+    assert any(c.endswith("/job/5") for c in deletes)
+    assert not any(c.endswith("/job/50") for c in deletes)

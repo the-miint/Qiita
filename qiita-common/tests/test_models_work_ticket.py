@@ -301,3 +301,24 @@ def test_membership_works_for_plain_strings():
     assert "processing" not in TERMINAL_WORK_TICKET_STATES
     assert "processing" in NON_TERMINAL_WORK_TICKET_STATES
     assert "no_data" not in NON_TERMINAL_WORK_TICKET_STATES
+
+
+def test_work_ticket_cancel_request_selector_and_cap():
+    """WorkTicketCancelRequest requires a selector, ties run/pool narrowing to
+    action_id, and caps the explicit idx list."""
+    from qiita_common.models import WorkTicketCancelRequest
+
+    # At least one selector required.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest()
+    # run/pool narrowing without action_id is rejected.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest(sequencing_run_idx=3)
+    # The explicit idx list is capped.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest(work_ticket_idxs=list(range(1, 1002)))
+    # Valid shapes.
+    assert WorkTicketCancelRequest(work_ticket_idxs=[1, 2]).action_id is None
+    filtered = WorkTicketCancelRequest(action_id="read-mask", sequenced_pool_idx=9)
+    assert filtered.action_id == "read-mask"
+    assert filtered.sequenced_pool_idx == 9
