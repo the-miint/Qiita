@@ -221,6 +221,23 @@ class StepFindByNameResponse(BaseModel):
     jobs: list[FoundJobWire]
 
 
+class StepCancelRequest(BaseModel):
+    """Body for POST /api/v1/step/cancel. `work_ticket_idx` selects EVERY live
+    SLURM job of the ticket (all attempts) by the deterministic name prefix
+    `qiita-wt{idx}-`. The CP calls this only AFTER flipping the ticket terminal, so
+    no new attempt can spawn between the find and the scancel."""
+
+    work_ticket_idx: int = Field(gt=0)
+
+
+class StepCancelResponse(BaseModel):
+    """Returned by POST /api/v1/step/cancel — the SLURM job ids actually cancelled
+    (empty when none were live: already finished/purged, or an in-process backend).
+    Idempotent."""
+
+    cancelled_job_ids: list[int]
+
+
 # Upper bound on a feature_idx-scoped DoGet ticket's subset list. A reference
 # shard is ~hundreds/thousands of features; the cap guards ticket/query size
 # (the list rides the signed ticket payload and becomes a `feature_idx IN (...)`

@@ -179,6 +179,10 @@ PATH_STEP_PLAN = "/plan"
 # Recovery / idempotency: look up live SLURM jobs by their deterministic
 # name so the CP can adopt a job it submitted but never recorded the id for.
 PATH_STEP_FIND_BY_NAME = "/find-by-name"
+# Cancel: scancel every live SLURM job of a work_ticket (all attempts, by the
+# `qiita-wt{idx}-` name prefix). The CP calls this AFTER flipping the ticket
+# terminal, so no new attempt spawns between the find and the scancel.
+PATH_STEP_CANCEL = "/cancel"
 
 URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
 URL_STEP_SUBMIT = f"{URL_STEP_PREFIX}{PATH_STEP_SUBMIT}"
@@ -186,6 +190,7 @@ URL_STEP_STATUS = f"{URL_STEP_PREFIX}{PATH_STEP_STATUS}"
 URL_STEP_RESULT = f"{URL_STEP_PREFIX}{PATH_STEP_RESULT}"
 URL_STEP_PLAN = f"{URL_STEP_PREFIX}{PATH_STEP_PLAN}"
 URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
+URL_STEP_CANCEL = f"{URL_STEP_PREFIX}{PATH_STEP_CANCEL}"
 
 
 # =============================================================================

@@ -1455,3 +1455,78 @@ async def test_container_tmpdir_points_at_the_workspace_not_the_tmpfs(jwt_path, 
 
     assert f"TMPDIR={tmp_path}/tmp" in shlex.split(captured["payload"]["script"])
     assert (tmp_path / "tmp").is_dir(), "workspace tmp/ must exist before the job starts"
+
+
+# ============================================================================
+# cancel — scancel every attempt of a ticket by name prefix
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_scancels_all_attempts_by_prefix_and_ignores_other_tickets(jwt_path):
+    """cancel(42) lists jobs, keeps only those whose name starts with
+    `qiita-wt42-` (all attempts), DELETEs each, and returns their ids — a job for
+    a DIFFERENT ticket (wt5, which `qiita-wt42-` must not prefix-match) is left
+    untouched."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {"job_id": 100, "job_state": ["RUNNING"], "name": "qiita-wt42-fastq-a0"},
+                        {"job_id": 101, "job_state": ["PENDING"], "name": "qiita-wt42-fastq-a1"},
+                        {"job_id": 200, "job_state": ["RUNNING"], "name": "qiita-wt5-fastq-a0"},
+                    ]
+                },
+            )
+        if request.method == "DELETE" and "/job/" in request.url.path:
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    cancelled = await backend.cancel(42)
+
+    assert cancelled == [100, 101]
+    deletes = [c for c in seen if c.startswith("DELETE")]
+    assert any(c.endswith("/job/100") for c in deletes)
+    assert any(c.endswith("/job/101") for c in deletes)
+    assert not any(c.endswith("/job/200") for c in deletes)  # other ticket untouched
+
+
+@pytest.mark.asyncio
+async def test_cancel_no_live_jobs_returns_empty(jwt_path):
+    """A ticket with no live jobs (all finished/purged) cancels to []."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(200, json={"jobs": []})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    assert await backend.cancel(42) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_swallows_404_on_a_job_that_finished_mid_reap(jwt_path):
+    """A job listed as live but gone (404) by the time we DELETE it is a no-op,
+    not an error — cancel stays idempotent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [{"job_id": 100, "job_state": ["RUNNING"], "name": "qiita-wt42-x-a0"}]
+                },
+            )
+        if request.method == "DELETE" and request.url.path.endswith("/job/100"):
+            return httpx.Response(404, json={"errors": [{"error": "unknown job"}]})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    # No exception; the id is still reported (we targeted it).
+    assert await backend.cancel(42) == [100]

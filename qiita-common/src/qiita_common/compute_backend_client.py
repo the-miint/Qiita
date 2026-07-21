@@ -22,6 +22,7 @@ import httpx
 
 from .api_paths import (
     URL_REFERENCE_ARTIFACT_BY_IDX,
+    URL_STEP_CANCEL,
     URL_STEP_FIND_BY_NAME,
     URL_STEP_PLAN,
     URL_STEP_RESULT,
@@ -40,6 +41,8 @@ from .models import (
     FoundJobWire,
     ReferenceArtifactPurgeResponse,
     StepBaselineResources,
+    StepCancelRequest,
+    StepCancelResponse,
     StepFindByNameRequest,
     StepFindByNameResponse,
     StepHandleWire,
@@ -232,6 +235,26 @@ class ComputeBackendClient:
         self._raise_if_backend_failure(resp)
         resp.raise_for_status()
         return StepFindByNameResponse.model_validate(resp.json()).jobs
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """Ask the orchestrator to scancel EVERY live SLURM job of a work_ticket
+        (all attempts, by the deterministic `qiita-wt{idx}-` name prefix). Returns
+        the ids actually cancelled (empty when none are live).
+
+        The CP's cancel/reap path calls this AFTER flipping the ticket terminal, so
+        no new attempt can spawn between the find and the scancel. Idempotent. An
+        unreachable orchestrator surfaces as `BackendFailure(ORCHESTRATOR_UNREACHABLE)`
+        (via `_post`) so the caller can retry rather than leaving a job orphaned; a
+        classified backend failure (slurmrestd unreachable) is reconstructed and
+        raised the same way the step trio does."""
+        resp = await self._post(
+            URL_STEP_CANCEL,
+            StepCancelRequest(work_ticket_idx=work_ticket_idx),
+            step_name=f"cancel-wt{work_ticket_idx}",
+        )
+        self._raise_if_backend_failure(resp)
+        resp.raise_for_status()
+        return StepCancelResponse.model_validate(resp.json()).cancelled_job_ids
 
     async def purge_reference_artifacts(self, reference_idx: int) -> ReferenceArtifactPurgeResponse:
         """Ask the orchestrator to remove a reference's on-disk index
