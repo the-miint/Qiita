@@ -100,7 +100,13 @@ from qiita_common.models.biosample import (
     StudyLookupByAccessionResponse,
     TerminologyTermRef,
 )
-from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyHeader
+from qiita_common.models.ena import (
+    EnaRunRecord,
+    EnaSampleAttributes,
+    EnaStudyHeader,
+    ResolverKind,
+    SourceArchive,
+)
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
@@ -367,6 +373,8 @@ __all__ = [
     "EnaRunRecord",
     "EnaSampleAttributes",
     "EnaStudyHeader",
+    "ResolverKind",
+    "SourceArchive",
     # Study.
     "StudyCreate",
     "StudyPatchRequest",

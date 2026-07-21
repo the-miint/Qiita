@@ -368,6 +368,28 @@ async def insert_sequenced_pool(
     return (existing["idx"], False)
 
 
+async def fetch_sequenced_pool_idxs_for_run(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+) -> list[int]:
+    """Return every qiita.sequenced_pool idx attached to sequencing_run_idx,
+    ordered by idx ascending (oldest first).
+
+    Used by the ENA-import registration composer's get-or-create-pool-for-
+    run step (ena_import.registration): a pool created with no preflight
+    has no natural content key to ON-CONFLICT against (see
+    insert_sequenced_pool's no-preflight case, which always inserts a new
+    row), so a caller that wants "one pool per run" checks this first and
+    reuses the oldest existing pool instead of inserting a fresh one on
+    every call.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT idx FROM qiita.sequenced_pool WHERE sequencing_run_idx = $1 ORDER BY idx",
+        sequencing_run_idx,
+    )
+    return [r["idx"] for r in rows]
+
+
 async def fetch_sequenced_pool(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,

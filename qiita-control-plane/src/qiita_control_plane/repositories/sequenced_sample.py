@@ -189,6 +189,9 @@ async def insert_sequenced_sample(
     created_by_idx: int,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
+    source_archive: str | None = None,
+    resolver_kind: str | None = None,
+    transport: str | None = None,
 ) -> int:
     """Insert a row into qiita.sequenced_sample and return the generated idx.
 
@@ -203,6 +206,16 @@ async def insert_sequenced_sample(
     cannot be constructed. submission tracking columns are NULL on a fresh
     row and are not parameters here.
 
+    source_archive / resolver_kind / transport are the ENA-import
+    provenance columns added by db/migrations/20260721000000_sequenced_
+    sample_ena_provenance.sql (TEXT/CHECK, mirrored by
+    qiita_common.models.ena.SourceArchive / ResolverKind); all three are
+    plain strings here (not the enum types) so this repo module stays
+    free of the qiita_common.models.ena import -- the caller
+    (ena_import.registration) passes `.value`. All default to None for
+    every non-ENA-import caller; transport is always None from this
+    ticket's callers (populated by TASK-04's download workflow).
+
     Raises asyncpg.UniqueViolationError on a collision against the unique
     indexes (per-pool item id, ENA experiment, ENA run); raises
     asyncpg.ForeignKeyViolationError on a bad sequenced_pool_idx.
@@ -212,14 +225,18 @@ async def insert_sequenced_sample(
     return await conn.fetchval(
         "INSERT INTO qiita.sequenced_sample ("
         "    prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id,"
-        "    ena_experiment_accession, ena_run_accession, created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $5, $6)"
+        "    ena_experiment_accession, ena_run_accession,"
+        "    source_archive, resolver_kind, transport, created_by_idx"
+        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         " RETURNING idx",
         prep_sample_idx,
         sequenced_pool_idx,
         sequenced_pool_item_id,
         ena_experiment_accession,
         ena_run_accession,
+        source_archive,
+        resolver_kind,
+        transport,
         created_by_idx,
     )
 
@@ -247,6 +264,9 @@ async def import_sequenced_prep_sample(
     metadata_checklist_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
+    source_archive: str | None = None,
+    resolver_kind: str | None = None,
+    transport: str | None = None,
 ) -> SequencedPrepSampleImportResult:
     """Create one sequenced prep sample with its study links and metadata.
 
@@ -294,6 +314,11 @@ async def import_sequenced_prep_sample(
     primary_study_idx must not also appear in secondary_study_idxs; the
     Pydantic validator on SequencedSampleCreateRequest blocks this at
     the route, and the composer raises ValueError as defense-in-depth.
+
+    source_archive / resolver_kind / transport are the ENA-import
+    provenance columns (see insert_sequenced_sample); all default to None
+    for every non-ENA-import caller and are written on the same subtype
+    INSERT as ena_experiment_accession / ena_run_accession.
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
@@ -341,6 +366,9 @@ async def import_sequenced_prep_sample(
         created_by_idx=caller_idx,
         ena_experiment_accession=ena_experiment_accession,
         ena_run_accession=ena_run_accession,
+        source_archive=source_archive,
+        resolver_kind=resolver_kind,
+        transport=transport,
     )
 
     # Step c: link the prep_sample to every requested study (dedup, sort,
@@ -370,6 +398,33 @@ async def import_sequenced_prep_sample(
         prep_sample_idx=ps_idx,
         sequenced_sample_idx=ss_idx,
     )
+
+
+async def fetch_sequenced_sample_idxs_by_ena_run_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    values: list[str],
+) -> dict[str, int]:
+    """Return `{ena_run_accession: sequenced_sample_idx}` for every value in
+    `values` that resolves to a qiita.sequenced_sample row.
+
+    Mirrors fetch_biosample_idxs_by_natural_key / fetch_sequencing_run_idxs_
+    by_instrument_run_id (biosample.py / sequencing_run.py): values absent
+    from the table are omitted from the returned map, so a caller detects a
+    miss by set-difference. ena_run_accession is UNIQUE
+    (sequenced_sample_ena_run_accession_unique) so each key maps to at most
+    one idx. Used by the ENA-import registration composer
+    (ena_import.registration) to skip a run a previous import already
+    registered -- the idempotent-re-import case, T02-5.
+    """
+    if not values:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, ena_run_accession FROM qiita.sequenced_sample"
+        " WHERE ena_run_accession = ANY($1::text[])",
+        values,
+    )
+    return {r["ena_run_accession"]: r["idx"] for r in rows}
 
 
 async def fetch_sequenced_sample_idxs_for_run(

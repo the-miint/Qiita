@@ -35,6 +35,28 @@ duplicates further down are historical strata; leave them where they are.
   (`InvalidEnaAccessionError` / `EnaAccessionNotFoundError`) rather than
   returning empty. No DB writes or read downloads yet — those land in later
   tickets of this epic.
+- **ENA study & sample registration + cross-study de-dup (`ena_import.registration`,
+  TASK-02).** Turns a resolved ENA study (`EnaStudyHeader` + `EnaRunRecord` list)
+  into Qiita `study` / `biosample` / `prep_sample` / `sequenced_sample` rows,
+  idempotently: `register_ena_study` upserts the study keyed positionally on
+  the two ENA accessions, get-or-creates each biosample by
+  `ena_sample_accession` (so the same BioSample recurring across overlapping
+  studies registers once and links to each — the meta-analysis de-dup
+  requirement), maps every run's ENA `instrument_platform` to `qiita.platform`
+  (`ena_import.platform_mapping`, one `sequencing_run`/`sequenced_pool` per
+  distinct platform) and its `library_strategy`/`library_source` to one of the
+  five curated `prep_protocol` rows (`ena_import.protocol_mapping`) — both
+  fail loud on an unmappable value — then imports the sequenced prep_sample
+  via the existing composer. Each run registers inside its own transaction, so
+  a run that fails (e.g. an unmappable protocol) is recorded `failed` in the
+  result without leaving orphan rows or blocking its siblings; a re-import
+  skips runs already present. `EnaRunRecord` gains `instrument_platform`
+  (TASK-01 amendment) and `qiita.sequenced_sample` gains three nullable
+  provenance columns (`source_archive` / `resolver_kind` / `transport`,
+  TEXT/CHECK — mirrored by new `SourceArchive`/`ResolverKind` enums in
+  `qiita_common.models.ena`) via an additive, reversible migration;
+  `transport` stays unpopulated until TASK-04's download workflow lands. No
+  metadata harmonization (TASK-03) or batch fan-out (TASK-06) yet.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

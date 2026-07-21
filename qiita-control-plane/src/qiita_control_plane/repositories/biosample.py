@@ -153,6 +153,90 @@ async def update_biosample(
     )
 
 
+async def get_or_create_biosample_by_ena_accession(
+    conn: asyncpg.Connection,
+    *,
+    ena_sample_accession: str,
+    owner_idx: int,
+    created_by_idx: int,
+) -> int:
+    """Race-safe find-or-create for a biosample keyed on ena_sample_accession
+    (T02-2, cross-study de-dup). ON CONFLICT DO NOTHING + fallback SELECT
+    against the biosample_ena_sample_accession_unique constraint, mirroring
+    insert_sequencing_run's find-or-create shape
+    (repositories/sequencing_run.py).
+
+    A biosample is shared identity across every study that imports the same
+    ENA BioSample: owner_idx/created_by_idx are pinned to whichever import
+    creates the row first and are intentionally NOT compared against a
+    later caller's values on the reuse path (unlike insert_sequencing_run's
+    PayloadMismatch check) -- a second study importing the same ENA sample
+    under a different owner is the expected cross-study-overlap case, not a
+    conflict to reject. Linking the (possibly different-owner) study to
+    this biosample is the caller's next step via
+    ensure_biosample_linked_to_study.
+
+    Does not write any metadata -- unlike import_biosample_from_owner_
+    biosample_id, which always inserts and mandates an owner-id value plus
+    metadata. This is deliberately the bare row: TASK-03 owns mapping ENA
+    sample attributes into metadata.
+    """
+    inserted_idx = await conn.fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, ena_sample_accession)"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (ena_sample_accession) DO NOTHING"
+        " RETURNING idx",
+        owner_idx,
+        created_by_idx,
+        ena_sample_accession,
+    )
+    if inserted_idx is not None:
+        return inserted_idx
+
+    existing_idx = await conn.fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        ena_sample_accession,
+    )
+    if existing_idx is None:
+        # The ON CONFLICT path was taken but no row is visible -- a race
+        # window where another transaction's row was rolled back between
+        # the INSERT attempt and this SELECT. Re-raise as an opaque error
+        # rather than looping; the caller can retry.
+        raise asyncpg.PostgresError(
+            "find-or-create on biosample(ena_sample_accession="
+            f"{ena_sample_accession!r}) collided on insert but the existing"
+            " row is not visible"
+        )
+    return existing_idx
+
+
+async def ensure_biosample_linked_to_study(
+    conn: asyncpg.Connection,
+    *,
+    biosample_idx: int,
+    study_idx: int,
+    created_by_idx: int,
+) -> None:
+    """Idempotent (biosample, study) link insert.
+
+    ON CONFLICT DO NOTHING against the biosample_to_study primary key
+    (biosample_idx, study_idx). Unlike insert_entity_to_study
+    (_sample_helpers.py), which raises asyncpg.UniqueViolationError on a
+    repeat call, this is the ENA-import registration path's building block
+    precisely because re-registering an already-linked (biosample, study)
+    pair on re-import is the expected case, not an error -- see
+    ena_import.registration.register_ena_study.
+    """
+    await conn.execute(
+        "INSERT INTO qiita.biosample_to_study (biosample_idx, study_idx, created_by_idx)"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (biosample_idx, study_idx) DO NOTHING",
+        biosample_idx,
+        study_idx,
+        created_by_idx,
+    )
+
+
 async def fetch_caller_has_biosample_access(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
