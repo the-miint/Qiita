@@ -85,6 +85,7 @@ def test_ena_run_record_field_by_field():
         library_strategy="WGS",
         library_source="METAGENOMIC",
         library_selection="RANDOM",
+        instrument_platform="ILLUMINA",
         fastq_ftp=(
             "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_1.fastq.gz;"
             "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_2.fastq.gz"
@@ -106,6 +107,7 @@ def test_ena_run_record_field_by_field():
     assert run.library_strategy == "WGS"
     assert run.library_source == "METAGENOMIC"
     assert run.library_selection == "RANDOM"
+    assert run.instrument_platform == "ILLUMINA"
     assert run.fastq_ftp == [
         "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_1.fastq.gz",
         "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_2.fastq.gz",
@@ -154,6 +156,7 @@ def test_ena_run_record_blank_optional_fields_default_empty():
     assert run.fastq_bytes == []
     assert run.read_count is None
     assert run.base_count is None
+    assert run.instrument_platform is None
 
 
 def test_ena_run_record_rejects_garbage_fastq_bytes():

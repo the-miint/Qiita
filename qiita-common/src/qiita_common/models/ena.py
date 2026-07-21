@@ -84,6 +84,11 @@ class EnaRunRecord(BaseModel):
     library_strategy: str | None = None
     library_source: str | None = None
     library_selection: str | None = None
+    # ENA's controlled-vocabulary instrument platform (ILLUMINA,
+    # OXFORD_NANOPORE, PACBIO_SMRT, ...). Carried through unmapped -- the
+    # registration layer (ena_import.platform_mapping) maps it to
+    # qiita_common.models.Platform, fail-loud on an unrecognized value.
+    instrument_platform: str | None = None
     fastq_ftp: list[str] = Field(default_factory=list)
     fastq_aspera: list[str] = Field(default_factory=list)
     fastq_bytes: list[int] = Field(default_factory=list)

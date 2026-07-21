@@ -1,5 +1,5 @@
 {
-  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count&limit=0&format=tsv on 2026-07-21",
+  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count&limit=0&format=tsv on 2026-07-21 (instrument_platform column added TASK-02/R3, re-recorded same date)",
   "columns": [
     "run_accession",
     "experiment_accession",
@@ -9,6 +9,7 @@
     "library_strategy",
     "library_source",
     "library_selection",
+    "instrument_platform",
     "fastq_ftp",
     "fastq_aspera",
     "fastq_bytes",
@@ -26,6 +27,7 @@
       "WGS",
       "GENOMIC",
       "RANDOM",
+      "LS454",
       "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz",
       "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz",
       "89054035",
@@ -42,6 +44,7 @@
       "WGS",
       "GENOMIC",
       "RANDOM",
+      "LS454",
       "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz",
       "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz;fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz;fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz",
       "5686490;22054785;24627105",

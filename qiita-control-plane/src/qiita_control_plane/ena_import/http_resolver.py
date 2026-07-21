@@ -33,6 +33,7 @@ BROWSER_BASE = "https://www.ebi.ac.uk/ena/browser/api"
 _RUN_FIELDS = (
     "run_accession,experiment_accession,sample_accession,study_accession,"
     "library_layout,library_strategy,library_source,library_selection,"
+    "instrument_platform,"
     "fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count"
 )
 _STUDY_FIELDS = (

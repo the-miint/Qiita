@@ -29,6 +29,7 @@ def assert_prjna48739_runs(runs: list[EnaRunRecord]) -> None:
     assert single.library_strategy == "WGS"
     assert single.library_source == "GENOMIC"
     assert single.library_selection == "RANDOM"
+    assert single.instrument_platform == "LS454"
     assert single.fastq_ftp == ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"]
     assert single.fastq_bytes == [89054035]
     assert single.fastq_md5 == ["791595268ae7a965664652bde3444a2b"]
@@ -37,6 +38,7 @@ def assert_prjna48739_runs(runs: list[EnaRunRecord]) -> None:
 
     paired = by_accession["SRR096343"]
     assert paired.library_layout == "PAIRED"
+    assert paired.instrument_platform == "LS454"
     assert paired.fastq_ftp == [
         "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz",
         "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz",
