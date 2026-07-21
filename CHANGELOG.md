@@ -138,6 +138,45 @@ duplicates further down are historical strata; leave them where they are.
   (counted under `samples_no_data`); an unexpected-empty **data** well keeps the
   `BAD_INPUT` → failure it gets today. No schema or rollup change — the completion
   rollup already buckets `no_data` separately from `failed`.
+- **`long-read-assembly` could never stream a sample's masked reads (#352).**
+  Every ticket failed at submission with DuckDB's `IO Error: Can't find the home
+  directory at '/dev/null'`. The CP runner's masked-read streamer
+  (`_stream_masked_reads_to_fastq`) called `connect_with_miint()` — the helper
+  documented for the **client** CLI, which runs `INSTALL miint` then `LOAD`.
+  `INSTALL` resolves DuckDB's extension directory, defaulting to
+  `$HOME/.duckdb/extensions`, and the `qiita-api` service account's home is
+  `/dev/null`. This was the control plane's first *service-side* miint consumer;
+  the helper's other callers are CLIs that have so far only run from hosts with a
+  real `$HOME`, so it had never surfaced. (That is a property of where they run,
+  not of which CLI they are — `qiita-admin` subcommands *are* run as `qiita-api`
+  on the deploy host, so `qiita-admin masked-read-export` would hit the same wall
+  if it were ever invoked that way.) Service-side miint is now LOAD-only from the
+  deploy-staged directory via a new `connect_with_miint_staged()`, mirroring the
+  cluster paths (which are LOAD-only precisely so no node "depends on mirror
+  reachability, or needs a writable `$HOME`"). Requires `MIINT_EXTENSION_DIRECTORY`
+  in the control plane's env, byte-identical to the CO's and DP's; unset or
+  non-directory now fails with a message naming the variable and the service
+  instead of a DuckDB IOException. A read-only staged directory is sufficient —
+  `LOAD` writes nothing. `make verify-deploy` gains a `cp-miint` check, since a
+  missing var takes nothing down at boot and would otherwise stay invisible until
+  the next assembly submission.
+- **The staged-directory requirement is single-sourced (#352)** as
+  `qiita_common.duckdb_miint.require_staged_extension_directory`, and
+  `MIINT_EXTENSION_DIRECTORY` is now named once (`MIINT_EXTENSION_DIRECTORY_VAR`)
+  instead of spelled as a literal across the connect config, the job-env
+  allowlist, and the orchestrator's staging gate. The **orchestrator
+  deliberately does not adopt the check**: a slurm CO already requires the var at
+  boot (`_resolve_slurm_settings`), its native jobs get a writable per-ticket
+  `HOME` (`slurm/payload.py` points HOME at the workspace so DuckDB can cache
+  extensions there), and a `COMPUTE_BACKEND=local` dev run legitimately has
+  neither — so requiring it there would guard an unreachable state on the deploy
+  while breaking local development. The helper is pure Python; qiita-common
+  imports no duckdb, so each component keeps its own connect.
+- **`make preflight` now checks `MIINT_EXTENSION_DIRECTORY` byte-identity across
+  the CP/DP/CO env files (#352)**, the way it already did for `PATH_SCRATCH` —
+  both name a shared path every component must resolve identically, so a per-file
+  typo was a silent divergence. The comparison is now a helper called twice
+  rather than a copied loop.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
