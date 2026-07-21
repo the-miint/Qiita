@@ -15,10 +15,13 @@ outer rolled-back transaction. `_cleanup` below removes every row reachable
 from the study_idxs / study_accessions / principal_idxs a test tracks.
 """
 
+from decimal import Decimal
+
 import pytest
 import pytest_asyncio
 from qiita_common.models.ena import (
     EnaRunRecord,
+    EnaSampleAttributes,
     EnaStudyHeader,
     ResolverKind,
     SourceArchive,
@@ -113,6 +116,19 @@ async def _cleanup(pool, tracker: _Tracker) -> None:
             study_idxs,
         )
         bs_idxs = [r["biosample_idx"] for r in bs_rows]
+        # Harmonization (T03) writes biosample_metadata / biosample_study_field
+        # rows against these biosamples/studies; both reference their
+        # respective parents ON DELETE RESTRICT, so they must be swept before
+        # biosample_to_study / biosample / study below.
+        if bs_idxs:
+            await pool.execute(
+                "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
+                bs_idxs,
+            )
+        await pool.execute(
+            "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
+            study_idxs,
+        )
         await pool.execute(
             "DELETE FROM qiita.biosample_to_study WHERE study_idx = ANY($1::bigint[])",
             study_idxs,
@@ -167,12 +183,12 @@ async def reg(postgres_pool):
     await _cleanup(postgres_pool, tracker)
 
 
-async def _register(reg, *, study_header, runs):
+async def _register(reg, *, study_header, runs, sample_attributes=()):
     result = await register_ena_study(
         reg["pool"],
         study_header=study_header,
         runs=runs,
-        sample_attributes=[],
+        sample_attributes=list(sample_attributes),
         owner_idx=reg["owner_idx"],
         caller_idx=reg["caller_idx"],
         source_archive=SourceArchive.ENA,
@@ -181,6 +197,257 @@ async def _register(reg, *, study_header, runs):
     reg["tracker"].study_idxs.append(result.study_idx)
     reg["tracker"].study_accessions.append(study_header.study_accession)
     return result
+
+
+# ---------------------------------------------------------------------------
+# T03 -- metadata harmonization into the checklist model
+# ---------------------------------------------------------------------------
+#
+# A real, doc-confirmed MIxS-tagged fixture (NOT SAMN00199006, which has no
+# mappable tags): the five ena_import.attribute_mapping tags (collection
+# date/geo-country/lat/long/depth) plus one "hard" value (`depth` = an
+# INSDC missing-value string, proving the known_missing_reasons wiring) and
+# four deliberately-unmapped tags -- `host` (owner decision: free text, not
+# an NCBI taxon id) and the broad-scale/local/medium environmental-context
+# triad (owner decision, extended on discovery: these were rebound to
+# TERMINOLOGY/ENVO by `20260608000001_seed_envo_terminology.sql`, so mapping
+# ENA's free-text value directly would require an ENVO-CURIE resolution this
+# ticket does not own; see attribute_mapping.py's module docstring).
+# ---------------------------------------------------------------------------
+
+
+def _mixs_sample_attributes(sample_accession: str, **overrides: str) -> EnaSampleAttributes:
+    attributes = {
+        "collection date": "2019-06-01",
+        "geographic location (country and/or sea)": "USA: California",
+        "geographic location (latitude)": "32.88",
+        "geographic location (longitude)": "-117.24",
+        # Hard value: an INSDC missing-value string -- proves the
+        # known_missing_reasons wiring resolves it as a MissingReasonRef
+        # instead of raising MetadataParseError (numeric field, non-numeric text).
+        "depth": "not collected",
+        # Deliberately unmapped: TERMINOLOGY/ENVO-typed global fields --
+        # mapping this free text would require an ontology resolution this
+        # ticket does not own (see attribute_mapping.py). Retained as local
+        # metadata, not dropped.
+        "broad-scale environmental context": "marine biome",
+        "local environmental context": "coastal water",
+        "environmental medium": "sea water",
+        # Deliberately unmapped (owner decision) -- free-text, not an NCBI
+        # taxon id; retained as local metadata, not dropped.
+        "host": "Homo sapiens",
+    }
+    attributes.update(overrides)
+    return EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
+
+
+async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    sample_accession = unique_accession("SAMN")
+    run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=sample_accession,
+        study_accession=study_accession,
+    )
+    attrs = _mixs_sample_attributes(sample_accession)
+
+    result = await _register(reg, study_header=header, runs=[run], sample_attributes=[attrs])
+
+    assert result.runs[0].status == RunRegistrationStatus.REGISTERED
+    harmonization = result.runs[0].harmonization
+    assert harmonization is not None
+    # 9 tags total, 4 unmapped (host + the environmental-context triad) --
+    # 5 mapped (collection date, geo-country, lat, long, depth).
+    assert harmonization.mapped_count == 5
+    assert harmonization.retained_unmapped == [
+        "broad-scale environmental context",
+        "environmental medium",
+        "host",
+        "local environmental context",
+    ]
+    assert harmonization.checklist_name == "ERC000011"
+    # Both ERC000011-mandatory fields (collection date, geo country/sea) were
+    # supplied -- the non-raising report has nothing to list (T03-2, import
+    # still succeeds either way).
+    assert harmonization.missing_required == []
+
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
+    )
+
+    # T03-2: biosample.metadata_checklist_idx names ERC000011.
+    checklist_name = await reg["pool"].fetchval(
+        "SELECT mc.name FROM qiita.biosample b"
+        " JOIN qiita.metadata_checklist mc ON mc.idx = b.metadata_checklist_idx"
+        " WHERE b.idx = $1",
+        biosample_idx,
+    )
+    assert checklist_name == "ERC000011"
+
+    # T03-1: mapped attrs land on the correct biosample_global_fields (joined
+    # via global_field_idx).
+    rows = await reg["pool"].fetch(
+        "SELECT gf.display_name, bm.value_text, bm.value_numeric,"
+        " bm.value_missing_reason_idx"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1",
+        biosample_idx,
+    )
+    by_display_name = {r["display_name"]: r for r in rows}
+    assert set(by_display_name) == {
+        "collection date",
+        "geographic location (country and/or sea)",
+        "geographic location (latitude)",
+        "geographic location (longitude)",
+        "depth",
+    }
+    # collection_date is TEXT (rebound from DATE by
+    # 20260616000000_collection_date_text.sql) -- verbatim ISO8601 text.
+    assert by_display_name["collection date"]["value_text"] == "2019-06-01"
+    assert (
+        by_display_name["geographic location (country and/or sea)"]["value_text"]
+        == "USA: California"
+    )
+    assert by_display_name["geographic location (latitude)"]["value_numeric"] == Decimal("32.88")
+    assert by_display_name["geographic location (longitude)"]["value_numeric"] == Decimal("-117.24")
+    # The hard value: 'depth' = 'not collected' resolves as a missing-reason
+    # marker via the known_missing_reasons wiring, not a MetadataParseError
+    # (depth is NUMERIC-typed; 'not collected' is not a valid Decimal).
+    depth_row = by_display_name["depth"]
+    assert depth_row["value_numeric"] is None
+    assert depth_row["value_missing_reason_idx"] is not None
+
+    # T03-1: unmapped tags retained as local TEXT metadata, not dropped --
+    # 'host' plus the environmental-context triad.
+    local_rows = await reg["pool"].fetch(
+        "SELECT bsf.display_name, bm.value_text"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bm.global_field_idx IS NULL",
+        biosample_idx,
+    )
+    local_by_display_name = {r["display_name"]: r["value_text"] for r in local_rows}
+    assert local_by_display_name == {
+        "host": "Homo sapiens",
+        "broad-scale environmental context": "marine biome",
+        "local environmental context": "coastal water",
+        "environmental medium": "sea water",
+    }
+
+
+async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
+    shared_sample_accession = unique_accession("SAMN")
+    attrs = _mixs_sample_attributes(shared_sample_accession)
+
+    study_a_accession = unique_accession("PRJNA")
+    header_a = _study_header(study_accession=study_a_accession)
+    run_a = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=shared_sample_accession,
+        study_accession=study_a_accession,
+    )
+
+    study_b_accession = unique_accession("PRJNA")
+    header_b = _study_header(study_accession=study_b_accession)
+    run_b = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=shared_sample_accession,
+        study_accession=study_b_accession,
+    )
+
+    result_a = await _register(reg, study_header=header_a, runs=[run_a], sample_attributes=[attrs])
+    result_b = await _register(reg, study_header=header_b, runs=[run_b], sample_attributes=[attrs])
+
+    # Write-once: harmonization ran only on the FIRST import (the biosample
+    # was newly created then); the second study's registration reuses the
+    # biosample and does not re-harmonize it.
+    assert result_a.runs[0].harmonization is not None
+    assert result_b.runs[0].harmonization is None
+
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        shared_sample_accession,
+    )
+
+    # ONE canonical biosample_metadata value per global field -- not
+    # duplicated or overwritten by the second study's registration.
+    count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
+        biosample_idx,
+    )
+    assert count == 5
+
+    # Reachable from both studies via biosample_to_study (T02-2's existing
+    # cross-study de-dup, unaffected by write-once harmonization).
+    linked_studies = {
+        r["study_idx"]
+        for r in await reg["pool"].fetch(
+            "SELECT study_idx FROM qiita.biosample_to_study WHERE biosample_idx = $1",
+            biosample_idx,
+        )
+    }
+    assert linked_studies == {result_a.study_idx, result_b.study_idx}
+
+
+async def test_harmonization_parse_failure_isolated_to_its_run(reg):
+    """A genuine harmonization failure (an unparseable mapped value) fails
+    only that run -- the same per-run isolation as a platform/protocol-
+    mapping failure; it never aborts sibling runs or the whole study."""
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+
+    ok_sample_accession = unique_accession("SAMN")
+    ok_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=ok_sample_accession,
+        study_accession=study_accession,
+    )
+    ok_attrs = _mixs_sample_attributes(ok_sample_accession)
+
+    bad_sample_accession = unique_accession("SAMN")
+    bad_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=bad_sample_accession,
+        study_accession=study_accession,
+    )
+    # 'latitude' maps to a NUMERIC-typed global field; a non-numeric,
+    # non-missing-marker text fails to parse -- a genuine data error, not a
+    # missing-required-field gap.
+    bad_attrs = _mixs_sample_attributes(
+        bad_sample_accession, **{"geographic location (latitude)": "not-a-number"}
+    )
+
+    result = await _register(
+        reg,
+        study_header=header,
+        runs=[ok_run, bad_run],
+        sample_attributes=[ok_attrs, bad_attrs],
+    )
+
+    outcomes_by_accession = {o.run_accession: o for o in result.runs}
+    ok_outcome = outcomes_by_accession[ok_run.run_accession]
+    assert ok_outcome.status == RunRegistrationStatus.REGISTERED
+    assert ok_outcome.harmonization is not None
+
+    bad_outcome = outcomes_by_accession[bad_run.run_accession]
+    assert bad_outcome.status == RunRegistrationStatus.FAILED
+    assert bad_outcome.failure_reason is not None
+
+    # No orphan biosample / metadata / link rows for the failed run --
+    # the per-run transaction rolled back entirely.
+    orphan_biosample_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1",
+        bad_sample_accession,
+    )
+    assert orphan_biosample_count == 0
 
 
 # ---------------------------------------------------------------------------

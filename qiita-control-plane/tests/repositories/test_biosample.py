@@ -154,7 +154,7 @@ async def test_insert_biosample_full_columns(ctx):
 async def test_get_or_create_biosample_by_ena_accession_creates_on_miss(ctx):
     ena_acc = unique_accession("SAMEA")
 
-    idx = await get_or_create_biosample_by_ena_accession(
+    idx, created = await get_or_create_biosample_by_ena_accession(
         ctx["pool"],
         ena_sample_accession=ena_acc,
         owner_idx=ctx["biosample_owner_idx"],
@@ -162,6 +162,7 @@ async def test_get_or_create_biosample_by_ena_accession_creates_on_miss(ctx):
     )
     ctx["created"]["biosample"].append(idx)
 
+    assert created is True
     row = await ctx["pool"].fetchrow(
         "SELECT owner_idx, created_by_idx, ena_sample_accession"
         " FROM qiita.biosample WHERE idx = $1",
@@ -175,19 +176,20 @@ async def test_get_or_create_biosample_by_ena_accession_creates_on_miss(ctx):
 async def test_get_or_create_biosample_by_ena_accession_reuses_on_hit(ctx):
     ena_acc = unique_accession("SAMEA")
 
-    first_idx = await get_or_create_biosample_by_ena_accession(
+    first_idx, first_created = await get_or_create_biosample_by_ena_accession(
         ctx["pool"],
         ena_sample_accession=ena_acc,
         owner_idx=ctx["biosample_owner_idx"],
         created_by_idx=ctx["principal_idx"],
     )
     ctx["created"]["biosample"].append(first_idx)
+    assert first_created is True
 
     # A second caller with a DIFFERENT owner (the cross-study-overlap case,
     # e.g. a second study importing the same ENA BioSample under a
     # different importing owner) reuses the same row rather than raising
     # or minting a duplicate -- owner_idx/created_by_idx are not compared.
-    second_idx = await get_or_create_biosample_by_ena_accession(
+    second_idx, second_created = await get_or_create_biosample_by_ena_accession(
         ctx["pool"],
         ena_sample_accession=ena_acc,
         owner_idx=ctx["principal_idx"],
@@ -195,6 +197,7 @@ async def test_get_or_create_biosample_by_ena_accession_reuses_on_hit(ctx):
     )
 
     assert second_idx == first_idx
+    assert second_created is False
     count = await ctx["pool"].fetchval(
         "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1", ena_acc
     )
@@ -207,7 +210,7 @@ async def test_get_or_create_biosample_by_ena_accession_reuses_on_hit(ctx):
 
 
 async def test_ensure_biosample_linked_to_study_creates_link(ctx):
-    bs_idx = await get_or_create_biosample_by_ena_accession(
+    bs_idx, _ = await get_or_create_biosample_by_ena_accession(
         ctx["pool"],
         ena_sample_accession=unique_accession("SAMEA"),
         owner_idx=ctx["biosample_owner_idx"],
@@ -235,7 +238,7 @@ async def test_ensure_biosample_linked_to_study_is_idempotent(ctx):
     """Unlike insert_entity_to_study (which raises UniqueViolationError on a
     repeat call), a second call for the same (biosample, study) pair is a
     silent no-op -- the whole point of this helper over the shared one."""
-    bs_idx = await get_or_create_biosample_by_ena_accession(
+    bs_idx, _ = await get_or_create_biosample_by_ena_accession(
         ctx["pool"],
         ena_sample_accession=unique_accession("SAMEA"),
         owner_idx=ctx["biosample_owner_idx"],

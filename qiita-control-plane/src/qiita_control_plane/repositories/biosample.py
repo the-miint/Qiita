@@ -159,12 +159,19 @@ async def get_or_create_biosample_by_ena_accession(
     ena_sample_accession: str,
     owner_idx: int,
     created_by_idx: int,
-) -> int:
+) -> tuple[int, bool]:
     """Race-safe find-or-create for a biosample keyed on ena_sample_accession
     (T02-2, cross-study de-dup). ON CONFLICT DO NOTHING + fallback SELECT
     against the biosample_ena_sample_accession_unique constraint, mirroring
     insert_sequencing_run's find-or-create shape
     (repositories/sequencing_run.py).
+
+    Returns (idx, created). created is True only on the insert branch; the
+    caller (ena_import.registration) uses it to harmonize a newly-created
+    biosample's ENA attributes exactly once (T03's write-once rule) -- a
+    later study reusing the same biosample via the reuse branch below must
+    not re-harmonize (and must not re-write metadata another study's import
+    already wrote through the shared global-field slot).
 
     A biosample is shared identity across every study that imports the same
     ENA BioSample: owner_idx/created_by_idx are pinned to whichever import
@@ -176,10 +183,11 @@ async def get_or_create_biosample_by_ena_accession(
     this biosample is the caller's next step via
     ensure_biosample_linked_to_study.
 
-    Does not write any metadata -- unlike import_biosample_from_owner_
+    Does not write any metadata itself -- unlike import_biosample_from_owner_
     biosample_id, which always inserts and mandates an owner-id value plus
-    metadata. This is deliberately the bare row: TASK-03 owns mapping ENA
-    sample attributes into metadata.
+    metadata. This is deliberately the bare row: ena_import.harmonization
+    (TASK-03) owns mapping ENA sample attributes into metadata, driven by
+    the caller off the `created` flag this function returns.
     """
     inserted_idx = await conn.fetchval(
         "INSERT INTO qiita.biosample (owner_idx, created_by_idx, ena_sample_accession)"
@@ -191,7 +199,7 @@ async def get_or_create_biosample_by_ena_accession(
         ena_sample_accession,
     )
     if inserted_idx is not None:
-        return inserted_idx
+        return inserted_idx, True
 
     existing_idx = await conn.fetchval(
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
@@ -207,7 +215,7 @@ async def get_or_create_biosample_by_ena_accession(
             f"{ena_sample_accession!r}) collided on insert but the existing"
             " row is not visible"
         )
-    return existing_idx
+    return existing_idx, False
 
 
 async def ensure_biosample_linked_to_study(

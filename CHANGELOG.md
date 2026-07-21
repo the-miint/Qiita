@@ -58,6 +58,31 @@ duplicates further down are historical strata; leave them where they are.
   `qiita_common.models.ena`) via an additive, reversible migration;
   `transport` stays unpopulated until TASK-04's download workflow lands. No
   metadata harmonization (TASK-03) or batch fan-out (TASK-06) yet.
+- **ENA sample-attribute harmonization into the checklist model
+  (`ena_import.harmonization`, TASK-03).** Every ENA-imported biosample is now
+  bound to the ENA default sample checklist (`ERC000011`) and, the first time
+  its biosample is created (write-once — a later study reusing the same
+  BioSample via the existing cross-study de-dup does not re-harmonize it), its
+  submitter-defined attributes are split by a curated, conservative
+  `ena_import.attribute_mapping.map_ena_attributes` into globally-linked
+  metadata (cross-study comparable) and study-local metadata (retained
+  verbatim, never dropped). `known_missing_reasons` is wired into the shared
+  `preflight_global_metadata` helper so an INSDC missing-value string (`not
+  collected`, ...) resolves as a missing-value marker instead of raising a
+  parse error. A checklist-required field ENA did not supply is reported on
+  the new `HarmonizationResult.missing_required` — never rejected; only a
+  genuine parse/type/collision failure fails that run, isolated exactly like
+  a platform/protocol-mapping failure. `host`, `taxon_id`, `host_taxon_id`,
+  and the GSC-MIxS broad-scale/local/medium environmental-context tags are
+  deliberately left unmapped — resolving them onto their (NCBI Taxonomy- or
+  ENVO-)terminology-typed global fields would fabricate an ontology-term
+  resolution this ticket does not own. A new migration seeds `ERC000011`'s
+  real mandatory field set (fetched from ENA: `collection date` and
+  `geographic location (country and/or sea)` — the only two `<FIELD>` entries
+  the checklist marks `mandatory`) into `metadata_checklist_field`.
+  `biosample.get_or_create_biosample_by_ena_accession` now returns
+  `(idx, created)` so the registration composer can key harmonization off
+  whether the biosample was newly created.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
