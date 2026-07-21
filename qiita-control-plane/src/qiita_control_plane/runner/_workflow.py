@@ -318,6 +318,7 @@ async def run_workflow(
             if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
                 bound.update(
                     await _resolve_staged_reads(
+                        pool,
                         scope_target,
                         upload_staging_root,
                         data_plane_url=data_plane_url,

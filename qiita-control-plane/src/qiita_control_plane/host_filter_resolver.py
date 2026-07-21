@@ -112,19 +112,7 @@ async def resolve_host_filter(
     # surface as an InvalidTextRepresentation from Postgres instead of here.
     platform = Platform(platform)
 
-    # Read the host_taxon_id value via the trigger-maintained global_field_idx,
-    # which is what makes this a cross-study read: it resolves the same field no
-    # matter which study's local field the value was written against.
-    #
-    # fetchrow (not fetch) is safe: the partial unique index
-    # biosample_metadata_one_value_per_global_field guarantees at most ONE row
-    # per (biosample, global field), so a biosample linked to several studies
-    # still cannot carry two conflicting host_taxon_id values.
-    row = await conn.fetchrow(
-        f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = $2",
-        BIOSAMPLE_FIELD_HOST_TAXON_ID,
-        biosample_idx,
-    )
+    row = await _fetch_host_taxon_metadata_row(conn, biosample_idx)
 
     # Look the profile up only when the sample actually named a host; the
     # classifier below needs it for exactly that branch.
@@ -134,6 +122,69 @@ async def resolve_host_filter(
             conn, host_term_idx=row["value_terminology_term_idx"], platform=platform
         )
     return _classify(biosample_idx, row, profile, platform)
+
+
+async def _fetch_host_taxon_metadata_row(
+    conn: asyncpg.Pool | asyncpg.Connection, biosample_idx: int
+) -> asyncpg.Record | None:
+    """The single host_taxon_id metadata row for a biosample (or None if unset),
+    read via the trigger-maintained global_field_idx — which is what makes this a
+    cross-study read: it resolves the same field no matter which study's local
+    field the value was written against. Shared by `resolve_host_filter` and
+    `is_control_sample` so the row SHAPE they classify can't drift.
+
+    fetchrow (not fetch) is safe: the partial unique index
+    biosample_metadata_one_value_per_global_field guarantees at most ONE row
+    per (biosample, global field), so a biosample linked to several studies
+    still cannot carry two conflicting host_taxon_id values.
+    """
+    return await conn.fetchrow(
+        f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = $2",
+        BIOSAMPLE_FIELD_HOST_TAXON_ID,
+        biosample_idx,
+    )
+
+
+async def is_control_sample(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    biosample_idx: int,
+) -> bool:
+    """True when `biosample_idx` is an expected-empty control — a blank / no-template
+    control whose host_taxon_id carries the control missing-reason
+    (`MISSING_REASON_CONTROL_SAMPLE`, the marker the control-sample backfill sets).
+
+    Platform-independent, and deliberately so: the control classification never
+    consults a host_filter_profile (that lookup only feeds the host-*present*
+    branch), so this reads the single metadata row (via the shared
+    `_fetch_host_taxon_metadata_row`) and reuses the SAME `_RECOGNISED_MISSING_REASON`
+    table `resolve_host_filter` classifies against — the two cannot drift about what
+    "control" means. A biosample with no host_taxon_id row, a named host, or any
+    non-control missing-reason returns False.
+
+    The caller is the read-mask reads binder: a control well legitimately yields
+    zero reads (a benign terminal `no_data`), whereas a data well with zero reads
+    is a genuine failure — so the two must be told apart before disposing of a
+    zero-read ticket.
+
+    KNOWN LIMITATION — positive vs. negative controls. The control missing-reason
+    is set by the control-sample backfill from `is_control` (`project_idx IS NULL`)
+    alone, which COLLAPSES the two control kinds the pre-flight actually
+    distinguishes: an `extraction_blank` (a NEGATIVE control — expected empty) and a
+    `katharoseq_cells_positive_control` (a POSITIVE control — a known spiked
+    organism that SHOULD yield reads). So this returns True for both, and a positive
+    control that yields zero reads is classified `no_data` (benign) when it is really
+    a failure. Distinguishing them needs a persisted positive/negative signal that
+    does not exist yet (the pre-flight's `input_sample.sample_type` is not carried
+    into biosample metadata) — the same collapse the host-filter policy defers to the
+    positive-vs-negative control follow-up. This classifier deliberately matches the
+    resolver's existing CONTROL treatment rather than pre-empting that policy.
+    """
+    row = await _fetch_host_taxon_metadata_row(conn, biosample_idx)
+    if row is None or row["value_terminology_term_idx"] is not None:
+        return False
+    recognised = _RECOGNISED_MISSING_REASON.get(row["missing_reason"])
+    return recognised is not None and recognised[0] is HostFilterOutcome.CONTROL
 
 
 async def resolve_host_filter_many(
