@@ -56,12 +56,18 @@ def miint_repo() -> str:
     return os.environ.get("MIINT_EXTENSION_REPO") or MIINT_MIRROR_URL
 
 
+# The env var naming the deploy-staged extension directory. Named once here and
+# referenced everywhere else (the connect config, the job-env allowlist, the
+# LOAD-only requirement check) so the literal cannot drift between them.
+_MIINT_EXTENSION_DIRECTORY_VAR = "MIINT_EXTENSION_DIRECTORY"
+
+
 def miint_connect_config() -> dict[str, str]:
     """DuckDB `connect()` config for loading miint. miint always installs from
     a mirror (the team's signing chain, not DuckDB's), so unsigned extensions
     are always allowed; the extension directory is isolated when configured."""
     config: dict[str, str] = {"allow_unsigned_extensions": "true"}
-    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+    ext_dir = os.environ.get(_MIINT_EXTENSION_DIRECTORY_VAR)
     if ext_dir:
         config["extension_directory"] = ext_dir
     return config
@@ -103,7 +109,46 @@ def miint_load_sql() -> str:
 # `environment` is an allowlist, not an inherited copy — see SlurmBackend and
 # payload.build_job_submit_payload), so an unforwarded var is simply absent at
 # job runtime.
-MIINT_REQUIRED_JOB_VARS = ("MIINT_EXTENSION_DIRECTORY", "MIINT_GPL_BOUNDARY_PATH")
+MIINT_REQUIRED_JOB_VARS = (_MIINT_EXTENSION_DIRECTORY_VAR, "MIINT_GPL_BOUNDARY_PATH")
+
+
+def require_staged_extension_directory(*, service: str) -> str:
+    """Return `MIINT_EXTENSION_DIRECTORY`, raising if it is unset or is not a
+    directory. The single requirement check for every **LOAD-only** connect —
+    the control plane's `connect_with_miint_staged()` and the orchestrator's
+    `open_miint_conn()` both call it, so the rule and its wording live once.
+
+    `service` names the caller in the message ("control-plane service",
+    "compute orchestrator") so an operator learns which env file to edit.
+
+    Why this exists as a guard rather than letting DuckDB fail: with the
+    variable unset DuckDB resolves extensions under `$HOME/.duckdb/extensions`,
+    and the service accounts' home is `/dev/null`, so the raw failure is
+    `IO Error: Can't find the home directory at '/dev/null'` — which names
+    neither the variable nor the service. LOAD-only paths cannot fall back to
+    INSTALL (that is what needs the writable `$HOME` in the first place), so an
+    unset directory is always a misconfiguration, never a soft default.
+
+    Scoped to LOAD-only callers on purpose: the client `qiita reference load`
+    CLI legitimately runs with this unset and INSTALLs into its own cache, so it
+    uses `miint_connect_config()` directly — same carve-out `miint_job_env()`
+    documents."""
+    ext_dir = os.environ.get(_MIINT_EXTENSION_DIRECTORY_VAR)
+    if not ext_dir:
+        raise RuntimeError(
+            f"{_MIINT_EXTENSION_DIRECTORY_VAR} is not set for the {service}. "
+            "Service-side miint is LOAD-only from the deploy-staged extension "
+            "directory (the service account has no writable $HOME, so INSTALL "
+            "cannot resolve one). Set it in that service's env file to the same "
+            "path the other components use."
+        )
+    if not Path(ext_dir).is_dir():
+        raise RuntimeError(
+            f"{_MIINT_EXTENSION_DIRECTORY_VAR}={ext_dir!r} (read by the {service}) "
+            "is not a directory. It must point at the deploy-staged miint "
+            "extension directory, byte-identical across components."
+        )
+    return ext_dir
 
 
 def miint_job_env() -> dict[str, str]:

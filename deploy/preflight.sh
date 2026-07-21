@@ -51,35 +51,46 @@ fingerprint() {
 
 echo "preflight: config/secret consistency"
 
-# --- PATH_SCRATCH byte-identical across all three env files ------------------
-present_envs=()
-for ef in "$CP_ENV" "$DP_ENV" "$CO_ENV"; do
-    [ -r "$ef" ] && present_envs+=("$ef")
-done
-if [ "${#present_envs[@]}" -eq 0 ]; then
-    skip "path-scratch" "no env files present (first deploy)"
-else
-    # CO PATH_SCRATCH is optional (defaults to $TMPDIR/qiita in dev); only compare
-    # the env files that actually set it. A set value MUST match the others.
-    first=""
-    mismatch=""
-    details=""
-    n_set=0
+# --- Vars that must be byte-identical across the three env files -------------
+# Both PATH_SCRATCH and MIINT_EXTENSION_DIRECTORY name a shared filesystem path
+# every component must resolve the SAME way (derived subdirs on one; the staged
+# extension all three LOAD on the other), so a per-file typo is a silent
+# divergence rather than an error. Same comparison for both — a helper, so the
+# next such var is one call, not another copy of the loop.
+check_identical_across_envs() {
+    local var="$1" label="$2"
+    local present_envs=()
+    local ef v first="" mismatch="" details="" n_set=0
+    for ef in "$CP_ENV" "$DP_ENV" "$CO_ENV"; do
+        [ -r "$ef" ] && present_envs+=("$ef")
+    done
+    if [ "${#present_envs[@]}" -eq 0 ]; then
+        skip "$label" "no env files present (first deploy)"
+        return
+    fi
+    # A var may legitimately be unset in some files (CO's PATH_SCRATCH defaults in
+    # dev; MIINT_EXTENSION_DIRECTORY is optional-at-boot for the CP), so compare
+    # only the files that actually set it. A set value MUST match the others.
     for ef in "${present_envs[@]}"; do
-        v=$(read_env_var "$ef" PATH_SCRATCH)
+        v=$(read_env_var "$ef" "$var")
         details+="$(basename "$ef")=${v:-<unset>} "
         [ -n "$v" ] || continue
         n_set=$((n_set + 1))
         if [ -z "$first" ]; then first="$v"; elif [ "$v" != "$first" ]; then mismatch="yes"; fi
     done
     if [ -z "$first" ]; then
-        skip "path-scratch" "PATH_SCRATCH not set in any present env file"
+        skip "$label" "$var not set in any present env file"
     elif [ -n "$mismatch" ]; then
-        fail "path-scratch" "values differ across env files: ${details}(must be byte-identical)"
+        fail "$label" "values differ across env files: ${details}(must be byte-identical)"
     else
-        pass "path-scratch" "$first (identical across $n_set env file(s) that set it)"
+        pass "$label" "$first (identical across $n_set env file(s) that set it)"
     fi
-fi
+}
+
+check_identical_across_envs PATH_SCRATCH path-scratch
+# The CP joined the LOAD-only miint consumers, so a CP/CO divergence here means
+# one of them reads an extension directory the deploy never staged.
+check_identical_across_envs MIINT_EXTENSION_DIRECTORY miint-extension-dir
 
 # --- Flight ticket signing keypair (CP signs w/ private seed, DP verifies w/ public key) ---
 if [ -r "$CP_ENV" ] && [ -r "$DP_ENV" ]; then

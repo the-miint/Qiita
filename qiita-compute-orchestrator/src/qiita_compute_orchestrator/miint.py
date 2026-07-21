@@ -35,6 +35,7 @@ from qiita_common.duckdb_miint import (
     miint_connect_config,
     miint_install_sql,
     miint_load_sql,
+    require_staged_extension_directory,
 )
 from qiita_common.parquet import (
     PARQUET_OPTS,
@@ -237,7 +238,17 @@ def open_miint_conn() -> duckdb.DuckDBPyConnection:
     this never installs, downloads, or touches the mirror. If the extension is
     missing from the staged directory (a forgotten/failed deploy stage), the
     LOAD raises a DuckDB error — fail loud, as intended. The caller owns the
-    connection and must close it."""
+    connection and must close it.
+
+    The staged directory is REQUIRED here, checked up front via the shared
+    `require_staged_extension_directory` (same check the control plane's
+    `connect_with_miint_staged()` runs). Without it DuckDB falls back to
+    `$HOME/.duckdb/extensions`, and neither the CO service account (`qiita-orch`,
+    home `/dev/null`) nor a native job (ephemeral per-ticket HOME) has a usable
+    one — so the bare LOAD failed with `Can't find the home directory` rather
+    than naming the variable. Consistent with `miint_job_env()`, which already
+    refuses to submit a job without it."""
+    require_staged_extension_directory(service="compute orchestrator")
     conn = open_conn()
     conn.execute(miint_load_sql())
     return conn

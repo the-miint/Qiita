@@ -33,13 +33,13 @@ via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 
 import duckdb
 from qiita_common.duckdb_miint import (
     miint_connect_config,
     miint_install_sql,
     miint_load_sql,
+    require_staged_extension_directory,
 )
 
 _install_lock = threading.Lock()
@@ -80,28 +80,12 @@ def connect_with_miint_staged() -> duckdb.DuckDBPyConnection:
     module docstring). Requires `MIINT_EXTENSION_DIRECTORY`, which must be the
     same staged directory the compute orchestrator and data plane use.
 
-    Fails loudly and specifically when the directory is unset or missing: the
-    alternative is DuckDB's `Can't find the home directory at '/dev/null'`,
-    which names neither the variable to set nor the service that needs it. The
-    caller owns the connection and must close it."""
-    # Validate the value DuckDB will actually receive, not a second read of the
-    # environment: miint_connect_config() is the one that reaches `connect()`.
-    config = miint_connect_config()
-    ext_dir = config.get("extension_directory")
-    if not ext_dir:
-        raise RuntimeError(
-            "MIINT_EXTENSION_DIRECTORY is not set for the control-plane service. "
-            "Service-side miint is LOAD-only from the deploy-staged extension "
-            "directory (the CP service account has no writable $HOME, so INSTALL "
-            "cannot resolve one). Set it in the control plane's env file to the "
-            "same path the compute orchestrator and data plane use."
-        )
-    if not Path(ext_dir).is_dir():
-        raise RuntimeError(
-            f"MIINT_EXTENSION_DIRECTORY={ext_dir!r} is not a directory. It must point "
-            "at the deploy-staged miint extension directory, byte-identical to the "
-            "compute orchestrator's and data plane's."
-        )
-    conn = duckdb.connect(":memory:", config=config)
+    The requirement check is shared with the orchestrator's `open_miint_conn()`
+    (`require_staged_extension_directory`) so the rule and its wording live in
+    one place; the alternative it replaces is DuckDB's `Can't find the home
+    directory at '/dev/null'`, which names neither the variable nor the service.
+    The caller owns the connection and must close it."""
+    require_staged_extension_directory(service="control-plane service")
+    conn = _connect()
     conn.execute(miint_load_sql())
     return conn
