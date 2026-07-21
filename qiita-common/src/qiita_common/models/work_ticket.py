@@ -14,7 +14,7 @@ priority resolve from the originator, not the executor.
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
 from qiita_common.models._base import ComputeTarget, ScopeTarget
@@ -78,6 +78,18 @@ class WorkTicketState(StrEnum):
     carries NULL failure_* columns and is tallied in its own pool-
     completion bucket so a plate full of empty wells can still reach a
     "done" signal rather than being stuck behind permanent failures.
+
+    CANCELLED is the terminal outcome for an OPERATOR-stopped ticket (the
+    `qiita-admin ticket cancel` path): the CP flips it terminal so the poll
+    loop aborts and no new attempt is submitted, then reaps its SLURM job(s).
+    It carries NULL failure_* columns — distinct from FAILED so a deliberate
+    stop is legible (in `ticket list`, the pool rollups, the notify digest)
+    rather than masquerading as a genuine failure. Like FAILED it is redrivable
+    in place via /run once the blocker is fixed.
+
+    Mirrored DB-side by qiita.work_ticket_state; the two value sets are kept in
+    lockstep by tests (test_enum_parity + test_work_ticket_state_parity) — change
+    both in the same PR.
     """
 
     PENDING = "pending"
@@ -86,6 +98,7 @@ class WorkTicketState(StrEnum):
     COMPLETED = "completed"
     NO_DATA = "no_data"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 # The terminal/non-terminal split of WorkTicketState, defined once and imported
@@ -111,6 +124,7 @@ TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
     WorkTicketState.COMPLETED.value,
     WorkTicketState.NO_DATA.value,
     WorkTicketState.FAILED.value,
+    WorkTicketState.CANCELLED.value,
 )
 
 NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = tuple(
@@ -539,3 +553,69 @@ class WorkTicketStepLogs(BaseModel):
     stderr: str = ""
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+
+
+# Upper bound on an explicit cancel idx list, so one request can't fan a cancel
+# across an unbounded number of tickets (a fan-out is dozens, not thousands).
+_MAX_CANCEL_IDXS = 1000
+
+
+class WorkTicketCancelRequest(BaseModel):
+    """Body for POST /api/v1/work-ticket/cancel — operator-cancel of in-flight
+    compute (system_admin, `work_ticket:cancel`).
+
+    Selects the tickets by an explicit idx list AND/OR a filter. The filter is
+    `action_id` (required to filter) plus an optional `sequencing_run_idx` /
+    `sequenced_pool_idx` narrowing, and matches only NON-terminal tickets
+    (cancelling a terminal ticket is a no-op). Explicit `work_ticket_idxs` are
+    reaped regardless of state (defensive orphan-reap). At least one selector must
+    be present; run/pool narrowing requires `action_id`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_ticket_idxs: list[Annotated[int, Field(gt=0)]] = Field(
+        default_factory=list, max_length=_MAX_CANCEL_IDXS
+    )
+    action_id: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+    sequencing_run_idx: Annotated[int, Field(gt=0)] | None = None
+    sequenced_pool_idx: Annotated[int, Field(gt=0)] | None = None
+
+    @model_validator(mode="after")
+    def at_least_one_selector(self):
+        if not self.work_ticket_idxs and self.action_id is None:
+            raise ValueError(
+                "provide work_ticket_idxs and/or an action_id filter to select tickets to cancel"
+            )
+        if (
+            self.sequencing_run_idx is not None or self.sequenced_pool_idx is not None
+        ) and self.action_id is None:
+            raise ValueError(
+                "sequencing_run_idx / sequenced_pool_idx narrow the action_id filter;"
+                " set action_id too"
+            )
+        return self
+
+
+class WorkTicketCancelResult(BaseModel):
+    """The outcome for ONE ticket in a cancel request. `cancelled` is True iff this
+    call flipped it terminal (False = it was already terminal, a no-op); the scancel
+    reap runs either way. `not_found` marks an explicit idx that does not exist.
+    `reap_error` is set when the terminal flip landed but the scancel failed (the
+    flip stands — re-run cancel to retry the reap)."""
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    previous_state: str | None = None
+    state: str | None = None
+    cancelled: bool = False
+    cancelled_job_ids: list[int] = Field(default_factory=list)
+    reap_error: str | None = None
+    not_found: bool = False
+
+
+class WorkTicketCancelResponse(BaseModel):
+    """Returned by POST /api/v1/work-ticket/cancel — one result per selected ticket,
+    plus the count actually flipped this call. Compute-on-read over the selection."""
+
+    requested: int
+    cancelled: int
+    results: list[WorkTicketCancelResult]

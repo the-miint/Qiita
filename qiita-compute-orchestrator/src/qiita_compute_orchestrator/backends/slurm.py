@@ -51,6 +51,7 @@ from ..slurm import (
     SlurmrestdError,
     TerminalSlurmState,
     build_job_submit_payload,
+    job_name_prefix,
     parse_launcher_failure,
     parse_launcher_no_data,
     parse_outputs_map,
@@ -693,6 +694,28 @@ class SlurmBackend(ComputeBackend):
             for info in infos
             if info.job_id is not None
         ]
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """scancel every live job of a work_ticket — all attempts, by the
+        `qiita-wt{idx}-` name prefix. Returns the ids actually cancelled. slurmrestd
+        errors classify like `find_jobs_by_name` (transport / 5xx / 401 => retriable
+        SLURMRESTD_UNREACHABLE). Idempotent: a job already gone between the list and
+        the cancel (a 404) is swallowed by the client and simply not reported."""
+        prefix = job_name_prefix(work_ticket_idx)
+        try:
+            infos = await self._client.find_jobs_by_name_prefix(prefix)
+        except SlurmrestdError as exc:
+            raise self._classify_status_error(exc, prefix) from exc
+        cancelled: list[int] = []
+        for info in infos:
+            if info.job_id is None:
+                continue
+            try:
+                await self._client.cancel_job(info.job_id)
+            except SlurmrestdError as exc:
+                raise self._classify_status_error(exc, prefix) from exc
+            cancelled.append(info.job_id)
+        return cancelled
 
     @staticmethod
     def _require_slurm_handle(handle: StepHandle) -> None:

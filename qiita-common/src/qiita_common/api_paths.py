@@ -179,6 +179,10 @@ PATH_STEP_PLAN = "/plan"
 # Recovery / idempotency: look up live SLURM jobs by their deterministic
 # name so the CP can adopt a job it submitted but never recorded the id for.
 PATH_STEP_FIND_BY_NAME = "/find-by-name"
+# Cancel: scancel every live SLURM job of a work_ticket (all attempts, by the
+# `qiita-wt{idx}-` name prefix). The CP calls this AFTER flipping the ticket
+# terminal, so no new attempt spawns between the find and the scancel.
+PATH_STEP_CANCEL = "/cancel"
 
 URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
 URL_STEP_SUBMIT = f"{URL_STEP_PREFIX}{PATH_STEP_SUBMIT}"
@@ -186,6 +190,7 @@ URL_STEP_STATUS = f"{URL_STEP_PREFIX}{PATH_STEP_STATUS}"
 URL_STEP_RESULT = f"{URL_STEP_PREFIX}{PATH_STEP_RESULT}"
 URL_STEP_PLAN = f"{URL_STEP_PREFIX}{PATH_STEP_PLAN}"
 URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
+URL_STEP_CANCEL = f"{URL_STEP_PREFIX}{PATH_STEP_CANCEL}"
 
 
 # =============================================================================
@@ -218,6 +223,12 @@ PATH_WORK_TICKET_PREFIX = "/work-ticket"
 PATH_WORK_TICKET_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_WORK_TICKET_BY_IDX = "/{work_ticket_idx}"
 PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
+# Operator-cancel (system_admin, work_ticket:cancel): flip the selected tickets
+# terminal (`cancelled`) so the CP stops driving them AND scancel their SLURM
+# job(s). Selects by an explicit idx list AND/OR an action_id (+ run/pool) filter —
+# one collection-level verb path serves both single and bulk, so it hangs off the
+# prefix, not `/{idx}`.
+PATH_WORK_TICKET_CANCEL = "/cancel"
 # Read a single step attempt's stdout/stderr tail (operator diagnosis without
 # a host shell — the logs live under PATH_SCRATCH/ticket, served by the CP).
 PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
@@ -228,6 +239,7 @@ URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 URL_WORK_TICKET_LIST = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_ROOT}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
+URL_WORK_TICKET_CANCEL = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_CANCEL}"
 URL_WORK_TICKET_STEP_LOGS = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_STEP_LOGS}"
 
 
