@@ -509,6 +509,42 @@ async def fetch_sequenced_pool_samples(
     return list(rows)
 
 
+async def fetch_sequenced_pool_run_roster(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+) -> list[asyncpg.Record]:
+    """Return every active sequenced_sample in a pool as `(prep_sample_idx,
+    ena_run_accession)`, ordered by prep_sample_idx.
+
+    The `ingest_ena_reads` download-job's roster source: the CO has no DB
+    access, so the CP runner (`runner._read_ingest._stage_ena_run_roster`)
+    calls this before the step loop and stages the result as `run_map.parquet`.
+    Unlike `fetch_sequenced_pool_samples` (the richer per-sample projection
+    submit-host-filter-pool fans out over, with its biosample join and
+    has_read_mask_ticket EXISTS), this is the minimal two-column projection the
+    download job needs -- no unrelated joins.
+
+    Deliberately does NOT filter `ena_run_accession IS NOT NULL`: a row with a
+    NULL run accession would silently vanish from the roster if filtered here,
+    and the caller must fail loud on that instead (a download-ena-study ticket
+    against a pool with a non-ENA-origin sample is a misconfiguration, not
+    something to skip quietly). Excludes sequenced_samples whose supertype
+    prep_sample row is retired, mirroring fetch_sequenced_pool_samples. An
+    empty pool returns an empty list; the caller (not this repo function)
+    decides that is fail-loud territory."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx, ss.ena_run_accession"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
+    )
+    return list(rows)
+
+
 # same-pattern-ok: run-scoped sibling of fetch_sequenced_pool_samples; different
 # join/scope, kept as a separate function rather than parameterized by scope
 async def fetch_sequenced_samples_for_run(

@@ -12,8 +12,11 @@ TASK-03 lands metadata harmonization: `attribute_mapping` (curated ENA
 sample-attribute tag -> biosample_global_field.display_name mapping) and
 `harmonization.harmonize_biosample_attributes`, wired into
 `registration.register_ena_study` so a newly-created biosample's ENA
-attributes land on the shared checklist model. Batch driving (TASK-06)
-lands in a later ticket of this epic.
+attributes land on the shared checklist model. TASK-04 lands the download
+workflow + CO job (`workflows/download-ena-study/1.0.0.yaml`,
+`qiita_compute_orchestrator.jobs.ingest_ena_reads`) and this package's thin
+submit helper (`submit.build_download_ena_study_ticket`). Batch driving
+(TASK-06) lands in a later ticket of this epic.
 """
 
 from .accession import EnaAccessionKind, InvalidEnaAccessionError, detect_accession_kind
@@ -34,10 +37,19 @@ from .registration import (
     register_ena_study,
 )
 from .resolver import EnaAccessionNotFoundError, EnaResolver
+from .submit import (
+    DEFAULT_DOWNLOAD_METHOD,
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    build_download_ena_study_ticket,
+)
 
 __all__ = [
     "BACKEND_HTTP",
     "BACKEND_MIINT",
+    "DEFAULT_DOWNLOAD_METHOD",
+    "DOWNLOAD_ENA_STUDY_ACTION_ID",
+    "DOWNLOAD_ENA_STUDY_ACTION_VERSION",
     "EnaAccessionKind",
     "EnaAccessionNotFoundError",
     "EnaResolver",
@@ -50,6 +62,7 @@ __all__ = [
     "RunRegistrationStatus",
     "UnmappableEnaLibraryStrategyError",
     "UnmappableEnaPlatformError",
+    "build_download_ena_study_ticket",
     "detect_accession_kind",
     "get_resolver",
     "harmonize_biosample_attributes",

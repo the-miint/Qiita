@@ -83,6 +83,33 @@ duplicates further down are historical strata; leave them where they are.
   `biosample.get_or_create_biosample_by_ena_accession` now returns
   `(idx, created)` so the registration composer can key harmonization off
   whether the biosample was newly created.
+- **ENA study download workflow + CO job (`download-ena-study`,
+  `qiita_compute_orchestrator.jobs.ingest_ena_reads`, TASK-04).** Downloads a
+  registered ENA study's reads via miint `read_ena_sequences` and stores them
+  once into the DuckLake `read` table — the ENA-fetch analog of bcl-convert.
+  New `sequenced_pool`-scoped workflow `workflows/download-ena-study/1.0.0.yaml`
+  (`context_schema` requires `ena_study_accession`; `download_method` is
+  optional, pinned to `http` — no Aspera key-staging in this compute env)
+  replaces the inert placeholder of the same name. The CP runner materializes
+  the pool's `{prep_sample_idx, ena_run_accession}` roster from a LIVE
+  Postgres query (`run_map`, dispatched by declared-input name so it never
+  collides with bcl-convert's action-context-embedded `sample_map`, though
+  both are `sequenced_pool`-scoped) via a new
+  `repositories.sequenced_sample.fetch_sequenced_pool_run_roster`. The job
+  opens a FRESH DuckDB connection per run (`open_miint_ena_conn`, LOAD miint +
+  httpfs) so `miint_warnings()` stays scoped to exactly that run, mints the
+  `sequence_idx` range through the existing CO→CP callback, and fails loud
+  (new retriable `FailureKind.EXTERNAL_FETCH_TRANSIENT` for a
+  transport/network-shaped raised error; permanent `BAD_INPUT` for a
+  `miint_warnings()` skip/truncation entry or for zero reads with no
+  explanatory warning — never silently registers an incomplete or empty read
+  set). No md5 verification (`read_ena_sequences` performs none; tracked
+  separately as the D3-approved duckdb-miint escalation, TASK-10). The
+  sort/hardlink/per-slot-DuckDB-cap helpers `ingest_reads` already had are
+  extracted into a shared sibling module (`read_staging.py`) so both jobs
+  share one implementation. A new pure `ena_import.submit.
+  build_download_ena_study_ticket` composes the ticket body for TASK-06's
+  batch driver to submit per `(study, platform)` pool.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

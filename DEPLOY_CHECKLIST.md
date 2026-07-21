@@ -31,7 +31,10 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (TASK-04) `make verify-deploy`'s workflow-actions check already lists every
+  row; confirm it includes `download-ena-study 1.0.0` (new `workflows/`
+  entry, picked up by the standing `qiita-admin actions sync` inside
+  `activate.sh` — no extra operator step).
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +42,14 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (TASK-04) miint deploy staging (`stage_miint_extension`, run at deploy via
+  `scripts/stage-miint-extension.sh`) now also installs DuckDB's own
+  `httpfs` extension into the same `MIINT_EXTENSION_DIRECTORY` — the new
+  `ingest_ena_reads` job's `open_miint_ena_conn` LOADs it for
+  `read_ena_sequences`'s HTTP transport. No new operator action: the
+  standing staging step already covers it (a plain `INSTALL`, not `FORCE` —
+  httpfs is DuckDB's own signed extension, not the team mirror, so a warm
+  cache is always current).
 
 ---
 

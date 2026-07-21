@@ -20,6 +20,7 @@ from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.runner import (
+    RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
@@ -28,6 +29,7 @@ from qiita_control_plane.runner import (
     _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
+    _stage_ena_run_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
@@ -67,6 +69,72 @@ def test_resolve_sample_map_rejects_empty_roster(tmp_path):
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(_resolve_sample_map({SAMPLE_MAP_BINDING: []}, tmp_path / "ws"))
     assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+# --- ENA run roster (_stage_ena_run_roster) ---------------------------------
+
+
+class _FakeRosterPool:
+    """Minimal asyncpg.Pool stand-in: `.fetch()` returns canned
+    (prep_sample_idx, ena_run_accession) rows regardless of the query text —
+    the resolver's own SQL shape is exercised by
+    repositories/tests/test_sequenced_sample.py; this fake only needs to hand
+    back rows in a stable, asserted order."""
+
+    def __init__(self, rows: list[tuple[int, str | None]]):
+        self._rows = [{"prep_sample_idx": p, "ena_run_accession": a} for p, a in rows]
+
+    async def fetch(self, *_args, **_kwargs):
+        return self._rows
+
+
+def test_stage_ena_run_roster_writes_ordered_parquet(tmp_path):
+    """The pool's (prep_sample_idx, ena_run_accession) rows are materialized
+    to `run_map.parquet`, ordered by prep_sample_idx (the repo fetch's own
+    ORDER BY — this asserts the resolver preserves it verbatim)."""
+    pool = _FakeRosterPool([(82, "ERR002"), (81, "ERR001")])
+    bound = asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
+    out = bound[RUN_MAP_BINDING]
+    assert out.exists()
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT prep_sample_idx, ena_run_accession FROM read_parquet('{out}') "
+            "ORDER BY prep_sample_idx"
+        ).fetchall()
+    assert rows == [(81, "ERR001"), (82, "ERR002")]
+
+
+def test_stage_ena_run_roster_rejects_empty_pool(tmp_path):
+    """An empty pool fails loud (BAD_INPUT) — there is nothing to download,
+    and this must never silently produce a 0-row run_map."""
+    pool = _FakeRosterPool([])
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "no sequenced_samples" in exc.value.reason
+
+
+def test_stage_ena_run_roster_rejects_missing_accession(tmp_path):
+    """A prep_sample with no ena_run_accession is a misconfiguration (a
+    non-ENA sample sharing the pool) — fails loud rather than silently
+    dropping it from the roster."""
+    pool = _FakeRosterPool([(81, "ERR001"), (82, None)])
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "82" in exc.value.reason
+
+
+def test_workflow_declares_run_map_binding_gate():
+    """`_workflow_declares_input` recognizes RUN_MAP_BINDING like any other
+    declared input — the runner's dispatch branch in `_workflow.py` gates on
+    exactly this, not on scope-kind, so it never fires for bcl-convert's
+    (also sequenced_pool-scoped) ticket."""
+    ena_steps = [_step(inputs=["run_map", "reads_staging_root"], outputs=["read_staging_dir"])]
+    assert _workflow_declares_input(ena_steps, RUN_MAP_BINDING) is True
+
+    bcl_steps = [_step(inputs=["convert_dir", "sample_map"], outputs=["read_staging_dir"])]
+    assert _workflow_declares_input(bcl_steps, RUN_MAP_BINDING) is False
 
 
 _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"

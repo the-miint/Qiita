@@ -100,6 +100,16 @@ class FailureKind(StrEnum):
     # concurrent update"). NOT a malformed request: the same call succeeds once
     # the contention clears, so a redrive self-heals.
     DATA_PLANE_TRANSIENT = "data_plane_transient"
+    # A native job's fetch from an external (non-Qiita) archive raised a
+    # transport/network error — e.g. `ingest_ena_reads` calling miint's
+    # `read_ena_sequences`, where ENA metadata resolution (the Portal API call
+    # `read_ena_sequences.Bind` makes before any per-run reader exists) fails
+    # outright rather than being internally retried/skipped by miint itself.
+    # A DNS failure, connection reset, or timeout self-heals on a redrive; a
+    # malformed/garbled accession or a genuine format error does NOT belong
+    # here (see BAD_INPUT) — the classification is per-exception, not
+    # per-job, because the same call can fail either way.
+    EXTERNAL_FETCH_TRANSIENT = "external_fetch_transient"
 
     # ---- Permanent: workflow / input / contract issues -------------------
     BAD_INPUT = "bad_input"
@@ -129,6 +139,7 @@ _RETRIABLE: frozenset[FailureKind] = frozenset(
         FailureKind.CONTROL_PLANE_UNREACHABLE,
         FailureKind.PROCESS_RESTARTED,
         FailureKind.DATA_PLANE_TRANSIENT,
+        FailureKind.EXTERNAL_FETCH_TRANSIENT,
     }
 )
 

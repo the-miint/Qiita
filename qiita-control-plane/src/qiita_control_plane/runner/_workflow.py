@@ -79,12 +79,14 @@ from ._processing import (
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
+    RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
     _resolve_staged_reads_block,
+    _stage_ena_run_roster,
     _stage_shard_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
@@ -307,6 +309,22 @@ async def run_workflow(
             bound.update(await _resolve_sample_map(bound, workspace))
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
+
+        # ENA run-roster binding (download-ena-study workflow's
+        # `ingest_ena_reads` step): materialize the pool's `{prep_sample_idx,
+        # ena_run_accession}` roster from a LIVE Postgres query (unlike
+        # `sample_map`, which the CP composer embeds in action_context at
+        # submit time). Dispatched by DECLARED-INPUT NAME, not scope-kind:
+        # bcl-convert is also sequenced_pool-scoped, so keying off scope-kind
+        # would wire this resolver into its ticket too. Same inside-try
+        # placement as the resolvers above so an empty-pool / missing-
+        # accession failure lands in the outer FAILED handler.
+        if _workflow_declares_input(action.steps, RUN_MAP_BINDING):
+            bound.update(
+                await _stage_ena_run_roster(
+                    pool, scope_target["sequenced_pool_idx"], workspace=workspace
+                )
+            )
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.
