@@ -32,10 +32,10 @@ from pathlib import Path
 import duckdb
 from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE
 from qiita_common.duckdb_miint import (
+    MIINT_EXTENSION_DIRECTORY_VAR,
     miint_connect_config,
     miint_install_sql,
     miint_load_sql,
-    require_staged_extension_directory,
 )
 from qiita_common.parquet import (
     PARQUET_OPTS,
@@ -240,15 +240,16 @@ def open_miint_conn() -> duckdb.DuckDBPyConnection:
     LOAD raises a DuckDB error — fail loud, as intended. The caller owns the
     connection and must close it.
 
-    The staged directory is REQUIRED here, checked up front via the shared
-    `require_staged_extension_directory` (same check the control plane's
-    `connect_with_miint_staged()` runs). Without it DuckDB falls back to
-    `$HOME/.duckdb/extensions`, and neither the CO service account (`qiita-orch`,
-    home `/dev/null`) nor a native job (ephemeral per-ticket HOME) has a usable
-    one — so the bare LOAD failed with `Can't find the home directory` rather
-    than naming the variable. Consistent with `miint_job_env()`, which already
-    refuses to submit a job without it."""
-    require_staged_extension_directory(service="compute orchestrator")
+    Deliberately does NOT call `require_staged_extension_directory()` (which the
+    control plane's `connect_with_miint_staged()` does). The CO does not need it
+    and would regress if it did: on `COMPUTE_BACKEND=slurm` the var is already
+    required at boot (`_resolve_slurm_settings` iterates MIINT_REQUIRED_JOB_VARS
+    and keeps the unit DOWN without it), so this is unreachable with it unset;
+    and a native job gets a writable per-ticket `HOME` (`slurm/payload.py` points
+    HOME at the workspace precisely so DuckDB can cache extensions), so it never
+    hits the `/dev/null` home the CP hit. On `COMPUTE_BACKEND=local` (dev/smoke)
+    the var is legitimately unset and a developer's own `$HOME` resolves fine —
+    requiring it here would break that path for every native job."""
     conn = open_conn()
     conn.execute(miint_load_sql())
     return conn
@@ -277,4 +278,4 @@ def stage_miint_extension() -> str:
     # Record the staged build's fingerprint so the next deploy can skip a
     # redundant FORCE INSTALL when the mirror hasn't moved (see miint_staging).
     write_staging_marker()
-    return os.environ.get("MIINT_EXTENSION_DIRECTORY", "<duckdb default ~/.duckdb>")
+    return os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR, "<duckdb default ~/.duckdb>")

@@ -119,10 +119,7 @@ fi
 if [ -n "${SKIP_CP_MIINT:-}" ]; then
     skip "cp-miint" "SKIP_CP_MIINT=1"
 elif [ -r "$CP_ENV" ]; then
-    # cd / first: qiita-api may not be able to traverse the invoking operator's
-    # cwd (deploys are run from NFS home dirs), and a bash -c that cannot resolve
-    # its cwd fails before it reaches the python.
-    if out=$(cd / && sudo -u "$QIITA_API_USER" bash -c "
+    if out=$(sudo -u "$QIITA_API_USER" bash -c "
         set -a
         # shellcheck disable=SC1091
         source /etc/qiita/control-plane.env; set +a

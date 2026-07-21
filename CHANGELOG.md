@@ -145,16 +145,18 @@ duplicates further down are historical strata; leave them where they are.
   `LOAD` writes nothing. `make verify-deploy` gains a `cp-miint` check, since a
   missing var takes nothing down at boot and would otherwise stay invisible until
   the next assembly submission.
-- **The orchestrator's `open_miint_conn()` had the same latent failure (#350).**
-  Every LOAD-only connect now shares one requirement check
-  (`qiita_common.duckdb_miint.require_staged_extension_directory`) instead of
-  each component re-deriving it, and `MIINT_EXTENSION_DIRECTORY` is named once
-  rather than spelled as a literal in three places. The CO reached the bare
-  `LOAD` with the directory unset — the same `Can't find the home directory`
-  DuckDB error, from `qiita-orch` (home `/dev/null`) or a native job's ephemeral
-  per-ticket HOME — and now fails naming the variable and the service, matching
-  what `miint_job_env()` already refused to submit without. The helper stays pure
-  Python (qiita-common imports no duckdb); each component keeps its own connect.
+- **The staged-directory requirement is single-sourced (#350)** as
+  `qiita_common.duckdb_miint.require_staged_extension_directory`, and
+  `MIINT_EXTENSION_DIRECTORY` is now named once (`MIINT_EXTENSION_DIRECTORY_VAR`)
+  instead of spelled as a literal across the connect config, the job-env
+  allowlist, and the orchestrator's staging gate. The **orchestrator
+  deliberately does not adopt the check**: a slurm CO already requires the var at
+  boot (`_resolve_slurm_settings`), its native jobs get a writable per-ticket
+  `HOME` (`slurm/payload.py` points HOME at the workspace so DuckDB can cache
+  extensions there), and a `COMPUTE_BACKEND=local` dev run legitimately has
+  neither — so requiring it there would guard an unreachable state on the deploy
+  while breaking local development. The helper is pure Python; qiita-common
+  imports no duckdb, so each component keeps its own connect.
 - **`make preflight` now checks `MIINT_EXTENSION_DIRECTORY` byte-identity across
   the CP/DP/CO env files (#350)**, the way it already did for `PATH_SCRATCH` —
   both name a shared path every component must resolve identically, so a per-file

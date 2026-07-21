@@ -82,6 +82,12 @@ check_identical_across_envs() {
         skip "$label" "$var not set in any present env file"
     elif [ -n "$mismatch" ]; then
         fail "$label" "values differ across env files: ${details}(must be byte-identical)"
+    elif [ "$n_set" -lt "${#present_envs[@]}" ]; then
+        # Agreeing-but-incomplete. NOT a fail (a var can be legitimately unset in
+        # some files), but the pass message must show WHICH file is missing it —
+        # printing only "identical" reads as green for exactly the misconfiguration
+        # bucket 1 exists to prevent (CP unset, CO+DP agreeing).
+        pass "$label" "$first (identical across $n_set of ${#present_envs[@]} env file(s)) — ${details}"
     else
         pass "$label" "$first (identical across $n_set env file(s) that set it)"
     fi

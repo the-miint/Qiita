@@ -12,11 +12,14 @@ from __future__ import annotations
 import pytest
 
 from qiita_common.duckdb_miint import (
+    MIINT_EXTENSION_DIRECTORY_VAR,
     MIINT_MIRROR_URL,
+    MIINT_REQUIRED_JOB_VARS,
     miint_connect_config,
     miint_install_sql,
     miint_job_env,
     miint_load_sql,
+    require_staged_extension_directory,
 )
 
 
@@ -106,3 +109,40 @@ def test_job_env_raises_lists_all_missing(monkeypatch):
     monkeypatch.delenv("MIINT_GPL_BOUNDARY_PATH", raising=False)
     with pytest.raises(RuntimeError, match="MIINT_EXTENSION_DIRECTORY.*MIINT_GPL_BOUNDARY_PATH"):
         miint_job_env()
+
+
+# --- require_staged_extension_directory ------------------------------------
+
+
+def test_require_staged_extension_directory_returns_the_dir(monkeypatch, tmp_path):
+    """The happy path returns the value, so a caller can use it directly."""
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", str(tmp_path))
+    assert require_staged_extension_directory(service="test service") == str(tmp_path)
+
+
+def test_require_staged_extension_directory_raises_when_unset(monkeypatch):
+    """Unset is always a misconfiguration for a LOAD-only caller: it cannot fall
+    back to INSTALL, which is what needs the writable $HOME in the first place.
+    The message must name BOTH the var and the service, because DuckDB's own
+    (`Can't find the home directory at '/dev/null'`) names neither."""
+    monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
+    with pytest.raises(RuntimeError) as excinfo:
+        require_staged_extension_directory(service="control-plane service")
+    assert "MIINT_EXTENSION_DIRECTORY" in str(excinfo.value)
+    assert "control-plane service" in str(excinfo.value)
+
+
+def test_require_staged_extension_directory_raises_on_non_directory(monkeypatch, tmp_path):
+    """A path that is not a usable directory is caught here rather than surfacing
+    later as a confusing `extension not found`."""
+    not_a_dir = tmp_path / "regular-file"
+    not_a_dir.write_text("")
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", str(not_a_dir))
+    with pytest.raises(RuntimeError, match="not a readable directory"):
+        require_staged_extension_directory(service="compute orchestrator")
+
+
+def test_extension_directory_var_is_the_one_job_env_requires():
+    """The named constant IS the job-env requirement, not a second spelling of
+    it — the drift this constant exists to prevent."""
+    assert MIINT_EXTENSION_DIRECTORY_VAR in MIINT_REQUIRED_JOB_VARS

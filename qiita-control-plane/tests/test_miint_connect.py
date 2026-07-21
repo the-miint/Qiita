@@ -24,20 +24,10 @@ from qiita_control_plane.miint import connect_with_miint_staged
 
 
 def test_staged_connect_requires_extension_directory(monkeypatch):
-    """Unset MIINT_EXTENSION_DIRECTORY fails with an actionable message, not a
-    DuckDB home-directory IOException."""
+    """The CP wrapper reaches the shared requirement check and names ITSELF in
+    the error (the check's own cases live in qiita-common's test_duckdb_miint)."""
     monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
-    with pytest.raises(RuntimeError, match="MIINT_EXTENSION_DIRECTORY is not set"):
-        connect_with_miint_staged()
-
-
-def test_staged_connect_rejects_non_directory(monkeypatch, tmp_path):
-    """A path that is not a directory is caught here rather than surfacing as a
-    confusing `extension not found` later."""
-    not_a_dir = tmp_path / "regular-file"
-    not_a_dir.write_text("")
-    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", str(not_a_dir))
-    with pytest.raises(RuntimeError, match="is not a directory"):
+    with pytest.raises(RuntimeError, match="control-plane service"):
         connect_with_miint_staged()
 
 
