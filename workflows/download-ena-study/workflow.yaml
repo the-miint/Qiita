@@ -1,0 +1,12 @@
+# Reserved slot for the ENA-study download action. This file deliberately
+# has no top-level `action_id` (mirrors workflows/amplicon/workflow.yaml),
+# so the actions loader (qiita_control_plane.actions.loader.load_actions)
+# skips it — it never syncs into qiita.action via `qiita-admin actions
+# sync`. The real action_id, steps, and version land in a later ticket of
+# this epic, once the ENA-study download workflow is authored, at which
+# point it is registered the normal way (actions sync — never a
+# migration).
+name: download-ena-study
+version: 0.0.0
+
+steps: []
