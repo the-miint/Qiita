@@ -12,13 +12,16 @@ Order of operations:
      `EnaStudyHeader.secondary_study_accession` -> `study.ena_study_accession`.
      Race-safe (`repositories.study.get_or_create_study_by_ena_accessions`).
 
-  2. Map every run's ENA `instrument_platform` to `qiita.platform` up
-     front (`platform_mapping.map_ena_platform`, fail-loud on an
-     unmappable value -- this is a hard stop for the whole study, run
-     BEFORE any write, so an unrecognized platform never leaves a
-     partially-registered study) and group runs by the mapped platform.
+  2. Map each run's ENA `instrument_platform` to `qiita.platform`
+     independently (`platform_mapping.map_ena_platform`, fail-loud on an
+     unmappable value -- but isolated per run, matching protocol-mapping
+     and per-run DB failures below: an unrecognized platform fails only
+     that run (`failed`, offending value in the reason) and never aborts
+     sibling runs or the whole study). Successfully-mapped runs are
+     grouped by the mapped platform.
 
-  3. For each distinct platform: get-or-create one `sequencing_run`
+  3. For each distinct platform among the successfully-mapped runs:
+     get-or-create one `sequencing_run`
      (`instrument_run_id = "{study_accession}:{platform}"`, race-safe via
      the existing `insert_sequencing_run`) and one `sequenced_pool`
      attached to it (reused via `fetch_sequenced_pool_idxs_for_run` if one
@@ -74,7 +77,7 @@ from qiita_control_plane.repositories.sequencing_run import (
 )
 from qiita_control_plane.repositories.study import get_or_create_study_by_ena_accessions
 
-from .platform_mapping import map_ena_platform
+from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
 from .protocol_mapping import map_ena_run_to_prep_protocol_name
 
 
@@ -137,11 +140,11 @@ async def register_ena_study(
     and must be supplied by the caller (e.g. the batch driver, TASK-06).
 
     Never raises for a per-run failure -- see `RunRegistrationOutcome`.
-    Does raise for a study-level problem that precedes any write: an
-    unmappable `instrument_platform` on ANY run aborts the whole call
-    (`platform_mapping.UnmappableEnaPlatformError`), because the platform
-    grouping in step 2 must be complete before step 3 can decide how many
-    sequencing_run/sequenced_pool rows to create.
+    An unmappable `instrument_platform` (`platform_mapping.
+    UnmappableEnaPlatformError`) is one such per-run failure, isolated
+    exactly like a protocol-mapping or per-run DB error: that run is
+    recorded `failed` with the offending platform value in the reason,
+    and every other run in the study is still registered normally.
     """
     async with pool.acquire() as conn:
         study_row, study_created = await get_or_create_study_by_ena_accessions(
@@ -157,14 +160,26 @@ async def register_ena_study(
         )
         study_idx = study_row["idx"]
 
-        # Map every run's platform up front (fail loud, before any write)
-        # and group by the mapped platform -- R3.
+        # Map each run's platform independently -- fail loud, but isolated
+        # per run (R3): an unmappable platform fails only that run, exactly
+        # like the protocol-mapping / DB failures _register_one_run already
+        # isolates. Only successfully-mapped runs are grouped by platform.
         runs_by_platform: dict[Platform, list[EnaRunRecord]] = defaultdict(list)
+        outcomes_by_accession: dict[str, RunRegistrationOutcome] = {}
         for run in runs:
-            platform = map_ena_platform(run.instrument_platform)
+            try:
+                platform = map_ena_platform(run.instrument_platform)
+            except UnmappableEnaPlatformError as exc:
+                outcomes_by_accession[run.run_accession] = RunRegistrationOutcome(
+                    run_accession=run.run_accession,
+                    status=RunRegistrationStatus.FAILED,
+                    failure_reason=str(exc),
+                )
+                continue
             runs_by_platform[platform].append(run)
 
-        # One sequencing_run + sequenced_pool per distinct platform.
+        # One sequencing_run + sequenced_pool per distinct platform that has
+        # at least one successfully-mapped run.
         sequenced_pool_idx_by_platform: dict[Platform, int] = {}
         for platform in runs_by_platform:
             sequenced_pool_idx_by_platform[platform] = await _get_or_create_pool_for_platform(
@@ -174,21 +189,22 @@ async def register_ena_study(
                 created_by_idx=caller_idx,
             )
 
-        outcomes: list[RunRegistrationOutcome] = [
-            await _register_one_run(
-                conn,
-                run=run,
-                study_idx=study_idx,
-                platform=platform,
-                sequenced_pool_idx=sequenced_pool_idx_by_platform[platform],
-                owner_idx=owner_idx,
-                caller_idx=caller_idx,
-                source_archive=source_archive,
-                resolver_kind=resolver_kind,
-            )
-            for platform, platform_runs in runs_by_platform.items()
-            for run in platform_runs
-        ]
+        for platform, platform_runs in runs_by_platform.items():
+            for run in platform_runs:
+                outcomes_by_accession[run.run_accession] = await _register_one_run(
+                    conn,
+                    run=run,
+                    study_idx=study_idx,
+                    platform=platform,
+                    sequenced_pool_idx=sequenced_pool_idx_by_platform[platform],
+                    owner_idx=owner_idx,
+                    caller_idx=caller_idx,
+                    source_archive=source_archive,
+                    resolver_kind=resolver_kind,
+                )
+
+    # Preserve the caller's input order in the returned per-run outcomes.
+    outcomes = [outcomes_by_accession[run.run_accession] for run in runs]
 
     return EnaStudyRegistrationResult(
         study_idx=study_idx,

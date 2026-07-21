@@ -552,3 +552,112 @@ async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg
         bad_run_accession,
     )
     assert final_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Unmappable-platform failure isolation -- a bad `instrument_platform` fails
+# only that run (mirrors the protocol-mapping partial-failure test above),
+# it never aborts the whole study import.
+# ---------------------------------------------------------------------------
+
+
+async def test_unmappable_platform_run_isolated_others_registered(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    ok_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="ILLUMINA",
+        library_strategy="AMPLICON",
+    )
+    bad_sample_accession = unique_accession("SAMN")
+    bad_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=bad_sample_accession,
+        study_accession=study_accession,
+        # CAPILLARY has no qiita.platform counterpart -- platform_mapping.py.
+        instrument_platform="CAPILLARY",
+    )
+
+    result = await _register(reg, study_header=header, runs=[ok_run, bad_run])
+
+    outcomes_by_accession = {o.run_accession: o for o in result.runs}
+    ok_outcome = outcomes_by_accession[ok_run.run_accession]
+    assert ok_outcome.status == RunRegistrationStatus.REGISTERED
+    assert ok_outcome.sequenced_sample_idx is not None
+
+    bad_outcome = outcomes_by_accession[bad_run.run_accession]
+    assert bad_outcome.status == RunRegistrationStatus.FAILED
+    assert bad_outcome.failure_reason is not None
+    assert "CAPILLARY" in bad_outcome.failure_reason
+
+    # Exactly one sequencing_run / sequenced_pool for this study -- only the
+    # ILLUMINA platform of the good run, none for the unmappable platform.
+    run_rows = await reg["pool"].fetch(
+        "SELECT idx, platform FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
+        f"{study_accession}:%",
+    )
+    assert len(run_rows) == 1
+    assert run_rows[0]["platform"] == "illumina"
+    pool_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.sequenced_pool WHERE sequencing_run_idx = $1",
+        run_rows[0]["idx"],
+    )
+    assert pool_count == 1
+
+    # No orphan rows at all for the platform-failed run -- it fails before
+    # any per-run write is attempted, unlike the protocol-mapping failure
+    # case above (which does commit the biosample/link before rolling back).
+    orphan_sequenced_sample_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        bad_run.run_accession,
+    )
+    assert orphan_sequenced_sample_count == 0
+    orphan_biosample_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1",
+        bad_sample_accession,
+    )
+    assert orphan_biosample_count == 0
+    orphan_link_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study bts"
+        " JOIN qiita.biosample b ON b.idx = bts.biosample_idx"
+        " WHERE b.ena_sample_accession = $1",
+        bad_sample_accession,
+    )
+    assert orphan_link_count == 0
+
+
+async def test_all_unmappable_platform_study_all_failed_no_runs_or_pools(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    bad_run_1 = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="CAPILLARY",
+    )
+    bad_run_2 = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform=None,
+    )
+
+    result = await _register(reg, study_header=header, runs=[bad_run_1, bad_run_2])
+
+    assert {o.status for o in result.runs} == {RunRegistrationStatus.FAILED}
+    assert {o.run_accession for o in result.runs} == {
+        bad_run_1.run_accession,
+        bad_run_2.run_accession,
+    }
+
+    run_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
+        f"{study_accession}:%",
+    )
+    assert run_count == 0

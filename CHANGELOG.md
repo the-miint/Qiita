@@ -46,11 +46,12 @@ duplicates further down are historical strata; leave them where they are.
   (`ena_import.platform_mapping`, one `sequencing_run`/`sequenced_pool` per
   distinct platform) and its `library_strategy`/`library_source` to one of the
   five curated `prep_protocol` rows (`ena_import.protocol_mapping`) — both
-  fail loud on an unmappable value — then imports the sequenced prep_sample
-  via the existing composer. Each run registers inside its own transaction, so
-  a run that fails (e.g. an unmappable protocol) is recorded `failed` in the
-  result without leaving orphan rows or blocking its siblings; a re-import
-  skips runs already present. `EnaRunRecord` gains `instrument_platform`
+  fail loud on an unmappable value, isolated per run — then imports the
+  sequenced prep_sample via the existing composer. Each run registers inside
+  its own transaction, so a run that fails (e.g. an unmappable platform or
+  protocol) is recorded `failed` in the result without leaving orphan rows or
+  blocking its siblings or the rest of the study; a re-import skips runs
+  already present. `EnaRunRecord` gains `instrument_platform`
   (TASK-01 amendment) and `qiita.sequenced_sample` gains three nullable
   provenance columns (`source_archive` / `resolver_kind` / `transport`,
   TEXT/CHECK — mirrored by new `SourceArchive`/`ResolverKind` enums in
