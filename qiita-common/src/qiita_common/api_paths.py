@@ -385,6 +385,28 @@ PATH_READ_MASKED_DOGET = "/ticket/doget"
 URL_READ_MASKED_PREFIX = f"{API_PREFIX}{PATH_READ_MASKED_PREFIX}"
 URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
 
+# =============================================================================
+# /read/* — Flight DoGet ticket for a block's reads (block-compute streaming)
+# =============================================================================
+# Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
+# sub-range)` members, so a block-scoped compute job streams its reads from the
+# data plane instead of reading a Parquet the control plane materialized onto
+# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
+# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
+# ticket), the same shape as /alignment/ticket/doget.
+#
+# The body carries only work_ticket_idx. The route reads the block's members
+# from qiita.block_member (keeping a large member list CP-side, off the wire)
+# and picks the selector — raw `read_block` for a read-mask block, mask-scoped
+# `read_masked_block` for an align block — from the ticket's action_context (see
+# block_read.resolve_block_read_scope).
+
+PATH_READ_PREFIX = "/read"
+PATH_READ_DOGET = "/ticket/doget"
+
+URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
+URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
+
 
 # =============================================================================
 # /auth/* — OIDC handoff, PAT mint/list/revoke, CLI device flow
