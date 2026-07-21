@@ -1435,3 +1435,94 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     assert fake_cls.instances == []
     assert preexisting.read_bytes() == b"stale"
     assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_B.5.7.43.R1.fastq.gz"]
+
+
+# ---------------------------------------------------------------------------
+# ticket cancel (calls the CP cancel route)
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_cancel_posts_idxs_and_filter(monkeypatch, capsys):
+    """`ticket cancel <idx...> --action-id --sequenced-pool-idx` POSTs the right
+    body to the cancel route and renders the per-ticket summary."""
+    from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    resp_body = {
+        "requested": 2,
+        "cancelled": 1,
+        "results": [
+            {
+                "work_ticket_idx": 10,
+                "previous_state": "processing",
+                "state": "cancelled",
+                "cancelled": True,
+                "cancelled_job_ids": [518235],
+                "reap_error": None,
+                "not_found": False,
+            },
+            {
+                "work_ticket_idx": 11,
+                "previous_state": "failed",
+                "state": "failed",
+                "cancelled": False,
+                "cancelled_job_ids": [],
+                "reap_error": None,
+                "not_found": False,
+            },
+        ],
+    }
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = json
+        return httpx.Response(200, json=resp_body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    rc = cli.main(
+        [
+            "ticket",
+            "cancel",
+            "10",
+            "11",
+            "--action-id",
+            "read-mask",
+            "--sequenced-pool-idx",
+            "25016",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith(URL_WORK_TICKET_CANCEL)
+    assert captured["json"] == {
+        "work_ticket_idxs": [10, 11],
+        "action_id": "read-mask",
+        "sequenced_pool_idx": 25016,
+    }
+    err = capsys.readouterr().err
+    assert "cancelled 1/2" in err
+    assert "wt 10: processing -> cancelled" in err
+    assert "wt 11: already failed" in err
+
+
+def test_ticket_cancel_requires_a_selector():
+    """Neither idxs nor --action-id → parser.error (exit 2), before any network."""
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["ticket", "cancel"])
+    assert exc.value.code == 2
+
+
+def test_ticket_cancel_run_idx_requires_action_id():
+    """--sequencing-run-idx without --action-id → parser.error (exit 2)."""
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["ticket", "cancel", "--sequencing-run-idx", "3"])
+    assert exc.value.code == 2

@@ -275,11 +275,12 @@ def test_terminal_and_non_terminal_partition_the_enum():
     assert terminal | non_terminal == {s.value for s in WorkTicketState}
 
 
-def test_terminal_set_carries_all_three_terminal_states():
-    """NO_DATA is terminal — it is an outcome (an empty well), not a pending one."""
+def test_terminal_set_carries_all_terminal_states():
+    """NO_DATA is terminal (an empty-well outcome, not pending); CANCELLED is
+    terminal (an operator stop). Both are outcomes, not in-flight states."""
     from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
-    assert TERMINAL_WORK_TICKET_STATES == ("completed", "no_data", "failed")
+    assert TERMINAL_WORK_TICKET_STATES == ("completed", "no_data", "failed", "cancelled")
 
 
 def test_non_terminal_states_are_in_lifecycle_order():

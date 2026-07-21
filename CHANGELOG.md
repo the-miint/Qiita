@@ -22,6 +22,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita-admin ticket cancel` — stop in-flight compute without raw scancel (#314).**
+  A single ticket or a whole fan-out (explicit idxs and/or an `--action-id` +
+  `--sequencing-run-idx`/`--sequenced-pool-idx` filter) can now be cancelled from the
+  CLI, replacing the fragile "scancel as the compute account + hand-written job-name
+  regex + race the re-driver" recovery. The CP does it **terminal-first**: it flips
+  each ticket to a new terminal `cancelled` state (distinct from `failed` so an
+  operator stop is legible in `ticket list` / rollups / the notify digest, with NULL
+  failure_*) so the runner's poll loop aborts and no new attempt spawns, THEN scancels
+  every attempt of the ticket via a new CO `POST /step/cancel` endpoint (matched by the
+  `qiita-wt{idx}-` job-name prefix, not just the recorded slurm_job_id). Idempotent
+  (already-terminal is a no-op but still reaps any stray job — the same primitive
+  #312's orphan-reaping needs); a cancelled ticket is redrivable in place with
+  `qiita ticket run` once the blocker is fixed. New `work_ticket:cancel` scope
+  (system_admin), `ALTER TYPE work_ticket_state ADD VALUE 'cancelled'` migration,
+  `ComputeBackend.cancel` / `ComputeBackendClient.cancel`, and `POST /work-ticket/cancel`.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

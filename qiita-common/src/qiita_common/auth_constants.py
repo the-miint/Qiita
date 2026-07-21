@@ -123,6 +123,14 @@ class Scope(StrEnum):
     # never wet_lab_admin or service accounts.
     ADMIN_MASKED_READ_EXPORT = "admin:masked_read_export"
 
+    # Operator-cancel of in-flight compute: flip a work_ticket terminal
+    # (cancelled) so the CP stops driving it AND scancel its SLURM job(s). Privileged
+    # — it stops running work and crosses into the compute account's reap on the
+    # operator's behalf — so it is granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES, never to wet_lab_admin or service accounts. Mirrors the
+    # destructive-delete scopes (REFERENCE_DELETE / SEQUENCED_POOL_DELETE).
+    WORK_TICKET_CANCEL = "work_ticket:cancel"
+
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"
     SELF_TOKEN = "self:token"

@@ -2085,6 +2085,40 @@ async def test_run_on_failed_resets_to_pending(
     assert row["failure_reason"] is None
 
 
+async def test_run_on_cancelled_resets_to_pending(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """CANCELLED → /run redrives just like FAILED: state → PENDING with a clean
+    retry budget, so an operator can restart a cancelled ticket once the blocker
+    is fixed. A cancelled ticket already carries NULL failure_*."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, retry_count)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state, 3)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+    assert row["state"] == WorkTicketState.PENDING.value
+    assert row["retry_count"] == 0
+
+
 async def test_run_on_failed_resets_reference_scope_target_to_pending(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
 ):

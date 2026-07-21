@@ -94,6 +94,7 @@ from .owner_id import (
     _write_owner_biosample_id_tsv,
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .ticket_cancel import _handle_ticket_cancel
 
 # ---------------------------------------------------------------------------
 # argparse entry point
@@ -163,6 +164,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="failure_step_name (required iff --stage=step_run)",
     )
     p_force_fail.set_defaults(handler=_handle_ticket_force_fail)
+
+    p_cancel = p_ticket_sub.add_parser(
+        "cancel",
+        help=(
+            "Cancel in-flight work_ticket(s): flip terminal (cancelled) so the CP"
+            " stops driving them AND scancel their SLURM job(s), via the CP route"
+            " (work_ticket:cancel scope). One ticket or a whole fan-out — no raw"
+            " scancel across the compute account. Idempotent; redrive later with"
+            " `qiita ticket run`."
+        ),
+    )
+    p_cancel.add_argument(
+        "work_ticket_idx",
+        nargs="*",
+        type=int,
+        help="explicit work_ticket idx(s) to cancel (reaped regardless of state)",
+    )
+    p_cancel.add_argument(
+        "--action-id",
+        dest="action_id",
+        default=None,
+        help=(
+            "cancel all NON-terminal tickets for this action_id (e.g. read-mask);"
+            " combine with --sequencing-run-idx / --sequenced-pool-idx to narrow"
+        ),
+    )
+    p_cancel.add_argument(
+        "--sequencing-run-idx",
+        dest="sequencing_run_idx",
+        type=int,
+        default=None,
+        help="narrow --action-id to tickets under this sequencing run",
+    )
+    p_cancel.add_argument(
+        "--sequenced-pool-idx",
+        dest="sequenced_pool_idx",
+        type=int,
+        default=None,
+        help="narrow --action-id to tickets under this sequenced pool",
+    )
+    p_cancel.set_defaults(handler=_handle_ticket_cancel)
 
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
