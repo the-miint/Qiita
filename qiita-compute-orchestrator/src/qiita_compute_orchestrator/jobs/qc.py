@@ -183,7 +183,7 @@ _SE_REASON_CASE = (
 class Inputs(BaseModel):
     """Typed input contract for qc.
 
-    `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
+    `reads` (OPTIONAL — see the note below on why) is a staged read Parquet:
     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`.
     `adapter_parquet` is the canonical adapter set the runner materializes
     (`_resolve_qc_adapters`) — OPTIONAL. Unbound (None) means NO adapter trim: the
@@ -207,11 +207,11 @@ class Inputs(BaseModel):
     flows no such scalar (None here). Kept as an accepted field so both scopes
     validate against one Inputs shape.
 
-    `reads` is OPTIONAL for the same reason it is on `align_sharded`: the
-    per-sample `read-mask` workflow binds a staged Parquet, while `read-mask-block`
-    binds nothing and the reads STREAM from the data plane at runtime. Which one
-    applies is a property of the workflow, not of this job — `bind_step_reads`
-    resolves it and hands back one relation name either way.
+    `reads` is OPTIONAL because its SOURCE is a property of the workflow, not of
+    this job: the per-sample `read-mask` workflow binds a staged Parquet, while
+    `read-mask-block` binds nothing and the block's reads STREAM from the data
+    plane at runtime. `bind_step_reads` resolves whichever applies and hands back
+    one relation name, so everything below is source-agnostic.
     """
 
     reads: Path | None = None
@@ -505,7 +505,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # reads stream from the data plane. One relation name either way, so
             # every view below is source-agnostic.
             async with bind_step_reads(
-                conn, reads=inputs.reads, work_ticket_idx=inputs.work_ticket_idx
+                conn,
+                reads=inputs.reads,
+                work_ticket_idx=inputs.work_ticket_idx,
+                workspace=duckdb_tmp,
             ) as reads_rel:
                 # Read + render the adapter set from the staged Parquet (fail fast on
                 # an empty/unreadable *file*). The constant VARCHAR[] is inlined into

@@ -57,8 +57,9 @@ that connection; see docs/duckdb-miint.md).
 `mask_idx` is a per-run constant stamped onto every `read_mask` row at emit
 time — the CP-minted filtering-config identity (the runner mints it before this
 step and threads it in via `params`); multiple masks coexist over the same
-reads. `prep_sample_idx`, by contrast, is stamped PER ROW from the reads
-parquet: a block spans many prep_samples, so there is no single owner. A
+reads. `prep_sample_idx`, by contrast, is stamped PER ROW from the bound reads
+relation (a staged Parquet on the per-sample path, a data-plane stream on the
+block path): a block spans many prep_samples, so there is no single owner. A
 single-sample ticket has one prep_sample_idx on every read, so this is a strict
 generalization — identical output for the per-sample read-mask path.
 """
@@ -112,8 +113,8 @@ _QUERY = "host_filter_query"
 _SURVIVORS = "host_filter_survivors"
 _RYPE_HOST = "host_filter_rype_hits"
 _MM2_HOST = "host_filter_minimap2_hits"
-# The per-read (sequence_idx -> prep_sample_idx) map, projected from the reads
-# parquet so the final mask can stamp prep_sample_idx PER ROW rather than as a
+# The per-read (sequence_idx -> prep_sample_idx) map, projected from the bound
+# reads relation so the final mask can stamp prep_sample_idx PER ROW rather than as a
 # per-run constant — a block spans many prep_samples (see the COPY below).
 _READ_META = "host_filter_read_meta"
 
@@ -134,7 +135,7 @@ _TRIM_SEQ2 = (
 class Inputs(BaseModel):
     """Typed input contract for host_filter.
 
-    `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
+    `reads` (OPTIONAL — see the note below on why) is a staged read Parquet:
     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`
     — the FULL reads. `qc_mask` is the partial mask the `qc` step emitted
     `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
@@ -152,9 +153,10 @@ class Inputs(BaseModel):
     value is authoritative and identical for the single-sample case. A block
     ticket flows no prep_sample_idx scalar at all (None here).
 
-    `reads` is OPTIONAL: the per-sample `read-mask` workflow stages a Parquet,
-    while `read-mask-block` binds none and the block's reads STREAM from the data
-    plane at runtime. `bind_step_reads` resolves whichever applies and yields one
+    `reads` is OPTIONAL because its SOURCE is a property of the workflow, not of
+    this job: the per-sample `read-mask` workflow stages a Parquet, while
+    `read-mask-block` binds none and the block's reads STREAM from the data plane
+    at runtime. `bind_step_reads` resolves whichever applies and yields one
     relation name, so the kernel below is source-agnostic — including the per-row
     `prep_sample_idx` stamping, which reads the same column either way.
     """
@@ -261,7 +263,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # path, a data-plane stream on the block path. One relation either
             # way, so the per-row owner stamping below is source-agnostic.
             async with bind_step_reads(
-                conn, reads=inputs.reads, work_ticket_idx=inputs.work_ticket_idx
+                conn,
+                reads=inputs.reads,
+                work_ticket_idx=inputs.work_ticket_idx,
+                workspace=duckdb_tmp,
             ) as reads_rel:
                 # qc_mask as a VIEW (read on this connection by both the query view
                 # and the final COPY).

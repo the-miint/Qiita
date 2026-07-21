@@ -11,8 +11,9 @@ HiFi / Nanopore long reads → minimap2); the control plane resolves it from
 
 Pipeline (modelled on `host_filter`, same miint-connection rules):
   1. A query VIEW `(read_id = sequence_idx BIGINT, sequence1, sequence2)` over the
-     staged reads Parquet (`export_read_block`'s
-     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`).
+     block's reads, streamed from the data plane at runtime and bound by
+     `read_source.bind_step_reads` in the shape
+     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`.
      `sequence_idx` is the globally-unique BIGINT read identity; exposing it AS
      `read_id` lets classify + align round-trip it and the output map straight back.
      Exactly like `host_filter`, a read pair rides as ONE row
@@ -84,8 +85,9 @@ sort match the DuckLake `alignment` table
 **Wired by the `align` workflow.** `workflows/align/1.0.0.yaml`
 (`target_kind: block`) drives `align_sharded` → `delete-alignment-block` →
 `register-files` → `reconcile-alignment-block`. The runner resolves the
-router/shard paths from action_context (`_resolve_sharded_align_indexes`) and
-stages the block's MASKED reads (`export_read_masked_block`); the align planner
+router/shard paths from action_context (`_resolve_sharded_align_indexes`); the
+block's MASKED reads are streamed by the job itself (the control plane scopes the
+ticket to the `read_masked` view under the completed mask). The align planner
 fans out one block ticket per ~10M-read block. The integration smoke
 (`tests/integration/test_sharded_alignment.py`) drives `execute()` directly
 against real miint.
@@ -310,11 +312,11 @@ class Inputs(BaseModel):
     injects no scope scalar and `reference_idx` is a RESERVED input key that cannot
     be passed via `params:`, so the CP resolves the router/shard paths from
     action_context (the `align_reference_idx` context key) instead. `work_ticket_idx`
-    is the framework-injected scope scalar. `prep_sample_idx` is OPTIONAL and unused:
-    like host_filter, each output row's owner is stamped PER ROW from the reads
-    Parquet, so a multi-sample block needs no scalar."""
+    is the framework-injected scope scalar (and the key the read stream is minted
+    by). `prep_sample_idx` is OPTIONAL and unused: like host_filter, each output
+    row's owner is stamped PER ROW from the streamed reads, so a multi-sample block
+    needs no scalar."""
 
-    reads: Path | None = None
     reference_idx: int | None = None
     aligner: Literal["minimap2", "bowtie2"]
     router_index_path: Path
@@ -462,7 +464,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # set above bound that materialization (it spills, it does not grow
             # the heap).
             async with bind_step_reads(
-                conn, reads=inputs.reads, work_ticket_idx=inputs.work_ticket_idx
+                conn,
+                reads=None,
+                work_ticket_idx=inputs.work_ticket_idx,
+                workspace=duckdb_tmp,
             ) as reads_rel:
                 # Per-read (sequence_idx -> prep_sample_idx) map, projected to the two
                 # key columns so the final COPY stamps each alignment row's owner PER
@@ -607,7 +612,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "a.position, a.flags) "
                     f"TO '{out_sql}' ({PARQUET_OPTS})"
                 )
-            success = True
+        # OUTSIDE the connection contexts, matching qc and host_filter: a context
+        # __exit__ that raises after the COPY must still take the partial-output
+        # cleanup below, not skip it.
+        success = True
     finally:
         # On failure remove a partial output so the SLURM launcher's manifest
         # walker (which runs after execute()) can't promote it as the result.

@@ -38,6 +38,9 @@ COMPUTE_WORKER_FIXTURE_SCOPES: frozenset[Scope] = frozenset(
         Scope.SEQUENCE_RANGE_MINT,
         Scope.SEQUENCED_POOL_PREFLIGHT_READ,
         Scope.READ_MASKED_DOGET,
+        # Block-read DoGet (raw + masked block selectors). The compute SA holds
+        # it in production too — a block-scoped job mints its read stream with it.
+        Scope.READ_DOGET,
     }
 )
 

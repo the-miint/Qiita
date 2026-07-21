@@ -258,7 +258,37 @@ async def test_read_doget_human_user_403(ctx, postgres_pool, regular_user_sessio
 async def test_read_doget_sa_without_scope_403(ctx, sa_no_scope_client):
     resp = await sa_no_scope_client.post(URL_READ_DOGET, json={"work_ticket_idx": 1})
     assert resp.status_code == 403, resp.text
-    assert "ticket:doget" in resp.json()["detail"]
+    assert "read:doget" in resp.json()["detail"]
+
+
+async def test_read_doget_rejects_the_generic_ticket_doget_scope(
+    postgres_pool, compute_worker_service_account
+):
+    """`ticket:doget` must NOT open this route.
+
+    That scope covers reference data and the derived `alignment` slice. This route
+    signs tickets for RAW `read` rows — a strict superset of the `read_masked`
+    surface, which already carries its own privacy-sensitive scope. If holding the
+    reference-read scope were enough here, any account minting reference tickets
+    could pull raw human/host reads.
+    """
+    from qiita_control_plane.main import app
+
+    app.state.pool = postgres_pool
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=compute_worker_service_account["principal_idx"],
+        label=f"sa-generic-doget-{secrets.token_hex(4)}",
+        scopes=[Scope.TICKET_DOGET],
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {plaintext}"},
+    ) as sa:
+        resp = await sa.post(URL_READ_DOGET, json={"work_ticket_idx": 1})
+    assert resp.status_code == 403, resp.text
+    assert "read:doget" in resp.json()["detail"]
 
 
 async def test_read_doget_unknown_ticket_404(ctx):

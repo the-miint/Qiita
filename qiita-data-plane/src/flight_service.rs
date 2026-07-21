@@ -237,12 +237,10 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 /// admissible only because it CANNOT express an unscoped read: it is not a table
 /// name, it is a block-read *selector* form that `build_query` rejects unless the
 /// ticket carries a non-empty `members` list (see `BLOCK_READ_SOURCES`). The
-/// bytes it streams are exactly the bytes the retired `export_read_block`
-/// DoAction used to write to shared scratch, so this widens no privacy boundary —
-/// it changes the transport from "data plane writes a human-readable Parquet onto
-/// a shared filesystem" to "data plane streams to one authenticated compute job",
-/// which is the narrower of the two. Direct DB tooling on the host remains the
-/// path for anything unscoped.
+/// bytes it streams are the block's own reads, delivered to one authenticated
+/// compute job rather than written as a human-readable Parquet onto a shared
+/// filesystem — the narrower of the two transports. Direct DB tooling on the host
+/// remains the path for anything unscoped.
 const ALLOWED_TABLES: &[&str] = &[
     "reference_sequences",
     "reference_sequence_chunks",
@@ -1253,10 +1251,11 @@ where
 const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
 
-/// The read-export projection, in `read` / `read_masked` table order. Shared by
-/// the raw (`export_read` / `export_read_block`, from `qiita_lake.read`) and
-/// masked (`export_read_masked_block`, from the `read_masked` VIEW) exports so
-/// every read-block Parquet has the identical column shape — the shape
+/// The read projection, in `read` / `read_masked` table order. Shared by the
+/// per-sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
+/// block-read DoGet selectors (`read_block` from `qiita_lake.read`,
+/// `read_masked_block` from the `read_masked` VIEW), so every read payload the
+/// data plane hands a compute job has the identical column shape — the shape
 /// `align_sharded.reads` / the read-mask jobs bind. `read_masked` exposes exactly
 /// these columns (plus `mask_idx`), already trimmed and `pass`-filtered.
 const EXPORT_READ_COLUMNS: &str =
@@ -1303,10 +1302,9 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// inlined integers only) and materialize its rows into a Parquet at `dest`.
 /// Returns the row count.
 ///
-/// Shared machinery for every read-export DoAction: `export_read` (one whole
-/// sample) and `export_read_block` (a block's `(prep_sample, sub-range)` members)
-/// read `qiita_lake.read`; `export_read_masked_block` reads the `read_masked`
-/// VIEW (trimmed + `pass`-filtered) scoped by `mask_idx`. Each caller builds its
+/// Machinery for the `export_read` DoAction — one whole sample from
+/// `qiita_lake.read`. (Its block siblings are gone: a block's reads STREAM over
+/// the `read_block` / `read_masked_block` DoGet selectors.) The caller builds its
 /// own SELECT (same `EXPORT_READ_COLUMNS` projection so the output shape is
 /// identical); this function owns the publish. An empty selection writes NO file
 /// and returns 0 — the control plane turns that into a clean submission failure.
@@ -2049,7 +2047,7 @@ fn delete_pool_reads(
 /// (the reconcile count-assertion would otherwise trip on a 2× row count).
 ///
 /// The WHERE clause is the SAME exact-by-construction footprint selector
-/// `export_read_block` emits (`block_read_where_clause`), scoped further by
+/// the `read_block` selector emits (`block_read_where_clause`), scoped further by
 /// `mask_idx = ?`: `mask_idx = {m} AND prep_sample_idx IN (...) AND sequence_idx
 /// BETWEEN block_min AND block_max AND (per-member OR)`. The per-member OR
 /// residual makes it exact — a split member deletes ONLY its own sub-range, so a
@@ -2462,12 +2460,8 @@ fn build_query(
 
 /// Build the SELECT for a block-read DoGet (`read_block` / `read_masked_block`).
 ///
-/// The streaming twin of the retired `export_read_block` /
-/// `export_read_masked_block` DoActions: identical source relation, identical
-/// `block_read_where_clause` selector, identical `EXPORT_READ_COLUMNS`
-/// projection — only the sink differs (a Flight stream to the compute node rather
-/// than a Parquet on shared scratch). Sharing the selector and the projection with
-/// the delete path is deliberate: a block's read footprint and its delete
+/// Source relation, `block_read_where_clause` selector and `EXPORT_READ_COLUMNS`
+/// projection are all shared with the block DELETE path — deliberately: a block's read footprint and its delete
 /// footprint are the same footprint, and one translator means they cannot drift.
 ///
 /// Guards, all fail-loud (a violation is a control-plane bug, and the ticket is
@@ -3910,7 +3904,7 @@ mod tests {
         .unwrap()
     }
 
-    /// `export_read_block` materializes the UNION of its members' `read`
+    /// The `read_block` selector streams the UNION of its members' `read`
     /// sub-ranges and nothing else: a sample whose `sequence_idx` falls in the
     /// gap between two block members (but whose prep_sample is not a member) is
     /// excluded, and a split member contributes only its sub-range (rows beyond
@@ -3919,7 +3913,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
-    fn export_read_block_writes_union_and_excludes_gap_and_split() {
+    fn read_block_selector_streams_union_and_excludes_gap_and_split() {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
@@ -4037,7 +4031,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
-    fn export_read_masked_block_writes_only_pass_rows_for_mask() {
+    fn read_masked_block_selector_streams_only_pass_rows_for_mask() {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
@@ -4161,7 +4155,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
-    fn export_read_block_split_member_not_at_max_is_exact() {
+    fn read_block_selector_split_member_not_at_max_is_exact() {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
@@ -4417,9 +4411,9 @@ mod tests {
     }
 
     #[test]
-    fn build_query_read_block_streams_the_export_projection_from_raw_read() {
-        // The streaming twin of the retired export_read_block DoAction: same
-        // source relation, same EXPORT_READ_COLUMNS projection, same selector.
+    fn build_query_read_block_streams_the_shared_projection_from_raw_read() {
+        // Resolves to the raw read table, projects the shared EXPORT_READ_COLUMNS,
+        // and scopes with the selector the block DELETE path also uses.
         let members = block_members();
         let (sql, table) = build_query("read_block", &auth::TicketFilter::new(), &members).unwrap();
         assert_eq!(
@@ -5241,7 +5235,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
-    fn export_read_block_prunes_and_scales() {
+    fn block_read_selector_prunes_and_scales() {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();

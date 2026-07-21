@@ -24,6 +24,13 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from qiita_common.hashing import canonical_json
 
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
+
+# The only tables a `members` selector may be signed onto — the block-read
+# selectors, mirroring the data plane's BLOCK_READ_SOURCES. Sourced from the
+# shared constants so the signer and the scope rule cannot drift.
+_MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
+
 TICKET_VERSION = 2
 DEFAULT_TTL_SECONDS = 300
 SIGNATURE_SIZE = 64  # Ed25519
@@ -92,6 +99,16 @@ def sign_ticket(
     """
     if filter and any(not value for value in filter.values()):
         raise ValueError("sign_ticket rejects a filter with an empty value list")
+    if members and table not in _MEMBERS_TABLES:
+        # The members selector is only meaningful for the block-read selectors,
+        # and only they can be scoped by it alone. Signing it onto another table
+        # would mint a ticket the data plane rejects — or, worse, one whose empty
+        # filter passed the scope check below on the strength of a selector that
+        # table ignores. Enforce here so the boundary holds what it documents.
+        raise ValueError(
+            f"sign_ticket: a members selector is only valid for "
+            f"{sorted(_MEMBERS_TABLES)}, got {table!r}"
+        )
     if members is not None and not members:
         # Distinct from "no members at all": an explicitly empty selector means
         # the caller computed a block footprint and got nothing, which is a

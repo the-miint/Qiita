@@ -238,9 +238,9 @@ qiita_sif_missing_sources() {
 # The instance specifier of `qiita-data-plane@.service` IS the port
 # (`qiita-data-plane@50051` binds 127.0.0.1:50051), so this list is simultaneously
 # the systemd units to enable/restart, the nginx upstream members, and the
-# endpoints to health-check. ONE definition, read by activate.sh (render + restart),
-# verify.sh (per-instance health), and preflight.sh (report) — so scaling out is a
-# single operator knob rather than three files that can disagree.
+# endpoints to health-check. ONE definition, read by activate.sh (render the
+# upstream + enable/restart each unit) and verify.sh (per-instance health) — so
+# scaling out is a single operator knob rather than files that can disagree.
 #
 # Operator sets QIITA_DATA_PLANE_PORTS to scale, e.g.
 #   QIITA_DATA_PLANE_PORTS="50051 50052 50053" sudo -E make redeploy ...
@@ -273,6 +273,13 @@ qiita_data_plane_ports() {
     [ -n "${ports// /}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is empty" >&2; return 1; }
     printf '%s' "$ports"
 }
+
+# The loopback gRPC balancer port the ON-HOST control plane talks to (nginx →
+# the qiita_data_plane upstream). One definition, read by activate.sh's rendered
+# nginx config and by verify.sh's health check, so the listener and the check
+# cannot name different ports. Not operator-tunable today; a constant with a name
+# beats the same literal in four files.
+QIITA_DATA_PLANE_LB_PORT=50050
 
 read_env_var() {
     local env_file="$1" var="$2"

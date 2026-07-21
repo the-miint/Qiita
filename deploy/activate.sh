@@ -194,6 +194,7 @@ echo "data plane instances: $DP_PORTS"
 
 cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
 sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
+sed -i "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" /etc/nginx/conf.d/qiita.conf
 
 # Render the upstream member lines from the instance list. Built as a file and
 # spliced with `sed -e /pat/r` rather than an in-place substitution because the

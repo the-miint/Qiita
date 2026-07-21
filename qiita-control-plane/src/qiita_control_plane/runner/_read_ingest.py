@@ -289,8 +289,8 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
 
 
 def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:
-    """Shared body for the read-export DoActions (`export_read`,
-    `export_read_block`): run a synchronous Flight DoAction of `action_type` in a
+    """Shared body for the read-export DoActions (`export_read` is the only one
+    left — block reads stream): run a synchronous Flight DoAction of `action_type` in a
     thread executor (pyarrow.flight is sync). The data plane writes the file; the
     bulk read bytes never transit the control plane. Returns `{"count": int,
     "dest": str}` with `count` already coerced to int, raising ValueError on a

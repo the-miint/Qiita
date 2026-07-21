@@ -6,11 +6,14 @@ job (read-mask-block's ``qc`` / ``host_filter``, align's ``align_sharded``)
 STREAMS its reads from the data plane instead of reading a Parquet the control
 plane materialized onto shared scratch at submit time.
 
-Service-account-only, gated on ``Scope.TICKET_DOGET`` — the same scope the
-sibling ``POST /alignment/ticket/doget`` uses, and for the same reason: the job
-mints at RUNTIME (tickets are short-TTL and a SLURM queue can outlive a
-submit-time ticket). Reusing that scope rather than minting a new one keeps the
-service-account grant surface fixed, so this route needs no operator action.
+Service-account-only, gated on its OWN ``Scope.READ_DOGET`` — deliberately not
+the generic ``ticket:doget`` the sibling ``POST /alignment/ticket/doget`` uses.
+That scope covers reference data and the derived ``alignment`` slice; this route
+signs tickets for RAW ``read`` rows, which is a strict superset of the
+``read_masked`` surface that already has its own privacy-sensitive scope. Reusing
+``ticket:doget`` would have let any account minting reference tickets pull raw
+human/host reads. Like its siblings the ticket is minted at RUNTIME (short TTL; a
+SLURM queue can outlive a submit-time ticket).
 
 The body carries only ``work_ticket_idx``. Everything that scopes the ticket is
 read CP-side:
@@ -22,11 +25,11 @@ read CP-side:
   ``block_read.resolve_block_read_scope``.
 
 **Privacy.** ``read_block`` streams RAW reads, which may contain host/human
-sequence. That is the same data the retired ``export_read_block`` DoAction used
-to write onto shared scratch, so this is a narrowing rather than a widening —
-but it means the scope check here is load-bearing, not decorative. A ticket is
-only ever signed for a BLOCK-scoped work ticket with a non-empty member set;
-``sign_ticket`` refuses an empty selector, and the data plane refuses one again.
+sequence — the surface ``read_masked`` exists to exclude. So the scoping here is
+load-bearing, not decorative, and it is enforced at three independent boundaries:
+this route signs only for a BLOCK-scoped work ticket with a non-empty member set,
+``sign_ticket`` refuses an empty or wrong-table selector, and the data plane
+refuses an unscoped block read again on the serving side.
 """
 
 import base64
@@ -53,7 +56,7 @@ async def create_read_doget_ticket(
     body: ReadDoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
-    _sa: ServiceAccount = Depends(require_service_with_scope(Scope.TICKET_DOGET)),
+    _sa: ServiceAccount = Depends(require_service_with_scope(Scope.READ_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a block-read DoGet ticket for the given block work ticket.
 
@@ -71,7 +74,7 @@ async def create_read_doget_ticket(
 
     Authorization is scope-only at this layer, matching the reference /
     read_masked / alignment doget routes: any service account holding
-    ``ticket:doget`` can request a ticket; row-level visibility is not enforced
+    ``read:doget`` can request a ticket; row-level visibility is not enforced
     here.
     """
     row = await pool.fetchrow(

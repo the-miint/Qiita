@@ -23,18 +23,29 @@ data-plane-sourced, and there are one or two consumers.
 the same either way and the per-sample path can migrate later (or not) without
 touching a job.
 
-**Why the two branches bind differently.** A Parquet is bound as a lazy VIEW over
-`read_parquet` — unchanged from before, and load-bearing: `qc` streams, so its
-peak memory is flat in row count, and materializing a whole sample would
-reintroduce exactly the memory-scales-with-input shape that OOM-killed the PacBio
-ingest. An Arrow Flight stream cannot be a lazy view: the reader is consumed
-ONCE, so a second scan sees nothing, and miint resolves relation names on a
-SEPARATE connection where a registered stream relation is invisible (see
-docs/duckdb-miint.md). So the stream branch materializes to a real non-temp
-TABLE. That is bounded, not unbounded: callers set a DuckDB `memory_limit` and a
-`temp_directory` under the job workspace (`apply_duckdb_settings` +
-`duckdb_tmp_dir`), so a block larger than the limit spills to node-local disk
-rather than growing the heap.
+**Both branches end at the same lazy VIEW over a Parquet, and that is the point.**
+`qc` streams: its peak memory is flat in row count, and that property is
+load-bearing — materializing a whole block into the heap would reintroduce
+exactly the memory-scales-with-input shape that OOM-killed 24/26 samples on the
+first real PacBio run. A block is tiled to ~10M reads regardless of platform
+(`block_planner._BLOCK_TARGET_READS`) against a job DuckDB capped at 8 GB, so
+"it will fit" is not a safe assumption and "DuckDB will spill a base table" is
+not a behaviour this repo has probed.
+
+So the stream branch does NOT hold the block in DuckDB. It drains the Flight
+reader exactly once with `COPY (SELECT * FROM <stream>) TO <workspace>/…parquet`
+— a streaming write whose memory is flat in row count — and then binds the same
+lazy `read_parquet` view the staged-Parquet branch binds. That also solves the
+two constraints a raw stream relation cannot satisfy on its own: the reader is
+single-consumption (`align_sharded` scans its reads twice), and miint resolves
+relation names on a SEPARATE connection where a registered stream relation is
+invisible (see docs/duckdb-miint.md) — a `read_parquet` view resolves there
+fine, which is exactly what these jobs did before this change.
+
+The spill file lives in the JOB'S OWN workspace, on node-local scratch, and is
+deleted when the binding closes. It is not a step-to-step filepath handoff and
+does not reintroduce the shared-filesystem coupling this seam exists to remove:
+nothing outside this one job ever learns the path.
 """
 
 from __future__ import annotations
@@ -47,6 +58,7 @@ from typing import TYPE_CHECKING
 from qiita_common.parquet import validate_parquet_path
 
 from .data_plane_client import open_read_block_stream
+from .miint import PARQUET_OPTS
 
 if TYPE_CHECKING:
     import duckdb
@@ -55,9 +67,13 @@ if TYPE_CHECKING:
 # reads identically regardless of which branch bound it.
 READS_RELATION = "step_reads"
 
-# The relation the raw Flight stream is registered as before materialization.
+# The relation the raw Flight stream is registered as before it is drained.
 # Distinct from READS_RELATION so the two never collide inside one connection.
 _STREAM_RELATION = "_step_reads_stream"
+
+# Basename of the node-local Parquet the streamed block is drained into, inside
+# the job's own workspace. Deleted when the binding closes.
+_STREAM_SPILL_FILENAME = "streamed_reads.parquet"
 
 
 @asynccontextmanager
@@ -66,6 +82,7 @@ async def bind_step_reads(
     *,
     reads: Path | None,
     work_ticket_idx: int,
+    workspace: Path,
     relation: str = READS_RELATION,
 ) -> AsyncIterator[str]:
     """Bind this step's reads into `conn` as `relation`, yielding the name.
@@ -84,30 +101,59 @@ async def bind_step_reads(
     A missing Parquet raises `FileNotFoundError` (fail fast, before any DuckDB
     work). A stream failure surfaces as the underlying httpx/Flight error, which
     the native-job dispatcher classifies.
+
+    `conn` must already have been through `miint.apply_duckdb_settings` (every
+    caller does, before binding): the stream branch's `COPY` uses the shared
+    `PARQUET_OPTS`, whose `ROW_GROUP_SIZE_BYTES` DuckDB rejects unless
+    `preserve_insertion_order=false` — which that helper sets. Row order carries
+    no meaning here anyway; the retired data-plane export disabled it for the same
+    reason, and every consumer (qc per-row, host_filter/align by join) is
+    order-independent.
     """
     if reads is not None:
         if not reads.exists():
             raise FileNotFoundError(f"reads parquet not found: {reads}")
-        # Lazy VIEW — see the module note on why this branch must not materialize.
-        conn.execute(
-            f"CREATE VIEW {relation} AS "
-            f"SELECT * FROM read_parquet('{validate_parquet_path(reads)}')"
-        )
-        try:
-            yield relation
-        finally:
-            conn.execute(f"DROP VIEW IF EXISTS {relation}")
+        async with _bind_parquet_view(conn, reads, relation) as rel:
+            yield rel
         return
 
-    async with open_read_block_stream(
-        conn, work_ticket_idx=work_ticket_idx, relation=_STREAM_RELATION
-    ) as stream_rel:
-        # Materialize INSIDE the stream's context: the Flight client stays open
-        # for the duration of the scan that drains it, and draining it here lets
-        # the client close before the (long) compute runs. Non-temp so miint can
-        # resolve it on its own connection.
-        conn.execute(f"CREATE TABLE {relation} AS SELECT * FROM {stream_rel}")
+    # Drain the Flight reader straight to a node-local Parquet. `COPY` streams
+    # row groups to disk, so peak memory is flat in row count rather than in
+    # block size — see the module note on why holding the block in DuckDB is not
+    # an option. Written INSIDE the stream's context so the Flight client stays
+    # open for the scan that drains it and closes before the (long) compute.
+    workspace.mkdir(parents=True, exist_ok=True)
+    spilled = workspace / _STREAM_SPILL_FILENAME
+    try:
+        async with open_read_block_stream(
+            conn, work_ticket_idx=work_ticket_idx, relation=_STREAM_RELATION
+        ) as stream_rel:
+            conn.execute(
+                f"COPY (SELECT * FROM {stream_rel}) "
+                f"TO '{validate_parquet_path(spilled)}' ({PARQUET_OPTS})"
+            )
+        async with _bind_parquet_view(conn, spilled, relation) as rel:
+            yield rel
+    finally:
+        # The job's own scratch, not an output — never leave it behind, including
+        # on failure (the SLURM launcher's manifest walker scans this workspace).
+        spilled.unlink(missing_ok=True)
+
+
+@asynccontextmanager
+async def _bind_parquet_view(
+    conn: duckdb.DuckDBPyConnection, path: Path, relation: str
+) -> AsyncIterator[str]:
+    """Bind `path` as a lazy `read_parquet` VIEW named `relation`.
+
+    The single binding both branches end at (see the module note): lazy, so peak
+    memory stays flat in row count, re-scannable, and resolvable by miint on its
+    own connection.
+    """
+    conn.execute(
+        f"CREATE VIEW {relation} AS SELECT * FROM read_parquet('{validate_parquet_path(path)}')"
+    )
     try:
         yield relation
     finally:
-        conn.execute(f"DROP TABLE IF EXISTS {relation}")
+        conn.execute(f"DROP VIEW IF EXISTS {relation}")

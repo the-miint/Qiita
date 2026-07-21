@@ -67,7 +67,11 @@ duplicates further down are historical strata; leave them where they are.
   across data-plane instances, and the handoff stops assuming a shared
   filesystem. The selectors reuse the data plane's existing
   `block_read_where_clause` and `EXPORT_READ_COLUMNS`, so a block's read
-  footprint and its delete footprint cannot drift.
+  footprint and its delete footprint cannot drift. Gated on a new
+  `read:doget` scope rather than the generic `ticket:doget`: `read_block`
+  streams RAW reads, a strict superset of the `read_masked` surface that
+  already carries its own privacy-sensitive scope, so reusing the
+  reference-read scope would have inverted the model.
 
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment

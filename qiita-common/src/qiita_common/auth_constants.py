@@ -58,6 +58,18 @@ class Scope(StrEnum):
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
     READ_MASKED_DOGET = "read_masked:doget"
+    # DoGet against the data plane's BLOCK-read selectors (`read_block` /
+    # `read_masked_block`) — one block's `(prep_sample_idx, sequence_idx
+    # sub-range)` members, streamed to a block-scoped compute job.
+    #
+    # Distinct from BOTH neighbours, and strictly the most privileged of the
+    # three. `read_block` streams RAW `read` rows: host/human sequence that the
+    # `read_masked` view exists to exclude, so it is a strict superset of what
+    # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
+    # `alignment` slice) would let any service account minting reference tickets
+    # pull raw reads — an inversion of the model the two scopes above establish.
+    # Granted only to the service account that drives block compute.
+    READ_DOGET = "read:doget"
     # Full purge of a mask (the mask_definition row + its DuckLake read_mask
     # rows). Deliberately distinct from the mask-minting capability: deletion
     # is destructive and admin-only, granted solely to system_admin in

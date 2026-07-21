@@ -59,7 +59,12 @@ else
         # rendered the nginx upstream from. Checking only :50051 would report a
         # healthy data plane while a scaled-out instance was down — and nginx
         # would keep routing a share of every job's traffic into it.
-        for dp_port in $(qiita_data_plane_ports); do
+        # Assigned first, NOT iterated as a command substitution: `for x in $(f)`
+        # swallows f's failure, so a malformed QIITA_DATA_PLANE_PORTS would make
+        # the loop iterate zero times and verify could still exit 0 having checked
+        # no instance at all. The assignment form trips errexit.
+        dp_ports=$(qiita_data_plane_ports)
+        for dp_port in $dp_ports; do
             if grpcurl -plaintext "localhost:${dp_port}" grpc.health.v1.Health/Check >/dev/null 2>&1; then
                 pass "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check OK"
             else
@@ -69,10 +74,17 @@ else
         # The loopback balancer the control plane talks to. Distinct from the
         # per-instance checks above: this one proves nginx is actually fronting
         # the pool, which is what makes the CP's traffic spread at all.
-        if grpcurl -plaintext localhost:50050 grpc.health.v1.Health/Check >/dev/null 2>&1; then
-            pass "health/data-plane-lb" "gRPC localhost:50050 (nginx → pool) Health/Check OK"
+        # The loopback balancer nginx fronts the pool with. Skipped rather than
+        # failed when nginx has no TLS material: activate.sh skips the nginx
+        # reload in that case, so the listener legitimately isn't up and a hard
+        # fail would just be noise on a non-TLS host.
+        lb="127.0.0.1:${QIITA_DATA_PLANE_LB_PORT}"
+        if [ ! -r /etc/ssl/certs/qiita.crt ] || [ ! -r /etc/ssl/private/qiita.key ]; then
+            skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
+        elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+            pass "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check OK"
         else
-            fail "health/data-plane-lb" "gRPC localhost:50050 (nginx → pool) Health/Check failed"
+            fail "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check failed"
         fi
     else
         skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"

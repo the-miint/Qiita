@@ -354,7 +354,7 @@ pub struct BlockReadMember {
 }
 
 /// Parsed payload for the `delete_read_mask_block` DoAction — the idempotent
-/// block-replace sibling of `export_read_block`.
+/// block-replace sibling of the `read_block` DoGet selector.
 ///
 /// Wire shape pinned by
 /// `qiita_control_plane.actions.library.delete_read_mask_block_data`:
@@ -366,7 +366,7 @@ pub struct BlockReadMember {
 /// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
 /// delete-then-re-register without double-counting or clobbering a sibling
 /// block's rows for a shared sample. The footprint is the SAME
-/// `(prep_sample_idx, sub-range)` member list `export_read_block` carries
+/// `(prep_sample_idx, sub-range)` member list the `read_block` DoGet selector carries
 /// (reusing `BlockReadMember`); it is exact by construction (per-member
 /// OR residual), so a split member never deletes a sibling block's tail. The
 /// extra `mask_idx` scopes the delete to this filtering identity — the `read`
@@ -409,7 +409,7 @@ pub fn verify_delete_read_mask_block(
 /// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
 /// delete-then-re-register without double-counting or clobbering a sibling
 /// block's rows for a shared sample. The footprint is the SAME
-/// `(prep_sample_idx, sub-range)` member list `export_read_masked_block` carries
+/// `(prep_sample_idx, sub-range)` member list the `read_masked_block` DoGet selector carries
 /// (reusing `BlockReadMember`); it is exact by construction (per-member OR
 /// residual) and feature_idx-agnostic (all of a read's alignment rows go, since a
 /// read produces multiple rows via cross-shard + PE multiplicity). The extra
@@ -727,11 +727,9 @@ mod tests {
 
     // -------------------- block-read DoGet ticket members --------------------
     //
-    // The `export_read_block` / `export_read_masked_block` ACTION tokens are gone;
-    // block-scoped reads are now a DoGet ticket carrying `members`. The parsing
-    // guarantees those action tests pinned — a member is exactly three fields, and
-    // a smuggled field is a hard error — live on `BlockReadMember`, which the
-    // DoGet payload embeds, so they are re-pinned here rather than dropped.
+    // Block-scoped reads are a DoGet ticket carrying `members`. A member is
+    // exactly three fields and a smuggled field is a hard error — guarantees that
+    // live on `BlockReadMember`, which the DoGet payload embeds.
 
     #[test]
     fn verify_ticket_parses_block_read_members() {

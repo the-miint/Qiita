@@ -32,12 +32,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   # [admin]
   grep -q '^DATA_PLANE_URL=' /etc/qiita/control-plane.env \
-    || sudo bash -c 'echo "DATA_PLANE_URL=grpc://localhost:50050" >> /etc/qiita/control-plane.env'
+    || sudo bash -c 'echo "DATA_PLANE_URL=grpc://127.0.0.1:50050" >> /etc/qiita/control-plane.env'
   ```
 
 ### 2. One-time host setup
 
-_None yet._
+- **Grant `read:doget` to the compute service account.** Block-scoped compute jobs (`read-mask-block`'s qc/host_filter, `align`'s align_sharded) now stream their reads from the data plane and mint a short-TTL ticket at runtime via `POST /read/ticket/doget`. That route is gated on a NEW scope, deliberately **not** the generic `ticket:doget` the reference/alignment doget routes use: `read_block` streams RAW reads (host/human sequence — a strict superset of the `read_masked` surface, which already has its own `read_masked:doget`), so riding the reference-read scope would have let any account minting reference tickets pull raw reads. Without this grant every block work ticket fails its first streaming step with a 403. (this PR)
+
+  ```bash
+  # [operator] — re-mint the compute SA's PAT with the added scope, then install it.
+  # Same procedure as any scope change; see docs/runbooks/compute-service-account-provisioning.md.
+  uv run qiita-admin service-account token \
+      --name compute \
+      --scopes 'feature:mint,reference:register_files,reference:read,ticket:doget,ticket:doput,sequence_range:mint,sequenced_pool_preflight:read,read_masked:doget,read:doget'
+  ```
+
+  Install the printed token at `/etc/qiita/co-to-cp.token` (mode `0400`, owner `qiita-orch`) exactly as the provisioning runbook describes, then restart `qiita-compute-orchestrator`.
 
 ### 3. Migrations
 
@@ -68,6 +78,13 @@ _None yet._
 
   The unit is a template whose instance specifier IS the listen port, so no new unit files are needed. `activate.sh` `systemctl enable`s each instance, so added ones also survive a reboot.
 
+  **Scaling back DOWN is not automatic.** `activate.sh` only enables/restarts the ports in the list; it never disables one you removed. Drop an instance by hand after redeploying with the shorter list, or it keeps running (out of the nginx upstream, but still bound and holding a DuckLake connection):
+
+  ```bash
+  # [admin]
+  sudo systemctl disable --now qiita-data-plane@50053
+  ```
+
 ### 5. Verify
 
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
@@ -89,6 +106,7 @@ _None yet._
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel
   command works — a stale-scope 403 otherwise names the fix. (#350)
 - **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. No host action: the route reuses the existing `ticket:doget` scope the compute service account already holds, so there is no new scope grant. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces. The per-sample `read-mask` path is unchanged and still stages a Parquet. (this PR)
+- **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. The scope grant this needs is in bucket 2 above. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces — a block job now drains its stream to a short-lived Parquet inside its OWN workspace instead. The per-sample `read-mask` path is unchanged and still stages a Parquet. (this PR)
 
 ---
 

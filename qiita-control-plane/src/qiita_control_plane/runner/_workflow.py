@@ -323,15 +323,23 @@ async def run_workflow(
                     )
                 )
             elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
-                # Nothing to bind: a block's steps STREAM their reads from the
-                # data plane at runtime (POST /read/ticket/doget, keyed on
-                # work_ticket_idx), so the control plane no longer materializes a
-                # per-ticket reads.parquet onto shared scratch at submit time.
-                # The raw-vs-masked decision that used to live here moved to
-                # `block_read.resolve_block_read_scope`, which the mint route
-                # applies — at runtime, where it also sees an alignment deleted
-                # after submission.
-                pass
+                # A block's steps STREAM their reads from the data plane at
+                # runtime (POST /read/ticket/doget, keyed on work_ticket_idx), so
+                # the control plane stages nothing — a block step declares NO
+                # `reads` input, and that absence is the signal. Reaching here
+                # means a BLOCK workflow declared one anyway, which nothing binds:
+                # the step would receive an unbound input and fail obscurely
+                # inside the job. Fail at submit instead.
+                #
+                # (The raw-vs-masked decision that used to live here moved to
+                # `block_read.resolve_block_read_scope`, applied by the mint route
+                # at runtime — where it also sees an alignment deleted after
+                # submission.)
+                raise _submission_bad_input(
+                    "a block-scoped workflow must not declare a `reads` input: a "
+                    "block's steps stream their reads from the data plane at "
+                    "runtime, so nothing binds it"
+                )
             else:
                 raise _submission_bad_input(
                     "a workflow that masks stored reads must be prep_sample- or "
