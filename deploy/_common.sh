@@ -233,6 +233,47 @@ qiita_sif_missing_sources() {
 # subshell; printf the requested var. bash strips the `KEY=...` quoting, so the
 # returned value matches what the service's own loader sees. The subshell
 # contains the `set -a` pollution.
+# The data plane's instance set, as a whitespace-separated list of listen ports.
+#
+# The instance specifier of `qiita-data-plane@.service` IS the port
+# (`qiita-data-plane@50051` binds 127.0.0.1:50051), so this list is simultaneously
+# the systemd units to enable/restart, the nginx upstream members, and the
+# endpoints to health-check. ONE definition, read by activate.sh (render + restart),
+# verify.sh (per-instance health), and preflight.sh (report) — so scaling out is a
+# single operator knob rather than three files that can disagree.
+#
+# Operator sets QIITA_DATA_PLANE_PORTS to scale, e.g.
+#   QIITA_DATA_PLANE_PORTS="50051 50052 50053" sudo -E make redeploy ...
+# Default is the single instance every deploy has had.
+#
+# Why a knob and not just "edit the nginx conf": activate.sh OVERWRITES
+# /etc/nginx/conf.d/qiita.conf from the checked-in file on every deploy, so a
+# hand-added upstream member silently disappeared at the next deploy — and the
+# restart list was hardcoded to @50051, so an added instance was never restarted
+# onto new code either. Both are now generated from this list.
+#
+# Validates each entry is a plain TCP port: the value reaches a systemd unit name,
+# an nginx `server 127.0.0.1:<port>` line, and a health-check target, so a
+# malformed entry must fail the deploy loudly rather than render broken config.
+qiita_data_plane_ports() {
+    local ports port
+    ports="${QIITA_DATA_PLANE_PORTS:-50051}"
+    for port in $ports; do
+        case "$port" in
+            ''|*[!0-9]*)
+                echo "ERROR: QIITA_DATA_PLANE_PORTS entry '$port' is not a number" >&2
+                return 1
+                ;;
+        esac
+        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "ERROR: QIITA_DATA_PLANE_PORTS entry $port is not a valid TCP port" >&2
+            return 1
+        fi
+    done
+    [ -n "${ports// /}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is empty" >&2; return 1; }
+    printf '%s' "$ports"
+}
+
 read_env_var() {
     local env_file="$1" var="$2"
     # shellcheck disable=SC1090,SC1091

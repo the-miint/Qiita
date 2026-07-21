@@ -27,6 +27,14 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   echo "installed: $line"'
   ```
 
+- **`DATA_PLANE_URL` for the control plane** — point it at the new loopback gRPC balancer so CP-side Flight traffic spreads across data-plane instances instead of pinning to instance #1. Not fail-fast (unset falls back to `grpc://localhost:50051`, so the unit still boots) — but leaving it unset means horizontal scaling has no effect on CP traffic. Compute nodes are unaffected: `compute-orchestrator.env` already points at `grpc+tls://<fqdn>:443`, which nginx balances. (this PR)
+
+  ```bash
+  # [admin]
+  grep -q '^DATA_PLANE_URL=' /etc/qiita/control-plane.env \
+    || sudo bash -c 'echo "DATA_PLANE_URL=grpc://localhost:50050" >> /etc/qiita/control-plane.env'
+  ```
+
 ### 2. One-time host setup
 
 _None yet._
@@ -51,11 +59,24 @@ _None yet._
 
 ### 4. Deploy
 
-_None yet._
+- **Optional — scale the data plane out.** The instance set is now a single knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (this PR)
+
+  ```bash
+  # [admin] — one instance per ~core you want to give the data plane
+  sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+  ```
+
+  The unit is a template whose instance specifier IS the listen port, so no new unit files are needed. `activate.sh` `systemctl enable`s each instance, so added ones also survive a reboot.
 
 ### 5. Verify
 
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
+- **Per-instance data-plane health + the balancer.** `make verify-deploy` now health-checks every port in `QIITA_DATA_PLANE_PORTS` individually, plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down — and nginx would keep routing a share of every job's traffic into it. Export the same `QIITA_DATA_PLANE_PORTS` you deployed with, or it only checks `50051`. (this PR)
+
+  ```bash
+  # [admin]
+  sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+  ```
 
 ### 6. After the deploy verifies green
 
@@ -67,6 +88,7 @@ _None yet._
   PATs minted before this deploy are frozen and won't carry it, so an admin must
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel
   command works — a stale-scope 403 otherwise names the fix. (#350)
+- **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. No host action: the route reuses the existing `ticket:doget` scope the compute service account already holds, so there is no new scope grant. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces. The per-sample `read-mask` path is unchanged and still stages a Parquet. (this PR)
 
 ---
 

@@ -42,6 +42,33 @@ duplicates further down are historical strata; leave them where they are.
   term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
   is deprecated at source but appears in data we import), to the existing
   pre-release MVP terminologies.
+- **Data-plane horizontal scaling is now a single, deploy-durable knob.** The
+  instance set is `QIITA_DATA_PLANE_PORTS` (default `50051`), read once by
+  `qiita_data_plane_ports` and used to render the nginx upstream, to
+  enable/restart the matching `qiita-data-plane@NNNN` units, and to health-check
+  each instance in `verify-deploy`. Previously scaling out did not survive a
+  deploy: `activate.sh` overwrites `/etc/nginx/conf.d/qiita.conf` from the
+  checked-in file, so a hand-added upstream member disappeared at the next
+  deploy, and the restart list was hardcoded to `@50051`, so an added instance
+  kept running stale code. Also adds a loopback-only plaintext gRPC balancer
+  (`127.0.0.1:50050`) for on-host clients: compute nodes already reach the pool
+  through nginx at `grpc+tls://<host>:443`, but the control plane's default
+  `DATA_PLANE_URL` addressed instance #1 directly, so CP-side Flight traffic
+  bypassed the balancer entirely.
+- **Block-read DoGet: block-scoped compute jobs stream their reads.** New
+  `read_block` / `read_masked_block` ticket selectors on the data plane, scoped
+  by a block's `(prep_sample_idx, sequence_idx sub-range)` members rather than a
+  flat column filter, plus `POST /read/ticket/doget` to mint one at job runtime
+  and the `open_read_block_stream` / `bind_step_reads` seams on the compute side.
+  This replaces "the control plane asks the data plane to COPY a `reads.parquet`
+  onto shared scratch at submit time, then hands the job a path" for the
+  `read-mask-block` and `align` workflows: same bytes, same column shape, but the
+  bulk work moves off the CP submit path onto compute nodes where it spreads
+  across data-plane instances, and the handoff stops assuming a shared
+  filesystem. The selectors reuse the data plane's existing
+  `block_read_where_clause` and `EXPORT_READ_COLUMNS`, so a block's read
+  footprint and its delete footprint cannot drift.
+
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
@@ -182,6 +209,12 @@ duplicates further down are historical strata; leave them where they are.
   both name a shared path every component must resolve identically, so a per-file
   typo was a silent divergence. The comparison is now a helper called twice
   rather than a copied loop.
+- **`qiita-data-plane@.service` set `LISTEN_ADDR` before `EnvironmentFile=`.**
+  systemd applies the two in file order, last writer wins, so a `LISTEN_ADDR` in
+  the SHARED `/etc/qiita/data-plane.env` would have overridden the per-instance
+  value for every instance and collapsed them all onto one port. Latent until
+  now (the live host leaves it unset), and a trap for the first operator to scale
+  out. The per-instance assignment now comes last.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket

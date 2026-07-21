@@ -106,6 +106,58 @@ def _fake_native_checkout(tmp_path: Path) -> Path:
     return py
 
 
+def _call_data_plane_ports(value: str | None) -> subprocess.CompletedProcess[str]:
+    """Source _common.sh and invoke qiita_data_plane_ports with QIITA_DATA_PLANE_PORTS
+    set to `value` (unset when None). Returns the CompletedProcess."""
+    env = {**os.environ}
+    if value is None:
+        env.pop("QIITA_DATA_PLANE_PORTS", None)
+    else:
+        env["QIITA_DATA_PLANE_PORTS"] = value
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_data_plane_ports'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_data_plane_ports_defaults_to_the_single_instance() -> None:
+    """Unset ⇒ the one instance every deploy has had. Scaling is opt-in."""
+    result = _call_data_plane_ports(None)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "50051"
+
+
+def test_data_plane_ports_passes_through_a_scaled_list() -> None:
+    result = _call_data_plane_ports("50051 50052 50053")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["50051", "50052", "50053"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "50051 abc",  # non-numeric entry
+        "0",  # not a valid TCP port
+        "99999",  # out of range
+        "-1",  # negative
+        "50051; rm -rf /",  # the value reaches a systemd unit name + nginx config
+        "   ",  # blank
+    ],
+)
+def test_data_plane_ports_rejects_malformed_values(value: str) -> None:
+    """A bad entry must abort the deploy, not render broken config.
+
+    This value becomes a systemd unit name (`qiita-data-plane@<port>`), an nginx
+    `server 127.0.0.1:<port>;` line, and a health-check target, so validating it
+    once here is what keeps three downstream consumers honest.
+    """
+    result = _call_data_plane_ports(value)
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
 def test_native_checkout_resolves_valid_layout(tmp_path: Path) -> None:
     py = _fake_native_checkout(tmp_path)
     result = _call_native_checkout(str(py))

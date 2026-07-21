@@ -55,10 +55,24 @@ else
         fail "health/compute-orchestrator" "localhost:8081/health unreachable"
     fi
     if command -v grpcurl >/dev/null 2>&1; then
-        if grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check >/dev/null 2>&1; then
-            pass "health/data-plane" "gRPC localhost:50051 Health/Check OK"
+        # Every configured instance individually, from the same list activate.sh
+        # rendered the nginx upstream from. Checking only :50051 would report a
+        # healthy data plane while a scaled-out instance was down — and nginx
+        # would keep routing a share of every job's traffic into it.
+        for dp_port in $(qiita_data_plane_ports); do
+            if grpcurl -plaintext "localhost:${dp_port}" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+                pass "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check OK"
+            else
+                fail "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check failed"
+            fi
+        done
+        # The loopback balancer the control plane talks to. Distinct from the
+        # per-instance checks above: this one proves nginx is actually fronting
+        # the pool, which is what makes the CP's traffic spread at all.
+        if grpcurl -plaintext localhost:50050 grpc.health.v1.Health/Check >/dev/null 2>&1; then
+            pass "health/data-plane-lb" "gRPC localhost:50050 (nginx → pool) Health/Check OK"
         else
-            fail "health/data-plane" "gRPC localhost:50051 Health/Check failed"
+            fail "health/data-plane-lb" "gRPC localhost:50050 (nginx → pool) Health/Check failed"
         fi
     else
         skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
