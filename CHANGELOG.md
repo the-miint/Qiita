@@ -255,6 +255,24 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **ENA import batch driver: reconcile principal guard + `download_method`
+  threading (TASK-06 hardening).** `ena_import.batch._load_principal`
+  (used by `reconcile_inflight_batches` to re-drive in-flight batch items
+  after a CP restart) now rejects a since-disabled/retired submitting
+  principal, the same `MSG_PRINCIPAL_DISABLED_OR_RETIRED` guard
+  `auth.principal._build_human_user` already enforces on every live
+  request — a batch is no longer re-driven on behalf of an admin whose
+  access was revoked after submission; the reconcile skips that batch and
+  logs it, exactly like an unresolvable principal already did. Also:
+  `_run_batch` / `_process_one_study` previously always passed
+  `submit.DEFAULT_DOWNLOAD_METHOD` into `build_download_ena_study_ticket`
+  instead of reading the batch's own persisted `download_method`
+  (`qiita.ena_import_batch.download_method`, validated and stored at
+  submission time but never read back); `schedule_ena_import_batch` and
+  `reconcile_inflight_batches`'s SELECT now thread it through explicitly.
+  No behavior change today (`'http'` is the only value the route/DB CHECK
+  currently allow), but this closes the latent drift before a second
+  transport is ever added.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket

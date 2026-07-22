@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -27,12 +28,17 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
 from qiita_control_plane.ena_import.batch import (
+    _process_one_study,
     create_ena_import_batch,
     fetch_batch_status,
     reconcile_inflight_batches,
     schedule_ena_import_batch,
 )
-from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.testing.db_seeds import (
+    disable_principal,
+    retire_principal,
+    seed_user_principal,
+)
 from qiita_control_plane.testing.unique_names import unique_accession
 
 pytestmark = pytest.mark.db
@@ -306,6 +312,96 @@ async def _cleanup_study(postgres_pool, study_accession: str) -> None:
     await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
+async def _cleanup_two_studies_sharing_biosample(
+    postgres_pool, *, study_accessions: list[str], shared_sample_accession: str
+) -> None:
+    """Teardown twin of `_cleanup_study` for a test whose two studies share
+    ONE biosample row (T06-2 at the batch level). Unlike `_cleanup_study`
+    (which deletes a study's own biosample rows outright), the shared
+    biosample here still carries a live `biosample_to_study` link to the
+    OTHER study while either single study is being torn down -- deleting it
+    early would trip `biosample_to_study`'s `ON DELETE RESTRICT` FK. Clear
+    both studies' links/prep data first, THEN drop the now-unlinked shared
+    biosample exactly once, THEN each study row itself.
+    """
+    # Resolve + clear the shared biosample's metadata FIRST, before either
+    # study's biosample_study_field rows are dropped below --
+    # biosample_metadata FKs (RESTRICT) into biosample_study_field, so
+    # metadata must go before the field rows it references, for BOTH
+    # studies, not just the one being processed at the time.
+    biosample_idx = await postgres_pool.fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        shared_sample_accession,
+    )
+    if biosample_idx is not None:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = $1", biosample_idx
+        )
+
+    study_idxs: list[int] = []
+    for accession in study_accessions:
+        study_idx = await postgres_pool.fetchval(
+            "SELECT idx FROM qiita.study WHERE bioproject_accession = $1", accession
+        )
+        if study_idx is None:
+            continue
+        study_idxs.append(study_idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.ena_import_batch_item WHERE study_idx = $1", study_idx
+        )
+        ps_rows = await postgres_pool.fetch(
+            "SELECT prep_sample_idx FROM qiita.prep_sample_to_study WHERE study_idx = $1",
+            study_idx,
+        )
+        ps_idxs = [r["prep_sample_idx"] for r in ps_rows]
+        if ps_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+                ps_idxs,
+            )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
+        )
+        if ps_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
+            )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
+        )
+        run_rows = await postgres_pool.fetch(
+            "SELECT idx FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
+            f"{accession}:%",
+        )
+        run_idxs = [r["idx"] for r in run_rows]
+        if run_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx IN"
+                " (SELECT idx FROM qiita.sequenced_pool"
+                "  WHERE sequencing_run_idx = ANY($1::bigint[]))",
+                run_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[])",
+                run_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])", run_idxs
+            )
+
+    if biosample_idx is not None:
+        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+
+    for study_idx in study_idxs:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
+
+
 @pytest_asyncio.fixture
 async def dummy_reference_idx(postgres_pool, admin_principal):
     """A bare, unrelated `qiita.reference` row -- just something to satisfy
@@ -446,6 +542,7 @@ async def test_process_one_study_registers_and_submits_download_ticket(
         resolver_backend="miint",
         source_archive=SourceArchive.ENA,
         resolver_kind=ResolverKind.MIINT,
+        download_method="http",
     )
     await task
 
@@ -476,6 +573,261 @@ async def test_process_one_study_registers_and_submits_download_ticket(
     assert context["download_method"] == "http"
 
     await _cleanup_study(postgres_pool, accession)
+
+
+async def test_process_one_study_threads_batch_download_method_not_hardcoded_default(
+    batch_app, postgres_pool, admin_principal, batch_cleanup, monkeypatch
+):
+    """The download-ena-study ticket's `action_context.download_method`
+    must come from the CALLER'S `download_method` argument, never from a
+    hardcoded `submit.DEFAULT_DOWNLOAD_METHOD` fallback inside the driver.
+
+    The route persists (and the real DB CHECK only allows) `'http'` today,
+    which is also `DEFAULT_DOWNLOAD_METHOD` -- so an end-to-end test alone
+    cannot distinguish "correctly threaded" from "coincidentally matches the
+    hardcoded default". This test closes that gap directly: it drives
+    `_process_one_study` with a deliberately non-default value and a
+    monkeypatched `submit_work_ticket_core` (bypassing the real action's
+    context_schema, which legitimately only allows `'http'`), and asserts
+    that exact value reaches the submitted ticket body verbatim.
+    """
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    captured_bodies = []
+
+    async def _fake_submit_work_ticket_core(*, app, principal, body):
+        captured_bodies.append(body)
+        return SimpleNamespace(work_ticket_idx=999_999_999)
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.work_ticket.submit_work_ticket_core",
+        _fake_submit_work_ticket_core,
+    )
+
+    distinctive_download_method = "not-the-hardcoded-default"
+    await _process_one_study(
+        batch_app,
+        postgres_pool,
+        item=items[0],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        resolver_kind=ResolverKind.MIINT,
+        download_method=distinctive_download_method,
+    )
+
+    assert len(captured_bodies) == 1
+    assert captured_bodies[0].action_context["download_method"] == distinctive_download_method
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+# ---------------------------------------------------------------------------
+# Audience enforcement -- submit_work_ticket_core must reject a principal
+# not in the download-ena-study action's own audience, even though the
+# batch route itself is admin-gated
+# ---------------------------------------------------------------------------
+
+
+async def test_process_one_study_rejects_non_audience_principal_no_ticket_created(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """`_process_one_study` propagates the BATCH's own submitting principal
+    into `submit_work_ticket_core`, which enforces the download-ena-study
+    action's own audience against it -- never bypassed just because
+    `POST /ena-import-batch` itself is admin-gated (see both functions'
+    docstrings). Here the submitting principal is a plain `user`-role
+    human, outside the action's `wet_lab_admin`/`system_admin`-only
+    audience (`download_ena_study_action` fixture): the ticket submission
+    must be rejected (403, audience) and NO `qiita.work_ticket` row
+    created for it -- the study/pool registration itself has no audience
+    gate and still succeeds, isolated per T06-3's per-item failure model.
+    """
+    non_audience_pidx = await seed_user_principal(
+        postgres_pool, prefix="ena-batch-non-audience", suffix="t06", system_role=SystemRole.USER
+    )
+    non_audience_principal = HumanUser(
+        principal_idx=non_audience_pidx,
+        email=f"ena-batch-non-audience-{non_audience_pidx}@test.local",
+        system_role=SystemRole.USER,
+        scopes=frozenset(),
+        profile_complete=True,
+        disabled=False,
+        retired=False,
+    )
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=non_audience_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(
+        batch_app,
+        items=items,
+        principal=non_audience_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        resolver_kind=ResolverKind.MIINT,
+        download_method="http",
+    )
+    # Must not raise -- rejected submissions are recorded as a per-item
+    # failure (T06-3), never propagated to fail the whole batch task.
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, download_work_ticket_idxs, failure_reason"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    # register_ena_study has no audience gate -- the study itself registers.
+    assert item_row["study_idx"] is not None
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert item_row["download_work_ticket_idxs"] == []
+    assert "403" in item_row["failure_reason"]
+    assert "audience" in item_row["failure_reason"].lower()
+
+    ticket_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+    assert ticket_count == 0
+
+    await _cleanup_study(postgres_pool, accession)
+    # Drop the batch (and its item, via CASCADE) explicitly before deleting
+    # its submitting principal -- ena_import_batch.submitted_by_principal_idx
+    # FKs (ON DELETE RESTRICT) into qiita.principal, and the `batch_cleanup`
+    # fixture's own DELETE only runs at teardown, after this test function
+    # returns. Making that fixture's later DELETE a no-op is fine (0 rows).
+    await postgres_pool.execute("DELETE FROM qiita.ena_import_batch WHERE idx = $1", batch_idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.user WHERE principal_idx = $1", non_audience_pidx
+    )
+    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", non_audience_pidx)
+
+
+# ---------------------------------------------------------------------------
+# T06-2 -- batch-driver-level de-dup: two items of the SAME batch whose runs
+# resolve to a SHARED sample_accession still land as one biosample row
+# (the register-level concurrency case -- two INDEPENDENT
+# register_ena_study calls racing via asyncio.gather -- is already covered
+# by test_registration.py's
+# test_concurrent_registration_of_shared_biosample_dedupes_to_one_row; this
+# closes the same invariant one level up, through the actual batch driver).
+# ---------------------------------------------------------------------------
+
+
+def _make_shared_sample_fakes(shared_sample_accession: str):
+    """Build a (runs, attrs) fake-resolver pair where every accession's run
+    carries the SAME `sample_accession`, keeping `study_accession` /
+    `run_accession` / `experiment_accession` distinct per input accession
+    (mirrors `_fake_runs` / `_fake_attrs` above, just pinning the sample
+    accession to one shared value instead of deriving it from the input).
+    """
+
+    def _fake_runs_shared(accession: str) -> tuple[list[str], list[tuple]]:
+        row = (
+            f"SRR-{accession}",
+            f"SRX-{accession}",
+            shared_sample_accession,
+            accession,
+            "SINGLE",
+            "WGS",
+            "GENOMIC",
+            None,
+            "ILLUMINA",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+        return list(_RUN_COLUMNS), [row]
+
+    def _fake_attrs_shared(accession: str) -> tuple[list[str], list[tuple]]:
+        return (
+            ["sample_accession", "tag", "value"],
+            [(shared_sample_accession, "collection date", "2020-01-01")],
+        )
+
+    return _fake_runs_shared, _fake_attrs_shared
+
+
+async def test_batch_dedupes_shared_biosample_across_two_items(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    shared_sample_accession = unique_accession("SAMN")
+    fake_runs, fake_attrs = _make_shared_sample_fakes(shared_sample_accession)
+    monkeypatch.setattr(_QUERY_RUNS, fake_runs)
+    monkeypatch.setattr(_QUERY_ATTRS, fake_attrs)
+
+    accession_a = unique_accession("PRJNA")
+    accession_b = unique_accession("PRJEB")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession_a, accession_b],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(
+        batch_app,
+        items=items,
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        resolver_kind=ResolverKind.MIINT,
+        download_method="http",
+    )
+    await task
+
+    item_rows = await postgres_pool.fetch(
+        "SELECT ena_study_accession, state, failure_reason, study_idx"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert len(item_rows) == 2
+    for row in item_rows:
+        assert row["state"] == BatchItemState.DOWNLOADING.value, row["failure_reason"]
+        assert row["study_idx"] is not None
+
+    biosample_rows = await postgres_pool.fetch(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        shared_sample_accession,
+    )
+    assert len(biosample_rows) == 1
+    biosample_idx = biosample_rows[0]["idx"]
+
+    link_rows = await postgres_pool.fetch(
+        "SELECT study_idx FROM qiita.biosample_to_study WHERE biosample_idx = $1", biosample_idx
+    )
+    assert len(link_rows) == 2
+    assert {r["study_idx"] for r in link_rows} == {r["study_idx"] for r in item_rows}
+
+    await _cleanup_two_studies_sharing_biosample(
+        postgres_pool,
+        study_accessions=[accession_a, accession_b],
+        shared_sample_accession=shared_sample_accession,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +869,7 @@ async def test_run_batch_isolates_per_study_failure(
         resolver_backend="miint",
         source_archive=SourceArchive.ENA,
         resolver_kind=ResolverKind.MIINT,
+        download_method="http",
     )
     # Must not raise -- the batch as a whole never fails (T06-3).
     await task
@@ -722,9 +1075,24 @@ async def test_reconcile_inflight_batches_redrives_pending_items(
     await tasks[0]
 
     item_row = await postgres_pool.fetchrow(
-        "SELECT state FROM qiita.ena_import_batch_item WHERE batch_idx = $1", batch_idx
+        "SELECT state, download_work_ticket_idxs FROM qiita.ena_import_batch_item"
+        " WHERE batch_idx = $1",
+        batch_idx,
     )
     assert item_row["state"] == BatchItemState.DOWNLOADING.value
+
+    # The re-driven ticket's download_method must be the batch's OWN
+    # persisted value (SELECTed by reconcile_inflight_batches), not a
+    # hardcoded default -- see test_process_one_study_threads_batch_download_
+    # method_not_hardcoded_default for the value-distinguishing unit test.
+    work_ticket_idx = item_row["download_work_ticket_idxs"][0]
+    context = json.loads(
+        await postgres_pool.fetchval(
+            "SELECT action_context FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+    )
+    assert context["download_method"] == "http"
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -733,3 +1101,88 @@ async def test_reconcile_inflight_batches_no_op_when_nothing_in_flight(batch_app
     scheduled = await reconcile_inflight_batches(batch_app)
     assert scheduled == 0
     assert len(batch_app.state.running_ena_import_batches) == 0
+
+
+# ---------------------------------------------------------------------------
+# reconcile_inflight_batches -- disabled/retired submitting principal must
+# NOT be re-driven on their behalf (mirrors auth.principal._build_human_user's
+# guard, reused here for the no-live-HTTP-request reconcile/batch path)
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_inflight_batches_refuses_disabled_principal(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """A batch submitted by an admin who was DISABLED after submission must
+    not be re-driven on their behalf across a CP restart: `_load_principal`
+    raises, `reconcile_inflight_batches` catches it and skips the batch
+    entirely -- the item is left `pending` (untouched), no study or ticket
+    is created, and nothing is scheduled for it."""
+    accession = unique_accession("PRJNA")
+    batch_idx, _items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    await disable_principal(postgres_pool, admin_principal.principal_idx)
+
+    scheduled = await reconcile_inflight_batches(batch_app)
+    assert scheduled == 0
+    assert len(batch_app.state.running_ena_import_batches) == 0
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, download_work_ticket_idxs"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.PENDING.value
+    assert item_row["study_idx"] is None
+    assert item_row["download_work_ticket_idxs"] == []
+
+    ticket_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+    assert ticket_count == 0
+
+    study_idx = await postgres_pool.fetchval(
+        "SELECT idx FROM qiita.study WHERE bioproject_accession = $1", accession
+    )
+    assert study_idx is None
+
+
+async def test_reconcile_inflight_batches_refuses_retired_principal(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """Same guard, retired instead of disabled -- `qiita.principal.retired`
+    is refused identically (mirrors `auth.principal._build_human_user`,
+    which treats `disabled` and `retired` the same way)."""
+    accession = unique_accession("PRJEB")
+    batch_idx, _items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    await retire_principal(postgres_pool, admin_principal.principal_idx)
+
+    scheduled = await reconcile_inflight_batches(batch_app)
+    assert scheduled == 0
+    assert len(batch_app.state.running_ena_import_batches) == 0
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.PENDING.value
+    assert item_row["study_idx"] is None

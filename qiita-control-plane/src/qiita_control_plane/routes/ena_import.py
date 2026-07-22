@@ -129,6 +129,7 @@ async def submit_ena_import_batch(
         resolver_backend=body.backend,
         source_archive=source_archive,
         resolver_kind=ResolverKind(body.backend),
+        download_method=body.download_method,
     )
 
     return BatchImportResponse(

@@ -21,9 +21,11 @@ work-ticket submission per pool the study created
 (`submit.build_download_ena_study_ticket` +
 `routes.work_ticket.submit_work_ticket_core`, in-process, propagating the
 BATCH's submitting principal so that ticket's own audience gate is
-enforced against a real principal, never bypassed). One accession's
-failure marks only that item `failed` -- the batch itself never fails
-(T06-3).
+enforced against a real principal, never bypassed, AND the batch's own
+persisted `download_method` -- never `submit.DEFAULT_DOWNLOAD_METHOD`
+directly, so a ticket this batch submits always carries the transport the
+route validated at submission time). One accession's failure marks only
+that item `failed` -- the batch itself never fails (T06-3).
 
 `reconcile_inflight_batches` (called from `main.py`'s lifespan startup,
 alongside `dispatch.reconcile_inflight_tickets`) re-drives every item still
@@ -40,6 +42,7 @@ from dataclasses import dataclass
 
 import asyncpg
 from fastapi import FastAPI
+from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED
 from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, WorkTicketState
 from qiita_common.models.ena import ResolverKind, SourceArchive
 from qiita_common.models.ena_import import BatchImportItem, BatchImportStatus, BatchItemState
@@ -84,7 +87,11 @@ async def _load_principal(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
     small, local re-implementation of `auth.principal._build_human_user`'s
     query (kept local rather than importing that module-private helper
     across modules) -- `role_ceiling` (public, `auth.scopes`) supplies the
-    same scope set an OIDC-resolved session would carry.
+    same scope set an OIDC-resolved session would carry. Same guard as
+    `_build_human_user`: a disabled/retired principal is refused, not just
+    a missing one -- a batch submitted by an admin who was disabled or
+    retired AFTER submission must not be re-driven on their behalf across
+    a CP restart.
     """
     row = await pool.fetchrow(
         "SELECT p.idx, p.system_role, p.disabled, p.retired, u.email, u.profile_complete"
@@ -95,6 +102,11 @@ async def _load_principal(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
     if row is None:
         raise RuntimeError(
             f"principal {principal_idx} not found (or not a human user);"
+            " cannot submit/re-drive ena_import_batch work on its behalf"
+        )
+    if row["disabled"] or row["retired"]:
+        raise RuntimeError(
+            f"principal {principal_idx}: {MSG_PRINCIPAL_DISABLED_OR_RETIRED};"
             " cannot submit/re-drive ena_import_batch work on its behalf"
         )
     return HumanUser(
@@ -198,6 +210,7 @@ async def _process_one_study(
     resolver_backend: str,
     source_archive: SourceArchive,
     resolver_kind: ResolverKind,
+    download_method: str,
 ) -> None:
     """Resolve + register ONE study, then submit one download-ena-study
     ticket per pool it created. Never raises -- every failure mode
@@ -248,6 +261,7 @@ async def _process_one_study(
                 sequenced_pool_idx=created_pool.sequenced_pool_idx,
                 sequencing_run_idx=created_pool.sequencing_run_idx,
                 ena_study_accession=study_header.study_accession,
+                download_method=download_method,
             )
             response = await submit_work_ticket_core(app=app, principal=principal, body=body)
             work_ticket_idxs.append(response.work_ticket_idx)
@@ -275,6 +289,7 @@ async def _run_batch(
     resolver_backend: str,
     source_archive: SourceArchive,
     resolver_kind: ResolverKind,
+    download_method: str,
 ) -> None:
     """Process every item with bounded concurrency. Never raises -- each
     item's own try/except in `_process_one_study` absorbs its failure."""
@@ -290,6 +305,7 @@ async def _run_batch(
                 resolver_backend=resolver_backend,
                 source_archive=source_archive,
                 resolver_kind=resolver_kind,
+                download_method=download_method,
             )
 
     await asyncio.gather(*[_bounded(item) for item in items])
@@ -303,6 +319,7 @@ def schedule_ena_import_batch(
     resolver_backend: str,
     source_archive: SourceArchive,
     resolver_kind: ResolverKind,
+    download_method: str,
 ) -> asyncio.Task:
     """Fire-and-forget the batch's resolve+register+submit background task.
 
@@ -312,6 +329,13 @@ def schedule_ena_import_batch(
     drives `register_ena_study` + `submit_work_ticket_core` directly, not a
     work_ticket/`ComputeBackendClient` run; it does not belong in (or need)
     `dispatch.py`'s task set or drain.
+
+    `download_method` is the batch's OWN persisted value
+    (`qiita.ena_import_batch.download_method`, validated at submission time
+    by the route) -- threaded through verbatim rather than defaulting to
+    `submit.DEFAULT_DOWNLOAD_METHOD` here, so a future additional
+    download_method value never silently drifts to the wrong transport for
+    tickets this batch submits.
     """
     task = asyncio.create_task(
         _run_batch(
@@ -322,6 +346,7 @@ def schedule_ena_import_batch(
             resolver_backend=resolver_backend,
             source_archive=source_archive,
             resolver_kind=resolver_kind,
+            download_method=download_method,
         ),
         name="ena_import_batch",
     )
@@ -372,7 +397,8 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     pool = app.state.pool
     rows = await pool.fetch(
         "SELECT bi.idx, bi.ena_study_accession, bi.batch_idx,"
-        "       b.submitted_by_principal_idx, b.resolver_backend, b.source_archive"
+        "       b.submitted_by_principal_idx, b.resolver_backend, b.source_archive,"
+        "       b.download_method"
         " FROM qiita.ena_import_batch_item bi"
         " JOIN qiita.ena_import_batch b ON b.idx = bi.batch_idx"
         " WHERE bi.state = ANY($1::text[])"
@@ -391,6 +417,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
         principal_idx = batch_rows[0]["submitted_by_principal_idx"]
         resolver_backend = batch_rows[0]["resolver_backend"]
         source_archive = SourceArchive(batch_rows[0]["source_archive"])
+        download_method = batch_rows[0]["download_method"]
         try:
             principal = await _load_principal(pool, principal_idx)
         except RuntimeError:
@@ -416,6 +443,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
             resolver_backend=resolver_backend,
             source_archive=source_archive,
             resolver_kind=ResolverKind(resolver_backend),
+            download_method=download_method,
         )
         total += len(items)
     return total
