@@ -42,6 +42,35 @@ duplicates further down are historical strata; leave them where they are.
   term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
   is deprecated at source but appears in data we import), to the existing
   pre-release MVP terminologies.
+- **Data-plane horizontal scaling is now deploy-durable, and reaches past one host.** The
+  instance set is `QIITA_DATA_PLANE_PORTS` (default `50051`), read once by
+  `qiita_data_plane_ports` and used to render the nginx upstream, to
+  enable/restart the matching `qiita-data-plane@NNNN` units, and to health-check
+  each instance in `verify-deploy`. Previously scaling out did not survive a
+  deploy: `activate.sh` overwrites `/etc/nginx/conf.d/qiita.conf` from the
+  checked-in file, so a hand-added upstream member disappeared at the next
+  deploy, and the restart list was hardcoded to `@50051`, so an added instance
+  kept running stale code. Also adds a loopback-only plaintext gRPC balancer
+  (`127.0.0.1:50050`) for on-host clients: compute nodes already reach the pool
+  through nginx at `grpc+tls://<host>:443`, but the control plane's default
+  `DATA_PLANE_URL` addressed instance #1 directly, so CP-side Flight traffic
+  bypassed the balancer entirely. Scaling is not limited to one host:
+  `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds
+  data planes running elsewhere to the same upstream, because extra processes on
+  one box share its cores, memory, and NIC and stop helping once it saturates.
+  Peers are a separate knob from `QIITA_DATA_PLANE_PORTS` rather than entries in
+  it: only the local list drives systemd, so overloading one list would have made
+  "which entries get a unit" a parsing question and would have tried to restart a
+  unit named after a remote host. Peer entries are shape-validated before any
+  config is written (they land verbatim in an nginx `server` directive) and each
+  gets its own `verify-deploy` health row, and a peer hostname that does not
+  resolve aborts the deploy before any service restarts rather than at the
+  `nginx -t` that runs after them. `verify-deploy` reads its member list from
+  the rendered nginx config rather than the env lists, so it checks what is
+  actually being served instead of what the verifying shell happens to have
+  exported. Note peer traffic is plaintext gRPC —
+  `grpc_pass`'s scheme is per-directive, not per-member, so a peer belongs only on
+  a trusted network. (#PRSCALE)
 - **Pool / run summary + rollup endpoints (#236).** Server-side aggregation so
   callers stop paging the per-sample list route and tallying by hand. All
   compute-on-read (never drifts), no migration. (1) `PoolReadMetrics` gains a
@@ -201,6 +230,12 @@ duplicates further down are historical strata; leave them where they are.
   both name a shared path every component must resolve identically, so a per-file
   typo was a silent divergence. The comparison is now a helper called twice
   rather than a copied loop.
+- **`qiita-data-plane@.service` set `LISTEN_ADDR` before `EnvironmentFile=`.**
+  systemd applies the two in file order, last writer wins, so a `LISTEN_ADDR` in
+  the SHARED `/etc/qiita/data-plane.env` would have overridden the per-instance
+  value for every instance and collapsed them all onto one port. Latent until
+  now (the live host leaves it unset), and a trap for the first operator to scale
+  out. The per-instance assignment now comes last. (#PRSCALE)
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket

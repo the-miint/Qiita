@@ -54,15 +54,81 @@ else
     else
         fail "health/compute-orchestrator" "localhost:8081/health unreachable"
     fi
-    if command -v grpcurl >/dev/null 2>&1; then
-        if grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check >/dev/null 2>&1; then
-            pass "health/data-plane" "gRPC localhost:50051 Health/Check OK"
-        else
-            fail "health/data-plane" "gRPC localhost:50051 Health/Check failed"
-        fi
+fi
+
+# --- 1b. Data-plane pool members -------------------------------------------
+# UNCONDITIONAL, deliberately outside the branch above. The aggregate
+# `https://<host>/health` answers "is the stack reachable through the edge?" — it
+# hits whichever ONE member nginx balanced it to, so it stays green with every
+# other instance down. That is the exact failure scaling out exists to avoid, so
+# the per-member sweep cannot live in the fallback branch that only runs when the
+# aggregate is unavailable.
+if [ -n "${SKIP_HEALTH:-}" ]; then
+    skip "health/data-plane-pool" "SKIP_HEALTH=1"
+elif command -v grpcurl >/dev/null 2>&1; then
+    # Every member individually. Checking only :50051 would report a healthy data
+    # plane while a scaled-out instance was down — and nginx would keep routing a
+    # share of every job's traffic into it.
+    #
+    # Members come from the RENDERED nginx config — what is actually being served —
+    # not from this shell's env. See qiita_data_plane_rendered_members for why, and
+    # for the meaning of the three return codes.
+    dp_members=$(qiita_data_plane_rendered_members) && dp_rc=0 || dp_rc=$?
+    if [ "$dp_rc" -eq 1 ]; then
+        # No config rendered yet (first deploy) — env is the only source there is.
+        # Assigned first, NOT iterated as `for x in $(f)`: that form swallows f's
+        # failure, so a malformed list would make the loop iterate zero times and
+        # verify could still exit 0 having checked nothing. The assignment trips
+        # errexit.
+        dp_ports=$(qiita_data_plane_ports)
+        dp_peers=$(qiita_data_plane_peers)
+        dp_members=""
+        for dp_port in $dp_ports; do dp_members+="127.0.0.1:${dp_port}"$'\n'; done
+        for dp_peer in $dp_peers; do dp_members+="${dp_peer}"$'\n'; done
+        echo "  data-plane members from env (no rendered nginx upstream yet)"
+    elif [ "$dp_rc" -ne 0 ]; then
+        # Config present but unparseable. Falling back to env here would check the
+        # single default port and report green, which is worse than saying so.
+        fail "health/data-plane-pool" "could not read upstream members from $QIITA_NGINX_CONF"
+        dp_members=""
     else
-        skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
+        echo "  data-plane members from the rendered nginx upstream"
     fi
+    while IFS= read -r dp_member; do
+        [ -n "$dp_member" ] || continue
+        # Label local vs remote so a red row says which host to go look at. The
+        # distinction is derivable from the member itself — activate.sh renders
+        # locals as 127.0.0.1:<port> — so it survives the config round-trip.
+        case "$dp_member" in
+            127.0.0.1:*) dp_label="health/data-plane@${dp_member##*:}" ;;
+            *)           dp_label="health/data-plane-peer@${dp_member}" ;;
+        esac
+        # </dev/null: the loop body inherits the here-string as stdin, so any
+        # future stdin-reading command here would eat the remaining members and
+        # silently check only the first.
+        if grpcurl -plaintext "$dp_member" grpc.health.v1.Health/Check </dev/null >/dev/null 2>&1; then
+            pass "$dp_label" "gRPC $dp_member Health/Check OK"
+        else
+            fail "$dp_label" "gRPC $dp_member Health/Check failed"
+        fi
+    done <<<"$dp_members"
+    # The loopback balancer the control plane talks to. Distinct from the
+    # per-instance checks above: this one proves nginx is actually fronting
+    # the pool, which is what makes the CP's traffic spread at all.
+    # The loopback balancer nginx fronts the pool with. Skipped rather than
+    # failed when nginx has no TLS material: activate.sh skips the nginx
+    # reload in that case, so the listener legitimately isn't up and a hard
+    # fail would just be noise on a non-TLS host.
+    lb="127.0.0.1:${QIITA_DATA_PLANE_LB_PORT}"
+    if [ ! -r /etc/ssl/certs/qiita.crt ] || [ ! -r /etc/ssl/private/qiita.key ]; then
+        skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
+    elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+        pass "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check OK"
+    else
+        fail "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check failed"
+    fi
+else
+    skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
 fi
 
 # --- 2. Workflow actions list (as qiita-api, control-plane.env) -------------

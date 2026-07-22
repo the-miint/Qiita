@@ -841,7 +841,14 @@ On-premise Linux, systemd services. Local dev on macOS.
 
 The `make deploy` target builds all components and prints the required admin commands for systemd/nginx installation. An admin executes the privileged commands manually.
 
-The data plane is deployed as multiple systemd instances of the `qiita-data-plane@.service` template. The instance specifier *is* the listen port — `qiita-data-plane@50051` binds `127.0.0.1:50051`, `qiita-data-plane@50052` binds `:50052`, etc. nginx upstream `qiita_data_plane` (in `deploy/nginx/qiita.conf`) load-balances gRPC traffic across the configured ports. Instance count is tunable without code changes — only the nginx upstream block and the number of systemd units need updating.
+The data plane is deployed as multiple systemd instances of the `qiita-data-plane@.service` template. The instance specifier *is* the listen port — `qiita-data-plane@50051` binds `127.0.0.1:50051`, `qiita-data-plane@50052` binds `:50052`, etc. nginx upstream `qiita_data_plane` (in `deploy/nginx/qiita.conf`) load-balances gRPC traffic across the members.
+
+That upstream block is **generated** at deploy time by `deploy/activate.sh`, which overwrites `/etc/nginx/conf.d/qiita.conf` from the checked-in file — so it is never hand-edited on the host. Two env vars drive it, and they answer different questions:
+
+- `QIITA_DATA_PLANE_PORTS` (default `50051`) — instances **this** host runs. One list renders the `server 127.0.0.1:<port>` members *and* enables/restarts the matching `qiita-data-plane@NNNN` units, so the upstream and the running instances cannot disagree.
+- `QIITA_DATA_PLANE_PEERS` (default empty) — data planes on **other** hosts, as `server <host:port>` members only. This deploy does not start, restart, or upgrade them; a peer is the peer host's own deploy, and must point at the same Postgres/DuckLake catalog and the same scratch/persistent paths. Peers exist because extra processes on one box share its cores, memory, and NIC, so they stop helping once it saturates.
+
+Every member is reached over plaintext gRPC (`grpc_pass grpc://`, and the scheme is per-directive rather than per-member), so a peer belongs only on a trusted network. `deploy/verify.sh` health-checks each member individually, reading the list back out of the rendered config rather than the env vars.
 
 ## Monorepo Structure
 
