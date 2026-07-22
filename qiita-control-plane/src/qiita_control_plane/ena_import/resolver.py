@@ -1,6 +1,6 @@
-"""Resolver contract for ENA/SRA study metadata (T01-1).
+"""Resolver contract for ENA/SRA study metadata.
 
-`EnaResolver` is the seam architecture decision D2 locks: given a validated
+`EnaResolver` is the seam this architecture locks: given a validated
 study accession, resolve its header, its runs (one row per run, joined to
 its sample), and its per-sample attributes as typed
 `qiita_common.models.ena` models — never a raw dict, and never an empty

@@ -1,5 +1,5 @@
-"""`HttpEnaResolver` — the experimental plain-HTTP fallback (T01-4, D2's
-escape hatch). Implements the same `EnaResolver` contract as
+"""`HttpEnaResolver` — the experimental plain-HTTP fallback (an escape
+hatch for the default resolver). Implements the same `EnaResolver` contract as
 `MiintEnaResolver` by talking directly to ENA's public APIs over `httpx`
 instead of DuckDB + miint: the Portal API (`/search`, TSV) for the study
 header and runs, and the Browser API (`/xml/...`) for per-sample attributes.

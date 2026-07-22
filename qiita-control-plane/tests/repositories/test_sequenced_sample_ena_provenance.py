@@ -1,7 +1,7 @@
-"""Tests for the ENA-import provenance surface on qiita.sequenced_sample
-(T02-4): the source_archive/resolver_kind/transport kwargs on
+"""Tests for the ENA-import provenance surface on qiita.sequenced_sample:
+the source_archive/resolver_kind/transport kwargs on
 insert_sequenced_sample, fetch_sequenced_sample_idxs_by_ena_run_accession
-(T02-5's idempotent-re-import lookup), and set_sequenced_pool_transport
+(the idempotent-re-import lookup), and set_sequenced_pool_transport
 (the download workflow's finalize-time write-back of the download `transport`).
 
 Pattern 1 (transaction-rollback per test): all seed and assertions happen

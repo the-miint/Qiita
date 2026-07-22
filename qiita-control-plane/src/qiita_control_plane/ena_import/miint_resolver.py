@@ -1,4 +1,4 @@
-"""`MiintEnaResolver` — the default `EnaResolver` implementation (T01-2, D2).
+"""`MiintEnaResolver` — the default `EnaResolver` implementation.
 
 Drives a DuckDB session with the miint extension loaded
 (`qiita_control_plane.miint.connect_with_miint`) and calls `read_ena`
@@ -38,7 +38,7 @@ _httpfs_installed = False
 # Explicit fields for read_run keep the mapping tight: this resolver only
 # needs the columns EnaRunRecord models, not read_ena's full default set
 # (which also carries sample-descriptive fields like scientific_name/
-# collection_date — out of scope for T01-2's runs+samples contract).
+# collection_date — out of scope for this resolver's runs+samples contract).
 _RUN_FIELDS = (
     "run_accession,experiment_accession,sample_accession,study_accession,"
     "library_layout,library_strategy,library_source,library_selection,"
@@ -54,7 +54,7 @@ def _open_ena_connection() -> duckdb.DuckDBPyConnection:
     Portal/Browser API calls; `duckdb-miint/docs/insdc_ena.md` states it is
     "automatically loaded", but that isn't reliably true under
     `connect_with_miint()`'s config (`allow_unsigned_extensions` plus a
-    private `extension_directory`) — confirmed empirically (T01-2 live
+    private `extension_directory`) — confirmed empirically (a live
     system test + manual runs against a real ENA study): the query fails
     with a bare DuckDB `'https' scheme is not supported` error instead of
     silently degrading. Rather than depend on DuckDB's own autoload, install

@@ -145,7 +145,7 @@ duplicates further down are historical strata; leave them where they are.
   TEXT/CHECK state — no `CREATE TYPE`) tracks each accession independently
   through `pending -> resolving -> registered -> downloading -> done`, with
   `failed` reachable from any non-terminal step, so one bad accession never
-  affects its siblings or the batch as a whole (T06-3). The background driver
+  affects its siblings or the batch as a whole. The background driver
   (`ena_import.batch._run_batch`) processes every item with bounded
   concurrency (`asyncio.Semaphore`, capped at 4 — miint's `ENAClient`
   rate-limits ENA Portal/Browser calls to ~3 req/s) on its own tracked

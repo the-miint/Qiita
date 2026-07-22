@@ -1,10 +1,10 @@
 """System test: `MiintEnaResolver` against a real, live ENA study —
-guards against `read_ena` / `read_ena_attributes` column drift (T01-2).
+guards against `read_ena` / `read_ena_attributes` column drift.
 
 Every other `ena_import` test is network-free (monkeypatched query
 functions / `httpx.MockTransport` against recorded fixtures — see
 `qiita-control-plane/tests/ena_import/`). This is the one exception,
-approved as part of the reconciled resolver-design plan: it drives the real
+approved as a deliberate exception: it drives the real
 resolver against the real ENA Portal/Browser APIs and asserts the columns
 this resolver depends on are still present with the expected shape. If ENA
 renames/removes a field `read_ena`'s `DefaultFields` (or our explicit

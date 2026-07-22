@@ -1,4 +1,4 @@
-"""Tests for `HttpEnaResolver` (T01-4): the experimental plain-ENA-Portal-API
+"""Tests for `HttpEnaResolver`: the experimental plain-ENA-Portal-API
 fallback. Network-free via `httpx.MockTransport` (see
 `qiita-common/tests/test_compute_backend_client.py` for the pattern this
 mirrors) against real recorded Portal-TSV / Browser-XML fixtures — the same
@@ -6,7 +6,7 @@ small, long-lived public study (PRJNA48739) `test_miint_resolver.py` uses, so
 `_resolver_contract_checks.py` runs identical field-by-field assertions
 against both implementations.
 
-Also covers the `get_resolver` factory (T01-4): returns the right
+Also covers the `get_resolver` factory: returns the right
 implementation per `backend`, raises on an unknown one."""
 
 from pathlib import Path
@@ -142,7 +142,7 @@ def test_resolve_study_header_rejects_non_study_accession():
 
 
 # ---------------------------------------------------------------------------
-# get_resolver factory (T01-4)
+# get_resolver factory
 # ---------------------------------------------------------------------------
 
 

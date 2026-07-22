@@ -455,7 +455,7 @@ async def fetch_sequenced_sample_idxs_by_ena_run_accession(
     (sequenced_sample_ena_run_accession_unique) so each key maps to at most
     one idx. Used by the ENA-import registration composer
     (ena_import.registration) to skip a run a previous import already
-    registered -- the idempotent-re-import case, T02-5.
+    registered -- the idempotent-re-import case.
     """
     if not values:
         return {}

@@ -1,4 +1,4 @@
-"""Tests for the `EnaResolver` ABC (T01-1): the contract every
+"""Tests for the `EnaResolver` ABC: the contract every
 implementation (`MiintEnaResolver`, `HttpEnaResolver`) shares. Interface
 only — no implementation is bound here."""
 

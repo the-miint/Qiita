@@ -1,4 +1,4 @@
-"""ENA study registration composer (T02): turns one resolved ENA study
+"""ENA study registration composer: turns one resolved ENA study
 (`EnaStudyHeader` + `EnaRunRecord` list, as produced by `ena_import`'s
 resolvers) into Qiita `study` / `biosample` / `prep_sample` /
 `sequenced_sample` rows, idempotently -- re-imports and cross-study
@@ -28,25 +28,25 @@ Order of operations:
      already exists for this run -- a no-preflight `insert_sequenced_pool`
      call has no natural content key to de-duplicate against).
 
-  4. For each run, independently, inside its own transaction (T02-5's
-     per-run atomicity -- a partial failure rolls back only that run's
+  4. For each run, independently, inside its own transaction (per-run
+     atomicity -- a partial failure rolls back only that run's
      writes and is recorded `failed` rather than aborting or half-writing
      the rest of the study): get-or-create the biosample by ENA sample
-     accession (cross-study de-dup, T02-2) and link it to the study. If
+     accession (cross-study de-dup) and link it to the study. If
      the biosample was newly created by this call, harmonize its ENA
      sample attributes onto it (`harmonization.harmonize_biosample_
      attributes`) -- write-once: a later study reusing the same
      biosample (cross-study overlap) does not re-harmonize it, since the
      canonical values already exist. Then skip if a sequenced_sample
      already carries this run's `ena_run_accession` (idempotent
-     re-import, T02-5), else map the run's library_strategy/library_source
+     re-import), else map the run's library_strategy/library_source
      to a curated prep_protocol name
      (`protocol_mapping.map_ena_run_to_prep_protocol_name`) and import the
      sequenced prep_sample via the existing `import_sequenced_prep_sample`
      composer.
 
 Harmonization gaps (a checklist-required field ENA did not supply) are
-reported on `RunRegistrationOutcome.harmonization`, never raised -- T03-2.
+reported on `RunRegistrationOutcome.harmonization`, never raised.
 A genuine harmonization failure (an unparseable value, a cross-study
 metadata slot collision) is caught by the same per-run try/except as every
 other step here and recorded `failed`, isolated exactly like a platform- or
@@ -331,12 +331,12 @@ async def _register_one_run(
     attrs_by_sample_accession: dict[str, EnaSampleAttributes],
 ) -> RunRegistrationOutcome:
     """Register one ENA run inside its own transaction so a partial
-    failure rolls back only this run's writes -- T02-5's per-run
+    failure rolls back only this run's writes -- per-run
     atomicity. Never raises: every failure mode (platform/protocol-mapping,
     harmonization, composer/DB errors) is caught and folded into a `failed`
     outcome so one bad run cannot abort the whole study import. A
     harmonization gap (a checklist-required field ENA did not supply) is
-    NOT one of those failure modes -- it never raises (T03-2); only a
+    NOT one of those failure modes -- it never raises; only a
     genuine parse/collision failure inside harmonize_biosample_attributes
     does, and that is caught here exactly like any other per-run failure."""
     try:
@@ -419,7 +419,7 @@ async def _register_one_run(
                 sequenced_sample_idx=result.sequenced_sample_idx,
                 harmonization=harmonization_result,
             )
-    except Exception as exc:  # noqa: BLE001 -- per-run isolation is the point (T02-5): a
+    except Exception as exc:  # noqa: BLE001 -- per-run isolation is the point: a
         # failure here must never abort sibling runs' registration; it is
         # recorded, not swallowed -- the caller sees every failed run
         # (accession + reason) in the returned result.

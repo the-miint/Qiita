@@ -140,7 +140,7 @@ async def test_insert_biosample_full_columns(ctx):
 
 # ---------------------------------------------------------------------------
 # get_or_create_biosample_by_ena_accession / ensure_biosample_linked_to_study
-# (T02-2, ena_import.registration cross-study de-dup)
+# (ena_import.registration cross-study de-dup)
 #
 # Known coverage gap, same shape as get_or_create_study_by_ena_accessions'
 # (tests/repositories/test_study.py): the ON-CONFLICT-DO-NOTHING +

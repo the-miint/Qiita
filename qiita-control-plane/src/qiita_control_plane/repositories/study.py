@@ -325,7 +325,7 @@ async def get_or_create_study_by_ena_accessions(
     created_by_idx: int,
     title: str,
 ) -> tuple[asyncpg.Record, bool]:
-    """Race-safe find-or-create for an ENA-study import (T02-1).
+    """Race-safe find-or-create for an ENA-study import.
 
     Positional accession mapping is the caller's responsibility (see
     `ena_import.registration.register_ena_study`): this function only

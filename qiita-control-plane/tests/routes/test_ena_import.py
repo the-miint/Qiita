@@ -364,7 +364,7 @@ async def _await_batch_tasks(eib_client) -> None:
 async def test_submit_returns_202_with_pending_items(
     eib_client, postgres_pool, admin_token, download_ena_study_action
 ):
-    """T06-1: POST N accessions -> 202 with N pending items; N studies get
+    """POST N accessions -> 202 with N pending items; N studies get
     registered by the (monkeypatched, network-free) background task."""
     token, _ = admin_token
     accessions = [unique_accession("PRJNA"), unique_accession("PRJEB")]
@@ -470,7 +470,7 @@ async def test_submit_503_when_compute_backend_unconfigured(eib_client, admin_to
 
 
 # ---------------------------------------------------------------------------
-# T06-3 -- one accession's failure never fails the batch as a whole
+# Per-item isolation -- one accession's failure never fails the batch as a whole
 # ---------------------------------------------------------------------------
 
 

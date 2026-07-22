@@ -1,5 +1,5 @@
-"""Tests for `ena_import.attribute_mapping.map_ena_attributes` (T03, owner
-decision D-A): a curated, conservative ENA sample-attribute tag ->
+"""Tests for `ena_import.attribute_mapping.map_ena_attributes` (conservative
+by design): a curated ENA sample-attribute tag ->
 `biosample_global_field.display_name` mapping. Split output — mapped
 (display_name -> value) vs. unmapped (raw tag -> value) — never drops a
 tag; normalization is whitespace/case-insensitive but the lookup table
@@ -44,7 +44,7 @@ def test_map_ena_attributes_is_case_and_whitespace_insensitive():
 def test_map_ena_attributes_leaves_host_unmapped():
     """`host` is free-text (a common/scientific name), not an NCBI taxon id --
     mapping it onto `host_taxon_id` (terminology-typed) would fabricate a
-    term-id resolution this ticket does not own (owner decision: taxon)."""
+    term-id resolution this ticket does not own (deliberately out of scope: taxon)."""
     attributes = {"host": "Homo sapiens"}
 
     mapped, unmapped = map_ena_attributes(attributes)

@@ -161,7 +161,7 @@ async def get_or_create_biosample_by_ena_accession(
     created_by_idx: int,
 ) -> tuple[int, bool]:
     """Race-safe find-or-create for a biosample keyed on ena_sample_accession
-    (T02-2, cross-study de-dup). ON CONFLICT DO NOTHING + fallback SELECT
+    (cross-study de-dup). ON CONFLICT DO NOTHING + fallback SELECT
     against the biosample_ena_sample_accession_unique constraint, mirroring
     insert_sequencing_run's find-or-create shape
     (repositories/sequencing_run.py).

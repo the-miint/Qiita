@@ -1,5 +1,5 @@
-"""ENA `instrument_platform` -> `qiita.platform` mapping (T02, owner decision
-R3): every ENA run is mapped to a `qiita_common.models.Platform` up front so
+"""ENA `instrument_platform` -> `qiita.platform` mapping (the per-platform
+grouping design): every ENA run is mapped to a `qiita_common.models.Platform` up front so
 the registration composer can group runs by platform and mint one
 `sequencing_run` + `sequenced_pool` per distinct platform.
 

@@ -3,8 +3,8 @@
 -- Bind the ENA default sample checklist (ERC000011, seeded by
 -- 20260524000000_seed_metadata_checklist.sql) to its MANDATORY field set --
 -- fetched verbatim from https://www.ebi.ac.uk/ena/browser/api/xml/ERC000011
--- on 2026-07-21 (T03 owner decision D-C: seed the REAL ERC000011 mandatory
--- set, not an assumed one). Of ERC000011's 30 <FIELD> entries, exactly two
+-- on 2026-07-21 (seeding the real ERC000011 mandatory set, not an assumed
+-- one). Of ERC000011's 30 <FIELD> entries, exactly two
 -- carry <MANDATORY>mandatory</MANDATORY> -- every other field (lat_lon, host
 -- scientific name, strain, isolate, sex, serovar, ...) is
 -- <MANDATORY>optional</MANDATORY>:

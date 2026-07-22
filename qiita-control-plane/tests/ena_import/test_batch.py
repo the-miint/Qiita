@@ -318,7 +318,7 @@ async def _cleanup_two_studies_sharing_biosample(
     postgres_pool, *, study_accessions: list[str], shared_sample_accession: str
 ) -> None:
     """Teardown twin of `_cleanup_study` for a test whose two studies share
-    ONE biosample row (T06-2 at the batch level). Unlike `_cleanup_study`
+    ONE biosample row (batch-level de-dup). Unlike `_cleanup_study`
     (which deletes a study's own biosample rows outright), the shared
     biosample here still carries a live `biosample_to_study` link to the
     OTHER study while either single study is being torn down -- deleting it
@@ -519,7 +519,7 @@ async def test_create_ena_import_batch_rejects_unknown_backend(
 
 
 # ---------------------------------------------------------------------------
-# T06-1 -- resolve + register + submit ONE download ticket per pool
+# Resolve + register + submit ONE download ticket per pool
 # ---------------------------------------------------------------------------
 
 
@@ -741,7 +741,7 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
     audience (`download_ena_study_action` fixture): the ticket submission
     must be rejected (403, audience) and NO `qiita.work_ticket` row
     created for it -- the study/pool registration itself has no audience
-    gate and still succeeds, isolated per T06-3's per-item failure model.
+    gate and still succeeds, isolated per the batch's per-item failure model.
     """
     non_audience_pidx = await seed_user_principal(
         postgres_pool, prefix="ena-batch-non-audience", suffix="t06", system_role=SystemRole.USER
@@ -777,7 +777,7 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
         download_method="http",
     )
     # Must not raise -- rejected submissions are recorded as a per-item
-    # failure (T06-3), never propagated to fail the whole batch task.
+    # failure, never propagated to fail the whole batch task.
     await task
 
     item_row = await postgres_pool.fetchrow(
@@ -813,7 +813,7 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
 
 
 # ---------------------------------------------------------------------------
-# T06-2 -- batch-driver-level de-dup: two items of the SAME batch whose runs
+# Batch-driver-level de-dup: two items of the SAME batch whose runs
 # resolve to a SHARED sample_accession still land as one biosample row
 # (the register-level concurrency case -- two INDEPENDENT
 # register_ena_study calls racing via asyncio.gather -- is already covered
@@ -922,7 +922,7 @@ async def test_batch_dedupes_shared_biosample_across_two_items(
 
 
 # ---------------------------------------------------------------------------
-# T06-3 -- one accession's failure never affects its siblings or the batch
+# Per-item isolation -- one accession's failure never affects its siblings or the batch
 # ---------------------------------------------------------------------------
 
 
@@ -962,7 +962,7 @@ async def test_run_batch_isolates_per_study_failure(
         resolver_kind=ResolverKind.MIINT,
         download_method="http",
     )
-    # Must not raise -- the batch as a whole never fails (T06-3).
+    # Must not raise -- the batch as a whole never fails.
     await task
 
     rows = await postgres_pool.fetch(

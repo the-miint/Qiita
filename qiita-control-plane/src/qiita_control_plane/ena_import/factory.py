@@ -1,4 +1,4 @@
-"""Config-level `EnaResolver` selection (T01-4). D2's HTTP fallback is a
+"""Config-level `EnaResolver` selection. The HTTP fallback is a
 swap here, never a callers change — mirrors
 `qiita_compute_orchestrator.main._build_backend`'s factory-raises-on-unknown
 pattern for `ComputeBackend`."""

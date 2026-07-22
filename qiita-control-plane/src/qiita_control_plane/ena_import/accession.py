@@ -1,4 +1,4 @@
-"""ENA/SRA accession-type detection and validation (T01-3).
+"""ENA/SRA accession-type detection and validation.
 
 Every resolver call takes a validated accession up front — fail loud on an
 empty, malformed, or wrong-kind accession instead of handing it to

@@ -25,12 +25,12 @@ enforced against a real principal, never bypassed, AND the batch's own
 persisted `download_method` -- never `submit.DEFAULT_DOWNLOAD_METHOD`
 directly, so a ticket this batch submits always carries the transport the
 route validated at submission time). One accession's failure marks only
-that item `failed` -- the batch itself never fails (T06-3).
+that item `failed` -- the batch itself never fails.
 
 `reconcile_inflight_batches` (called from `main.py`'s lifespan startup,
 alongside `dispatch.reconcile_inflight_tickets`) re-drives every item still
 `pending`/`resolving` after a CP restart -- `register_ena_study` is
-idempotent (T02-5) so re-driving from `pending` is always safe, even if a
+idempotent so re-driving from `pending` is always safe, even if a
 prior resolve partially ran.
 """
 
@@ -216,7 +216,7 @@ async def _process_one_study(
     ticket per pool it created. Never raises -- every failure mode
     (resolve, register, ticket submission) is caught and recorded as this
     item's `failed` state, so one bad accession in a batch can never
-    affect any other item or the batch as a whole (T06-3).
+    affect any other item or the batch as a whole.
 
     Blocking DuckDB+miint resolver calls run under `asyncio.to_thread` so
     they don't stall the event loop the other concurrently-processing
@@ -267,8 +267,8 @@ async def _process_one_study(
             work_ticket_idxs.append(response.work_ticket_idx)
 
         await _set_item_downloading(pool, item.idx, work_ticket_idxs=work_ticket_idxs)
-    except Exception as exc:  # noqa: BLE001 -- per-study isolation is the point
-        # (T06-3): one accession's failure must never abort its siblings or
+    except Exception as exc:  # noqa: BLE001 -- per-study isolation is the point:
+        # one accession's failure must never abort its siblings or
         # the batch as a whole. Recorded on this item, never swallowed
         # silently -- callers see it via GET /ena-import-batch/{idx}.
         _log.warning(
@@ -388,7 +388,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
 
     Mirrors `dispatch.reconcile_inflight_tickets`: a CP restart leaves any
     item that hadn't reached `registered` with no live owner.
-    `register_ena_study` is idempotent (T02-5), so re-driving from
+    `register_ena_study` is idempotent, so re-driving from
     `pending` is safe even if a prior resolve partially ran. Items are
     grouped by batch so each batch's in-flight items share one background
     task + one bounded-concurrency semaphore, same as a fresh submission.

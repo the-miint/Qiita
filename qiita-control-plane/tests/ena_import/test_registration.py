@@ -1,16 +1,15 @@
-"""DB-bound tests for `ena_import.registration.register_ena_study` (T02).
+"""DB-bound tests for `ena_import.registration.register_ena_study`.
 
 Covers the epic's acceptance criteria end to end against a real Postgres:
-study upsert (T02-1), cross-study biosample de-dup (T02-2), one
+study upsert, cross-study biosample de-dup, one
 sequenced_sample per run with accessions carried + the reserved-idx-range
-invariant scoped to study/prep_sample only (T02-3), mixed-platform grouping
-into multiple sequencing_run/sequenced_pool rows (R3), provenance columns
-(T02-4), and idempotent re-import + per-run partial-failure isolation
-(T02-5).
+invariant scoped to study/prep_sample only, mixed-platform grouping
+into multiple sequencing_run/sequenced_pool rows, provenance columns,
+and idempotent re-import + per-run partial-failure isolation.
 
 Pattern 2 (committed fixture + FK-reverse cleanup): `register_ena_study`
 takes a pool and commits its own writes internally (each run gets its own
-transaction, by design -- T02-5), so nothing here can be wrapped in one
+transaction, by design), so nothing here can be wrapped in one
 outer rolled-back transaction. `_cleanup` below removes every row reachable
 from the study_idxs / study_accessions / principal_idxs a test tracks.
 """
@@ -207,9 +206,9 @@ async def _register(reg, *, study_header, runs, sample_attributes=()):
 # mappable tags): the five ena_import.attribute_mapping tags (collection
 # date/geo-country/lat/long/depth) plus one "hard" value (`depth` = an
 # INSDC missing-value string, proving the known_missing_reasons wiring) and
-# four deliberately-unmapped tags -- `host` (owner decision: free text, not
+# four deliberately-unmapped tags -- `host` (free text, not
 # an NCBI taxon id) and the broad-scale/local/medium environmental-context
-# triad (owner decision, extended on discovery: these were rebound to
+# triad (extended on discovery: these were rebound to
 # TERMINOLOGY/ENVO by `20260608000001_seed_envo_terminology.sql`, so mapping
 # ENA's free-text value directly would require an ENVO-CURIE resolution this
 # ticket does not own; see attribute_mapping.py's module docstring).
@@ -233,7 +232,7 @@ def _mixs_sample_attributes(sample_accession: str, **overrides: str) -> EnaSampl
         "broad-scale environmental context": "marine biome",
         "local environmental context": "coastal water",
         "environmental medium": "sea water",
-        # Deliberately unmapped (owner decision) -- free-text, not an NCBI
+        # Deliberately unmapped -- free-text, not an NCBI
         # taxon id; retained as local metadata, not dropped.
         "host": "Homo sapiens",
     }
@@ -269,7 +268,7 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
     ]
     assert harmonization.checklist_name == "ERC000011"
     # Both ERC000011-mandatory fields (collection date, geo country/sea) were
-    # supplied -- the non-raising report has nothing to list (T03-2, import
+    # supplied -- the non-raising report has nothing to list (import
     # still succeeds either way).
     assert harmonization.missing_required == []
 
@@ -277,7 +276,7 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
     )
 
-    # T03-2: biosample.metadata_checklist_idx names ERC000011.
+    # biosample.metadata_checklist_idx names ERC000011.
     checklist_name = await reg["pool"].fetchval(
         "SELECT mc.name FROM qiita.biosample b"
         " JOIN qiita.metadata_checklist mc ON mc.idx = b.metadata_checklist_idx"
@@ -286,7 +285,7 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
     )
     assert checklist_name == "ERC000011"
 
-    # T03-1: mapped attrs land on the correct biosample_global_fields (joined
+    # Mapped attrs land on the correct biosample_global_fields (joined
     # via global_field_idx).
     rows = await reg["pool"].fetch(
         "SELECT gf.display_name, bm.value_text, bm.value_numeric,"
@@ -320,7 +319,7 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
     assert depth_row["value_numeric"] is None
     assert depth_row["value_missing_reason_idx"] is not None
 
-    # T03-1: unmapped tags retained as local TEXT metadata, not dropped --
+    # Unmapped tags retained as local TEXT metadata, not dropped --
     # 'host' plus the environmental-context triad.
     local_rows = await reg["pool"].fetch(
         "SELECT bsf.display_name, bm.value_text"
@@ -383,7 +382,7 @@ async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
     )
     assert count == 5
 
-    # Reachable from both studies via biosample_to_study (T02-2's existing
+    # Reachable from both studies via biosample_to_study (existing
     # cross-study de-dup, unaffected by write-once harmonization).
     linked_studies = {
         r["study_idx"]
@@ -578,7 +577,7 @@ async def test_empty_sample_attributes_registers_with_missing_required_report(re
 
 
 # ---------------------------------------------------------------------------
-# T02-1 -- study upsert
+# Study upsert
 # ---------------------------------------------------------------------------
 
 
@@ -614,7 +613,7 @@ async def test_reimport_same_study_reuses_study_row(reg):
 
 
 # ---------------------------------------------------------------------------
-# T02-2 -- cross-study biosample de-dup
+# Cross-study biosample de-dup
 # ---------------------------------------------------------------------------
 
 
@@ -665,7 +664,7 @@ async def test_shared_biosample_across_two_studies_one_row_two_links(reg):
     assert linked_studies == {result_a.study_idx, result_b.study_idx}
 
 
-# T06-2 -- the same de-dup, but under REAL concurrency (asyncio.gather over
+# The same de-dup, but under REAL concurrency (asyncio.gather over
 # two register_ena_study calls sharing a sample_accession), not just two
 # sequential calls. The batch driver's bounded-concurrency phase
 # processes multiple studies at once, so the cross-study biosample
@@ -737,7 +736,7 @@ async def test_concurrent_registration_of_shared_biosample_dedupes_to_one_row(re
 
 
 # ---------------------------------------------------------------------------
-# T02-3 -- prep_sample / sequenced_sample creation, reserved-range invariant
+# prep_sample / sequenced_sample creation, reserved-range invariant
 # ---------------------------------------------------------------------------
 
 
@@ -960,7 +959,7 @@ async def test_created_pools_empty_when_every_run_fails(reg):
 
 
 # ---------------------------------------------------------------------------
-# T02-4 -- provenance columns persisted
+# Provenance columns persisted
 # ---------------------------------------------------------------------------
 
 
@@ -988,7 +987,7 @@ async def test_provenance_columns_persisted(reg):
 
 
 # ---------------------------------------------------------------------------
-# T02-5 -- idempotency + partial-failure semantics
+# Idempotency + partial-failure semantics
 # ---------------------------------------------------------------------------
 
 

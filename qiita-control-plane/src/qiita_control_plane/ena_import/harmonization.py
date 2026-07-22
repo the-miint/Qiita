@@ -6,7 +6,7 @@ model: turns one BioSample's ENA submitter-defined attribute map
 Splits the attribute map via `attribute_mapping.map_ena_attributes` into a
 curated set that lands on an existing `biosample_global_field` (globally
 linked -- one canonical value shared cross-study) and everything else, which
-is retained as raw study-local TEXT metadata rather than dropped (T03-1).
+is retained as raw study-local TEXT metadata rather than dropped.
 Wires `known_missing_reasons` into `preflight_global_metadata` so an
 ENA/INSDC missing-value string (`not applicable`, `not collected`, ...)
 resolves as a `MissingReasonRef` instead of raising `MetadataParseError` --
@@ -16,7 +16,7 @@ Unlike `import_biosample_from_owner_biosample_id` /
 `import_sequenced_prep_sample`, this composer deliberately never calls
 `assert_required_global_fields_supplied`: a checklist-required field ENA did
 not supply is reported on the returned `HarmonizationResult.missing_required`,
-never rejected (T03-2). Only a genuine parse/type/collision failure (an
+never rejected. Only a genuine parse/type/collision failure (an
 unrecognized display_name, an unparseable typed value, a cross-study slot
 collision) raises -- the caller (`ena_import.registration`) isolates that
 per-run, exactly like a platform- or protocol-mapping failure; a
@@ -52,7 +52,7 @@ class HarmonizationResult:
     study-local metadata instead of being dropped; `checklist_name` and
     `missing_required` describe the checklist the biosample was bound to and
     which of its required fields (by display_name) still have no value after
-    this write -- always a report, never a rejection (T03-2).
+    this write -- always a report, never a rejection.
     """
 
     mapped_count: int
@@ -151,7 +151,7 @@ async def harmonize_biosample_attributes(
         "SELECT name FROM qiita.metadata_checklist WHERE idx = $1", metadata_checklist_idx
     )
 
-    # Non-raising required-field gap report (T03-2): every checklist-required
+    # Non-raising required-field gap report: every checklist-required
     # biosample_global_field the biosample still has no value for, after the
     # writes above. Never raises -- ENA declining to supply a required field
     # is reported, not rejected.

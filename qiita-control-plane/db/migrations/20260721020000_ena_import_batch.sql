@@ -2,7 +2,7 @@
 -- one `POST /api/v1/ena-import-batch` submission (a list of ENA/SRA study
 -- accessions); one `qiita.ena_import_batch_item` row per accession tracks
 -- its own resolve/register/download-submit progress independently, so one
--- accession's failure never affects its siblings (T06-3) -- mirrors the
+-- accession's failure never affects its siblings -- mirrors the
 -- per-run isolation `ena_import.registration.register_ena_study` already
 -- guarantees, one level up.
 --
@@ -113,7 +113,7 @@ CREATE TABLE qiita.ena_import_batch_item (
 COMMENT ON TABLE qiita.ena_import_batch_item IS
     'One ENA/SRA study accession within a qiita.ena_import_batch, tracked '
     'independently through resolve -> register -> download-submit so one '
-    'accession''s failure never affects its siblings (T06-3). state mirrors '
+    'accession''s failure never affects its siblings. state mirrors '
     'qiita_common.models.ena_import.BatchItemState.';
 
 COMMENT ON COLUMN qiita.ena_import_batch_item.download_work_ticket_idxs IS

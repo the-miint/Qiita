@@ -1,5 +1,5 @@
 """ENA sample-attribute tag -> `biosample_global_field.display_name` mapping
-(T03, owner decision D-A: conservative). `ena_import.harmonization` uses this
+(conservative by design). `ena_import.harmonization` uses this
 to split one BioSample's submitter-defined ENA attributes into a curated set
 that lands on an existing global field (cross-study comparable) and
 everything else, which is retained as study-local metadata rather than
@@ -39,7 +39,7 @@ forms are recognized side by side -- neither supersedes the other:
     as raw local metadata under the original combined tag) rather than
     guessed at or crashed on.
 
-Deliberately NOT mapped here (owner decisions, reconciled harmonization plan):
+Deliberately NOT mapped here (by design):
 
   - `host` -- ENA's `host` attribute is free-text (a common/scientific name),
     not an NCBI Taxonomy id. Mapping it onto `host_taxon_id`
@@ -61,13 +61,13 @@ Deliberately NOT mapped here (owner decisions, reconciled harmonization plan):
     necessarily a CURIE. Mapping it directly would either fabricate an
     ENVO-resolution step this ticket does not own or fail to parse for most
     real values; both are worse than retaining the raw text as study-local
-    metadata (T03-1), so these three tags stay unmapped here too.
+    metadata, so these three tags stay unmapped here too.
 
 Normalization (whitespace-collapsed, lower-cased, underscore-folded-to-space)
 only smooths a submitter's spacing/casing/vocabulary-punctuation quirk; the
 lookup table itself is exact-match on the normalized form, never
 fuzzy/partial -- a tag this table does not recognize is retained as
-study-local metadata (T03-1), never silently dropped or guessed at.
+study-local metadata, never silently dropped or guessed at.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def _normalize_tag(tag: str) -> str:
 # One handler per normalized tag. Each takes the attribute's raw (untouched)
 # value and returns the {global_field_display_name: value} entries to merge
 # into `mapped`, or `None` if this particular value can't be safely mapped --
-# in which case the ORIGINAL tag+value is retained as unmapped (T03-1),
+# in which case the ORIGINAL tag+value is retained as unmapped,
 # never split or guessed at.
 _TagHandler = Callable[[str], dict[str, str] | None]
 
@@ -180,7 +180,7 @@ def map_ena_attributes(attributes: dict[str, str]) -> tuple[dict[str, str], dict
     and its siblings, which key on `display_name`. `unmapped` is keyed by the
     ORIGINAL (un-normalized) tag as submitted -- `ena_import.harmonization`
     writes it as the `display_name` of a purely-local `biosample_study_field`
-    so the value is retained rather than dropped (T03-1).
+    so the value is retained rather than dropped.
 
     A recognized tag whose handler declines to map its particular value
     (currently only `lat_lon` on an unparseable/missing value) is retained

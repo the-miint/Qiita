@@ -665,7 +665,7 @@ async def test_update_study_duplicate_bioproject_accession_raises_unique_error(p
 
 
 # ---------------------------------------------------------------------------
-# get_or_create_study_by_ena_accessions (T02-1, ena_import.registration)
+# get_or_create_study_by_ena_accessions (ena_import.registration)
 #
 # Known coverage gap, documented rather than papered over with a synthetic
 # test: exercising the UniqueViolationError-catch-and-refetch branch needs a

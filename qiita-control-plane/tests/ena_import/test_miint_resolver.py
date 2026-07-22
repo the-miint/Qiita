@@ -1,4 +1,4 @@
-"""Tests for `MiintEnaResolver` (T01-2): the default `EnaResolver`
+"""Tests for `MiintEnaResolver`: the default `EnaResolver`
 implementation, driving DuckDB + the miint `read_ena` / `read_ena_attributes`
 table functions.
 
