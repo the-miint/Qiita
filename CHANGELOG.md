@@ -168,6 +168,28 @@ duplicates further down are historical strata; leave them where they are.
   `_open_ena_connection` to `INSTALL httpfs` at most once per process
   (double-checked lock, mirroring `connect_with_miint()`'s own guard) instead
   of on every call.
+- **ENA import: full-span integration coverage, gated live tests, and an
+  operator runbook.** New `tests/integration/test_ena_import_e2e.py` threads
+  the batch driver's real registration (`create_ena_import_batch` /
+  `_process_one_study`, against a fixture study whose two runs share one
+  sample accession) into the `ingest_ena_reads` native job and the real
+  `register-files` tail, landing in a real DuckLake `read` table in one
+  process — asserting the study/biosample de-dup, the per-run read counts,
+  and that re-processing the same study a second time registers nothing new.
+  New `tests/integration/test_ena_import_live_e2e.py` adds two
+  `@pytest.mark.system`-gated tests (never run by CI, human-run only via
+  `make test-system`) that clean-skip on network absence: one drives the
+  real batch driver's metadata resolution and de-dup against a real, tiny
+  public study without downloading any read bytes, the other calls
+  `ingest_ena_reads.execute()` directly against a real, tiny public run and
+  verifies its reads land in DuckLake. New
+  `docs/runbooks/ena-import.md` documents the batch REST surface, the
+  resolve/register/submit flow, ERC000011 metadata harmonization, this
+  surface's hard scope limits (ENA/SRA and `http` transport only; DDBJ/
+  legacy-platform and ENVO harmonization are deferred gaps), and the
+  duckdb-miint dependency (including that read md5 verification awaits an
+  upstream miint change). `docs/architecture.md` gains a short cross-linked
+  ENA Study Import subsection.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
