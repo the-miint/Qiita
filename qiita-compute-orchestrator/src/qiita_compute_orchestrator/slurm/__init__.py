@@ -30,7 +30,7 @@ from .launcher_failure import (
     parse_launcher_failure,
     parse_launcher_no_data,
 )
-from .payload import build_job_submit_payload
+from .payload import build_job_submit_payload, job_name, job_name_prefix
 from .verify import VerificationFailure, parse_outputs_map, verify_container_output
 
 __all__ = [
@@ -43,6 +43,8 @@ __all__ = [
     "TerminalSlurmState",
     "VerificationFailure",
     "build_job_submit_payload",
+    "job_name",
+    "job_name_prefix",
     "parse_launcher_failure",
     "parse_launcher_no_data",
     "parse_outputs_map",

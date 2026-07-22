@@ -241,3 +241,16 @@ class ComputeBackend(ABC):
         instead of re-submitting a duplicate. Raises a classified
         `BackendFailure` on a backend read error (e.g. SLURMRESTD_UNREACHABLE,
         which the runner's recovery treats as transient)."""
+
+    @abstractmethod
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """Cancel (scancel) EVERY live SLURM job of a work_ticket — all attempts,
+        matched by the deterministic name prefix `qiita-wt{idx}-`. Returns the job
+        ids actually cancelled (empty when none are live: already finished/purged,
+        or an in-process backend that never submits to SLURM).
+
+        Idempotent: cancelling an already-gone job is a no-op. The control plane
+        calls this AFTER flipping the ticket terminal (so no new attempt spawns
+        between the find and the scancel — the terminal-first ordering the cancel
+        command relies on). Raises a classified `BackendFailure` on a backend
+        error the caller can retry."""

@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.api_paths import (
+    PATH_STEP_CANCEL,
     PATH_STEP_FIND_BY_NAME,
     PATH_STEP_PLAN,
     PATH_STEP_PREFIX,
@@ -54,6 +55,8 @@ from qiita_common.backend_failure import (
 from qiita_common.models import (
     ComputeTarget,
     FoundJobWire,
+    StepCancelRequest,
+    StepCancelResponse,
     StepFindByNameRequest,
     StepFindByNameResponse,
     StepHandleWire,
@@ -356,3 +359,22 @@ async def find_jobs_by_name(
             for f in found
         ]
     )
+
+
+@router.post(PATH_STEP_CANCEL)
+async def cancel_step(
+    body: StepCancelRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepCancelResponse:
+    """scancel every live SLURM job of a work_ticket (all attempts, by the
+    `qiita-wt{idx}-` name prefix). The control plane calls this AFTER flipping the
+    ticket terminal, so no new attempt can spawn between the find and the scancel.
+    Idempotent — returns the ids actually cancelled (empty when none are live).
+    Serializes a classified BackendFailure (e.g. slurmrestd unreachable) so the CP
+    retries rather than treating a transient reap failure as permanent."""
+    try:
+        cancelled = await backend.cancel(body.work_ticket_idx)
+    except BackendFailure as exc:
+        return _backend_failure_response(exc)
+    return StepCancelResponse(cancelled_job_ids=cancelled)

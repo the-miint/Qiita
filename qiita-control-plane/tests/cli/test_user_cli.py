@@ -546,6 +546,7 @@ def _stub_post(
     response_json: dict,
     status: int = 201,
     whoami_idx: int | None = None,
+    response_headers: dict | None = None,
 ):
     """Patch `_common.httpx.request` to capture every call and return canned
     responses. Each call appends to `captured['requests']` (full list); the
@@ -585,7 +586,12 @@ def _stub_post(
                 json={"kind": "human", "principal_idx": whoami_idx},
                 request=_httpx.Request(method, url),
             )
-        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
+        return _httpx.Response(
+            status,
+            json=response_json,
+            headers=response_headers,
+            request=_httpx.Request(method, url),
+        )
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
@@ -2048,6 +2054,78 @@ def test_http_error_response_prints_to_stderr_and_exits_1(monkeypatch, capsys):
     assert "http error 403" in err
     # The server's response body is echoed so the user sees the reason.
     assert "requires study access" in err
+
+
+def test_stale_scope_403_prints_clean_relogin_prompt(monkeypatch, capsys):
+    """A 403 the server flags with the stale-token-scope marker header —
+    the token predates a scope the caller's role now grants — surfaces a
+    clean, actionable `qiita login` prompt instead of the raw JSON envelope."""
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "missing required scope 'sequenced_pool:delete' (...)"},
+        status=403,
+        response_headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "qiita login" in err
+    # The clean prompt replaces the raw JSON dump — no braces/quotes leak.
+    assert "{" not in err
+    assert '"detail"' not in err
+
+
+def test_plain_403_without_marker_still_echoes_body(monkeypatch, capsys):
+    """A 403 that is *not* a stale-scope case (no marker header) keeps the
+    generic body echo — the clean prompt is reserved for the stale case so an
+    ordinary authorization denial isn't misdescribed as a re-login fix."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "requires study access at tier 'admin' or higher"},
+        status=403,
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 403" in err
+    assert "requires study access" in err
+    assert "qiita login" not in err
+
+
+def test_marker_header_on_non_403_still_echoes_body(monkeypatch, capsys):
+    """The clean prompt is gated on `status_code == 403`, not the header alone:
+    a non-403 response that happens to carry the marker keeps the generic body
+    echo. Pins that the status half of the guard is load-bearing."""
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "conflict"},
+        status=409,
+        response_headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 409" in err
+    assert "qiita login" not in err
 
 
 def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsys):
@@ -3971,6 +4049,95 @@ def test_pool_completion_requires_both_idxs(capsys):
         main(["pool-completion", "--sequencing-run-idx", "3"])
     assert exc_info.value.code == 2
     assert "--sequenced-pool-idx" in capsys.readouterr().err
+
+
+def test_pool_completion_help_uses_current_labels(capsys):
+    """The --help text describes the command in demux (bcl-convert) + host-masking
+    (read-mask) terms, not the retired fastq-to-parquet / prep-generation /
+    GenPrepFileJob labels the read-storage/masking split obsoleted."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["pool-completion", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "bcl-convert" in out
+    assert "read-mask" in out
+    for stale in ("fastq-to-parquet", "prep-generation", "GenPrepFileJob"):
+        assert stale not in out
+
+
+def test_render_pool_completion_summarizes_fully_processed(capsys):
+    """The render prints the full JSON to stdout AND a human verdict line to
+    stderr surfacing fully_processed / demux_state / never-submitted, so the
+    'is this pool done and clean?' answer is legible at a glance."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    body = {
+        "sequenced_pool_idx": 5,
+        "sequencing_run_idx": 3,
+        "demux_state": "completed",
+        "sample_count": 4,
+        "samples_completed": 4,
+        "samples_in_flight": 0,
+        "samples_no_data": 0,
+        "samples_failed": 0,
+        "samples_not_submitted": 0,
+        "complete": True,
+        "fully_processed": True,
+    }
+    _render_pool_completion(body)
+    cap = capsys.readouterr()
+    # Full machine-readable body still on stdout.
+    assert '"fully_processed": true' in cap.out
+    # Human summary on stderr surfaces the three operator questions.
+    assert "DONE and clean" in cap.err
+    assert "demux completed" in cap.err
+    assert "0 never-submitted" in cap.err
+
+
+def test_render_pool_completion_flags_incomplete_and_stranded(capsys):
+    """A pool with stranded (never-submitted) samples reads NOT fully processed
+    with the never-submitted count front-and-centre, instead of the operator
+    having to spot it in the raw JSON (the stranded-samples incident that
+    motivated this surface was originally found only by hand-written SQL)."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    body = {
+        "sequenced_pool_idx": 9,
+        "sequencing_run_idx": 3,
+        "demux_state": "completed",
+        "sample_count": 200,
+        "samples_completed": 5,
+        "samples_in_flight": 0,
+        "samples_no_data": 0,
+        "samples_failed": 0,
+        "samples_not_submitted": 195,
+        "complete": False,
+        "fully_processed": False,
+    }
+    _render_pool_completion(body)
+    err = capsys.readouterr().err
+    assert "NOT fully processed" in err
+    assert "195 never-submitted" in err
+
+
+def test_render_pool_completion_stays_quiet_on_unrecognized_body(capsys):
+    """The render only summarizes a recognized PoolCompletionStatus body: an
+    unexpected shape (a list, or a dict missing the discriminating
+    `fully_processed` field) still gets its JSON on stdout but no verdict line on
+    stderr, and never raises."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    _render_pool_completion(["not", "a", "completion", "body"])
+    cap = capsys.readouterr()
+    assert "not" in cap.out  # JSON is still printed
+    assert cap.err == ""  # no verdict on an unrecognized shape
+
+    _render_pool_completion({"unexpected": "shape"})
+    cap = capsys.readouterr()
+    assert "unexpected" in cap.out
+    assert cap.err == ""
 
 
 # ---------------------------------------------------------------------------

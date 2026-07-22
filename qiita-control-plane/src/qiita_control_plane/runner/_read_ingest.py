@@ -18,8 +18,10 @@ from qiita_common.parquet import validate_parquet_path
 import qiita_control_plane.runner as _runner_pkg
 
 from ..auth.tickets import sign_action, sign_ticket
-from ..miint import connect_with_miint
+from ..host_filter_resolver import is_control_sample
+from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
+from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -359,7 +361,7 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     read_opts = flight.FlightCallOptions(
         read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
     )
-    with flight.FlightClient(data_plane_url) as client, connect_with_miint() as con:
+    with flight.FlightClient(data_plane_url) as client, connect_with_miint_staged() as con:
         reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
         con.register("masked", reader)
         # Single-end long reads: sequence2/qual2 are NULL, so FORMAT FASTQ writes a
@@ -371,7 +373,25 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     return int(count)
 
 
+async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample_idx: int) -> bool:
+    """True when this prep_sample's biosample is flagged an expected-empty control
+    (host_taxon_id == "missing: control sample"). Resolves prep_sample → biosample,
+    then defers the control classification to `is_control_sample` so the definition
+    of "control" stays shared with the host-filter resolver. Fail-safe on a missing
+    prep_sample (returns False → the zero-read ticket FAILs as a data well).
+
+    Covers BOTH positive and negative controls, because the persisted control
+    marker cannot yet tell them apart — see the KNOWN LIMITATION in
+    `is_control_sample`: a positive control (katharoseq) that yields zero reads is
+    currently classified `no_data` too, though it is really a failure."""
+    biosample_idx = await fetch_biosample_idx_for_prep_sample(pool, prep_sample_idx)
+    if biosample_idx is None:
+        return False
+    return await is_control_sample(pool, biosample_idx=biosample_idx)
+
+
 async def _resolve_staged_reads(
+    pool: asyncpg.Pool,
     scope_target: dict[str, Any],
     staging_root: Path,
     *,
@@ -390,9 +410,14 @@ async def _resolve_staged_reads(
     Either source binds the same `reads` path; they are byte-equivalent modulo row
     order, and qc / host_filter are order-independent.
 
-    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if the sample has no
-    stored reads in either place — it must be ingested before a mask can be
-    created over it — or if the data plane is unreachable."""
+    Zero stored reads splits on whether the well is an expected-empty control: a
+    blank / no-template control legitimately produces no reads, so it ends the
+    ticket at a benign terminal `no_data` (StepNoData); a data well with no reads
+    is a genuine failure and stays SUBMISSION/BAD_INPUT (FAILED) — it must be
+    ingested before a mask can be created over it. (An unreachable data plane is
+    likewise SUBMISSION/BAD_INPUT.) Without this split every empty well — control
+    or data — lands in the pool's `samples_failed`, burying real failures among
+    blanks doing their job."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     durable = compute_reads_staging_path(staging_root, prep_sample_idx)
@@ -428,7 +453,20 @@ async def _resolve_staged_reads(
     # `count` is already an int (coerced in `_do_action_export_read`).
     if result.get("count", 0) == 0:
         # The persistent store has no reads for this sample either (the data plane
-        # writes no file for an empty result) — same "must be ingested" semantics.
+        # writes no file for an empty result). Split control from data: an
+        # expected-empty control (blank / NTC) reading zero is the benign, correct
+        # outcome → terminal no_data; a data well reading zero is a real failure →
+        # BAD_INPUT (must be ingested before a mask can be created over it). The
+        # control marker is the persisted biosample host_taxon_id == "missing:
+        # control sample" (see `is_control_sample`).
+        if await _prep_sample_is_expected_empty_control(pool, prep_sample_idx):
+            raise StepNoData(
+                reason=(
+                    f"prep_sample {prep_sample_idx} is an expected-empty control "
+                    "(blank / no-template control) with no stored reads; recording "
+                    "no_data rather than a failure"
+                )
+            )
         raise _submission_bad_input(
             f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
             "ingested (submit-bcl-convert stores reads) before a read mask can be "

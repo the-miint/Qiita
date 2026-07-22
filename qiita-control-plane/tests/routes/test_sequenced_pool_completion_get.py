@@ -199,6 +199,23 @@ async def test_get_completion_buckets_samples(ctx, seeded_pool):
     # No bcl-convert ticket seeded by default → demux not_submitted, not fully done.
     assert body["demux_state"] == "not_submitted"
     assert body["fully_processed"] is False
+    # Pool-wide (no reference scope) echoes reference_idx=null.
+    assert body["reference_idx"] is None
+
+
+async def test_get_completion_reference_scope_echoes_and_narrows(ctx, seeded_pool):
+    """?reference_idx=N echoes the scope and narrows host-masking to masks that
+    used that reference. The seeded completed ticket carries no mask_idx, so
+    scoping to any reference reads it as not_submitted (masked, but not against N)."""
+    resp = await ctx["wet"].get(
+        _url(seeded_pool["run_idx"], seeded_pool["pool_idx"]) + "?reference_idx=555"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reference_idx"] == 555
+    assert body["sample_count"] == 2
+    assert body["samples_completed"] == 0
+    assert body["samples_not_submitted"] == 2
 
 
 async def _complete_second_sample(db, seeded_pool):

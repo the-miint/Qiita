@@ -53,6 +53,45 @@ duplicates further down are historical strata; leave them where they are.
   Phylogeny defers to a documented `shear_tree` prune contract (no production tree
   consumer exists yet). Two migrations: `reference_membership.accession`,
   `reference_exclusion`.
+- **`qiita-admin ticket cancel` — stop in-flight compute without raw scancel (#314).**
+  A single ticket or a whole fan-out (explicit idxs and/or an `--action-id` +
+  `--sequencing-run-idx`/`--sequenced-pool-idx` filter) can now be cancelled from the
+  CLI, replacing the fragile "scancel as the compute account + hand-written job-name
+  regex + race the re-driver" recovery. The CP does it **terminal-first**: it flips
+  each ticket to a new terminal `cancelled` state (distinct from `failed` so an
+  operator stop is legible in `ticket list` / rollups / the notify digest, with NULL
+  failure_*) so the runner's poll loop aborts and no new attempt spawns, THEN scancels
+  every attempt of the ticket via a new CO `POST /step/cancel` endpoint (matched by the
+  `qiita-wt{idx}-` job-name prefix, not just the recorded slurm_job_id). Idempotent
+  (already-terminal is a no-op but still reaps any stray job — the same primitive
+  #312's orphan-reaping needs); a cancelled ticket is redrivable in place with
+  `qiita ticket run` once the blocker is fixed. New `work_ticket:cancel` scope
+  (system_admin), `ALTER TYPE work_ticket_state ADD VALUE 'cancelled'` migration,
+  `ComputeBackend.cancel` / `ComputeBackendClient.cancel`, and `POST /work-ticket/cancel`.
+- **Mouse gut terminology seeds (#360).** Appends the NCBI Taxonomy terms
+  `410661` (mouse gut metagenome) and `10090` (Mus musculus), plus the ENVO
+  term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
+  is deprecated at source but appears in data we import), to the existing
+  pre-release MVP terminologies.
+- **Pool / run summary + rollup endpoints (#236).** Server-side aggregation so
+  callers stop paging the per-sample list route and tallying by hand. All
+  compute-on-read (never drifts), no migration. (1) `PoolReadMetrics` gains a
+  read-outcome breakdown (`samples_unprocessed` / `samples_zero_reads` /
+  `samples_with_reads`, splitting the old `samples_with_metrics` into "no metrics
+  yet" vs "processed but everything filtered out") and accession-coverage counts
+  (per-accession + all-four `samples_fully_submitted_to_ena`); the pool + run
+  rollups share one SQL aggregate so they can't drift. (2) `GET /sequencing-run/{run}`
+  now nests `read_metrics` (the run-level twin, summed across the run's pools).
+  (3) New `GET .../sequenced-pool/{P}/sequenced-sample/exceptions` — only the
+  anomalous samples (no usable reads / missing any submission accession / failed
+  read-mask ticket), each with the flags naming why. (4) New
+  `GET .../sequenced-pool/{P}/work-ticket/summary` — read-mask ticket coverage +
+  per-state ticket counts (tickets as denominator), reconciled with the completion
+  rollup. (5) `GET /work-ticket` list rows now nest `read_outcome` (the ticket's
+  prep_sample read counts + passing fraction) for prep_sample-scoped tickets.
+  (6) `GET .../completion` gains an optional `?reference_idx=N` so host-masking
+  completion distinguishes "not masked against THIS reference" from the
+  reference-agnostic "not masked at all" (folded from #217 ask-4).
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
@@ -140,6 +179,59 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Empty control wells end `no_data`, not `samples_failed`, on the live read-mask
+  path (#177).** On the live `bcl-convert → ingest_reads → read-mask` pipeline an
+  empty well produces zero stored reads; the per-sample read-mask ticket then failed
+  at input binding (`_resolve_staged_reads` → `BAD_INPUT` → FAILED), so *every* empty
+  well — a legitimate blank / no-template control included — landed in the pool's
+  `samples_failed`, burying real failures among blanks doing their job (the #164
+  defect re-manifested after the store-once/mask-many split orphaned the old
+  `fastq_to_parquet` `no_data` path). The zero-read branch now splits on the persisted
+  biosample control marker (`host_taxon_id == "missing: control sample"`, reused via
+  the host-filter resolver's `is_control_sample` so "what is a control" stays defined
+  once): an expected-empty **control** raises `StepNoData` → terminal `no_data`
+  (counted under `samples_no_data`); an unexpected-empty **data** well keeps the
+  `BAD_INPUT` → failure it gets today. No schema or rollup change — the completion
+  rollup already buckets `no_data` separately from `failed`.
+- **`long-read-assembly` could never stream a sample's masked reads (#352).**
+  Every ticket failed at submission with DuckDB's `IO Error: Can't find the home
+  directory at '/dev/null'`. The CP runner's masked-read streamer
+  (`_stream_masked_reads_to_fastq`) called `connect_with_miint()` — the helper
+  documented for the **client** CLI, which runs `INSTALL miint` then `LOAD`.
+  `INSTALL` resolves DuckDB's extension directory, defaulting to
+  `$HOME/.duckdb/extensions`, and the `qiita-api` service account's home is
+  `/dev/null`. This was the control plane's first *service-side* miint consumer;
+  the helper's other callers are CLIs that have so far only run from hosts with a
+  real `$HOME`, so it had never surfaced. (That is a property of where they run,
+  not of which CLI they are — `qiita-admin` subcommands *are* run as `qiita-api`
+  on the deploy host, so `qiita-admin masked-read-export` would hit the same wall
+  if it were ever invoked that way.) Service-side miint is now LOAD-only from the
+  deploy-staged directory via a new `connect_with_miint_staged()`, mirroring the
+  cluster paths (which are LOAD-only precisely so no node "depends on mirror
+  reachability, or needs a writable `$HOME`"). Requires `MIINT_EXTENSION_DIRECTORY`
+  in the control plane's env, byte-identical to the CO's and DP's; unset or
+  non-directory now fails with a message naming the variable and the service
+  instead of a DuckDB IOException. A read-only staged directory is sufficient —
+  `LOAD` writes nothing. `make verify-deploy` gains a `cp-miint` check, since a
+  missing var takes nothing down at boot and would otherwise stay invisible until
+  the next assembly submission.
+- **The staged-directory requirement is single-sourced (#352)** as
+  `qiita_common.duckdb_miint.require_staged_extension_directory`, and
+  `MIINT_EXTENSION_DIRECTORY` is now named once (`MIINT_EXTENSION_DIRECTORY_VAR`)
+  instead of spelled as a literal across the connect config, the job-env
+  allowlist, and the orchestrator's staging gate. The **orchestrator
+  deliberately does not adopt the check**: a slurm CO already requires the var at
+  boot (`_resolve_slurm_settings`), its native jobs get a writable per-ticket
+  `HOME` (`slurm/payload.py` points HOME at the workspace so DuckDB can cache
+  extensions there), and a `COMPUTE_BACKEND=local` dev run legitimately has
+  neither — so requiring it there would guard an unreachable state on the deploy
+  while breaking local development. The helper is pure Python; qiita-common
+  imports no duckdb, so each component keeps its own connect.
+- **`make preflight` now checks `MIINT_EXTENSION_DIRECTORY` byte-identity across
+  the CP/DP/CO env files (#352)**, the way it already did for `PATH_SCRATCH` —
+  both name a shared path every component must resolve identically, so a per-file
+  typo was a silent divergence. The comparison is now a helper called twice
+  rather than a copied loop.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
@@ -297,6 +389,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
+  PAT predates a scope its principal's role now grants (or was deliberately
+  minted below the ceiling), a scope-gated route 403s even though the role
+  allows it. The scope guards now flag that condition with a machine-readable
+  `X-Qiita-Stale-Token-Scope` response header (twin of the existing #258 detail
+  hint), and the CLI's single HTTP-error chokepoint (`run_http_subcommand`) keys
+  off it to print a clean "your token predates a scope your role now grants — run
+  `qiita login`" message instead of the raw JSON error envelope. Structured
+  signal, so the CLI needs no drift-prone client-side copy of the role ceiling;
+  every other HTTP error keeps the generic body echo. Closes the last direction
+  of #161 — PAT authority stays immutable-once-minted (no auto-widening); this is
+  the reactive re-login nudge, not a capability grant.
+- **`qiita pool-completion` reads accurately and answers "done and clean?" at a
+  glance (#217).** The subcommand's `--help`/description still described the command
+  in the retired `fastq-to-parquet` / `prep-generation` / `GenPrepFileJob` terms
+  (the API surfaces were corrected earlier but the parser text was missed); it now
+  says demux (bcl-convert) + host-masking (read-mask), matching `PoolCompletionStatus`.
+  The handler also gained a `render=` that, alongside the full JSON, prints a
+  one-line human summary to stderr surfacing the three questions an operator asks —
+  `fully_processed` (a DONE-and-clean verdict), `demux_state`, and
+  `samples_not_submitted` (stranded samples) — so the answer no longer has to be
+  picked out of the raw body. No route/schema change.
 - **The bulk-block mask + align planners now resolve host filtering per sample, not
   pool-wide (#305).** `block_planner.plan_and_submit_blocks` and
   `align_planner.plan_and_submit_alignments` no longer take

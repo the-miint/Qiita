@@ -99,6 +99,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # masked-read pull, admin-gated until there's a model for picking the
             # right mask. Service accounts use READ_MASKED_DOGET, not this.
             Scope.ADMIN_MASKED_READ_EXPORT,
+            # Operator-cancel of in-flight compute (flip terminal + scancel) is
+            # system_admin-only — it stops running work and reaps SLURM jobs on the
+            # operator's behalf, same privilege tier as the destructive deletes.
+            Scope.WORK_TICKET_CANCEL,
             Scope.TICKET_DOPUT,
         }
     ),

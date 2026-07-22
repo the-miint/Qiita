@@ -130,6 +130,14 @@ class Scope(StrEnum):
     # never wet_lab_admin or service accounts.
     ADMIN_MASKED_READ_EXPORT = "admin:masked_read_export"
 
+    # Operator-cancel of in-flight compute: flip a work_ticket terminal
+    # (cancelled) so the CP stops driving it AND scancel its SLURM job(s). Privileged
+    # — it stops running work and crosses into the compute account's reap on the
+    # operator's behalf — so it is granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES, never to wet_lab_admin or service accounts. Mirrors the
+    # destructive-delete scopes (REFERENCE_DELETE / SEQUENCED_POOL_DELETE).
+    WORK_TICKET_CANCEL = "work_ticket:cancel"
+
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"
     SELF_TOKEN = "self:token"
@@ -178,6 +186,18 @@ API_PREFIX = "/api/v1"
 # HTTP Authorization header bearer-scheme prefix (note the trailing space).
 # Splitting on this is what `auth.principal.get_current_principal` does.
 BEARER_PREFIX = "Bearer "
+
+
+# Machine-readable marker the scope guards set on a *stale-scope* 403 — one
+# whose real cause is a PAT minted before the missing scope entered the
+# caller's live role ceiling (or a PAT deliberately narrowed below it). The
+# server is the authoritative place to decide this (it holds the live
+# `role_ceiling`), so it flags the condition here as a response header rather
+# than in the detail prose. The CLI's single HTTP-error chokepoint keys off
+# this header to surface a clean "run `qiita login`" prompt, without the CLI
+# needing its own (drift-prone) copy of the role ceiling. Presence is the
+# signal; the value is unspecified beyond being truthy.
+STALE_TOKEN_SCOPE_HEADER = "X-Qiita-Stale-Token-Scope"
 
 
 # Pydantic Field max_length policy values. 255 is the historical "name-ish"

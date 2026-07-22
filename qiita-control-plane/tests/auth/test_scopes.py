@@ -143,12 +143,27 @@ def test_mask_definition_delete_is_system_admin_only():
     mask-delete route tests without a 403."""
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,
-        SERVICE_ACCOUNT_SCOPE_CEILING,
     )
 
     assert Scope.MASK_DEFINITION_DELETE in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
     assert Scope.MASK_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
     assert Scope.MASK_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+
+
+def test_work_ticket_cancel_is_system_admin_only():
+    """work_ticket:cancel gates the operator-cancel of in-flight compute (flip
+    terminal + scancel) — system_admin only, like reference:delete and the other
+    destructive scopes. wet_lab_admin and USER never get it, and service accounts
+    aren't in the ceiling either."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.WORK_TICKET_CANCEL in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
+    assert Scope.WORK_TICKET_CANCEL not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    assert Scope.WORK_TICKET_CANCEL not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.WORK_TICKET_CANCEL not in SERVICE_ACCOUNT_SCOPE_CEILING
     assert Scope.MASK_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
 
 

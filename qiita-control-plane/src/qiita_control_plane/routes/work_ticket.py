@@ -26,6 +26,7 @@ access to).
 | COMPLETED     | 409 — terminal                                    |
 | NO_DATA       | 409 — terminal (empty-well outcome)               |
 | FAILED        | Reset → PENDING and dispatch (manual restart)     |
+| CANCELLED     | Reset → PENDING and dispatch (redrive after fix)  |
 
 The atomic state transition guard inside `runner._atomic_transition`
 prevents double-dispatch even if `/run` races with the implicit dispatch
@@ -53,12 +54,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
+    PATH_WORK_TICKET_CANCEL,
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
     PATH_WORK_TICKET_STEP_LOGS,
 )
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
@@ -66,7 +68,11 @@ from qiita_common.models import (
     ScopeTargetKind,
     StepProgressState,
     WorkTicket,
+    WorkTicketCancelRequest,
+    WorkTicketCancelResponse,
+    WorkTicketCancelResult,
     WorkTicketCreateRequest,
+    WorkTicketReadOutcome,
     WorkTicketResponse,
     WorkTicketState,
     WorkTicketStepLogs,
@@ -79,12 +85,13 @@ from ..actions.reference import (
     ReferenceNotFound,
     transition_reference_status,
 )
-from ..auth.guards import require_caller_has_admin_on_all_studies
+from ..auth.guards import require_caller_has_admin_on_all_studies, require_scope
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
+from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 
 _log = logging.getLogger(__name__)
 
@@ -94,12 +101,24 @@ _STEP_LOGS_DEFAULT_TAIL_LINES = 200
 _STEP_LOGS_MAX_TAIL_LINES = 5000
 _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 
-# /run applies to exactly two states: a PENDING ticket that was never dispatched,
-# and a FAILED one being redriven in place. Everything else is refused. Expressed
-# as the complement of that pair rather than listed out, so a new WorkTicketState
-# defaults to REFUSED — the safe direction. Listing the refused states positively
-# would silently make a new state runnable.
-_RUN_APPLICABLE_STATES = frozenset({WorkTicketState.PENDING.value, WorkTicketState.FAILED.value})
+# /run applies to a PENDING ticket that was never dispatched and the two redrivable
+# terminal states (FAILED, CANCELLED). Everything else is refused. The
+# not-applicable set is the COMPLEMENT of the applicable set, so a new
+# WorkTicketState defaults to REFUSED — the safe direction; listing the refused
+# states positively would silently make a new state runnable.
+# FAILED and CANCELLED both redrive in place (reset → PENDING + dispatch): they are
+# terminal with no in-flight job (a cancel scancelled it), so the same clean-restart
+# path applies. PENDING just (re)dispatches a lost create-time task.
+_RUN_APPLICABLE_STATES = frozenset(
+    {
+        WorkTicketState.PENDING.value,
+        WorkTicketState.FAILED.value,
+        WorkTicketState.CANCELLED.value,
+    }
+)
+# The two terminal states /run redrives by resetting to PENDING (vs. PENDING, which
+# just dispatches).
+_RUN_REDRIVE_STATES = frozenset({WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value})
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )
@@ -531,6 +550,33 @@ def _require_compute_backend_client(request: Request) -> None:
         )
 
 
+async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelRequest) -> list[int]:
+    """Resolve a cancel request's `action_id` (+ optional run/pool) filter to the
+    NON-terminal work_ticket idxs it matches. A ticket's pool is either its own
+    (`sequenced_pool`-scoped, e.g. bcl-convert) or its prep_sample's
+    (`prep_sample`-scoped, e.g. read-mask) — COALESCE bridges both so a
+    `sequenced_pool_idx` / `sequencing_run_idx` narrowing covers either shape. Only
+    non-terminal tickets: the filter targets in-flight work (cancelling a terminal
+    ticket is a no-op), whereas an explicit idx is reaped regardless."""
+    rows = await pool.fetch(
+        "SELECT DISTINCT wt.work_ticket_idx"
+        " FROM qiita.work_ticket wt"
+        " LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = wt.prep_sample_idx"
+        " LEFT JOIN qiita.sequenced_pool sp"
+        "   ON sp.idx = COALESCE(wt.sequenced_pool_idx, ss.sequenced_pool_idx)"
+        " WHERE wt.action_id = $1"
+        "   AND wt.state = ANY($2::qiita.work_ticket_state[])"
+        "   AND ($3::bigint IS NULL OR sp.sequencing_run_idx = $3)"
+        "   AND ($4::bigint IS NULL OR sp.idx = $4)"
+        " ORDER BY wt.work_ticket_idx",
+        body.action_id,
+        list(NON_TERMINAL_WORK_TICKET_STATES),
+        body.sequencing_run_idx,
+        body.sequenced_pool_idx,
+    )
+    return [r["work_ticket_idx"] for r in rows]
+
+
 # =============================================================================
 # Routes
 # =============================================================================
@@ -789,13 +835,28 @@ _WORK_TICKET_SUMMARY_FROM = (
     "   LIMIT 1"
     " ) cur ON true"
 )
+# The summary read also nests the ticket's prep_sample read outcome: a LEFT JOIN
+# to the sequenced_sample of wt.prep_sample_idx (1:1 with the
+# prep_sample), so a read-mask ticket is assessable without a separate lookup. The
+# join is NULL for a non-prep_sample-scoped ticket (prep_sample_idx NULL) or a
+# prep_sample with no sequenced_sample; `ro_present` (ss.idx) distinguishes "no
+# sequenced_sample" from "processed = has no counts yet".
+_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME = (
+    _WORK_TICKET_SUMMARY_FROM
+    + " LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = wt.prep_sample_idx"
+)
 _WORK_TICKET_SUMMARY_COLUMNS = (
     _WORK_TICKET_COLUMNS + ","
     " cur.step_index AS current_step_index,"
     " cur.step_name AS current_step_name,"
     " cur.compute_target AS current_compute_target,"
     " cur.slurm_job_id AS current_slurm_job_id,"
-    " cur.state AS current_step_state"
+    " cur.state AS current_step_state,"
+    " ss.idx AS ro_present,"
+    " ss.raw_read_count_r1r2 AS ro_raw_read_count_r1r2,"
+    " ss.biological_read_count_r1r2 AS ro_biological_read_count_r1r2,"
+    " ss.quality_filtered_read_count_r1r2 AS ro_quality_filtered_read_count_r1r2,"
+    " ss.spikein_read_count_r1r2 AS ro_spikein_read_count_r1r2"
 )
 
 
@@ -881,6 +942,21 @@ def _row_to_work_ticket_summary(row: asyncpg.Record) -> WorkTicketSummary:
         "slurm_job_id": data.pop("current_slurm_job_id"),
         "step_state": data.pop("current_step_state"),
     }
+    # Nest the prep_sample read outcome. `ro_present` (ss.idx) is NULL when the
+    # ticket has no sequenced_sample (non-prep_sample-scoped, or a prep_sample
+    # without one) → read_outcome None; otherwise build it from the counts (each
+    # individually None until processed). Pop all ro_* either way so they don't
+    # reach `_shape_work_ticket_columns`.
+    ro_present = data.pop("ro_present")
+    ro_counts = {
+        "raw_read_count_r1r2": data.pop("ro_raw_read_count_r1r2"),
+        "biological_read_count_r1r2": data.pop("ro_biological_read_count_r1r2"),
+        "quality_filtered_read_count_r1r2": data.pop("ro_quality_filtered_read_count_r1r2"),
+        "spikein_read_count_r1r2": data.pop("ro_spikein_read_count_r1r2"),
+    }
+    summary_fields["read_outcome"] = (
+        WorkTicketReadOutcome.model_validate(ro_counts) if ro_present is not None else None
+    )
     shaped = _shape_work_ticket_columns(data)
     return WorkTicketSummary.model_validate({**shaped, **summary_fields})
 
@@ -993,7 +1069,7 @@ async def list_work_tickets(
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     args.append(limit)
     rows = await pool.fetch(
-        f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM}{where}"
+        f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME}{where}"
         f" ORDER BY wt.work_ticket_idx DESC LIMIT ${len(args)}",
         *args,
     )
@@ -1228,15 +1304,17 @@ async def run_work_ticket(
             },
         )
 
-    if current_state == WorkTicketState.FAILED.value:
-        # Manual restart: FAILED → PENDING. Per arch.md spec, resets
+    if current_state in _RUN_REDRIVE_STATES:
+        # Manual restart: FAILED / CANCELLED → PENDING. Per arch.md spec, resets
         # retry_count to 0 (operator override of the auto-retry budget)
         # and clears the failure_* columns so the
         # work_ticket_failure_consistent DB CHECK is honoured (failure_*
-        # all NULL when state != failed). The ticket reset, the dead
-        # step-row drop, and the scope-target reset are ONE transaction so
+        # all NULL when state != failed; a CANCELLED ticket already carries
+        # NULLs, so the clear is a harmless no-op there). The ticket reset, the
+        # dead step-row drop, and the scope-target reset are ONE transaction so
         # a redrive never half-applies. Atomic; refuses if state changed
-        # under us between the SELECT and now.
+        # under us between the SELECT and now (the WHERE binds the exact
+        # from-state we read, so a concurrent flip loses the race cleanly).
         async with pool.acquire() as conn, conn.transaction():
             updated = await conn.fetchval(
                 "UPDATE qiita.work_ticket"
@@ -1246,9 +1324,9 @@ async def run_work_ticket(
                 "     failure_stage = NULL,"
                 "     failure_step_name = NULL,"
                 "     failure_reason = NULL,"
-                # A prior FAILED outcome may already have been notified; a
-                # redrive that later reaches its TRUE terminal state must
-                # re-notify, so reset the notification lifecycle here.
+                # A prior FAILED/CANCELLED outcome may already have been
+                # notified; a redrive that later reaches its TRUE terminal state
+                # must re-notify, so reset the notification lifecycle here.
                 "     notified_at = NULL,"
                 "     notify_attempts = 0"
                 " WHERE work_ticket_idx = $2"
@@ -1256,7 +1334,7 @@ async def run_work_ticket(
                 " RETURNING work_ticket_idx",
                 WorkTicketState.PENDING.value,
                 work_ticket_idx,
-                WorkTicketState.FAILED.value,
+                current_state,
             )
             if updated is None:
                 raise HTTPException(
@@ -1299,3 +1377,46 @@ async def run_work_ticket(
 
     schedule_dispatch(request.app, work_ticket_idx)
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+@router.post(PATH_WORK_TICKET_CANCEL, response_model=WorkTicketCancelResponse)
+async def cancel_work_tickets(
+    body: WorkTicketCancelRequest,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
+    _: None = Depends(_require_compute_backend_client),
+) -> WorkTicketCancelResponse:
+    """Operator-cancel of in-flight compute (system_admin, `work_ticket:cancel`):
+    for each selected ticket, flip it terminal (`cancelled`) so the runner's poll
+    loop aborts and no new attempt is submitted, THEN scancel its SLURM job(s) — the
+    terminal-first ordering that avoids re-submitting the job we just reaped.
+
+    Selection is the explicit `work_ticket_idxs` (reaped regardless of state — a
+    defensive orphan-reap) UNION the `action_id` (+ optional run/pool) filter
+    matches (non-terminal only). Idempotent per ticket: an already-terminal ticket
+    is not re-flipped (`cancelled=False`) but its jobs are still reaped. A missing
+    explicit idx comes back `not_found`; a reap that fails after the flip lands
+    comes back with `reap_error` (the flip stands — re-run cancel to retry)."""
+    backend_client = request.app.state.compute_backend_client
+    # Explicit idxs first (stable, deduped), then filter matches not already listed.
+    selected = list(dict.fromkeys(body.work_ticket_idxs))
+    if body.action_id is not None:
+        for idx in await _resolve_cancel_filter(pool, body):
+            if idx not in selected:
+                selected.append(idx)
+
+    results: list[WorkTicketCancelResult] = []
+    for idx in selected:
+        try:
+            outcome = await cancel_work_ticket(pool, backend_client, idx)
+        except WorkTicketNotFound:
+            results.append(WorkTicketCancelResult(work_ticket_idx=idx, not_found=True))
+            continue
+        results.append(WorkTicketCancelResult(**outcome))
+
+    return WorkTicketCancelResponse(
+        requested=len(selected),
+        cancelled=sum(1 for r in results if r.cancelled),
+        results=results,
+    )
