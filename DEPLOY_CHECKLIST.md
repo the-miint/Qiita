@@ -39,6 +39,15 @@ _None yet._
   `20260721000001_drop_email_owed_idx.sql` + `20260721000002_email_owed_idx_with_cancelled.sql`
   (CONCURRENTLY drop+create widening the partial index to the new terminal state — so a
   cancelled ticket's originator still gets the digest). (#350)
+- `make migrate` also applies `20260721000003_seed_mouse_gut_terminology.sql`, no
+  out-of-band setup: a pure data seed appending three controlled-vocabulary terms to
+  the terminologies already seeded — NCBI Taxonomy gains `410661` (mouse gut
+  metagenome) and `10090` (Mus musculus), ENVO gains `ENVO:00006776`
+  (animal-associated habitat, flagged `source_deprecated` because it is obsolete
+  upstream but appears in data we import). Every INSERT is `ON CONFLICT DO NOTHING`,
+  so re-running is a no-op. It appends terms rather than running the terminology
+  reload pipeline, so `version` / `loaded_at` on the parent NCBI Taxonomy and ENVO
+  rows are deliberately left as originally seeded. (#360)
 
 ### 4. Deploy
 
