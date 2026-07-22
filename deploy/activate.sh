@@ -191,6 +191,13 @@ install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-pl
 # A malformed QIITA_DATA_PLANE_PORTS aborts here, before any config is written.
 DP_PORTS=$(qiita_data_plane_ports)
 echo "data plane instances: $DP_PORTS"
+# Remote instances, if any. Assigned separately (and BEFORE any config is written)
+# so a malformed entry aborts here like a malformed port does. Peers join the nginx
+# upstream only — they are another host's systemd units, not ours.
+DP_PEERS=$(qiita_data_plane_peers)
+if [ -n "$DP_PEERS" ]; then
+    echo "data plane peers (remote, not managed here): $DP_PEERS"
+fi
 
 cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
 sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
@@ -202,6 +209,12 @@ sed -i "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" /etc/nginx
 DP_UPSTREAM=$(mktemp)
 for port in $DP_PORTS; do
     printf '    server 127.0.0.1:%s;\n' "$port" >>"$DP_UPSTREAM"
+done
+# Remote members last, so a `nginx -T` reads local-then-remote. Written verbatim —
+# qiita_data_plane_peers already validated the shape (see _common.sh), which is what
+# keeps a stray `;` out of the generated config.
+for peer in $DP_PEERS; do
+    printf '    server %s;\n' "$peer" >>"$DP_UPSTREAM"
 done
 sed -i -e "/__QIITA_DATA_PLANE_UPSTREAM__/r $DP_UPSTREAM" \
        -e "/__QIITA_DATA_PLANE_UPSTREAM__/d" /etc/nginx/conf.d/qiita.conf

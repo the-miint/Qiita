@@ -69,7 +69,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 4. Deploy
 
-- **Optional — scale the data plane out.** The instance set is now a single knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (#359)
+- **Optional — scale the data plane out on this host.** The local instance set is one knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (#359)
 
   ```bash
   # [admin] — one instance per ~core you want to give the data plane
@@ -85,6 +85,20 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   sudo systemctl disable --now qiita-data-plane@50053
   ```
 
+- **Optional — scale the data plane across HOSTS.** Extra processes on one box share its cores, memory, and NIC, so they stop helping once the box saturates; `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds data planes running on *other* hosts to the same nginx upstream. Local instances and peers are separate knobs because only the local list drives systemd here — a peer is another host's deploy, and this one neither starts, restarts, nor upgrades it. **You must deploy the peer host yourself** (same checkout, its own `QIITA_DATA_PLANE_PORTS`, and an env pointing at the SAME Postgres/DuckLake catalog and the same `PATH_SCRATCH`/`PATH_PERSISTENT` — a data plane serving a different lake would return wrong data, not an error). (#359)
+
+  ```bash
+  # [admin] — three local instances plus two on a second host
+  sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" \
+             QIITA_DATA_PLANE_PEERS="dp2.internal:50051 dp2.internal:50052" \
+             make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+  ```
+
+  ⚠️ **Peer traffic is plaintext gRPC.** The upstream is consumed by `grpc_pass grpc://` and the scheme is per-`grpc_pass`, not per-member, so a peer cannot use TLS while the loopback members stay plaintext. Only add a peer reachable over a network you control (private VLAN / VPC / WireGuard) — never across the public internet. Flight tickets stay Ed25519-signed, so a peer cannot be fed forged identifiers, but the payload on the wire is unencrypted.
+
+  **Removing a peer IS automatic**, unlike removing a local instance: drop it from `QIITA_DATA_PLANE_PEERS` and redeploy, and it leaves the upstream at the next render — there is no unit here to disable. Stopping the peer host's own instances is that host's deploy.
+
+
 ### 5. Verify
 
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
@@ -94,6 +108,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   # [admin]
   sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
   ```
+
+  Export `QIITA_DATA_PLANE_PEERS` too if you set it at deploy: each peer gets its own `health/data-plane-peer@<host:port>` row. A peer that is down fails the check rather than hiding behind the local instances, since nginx routes a share of every job's traffic into it either way. (#359)
 
 ### 6. After the deploy verifies green
 

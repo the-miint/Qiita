@@ -54,41 +54,63 @@ else
     else
         fail "health/compute-orchestrator" "localhost:8081/health unreachable"
     fi
-    if command -v grpcurl >/dev/null 2>&1; then
-        # Every configured instance individually, from the same list activate.sh
-        # rendered the nginx upstream from. Checking only :50051 would report a
-        # healthy data plane while a scaled-out instance was down — and nginx
-        # would keep routing a share of every job's traffic into it.
-        # Assigned first, NOT iterated as a command substitution: `for x in $(f)`
-        # swallows f's failure, so a malformed QIITA_DATA_PLANE_PORTS would make
-        # the loop iterate zero times and verify could still exit 0 having checked
-        # no instance at all. The assignment form trips errexit.
-        dp_ports=$(qiita_data_plane_ports)
-        for dp_port in $dp_ports; do
-            if grpcurl -plaintext "localhost:${dp_port}" grpc.health.v1.Health/Check >/dev/null 2>&1; then
-                pass "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check OK"
-            else
-                fail "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check failed"
-            fi
-        done
-        # The loopback balancer the control plane talks to. Distinct from the
-        # per-instance checks above: this one proves nginx is actually fronting
-        # the pool, which is what makes the CP's traffic spread at all.
-        # The loopback balancer nginx fronts the pool with. Skipped rather than
-        # failed when nginx has no TLS material: activate.sh skips the nginx
-        # reload in that case, so the listener legitimately isn't up and a hard
-        # fail would just be noise on a non-TLS host.
-        lb="127.0.0.1:${QIITA_DATA_PLANE_LB_PORT}"
-        if [ ! -r /etc/ssl/certs/qiita.crt ] || [ ! -r /etc/ssl/private/qiita.key ]; then
-            skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
-        elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
-            pass "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check OK"
+fi
+
+# --- 1b. Data-plane pool members -------------------------------------------
+# UNCONDITIONAL, deliberately outside the branch above. The aggregate
+# `https://<host>/health` answers "is the stack reachable through the edge?" — it
+# hits whichever ONE member nginx balanced it to, so it stays green with every
+# other instance down. That is the exact failure scaling out exists to avoid, so
+# the per-member sweep cannot live in the fallback branch that only runs when the
+# aggregate is unavailable.
+if [ -n "${SKIP_HEALTH:-}" ]; then
+    skip "health/data-plane-pool" "SKIP_HEALTH=1"
+elif command -v grpcurl >/dev/null 2>&1; then
+    # Every configured instance individually, from the same list activate.sh
+    # rendered the nginx upstream from. Checking only :50051 would report a
+    # healthy data plane while a scaled-out instance was down — and nginx
+    # would keep routing a share of every job's traffic into it.
+    # Assigned first, NOT iterated as a command substitution: `for x in $(f)`
+    # swallows f's failure, so a malformed QIITA_DATA_PLANE_PORTS would make
+    # the loop iterate zero times and verify could still exit 0 having checked
+    # no instance at all. The assignment form trips errexit.
+    dp_ports=$(qiita_data_plane_ports)
+    for dp_port in $dp_ports; do
+        if grpcurl -plaintext "localhost:${dp_port}" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+            pass "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check OK"
         else
-            fail "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check failed"
+            fail "health/data-plane@${dp_port}" "gRPC localhost:${dp_port} Health/Check failed"
         fi
+    done
+    # Remote instances in the upstream, if any. Same reasoning as the local
+    # loop: nginx routes a share of every job's traffic into a peer, so a peer
+    # that is down has to fail the deploy check rather than hide behind the
+    # local instances passing. Assigned first for the same errexit reason.
+    dp_peers=$(qiita_data_plane_peers)
+    for dp_peer in $dp_peers; do
+        if grpcurl -plaintext "$dp_peer" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+            pass "health/data-plane-peer@${dp_peer}" "gRPC $dp_peer Health/Check OK"
+        else
+            fail "health/data-plane-peer@${dp_peer}" "gRPC $dp_peer Health/Check failed"
+        fi
+    done
+    # The loopback balancer the control plane talks to. Distinct from the
+    # per-instance checks above: this one proves nginx is actually fronting
+    # the pool, which is what makes the CP's traffic spread at all.
+    # The loopback balancer nginx fronts the pool with. Skipped rather than
+    # failed when nginx has no TLS material: activate.sh skips the nginx
+    # reload in that case, so the listener legitimately isn't up and a hard
+    # fail would just be noise on a non-TLS host.
+    lb="127.0.0.1:${QIITA_DATA_PLANE_LB_PORT}"
+    if [ ! -r /etc/ssl/certs/qiita.crt ] || [ ! -r /etc/ssl/private/qiita.key ]; then
+        skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
+    elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+        pass "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check OK"
     else
-        skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
+        fail "health/data-plane-lb" "gRPC $lb (nginx → pool) Health/Check failed"
     fi
+else
+    skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
 fi
 
 # --- 2. Workflow actions list (as qiita-api, control-plane.env) -------------

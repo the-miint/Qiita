@@ -158,6 +158,126 @@ def test_data_plane_ports_rejects_malformed_values(value: str) -> None:
     assert result.stdout == ""
 
 
+def _call_data_plane_peers(value: str | None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ}
+    if value is None:
+        env.pop("QIITA_DATA_PLANE_PEERS", None)
+    else:
+        env["QIITA_DATA_PLANE_PEERS"] = value
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_data_plane_peers'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_data_plane_peers_defaults_to_empty() -> None:
+    """Unset ⇒ no remote members. A single-host deploy is unchanged, which is what
+    makes multi-host opt-in rather than a behaviour change for every deploy."""
+    result = _call_data_plane_peers(None)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dp2.example.org:50051",
+        "dp2.example.org:50051 dp3.example.org:50051",
+        "10.0.0.7:50051",
+        "[2001:db8::1]:50051",  # bracketed IPv6 literal
+    ],
+)
+def test_data_plane_peers_accepts_host_port_forms(value: str) -> None:
+    result = _call_data_plane_peers(value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == value.split()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dp2.example.org",  # no port
+        "dp2.example.org:",  # empty port
+        ":50051",  # empty host
+        "dp2.example.org:abc",  # non-numeric port
+        "dp2.example.org:0",  # not a valid TCP port
+        "dp2.example.org:99999",  # out of range
+        "2001:db8::1:50051",  # unbracketed IPv6 — ambiguous, must be rejected
+        "dp2.example.org:50051; rm -rf /",  # reaches an nginx `server` directive
+        "dp2.example.org:50051;",  # a bare `;` would inject config
+        "dp2.example.org:50051 }",  # would close the upstream block early
+    ],
+)
+def test_data_plane_peers_rejects_malformed_values(value: str) -> None:
+    """A bad entry must abort the deploy, not render broken config.
+
+    Unlike a port, this value is written into the nginx config VERBATIM
+    (`server <host:port>;`), so shape validation here is the only thing standing
+    between operator input and an injected directive.
+    """
+    result = _call_data_plane_peers(value)
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t", " \t "])
+def test_data_plane_peers_treats_whitespace_only_as_unset(blank: str) -> None:
+    """Whitespace-only ⇒ no peers, NOT an error — deliberately the opposite of the
+    ports sibling, which rejects blank because it can never legitimately be empty.
+    Tabs count: a tab-only value must not slip past the guard and be echoed back as
+    a 'peer'."""
+    result = _call_data_plane_peers(blank)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_upstream_render_places_peers_after_local_instances() -> None:
+    """The rendered nginx upstream carries locals as 127.0.0.1:<port> and peers
+    verbatim, locals first.
+
+    Pins the one place operator-supplied text reaches the generated config: the
+    validator tests above prove a bad peer is rejected, this proves a good one
+    becomes a well-formed `server` line rather than, say, losing its brackets.
+    Mirrors the loop in deploy/activate.sh.
+    """
+    script = f'''
+        source "{_COMMON}"
+        for port in $(qiita_data_plane_ports); do printf '    server 127.0.0.1:%s;\\n' "$port"; done
+        for peer in $(qiita_data_plane_peers); do printf '    server %s;\\n' "$peer"; done
+    '''
+    env = {
+        **os.environ,
+        "QIITA_DATA_PLANE_PORTS": "50051 50052",
+        "QIITA_DATA_PLANE_PEERS": "dp2.internal:50051 [2001:db8::1]:50052",
+    }
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "    server 127.0.0.1:50051;",
+        "    server 127.0.0.1:50052;",
+        "    server dp2.internal:50051;",
+        "    server [2001:db8::1]:50052;",
+    ]
+
+
+def test_upstream_render_defaults_to_one_local_member() -> None:
+    """Neither variable set ⇒ exactly the single loopback member every deploy has
+    had. Multi-host must be opt-in, not a behaviour change for existing hosts."""
+    script = f'''
+        source "{_COMMON}"
+        for port in $(qiita_data_plane_ports); do printf '    server 127.0.0.1:%s;\\n' "$port"; done
+        for peer in $(qiita_data_plane_peers); do printf '    server %s;\\n' "$peer"; done
+    '''
+    env = {**os.environ}
+    env.pop("QIITA_DATA_PLANE_PORTS", None)
+    env.pop("QIITA_DATA_PLANE_PEERS", None)
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["    server 127.0.0.1:50051;"]
+
+
 def test_native_checkout_resolves_valid_layout(tmp_path: Path) -> None:
     py = _fake_native_checkout(tmp_path)
     result = _call_native_checkout(str(py))

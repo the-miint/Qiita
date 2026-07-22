@@ -42,7 +42,7 @@ duplicates further down are historical strata; leave them where they are.
   term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
   is deprecated at source but appears in data we import), to the existing
   pre-release MVP terminologies.
-- **Data-plane horizontal scaling is now a single, deploy-durable knob.** The
+- **Data-plane horizontal scaling is now deploy-durable, and reaches past one host.** The
   instance set is `QIITA_DATA_PLANE_PORTS` (default `50051`), read once by
   `qiita_data_plane_ports` and used to render the nginx upstream, to
   enable/restart the matching `qiita-data-plane@NNNN` units, and to health-check
@@ -54,7 +54,18 @@ duplicates further down are historical strata; leave them where they are.
   (`127.0.0.1:50050`) for on-host clients: compute nodes already reach the pool
   through nginx at `grpc+tls://<host>:443`, but the control plane's default
   `DATA_PLANE_URL` addressed instance #1 directly, so CP-side Flight traffic
-  bypassed the balancer entirely. (#359)
+  bypassed the balancer entirely. Scaling is not limited to one host:
+  `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds
+  data planes running elsewhere to the same upstream, because extra processes on
+  one box share its cores, memory, and NIC and stop helping once it saturates.
+  Peers are a separate knob from `QIITA_DATA_PLANE_PORTS` rather than entries in
+  it: only the local list drives systemd, so overloading one list would have made
+  "which entries get a unit" a parsing question and would have tried to restart a
+  unit named after a remote host. Peer entries are shape-validated before any
+  config is written (they land verbatim in an nginx `server` directive) and each
+  gets its own `verify-deploy` health row. Note peer traffic is plaintext gRPC —
+  `grpc_pass`'s scheme is per-directive, not per-member, so a peer belongs only on
+  a trusted network. (#359)
 - **Block-read DoGet: block-scoped compute jobs stream their reads.** New
   `read_block` / `read_masked_block` ticket selectors on the data plane, scoped
   by a block's `(prep_sample_idx, sequence_idx sub-range)` members rather than a

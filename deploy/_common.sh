@@ -235,12 +235,33 @@ qiita_sif_missing_sources() {
 # contains the `set -a` pollution.
 # The data plane's instance set, as a whitespace-separated list of listen ports.
 #
+# Is $1 a plain TCP port (1-65535)? $2 is a caller-supplied label used verbatim in
+# the error, so each caller keeps its own "which variable, which entry" wording while
+# the numeric rule itself lives in ONE place — a range change here cannot land on only
+# one of the two data-plane list validators.
+qiita_valid_tcp_port() {
+    local port="$1" label="$2"
+    case "$port" in
+        ''|*[!0-9]*)
+            echo "ERROR: $label is not a number" >&2
+            return 1
+            ;;
+    esac
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "ERROR: $label is not a valid TCP port (1-65535)" >&2
+        return 1
+    fi
+}
+
 # The instance specifier of `qiita-data-plane@.service` IS the port
 # (`qiita-data-plane@50051` binds 127.0.0.1:50051), so this list is simultaneously
 # the systemd units to enable/restart, the nginx upstream members, and the
 # endpoints to health-check. ONE definition, read by activate.sh (render the
 # upstream + enable/restart each unit) and verify.sh (per-instance health) — so
-# scaling out is a single operator knob rather than files that can disagree.
+# scaling out on THIS host is one operator knob rather than files that can
+# disagree. Scaling across hosts is the sibling knob, QIITA_DATA_PLANE_PEERS
+# below: peers are upstream members only, so they deliberately do not share
+# this list's systemd coupling.
 #
 # Operator sets QIITA_DATA_PLANE_PORTS to scale, e.g.
 #   QIITA_DATA_PLANE_PORTS="50051 50052 50053" sudo -E make redeploy ...
@@ -259,19 +280,86 @@ qiita_data_plane_ports() {
     local ports port
     ports="${QIITA_DATA_PLANE_PORTS:-50051}"
     for port in $ports; do
-        case "$port" in
-            ''|*[!0-9]*)
-                echo "ERROR: QIITA_DATA_PLANE_PORTS entry '$port' is not a number" >&2
+        qiita_valid_tcp_port "$port" "QIITA_DATA_PLANE_PORTS entry '$port'" || return 1
+    done
+    # Strip ALL whitespace for the blank test, not just spaces: a tab-only value
+    # would otherwise pass as "non-empty", validate nothing, and be echoed back.
+    [ -n "${ports//[[:space:]]/}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is empty" >&2; return 1; }
+    printf '%s' "$ports"
+}
+
+# REMOTE data-plane instances to balance into, as a space-separated `host:port`
+# list. Empty by default — a single-host deploy is unchanged.
+#
+# Distinct from QIITA_DATA_PLANE_PORTS on purpose, rather than letting that list
+# carry `host:port` entries. The two answer different questions and only one of
+# them is about this host:
+#   PORTS  — instances THIS host runs. Drives the systemd `qiita-data-plane@<port>`
+#            units AND upstream members on 127.0.0.1.
+#   PEERS  — instances ANOTHER host runs. Upstream members only; this deploy
+#            neither starts, restarts, nor upgrades them.
+# Overloading one list would have made "which entries get a systemd unit" a
+# parsing question, and silently tried to `systemctl restart` a unit named after
+# a remote host.
+#
+# Scaling past one host is the point: extra processes on one box share its cores,
+# memory, and NIC, so they stop helping once the box is saturated. A data plane on
+# a second host adds real resources.
+#
+# ⚠️  TRAFFIC TO A PEER IS PLAINTEXT gRPC. The `qiita_data_plane` upstream is
+# consumed by `grpc_pass grpc://...` (not `grpcs://`), and the scheme is per
+# grpc_pass, not per member — so every member of the pool is reached the same way,
+# and the loopback members require plaintext. A peer must therefore sit on a
+# trusted network the operator controls (a private VLAN / VPC / WireGuard link),
+# never the public internet. Flight tickets are Ed25519-signed so a peer cannot be
+# tricked into serving forged identifiers, but the DATA on the wire is unencrypted.
+# Deploying a peer across an untrusted path needs a TLS-terminating design this
+# knob does not provide.
+#
+# Validated for shape because the value is written verbatim into an nginx `server`
+# directive: a stray `;` or whitespace would inject config rather than fail.
+qiita_data_plane_peers() {
+    local peers peer host port
+    peers="${QIITA_DATA_PLANE_PEERS:-}"
+    # Unset/blank is the common case (single-host deploy) — emit nothing.
+    [ -n "${peers//[[:space:]]/}" ] || { printf ''; return 0; }
+    for peer in $peers; do
+        case "$peer" in
+            # Bracketed IPv6 literal: [::1]:50051
+            \[*\]:*)
+                host="${peer%]:*}]"
+                port="${peer##*]:}"
+                case "${host:1:${#host}-2}" in
+                    ''|*[!0-9A-Fa-f:]*)
+                        echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' has a malformed IPv6 host" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
+            # DNS name or IPv4, exactly one colon.
+            *:*:*)
+                echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' has more than one ':'" \
+                     "(bracket an IPv6 literal, e.g. [::1]:50051)" >&2
+                return 1
+                ;;
+            *:*)
+                host="${peer%:*}"
+                port="${peer##*:}"
+                case "$host" in
+                    ''|*[!A-Za-z0-9._-]*)
+                        echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' has a malformed host" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
+            *)
+                echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' is not host:port" >&2
                 return 1
                 ;;
         esac
-        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            echo "ERROR: QIITA_DATA_PLANE_PORTS entry $port is not a valid TCP port" >&2
-            return 1
-        fi
+        qiita_valid_tcp_port "$port" "QIITA_DATA_PLANE_PEERS entry '$peer' port '$port'" || return 1
     done
-    [ -n "${ports// /}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is empty" >&2; return 1; }
-    printf '%s' "$ports"
+    printf '%s' "$peers"
 }
 
 # The loopback gRPC balancer port the ON-HOST control plane talks to (nginx →
