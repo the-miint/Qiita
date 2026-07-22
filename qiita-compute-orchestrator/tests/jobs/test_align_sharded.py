@@ -74,10 +74,19 @@ _OUTPUT_COLS = [
 ]
 
 
+# The reads the streamed-block stub serves. `_write_reads_parquet` records the
+# last file it wrote here, and `_stub_block_read_stream` streams it — so a test
+# still declares its reads by writing them, exactly as before align_sharded
+# stopped taking a `reads` input.
+_STAGED_READS: list[Path] = []
+
+
 def _write_reads_parquet(path: Path, rows: list[tuple[int, int, str, str | None]]) -> Path:
-    """Write a staged read-block Parquet with the columns align_sharded reads:
+    """Write a read-block Parquet with the columns align_sharded reads:
     `(prep_sample_idx BIGINT, sequence_idx BIGINT, sequence1 VARCHAR, sequence2
-    VARCHAR)`. `rows` = (prep_sample_idx, sequence_idx, sequence1, sequence2)."""
+    VARCHAR)`. `rows` = (prep_sample_idx, sequence_idx, sequence1, sequence2).
+
+    Also records the path for the streamed-block stub (see `_STAGED_READS`)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(":memory:") as conn:
         if not rows:
@@ -87,6 +96,7 @@ def _write_reads_parquet(path: Path, rows: list[tuple[int, int, str, str | None]
                 "CAST(NULL AS VARCHAR) AS sequence2 WHERE false) "
                 f"TO '{path}' (FORMAT PARQUET)"
             )
+            _STAGED_READS.append(path)
             return path
         values_sql = ", ".join(
             "(CAST(? AS BIGINT), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR))"
@@ -101,7 +111,37 @@ def _write_reads_parquet(path: Path, rows: list[tuple[int, int, str, str | None]
             f"TO '{path}' (FORMAT PARQUET)",
             params,
         )
+    _STAGED_READS.append(path)
     return path
+
+
+@pytest.fixture(autouse=True)
+def _stub_block_read_stream(monkeypatch):
+    """Serve `align_sharded`'s streamed reads from the test's own Parquet.
+
+    The job always streams now (it has no `reads` input), so without this every
+    test would try to mint a ticket against a control plane. Stubbed at
+    `open_read_block_stream` — the CO→CP/DP seam — rather than at
+    `bind_step_reads`, so the real drain-to-Parquet and lazy-view binding stay
+    under test.
+    """
+    from contextlib import asynccontextmanager
+
+    from qiita_compute_orchestrator import read_source
+
+    _STAGED_READS.clear()
+
+    @asynccontextmanager
+    async def _fake(conn, *, work_ticket_idx, relation):
+        assert _STAGED_READS, "test did not write a reads parquet"
+        path = _STAGED_READS[-1]
+        conn.execute(f"CREATE VIEW {relation} AS SELECT * FROM read_parquet('{path}')")
+        try:
+            yield relation
+        finally:
+            conn.execute(f"DROP VIEW IF EXISTS {relation}")
+
+    monkeypatch.setattr(read_source, "open_read_block_stream", _fake)
 
 
 def _make_indexes(tmp_path):
@@ -203,7 +243,7 @@ def test_align_sharded_single_call_and_passthrough_minimap2(tmp_path, monkeypatc
     from qiita_compute_orchestrator.jobs import align_sharded
 
     # reads 1 & 3 align (distinct prep_samples), read 2 routes nowhere.
-    reads = _write_reads_parquet(
+    _write_reads_parquet(
         tmp_path / "reads.parquet",
         [(10, 1, "ACGT", None), (10, 2, "TTGG", None), (20, 3, "GGCC", None)],
     )
@@ -224,7 +264,7 @@ def test_align_sharded_single_call_and_passthrough_minimap2(tmp_path, monkeypatc
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -258,7 +298,7 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
     is inlined in the seam), never minimap2, in a single call."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
     router, shard_dir = _make_indexes(tmp_path)
 
     calls: list = []
@@ -271,7 +311,7 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="bowtie2",
@@ -291,7 +331,7 @@ def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
     BOTH rows — no cross-shard dedup (a feature is in exactly one shard)."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 7, "ACGTTTGG", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 7, "ACGTTTGG", None)])
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(
         align_sharded,
@@ -301,7 +341,7 @@ def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -328,7 +368,7 @@ def test_align_sharded_pe_pair_keeps_mate_columns(tmp_path, monkeypatch):
     keeps it."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 5, "ACGTACGT", "TTGGCCAA")])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 5, "ACGTACGT", "TTGGCCAA")])
     router, shard_dir = _make_indexes(tmp_path)
     # One PE read routed to a single shard; the align seam emits two mate rows to the
     # same feature 100 with a signed template_length, mimicking an fr pair (R1 fwd
@@ -348,7 +388,7 @@ def test_align_sharded_pe_pair_keeps_mate_columns(tmp_path, monkeypatch):
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="bowtie2",
@@ -371,9 +411,7 @@ def test_align_sharded_low_identity_alignment_filtered(tmp_path, monkeypatch):
     while a high-identity one on the same block survives — the per-record filter."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(
-        tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)]
-    )
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)])
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(
         align_sharded,
@@ -386,7 +424,7 @@ def test_align_sharded_low_identity_alignment_filtered(tmp_path, monkeypatch):
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -407,9 +445,7 @@ def test_align_sharded_minimap2_low_query_coverage_filtered(tmp_path, monkeypatc
     keep both — this pins the separate minimap2 query-coverage gate."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(
-        tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)]
-    )
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)])
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(
         align_sharded,
@@ -424,7 +460,7 @@ def test_align_sharded_minimap2_low_query_coverage_filtered(tmp_path, monkeypatc
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -444,9 +480,7 @@ def test_align_sharded_minimap2_identity_floor_is_0_90(tmp_path, monkeypatch):
     pinning the per-aligner floor for the more-divergent long-read population."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(
-        tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)]
-    )
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None), (10, 2, "TTGG", None)])
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(
         align_sharded,
@@ -459,7 +493,7 @@ def test_align_sharded_minimap2_identity_floor_is_0_90(tmp_path, monkeypatch):
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -479,7 +513,7 @@ def test_align_sharded_bowtie2_low_identity_pair_dropped_as_unit(tmp_path, monke
     whole."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(
+    _write_reads_parquet(
         tmp_path / "reads.parquet",
         [(10, 5, "ACGTACGT", "TTGGCCAA"), (10, 6, "GGGGCCCC", "AAAATTTT")],
     )
@@ -504,7 +538,7 @@ def test_align_sharded_bowtie2_low_identity_pair_dropped_as_unit(tmp_path, monke
     )
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="bowtie2",
@@ -526,12 +560,12 @@ def test_align_sharded_empty_alignment_is_valid(tmp_path, monkeypatch):
     not a fail-fast — while keeping the full column schema."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(align_sharded, monkeypatch, routing={}, alignments={})
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -558,7 +592,7 @@ def test_align_sharded_partial_output_removed_on_failure(tmp_path, monkeypatch):
     not promote it)."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(align_sharded, monkeypatch, routing={1: ["0"]}, alignments={})
 
@@ -568,7 +602,7 @@ def test_align_sharded_partial_output_removed_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(align_sharded, "_run_align_minimap2_sharded", boom)
 
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
         aligner="minimap2",
@@ -581,30 +615,26 @@ def test_align_sharded_partial_output_removed_on_failure(tmp_path, monkeypatch):
     assert not (tmp_path / "ws" / "alignment.parquet").exists()
 
 
-def test_align_sharded_missing_reads_raises(tmp_path):
+def test_align_sharded_takes_no_reads_input():
+    """align_sharded ALWAYS streams its reads; there is no `reads` field.
+
+    Pinned because the absence is the contract: the `align` workflow stages
+    nothing, and the control plane decides from the work ticket that the stream
+    is the block's MASKED reads. A `reads` input would reintroduce a way to hand
+    this job raw, un-host-depleted reads.
+    """
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    router, shard_dir = _make_indexes(tmp_path)
-    inputs = align_sharded.Inputs(
-        reads=tmp_path / "nope.parquet",
-        reference_idx=1,
-        alignment_idx=555,
-        aligner="minimap2",
-        router_index_path=router,
-        shard_directory=shard_dir,
-        work_ticket_idx=1,
-    )
-    with pytest.raises(FileNotFoundError, match="reads parquet"):
-        asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+    assert "reads" not in align_sharded.Inputs.model_fields
 
 
 def test_align_sharded_missing_router_raises(tmp_path):
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
     _router, shard_dir = _make_indexes(tmp_path)
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=1,
         alignment_idx=555,
         aligner="minimap2",
@@ -619,12 +649,12 @@ def test_align_sharded_missing_router_raises(tmp_path):
 def test_align_sharded_empty_router_raises(tmp_path):
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
     _router, shard_dir = _make_indexes(tmp_path)
     empty_router = tmp_path / "empty.ryxdi"
     empty_router.mkdir()
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=1,
         alignment_idx=555,
         aligner="minimap2",
@@ -639,10 +669,10 @@ def test_align_sharded_empty_router_raises(tmp_path):
 def test_align_sharded_missing_shard_directory_raises(tmp_path):
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    reads = _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
     router, _shard_dir = _make_indexes(tmp_path)
     inputs = align_sharded.Inputs(
-        reads=reads,
+        # reads stream (see _stub_block_read_stream)
         reference_idx=1,
         alignment_idx=555,
         aligner="minimap2",
@@ -672,31 +702,20 @@ def test_align_sharded_rejects_unknown_aligner(tmp_path):
         )
 
 
-def test_align_sharded_plan_sizes_walltime_from_read_count(tmp_path):
-    """plan() returns a walltime hint (memory/cpu untouched) that grows with the
-    read-block cardinality."""
+def test_align_sharded_has_no_plan():
+    """align_sharded deliberately exposes NO plan().
+
+    Its reads stream from the data plane, and the walltime model it used to carry
+    was driven by a Parquet-footer read count that a stream cannot supply — and
+    plan() runs at submit time in the orchestrator process, so it must not open a
+    Flight stream to find one. Sizing falls back to the workflow YAML baseline
+    with TIMEOUT escalation as the backstop, matching estimate_feature_table.
+
+    Pinned as a test because the absence is a decision, not an omission: the
+    block's exact read count IS derivable control-plane-side from the block
+    members, so restoring sizing means threading that count through the workflow
+    `params:` — not reinstating a footer read here.
+    """
     from qiita_compute_orchestrator.jobs import align_sharded
 
-    def _walltime(n_rows):
-        reads = _write_reads_parquet(
-            tmp_path / f"reads_{n_rows}.parquet",
-            [(1, i, "ACGT", None) for i in range(n_rows)],
-        )
-        inputs = align_sharded.Inputs(
-            reads=reads,
-            reference_idx=1,
-            alignment_idx=555,
-            aligner="minimap2",
-            router_index_path=tmp_path / "r.ryxdi",
-            shard_directory=tmp_path / "shards",
-            work_ticket_idx=1,
-        )
-        plan = align_sharded.plan(inputs)
-        assert plan.resources is not None
-        assert plan.resources.mem_gb is None and plan.resources.cpu is None
-        return plan.resources.walltime
-
-    small = _walltime(1)
-    big = _walltime(500)
-    assert small is not None and big is not None
-    assert big >= small  # non-decreasing in read count
+    assert not hasattr(align_sharded, "plan")

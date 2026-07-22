@@ -186,6 +186,7 @@ from qiita_common.models.step import (
     DoGetTicketRequest,
     DoGetTicketResponse,
     FoundJobWire,
+    ReadDoGetTicketRequest,
     StepBaselineResources,
     StepCancelRequest,
     StepCancelResponse,
@@ -332,6 +333,7 @@ __all__ = [
     "Tier",
     # Step wire contract.
     "AlignmentDoGetTicketRequest",
+    "ReadDoGetTicketRequest",
     "DoGetTicketRequest",
     "DoGetTicketResponse",
     "FoundJobWire",

@@ -29,7 +29,17 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-_None yet._
+- **Grant `read:doget` to the compute service account.** Block-scoped compute jobs (`read-mask-block`'s qc/host_filter, `align`'s align_sharded) now stream their reads from the data plane and mint a short-TTL ticket at runtime via `POST /read/ticket/doget`. That route is gated on a NEW scope, deliberately **not** the generic `ticket:doget` the reference/alignment doget routes use: `read_block` streams RAW reads (host/human sequence — a strict superset of the `read_masked` surface, which already has its own `read_masked:doget`), so riding the reference-read scope would have let any account minting reference tickets pull raw reads. Without this grant every block work ticket fails its first streaming step with a 403. (#PRSTREAM)
+
+  ```bash
+  # [operator] — re-mint the compute SA's PAT with the added scope, then install it.
+  # Same procedure as any scope change; see docs/runbooks/compute-service-account-provisioning.md.
+  uv run qiita-admin service-account token \
+      --name compute \
+      --scopes 'feature:mint,reference:register_files,reference:read,ticket:doget,ticket:doput,sequence_range:mint,sequenced_pool_preflight:read,read_masked:doget,read:doget'
+  ```
+
+  Install the printed token at `/etc/qiita/co-to-cp.token` (mode `0400`, owner `qiita-orch`) exactly as the provisioning runbook describes, then restart `qiita-compute-orchestrator`.
 
 ### 3. Migrations
 
@@ -72,6 +82,7 @@ _None yet._
   PATs minted before this deploy are frozen and won't carry it, so an admin must
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel
   command works — a stale-scope 403 otherwise names the fix. (#350)
+- **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. The scope grant this needs is in bucket 2 above. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces — a block job now drains its stream to a short-lived Parquet inside its OWN workspace instead. The per-sample `read-mask` path is unchanged and still stages a Parquet. (#PRSTREAM)
 
 ---
 

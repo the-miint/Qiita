@@ -125,6 +125,10 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         # only — the masked-read consumer path is service-driven; no human role
         # carries it (privacy-sensitive read surface, see Scope.READ_MASKED_DOGET).
         Scope.READ_MASKED_DOGET,
+        # Sign block-read DoGet tickets so a block-scoped compute job can stream
+        # its reads. Workers only, and the most privacy-sensitive of the three
+        # doget scopes — `read_block` streams RAW reads (see Scope.READ_DOGET).
+        Scope.READ_DOGET,
     }
 )
 

@@ -73,6 +73,25 @@ duplicates further down are historical strata; leave them where they are.
   term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
   is deprecated at source but appears in data we import), to the existing
   pre-release MVP terminologies.
+- **Block-read DoGet: block-scoped compute jobs stream their reads.** New
+  `read_block` / `read_masked_block` ticket selectors on the data plane, scoped
+  by a block's `(prep_sample_idx, sequence_idx sub-range)` members rather than a
+  flat column filter, plus `POST /read/ticket/doget` to mint one at job runtime
+  and the `open_read_block_stream` / `bind_step_reads` seams on the compute side.
+  This replaces "the control plane asks the data plane to COPY a `reads.parquet`
+  onto shared scratch at submit time, then hands the job a path" for the
+  `read-mask-block` and `align` workflows: same bytes, same column shape, but the
+  bulk work moves off the CP submit path onto compute nodes where it spreads
+  across data-plane instances, and the handoff stops assuming a shared
+  filesystem. DoGet itself is unchanged — it already streamed RecordBatches
+  through a bounded channel; what the retired export DoActions did was bypass
+  that with a server-side `COPY … TO parquet`. The selectors reuse the data
+  plane's existing `block_read_where_clause` and `EXPORT_READ_COLUMNS`, so a
+  block's read footprint and its delete footprint cannot drift. (#PRSTREAM)
+  Gated on a new `read:doget` scope rather than the generic `ticket:doget`:
+  `read_block` streams RAW reads, a strict superset of the `read_masked` surface
+  that already carries its own privacy-sensitive scope, so reusing the
+  reference-read scope would have inverted the model.
 - **Pool / run summary + rollup endpoints (#236).** Server-side aggregation so
   callers stop paging the per-sample list route and tallying by hand. All
   compute-on-read (never drifts), no migration. (1) `PoolReadMetrics` gains a
