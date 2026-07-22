@@ -1,4 +1,4 @@
--- Batch multi-study ENA import (TASK-06): a `qiita.ena_import_batch` row is
+-- Batch multi-study ENA import: a `qiita.ena_import_batch` row is
 -- one `POST /api/v1/ena-import-batch` submission (a list of ENA/SRA study
 -- accessions); one `qiita.ena_import_batch_item` row per accession tracks
 -- its own resolve/register/download-submit progress independently, so one
@@ -55,7 +55,7 @@ CREATE TABLE qiita.ena_import_batch (
 
     -- Transport pinned into every download-ena-study ticket this batch
     -- submits. Only 'http' is supported today -- no Aspera key-staging in
-    -- this compute environment (see ARCHITECTURE.md's TASK-04
+    -- this compute environment (see ARCHITECTURE.md's ENA Study Import
     -- download-ticket-granularity decision); a single-value CHECK so a
     -- future transport addition is a deliberate migration, not a silent
     -- drift.

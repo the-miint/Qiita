@@ -1,5 +1,5 @@
 """ENA sample-attribute harmonization into Qiita's shared biosample metadata
-model (TASK-03): turns one BioSample's ENA submitter-defined attribute map
+model: turns one BioSample's ENA submitter-defined attribute map
 (`EnaSampleAttributes.attributes`) into cross-study-comparable metadata on a
 `qiita.biosample` row.
 

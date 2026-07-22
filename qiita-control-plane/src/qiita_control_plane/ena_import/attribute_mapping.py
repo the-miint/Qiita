@@ -17,7 +17,7 @@ conversion, ontology-term resolution, or other semantic reinterpretation:
   - `depth` (NUMERIC), seeded by
     `db/migrations/20260709000000_seed_water_metadata_terminology.sql`.
 
-Deliberately NOT mapped here (owner decisions, reconciled TASK-03 plan):
+Deliberately NOT mapped here (owner decisions, reconciled harmonization plan):
 
   - `host` -- ENA's `host` attribute is free-text (a common/scientific name),
     not an NCBI Taxonomy id. Mapping it onto `host_taxon_id`

@@ -540,7 +540,7 @@ async def test_shared_biosample_across_two_studies_one_row_two_links(reg):
 
 # T06-2 -- the same de-dup, but under REAL concurrency (asyncio.gather over
 # two register_ena_study calls sharing a sample_accession), not just two
-# sequential calls. The batch driver's bounded-concurrency phase (TASK-06)
+# sequential calls. The batch driver's bounded-concurrency phase
 # processes multiple studies at once, so the cross-study biosample
 # get-or-create (`get_or_create_biosample_by_ena_accession`'s `ON CONFLICT
 # ... DO NOTHING` + fallback SELECT, repositories/biosample.py) must hold
@@ -753,7 +753,7 @@ async def test_mixed_platform_study_creates_one_run_and_pool_per_platform(reg):
 
 
 # ---------------------------------------------------------------------------
-# created_pools (TASK-06, additive to T02) -- surfaces the
+# created_pools (additive to T02) -- surfaces the
 # (platform, sequenced_pool_idx, sequencing_run_idx) triples the batch
 # driver needs to build one download-ena-study ticket per pool, without
 # re-deriving them from the DB.
@@ -856,7 +856,7 @@ async def test_provenance_columns_persisted(reg):
     )
     assert row["source_archive"] == "ena"
     assert row["resolver_kind"] == "miint"
-    # transport stays NULL in T02 -- populated by TASK-04's download workflow.
+    # transport stays NULL in T02 -- populated by the download workflow.
     assert row["transport"] is None
 
 

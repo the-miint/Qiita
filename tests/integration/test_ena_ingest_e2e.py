@@ -2,8 +2,8 @@
 the EXISTING tail — `ingest_ena_reads.execute()` -> the real `register-files`
 action primitive -> the real data-plane `register_files` DoAction -> the real
 DuckLake catalog. No product/data-plane code changes accompany this file (see
-TASK-05's reconciled plan): the verdict is that the tail already works, and
-this test is the proof.
+the reconciled parity-verification plan): the verdict is that the tail already
+works, and this test is the proof.
 
 **What's exercised (Option A: call execute() directly, then drive the REAL
 register-files tail).**
@@ -52,11 +52,11 @@ here.
 **AMENDMENT 3 — real ENA fetch is out of scope.** The real
 `read_ena_sequences`/miint ENA network fetch is deliberately NOT exercised
 (monkeypatched at the `_stage_run_reads` seam) — proving THAT path is
-TASK-04's own unit-test job (`qiita-compute-orchestrator/tests/
+the download job's own unit-test job (`qiita-compute-orchestrator/tests/
 test_ingest_ena_reads.py`, plus its opt-in `QIITA_ENA_LIVE_SMOKE=1` live
-smoke) and TASK-10's (md5 verification escalation). This file's scope is
+smoke) and the md5-verification escalation's. This file's scope is
 narrower and complementary: prove the storage TAIL from a staged intermediate
-onward, the one seam TASK-04's suite does not reach (it never touches a real
+onward, the one seam that job's suite does not reach (it never touches a real
 data plane / DuckLake).
 """
 

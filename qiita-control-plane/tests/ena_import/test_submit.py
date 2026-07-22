@@ -1,8 +1,8 @@
-"""Unit tests for the download-ena-study submit helper (TASK-04).
+"""Unit tests for the download-ena-study submit helper.
 
 Pure-function coverage (no DB, no HTTP) for
 `ena_import.submit.build_download_ena_study_ticket` — the thin composer
-TASK-06's batch driver (and an operator via the generic `qiita user ticket
+the batch driver (and an operator via the generic `qiita user ticket
 submit`) uses to open one sequenced_pool-scoped download-ena-study ticket.
 """
 

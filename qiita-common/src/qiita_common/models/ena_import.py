@@ -1,4 +1,4 @@
-"""Wire models for the batch multi-study ENA import driver (TASK-06).
+"""Wire models for the batch multi-study ENA import driver.
 
 `POST /api/v1/ena-import-batch` accepts a *list* of ENA/SRA study
 accessions (`BatchImportRequest`) and returns a handle immediately

@@ -545,7 +545,7 @@ async def submit_work_ticket_core(
     """Submit one work ticket: the gating (audience/scope/context/
     disallow-without-delete), the INSERT, and `schedule_dispatch` --
     extracted from `POST /work-ticket` so an in-process caller with no live
-    HTTP request (TASK-06's batch driver, submitting a `download-ena-study`
+    HTTP request (the batch driver, submitting a `download-ena-study`
     ticket on the batch's own submitting principal's behalf) gets the
     IDENTICAL gates a real HTTP submission would go through, never a
     bypass. In particular this enforces the TARGET action's own audience

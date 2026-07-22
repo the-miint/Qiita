@@ -128,8 +128,8 @@ class Inputs(BaseModel):
     `compute_reads_staging_path`). `download_method` is the ENA transport
     (`params: {download_method: download_method}` in the workflow YAML,
     optional — defaults to 'http', the only transport this compute
-    environment supports; see ARCHITECTURE.md's TASK-04 download-ticket-
-    granularity decision). `sequenced_pool_idx` / `sequencing_run_idx` /
+    environment supports; see ARCHITECTURE.md's ENA Study Import
+    download-ticket-granularity decision). `sequenced_pool_idx` / `sequencing_run_idx` /
     `work_ticket_idx` are the framework-injected scope scalars for the
     sequenced_pool-scoped download-ena-study ticket."""
 

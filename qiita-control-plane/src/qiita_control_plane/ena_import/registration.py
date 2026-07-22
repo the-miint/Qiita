@@ -35,7 +35,7 @@ Order of operations:
      accession (cross-study de-dup, T02-2) and link it to the study. If
      the biosample was newly created by this call, harmonize its ENA
      sample attributes onto it (`harmonization.harmonize_biosample_
-     attributes`, TASK-03) -- write-once: a later study reusing the same
+     attributes`) -- write-once: a later study reusing the same
      biosample (cross-study overlap) does not re-harmonize it, since the
      canonical values already exist. Then skip if a sequenced_sample
      already carries this run's `ena_run_accession` (idempotent
@@ -50,8 +50,8 @@ reported on `RunRegistrationOutcome.harmonization`, never raised -- T03-2.
 A genuine harmonization failure (an unparseable value, a cross-study
 metadata slot collision) is caught by the same per-run try/except as every
 other step here and recorded `failed`, isolated exactly like a platform- or
-protocol-mapping failure. No read bytes (TASK-04); no batch fan-out
-(TASK-06).
+protocol-mapping failure. No read bytes yet; no batch fan-out yet -- those
+land in the download workflow and the batch driver, respectively.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ class CreatedPool:
     """One `(platform, sequenced_pool_idx, sequencing_run_idx)` triple this
     call's `_get_or_create_pool_for_platform` resolved (created or reused).
 
-    Additive to T02, for TASK-06's batch driver: after registering a
+    Additive to T02, for the batch driver: after registering a
     study's runs, the driver needs exactly these triples to build one
     `download-ena-study` work-ticket per pool (`submit.
     build_download_ena_study_ticket`) without a separate DB round trip to
@@ -177,12 +177,12 @@ async def register_ena_study(
     into each run's registration: when a run's biosample is newly created,
     its matching `EnaSampleAttributes.attributes` (or `{}` if this study's
     resolver did not resolve any for that sample) is harmonized onto it
-    (`harmonization.harmonize_biosample_attributes`, TASK-03) inside that
+    (`harmonization.harmonize_biosample_attributes`) inside that
     run's own transaction.
 
     `owner_idx` / `caller_idx` / `source_archive` / `resolver_kind` are
     identity inputs this function cannot invent from the resolver output
-    and must be supplied by the caller (e.g. the batch driver, TASK-06).
+    and must be supplied by the caller (e.g. the batch driver).
 
     Never raises for a per-run failure -- see `RunRegistrationOutcome`.
     An unmappable `instrument_platform` (`platform_mapping.
@@ -295,7 +295,7 @@ async def _get_or_create_pool_for_platform(
     statements (no explicit transaction required). Returns
     `(sequenced_pool_idx, sequencing_run_idx)` -- both idxs, so the caller
     can surface them on `EnaStudyRegistrationResult.created_pools`
-    (TASK-06) without a second lookup."""
+    for the batch driver without a second lookup."""
     instrument_run_id = f"{study_accession}:{platform.value}"
     sequencing_run_idx, _ = await insert_sequencing_run(
         conn,
@@ -400,8 +400,8 @@ async def _register_one_run(
                 prep_protocol_idx=prep_protocol_idx,
                 owner_idx=owner_idx,
                 sequenced_pool_item_id=run.run_accession,
-                # Biosample-level ENA attributes are harmonized above
-                # (TASK-03); this composer's `metadata` is prep_sample-level
+                # Biosample-level ENA attributes are harmonized above;
+                # this composer's `metadata` is prep_sample-level
                 # (library/sequencing metadata), which no current resolver
                 # output populates, so it stays empty.
                 metadata={},

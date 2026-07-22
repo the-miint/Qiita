@@ -5057,11 +5057,11 @@ async def test_skipped_gated_step_leaves_the_earlier_binding_standing(
 
 
 # =============================================================================
-# ENA download finalize: transport write-back (TASK-04)
+# ENA download finalize: transport write-back
 # =============================================================================
 #
 # Closes the gap `db/migrations/20260721000000_sequenced_sample_ena_
-# provenance.sql` documents: `transport` is added but left NULL, "TASK-04's
+# provenance.sql` documents: `transport` is added but left NULL, "the
 # download workflow populates it once read_ena_sequences actually fetches
 # bytes". `run_workflow`'s finalize transaction now does that write, gated on
 # the RUN_MAP_BINDING declared input (the SAME gate `_stage_ena_run_roster`

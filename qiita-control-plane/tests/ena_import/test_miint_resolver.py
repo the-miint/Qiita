@@ -118,7 +118,7 @@ def test_resolve_runs_rejects_empty_accession(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# httpfs install-once lock (TASK-01 carry-forward, TASK-06)
+# httpfs install-once lock (carried forward from the resolver work into the batch driver)
 # ---------------------------------------------------------------------------
 # `_open_ena_connection` used to run a bare `INSTALL httpfs; LOAD httpfs;` on
 # every call -- an unlocked, repeated INSTALL. Mirrors

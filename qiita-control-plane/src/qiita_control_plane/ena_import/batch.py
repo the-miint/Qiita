@@ -1,4 +1,4 @@
-"""Batch multi-study ENA import driver (TASK-06).
+"""Batch multi-study ENA import driver.
 
 `create_ena_import_batch` INSERTs one `qiita.ena_import_batch` row plus one
 `qiita.ena_import_batch_item` row per accession (state `pending`) and

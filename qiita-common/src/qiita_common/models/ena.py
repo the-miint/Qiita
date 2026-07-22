@@ -140,7 +140,8 @@ class EnaSampleAttributes(BaseModel):
 
 class SourceArchive(StrEnum):
     """Public archive an `ena_import`-registered `sequenced_sample` row's
-    metadata (and, once TASK-04 lands, its read bytes) was resolved from.
+    metadata (and, once the download workflow lands, its read bytes) was
+    resolved from.
 
     Mirrored by the `qiita.sequenced_sample.source_archive` TEXT/CHECK
     constraint (db/migrations/20260721000000_sequenced_sample_ena_provenance.sql)

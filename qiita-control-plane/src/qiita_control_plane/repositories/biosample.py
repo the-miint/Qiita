@@ -186,7 +186,7 @@ async def get_or_create_biosample_by_ena_accession(
     Does not write any metadata itself -- unlike import_biosample_from_owner_
     biosample_id, which always inserts and mandates an owner-id value plus
     metadata. This is deliberately the bare row: ena_import.harmonization
-    (TASK-03) owns mapping ENA sample attributes into metadata, driven by
+    owns mapping ENA sample attributes into metadata, driven by
     the caller off the `created` flag this function returns.
     """
     inserted_idx = await conn.fetchval(

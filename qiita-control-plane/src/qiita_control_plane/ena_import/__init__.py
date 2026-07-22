@@ -1,22 +1,22 @@
 """ENA-study import package — batch, per-study ingestion of ENA/SRA metadata
 and reads into Qiita.
 
-TASK-01 lands the metadata resolver: `EnaResolver` (the contract),
+The metadata resolver seam: `EnaResolver` (the contract),
 `MiintEnaResolver` (default, D2), `HttpEnaResolver` (experimental fallback),
 accession validation (`ena_import.accession`), and the `get_resolver`
-backend factory. TASK-02 lands registration: `platform_mapping` /
+backend factory. The registration path: `platform_mapping` /
 `protocol_mapping` (ENA metadata -> qiita.platform / curated prep_protocol
 name) and `registration.register_ena_study`, the composer that turns
 resolved metadata into study/biosample/prep_sample/sequenced_sample rows.
-TASK-03 lands metadata harmonization: `attribute_mapping` (curated ENA
+Metadata harmonization: `attribute_mapping` (curated ENA
 sample-attribute tag -> biosample_global_field.display_name mapping) and
 `harmonization.harmonize_biosample_attributes`, wired into
 `registration.register_ena_study` so a newly-created biosample's ENA
-attributes land on the shared checklist model. TASK-04 lands the download
+attributes land on the shared checklist model. The download
 workflow + CO job (`workflows/download-ena-study/1.0.0.yaml`,
 `qiita_compute_orchestrator.jobs.ingest_ena_reads`) and this package's thin
-submit helper (`submit.build_download_ena_study_ticket`). Batch driving
-(TASK-06) lands in a later ticket of this epic.
+submit helper (`submit.build_download_ena_study_ticket`). The batch driver
+fans this out across multiple studies.
 """
 
 from .accession import EnaAccessionKind, InvalidEnaAccessionError, detect_accession_kind

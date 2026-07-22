@@ -4,7 +4,7 @@ guards against `read_ena` / `read_ena_attributes` column drift (T01-2).
 Every other `ena_import` test is network-free (monkeypatched query
 functions / `httpx.MockTransport` against recorded fixtures — see
 `qiita-control-plane/tests/ena_import/`). This is the one exception,
-approved as part of the reconciled TASK-01 plan: it drives the real
+approved as part of the reconciled resolver-design plan: it drives the real
 resolver against the real ENA Portal/Browser APIs and asserts the columns
 this resolver depends on are still present with the expected shape. If ENA
 renames/removes a field `read_ena`'s `DefaultFields` (or our explicit

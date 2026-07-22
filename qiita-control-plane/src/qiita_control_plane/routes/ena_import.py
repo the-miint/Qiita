@@ -1,4 +1,4 @@
-"""Batch multi-study ENA import routes (TASK-06).
+"""Batch multi-study ENA import routes.
 
 `POST /api/v1/ena-import-batch` accepts a *list* of ENA/SRA study
 accessions, validates their shape up front (fail-loud, 422 on anything

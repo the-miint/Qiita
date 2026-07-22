@@ -1,4 +1,4 @@
-"""Tests for the batch ENA-import wire models (`models.ena_import`, TASK-06).
+"""Tests for the batch ENA-import wire models (`models.ena_import`).
 
 Pure Pydantic-model coverage: request validation (non-empty accessions,
 defaults) and the response/status shapes the `/ena-import-batch` route

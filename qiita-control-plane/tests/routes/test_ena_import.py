@@ -1,4 +1,4 @@
-"""DB-bound integration tests for /api/v1/ena-import-batch (TASK-06).
+"""DB-bound integration tests for /api/v1/ena-import-batch.
 
 Network-free: the DuckDB+miint resolver seam (`miint_resolver._query_ena_*`)
 is monkeypatched per accession, mirroring `test_miint_resolver.py` /

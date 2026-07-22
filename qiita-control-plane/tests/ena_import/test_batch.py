@@ -1,4 +1,4 @@
-"""DB-bound tests for the batch multi-study ENA import driver (TASK-06).
+"""DB-bound tests for the batch multi-study ENA import driver.
 
 Network-free: the DuckDB+miint resolver seam (`miint_resolver._query_ena_*`)
 is monkeypatched per accession, exactly like `test_miint_resolver.py` —

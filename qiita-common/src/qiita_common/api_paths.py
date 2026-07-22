@@ -251,7 +251,7 @@ URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 
 
 # =============================================================================
-# /ena-import-batch/* — batch multi-study ENA import driver (TASK-06)
+# /ena-import-batch/* — batch multi-study ENA import driver
 # =============================================================================
 # POST accepts a list of ENA/SRA study accessions and returns a batch handle
 # immediately (202); the resolve+register+download-submit work runs in a

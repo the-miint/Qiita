@@ -1,4 +1,4 @@
-"""Submit helper for the `download-ena-study` work ticket (TASK-04).
+"""Submit helper for the `download-ena-study` work ticket.
 
 Thin, admin-facing composer: builds the `WorkTicketCreateRequest` body for
 ONE `sequenced_pool`-scoped `download-ena-study` ticket, `action_context`
@@ -10,7 +10,7 @@ its `sequenced_sample` rows already exist (created by
 `ena_import.registration.register_ena_study`).
 
 Deliberately a PURE body-builder -- no DB access, no HTTP call. The caller
-(TASK-06's batch driver, which fans a whole study's runs out into one ticket
+(the batch driver, which fans a whole study's runs out into one ticket
 per `(study, platform)` pool `register_ena_study` created, or an operator via
 the existing generic `qiita user ticket submit`) is responsible for knowing
 `sequenced_pool_idx` / `sequencing_run_idx` (e.g. from
@@ -33,8 +33,8 @@ DOWNLOAD_ENA_STUDY_ACTION_ID = "download-ena-study"
 DOWNLOAD_ENA_STUDY_ACTION_VERSION = "1.0.0"
 
 # The only transport this compute environment supports (no Aspera
-# key-staging) -- see ARCHITECTURE.md's TASK-04 download-ticket-granularity
-# decision (2026-07-21). Matches the workflow YAML's context_schema, which
+# key-staging) -- see ARCHITECTURE.md's ENA Study Import download-ticket-
+# granularity decision (2026-07-21). Matches the workflow YAML's context_schema, which
 # pins `download_method` to a single-value enum.
 DEFAULT_DOWNLOAD_METHOD = "http"
 

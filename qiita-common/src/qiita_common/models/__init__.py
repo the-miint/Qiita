@@ -382,7 +382,7 @@ __all__ = [
     "EnaStudyHeader",
     "ResolverKind",
     "SourceArchive",
-    # Batch ENA import (TASK-06).
+    # Batch ENA import.
     "BatchImportItem",
     "BatchImportRequest",
     "BatchImportResponse",

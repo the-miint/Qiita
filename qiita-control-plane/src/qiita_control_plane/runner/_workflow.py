@@ -699,10 +699,10 @@ async def run_workflow(
                     conn, scope_target, bound
                 ):
                     await _patch_resource_status(conn, scope_target, action.success_status)
-                # ENA read-download provenance (TASK-04): stamp the pool's
+                # ENA read-download provenance: stamp the pool's
                 # sequenced_sample rows with the transport the download used,
                 # closing the gap `20260721000000_sequenced_sample_ena_
-                # provenance.sql` documents (column added, left NULL, "TASK-04's
+                # provenance.sql` documents (column added, left NULL, "the
                 # download workflow populates it"). Gated on the SAME
                 # declared-input-name check `_stage_ena_run_roster` above uses
                 # (RUN_MAP_BINDING), NOT scope-kind: bcl-convert is ALSO

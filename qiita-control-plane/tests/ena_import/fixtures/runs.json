@@ -1,5 +1,5 @@
 {
-  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count&limit=0&format=tsv on 2026-07-21 (instrument_platform column added TASK-02/R3, re-recorded same date)",
+  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count&limit=0&format=tsv on 2026-07-21 (instrument_platform column added during registration work, R3, re-recorded same date)",
   "columns": [
     "run_accession",
     "experiment_accession",

@@ -331,7 +331,7 @@ async def _stage_ena_run_roster(
     fetch_sequenced_pool_run_roster`), unlike `_resolve_sample_map`'s
     action_context-embedded roster: bcl-convert's submitter enumerates its own
     freshly-created samples and can embed them at submit time, but a
-    download-ena-study ticket is submitted by TASK-06's batch driver against a
+    download-ena-study ticket is submitted by the batch driver against a
     pool `ena_import.registration.register_ena_study` already populated, so
     reading it live (rather than requiring the submitter to re-embed it) keeps
     the two ticket-creation paths from having to agree on a duplicated roster

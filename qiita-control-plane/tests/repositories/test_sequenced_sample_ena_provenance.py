@@ -2,7 +2,7 @@
 (T02-4): the source_archive/resolver_kind/transport kwargs on
 insert_sequenced_sample, fetch_sequenced_sample_idxs_by_ena_run_accession
 (T02-5's idempotent-re-import lookup), and set_sequenced_pool_transport
-(TASK-04's finalize-time write-back of the download `transport`).
+(the download workflow's finalize-time write-back of the download `transport`).
 
 Pattern 1 (transaction-rollback per test): all seed and assertions happen
 inside one rolled-back transaction, mirroring test_study.py /

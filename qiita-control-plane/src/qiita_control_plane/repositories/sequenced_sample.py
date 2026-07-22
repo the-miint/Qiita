@@ -214,7 +214,7 @@ async def insert_sequenced_sample(
     free of the qiita_common.models.ena import -- the caller
     (ena_import.registration) passes `.value`. All default to None for
     every non-ENA-import caller; transport is always None from this
-    ticket's callers (populated by TASK-04's download workflow).
+    ticket's callers (populated by the download workflow).
 
     Raises asyncpg.UniqueViolationError on a collision against the unique
     indexes (per-pool item id, ENA experiment, ENA run); raises
@@ -411,7 +411,7 @@ async def set_sequenced_pool_transport(
 
     Closes the provenance gap `db/migrations/20260721000000_sequenced_
     sample_ena_provenance.sql` documents: that migration adds the column but
-    leaves it NULL, deferring the write to "TASK-04's download workflow" —
+    leaves it NULL, deferring the write to the download workflow —
     this is that write, called from the runner's `download-ena-study`
     finalize (`runner._workflow.run_workflow`, gated on the RUN_MAP_BINDING
     declared input so it never fires for bcl-convert or another

@@ -779,7 +779,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
 
 def test_load_actions_loads_on_disk_download_ena_study_yaml():
     """The actual on-disk `workflows/download-ena-study/1.0.0.yaml` loads as a
-    valid ActionDefinition — the ENA-fetch analog of bcl-convert (TASK-04):
+    valid ActionDefinition — the ENA-fetch analog of bcl-convert:
 
       * target_kind sequenced_pool (there is no `study` ScopeTargetKind);
       * admin-only audience (not end-user-submittable), mirroring bcl-convert;

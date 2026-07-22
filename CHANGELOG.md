@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **ENA/SRA study metadata resolver (`ena_import`, TASK-01).** Adds the
+- **ENA/SRA study metadata resolver (`ena_import`).** Adds the
   control-plane seam for resolving an ENA/SRA study's metadata ahead of
   ingestion: `qiita_common.models.ena` (`EnaStudyHeader` / `EnaRunRecord` /
   `EnaSampleAttributes`, coercing `read_ena`'s ALL-VARCHAR numeric fields and
@@ -35,8 +35,8 @@ duplicates further down are historical strata; leave them where they are.
   (`InvalidEnaAccessionError` / `EnaAccessionNotFoundError`) rather than
   returning empty. No DB writes or read downloads yet — those land in later
   tickets of this epic.
-- **ENA study & sample registration + cross-study de-dup (`ena_import.registration`,
-  TASK-02).** Turns a resolved ENA study (`EnaStudyHeader` + `EnaRunRecord` list)
+- **ENA study & sample registration + cross-study de-dup (`ena_import.registration`).**
+  Turns a resolved ENA study (`EnaStudyHeader` + `EnaRunRecord` list)
   into Qiita `study` / `biosample` / `prep_sample` / `sequenced_sample` rows,
   idempotently: `register_ena_study` upserts the study keyed positionally on
   the two ENA accessions, get-or-creates each biosample by
@@ -52,14 +52,14 @@ duplicates further down are historical strata; leave them where they are.
   protocol) is recorded `failed` in the result without leaving orphan rows or
   blocking its siblings or the rest of the study; a re-import skips runs
   already present. `EnaRunRecord` gains `instrument_platform`
-  (TASK-01 amendment) and `qiita.sequenced_sample` gains three nullable
+  (a resolver amendment) and `qiita.sequenced_sample` gains three nullable
   provenance columns (`source_archive` / `resolver_kind` / `transport`,
   TEXT/CHECK — mirrored by new `SourceArchive`/`ResolverKind` enums in
   `qiita_common.models.ena`) via an additive, reversible migration;
-  `transport` stays unpopulated until TASK-04's download workflow lands. No
-  metadata harmonization (TASK-03) or batch fan-out (TASK-06) yet.
+  `transport` stays unpopulated until the download workflow lands. No
+  metadata harmonization or batch fan-out yet.
 - **ENA sample-attribute harmonization into the checklist model
-  (`ena_import.harmonization`, TASK-03).** Every ENA-imported biosample is now
+  (`ena_import.harmonization`).** Every ENA-imported biosample is now
   bound to the ENA default sample checklist (`ERC000011`) and, the first time
   its biosample is created (write-once — a later study reusing the same
   BioSample via the existing cross-study de-dup does not re-harmonize it), its
@@ -84,7 +84,7 @@ duplicates further down are historical strata; leave them where they are.
   `(idx, created)` so the registration composer can key harmonization off
   whether the biosample was newly created.
 - **ENA study download workflow + CO job (`download-ena-study`,
-  `qiita_compute_orchestrator.jobs.ingest_ena_reads`, TASK-04).** Downloads a
+  `qiita_compute_orchestrator.jobs.ingest_ena_reads`).** Downloads a
   registered ENA study's reads via miint `read_ena_sequences` and stores them
   once into the DuckLake `read` table — the ENA-fetch analog of bcl-convert.
   New `sequenced_pool`-scoped workflow `workflows/download-ena-study/1.0.0.yaml`
@@ -104,21 +104,21 @@ duplicates further down are historical strata; leave them where they are.
   `miint_warnings()` skip/truncation entry or for zero reads with no
   explanatory warning — never silently registers an incomplete or empty read
   set). No md5 verification (`read_ena_sequences` performs none; tracked
-  separately as the D3-approved duckdb-miint escalation, TASK-10). The
+  separately as the D3-approved duckdb-miint escalation). The
   sort/hardlink/per-slot-DuckDB-cap helpers `ingest_reads` already had are
   extracted into a shared sibling module (`read_staging.py`) so both jobs
   share one implementation. A new pure `ena_import.submit.
-  build_download_ena_study_ticket` composes the ticket body for TASK-06's
-  batch driver to submit per `(study, platform)` pool. The runner's finalize
-  transaction now also closes TASK-02's deferred `qiita.sequenced_sample.
-  transport` column: a new `repositories.sequenced_sample.
+  build_download_ena_study_ticket` composes the ticket body for the batch
+  driver to submit per `(study, platform)` pool. The runner's finalize
+  transaction now also closes the registration path's deferred
+  `qiita.sequenced_sample.transport` column: a new `repositories.sequenced_sample.
   set_sequenced_pool_transport` stamps every row in the ticket's pool with
   the ticket's `download_method` (falling back to the same `http` default
   `ingest_ena_reads.Inputs` uses), gated on the SAME `run_map`
   declared-input check `_stage_ena_run_roster` uses so it never fires for
   bcl-convert or another `sequenced_pool`-scoped workflow.
-- **ENA-ingest DuckLake parity verification (TASK-05).** New
-  `tests/integration/test_ena_ingest_e2e.py` proves TASK-04's `ingest_ena_reads`
+- **ENA-ingest DuckLake parity verification.** New
+  `tests/integration/test_ena_ingest_e2e.py` proves the download workflow's `ingest_ena_reads`
   storage tail lands in the real DuckLake `read` table through the EXISTING
   `register-files` action — no product/data-plane code change was needed. Calls
   `ingest_ena_reads.execute()` directly against two seeded prep_samples (one
@@ -137,7 +137,7 @@ duplicates further down are historical strata; leave them where they are.
   unchanged. The bcl-convert/`ingest_reads` parity claim rests on CODE IDENTITY
   (`read_staging.write_sorted_reads`/`hardlink`, shared verbatim by both jobs),
   not an existing baseline test — none exists today for either producer.
-- **Batch multi-study ENA import driver (`ena_import.batch`, TASK-06).** New
+- **Batch multi-study ENA import driver (`ena_import.batch`).** New
   `POST /api/v1/ena-import-batch` (`qiita_common.models.ena_import`,
   `routes.ena_import`) accepts a list of ENA/SRA study accessions and returns
   202 with a batch handle immediately; a new, additive-and-reversible
@@ -278,7 +278,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **ENA import batch driver: reconcile principal guard + `download_method`
-  threading (TASK-06 hardening).** `ena_import.batch._load_principal`
+  threading (batch-driver hardening).** `ena_import.batch._load_principal`
   (used by `reconcile_inflight_batches` to re-drive in-flight batch items
   after a CP restart) now rejects a since-disabled/retired submitting
   principal, the same `MSG_PRINCIPAL_DISABLED_OR_RETIRED` guard

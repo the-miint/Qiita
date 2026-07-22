@@ -13,7 +13,7 @@ description: >
   register_ena_study` creates one sequenced_pool per (study, platform)
   pair, and this ticket downloads exactly one such pool's runs. A
   multi-platform study therefore yields multiple download tickets, fanned
-  out by the batch driver (TASK-06).
+  out by the batch driver.
 
   The runner materializes the pool's `{prep_sample_idx, ena_run_accession}`
   roster from a LIVE Postgres query (`run_map`, unlike bcl-convert's
@@ -24,7 +24,7 @@ description: >
   independent of any mask) plus a durable per-sample copy the repeatable
   read-mask workflow consumes. Transport is pinned to `download_method:
   http` (no Aspera key-staging exists in the compute env; see
-  ARCHITECTURE.md's TASK-04 download-ticket-granularity decision).
+  ARCHITECTURE.md's ENA Study Import download-ticket-granularity decision).
 
 scopes: []
 
