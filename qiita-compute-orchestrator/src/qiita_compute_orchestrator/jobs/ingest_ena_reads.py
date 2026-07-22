@@ -11,12 +11,14 @@ contiguous `sequence_idx` range from the control plane, and writes the FULL
 reads as `read.parquet` keyed by the minted range — exactly the same
 mint-then-sort-and-assign pipeline `ingest_reads` uses (`..read_staging`).
 
-**No md5 verification here.** `read_ena_sequences` performs no checksum
-verification of downloaded bytes (confirmed by source read) — this is a known
-gap tracked separately as a duckdb-miint escalation (TASK-10, a D3-approved
-exception). This job does not attempt md5 verification and carries no TODO
-for it; wiring TASK-10's verification in is explicitly a later, separate
-change.
+**md5 verification is miint's, not this job's.** `read_ena_sequences` verifies
+every downloaded run's bytes against ENA's reported `fastq_md5` by default
+(`verify_md5` defaults on) — this job does not pass `verify_md5` explicitly
+and relies on that default. A mismatch surfaces as a raised `duckdb.IOException`
+whose message contains "md5" and carries none of `_TRANSIENT_ERROR_MARKERS`
+(by design — a corrupted download is a data-integrity failure, not a
+retryable network blip); `_classify_ena_fetch_error` classifies it BAD_INPUT
+(permanent), since retrying would just re-download the same corrupted bytes.
 
 **One fresh DuckDB connection PER RUN, never reused across the roster loop.**
 `miint_warnings()` is scoped to the DatabaseInstance a connection belongs to
@@ -224,12 +226,20 @@ def _classify_ena_fetch_error(
     run_accession: str, exc: duckdb.Error, *, step_name: str
 ) -> BackendFailure:
     """Classify a raised `duckdb.Error` from `_stage_run_reads` as retriable
-    (a transport/network-shaped failure) or permanent (a format/parse
-    failure, or anything not confidently network-shaped). A raised exception
-    here means miint's own internal open-retry-then-skip did NOT run — e.g.
-    ENA Portal metadata resolution for `run_accession` failed before any
-    per-run reader was even constructed — so there is no `miint_warnings()`
-    entry to inspect; the exception text is all the caller has."""
+    (a transport/network-shaped failure) or permanent (an md5-verification
+    failure, a format/parse failure, or anything not confidently
+    network-shaped). A raised exception here means miint's own internal
+    open-retry-then-skip did NOT run — e.g. ENA Portal metadata resolution for
+    `run_accession` failed before any per-run reader was even constructed, or
+    miint's own md5 tap detected corruption after streaming a run to true EOF
+    — so there is no `miint_warnings()` entry to inspect; the exception text
+    is all the caller has.
+
+    The transient-marker check runs FIRST, so a (hypothetical) message that
+    mentions both md5 and a transient marker (e.g. a network reset that
+    interrupted md5-tap streaming) still classifies transient — the explicit
+    md5 branch below only ever sees text that has already been ruled out as
+    network-shaped."""
     text = str(exc).lower()
     if any(marker in text for marker in _TRANSIENT_ERROR_MARKERS):
         return BackendFailure(
@@ -238,6 +248,16 @@ def _classify_ena_fetch_error(
             step_name=step_name,
             reason=(
                 f"ENA run {run_accession}: transient fetch error ({type(exc).__name__}): {exc}"
+            ),
+        )
+    if "md5" in text:
+        return BackendFailure(
+            kind=FailureKind.BAD_INPUT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=(
+                f"ENA run {run_accession}: ENA download md5 verification failed "
+                f"(data corruption) ({type(exc).__name__}): {exc}"
             ),
         )
     return BackendFailure(

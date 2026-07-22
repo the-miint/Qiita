@@ -452,6 +452,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA ingest classifies an md5-verification failure as an explicit,
+  self-documented permanent error.** duckdb-miint's `read_ena_sequences` now
+  verifies every downloaded run's bytes against ENA's reported `fastq_md5` by
+  default; `ingest_ena_reads` relies on that default (it never passes
+  `verify_md5` itself). A mismatch raises a `duckdb.IOException` whose message
+  contains "md5" and none of the transient network markers; previously this
+  fell through the classifier's default permanent case implicitly.
+  `_classify_ena_fetch_error` now has a dedicated md5 branch (checked after
+  the transient-marker check, so an error that mentions both md5 and a
+  transient marker still classifies retriable) with a reason string that
+  names the failure explicitly instead of relying on the generic fallthrough
+  message.
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately
   minted below the ceiling), a scope-gated route 403s even though the role

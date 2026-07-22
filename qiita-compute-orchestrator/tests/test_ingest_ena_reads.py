@@ -19,8 +19,10 @@ real miint extension. Covers:
     NO explanatory warning also fails permanently — unlike `ingest_reads`,
     there is no legitimate "empty well" reading for an ENA run.
   - Raised `duckdb.Error` classification: a transport/network-shaped message
-    classifies EXTERNAL_FETCH_TRANSIENT (retriable); anything else classifies
-    BAD_INPUT (permanent).
+    classifies EXTERNAL_FETCH_TRANSIENT (retriable); an md5-verification
+    failure (miint's default-on download integrity check) classifies
+    BAD_INPUT (permanent) unless it also carries a transient marker
+    (ordering); anything else classifies BAD_INPUT (permanent).
   - Range reuse wiring: a mint 409 reads back and reuses an in-flight
     ticket's existing range (the shared `mint_or_reuse_sequence_range` path,
     exercised here only to prove the wiring, not re-testing its full matrix —
@@ -380,6 +382,50 @@ def test_format_fetch_error_is_permanent(fake_mint, monkeypatch, tmp_path):
         _run(inputs, tmp_path / "ws")
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert exc.value.transient is False
+
+
+def test_md5_mismatch_fetch_error_is_permanent(fake_mint, monkeypatch, tmp_path):
+    """A raised duckdb.Error shaped like miint's md5-verification failure
+    (contains "md5", no transient marker) classifies BAD_INPUT (permanent) —
+    a corrupted download fails identically on retry, so it must not be
+    misclassified as a transient network blip."""
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise duckdb.IOException(
+            "read_ena_sequences: md5 mismatch for 'ERR001 ftp://...': ENA reported "
+            "abc123 but downloaded bytes hash to def456"
+        )
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert exc.value.transient is False
+    assert "md5" in exc.value.reason.lower()
+
+
+def test_md5_error_with_transient_marker_still_classifies_transient(
+    fake_mint, monkeypatch, tmp_path
+):
+    """Ordering regression: the transient-marker check runs BEFORE the md5
+    branch, so a (hypothetical) error mentioning both md5 and a transient
+    marker still classifies EXTERNAL_FETCH_TRANSIENT — a network blip that
+    happened to occur during md5-tap streaming is still retriable."""
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise duckdb.IOException(
+            "read_ena_sequences: md5 verification aborted: connection reset by peer"
+        )
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
+    assert exc.value.transient is True
 
 
 # ---------------------------------------------------------------------------
