@@ -17,6 +17,8 @@ connect_with_miint()-touching code."""
 
 from __future__ import annotations
 
+import threading
+
 import duckdb
 from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyHeader
 
@@ -24,6 +26,14 @@ from qiita_control_plane.miint import connect_with_miint
 
 from .accession import validate_study_accession
 from .resolver import EnaAccessionNotFoundError, EnaResolver, pivot_sample_attributes
+
+# Double-checked-lock guard for the one-time `INSTALL httpfs`, mirroring
+# `qiita_control_plane.miint.connect_with_miint`'s own `_install_lock` /
+# `_installed` pair for the miint extension itself. `INSTALL` is a no-op on
+# a warm cache, but it still round-trips to disk/network on every call
+# without this guard; `LOAD` stays per-connection and always runs below.
+_httpfs_install_lock = threading.Lock()
+_httpfs_installed = False
 
 # Explicit fields for read_run keep the mapping tight: this resolver only
 # needs the columns EnaRunRecord models, not read_ena's full default set
@@ -49,12 +59,24 @@ def _open_ena_connection() -> duckdb.DuckDBPyConnection:
     with a bare DuckDB `'https' scheme is not supported` error instead of
     silently degrading. Rather than depend on DuckDB's own autoload, install
     + load `httpfs` explicitly here, exactly like `connect_with_miint()`
-    does for `miint` itself. `INSTALL` is a no-op on a warm cache; `LOAD` is
-    per-connection and always needed. Scoped to this ENA-network-dependent
+    does for `miint` itself.
+
+    `INSTALL` runs at most once per process, guarded by the module-level
+    `_httpfs_install_lock` / `_httpfs_installed` double-checked lock —
+    mirroring `connect_with_miint()`'s own guard for the miint extension
+    itself. A bare, unlocked `INSTALL` on every call round-trips needlessly
+    even though it is a no-op on a warm cache. `LOAD` stays per-connection
+    and always needed, so it always runs. Scoped to this ENA-network-dependent
     module rather than `connect_with_miint()` itself, which other (local,
     non-network) miint call sites also share."""
+    global _httpfs_installed
     con = connect_with_miint()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
+    if not _httpfs_installed:
+        with _httpfs_install_lock:
+            if not _httpfs_installed:
+                con.execute("INSTALL httpfs;")
+                _httpfs_installed = True
+    con.execute("LOAD httpfs;")
     return con
 
 

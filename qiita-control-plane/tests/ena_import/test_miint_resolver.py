@@ -115,3 +115,57 @@ def test_resolve_runs_rejects_empty_accession(monkeypatch):
 
     with pytest.raises(InvalidEnaAccessionError):
         MiintEnaResolver().resolve_runs("")
+
+
+# ---------------------------------------------------------------------------
+# httpfs install-once lock (TASK-01 carry-forward, TASK-06)
+# ---------------------------------------------------------------------------
+# `_open_ena_connection` used to run a bare `INSTALL httpfs; LOAD httpfs;` on
+# every call -- an unlocked, repeated INSTALL. Mirrors
+# `qiita_control_plane.miint.connect_with_miint`'s double-checked-lock
+# pattern: INSTALL should run at most once per process; LOAD always runs,
+# per connection.
+
+
+class _FakeConnection:
+    """Records every SQL string passed to `.execute`; nothing else needed
+    for this seam (the real query functions each open their own `with
+    _open_ena_connection() as con:` block via a context manager, but this
+    test calls `_open_ena_connection` directly, so only `.execute` matters).
+    """
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    def execute(self, sql: str, *args, **kwargs) -> _FakeConnection:
+        self.executed.append(sql)
+        return self
+
+
+def test_httpfs_install_runs_at_most_once_across_repeated_calls(monkeypatch):
+    from qiita_control_plane.ena_import import miint_resolver
+
+    # Reset the module-level once-flag so this test is independent of
+    # execution order / prior tests in the same process.
+    monkeypatch.setattr(miint_resolver, "_httpfs_installed", False)
+
+    connections: list[_FakeConnection] = []
+
+    def _fake_connect_with_miint() -> _FakeConnection:
+        con = _FakeConnection()
+        connections.append(con)
+        return con
+
+    monkeypatch.setattr(miint_resolver, "connect_with_miint", _fake_connect_with_miint)
+
+    miint_resolver._open_ena_connection()
+    miint_resolver._open_ena_connection()
+
+    assert len(connections) == 2
+    all_executed = [sql for con in connections for sql in con.executed]
+    install_calls = [sql for sql in all_executed if "INSTALL httpfs" in sql]
+    load_calls = [sql for sql in all_executed if "LOAD httpfs" in sql]
+    assert len(install_calls) == 1
+    # LOAD is per-connection and always needed -- once per call, regardless
+    # of the INSTALL cache.
+    assert len(load_calls) == 2

@@ -42,6 +42,13 @@ _None yet._
 
 ### Notes (no host action)
 
+- (TASK-06) Soft API change, additive, no host action. New `POST` /
+  `GET /api/v1/ena-import-batch` (batch multi-study ENA import driver) —
+  admin-only, no client is required to call either. The new migration
+  (`qiita.ena_import_batch` / `qiita.ena_import_batch_item`) is a plain
+  additive `CREATE TABLE`, handled autonomously by the standing `make
+  migrate` step (bucket 3) — no out-of-band setup (no `CREATE EXTENSION`,
+  no backfill), so it needs no bucket-3 entry.
 - (TASK-04) miint deploy staging (`stage_miint_extension`, run at deploy via
   `scripts/stage-miint-extension.sh`) now also installs DuckDB's own
   `httpfs` extension into the same `MIINT_EXTENSION_DIRECTORY` — the new

@@ -107,6 +107,13 @@ from qiita_common.models.ena import (
     ResolverKind,
     SourceArchive,
 )
+from qiita_common.models.ena_import import (
+    BatchImportItem,
+    BatchImportRequest,
+    BatchImportResponse,
+    BatchImportStatus,
+    BatchItemState,
+)
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
@@ -375,6 +382,12 @@ __all__ = [
     "EnaStudyHeader",
     "ResolverKind",
     "SourceArchive",
+    # Batch ENA import (TASK-06).
+    "BatchImportItem",
+    "BatchImportRequest",
+    "BatchImportResponse",
+    "BatchImportStatus",
+    "BatchItemState",
     # Study.
     "StudyCreate",
     "StudyPatchRequest",

@@ -538,6 +538,77 @@ async def test_shared_biosample_across_two_studies_one_row_two_links(reg):
     assert linked_studies == {result_a.study_idx, result_b.study_idx}
 
 
+# T06-2 -- the same de-dup, but under REAL concurrency (asyncio.gather over
+# two register_ena_study calls sharing a sample_accession), not just two
+# sequential calls. The batch driver's bounded-concurrency phase (TASK-06)
+# processes multiple studies at once, so the cross-study biosample
+# get-or-create (`get_or_create_biosample_by_ena_accession`'s `ON CONFLICT
+# ... DO NOTHING` + fallback SELECT, repositories/biosample.py) must hold
+# up when two of its callers race for real, not just when called back to
+# back. Still ONE biosample row + TWO biosample_to_study links.
+async def test_concurrent_registration_of_shared_biosample_dedupes_to_one_row(reg):
+    import asyncio
+
+    shared_sample_accession = unique_accession("SAMN")
+
+    study_a_accession = unique_accession("PRJNA")
+    header_a = _study_header(study_accession=study_a_accession)
+    run_a = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=shared_sample_accession,
+        study_accession=study_a_accession,
+    )
+
+    study_b_accession = unique_accession("PRJNA")
+    header_b = _study_header(study_accession=study_b_accession)
+    run_b = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=shared_sample_accession,
+        study_accession=study_b_accession,
+    )
+
+    result_a, result_b = await asyncio.gather(
+        _register(reg, study_header=header_a, runs=[run_a]),
+        _register(reg, study_header=header_b, runs=[run_b]),
+    )
+
+    assert result_a.study_idx != result_b.study_idx
+
+    biosample_rows = await reg["pool"].fetch(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        shared_sample_accession,
+    )
+    assert len(biosample_rows) == 1
+    biosample_idx = biosample_rows[0]["idx"]
+
+    link_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study WHERE biosample_idx = $1", biosample_idx
+    )
+    assert link_count == 2
+
+    linked_studies = {
+        r["study_idx"]
+        for r in await reg["pool"].fetch(
+            "SELECT study_idx FROM qiita.biosample_to_study WHERE biosample_idx = $1",
+            biosample_idx,
+        )
+    }
+    assert linked_studies == {result_a.study_idx, result_b.study_idx}
+
+    # Exactly one of the two runs harmonized-write-once (created the
+    # biosample); the other reused it -- same write-once invariant as the
+    # sequential test, still holding under real concurrency.
+    harmonized_flags = sorted(
+        [
+            result_a.runs[0].harmonization is not None,
+            result_b.runs[0].harmonization is not None,
+        ]
+    )
+    assert harmonized_flags == [False, True]
+
+
 # ---------------------------------------------------------------------------
 # T02-3 -- prep_sample / sequenced_sample creation, reserved-range invariant
 # ---------------------------------------------------------------------------
@@ -679,6 +750,86 @@ async def test_mixed_platform_study_creates_one_run_and_pool_per_platform(reg):
     )
     assert illumina_protocol == "short_read_amplicon"
     assert nanopore_protocol == "long_read_metagenomics"
+
+
+# ---------------------------------------------------------------------------
+# created_pools (TASK-06, additive to T02) -- surfaces the
+# (platform, sequenced_pool_idx, sequencing_run_idx) triples the batch
+# driver needs to build one download-ena-study ticket per pool, without
+# re-deriving them from the DB.
+# ---------------------------------------------------------------------------
+
+
+async def test_created_pools_single_platform(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="ILLUMINA",
+    )
+
+    result = await _register(reg, study_header=header, runs=[run])
+
+    assert len(result.created_pools) == 1
+    created = result.created_pools[0]
+    assert created.platform == "illumina"
+
+    pool_row = await reg["pool"].fetchrow(
+        "SELECT sp.idx AS sequenced_pool_idx, sp.sequencing_run_idx"
+        " FROM qiita.sequenced_pool sp"
+        " JOIN qiita.sequencing_run sr ON sr.idx = sp.sequencing_run_idx"
+        " WHERE sr.instrument_run_id LIKE $1",
+        f"{study_accession}:%",
+    )
+    assert created.sequenced_pool_idx == pool_row["sequenced_pool_idx"]
+    assert created.sequencing_run_idx == pool_row["sequencing_run_idx"]
+
+
+async def test_created_pools_one_per_distinct_platform(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    illumina_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="ILLUMINA",
+        library_strategy="AMPLICON",
+    )
+    nanopore_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="OXFORD_NANOPORE",
+        library_strategy="WGS",
+        library_source="METAGENOMIC",
+    )
+
+    result = await _register(reg, study_header=header, runs=[illumina_run, nanopore_run])
+
+    assert {c.platform for c in result.created_pools} == {"illumina", "oxford_nanopore"}
+    assert len({c.sequenced_pool_idx for c in result.created_pools}) == 2
+    assert len({c.sequencing_run_idx for c in result.created_pools}) == 2
+
+
+async def test_created_pools_empty_when_every_run_fails(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    bad_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="CAPILLARY",
+    )
+
+    result = await _register(reg, study_header=header, runs=[bad_run])
+
+    assert result.created_pools == []
 
 
 # ---------------------------------------------------------------------------

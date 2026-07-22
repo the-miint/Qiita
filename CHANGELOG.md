@@ -137,6 +137,37 @@ duplicates further down are historical strata; leave them where they are.
   unchanged. The bcl-convert/`ingest_reads` parity claim rests on CODE IDENTITY
   (`read_staging.write_sorted_reads`/`hardlink`, shared verbatim by both jobs),
   not an existing baseline test — none exists today for either producer.
+- **Batch multi-study ENA import driver (`ena_import.batch`, TASK-06).** New
+  `POST /api/v1/ena-import-batch` (`qiita_common.models.ena_import`,
+  `routes.ena_import`) accepts a list of ENA/SRA study accessions and returns
+  202 with a batch handle immediately; a new, additive-and-reversible
+  migration (`qiita.ena_import_batch` / `qiita.ena_import_batch_item`, both
+  TEXT/CHECK state — no `CREATE TYPE`) tracks each accession independently
+  through `pending -> resolving -> registered -> downloading -> done`, with
+  `failed` reachable from any non-terminal step, so one bad accession never
+  affects its siblings or the batch as a whole (T06-3). The background driver
+  (`ena_import.batch._run_batch`) processes every item with bounded
+  concurrency (`asyncio.Semaphore`, capped at 4 — miint's `ENAClient`
+  rate-limits ENA Portal/Browser calls to ~3 req/s) on its own tracked
+  `asyncio.Task` set (`app.state.running_ena_import_batches`, drained at
+  shutdown and re-driven at startup via `reconcile_inflight_batches`, mirroring
+  `dispatch.py`'s pattern but kept separate since this task drives
+  `register_ena_study` + a new `submit_work_ticket_core` directly, not a
+  work_ticket/`ComputeBackendClient` run). `submit_work_ticket_core` is
+  `routes.work_ticket`'s submission logic (gating, INSERT, dispatch) extracted
+  from the `POST /work-ticket` route into a callable an in-process caller with
+  no live HTTP request can reuse verbatim — the batch driver submits each
+  study's `download-ena-study` ticket(s) through it, on the batch's own
+  submitting principal, so that ticket's audience/scope/disallow-without-delete
+  gates are enforced exactly as a real HTTP submission would be, never
+  bypassed (`routes.submit_work_ticket` is now a thin wrapper with no behavior
+  change). `GET /api/v1/ena-import-batch/{idx}` rolls up each item's
+  `download_work_ticket_idxs`' current `qiita.work_ticket.state` on demand
+  into a `done`/`downloading`/`failed(download)` display state, without
+  mutating the item row. Also fixes `ena_import.miint_resolver`'s
+  `_open_ena_connection` to `INSTALL httpfs` at most once per process
+  (double-checked lock, mirroring `connect_with_miint()`'s own guard) instead
+  of on every call.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

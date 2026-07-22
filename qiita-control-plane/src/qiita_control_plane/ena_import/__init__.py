@@ -21,6 +21,14 @@ submit helper (`submit.build_download_ena_study_ticket`). Batch driving
 
 from .accession import EnaAccessionKind, InvalidEnaAccessionError, detect_accession_kind
 from .attribute_mapping import map_ena_attributes
+from .batch import (
+    BatchImportItemHandle,
+    create_ena_import_batch,
+    drain_running_ena_import_batches,
+    fetch_batch_status,
+    reconcile_inflight_batches,
+    schedule_ena_import_batch,
+)
 from .factory import BACKEND_HTTP, BACKEND_MIINT, get_resolver
 from .harmonization import HarmonizationResult, harmonize_biosample_attributes
 from .http_resolver import HttpEnaResolver
@@ -31,6 +39,7 @@ from .protocol_mapping import (
     map_ena_run_to_prep_protocol_name,
 )
 from .registration import (
+    CreatedPool,
     EnaStudyRegistrationResult,
     RunRegistrationOutcome,
     RunRegistrationStatus,
@@ -50,6 +59,8 @@ __all__ = [
     "DEFAULT_DOWNLOAD_METHOD",
     "DOWNLOAD_ENA_STUDY_ACTION_ID",
     "DOWNLOAD_ENA_STUDY_ACTION_VERSION",
+    "BatchImportItemHandle",
+    "CreatedPool",
     "EnaAccessionKind",
     "EnaAccessionNotFoundError",
     "EnaResolver",
@@ -63,11 +74,16 @@ __all__ = [
     "UnmappableEnaLibraryStrategyError",
     "UnmappableEnaPlatformError",
     "build_download_ena_study_ticket",
+    "create_ena_import_batch",
     "detect_accession_kind",
+    "drain_running_ena_import_batches",
+    "fetch_batch_status",
     "get_resolver",
     "harmonize_biosample_attributes",
     "map_ena_attributes",
     "map_ena_platform",
     "map_ena_run_to_prep_protocol_name",
+    "reconcile_inflight_batches",
     "register_ena_study",
+    "schedule_ena_import_batch",
 ]

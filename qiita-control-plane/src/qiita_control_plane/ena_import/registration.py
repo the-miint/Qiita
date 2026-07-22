@@ -132,12 +132,32 @@ class RunRegistrationOutcome:
 
 
 @dataclass(frozen=True)
+class CreatedPool:
+    """One `(platform, sequenced_pool_idx, sequencing_run_idx)` triple this
+    call's `_get_or_create_pool_for_platform` resolved (created or reused).
+
+    Additive to T02, for TASK-06's batch driver: after registering a
+    study's runs, the driver needs exactly these triples to build one
+    `download-ena-study` work-ticket per pool (`submit.
+    build_download_ena_study_ticket`) without a separate DB round trip to
+    re-derive them. `platform` is the `qiita_common.models.Platform` value
+    (a plain `str` here, matching the DB's `qiita.platform` enum text) each
+    pool was created/reused for.
+    """
+
+    platform: str
+    sequenced_pool_idx: int
+    sequencing_run_idx: int
+
+
+@dataclass(frozen=True)
 class EnaStudyRegistrationResult:
     """Composite result of one `register_ena_study` call."""
 
     study_idx: int
     study_created: bool
     runs: list[RunRegistrationOutcome] = field(default_factory=list)
+    created_pools: list[CreatedPool] = field(default_factory=list)
 
 
 async def register_ena_study(
@@ -219,12 +239,21 @@ async def register_ena_study(
         # One sequencing_run + sequenced_pool per distinct platform that has
         # at least one successfully-mapped run.
         sequenced_pool_idx_by_platform: dict[Platform, int] = {}
+        created_pools: list[CreatedPool] = []
         for platform in runs_by_platform:
-            sequenced_pool_idx_by_platform[platform] = await _get_or_create_pool_for_platform(
+            sequenced_pool_idx, sequencing_run_idx = await _get_or_create_pool_for_platform(
                 conn,
                 study_accession=study_header.study_accession,
                 platform=platform,
                 created_by_idx=caller_idx,
+            )
+            sequenced_pool_idx_by_platform[platform] = sequenced_pool_idx
+            created_pools.append(
+                CreatedPool(
+                    platform=platform.value,
+                    sequenced_pool_idx=sequenced_pool_idx,
+                    sequencing_run_idx=sequencing_run_idx,
+                )
             )
 
         for platform, platform_runs in runs_by_platform.items():
@@ -250,6 +279,7 @@ async def register_ena_study(
         study_idx=study_idx,
         study_created=study_created,
         runs=outcomes,
+        created_pools=created_pools,
     )
 
 
@@ -259,10 +289,13 @@ async def _get_or_create_pool_for_platform(
     study_accession: str,
     platform: Platform,
     created_by_idx: int,
-) -> int:
+) -> tuple[int, int]:
     """Get-or-create the one sequencing_run + sequenced_pool for a given
     (study, platform) pair. Both underlying repo calls are single
-    statements (no explicit transaction required)."""
+    statements (no explicit transaction required). Returns
+    `(sequenced_pool_idx, sequencing_run_idx)` -- both idxs, so the caller
+    can surface them on `EnaStudyRegistrationResult.created_pools`
+    (TASK-06) without a second lookup."""
     instrument_run_id = f"{study_accession}:{platform.value}"
     sequencing_run_idx, _ = await insert_sequencing_run(
         conn,
@@ -273,14 +306,14 @@ async def _get_or_create_pool_for_platform(
 
     existing_pool_idxs = await fetch_sequenced_pool_idxs_for_run(conn, sequencing_run_idx)
     if existing_pool_idxs:
-        return existing_pool_idxs[0]
+        return existing_pool_idxs[0], sequencing_run_idx
 
     sequenced_pool_idx, _ = await insert_sequenced_pool(
         conn,
         sequencing_run_idx=sequencing_run_idx,
         created_by_idx=created_by_idx,
     )
-    return sequenced_pool_idx
+    return sequenced_pool_idx, sequencing_run_idx
 
 
 async def _register_one_run(
