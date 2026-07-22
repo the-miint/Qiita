@@ -37,6 +37,11 @@ duplicates further down are historical strata; leave them where they are.
   `qiita ticket run` once the blocker is fixed. New `work_ticket:cancel` scope
   (system_admin), `ALTER TYPE work_ticket_state ADD VALUE 'cancelled'` migration,
   `ComputeBackend.cancel` / `ComputeBackendClient.cancel`, and `POST /work-ticket/cancel`.
+- **Mouse gut terminology seeds (#360).** Appends the NCBI Taxonomy terms
+  `410661` (mouse gut metagenome) and `10090` (Mus musculus), plus the ENVO
+  term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
+  is deprecated at source but appears in data we import), to the existing
+  pre-release MVP terminologies.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
