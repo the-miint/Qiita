@@ -72,6 +72,19 @@ created — it simply harmonizes against an empty attribute map, so it carries n
 globally-linked metadata and the checklist's required fields show up in the
 `missing_required` report rather than blocking the import.
 
+**Both the GSC-MIxS display-name and the underscore MIxS short-name vocabularies are
+recognized**, since real submitters (notably DDBJ) commonly use the latter:
+`collection_date`, `geo_loc_name`, `lat_lon`, and `depth` are harmonized onto the same
+global fields as their `collection date` / `geographic location (...)` / `depth`
+display-name twins. `geo_loc_name`'s `country:region:locality` value contributes only
+its country/sea part; `lat_lon`'s combined `"<lat> <N|S> <lon> <E|W>"` value splits
+into the separate latitude/longitude fields (negated for S/W), or is left as raw local
+metadata if it doesn't parse (including an INSDC missing-value marker like
+`"missing"`, which real DDBJ submissions do use for `lat_lon`). The three
+environmental-context tags (`env_broad_scale`/`env_local_scale`/`env_medium`, and
+their GSC-MIxS display-name twins) stay unmapped in either vocabulary — see
+"No ENVO / taxon-ontology harmonization" below.
+
 ## Scope and limits
 
 These are **hard limits** of the current import surface, not partial-implementation

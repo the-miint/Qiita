@@ -450,6 +450,83 @@ async def test_harmonization_parse_failure_isolated_to_its_run(reg):
     assert orphan_biosample_count == 0
 
 
+async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
+    """Real DDBJ submitters use the underscore MIxS vocabulary
+    (`collection_date`, `geo_loc_name`, `lat_lon`, `depth`) rather than the
+    GSC-MIxS display-name form -- these must land on the same
+    biosample_global_fields as their display-name twins (cross-study
+    comparability), not stay unmapped."""
+    study_accession = unique_accession("PRJDB")
+    header = _study_header(study_accession=study_accession)
+    sample_accession = unique_accession("SAMD")
+    run = _run(
+        run_accession=unique_accession("DRR"),
+        experiment_accession=unique_accession("DRX"),
+        sample_accession=sample_accession,
+        study_accession=study_accession,
+    )
+    attrs = EnaSampleAttributes(
+        sample_accession=sample_accession,
+        attributes={
+            "collection_date": "2021-11-15",
+            # Real observed shape: PRJDB40386's SAMD01820063.
+            "geo_loc_name": "Japan:Shinga, Ritsumeikan University BKC",
+            "lat_lon": "35.6895 N 139.6917 E",
+            "depth": "10",
+            # Underscore form of the ENVO-typed triad -- same deferral as
+            # the display-name form, stays unmapped/local.
+            "env_broad_scale": "marine biome",
+        },
+    )
+
+    result = await _register(reg, study_header=header, runs=[run], sample_attributes=[attrs])
+
+    assert result.runs[0].status == RunRegistrationStatus.REGISTERED
+    harmonization = result.runs[0].harmonization
+    assert harmonization is not None
+    # lat_lon splits into two mapped fields -- 5 tags in, but 4 lat_lon/
+    # geo_loc_name/collection_date/depth values produce 5 mapped entries.
+    assert harmonization.mapped_count == 5
+    assert harmonization.retained_unmapped == ["env_broad_scale"]
+
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
+    )
+    rows = await reg["pool"].fetch(
+        "SELECT gf.display_name, bm.value_text, bm.value_numeric"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1",
+        biosample_idx,
+    )
+    by_display_name = {r["display_name"]: r for r in rows}
+    assert set(by_display_name) == {
+        "collection date",
+        "geographic location (country and/or sea)",
+        "geographic location (latitude)",
+        "geographic location (longitude)",
+        "depth",
+    }
+    assert by_display_name["collection date"]["value_text"] == "2021-11-15"
+    assert by_display_name["geographic location (country and/or sea)"]["value_text"] == "Japan"
+    assert by_display_name["geographic location (latitude)"]["value_numeric"] == Decimal("35.6895")
+    assert by_display_name["geographic location (longitude)"]["value_numeric"] == Decimal(
+        "139.6917"
+    )
+    assert by_display_name["depth"]["value_numeric"] == Decimal("10")
+
+    local_rows = await reg["pool"].fetch(
+        "SELECT bsf.display_name, bm.value_text"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bm.global_field_idx IS NULL",
+        biosample_idx,
+    )
+    assert {r["display_name"]: r["value_text"] for r in local_rows} == {
+        "env_broad_scale": "marine biome",
+    }
+
+
 async def test_empty_sample_attributes_registers_with_missing_required_report(reg):
     """A sample with zero ENA attributes (e.g. `resolve_sample_attributes`
     returning `[]` for a real DDBJ sample with no `<SAMPLE_ATTRIBUTE>`

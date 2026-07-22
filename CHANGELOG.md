@@ -290,6 +290,23 @@ duplicates further down are historical strata; leave them where they are.
   registers normally; the biosample harmonizes against an empty attribute
   map (no globally-linked metadata) and the ERC000011 checklist's missing
   required fields are reported, never fatal.
+- **ENA import: harmonize the underscore MIxS attribute vocabulary
+  (`ena_import.attribute_mapping`).** The same live test found real DDBJ
+  MIGS samples use the underscore MIxS short names (`collection_date`,
+  `geo_loc_name`, `lat_lon`, `depth`) rather than the GSC-MIxS display-name
+  form the mapping table only recognized — so real imports mapped nothing
+  (`mapped_count=0`). Both vocabularies are now recognized side by side:
+  `collection_date`/`depth` map exactly like their display-name twins;
+  `geo_loc_name`'s `country:region:locality` value contributes only its
+  country/sea part; `lat_lon`'s combined `"<lat> <N|S> <lon> <E|W>"` value
+  splits into the separate latitude/longitude global fields (negated for
+  S/W), or is left as raw local metadata if it doesn't parse — including an
+  INSDC missing-value marker like `"missing"` (confirmed live: DDBJ sample
+  `SAMD01820063`'s own `lat_lon` is literally `"missing"`), which cannot be
+  split into two numbers without guessing. The underscore forms of the
+  environmental-context triad (`env_broad_scale`/`env_local_scale`/
+  `env_medium`) stay unmapped, same ENVO-resolution deferral as their
+  display-name twins.
 - **ENA import batch driver: reconcile principal guard + `download_method`
   threading (batch-driver hardening).** `ena_import.batch._load_principal`
   (used by `reconcile_inflight_batches` to re-drive in-flight batch items
