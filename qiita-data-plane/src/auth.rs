@@ -601,6 +601,43 @@ pub fn verify_doput(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `sync_reference_exclusion` DoAction.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.sync_reference_exclusion_data`:
+/// `{"action": "sync_reference_exclusion", "dest": "<abs path>"}`. The control
+/// plane resolves its authoritative blocklist to the excluded `feature_idx` set,
+/// writes that set to a single-column Parquet at `dest` on the shared scratch
+/// tree, and the data plane REPLACES its `reference_exclusion` mirror wholesale
+/// from that file (full-replace ⇒ idempotent / replay-safe). No `reference_idx`
+/// or other scoping field: the blocklist is global and the mirror is a flat
+/// `feature_idx` set. `deny_unknown_fields` keeps the contract tight: any extra
+/// field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncReferenceExclusionPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "sync_reference_exclusion".
+    pub action: String,
+    /// Absolute path to the single-column (`feature_idx`) Parquet the control
+    /// plane wrote. The handler re-validates it (`validate_export_dest`) before
+    /// inlining it into a `read_parquet(...)` literal — under the data plane's
+    /// scratch root, no `..`, no single quote — even though the token is
+    /// Ed25519-signed by the control plane (defense in depth). An empty
+    /// blocklist still ships a valid zero-row Parquet, so the replace clears the
+    /// mirror table.
+    pub dest: String,
+}
+
+/// Verify a `sync_reference_exclusion` DoAction token and return its payload.
+pub fn verify_sync_reference_exclusion(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<SyncReferenceExclusionPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +818,34 @@ mod tests {
             br#"{"action":"export_read","dest":"/scratch/x","prep_sample_idx":1,"smuggled":9}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         match verify_export_read(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // -------------------- sync_reference_exclusion --------------------
+
+    #[test]
+    fn verify_sync_reference_exclusion_round_trip() {
+        let payload = br#"{"action":"sync_reference_exclusion","dest":"/scratch/exclusion/reference_exclusion.parquet"}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed = verify_sync_reference_exclusion(&ticket, &test_vk())
+            .expect("valid token should verify");
+        assert_eq!(parsed.action, "sync_reference_exclusion");
+        assert_eq!(
+            parsed.dest,
+            "/scratch/exclusion/reference_exclusion.parquet"
+        );
+    }
+
+    #[test]
+    fn verify_sync_reference_exclusion_rejects_extra_fields() {
+        // A smuggled scoping field (e.g. reference_idx) is a design slip — the
+        // blocklist is global and the mirror is a flat feature_idx set.
+        let payload =
+            br#"{"action":"sync_reference_exclusion","dest":"/scratch/x","reference_idx":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_sync_reference_exclusion(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }

@@ -290,6 +290,90 @@ async def test_reference_membership_rejects_negative_shard_id(postgres_pool):
         await postgres_pool.release(conn)
 
 
+async def test_reference_membership_accession_defaults_null(postgres_pool):
+    """The pre-existing 2-column membership INSERT leaves accession NULL — a
+    row from before the column existed, or a non-FASTA ingest with no header."""
+    conn = await postgres_pool.acquire()
+    try:
+        tr = conn.transaction()
+        await tr.start()
+        ref_idx, feat_idx = await _make_membership_row(conn, "e0000000-0000-0000-0000-0000000000a1")
+        accession = await conn.fetchval(
+            "SELECT accession FROM qiita.reference_membership"
+            " WHERE reference_idx = $1 AND feature_idx = $2",
+            ref_idx,
+            feat_idx,
+        )
+        assert accession is None
+        await tr.rollback()
+    finally:
+        await postgres_pool.release(conn)
+
+
+async def test_write_membership_stores_representative_accession(postgres_pool, tmp_path):
+    """write_membership joins the manifest (read_id -> sequence_hash) to the
+    feature_map (sequence_hash -> feature_idx) and stores the representative
+    accession — the lex-smallest FASTA-header read_id — on each membership row.
+    Identical bytes shared under two headers collapse to one feature_idx."""
+    import uuid
+
+    import duckdb
+
+    from qiita_control_plane.actions import library as lib
+
+    h1 = str(uuid.UUID(int=0xACCE5501))
+    h2 = str(uuid.UUID(int=0xACCE5502))
+
+    ref_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', $2) RETURNING reference_idx",
+        "accession-membership",
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    feat1 = await postgres_pool.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx", h1
+    )
+    feat2 = await postgres_pool.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx", h2
+    )
+
+    def _write(path, schema, rows):
+        with duckdb.connect(":memory:") as c:
+            c.execute(f"CREATE TEMP TABLE t ({schema})")
+            c.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in rows[0])})", rows)
+            c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+
+    try:
+        manifest = tmp_path / "manifest.parquet"
+        feature_map = tmp_path / "feature_map.parquet"
+        _write(
+            manifest,
+            "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+            [("ACC_A", h1, 10), ("ACC_B2", h2, 20), ("ACC_B1", h2, 20)],
+        )
+        _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(h1, feat1), (h2, feat2)])
+
+        linked, already = await lib.write_membership(postgres_pool, ref_idx, manifest, feature_map)
+        assert (linked, already) == (2, 0)
+
+        rows = await postgres_pool.fetch(
+            "SELECT feature_idx, accession FROM qiita.reference_membership"
+            " WHERE reference_idx = $1",
+            ref_idx,
+        )
+        assert {r["feature_idx"]: r["accession"] for r in rows} == {feat1: "ACC_A", feat2: "ACC_B1"}
+    finally:
+        # write_membership commits, so clean up explicitly — this suite does not
+        # auto-reset between tests.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", ref_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", [feat1, feat2]
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref_idx)
+
+
 async def test_feature_genome_fk_on_feature(postgres_pool):
     """feature_genome must reject non-existent feature_idx."""
     conn = await postgres_pool.acquire()

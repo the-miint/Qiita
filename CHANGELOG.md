@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Reference feature/genome exclusion — a curated global blocklist (#361).**
+  Bad reference data (a contaminated genome, a mislabelled contig) can now be
+  **masked at consumption** without deleting rows or rebuilding aligner indexes.
+  A `genome_idx` or `feature_idx` is blocked in a new authoritative Postgres
+  table `qiita.reference_exclusion` (global — no `reference_idx`, so future
+  references inherit the block) and mirrored to a small DuckLake table that two
+  `CREATE OR REPLACE VIEW … _visible` anti-join views consume
+  (`alignment_visible`, `reference_taxonomy_visible`). The raw `alignment` /
+  `reference_taxonomy` tables are removed from both DoGet allowlists, so only the
+  views are Flight-reachable — the `read_masked`-style unbypassable enforcement
+  surface. `woltka_ogu` renormalizes over survivors, so feature tables are
+  corrected immediately with existing data intact. The Postgres→DuckLake mirror
+  is refreshed by a wholesale idempotent `sync_reference_exclusion` DoAction
+  (`REPLAY_SAFE_ACTIONS`) fired on every blocklist mutation **and** as the
+  post-load `sync-reference-exclusion` step of every reference-load workflow
+  (`reference-add`, `local-reference-add`, `host-reference-add`,
+  `local-host-reference-add`) — catching a fresh assembly of an already-blocked
+  genome so "future references inherit the block" holds on every load path.
+  Adds `reference_membership.accession` (the FASTA-header record accession,
+  persisted at load — previously dropped) surfaced as external provenance; a
+  system-admin curation surface `POST`/`DELETE /reference/exclusion` (new
+  `reference:exclusion:write` scope) + the reference-scoped query
+  `GET /reference/{reference_idx}/exclusion` (`reference:read`); and a
+  `qiita-admin reference exclusion add/remove/list` CLI. Phylogeny defers to a
+  documented `shear_tree` prune contract (no production tree consumer exists
+  yet). Two migrations: `reference_membership.accession`, `reference_exclusion`.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

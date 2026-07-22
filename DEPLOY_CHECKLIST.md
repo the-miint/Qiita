@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `make migrate` applies two new migrations — both plain (nullable `ADD COLUMN` / `CREATE TABLE`, no backfill, no `CREATE EXTENSION`): `20260721000000_reference_membership_accession.sql` (persist the FASTA-header record accession per reference membership) and `20260721000001_reference_exclusion.sql` (the curated global feature/genome blocklist table). (#361)
 
 ### 4. Deploy
 
@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- Reference exclusion wired: `GET /api/v1/reference/{idx}/exclusion` on any active reference returns `200` with `[]` (confirms the new route + the `reference_exclusion` migration reached the CP; read-only, creates no block). (#361)
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +39,9 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- New `system_admin`-only scope `reference:exclusion:write` (a code-defined ceiling, no DB grant) plus new routes `POST`/`DELETE /reference/exclusion` and `GET /reference/{idx}/exclusion`, and a `qiita-admin reference exclusion add/remove/list` CLI. Soft API addition — no existing client breaks. (#361)
+- The data-plane build now creates two anti-join views at boot (`alignment_visible`, `reference_taxonomy_visible`) and **removes the raw `alignment` / `reference_taxonomy` tables from the DoGet allowlist** — a DoGet ticket signed for a raw name is now rejected. The in-repo consumers (compute orchestrator, CLI) were flipped to the views in the same change, so no external action is needed — but a standard redeploy (which rebuilds + restarts the DP, i.e. **don't `SKIP_BUILD`**) is required for the views and the `sync_reference_exclusion` DoAction to exist. (#361)
+- All four reference-load workflows (`reference-add`, `local-reference-add`, `host-reference-add`, `local-host-reference-add`) gained a post-load `sync-reference-exclusion` step (no version bump); `qiita-admin actions sync` (run by `activate.sh`) re-upserts them at deploy — no separate action. (#361)
 
 ---
 

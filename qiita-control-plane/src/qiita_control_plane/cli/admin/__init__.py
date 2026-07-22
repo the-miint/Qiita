@@ -93,6 +93,12 @@ from .owner_id import (
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
 )
+from .reference_exclusion import (
+    _handle_exclusion_add,
+    _handle_exclusion_list,
+    _handle_exclusion_remove,
+    add_reference_exclusion_subparser,
+)
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
 
 # ---------------------------------------------------------------------------
@@ -231,6 +237,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="After each resubmit, poll the new ticket to a terminal state and report it.",
     )
     p_purge.set_defaults(handler=_handle_mask_purge_failed)
+
+    p_reference = sub.add_parser("reference", help="Reference maintenance operations")
+    p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
+    add_reference_exclusion_subparser(p_reference_sub)
 
     p_backfill = sub.add_parser("backfill", help="One-off data backfills")
     p_backfill_sub = p_backfill.add_subparsers(dest="backfill_cmd", required=True)
@@ -885,6 +895,10 @@ __all__ = [
     "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
+    "add_reference_exclusion_subparser",
+    "_handle_exclusion_add",
+    "_handle_exclusion_list",
+    "_handle_exclusion_remove",
     "_count_non_failed_missing_mask_idx",
     "_export_stem",
     "_force_fail_ticket",

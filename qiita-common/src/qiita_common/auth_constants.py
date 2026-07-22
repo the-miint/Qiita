@@ -43,6 +43,13 @@ class Scope(StrEnum):
     # destructive and admin-only, granted solely to system_admin in
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     REFERENCE_DELETE = "reference:delete"
+    # Curate the global reference exclusion blocklist (block/unblock a bad
+    # genome_idx / feature_idx so it stops contributing to downstream products).
+    # Destructive-adjacent and admin-only: granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. Mirrors
+    # REFERENCE_DELETE (the read-only GET /reference/{idx}/exclusion rides
+    # REFERENCE_READ instead).
+    REFERENCE_EXCLUSION_WRITE = "reference:exclusion:write"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
     # Sign DoGet tickets for the data plane's reference-data surfaces AND the

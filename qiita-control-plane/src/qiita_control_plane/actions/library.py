@@ -55,6 +55,7 @@ from ..repositories.block import (
     lock_mask_sample,
     set_block_state,
 )
+from ..repositories.reference_exclusion import resolve_excluded_features
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
@@ -294,23 +295,31 @@ async def _write_membership_rows(
     conn: asyncpg.Connection,
     reference_idx: int,
     feature_idxs: list[int],
+    accessions: list[str | None],
 ) -> int:
     """INSERT ... RETURNING for one chunk; returns count of newly-linked rows.
 
+    `accessions[i]` is the representative source accession (FASTA-header
+    read_id) for `feature_idxs[i]`, stored on the membership row so a reference
+    names each feature by its own header — the same feature bytes can carry a
+    different accession in a different reference.
+
     Wraps asyncpg.ForeignKeyViolationError into a ValueError so the public
-    `write_membership` and the route handler both surface a structured
-    error instead of letting the asyncpg exception leak to callers.
+    `write_membership` surfaces a structured error instead of letting the
+    asyncpg exception leak to callers.
     """
     if not feature_idxs:
         return 0
     try:
         rows = await conn.fetch(
-            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
-            " SELECT $1, unnest($2::bigint[])"
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx, accession)"
+            " SELECT $1, m.feature_idx, m.accession"
+            " FROM unnest($2::bigint[], $3::text[]) AS m(feature_idx, accession)"
             " ON CONFLICT DO NOTHING"
             " RETURNING feature_idx",
             reference_idx,
             feature_idxs,
+            accessions,
         )
     except asyncpg.ForeignKeyViolationError as exc:
         raise ValueError("One or more feature_idx values do not exist in qiita.feature") from exc
@@ -875,41 +884,63 @@ async def _write_annotation_terms(
         read_conn.close()
 
 
+# The join behind write-membership: reduce feature_map (sequence_hash ->
+# feature_idx) + manifest (read_id -> sequence_hash) to one (feature_idx,
+# accession) per feature. `min(read_id)` picks the lex-smallest FASTA header
+# when identical bytes repeat under several headers — deterministic, and the
+# same representative hash_sequences' DISTINCT-ON keeps for the stored chunks.
+# feature_map's sequence_hashes are a subset of the manifest's (mint_features
+# derives feature_map FROM the manifest), so the INNER JOIN drops no feature.
+MEMBERSHIP_ACCESSION_JOIN_SQL = (
+    "SELECT fm.feature_idx, min(m.read_id) AS accession"
+    " FROM read_parquet(?) AS fm"
+    " JOIN read_parquet(?) AS m ON fm.sequence_hash = m.sequence_hash"
+    " GROUP BY fm.feature_idx"
+)
+
+
 async def write_membership(
     pool: asyncpg.Pool,
     reference_idx: int,
+    manifest_path: Path,
     feature_map_path: Path,
 ) -> tuple[int, int]:
-    """Link already-minted feature_idx values from a feature_map Parquet
-    file to a reference.
+    """Link already-minted feature_idx values to a reference, tagging each with
+    its representative source accession.
 
-    `feature_map_path` is a Parquet file with a `feature_idx` column
-    (typically the output of `mint_features`). Reads it chunked via
-    DuckDB and bulk-inserts qiita.reference_membership.
+    `feature_map_path` is a Parquet with `(sequence_hash, feature_idx)` (the
+    output of `mint_features`); `manifest_path` is the hash_sequences manifest
+    `(read_id, sequence_hash, ...)`. DuckDB joins them on `sequence_hash` and
+    reduces to one `(feature_idx, accession)` per feature via
+    `MEMBERSHIP_ACCESSION_JOIN_SQL`, read chunked via the Arrow reader and
+    bulk-inserted into qiita.reference_membership — never materialising the
+    full list in Python.
 
-    Returns (linked, already_linked). Idempotent. Raises ValueError if
-    any feature_idx is missing from qiita.feature (FK violation surfaced
-    as a structured error).
+    Returns (linked, already_linked). Idempotent. Raises ValueError if any
+    feature_idx is missing from qiita.feature (FK violation surfaced as a
+    structured error).
     """
-    if not feature_map_path.exists():
-        raise FileNotFoundError(f"Feature map not found: {feature_map_path}")
+    for label, path in [("manifest", manifest_path), ("feature_map", feature_map_path)]:
+        if not path.exists():
+            raise FileNotFoundError(f"{label} not found: {path}")
 
     total_linked = 0
     total_seen = 0
     async with pool.acquire() as conn:
-        # Stream feature_idx in batches via DuckDB's Arrow reader so we
-        # never materialise the full list in Python.
         with duckdb.connect(":memory:") as duck:
             reader = duck.execute(
-                "SELECT feature_idx FROM read_parquet(?)",
-                [str(feature_map_path)],
+                MEMBERSHIP_ACCESSION_JOIN_SQL,
+                [str(feature_map_path), str(manifest_path)],
             ).to_arrow_reader(_CHUNK_SIZE)
             for batch in reader:
                 feature_idxs = batch.column("feature_idx").to_pylist()
                 if not feature_idxs:
                     continue
+                accessions = batch.column("accession").to_pylist()
                 async with conn.transaction():
-                    chunk_linked = await _write_membership_rows(conn, reference_idx, feature_idxs)
+                    chunk_linked = await _write_membership_rows(
+                        conn, reference_idx, feature_idxs, accessions
+                    )
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
     return total_linked, total_seen - total_linked
@@ -1007,7 +1038,13 @@ _TAXONOMY_RANK_COLUMNS = (
     "strain",
 )
 
-_REFERENCE_TAXONOMY_TABLE = "reference_taxonomy"
+# The shard planner streams taxonomy through the exclusion-aware VIEW, never the
+# raw base table, so a curated exclusion can't be bypassed. Accepted consequence:
+# an excluded feature loses its taxonomy row, so it sorts as unclassified in the
+# lineage tiler and still gets sharded (harmless — it never surfaces post-exclusion
+# in any feature table or lineage). Reads go through _visible; register-files still
+# writes the raw base.
+_REFERENCE_TAXONOMY_TABLE = "reference_taxonomy_visible"
 
 
 def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_path: Path) -> Path:
@@ -1713,6 +1750,125 @@ async def delete_mask_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+# Fixed advisory-lock key that serializes every reference-exclusion sync (see
+# sync_reference_exclusion_data). Chosen distinct from the sweepers' keys
+# (notify=…147, cli-login=…148) so it never blocks them.
+_EXCLUSION_SYNC_ADVISORY_LOCK_KEY = 4_310_290_149
+
+
+async def sync_reference_exclusion_data(
+    *,
+    pool: asyncpg.Pool,
+    dest: Path,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Re-materialize the resolved blocklist onto the data plane's lake mirror.
+
+    Resolves the GLOBAL blocklist to its excluded feature_idx set (direct feature
+    blocks plus every feature of a blocked genome, via
+    ``repositories.reference_exclusion.resolve_excluded_features``), streams that
+    set to a single-column (``feature_idx``) Parquet at `dest` on the shared
+    scratch tree, and signs a ``sync_reference_exclusion`` DoAction so the data
+    plane REPLACES its ``reference_exclusion`` mirror wholesale from the file.
+    Returns the data plane's loaded feature_count.
+
+    `dest` must live under the shared PATH_SCRATCH tree (the data plane
+    re-validates it under its scratch root before reading). The set is tiny by
+    design (a curated blocklist), but it is streamed in `_CHUNK_SIZE` batches
+    like the sibling exporters so a pathologically large blocklist never
+    materializes one giant Arrow array.
+
+    **Serialized by a transaction-scoped Postgres advisory lock** held across the
+    whole resolve → parquet-write → DoAction. The mirror is a BLIND wholesale
+    REPLACE from a CP-resolved snapshot, which is NOT commutative: two concurrent
+    syncs (two admin mutations, or a mutation racing a reference load's post-load
+    sync) could otherwise commit at the data plane out of resolve order, letting a
+    stale snapshot clobber a fresher block — a **fail-OPEN** outcome (a blocked
+    feature re-appears in the ``*_visible`` views) that, with no periodic
+    re-sync, would persist until the next mutation. The lock (blocking, not
+    try-lock — every sync MUST complete, never skip) forces syncs to commit in
+    lock-acquisition order, each resolving the CURRENT committed Postgres state,
+    so the last sync reflects Postgres exactly. It works across a multi-instance
+    CP (a DB-level lock, unlike an in-process asyncio.Lock) and also removes the
+    fixed-`dest` file race (only one writer at a time). Held across the network
+    DoAction — acceptable for a rare curation / post-load operation.
+
+    Wholesale full-replace ⇒ idempotent + replay-safe: re-running converges to
+    the same mirror. Meant to fire on every blocklist mutation AND after a
+    reference load completes (a new assembly of an already-blocked genome mints
+    fresh feature_idx that the re-resolve then catches). An EMPTY blocklist still
+    writes a valid zero-row Parquet and still calls the DoAction — so the replace
+    CLEARS the mirror (re-enabling everything) rather than leaving stale
+    exclusions behind. Raises pyarrow.flight.FlightError on transport /
+    data-plane failure."""
+    async with pool.acquire() as conn, conn.transaction():
+        # Serialize with (and resolve under) the advisory lock so the snapshot
+        # this sync replaces the mirror with is the latest committed Postgres
+        # state — see the docstring for why a blind full-replace needs this.
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", _EXCLUSION_SYNC_ADVISORY_LOCK_KEY)
+        feature_idxs = await resolve_excluded_features(conn)
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Schema created up front so an empty blocklist still writes a valid,
+        # correctly-typed Parquet (mirrors export_member_genome).
+        schema = pa.schema([("feature_idx", pa.int64())])
+        writer = pq.ParquetWriter(str(dest), schema, compression="snappy")
+        try:
+            for start in range(0, len(feature_idxs), _CHUNK_SIZE):
+                chunk = feature_idxs[start : start + _CHUNK_SIZE]
+                writer.write_table(pa.table({"feature_idx": pa.array(chunk, pa.int64())}))
+        finally:
+            writer.close()
+
+        token = sign_action(
+            action="sync_reference_exclusion",
+            payload={"dest": str(dest)},
+            secret=signing_key,
+        )
+        # Held under the lock so the data plane's DELETE+INSERT commits in
+        # lock-acquisition order (no stale snapshot can win the last write).
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, _do_action, "sync_reference_exclusion", data_plane_url, token
+        )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("feature_count", 0)
+
+
+async def sync_reference_exclusion(
+    pool: asyncpg.Pool,
+    *,
+    dest: Path,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Workflow-primitive wrapper around `sync_reference_exclusion_data`.
+
+    The runner dispatches the `sync-reference-exclusion` action step at the tail
+    of reference-add / local-reference-add (after register-files) so a reference
+    load that adds a fresh assembly of an already-blocked genome — minting new
+    feature_idx the standing lake mirror can't know about — re-resolves the whole
+    blocklist and REPLACES the mirror wholesale. `dest` is the per-attempt
+    workspace Parquet the runner supplies (under the shared PATH_SCRATCH tree the
+    data plane re-validates). Mirrors the delete_read_mask_block ->
+    delete_read_mask_block_data primitive/signer split: the pool-positional
+    primitive is the runner-facing entry, the `_data` signer does the work.
+
+    Returns `{synced_feature_count}` for the workflow log (the data plane's loaded
+    row count). Raises pyarrow.flight.FlightError on transport / data-plane
+    failure, which the runner classifies and the ticket surfaces — failing loud is
+    the safe outcome here (a stale mirror would leak a blocked genome's new
+    features), and the full-replace makes the redrive idempotent."""
+    feature_count = await sync_reference_exclusion_data(
+        pool=pool,
+        dest=dest,
+        signing_key=signing_key,
+        data_plane_url=data_plane_url,
+    )
+    return {"synced_feature_count": feature_count}
+
+
 async def mask_metrics_data(
     *,
     mask_idx: int,
@@ -2169,4 +2325,5 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
+    LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
 }

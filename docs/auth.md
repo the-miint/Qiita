@@ -250,6 +250,8 @@ Defined in `auth.scopes`. Two ceilings:
 
 The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hierarchical`) that asserts `user ⊊ wet_lab_admin ⊊ system_admin` strictly. If that test ever fails, the inheritance contract is broken and downstream guards become unsound.
 
+`reference:exclusion:write` (curate the global reference blocklist) is a **`system_admin`-only** scope — added to the `system_admin` ceiling alone, mirroring `reference:delete`, so a wet_lab_admin can load references but not mask genomes/features globally. Reading a reference's blocks rides the existing `reference:read`.
+
 ### Guards (`auth.guards`)
 
 | Guard | Behavior |
@@ -330,6 +332,16 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 | `/api/v1/user/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
 | `/api/v1/user/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
 
+### Reference exclusion (curation)
+
+The curated global blocklist that masks bad genomes/features from downstream products (architecture: [Reference exclusion](architecture.md#reference-exclusion-curated-blocklist)). Not under `/admin/*`, but the two mutations are `system_admin`-only by scope. Each mutation, after the atomic Postgres write, **synchronously re-materializes** the DuckLake `reference_exclusion` mirror via the `sync_reference_exclusion` DoAction (a 502 if the data plane is unreachable; the Postgres row persists, so a retry converges).
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/reference/exclusion` | POST | Block a `genome_idx` XOR `feature_idx` (422 if neither/both) with a required `reason`. Idempotent (`ON CONFLICT DO NOTHING`, keeps the original reason; re-POST still re-syncs). 404 on an unknown target. `503` when no shared scratch is configured — fail-fast *before* the Postgres write, since the block can't reach the enforcement surface. Requires `reference:exclusion:write` + a complete profile (the actor becomes `excluded_by_idx`). |
+| `/api/v1/reference/exclusion` | DELETE | Unblock by `?genome_idx=` XOR `?feature_idx=` query param. Idempotent (`changed=false` if absent). Re-syncs the mirror. Requires `reference:exclusion:write`. Registered *before* `DELETE /reference/{reference_idx}` so the literal `exclusion` path isn't shadowed by the int-param route. |
+| `/api/v1/reference/{reference_idx}/exclusion` | GET | Intersect the global blocklist with this reference's membership; returns each blocked member with `reason`, `direct_block`/`via_genome`, and external provenance — genome `(source, source_id)` + the reference's `reference_membership.accession`. `[]` for a clean reference, `404` for an unknown one (fail-loud, matches `get_reference_index`). Requires `reference:read`. |
+
 ## CLI (`qiita-admin`)
 
 Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproject. Subcommands:
@@ -345,6 +357,7 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `compute-readiness [--orchestrator-venv …] [--no-slurm-probe] [--json] [--probe-timeout-seconds …]` | subprocess | Subprocess-execs `<venv>/bin/python -m qiita_compute_orchestrator.cli.compute_readiness` to exercise the path `qiita-job` needs and report per-check status (JWT, CP `/healthz`, `SLURM_NATIVE_PYTHON` on host, plus an optional SLURM probe-job). Returns the subprocess exit code verbatim. |
 | `owner-biosample-id --study-idx N [--sequenced-pool-idx P] --output FILE` | HTTP | Calls `GET /api/v1/admin/study/{N}/owner-biosample-id` (forwarding `--sequenced-pool-idx` as a query param) and writes the result as a TSV to `--output` (created mode 0600; the owner names never touch stdout — only a row-count summary does). Requires a PAT carrying `admin:biosample_owner_id_read`. |
 | `masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet\|fastq] --output-dir DIR --data-plane-url U` | HTTP + Flight | GETs the pool roster manifest, then per non-retired sample mints a just-in-time `(prep_sample_idx, mask_idx)` ticket and streams that sample's `read_masked` rows from the data plane straight into a local DuckDB+miint `COPY` — bounded memory, no server-side scratch. One file per sample named `<biosample_accession>.<run>.<pool>.<prep>` + `.parquet`, or `.fastq` (single-end) / `.R1.fastq`+`.R2.fastq` (paired, via miint's `{ORIENTATION}`). Each output is written atomically (`.partial` → rename) at mode 0600. Fails loudly (exit 1, nothing written) if any sample lacks a usable `biosample_accession`. Requires a PAT carrying `admin:masked_read_export`; the client host needs miint+duckdb. |
+| `reference exclusion add (--genome-idx N \| --feature-idx N) --reason R` / `remove (…)` / `list --reference-idx N` | HTTP | Curates the global reference blocklist via the `/reference/exclusion` routes above. `add`/`remove` take a required, mutually-exclusive target; `list` shows a reference's blocked members with their external ids. Requires a PAT carrying `reference:exclusion:write` (`add`/`remove`) or `reference:read` (`list`). |
 
 ## CLI (`qiita`)
 

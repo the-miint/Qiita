@@ -287,7 +287,9 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
 
     step_names = [s.name for s in host.steps]
     # Shares the reference-add prefix, then adds the host-indexing tail: two
-    # index builders (rype + minimap2) and a register-index per build.
+    # index builders (rype + minimap2) and a register-index per build. The
+    # post-load `sync-reference-exclusion` step follows register-files here too
+    # (a host reference writes the reference_taxonomy anti-join surface).
     assert step_names == [
         "hash_sequences",
         "mint-features",
@@ -297,6 +299,7 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
         "build_rype_index",
         "build_minimap2_index",
         "register-files",
+        "sync-reference-exclusion",
         "register-index",
         "register-index",
     ]
@@ -499,6 +502,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "build_rype_index",
         "build_minimap2_index",
         "register-files",
+        "sync-reference-exclusion",
         "register-index",
         "register-index",
     ]
@@ -561,6 +565,35 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
 
     assert _LOCAL_HOST_REFERENCE_ADD_ACTION_ID == local_host.action_id == "local-host-reference-add"
     assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
+
+
+def test_every_write_membership_step_declares_the_runner_contract_inputs():
+    """Every on-disk `write-membership` action must declare `inputs:` exactly
+    {manifest, feature_map} — the runner's `_run_action_primitive` dispatch arm
+    hard-asserts that set and raises (failing the whole ticket) on any other
+    shape. This guards against the drift that a per-workflow-shape unit test can't
+    see: when `write-membership` gained its second input (`manifest`, for the
+    persisted accession), a workflow left on the old single-input form crashes at
+    runtime, not at load. Enumerating the real YAML here catches it at build time.
+    Same guard-by-enumeration applies to any future primitive-contract change."""
+    from pathlib import Path
+
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    offenders = {
+        f"{a.action_id}:{s.name}": s.inputs
+        for a in actions
+        for s in a.steps
+        if s.name == LibraryPrimitive.WRITE_MEMBERSHIP
+        and set(s.inputs) != {"manifest", "feature_map"}
+    }
+    assert not offenders, (
+        "these write-membership steps don't match the runner's required "
+        f"[manifest, feature_map] contract and will crash at dispatch: {offenders}"
+    )
 
 
 def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():

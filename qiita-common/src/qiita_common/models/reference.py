@@ -462,3 +462,53 @@ VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
 
 class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
+
+
+class ReferenceExclusionCreateRequest(BaseModel):
+    """Block exactly one of genome_idx / feature_idx (the DB CHECK enforces the
+    same invariant). `reason` is a required free-text curator note. The block is
+    GLOBAL — not scoped to a reference — so no reference_idx here."""
+
+    genome_idx: Annotated[int, Field(gt=0)] | None = None
+    feature_idx: Annotated[int, Field(gt=0)] | None = None
+    reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self):
+        if (self.genome_idx is None) == (self.feature_idx is None):
+            raise ValueError("exactly one of genome_idx / feature_idx must be given")
+        return self
+
+
+class ReferenceExclusionMutationResponse(BaseModel):
+    """Result of a block (POST) / unblock (DELETE). `target_kind` names which id
+    was targeted; `changed` is whether the blocklist actually changed — False for
+    a no-op re-block (already blocked) or an unblock that found nothing.
+    `synced_feature_count` is the number of excluded feature_idx now materialized
+    in the data plane's exclusion mirror after the wholesale re-sync."""
+
+    target_kind: Literal["genome", "feature"]
+    genome_idx: int | None = None
+    feature_idx: int | None = None
+    reason: str | None = None
+    changed: bool
+    synced_feature_count: int
+
+
+class ReferenceExclusionListItem(BaseModel):
+    """One blocked feature that appears in a given reference, with why + external
+    ids. `direct_block` = a feature-level block; `via_genome` = blocked through
+    its genome. `source`/`source_id` are the genome's external provenance;
+    `accession` is the reference's own FASTA-header id for the feature. Global
+    blocks that touch no feature in the queried reference are absent."""
+
+    feature_idx: int
+    genome_idx: int | None = None
+    reason: str
+    excluded_by_idx: int
+    excluded_at: AwareDatetime
+    source: str | None = None
+    source_id: str | None = None
+    accession: str | None = None
+    direct_block: bool
+    via_genome: bool

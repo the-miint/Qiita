@@ -64,6 +64,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # wet_lab_admin (who can create/load references via REFERENCE_WRITE
             # but not destroy them). Service accounts never get it.
             Scope.REFERENCE_DELETE,
+            # Curate the reference exclusion blocklist — system_admin-only, same
+            # rationale as REFERENCE_DELETE (masking a bad genome/feature is a
+            # curatorial act above wet_lab_admin's create/load capability).
+            Scope.REFERENCE_EXCLUSION_WRITE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,

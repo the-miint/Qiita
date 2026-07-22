@@ -235,17 +235,24 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 const ALLOWED_TABLES: &[&str] = &[
     "reference_sequences",
     "reference_sequence_chunks",
-    "reference_taxonomy",
+    // The exclusion-aware taxonomy view (`reference_taxonomy` ANTI JOIN the
+    // resolved blocklist). Reads go through the VIEW, never the raw base table
+    // — like `read_masked` over `read`, so a curated exclusion can't be bypassed
+    // by any consumer. The raw `reference_taxonomy` is deliberately absent (it is
+    // still the register-files write target, but not Flight-readable).
+    "reference_taxonomy_visible",
     "reference_phylogeny",
     "reference_placements",
     "reference_annotation",
     "read_masked",
-    // The alignment sink's read-side, for the feature-table (OGU) consumer. It
-    // holds host-depleted, derived per-read alignments (not raw human reads), so
-    // — unlike read_masked — it is not the human-read privacy surface. Reads are
-    // projected to the coverage/OGU columns and always scoped by alignment_idx +
-    // prep_sample_idx (see build_query / ALIGNMENT_DOGET_PROJECTION).
-    "alignment",
+    // The alignment sink's read-side, for the feature-table (OGU) consumer, as
+    // the exclusion-aware VIEW (`alignment` ANTI JOIN the resolved blocklist) —
+    // raw `alignment` is deliberately absent so a blocked feature can't reach an
+    // OGU rollup. It holds host-depleted, derived per-read alignments (not raw
+    // human reads), so — unlike read_masked — it is not the human-read privacy
+    // surface. Reads are projected to the coverage/OGU columns and always scoped
+    // by alignment_idx + prep_sample_idx (see build_query / ALIGNMENT_DOGET_PROJECTION).
+    "alignment_visible",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -297,6 +304,10 @@ const ALIGNMENT_DOGET_PROJECTION: &str =
 ///   re-materialize the same sample/block bytes to the same ticket path via
 ///   atomic publish; a replay reproduces identical output.
 /// - `count_masked` / `mask_metrics` — read-only aggregates.
+/// - `sync_reference_exclusion` — full-replace of the `reference_exclusion`
+///   mirror from the CP's resolved blocklist Parquet (one DELETE + INSERT
+///   transaction); a replay reloads the same authoritative set, so the table
+///   converges to the same state.
 ///
 /// The `do_action` dispatcher rejects any action not in this set, so a **new**
 /// action is refused until it is added here — forcing whoever adds it to
@@ -316,6 +327,7 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "export_read_masked_block",
     "count_masked",
     "mask_metrics",
+    "sync_reference_exclusion",
 ];
 
 #[tonic::async_trait]
@@ -936,6 +948,47 @@ impl FlightService for QiitaFlightService {
                 .map_err(|e| Status::internal(format!("mask_metrics task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&counts)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "sync_reference_exclusion" => {
+                let payload =
+                    auth::verify_sync_reference_exclusion(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "sync_reference_exclusion" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'sync_reference_exclusion', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                // Defense in depth on the signature-trusted destination before it
+                // is inlined into a DuckDB `read_parquet(...)` literal and read.
+                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
+
+                // The full-replace runs a blocking DuckLake transaction (and a
+                // blocking `canonicalize` in the handler) — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // register_files / export_read). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    sync_reference_exclusion(&catalog, &data_path, &dest, &scratch_root)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("sync_reference_exclusion task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&result)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
                 let result = arrow_flight::Result {
                     body: result_body.into(),
@@ -2103,6 +2156,125 @@ fn delete_mask(
     }))
 }
 
+/// Replace the DuckLake `reference_exclusion` mirror wholesale from the control
+/// plane's resolved-blocklist Parquet.
+///
+/// The control plane owns the authoritative blocklist (`qiita.reference_exclusion`),
+/// resolves it to the excluded `feature_idx` set (direct feature blocks plus every
+/// feature of a blocked genome), and writes that set to `dest` — a single-column
+/// (`feature_idx`) Parquet on the shared scratch tree. This handler clears the
+/// mirror and reloads it from that file in ONE transaction, so the two-statement
+/// swap is all-or-nothing: a failure leaves the previous mirror intact and the
+/// control plane can safely retry.
+///
+/// Full-replace makes it idempotent / replay-safe: re-running with the same
+/// Parquet converges to the same table, and a replay of a stale-but-valid token
+/// reloads whatever the (authoritative) file holds. An empty blocklist ships a
+/// valid zero-row Parquet, so the DELETE + zero-row INSERT simply clears the
+/// mirror (re-enabling everything). Opens and drops its own connection so the
+/// caller can run it on the blocking pool (mirrors `delete_mask` /
+/// `register_files`). Returns the loaded row count.
+///
+/// `dest` arrives lexically validated (`validate_export_dest`: absolute, under
+/// the scratch root, no `..`, no single quote), but that check is a string test
+/// done before any I/O — insufficient on the shared scratch tree, where another
+/// job could plant a symlink that redirects this read outside the controlled
+/// workspace. That matters MORE here than for the read-export sibling: this
+/// feeds the GLOBAL `reference_exclusion` mirror both `_visible` views enforce
+/// against, so a redirected read of an attacker-planted Parquet's `feature_idx`
+/// column would mass-exclude arbitrary features system-wide. So — the read-path
+/// analogue of `export_select_to_parquet`'s parent-canonicalize on write — we
+/// canonicalize `dest` ITSELF (the file already exists; the CP wrote it before
+/// signing) and re-assert it resolves under the canonicalized scratch root
+/// before reading, then inline the CANONICALIZED path (re-checked for a single
+/// quote a resolved symlink target could introduce) into `read_parquet`.
+fn sync_reference_exclusion(
+    catalog_connstr: &str,
+    data_path: &str,
+    dest: &Path,
+    scratch_root: &Path,
+) -> Result<serde_json::Value, Status> {
+    // Symlink-safe containment (see the doc comment): resolve the real target
+    // and re-assert it stays under the real scratch root.
+    let real_dest = std::fs::canonicalize(dest)
+        .map_err(|e| Status::internal(format!("failed to resolve {}: {e}", dest.display())))?;
+    let real_root = std::fs::canonicalize(scratch_root).map_err(|e| {
+        Status::internal(format!(
+            "failed to resolve scratch root {}: {e}",
+            scratch_root.display()
+        ))
+    })?;
+    if !real_dest.starts_with(&real_root) {
+        return Err(Status::permission_denied(format!(
+            "sync dest {} resolves outside the scratch root {}",
+            real_dest.display(),
+            real_root.display()
+        )));
+    }
+    let dest_str = real_dest
+        .to_str()
+        .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", real_dest.display())))?;
+    // The lexical check rejected a single quote in the requested path, but a
+    // resolved symlink could land on a real directory whose name contains one;
+    // re-check the canonicalized string we are about to inline.
+    if dest_str.contains('\'') {
+        return Err(Status::invalid_argument(format!(
+            "resolved sync dest must not contain a single quote: {dest_str:?}"
+        )));
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // Clear-then-reload in one transaction so the swap is atomic and retryable:
+    // a failure leaves the previous mirror intact.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let loaded = (|| -> Result<i64, Status> {
+        conn.execute(
+            "DELETE FROM qiita_lake.reference_exclusion",
+            duckdb::params![],
+        )
+        .map_err(|e| Status::internal(format!("failed to clear reference_exclusion: {e}")))?;
+        // `dest_str` is the canonicalized path, verified above to resolve under
+        // the scratch root and to carry no single quote, so inlining it into the
+        // read_parquet literal is safe. Project `feature_idx` by name so the load
+        // is insensitive to any extra column the producer might add later.
+        let inserted = conn
+            .execute(
+                &format!(
+                    "INSERT INTO qiita_lake.reference_exclusion (feature_idx) \
+                     SELECT feature_idx FROM read_parquet('{dest_str}')"
+                ),
+                duckdb::params![],
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to load reference_exclusion from {dest_str}: {e}"
+                ))
+            })?;
+        Ok(inserted as i64)
+    })();
+
+    let loaded = match loaded {
+        Ok(n) => n,
+        Err(e) => {
+            // Best-effort rollback; surface the original error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit sync transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "feature_count": loaded,
+    }))
+}
+
 /// Logically delete every `read` and `read_mask` row owned by a set of
 /// prep_samples from DuckLake.
 ///
@@ -2460,6 +2632,19 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
     }
 }
 
+/// The alignment DoGet surface: the exclusion-aware view `alignment_visible`, and
+/// ONLY that — never the raw `alignment` base table (which is out of
+/// `ALLOWED_TABLES`, so unreachable via `do_get`). `build_query` gives this name
+/// the `ALIGNMENT_DOGET_PROJECTION` and the mandatory (non-empty, single
+/// `alignment_idx`) scoping. Deliberately NOT recognizing the raw name: if
+/// `"alignment"` were ever re-added to `ALLOWED_TABLES` by mistake, it would fall
+/// through to a bare `SELECT *`, producing an obviously-malformed, unscoped result
+/// rather than a clean-looking one that silently bypasses exclusion — the failure
+/// stays loud.
+fn is_alignment_doget_surface(table: &str) -> bool {
+    table == "alignment_visible"
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -2488,10 +2673,10 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         // The reference_* tables are broadly readable by design (this mirrors
         // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
         // legitimate there — reject empty filters only for the read surface.
-        // `alignment` is likewise never read unscoped — the CP always scopes it
-        // to (alignment_idx, prep_sample_idx). An empty filter would dump the
-        // whole sink (and bypass the projection), so refuse it here too.
-        if table == "read_masked" || table == "alignment" {
+        // `alignment_visible` is likewise never read unscoped — the CP always
+        // scopes it to (alignment_idx, prep_sample_idx). An empty filter would
+        // dump the whole sink (and bypass the projection), so refuse it here too.
+        if table == "read_masked" || is_alignment_doget_surface(table) {
             return Err(Status::invalid_argument(format!(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
@@ -2504,7 +2689,7 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     // so require it present and single-valued. Otherwise a ticket could omit the
     // scope or pass several alignment_idx values and blend rows from
     // heterogeneous runs into one indistinguishable stream. Fail loud.
-    if table == "alignment" {
+    if is_alignment_doget_surface(table) {
         match filter.get("alignment_idx") {
             Some(values) if values.len() == 1 => {}
             _ => {
@@ -2577,9 +2762,9 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
              WHERE {where_str}"
         )
     } else {
-        // Most tables stream every column; `alignment` is projected to just the
-        // feature-table columns (projection pushdown — see ALIGNMENT_DOGET_PROJECTION).
-        let projection = if table == "alignment" {
+        // Most tables stream every column; the alignment surface is projected to
+        // just the feature-table columns (projection pushdown — see ALIGNMENT_DOGET_PROJECTION).
+        let projection = if is_alignment_doget_surface(table) {
             ALIGNMENT_DOGET_PROJECTION
         } else {
             "*"
@@ -3858,6 +4043,143 @@ mod tests {
         );
     }
 
+    /// `sync_reference_exclusion` REPLACES the mirror wholesale from the CP's
+    /// blocklist Parquet: stale rows are dropped, the file's rows become the
+    /// entire table, a re-run with the same file is idempotent, and an empty
+    /// Parquet clears the table (re-enabling everything). Full-replace ⇒
+    /// replay-safe. Also asserts symlink containment: a dest that lexically sits
+    /// under the scratch root but resolves outside it is rejected before any read.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn sync_reference_exclusion_full_replace_is_idempotent() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        // ensure_exclusion_tables also (re)creates the _visible views, which
+        // reference reference_taxonomy + alignment — so create those first.
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+        ducklake::ensure_exclusion_tables(&conn).unwrap();
+
+        // Unique feature ids so leftover rows never collide with other serial
+        // tests, and a full-table clean slate (the mirror is a global set with
+        // no scoping column to filter on).
+        let feat_a: i64 = 974_010;
+        let feat_b: i64 = 974_011;
+        let stale: i64 = 974_099;
+        conn.execute_batch("DELETE FROM qiita_lake.reference_exclusion;")
+            .unwrap();
+
+        // Seed a stale row the wholesale replace must drop.
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.reference_exclusion (feature_idx) VALUES ({stale});"
+        ))
+        .unwrap();
+
+        // The CP's blocklist Parquet: a single BIGINT `feature_idx` column,
+        // written by DuckDB so the type matches the table exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("reference_exclusion.parquet");
+        let src_str = src.to_str().unwrap();
+        {
+            let writer = Connection::open_in_memory().unwrap();
+            writer
+                .execute_batch(&format!(
+                    "COPY (SELECT * FROM (VALUES ({feat_a}::BIGINT), ({feat_b}::BIGINT)) \
+                         t(feature_idx)) \
+                     TO '{src_str}' (FORMAT PARQUET)"
+                ))
+                .unwrap();
+        }
+
+        let contents = || -> Vec<i64> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT feature_idx FROM qiita_lake.reference_exclusion ORDER BY feature_idx",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows
+        };
+
+        // The tempdir is the scratch root the handler contains reads to.
+        let root = dir.path();
+
+        let first =
+            sync_reference_exclusion(&connstr, &data_path, &src, root).expect("sync failed");
+        assert_eq!(
+            first["feature_count"], 2,
+            "two rows loaded from the parquet"
+        );
+        assert_eq!(
+            contents(),
+            vec![feat_a, feat_b],
+            "mirror is exactly the parquet's rows — the stale row was dropped"
+        );
+
+        // Idempotency: re-running with the same file converges to the same table.
+        let second =
+            sync_reference_exclusion(&connstr, &data_path, &src, root).expect("re-sync failed");
+        assert_eq!(second["feature_count"], 2, "same load on replay");
+        assert_eq!(
+            contents(),
+            vec![feat_a, feat_b],
+            "table unchanged on replay"
+        );
+
+        // An empty blocklist Parquet clears the mirror (re-enables everything).
+        let empty = dir.path().join("empty.parquet");
+        let empty_str = empty.to_str().unwrap();
+        {
+            let writer = Connection::open_in_memory().unwrap();
+            writer
+                .execute_batch(&format!(
+                    "COPY (SELECT 0::BIGINT AS feature_idx WHERE false) \
+                     TO '{empty_str}' (FORMAT PARQUET)"
+                ))
+                .unwrap();
+        }
+        let cleared = sync_reference_exclusion(&connstr, &data_path, &empty, root)
+            .expect("clear sync failed");
+        assert_eq!(cleared["feature_count"], 0, "empty parquet loads zero rows");
+        assert!(contents().is_empty(), "mirror cleared by the empty replace");
+
+        // Symlink containment: a dest UNDER the scratch root that resolves
+        // OUTSIDE it (a planted symlink) is rejected before any read — the
+        // lexical `starts_with` check would have passed it. Guards the global
+        // mirror against a redirected read of an attacker-planted Parquet.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_pq = outside.path().join("evil.parquet");
+        {
+            let writer = Connection::open_in_memory().unwrap();
+            writer
+                .execute_batch(&format!(
+                    "COPY (SELECT 999999::BIGINT AS feature_idx) TO '{}' (FORMAT PARQUET)",
+                    outside_pq.to_str().unwrap()
+                ))
+                .unwrap();
+        }
+        let planted = dir.path().join("planted.parquet");
+        std::os::unix::fs::symlink(&outside_pq, &planted).unwrap();
+        let escaped = sync_reference_exclusion(&connstr, &data_path, &planted, root);
+        assert_eq!(
+            escaped.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "a dest resolving outside the scratch root must be rejected"
+        );
+        // And the mirror is untouched by the rejected attempt.
+        assert!(
+            contents().is_empty(),
+            "rejected escape left the mirror empty"
+        );
+    }
+
     /// `export_read_to_parquet` writes one sample's full reads from the DuckLake
     /// `read` table to a Parquet drop-in: the 7-col schema with `qual` as
     /// UTINYINT[], the seeded rows, mode 0o440. An unknown sample writes NO file
@@ -4453,13 +4775,26 @@ mod tests {
     }
 
     #[test]
-    fn alignment_is_doget_allowed() {
-        // The feature-table consumer reads the alignment sink over DoGet; do_get
-        // gates on ALLOWED_TABLES, and the (alignment_idx, prep_sample_idx)
-        // scoping predicate needs alignment_idx as an allowed filter column.
+    fn exclusion_views_are_doget_allowed_and_raw_bases_are_not() {
+        // The alignment / taxonomy DoGet surfaces are the exclusion-aware VIEWS,
+        // never the raw base tables — so a curated exclusion cannot be bypassed
+        // by any consumer (the read_masked-over-read model). do_get gates on
+        // ALLOWED_TABLES, so the raw names being absent makes them Flight-unreachable.
         assert!(
-            ALLOWED_TABLES.contains(&"alignment"),
-            "alignment must be DoGet-readable for the feature-table consumer"
+            ALLOWED_TABLES.contains(&"alignment_visible"),
+            "alignment_visible must be DoGet-readable for the feature-table consumer"
+        );
+        assert!(
+            ALLOWED_TABLES.contains(&"reference_taxonomy_visible"),
+            "reference_taxonomy_visible must be DoGet-readable for the shard planner"
+        );
+        assert!(
+            !ALLOWED_TABLES.contains(&"alignment"),
+            "raw alignment must NOT be Flight-reachable (bypasses exclusion)"
+        );
+        assert!(
+            !ALLOWED_TABLES.contains(&"reference_taxonomy"),
+            "raw reference_taxonomy must NOT be Flight-reachable (bypasses exclusion)"
         );
         assert!(
             ALLOWED_FILTER_COLUMNS.contains(&"alignment_idx"),
@@ -4468,12 +4803,40 @@ mod tests {
     }
 
     #[test]
-    fn build_query_alignment_projects_and_scopes() {
-        // The feature-table DoGet scopes the alignment sink to one alignment_idx
-        // + an explicit prep_sample_idx set, projected to only the columns the
-        // coverage + woltka_ogu computation needs. Projection pushdown: the wide
-        // tag_* / mate_* columns never cross the wire. alignment has native
-        // alignment_idx / prep_sample_idx columns, so there is no membership JOIN.
+    fn build_query_raw_alignment_is_not_the_doget_surface() {
+        // Inverted canary: the raw base table is NOT the alignment DoGet surface
+        // (only `alignment_visible` is). do_get can't reach it (out of
+        // ALLOWED_TABLES), but build_query is a pure function tested directly — so
+        // this pins the deliberate design that if `"alignment"` were ever re-added
+        // to ALLOWED_TABLES by mistake, it would fall through to a bare, unscoped
+        // `SELECT *` (an obviously-malformed dump, loudly wrong), NOT a clean
+        // projected result that silently bypasses exclusion.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(7)],
+        );
+        let (sql, table) = build_query("alignment", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.alignment");
+        assert!(
+            sql.starts_with("SELECT * FROM qiita_lake.alignment WHERE"),
+            "raw alignment must NOT get the projection — expected a bare SELECT *, got: {sql}"
+        );
+        // And no mandatory-scope guard: an empty filter is not refused (unlike the
+        // view), further proof it is not the special surface.
+        let empty = auth::TicketFilter::new();
+        assert!(
+            build_query("alignment", &empty).is_ok(),
+            "raw alignment gets no alignment_idx requirement (it is not the surface)"
+        );
+    }
+
+    #[test]
+    fn build_query_alignment_visible_gets_projection_and_scope() {
+        // The exclusion-aware view is the ONLY Flight-reachable alignment name and
+        // the sole alignment DoGet surface: projected to the coverage/OGU columns,
+        // scoped by alignment_idx, no membership JOIN — the query targets the view,
+        // so the anti-join drops blocked features before projection.
         let mut filter = auth::TicketFilter::new();
         filter.insert(
             "alignment_idx".to_string(),
@@ -4483,59 +4846,74 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(3), serde_json::Value::from(4)],
         );
-        let (sql, table) = build_query("alignment", &filter).unwrap();
-        assert_eq!(table, "qiita_lake.alignment");
+        let (sql, table) = build_query("alignment_visible", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.alignment_visible");
         assert!(
             sql.starts_with(
                 "SELECT prep_sample_idx, sequence_idx, feature_idx, flags, position, \
-                 stop_position FROM qiita_lake.alignment WHERE"
+                 stop_position FROM qiita_lake.alignment_visible WHERE"
             ),
-            "expected a projected select of the coverage/OGU columns, got: {sql}"
+            "the view must get the projected coverage/OGU columns, got: {sql}"
         );
         assert!(sql.contains("alignment_idx IN (7)"), "got: {sql}");
         assert!(sql.contains("prep_sample_idx IN (3,4)"), "got: {sql}");
         assert!(
             !sql.contains("JOIN"),
-            "alignment has native columns, no membership JOIN, got: {sql}"
+            "no membership JOIN for the view, got: {sql}"
         );
-        assert!(
-            !sql.contains("SELECT *"),
-            "must project, not SELECT *, got: {sql}"
-        );
+        assert!(!sql.contains("SELECT *"), "must project, got: {sql}");
     }
 
     #[test]
-    fn build_query_alignment_rejects_empty_filter() {
-        // An unscoped alignment DoGet would dump the entire sink; the CP always
-        // scopes to (alignment_idx, prep_sample_idx), so refuse an empty filter
-        // (defense-in-depth, matching read_masked).
-        let empty = auth::TicketFilter::new();
-        assert!(
-            build_query("alignment", &empty).is_err(),
-            "empty filter on alignment must be rejected"
-        );
-    }
-
-    #[test]
-    fn build_query_alignment_requires_alignment_idx() {
-        // A feature table is built for ONE alignment run. `alignment_idx` is
-        // dropped from the projection, so a ticket that omits it would blend rows
-        // from multiple runs with no column to tell them apart — refuse it.
+    fn build_query_alignment_visible_requires_alignment_idx() {
+        // The scoping guard applies to the view too — an omitted alignment_idx is
+        // refused, so a ticket can't blend heterogeneous runs through the view.
         let mut filter = auth::TicketFilter::new();
         filter.insert(
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(3)],
         );
         assert!(
-            build_query("alignment", &filter).is_err(),
-            "alignment DoGet without alignment_idx must be rejected"
+            build_query("alignment_visible", &filter).is_err(),
+            "alignment_visible without alignment_idx must be rejected"
+        );
+        let empty = auth::TicketFilter::new();
+        assert!(
+            build_query("alignment_visible", &empty).is_err(),
+            "empty filter on alignment_visible must be rejected"
         );
     }
 
     #[test]
-    fn build_query_alignment_rejects_multivalued_alignment_idx() {
-        // Same rationale: several alignment_idx values would blend heterogeneous
-        // runs into one projected, indistinguishable stream — refuse it.
+    fn build_query_taxonomy_visible_scopes_by_reference_idx_direct() {
+        // The taxonomy view carries reference_idx (SELECT t.* over the base), so a
+        // reference-scoped DoGet is a direct WHERE — no membership JOIN — and it
+        // streams every column of the view (the anti-join having dropped blocked
+        // features' rows).
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
+        let (sql, table) = build_query("reference_taxonomy_visible", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.reference_taxonomy_visible");
+        assert_eq!(
+            sql,
+            "SELECT * FROM qiita_lake.reference_taxonomy_visible WHERE reference_idx IN (42)"
+        );
+        assert!(
+            !sql.contains("JOIN"),
+            "taxonomy has reference_idx, no JOIN: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_alignment_visible_rejects_multivalued_alignment_idx() {
+        // A feature table is built for ONE alignment run; alignment_idx is dropped
+        // from the projection, so several values would blend heterogeneous runs
+        // into one indistinguishable stream — refuse it. (The empty-filter and
+        // missing-alignment_idx rejections are covered by
+        // build_query_alignment_visible_requires_alignment_idx.)
         let mut filter = auth::TicketFilter::new();
         filter.insert(
             "alignment_idx".to_string(),
@@ -4546,17 +4924,20 @@ mod tests {
             vec![serde_json::Value::from(3)],
         );
         assert!(
-            build_query("alignment", &filter).is_err(),
-            "alignment DoGet with multi-valued alignment_idx must be rejected"
+            build_query("alignment_visible", &filter).is_err(),
+            "alignment_visible DoGet with multi-valued alignment_idx must be rejected"
         );
     }
 
     #[tokio::test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
-    async fn build_query_alignment_streams_projected_columns() {
-        // End-to-end: the projected column list must match the real alignment
-        // schema, and the prep_sample_idx scope must exclude out-of-cohort rows.
+    async fn build_query_alignment_visible_streams_projected_columns() {
+        // End-to-end through the VIEW (the only Flight-reachable alignment name):
+        // the projected column list must match the real alignment schema, and the
+        // prep_sample_idx scope must exclude out-of-cohort rows. No exclusions are
+        // seeded here (a sibling test covers the anti-join); this pins projection +
+        // scope over the view.
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
 
@@ -4567,7 +4948,11 @@ mod tests {
         {
             let conn = Connection::open_in_memory().unwrap();
             ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            // alignment_visible is a view over alignment; ensure_exclusion_tables
+            // creates it (and needs reference_taxonomy + alignment to exist first).
+            ducklake::ensure_reference_tables(&conn).unwrap();
             ducklake::ensure_alignment_tables(&conn).unwrap();
+            ducklake::ensure_exclusion_tables(&conn).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
                  INSERT INTO qiita_lake.alignment \
@@ -4592,7 +4977,7 @@ mod tests {
                 serde_json::Value::from(prep_b),
             ],
         );
-        let (sql, table) = build_query("alignment", &filter).unwrap();
+        let (sql, table) = build_query("alignment_visible", &filter).unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -4629,6 +5014,88 @@ mod tests {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};"
+        ));
+    }
+
+    /// The Flight query path over `alignment_visible` drops a blocked feature's
+    /// rows before they stream: seed two features under one alignment run, block
+    /// one in the exclusion mirror, and assert only the unblocked feature's row
+    /// survives the projected DoGet query (the anti-join enforced at read time,
+    /// no aligner index rebuilt). This is the alignment half of the Phase 5 swap
+    /// exercised end-to-end through `build_query` + `stream_ducklake_batches`.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn alignment_visible_doget_omits_blocked_feature() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let align: i64 = 976_000;
+        let prep: i64 = 976_010;
+        let feat_keep: i64 = 976_100;
+        let feat_blocked: i64 = 976_101;
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_alignment_tables(&conn).unwrap();
+            ducklake::ensure_exclusion_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
+                 DELETE FROM qiita_lake.reference_exclusion \
+                     WHERE feature_idx IN ({feat_keep}, {feat_blocked});
+                 INSERT INTO qiita_lake.alignment \
+                     (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, \
+                      flags, position, stop_position) VALUES \
+                     ({align}, {prep}, 1, {feat_keep}, 0, 100, 200), \
+                     ({align}, {prep}, 2, {feat_blocked}, 0, 300, 400);
+                 INSERT INTO qiita_lake.reference_exclusion (feature_idx) VALUES ({feat_blocked});"
+            ))
+            .unwrap();
+        }
+
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(align)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let (sql, table) = build_query("alignment_visible", &filter).unwrap();
+        let batches: Vec<arrow_array::RecordBatch> =
+            stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item should be Ok"))
+                .collect();
+
+        // Only the unblocked feature's row survives the anti-join.
+        let feature_col: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column_by_name("feature_idx")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            feature_col,
+            vec![feat_keep],
+            "the blocked feature's alignment row must not stream through the view"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
+             DELETE FROM qiita_lake.reference_exclusion WHERE feature_idx = {feat_blocked};"
         ));
     }
 
