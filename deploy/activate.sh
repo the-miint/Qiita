@@ -197,11 +197,16 @@ echo "data plane instances: $DP_PORTS"
 DP_PEERS=$(qiita_data_plane_peers)
 if [ -n "$DP_PEERS" ]; then
     echo "data plane peers (remote, not managed here): $DP_PEERS"
+    # Resolve every peer HERE rather than letting `nginx -t` catch it further
+    # down, which runs after the restarts — see qiita_assert_peer_resolves.
+    for peer in $DP_PEERS; do
+        qiita_assert_peer_resolves "$peer"
+    done
 fi
 
-cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
-sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
-sed -i "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" /etc/nginx/conf.d/qiita.conf
+cp "$INCOMING/deploy/nginx/qiita.conf" "$QIITA_NGINX_CONF"
+sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" "$QIITA_NGINX_CONF"
+sed -i "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" "$QIITA_NGINX_CONF"
 
 # Render the upstream member lines from the instance list. Built as a file and
 # spliced with `sed -e /pat/r` rather than an in-place substitution because the
@@ -217,7 +222,7 @@ for peer in $DP_PEERS; do
     printf '    server %s;\n' "$peer" >>"$DP_UPSTREAM"
 done
 sed -i -e "/__QIITA_DATA_PLANE_UPSTREAM__/r $DP_UPSTREAM" \
-       -e "/__QIITA_DATA_PLANE_UPSTREAM__/d" /etc/nginx/conf.d/qiita.conf
+       -e "/__QIITA_DATA_PLANE_UPSTREAM__/d" "$QIITA_NGINX_CONF"
 rm -f "$DP_UPSTREAM"
 cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/
 # Install systemd dropin directories. Each dropin lives under

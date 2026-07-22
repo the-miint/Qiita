@@ -63,7 +63,12 @@ duplicates further down are historical strata; leave them where they are.
   "which entries get a unit" a parsing question and would have tried to restart a
   unit named after a remote host. Peer entries are shape-validated before any
   config is written (they land verbatim in an nginx `server` directive) and each
-  gets its own `verify-deploy` health row. Note peer traffic is plaintext gRPC —
+  gets its own `verify-deploy` health row, and a peer hostname that does not
+  resolve aborts the deploy before any service restarts rather than at the
+  `nginx -t` that runs after them. `verify-deploy` reads its member list from
+  the rendered nginx config rather than the env lists, so it checks what is
+  actually being served instead of what the verifying shell happens to have
+  exported. Note peer traffic is plaintext gRPC —
   `grpc_pass`'s scheme is per-directive, not per-member, so a peer belongs only on
   a trusted network. (#359)
 - **Block-read DoGet: block-scoped compute jobs stream their reads.** New

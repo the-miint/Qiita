@@ -233,6 +233,199 @@ def test_data_plane_peers_treats_whitespace_only_as_unset(blank: str) -> None:
     assert result.stdout == ""
 
 
+def _render_upstream_conf(tmp_path: Path, ports: list[str], peers: list[str]) -> Path:
+    """Render deploy/nginx/qiita.conf the way activate.sh does, so the parser test
+    reads a REAL config (sibling upstreams and all) rather than a hand-made stub."""
+    template = (_DEPLOY / "nginx" / "qiita.conf").read_text()
+    members = "".join(f"    server 127.0.0.1:{p};\n" for p in ports)
+    members += "".join(f"    server {p};\n" for p in peers)
+    rendered = template.replace("__QIITA_DATA_PLANE_UPSTREAM__\n", members)
+    rendered = rendered.replace("__QIITA_HOSTNAME__", "example.org")
+    rendered = rendered.replace("__QIITA_DATA_PLANE_LB_PORT__", "50050")
+    conf = tmp_path / "qiita.conf"
+    conf.write_text(rendered)
+    return conf
+
+
+def _call_rendered_members(conf: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_data_plane_rendered_members "$1"', "_", conf],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_rendered_members_reads_locals_and_peers_from_the_deployed_config(
+    tmp_path: Path,
+) -> None:
+    """verify.sh derives its health targets from the RENDERED config, not the env
+    lists — an operator who forgets to re-export must not get a green run that
+    checked nothing. This pins that the parse returns exactly what nginx serves."""
+    conf = _render_upstream_conf(
+        tmp_path, ["50051", "50052"], ["dp2.internal:50051", "[2001:db8::1]:50052"]
+    )
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "127.0.0.1:50051",
+        "127.0.0.1:50052",
+        "dp2.internal:50051",
+        "[2001:db8::1]:50052",
+    ]
+
+
+def test_rendered_members_ignores_the_sibling_control_plane_upstream(
+    tmp_path: Path,
+) -> None:
+    """`upstream qiita_control_plane { server 127.0.0.1:8080; }` lives in the same
+    file. Picking it up would health-check the CP as if it were a data plane."""
+    conf = _render_upstream_conf(tmp_path, ["50051"], [])
+    assert "qiita_control_plane" in conf.read_text(), "fixture no longer has the sibling"
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["127.0.0.1:50051"]
+
+
+def test_rendered_members_signals_fallback_when_config_is_absent(tmp_path: Path) -> None:
+    """rc 1 = "no config" ⇒ verify.sh falls back to the env lists. That is the real
+    state on a first deploy, before nginx has ever been configured."""
+    result = _call_rendered_members(str(tmp_path / "does-not-exist.conf"))
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_rendered_members_distinguishes_unparseable_from_absent(tmp_path: Path) -> None:
+    """rc 2 = "config present, nothing parsed" — a DIFFERENT outcome from absent.
+
+    Collapsing the two would reopen the hole this parse exists to close: env on a
+    verify shell that never re-exported is the single default port, so falling back
+    on a broken parse would turn a five-member host into one green row. rc 2 makes
+    verify.sh fail the check instead.
+    """
+    conf = tmp_path / "qiita.conf"
+    conf.write_text("upstream qiita_control_plane {\n    server 127.0.0.1:8080;\n}\n")
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "no 'upstream qiita_data_plane' members" in result.stderr
+
+
+def test_rendered_members_ignores_upstream_server_parameters(tmp_path: Path) -> None:
+    """An upstream `server` may carry parameters; only the address is a valid
+    health-check target. activate.sh emits none today — this pins that adding one
+    later cannot turn the target into `127.0.0.1:50051 max_fails=3`."""
+    conf = tmp_path / "qiita.conf"
+    conf.write_text(
+        "upstream qiita_data_plane {\n    server 127.0.0.1:50051 max_fails=3 fail_timeout=30s;\n}\n"
+    )
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["127.0.0.1:50051"]
+
+
+def _call_peer_resolves(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ}
+    if stub_dir is not None:
+        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_assert_peer_resolves "$1"', "_", peer],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+@pytest.fixture
+def getent_stub(tmp_path: Path) -> str:
+    """A stand-in for glibc's getent that resolves only `good.internal`.
+
+    getent does not exist on macOS, so without a stub the resolvable and
+    unresolvable cases are indistinguishable here — both would take the
+    tool-absent path and the test would pass without testing anything.
+    """
+    d = tmp_path / "stub"
+    d.mkdir()
+    (d / "getent").write_text(
+        '#!/bin/sh\n[ "$1" = hosts ] && [ "$2" = good.internal ] && exit 0\nexit 2\n'
+    )
+    (d / "getent").chmod(0o755)
+    return str(d)
+
+
+def test_peer_resolves_accepts_a_resolvable_host(getent_stub: str) -> None:
+    result = _call_peer_resolves("good.internal:50051", getent_stub)
+    assert result.returncode == 0, result.stderr
+
+
+def test_peer_resolves_rejects_an_unresolvable_host(getent_stub: str) -> None:
+    """An unresolvable peer must abort in activate.sh, where the shape check runs —
+    NOT at `nginx -t`, which happens after every service has already restarted."""
+    result = _call_peer_resolves("bad.internal:50051", getent_stub)
+    assert result.returncode != 0
+    assert "does not resolve" in result.stderr
+
+
+@pytest.mark.parametrize("peer", ["10.0.0.7:50051", "[2001:db8::1]:50051"])
+def test_peer_resolves_accepts_ip_literals_without_lookup(peer: str, getent_stub: str) -> None:
+    """IP literals need no DNS. The bracketed v6 case matters: getent does not
+    resolve `[::1]`, so looking it up would reject a perfectly valid peer."""
+    result = _call_peer_resolves(peer, getent_stub)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "999.999.999.999",  # digits and dots, but not an address
+        "10.0.0.256",  # one octet out of range
+        "1.2.3",  # too few octets
+        "1.2.3.4.5",  # too many
+    ],
+)
+def test_peer_resolves_does_not_shortcut_invalid_dotted_quads(host: str, getent_stub: str) -> None:
+    """A digits-and-dots string that is not a valid address is a HOSTNAME to nginx,
+    which then fails to resolve it at config load — after the restarts. So these
+    must fall through to the lookup and be rejected here, not short-circuited as
+    'it's an IP literal, no lookup needed'."""
+    result = _call_peer_resolves(f"{host}:50051", getent_stub)
+    assert result.returncode != 0, f"{host!r} wrongly took the IP-literal shortcut"
+    assert "does not resolve" in result.stderr
+
+
+def test_activate_resolves_peers_before_writing_config_and_restarting() -> None:
+    """The whole value of the pre-resolve check is WHERE it runs.
+
+    Asserting the call ordering in activate.sh's source, because that ordering is
+    the feature: resolving after the config write (or worse, after the restarts)
+    would be no better than letting `nginx -t` catch it.
+    """
+    src = (_DEPLOY / "activate.sh").read_text()
+    call = src.index("qiita_assert_peer_resolves")
+    write = src.index('cp "$INCOMING/deploy/nginx/qiita.conf"')
+    restart = src.index("systemctl restart")
+    assert call < write, "peer resolution must run before the nginx config is written"
+    assert call < restart, "peer resolution must run before any service restart"
+
+
+def test_peer_resolves_skips_when_getent_is_unavailable(tmp_path: Path) -> None:
+    """No getent ⇒ skip, not fail. This check only moves an nginx-parse failure
+    earlier; missing tooling must never be the thing that blocks a deploy."""
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    bash = shutil.which("bash")
+    assert bash, "bash not found"
+    result = subprocess.run(
+        # bash by ABSOLUTE path: the empty PATH is meant to hide getent from the
+        # script, not to hide the interpreter from subprocess.
+        [bash, "-c", f'source "{_COMMON}"; qiita_assert_peer_resolves "$1"', "_", "bad.internal:1"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": str(empty)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "getent unavailable" in result.stderr
+
+
 def test_upstream_render_places_peers_after_local_instances() -> None:
     """The rendered nginx upstream carries locals as 127.0.0.1:<port> and peers
     verbatim, locals first.

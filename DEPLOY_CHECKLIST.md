@@ -96,20 +96,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
   ⚠️ **Peer traffic is plaintext gRPC.** The upstream is consumed by `grpc_pass grpc://` and the scheme is per-`grpc_pass`, not per-member, so a peer cannot use TLS while the loopback members stay plaintext. Only add a peer reachable over a network you control (private VLAN / VPC / WireGuard) — never across the public internet. Flight tickets stay Ed25519-signed, so a peer cannot be fed forged identifiers, but the payload on the wire is unencrypted.
 
+  A peer hostname that does not resolve aborts the deploy **before** any service restarts, rather than at the `nginx -t` that runs after them. (Skipped where `getent` is unavailable, e.g. a macOS dev box.)
+
   **Removing a peer IS automatic**, unlike removing a local instance: drop it from `QIITA_DATA_PLANE_PEERS` and redeploy, and it leaves the upstream at the next render — there is no unit here to disable. Stopping the peer host's own instances is that host's deploy.
 
 
 ### 5. Verify
 
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
-- **Per-instance data-plane health + the balancer.** `make verify-deploy` now health-checks every port in `QIITA_DATA_PLANE_PORTS` individually, plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down — and nginx would keep routing a share of every job's traffic into it. Export the same `QIITA_DATA_PLANE_PORTS` you deployed with, or it only checks `50051`. (#359)
+- **Per-member data-plane health + the balancer.** `make verify-deploy` now health-checks every upstream member individually — local instances *and* remote peers — plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down, with nginx still routing a share of every job's traffic into it. **You do not need to re-export anything:** the member list is read from the rendered `/etc/nginx/conf.d/qiita.conf`, i.e. what nginx is actually serving, so a forgotten export cannot produce a green run that checked nothing. (It falls back to the env lists only when no config is rendered yet, as on a first deploy.) (#359)
 
   ```bash
-  # [admin]
-  sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+  # [admin] — no QIITA_DATA_PLANE_* needed; the member list comes from the rendered nginx config
+  sudo make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
   ```
 
-  Export `QIITA_DATA_PLANE_PEERS` too if you set it at deploy: each peer gets its own `health/data-plane-peer@<host:port>` row. A peer that is down fails the check rather than hiding behind the local instances, since nginx routes a share of every job's traffic into it either way. (#359)
+  Each peer gets its own `health/data-plane-peer@<host:port>` row; local instances stay `health/data-plane@<port>`. A peer that is down fails the check rather than hiding behind the local instances, since nginx routes a share of every job's traffic into it either way. (#359)
 
 ### 6. After the deploy verifies green
 

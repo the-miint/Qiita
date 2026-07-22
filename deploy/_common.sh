@@ -362,6 +362,117 @@ qiita_data_plane_peers() {
     printf '%s' "$peers"
 }
 
+# Is $1 exactly four decimal octets, each 0-255? Used to skip a DNS lookup for a
+# literal address. Deliberately strict: a digits-and-dots string that is NOT a
+# valid address (999.999.999.999, 1.2.3, 10.0.0.256) is a hostname as far as
+# nginx is concerned, so it must NOT take the literal short-circuit.
+qiita_is_ipv4_literal() {
+    local addr="$1" o1 o2 o3 o4 extra
+    IFS=. read -r o1 o2 o3 o4 extra <<<"$addr"
+    [ -z "$extra" ] || return 1
+    local o
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$o" -le 255 ] || return 1
+    done
+}
+
+# Abort unless a peer's host resolves. $1 = a validated `host:port` entry.
+#
+# Shape validation cannot cover this: `dp2`, `typo.internal`, and
+# `999.999.999.999` are all well-formed `host:port` and all fail only when nginx
+# parses the config. That parse is the LAST step of activate.sh, after every
+# service has restarted — so an unresolvable peer would otherwise abort a deploy
+# in its most awkward state. Called from activate.sh alongside the shape check,
+# before any config is written.
+#
+# An IP literal (v4 or bracketed v6) needs no lookup and is accepted as-is;
+# getent does not resolve a bracketed v6 literal, so testing it would fail a
+# perfectly valid peer.
+qiita_assert_peer_resolves() {
+    local peer="$1" host
+    case "$peer" in
+        \[*\]:*) return 0 ;;                       # bracketed IPv6 literal
+        *:*)     host="${peer%:*}" ;;
+        *)       echo "ERROR: '$peer' is not host:port" >&2; return 1 ;;
+    esac
+    # A real dotted-quad needs no lookup (getent hosts on an IP that has no PTR
+    # returns nothing, which would reject a perfectly good peer). Validate the
+    # OCTETS, not just the character class: `999.999.999.999` and `1.2.3` are
+    # digits-and-dots but are not addresses — nginx treats them as hostnames and
+    # fails to resolve them, so they must fall through to the lookup below and be
+    # caught here rather than at `nginx -t` after the restarts.
+    if qiita_is_ipv4_literal "$host"; then
+        return 0
+    fi
+    # getent is glibc — present on the Linux deploy hosts, absent on a macOS dev
+    # box. Skip rather than fail when it isn't there: this check only moves an
+    # nginx-parse failure earlier, so missing tooling must not be what blocks a
+    # deploy. Same posture as the grpcurl-optional health checks in verify.sh.
+    if ! command -v getent >/dev/null 2>&1; then
+        echo "NOTE: getent unavailable — cannot pre-resolve peer '$host'" >&2
+        return 0
+    fi
+    if ! getent hosts "$host" >/dev/null 2>&1; then
+        echo "ERROR: QIITA_DATA_PLANE_PEERS host '$host' does not resolve" >&2
+        echo "       (nginx resolves upstream names once at config load, and that" >&2
+        echo "        parse runs AFTER the service restarts — failing here instead)" >&2
+        return 1
+    fi
+}
+
+# The rendered nginx config. One definition: activate.sh writes it, verify.sh reads
+# the deployed member list back out of it, so the writer and the reader cannot name
+# different files (same reasoning as QIITA_DATA_PLANE_LB_PORT below).
+QIITA_NGINX_CONF="${QIITA_NGINX_CONF:-/etc/nginx/conf.d/qiita.conf}"
+
+# The data-plane upstream members nginx is ACTUALLY serving, one per line, read
+# from the rendered config. $1 = config path (default $QIITA_NGINX_CONF).
+#
+# Why parse the deployed file instead of re-reading the env lists: verify.sh runs
+# as a separate command from the deploy, so QIITA_DATA_PLANE_PORTS/_PEERS may be
+# unset or stale in the verifying shell even though nginx is happily balancing to
+# three instances and two peers. Deriving from env there means an operator who
+# forgets to re-export gets a GREEN run that checked nothing — the same
+# silently-skipped-check failure mode as putting the sweep in a fallback branch.
+# The rendered config is the one artifact that cannot disagree with what is live.
+#
+# Three outcomes, deliberately distinct — collapsing the last two would reopen the
+# hole this function exists to close:
+#   0 — members on stdout.
+#   1 — no config to read. The caller SHOULD fall back to the env lists; this is
+#       the legitimate first-deploy state, before nginx has ever been configured.
+#   2 — the config is there but no members parsed (block renamed, file truncated,
+#       parse broken). The caller must NOT fall back: env on a verify shell that
+#       never re-exported is the single default port, so falling back here would
+#       turn a five-member host into one green row — exactly the silently-checked-
+#       nothing failure this function was written to prevent.
+qiita_data_plane_rendered_members() {
+    local conf="${1:-$QIITA_NGINX_CONF}" members
+    [ -r "$conf" ] || return 1
+    # Bounded to the qiita_data_plane block specifically — qiita_control_plane is
+    # a sibling upstream in the same file and must not be picked up.
+    # $2 (not the rest of the line): an upstream `server` may carry parameters —
+    # `server 127.0.0.1:50051 max_fails=3;` — and the address is what we health-check.
+    # activate.sh emits none today, but taking $2 costs nothing and cannot regress.
+    members=$(awk '
+        /^[[:space:]]*upstream[[:space:]]+qiita_data_plane[[:space:]]*\{/ { inblock = 1; next }
+        inblock && /^[[:space:]]*\}/                                      { inblock = 0 }
+        inblock && /^[[:space:]]*server[[:space:]]/ {
+            addr = $2
+            sub(/;.*$/, "", addr)
+            if (addr != "") print addr
+        }
+    ' "$conf")
+    if [ -z "$members" ]; then
+        echo "ERROR: $conf has no 'upstream qiita_data_plane' members" >&2
+        return 2
+    fi
+    printf '%s\n' "$members"
+}
+
 # The loopback gRPC balancer port the ON-HOST control plane talks to (nginx →
 # the qiita_data_plane upstream). One definition, read by activate.sh's rendered
 # nginx config and by verify.sh's health check, so the listener and the check
