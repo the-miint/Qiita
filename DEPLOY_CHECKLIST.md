@@ -27,7 +27,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   echo "installed: $line"'
   ```
 
-- **`DATA_PLANE_URL` for the control plane** — point it at the new loopback gRPC balancer so CP-side Flight traffic spreads across data-plane instances instead of pinning to instance #1. Not fail-fast (unset falls back to `grpc://localhost:50051`, so the unit still boots) — but leaving it unset means horizontal scaling has no effect on CP traffic. Compute nodes are unaffected: `compute-orchestrator.env` already points at `grpc+tls://<fqdn>:443`, which nginx balances. (#PRSCALE)
+- **`DATA_PLANE_URL` for the control plane** — point it at the new loopback gRPC balancer so CP-side Flight traffic spreads across data-plane instances instead of pinning to instance #1. Not fail-fast (unset falls back to `grpc://localhost:50051`, so the unit still boots) — but leaving it unset means horizontal scaling has no effect on CP traffic. Compute nodes are unaffected: `compute-orchestrator.env` already points at `grpc+tls://<fqdn>:443`, which nginx balances. (#363)
 
   ```bash
   # [admin]
@@ -59,7 +59,7 @@ _None yet._
 
 ### 4. Deploy
 
-- **Optional — scale the data plane out on this host.** The local instance set is one knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (#PRSCALE)
+- **Optional — scale the data plane out on this host.** The local instance set is one knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (#363)
 
   ```bash
   # [admin] — one instance per ~core you want to give the data plane
@@ -75,7 +75,7 @@ _None yet._
   sudo systemctl disable --now qiita-data-plane@50053
   ```
 
-- **Optional — scale the data plane across HOSTS.** Extra processes on one box share its cores, memory, and NIC, so they stop helping once the box saturates; `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds data planes running on *other* hosts to the same nginx upstream. Local instances and peers are separate knobs because only the local list drives systemd here — a peer is another host's deploy, and this one neither starts, restarts, nor upgrades it. **You must deploy the peer host yourself** (same checkout, its own `QIITA_DATA_PLANE_PORTS`, and an env pointing at the SAME Postgres/DuckLake catalog and the same `PATH_SCRATCH`/`PATH_PERSISTENT` — a data plane serving a different lake would return wrong data, not an error). (#PRSCALE)
+- **Optional — scale the data plane across HOSTS.** Extra processes on one box share its cores, memory, and NIC, so they stop helping once the box saturates; `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds data planes running on *other* hosts to the same nginx upstream. Local instances and peers are separate knobs because only the local list drives systemd here — a peer is another host's deploy, and this one neither starts, restarts, nor upgrades it. **You must deploy the peer host yourself** (same checkout, its own `QIITA_DATA_PLANE_PORTS`, and an env pointing at the SAME Postgres/DuckLake catalog and the same `PATH_SCRATCH`/`PATH_PERSISTENT` — a data plane serving a different lake would return wrong data, not an error). (#363)
 
   ```bash
   # [admin] — three local instances plus two on a second host
@@ -93,7 +93,7 @@ _None yet._
 ### 5. Verify
 
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
-- **Per-member data-plane health + the balancer.** `make verify-deploy` now health-checks every upstream member individually — local instances *and* remote peers — plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down, with nginx still routing a share of every job's traffic into it. **You do not need to re-export anything:** the member list is read from the rendered `/etc/nginx/conf.d/qiita.conf`, i.e. what nginx is actually serving, so a forgotten export cannot produce a green run that checked nothing. (It falls back to the env lists only when no config is rendered yet, as on a first deploy.) (#PRSCALE)
+- **Per-member data-plane health + the balancer.** `make verify-deploy` now health-checks every upstream member individually — local instances *and* remote peers — plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down, with nginx still routing a share of every job's traffic into it. **You do not need to re-export anything:** the member list is read from the rendered `/etc/nginx/conf.d/qiita.conf`, i.e. what nginx is actually serving, so a forgotten export cannot produce a green run that checked nothing. (It falls back to the env lists only when no config is rendered yet, as on a first deploy.) (#363)
 
   ```bash
   # [admin] — no QIITA_DATA_PLANE_* needed; the member list comes from the rendered nginx config

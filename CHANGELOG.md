@@ -70,7 +70,7 @@ duplicates further down are historical strata; leave them where they are.
   actually being served instead of what the verifying shell happens to have
   exported. Note peer traffic is plaintext gRPC —
   `grpc_pass`'s scheme is per-directive, not per-member, so a peer belongs only on
-  a trusted network. (#PRSCALE)
+  a trusted network. (#363)
 - **Pool / run summary + rollup endpoints (#236).** Server-side aggregation so
   callers stop paging the per-sample list route and tallying by hand. All
   compute-on-read (never drifts), no migration. (1) `PoolReadMetrics` gains a
@@ -235,7 +235,7 @@ duplicates further down are historical strata; leave them where they are.
   the SHARED `/etc/qiita/data-plane.env` would have overridden the per-instance
   value for every instance and collapsed them all onto one port. Latent until
   now (the live host leaves it unset), and a trap for the first operator to scale
-  out. The per-instance assignment now comes last. (#PRSCALE)
+  out. The per-instance assignment now comes last. (#363)
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
