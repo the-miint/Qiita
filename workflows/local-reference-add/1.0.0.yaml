@@ -150,16 +150,6 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
-  # Post-load exclusion sync — identical to reference-add's post-register step.
-  # Re-resolves the GLOBAL curated blocklist and REPLACES the data plane's
-  # DuckLake `reference_exclusion` mirror wholesale (idempotent, replay-safe), so
-  # a fresh assembly of an already-blocked genome is caught by the re-resolve.
-  # Unconditional; MUST follow register-files. See reference-add/1.0.0.yaml and
-  # qiita_control_plane.actions.library.sync_reference_exclusion.
-  - action: sync-reference-exclusion
-    inputs: []
-    outputs: []
-
   # Sharded-index fan-out (opt-in) — identical to reference-add's plan-shards
   # tail. Runs only when shard_index: true; MUST follow register-files (shard
   # builds stream chunks from DuckLake). See reference-add/1.0.0.yaml for the
@@ -196,6 +186,20 @@ steps:
 
   - action: finalize-shard
     when: router_pending
+    inputs: []
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step, identical to reference-add's tail
+  # sync (see that file for the full rationale). Re-resolves the GLOBAL curated
+  # blocklist and REPLACES the data plane's DuckLake `reference_exclusion` mirror
+  # wholesale (idempotent, replay-safe), so a fresh assembly of an already-blocked
+  # genome is caught by the re-resolve. Unconditional; MUST follow register-files
+  # and is placed DEAD LAST — after the sharded fan-out and its register-index —
+  # so a transient sync FlightError can never strand an already-built index
+  # unregistered. On the unsharded path every step above is skipped
+  # (when: router_pending), so sync still effectively runs right after
+  # register-files. See qiita_control_plane.actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
     inputs: []
     outputs: []
 

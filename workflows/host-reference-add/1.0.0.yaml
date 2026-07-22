@@ -192,18 +192,6 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
-  # Post-load exclusion sync — identical to reference-add's post-register step. A
-  # host reference loads taxonomy into `reference_taxonomy` (hence the
-  # `reference_taxonomy_visible` anti-join view) and can carry a genome_map, so a
-  # fresh assembly of an already-blocked genome must re-materialize the DuckLake
-  # `reference_exclusion` mirror here too — otherwise the "future references
-  # inherit the block" guarantee would not hold on the host-ref load path.
-  # Unconditional; MUST follow register-files. See reference-add/1.0.0.yaml and
-  # qiita_control_plane.actions.library.sync_reference_exclusion.
-  - action: sync-reference-exclusion
-    inputs: []
-    outputs: []
-
   # One register-index per builder. The runner's register-index arm reads
   # bound[entry.inputs[0]] (native-step outputs are path strings, so the build
   # params ride a meta JSON file), so each step's `inputs` selects which index
@@ -218,6 +206,23 @@ steps:
   - action: register-index
     inputs: [minimap2_index_meta]
     when: build_minimap2
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step (see reference-add/1.0.0.yaml for the
+  # full rationale). A host reference loads taxonomy into `reference_taxonomy`
+  # (hence the `reference_taxonomy_visible` anti-join view) and can carry a
+  # genome_map, so a fresh assembly of an already-blocked genome must
+  # re-materialize the DuckLake `reference_exclusion` mirror here too — otherwise
+  # the "future references inherit the block" guarantee would not hold on the
+  # host-ref load path. Unconditional; MUST follow register-files, and placed DEAD
+  # LAST — after both register-index — so a transient sync FlightError can never
+  # strand an already-built rype/minimap2 index unregistered: the expensive builds
+  # and their registration complete and persist before this best-effort side step
+  # (its primitive swallows a transient failure rather than failing the ticket —
+  # see reference-add/1.0.0.yaml and the primitive docstring).
+  # See qiita_control_plane.actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
+    inputs: []
     outputs: []
 
 action_ceiling:

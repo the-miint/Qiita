@@ -187,14 +187,67 @@ async def test_add_is_idempotent(ref):
     assert count == 1
 
 
-async def test_remove_unblocks_and_reports_rows(ref):
-    """remove returns rows deleted; a second remove returns 0; resolve empties."""
+async def test_remove_is_a_soft_delete_and_reports_rows(ref):
+    """remove SOFT-deletes: the row is kept and stamped unblocked_at/unblocked_by;
+    it reports 1 affected, a second remove reports 0 (idempotent), resolve empties,
+    and the curatorial record (who/when) survives."""
+    pool = ref["pool"]
+    actor = ref["principal_idx"]
+    feat = await _seed_feature(ref)
+    await add_exclusion(pool, feature_idx=feat, reason="bad", excluded_by_idx=actor)
+    assert await remove_exclusion(pool, feature_idx=feat, unblocked_by_idx=actor) == 1
+    assert await remove_exclusion(pool, feature_idx=feat, unblocked_by_idx=actor) == 0
+    assert await resolve_excluded_features(pool) == []
+    # Soft delete: the row persists with the unblock stamped, not a hard DELETE.
+    row = await pool.fetchrow(
+        "SELECT unblocked_at, unblocked_by_idx FROM qiita.reference_exclusion"
+        " WHERE feature_idx = $1",
+        feat,
+    )
+    assert row is not None
+    assert row["unblocked_at"] is not None
+    assert row["unblocked_by_idx"] == ref["principal_idx"]
+
+
+async def test_reblock_after_unblock_creates_a_new_active_row(ref):
+    """Re-blocking a soft-deleted entity inserts a FRESH active row (changed=True)
+    and re-arms resolution — the active partial unique excludes the historical
+    unblocked row, so both coexist (a durable block/unblock/re-block trail)."""
     pool = ref["pool"]
     feat = await _seed_feature(ref)
-    await add_exclusion(pool, feature_idx=feat, reason="bad", excluded_by_idx=ref["principal_idx"])
-    assert await remove_exclusion(pool, feature_idx=feat) == 1
-    assert await remove_exclusion(pool, feature_idx=feat) == 0
-    assert await resolve_excluded_features(pool) == []
+    assert await add_exclusion(
+        pool, feature_idx=feat, reason="first", excluded_by_idx=ref["principal_idx"]
+    )
+    await remove_exclusion(pool, feature_idx=feat, unblocked_by_idx=ref["principal_idx"])
+    # Re-block: not a conflict (the prior row is unblocked), so a new active row.
+    assert await add_exclusion(
+        pool, feature_idx=feat, reason="again", excluded_by_idx=ref["principal_idx"]
+    )
+    assert await resolve_excluded_features(pool) == [feat]
+    total = await pool.fetchval(
+        "SELECT count(*) FROM qiita.reference_exclusion WHERE feature_idx = $1", feat
+    )
+    active = await pool.fetchval(
+        "SELECT count(*) FROM qiita.reference_exclusion"
+        " WHERE feature_idx = $1 AND unblocked_at IS NULL",
+        feat,
+    )
+    assert (total, active) == (2, 1)
+
+
+async def test_db_check_rejects_out_of_bounds_reason(ref):
+    """The reason length CHECK is the backstop for a raw INSERT (empty or
+    over-long) bypassing the Pydantic bound."""
+    pool = ref["pool"]
+    feat = await _seed_feature(ref)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await pool.execute(
+            "INSERT INTO qiita.reference_exclusion (feature_idx, reason, excluded_by_idx)"
+            " VALUES ($1, $2, $3)",
+            feat,
+            "x" * 2001,
+            ref["principal_idx"],
+        )
 
 
 async def test_add_requires_exactly_one_target(ref):
@@ -264,31 +317,62 @@ async def test_list_for_reference_feature_block_carries_accession(ref):
     assert r["via_genome"] is False
 
 
-async def test_deleting_a_blocked_feature_cascades_the_exclusion(ref):
-    """ON DELETE CASCADE: hard-deleting a feature (as delete_reference_cascade's
-    orphan-GC does) removes its block — a block on a feature that no longer
-    exists is moot. Documented accepted tradeoff (see the migration comment)."""
+async def test_direct_feature_block_survives_feature_deletion(ref):
+    """A block SURVIVES hard-deletion of its feature (targets are NOT foreign
+    keys). delete_reference_cascade's orphan-GC can drop the feature row, but the
+    block persists — and since feature_idx is content-hash-stable, a direct
+    feature block still resolves immediately (ready to re-mask the moment the same
+    bytes are re-ingested). "I blocked this, it stays blocked."""
     pool = ref["pool"]
     feat = await _seed_feature(ref, in_reference=False)
     await add_exclusion(pool, feature_idx=feat, reason="bad", excluded_by_idx=ref["principal_idx"])
     await pool.execute("DELETE FROM qiita.feature WHERE feature_idx = $1", feat)
-    assert await resolve_excluded_features(pool) == []
+    # Row survives (no FK cascade) and a direct feature block still resolves.
+    survived = await pool.fetchval(
+        "SELECT count(*) FROM qiita.reference_exclusion WHERE feature_idx = $1", feat
+    )
+    assert survived == 1
+    assert await resolve_excluded_features(pool) == [feat]
 
 
-async def test_deleting_a_blocked_genome_cascades_the_exclusion(ref):
-    """ON DELETE CASCADE on the genome FK: orphan-GCing a blocked genome (after
-    its feature_genome / feature rows go, mirroring delete_reference_cascade)
-    removes its block."""
+async def test_genome_block_survives_genome_deletion_and_reattaches(ref):
+    """A genome block SURVIVES orphan-GC of the genome. While the genome/features
+    are gone the block resolves to nothing (no feature_genome to expand), but the
+    row persists; re-ingesting the same (source, source_id) genome reuses the
+    genome_idx and its features re-appear in feature_genome, so the surviving
+    block re-arms without any operator action."""
     pool = ref["pool"]
     genome_idx, feats = await _seed_genome(ref, n_features=1, in_reference=False)
     await add_exclusion(
         pool, genome_idx=genome_idx, reason="bad", excluded_by_idx=ref["principal_idx"]
     )
-    # Reach the genome delete in orphan-GC order (feature_genome + feature first).
+    # Orphan-GC order (feature_genome + feature first, then genome).
     await pool.execute("DELETE FROM qiita.feature_genome WHERE genome_idx = $1", genome_idx)
     await pool.execute("DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats)
     await pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+    # Block row survives; dormant until re-ingest (no feature_genome to expand).
+    survived = await pool.fetchval(
+        "SELECT count(*) FROM qiita.reference_exclusion WHERE genome_idx = $1", genome_idx
+    )
+    assert survived == 1
     assert await resolve_excluded_features(pool) == []
+    # Re-ingest: same genome_idx reused, feature re-linked -> the block re-arms.
+    refeat = await pool.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES ($1) RETURNING feature_idx", uuid.uuid4()
+    )
+    ref["feature_idxs"].append(refeat)
+    await pool.execute(
+        "INSERT INTO qiita.genome (genome_idx, source, source_id)"
+        " OVERRIDING SYSTEM VALUE VALUES ($1, 'genbank', $2)",
+        genome_idx,
+        f"reattach_{secrets.token_hex(4)}",
+    )
+    await pool.execute(
+        "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
+        refeat,
+        genome_idx,
+    )
+    assert await resolve_excluded_features(pool) == [refeat]
 
 
 async def test_list_for_reference_ignores_blocks_outside_the_reference(ref):

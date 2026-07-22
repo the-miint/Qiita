@@ -28,6 +28,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_DOGET,
     PATH_REFERENCE_EXCLUSION,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
+    PATH_REFERENCE_EXCLUSION_SYNC,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
@@ -43,6 +44,7 @@ from qiita_common.models import (
     ReferenceExclusionCreateRequest,
     ReferenceExclusionListItem,
     ReferenceExclusionMutationResponse,
+    ReferenceExclusionSyncResponse,
     ReferenceIndex,
     ReferenceKind,
     ReferenceResponse,
@@ -374,6 +376,17 @@ async def _sync_exclusion_to_lake(
             signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
+    except asyncpg.LockNotAvailableError as exc:
+        # Another sync held the serialization lock past lock_timeout (a concurrent
+        # curation call or a stuck post-load sync). The Postgres row is committed;
+        # this is transient — retry once the other sync clears.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "blocklist updated in Postgres but a concurrent exclusion sync held"
+                " the lock; re-issue the request to retry the sync"
+            ),
+        ) from exc
     except _flight.FlightError as exc:
         raise HTTPException(
             status_code=502,
@@ -410,19 +423,27 @@ async def add_reference_exclusion(
     502 means "not yet protected, retry", never "protected"."""
     dest = _require_exclusion_sync_dest(staging_root)
     target_kind = "genome" if body.genome_idx is not None else "feature"
-    try:
-        changed = await add_exclusion(
-            pool,
-            reason=body.reason,
-            excluded_by_idx=user.principal_idx,
-            genome_idx=body.genome_idx,
-            feature_idx=body.feature_idx,
+    # Explicit existence check: the target columns are NOT foreign keys (a block
+    # deliberately outlives its entity — see the migration), so there is no FK to
+    # 404 an unknown idx. Non-atomic with the insert, which is fine — a target
+    # deleted in the race just yields a block that re-attaches on re-ingest.
+    if target_kind == "genome":
+        exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.genome WHERE genome_idx = $1", body.genome_idx
         )
-    except asyncpg.ForeignKeyViolationError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No such {target_kind} to block",
+    else:
+        exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", body.feature_idx
         )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=f"No such {target_kind} to block")
+    changed = await add_exclusion(
+        pool,
+        reason=body.reason,
+        excluded_by_idx=user.principal_idx,
+        genome_idx=body.genome_idx,
+        feature_idx=body.feature_idx,
+    )
     synced = await _sync_exclusion_to_lake(pool, dest, signing_key, data_plane_url)
     return ReferenceExclusionMutationResponse(
         target_kind=target_kind,
@@ -442,15 +463,19 @@ async def remove_reference_exclusion(
     signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     staging_root: Path | None = Depends(get_scratch_staging),
+    user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.REFERENCE_EXCLUSION_WRITE)),
 ) -> ReferenceExclusionMutationResponse:
     """Unblock exactly one genome_idx / feature_idx (system_admin,
     `reference:exclusion:write`). The target rides as a query param
-    (`?genome_idx=` or `?feature_idx=`). Idempotent: unblocking something not
-    blocked reports `changed=false`. Re-syncs the lake mirror so the entity is
-    surfaced again. Retriable like the add (502 on data-plane failure); the
-    failure window here is fail-CLOSED (the mirror over-excludes the entity until
-    a successful re-sync), the safe direction."""
+    (`?genome_idx=` or `?feature_idx=`). A SOFT delete: the block row is kept and
+    stamped `unblocked_at`/`unblocked_by_idx` (the actor — hence the complete
+    profile, symmetric with the add), preserving the curatorial record.
+    Idempotent: unblocking something not actively blocked reports `changed=false`.
+    Re-syncs the lake mirror so the entity is surfaced again. Retriable like the
+    add (502 on data-plane failure); the failure window here is fail-CLOSED (the
+    mirror over-excludes the entity until a successful re-sync), the safe
+    direction."""
     if (genome_idx is None) == (feature_idx is None):
         raise HTTPException(
             status_code=422,
@@ -458,7 +483,12 @@ async def remove_reference_exclusion(
         )
     dest = _require_exclusion_sync_dest(staging_root)
     target_kind = "genome" if genome_idx is not None else "feature"
-    removed = await remove_exclusion(pool, genome_idx=genome_idx, feature_idx=feature_idx)
+    removed = await remove_exclusion(
+        pool,
+        unblocked_by_idx=user.principal_idx,
+        genome_idx=genome_idx,
+        feature_idx=feature_idx,
+    )
     synced = await _sync_exclusion_to_lake(pool, dest, signing_key, data_plane_url)
     return ReferenceExclusionMutationResponse(
         target_kind=target_kind,
@@ -467,6 +497,31 @@ async def remove_reference_exclusion(
         changed=removed > 0,
         synced_feature_count=synced,
     )
+
+
+@router.post(PATH_REFERENCE_EXCLUSION_SYNC, status_code=200)
+async def sync_reference_exclusion_mirror(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_EXCLUSION_WRITE)),
+) -> ReferenceExclusionSyncResponse:
+    """Force-resync the data-plane exclusion mirror from the current Postgres
+    blocklist (system_admin, `reference:exclusion:write`). Makes NO Postgres change
+    — it re-resolves the committed blocklist and re-writes the DuckLake
+    `reference_exclusion` mirror wholesale (idempotent, replay-safe), the same sync
+    every mutation and reference-load runs.
+
+    For operator recovery when the mirror has drifted from Postgres: a prior sync's
+    502/503 was never retried, the DuckLake catalog was rebuilt, or a fresh data
+    plane came up with an empty mirror. Unlike add/remove there is no complete-profile
+    requirement (no actor is recorded — nothing is curated). A data-plane failure is
+    a 502 / a concurrent-sync lock timeout a 503, both retriable, exactly as for the
+    mutations (see `_sync_exclusion_to_lake`)."""
+    dest = _require_exclusion_sync_dest(staging_root)
+    synced = await _sync_exclusion_to_lake(pool, dest, signing_key, data_plane_url)
+    return ReferenceExclusionSyncResponse(synced_feature_count=synced)
 
 
 @router.get(PATH_REFERENCE_EXCLUSION_BY_IDX)
@@ -490,7 +545,7 @@ async def list_reference_exclusions(
     if exists is None:
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     rows = await list_for_reference(pool, reference_idx)
-    return [ReferenceExclusionListItem(**dict(r)) for r in rows]
+    return [ReferenceExclusionListItem.model_validate(dict(r)) for r in rows]
 
 
 @router.delete(PATH_REFERENCE_BY_IDX)

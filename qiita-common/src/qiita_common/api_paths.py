@@ -61,6 +61,11 @@ PATH_REFERENCE_DOGET = "/{reference_idx}/ticket/doget"
 # feature_idx alone, NOT scoped to a reference. Literal segment, so it must be
 # registered before the `/{reference_idx}` routes (see routes/reference.py).
 PATH_REFERENCE_EXCLUSION = "/exclusion"
+# Operator force-resync: re-materialize the data-plane exclusion mirror from the
+# current Postgres blocklist with no Postgres change (recovery after a failed
+# sync / rebuilt catalog / fresh data plane). A longer literal than /exclusion, so
+# unambiguous; still a literal, registered before the `/{reference_idx}` routes.
+PATH_REFERENCE_EXCLUSION_SYNC = "/exclusion/sync"
 # Reference-scoped read of what the blocklist filters from one reference.
 PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
 
@@ -71,6 +76,7 @@ URL_REFERENCE_INDEX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX}"
 URL_REFERENCE_SHARD_INDEX_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_SHARD_INDEX_STATUS}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
 URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
+URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
 URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
 
 # =============================================================================
@@ -165,11 +171,12 @@ class LibraryPrimitive(StrEnum):
     RECONCILE_ALIGNMENT_BLOCK = "reconcile-alignment-block"
     # Reference exclusion: re-materialize the GLOBAL curated blocklist onto the
     # data plane's DuckLake `reference_exclusion` mirror (a wholesale, idempotent,
-    # replay-safe REPLACE). Runs as the post-load step of reference-add /
-    # local-reference-add so a fresh assembly of an already-blocked genome — whose
-    # newly-minted feature_idx the standing mirror can't know about — is caught by
-    # the re-resolve. Also fired on every blocklist mutation by the admin route.
-    # See qiita_control_plane.actions.library.sync_reference_exclusion.
+    # replay-safe REPLACE). Runs as the post-load tail step of every reference-load
+    # workflow (reference-add, local-reference-add, host-reference-add,
+    # local-host-reference-add) so a fresh assembly of an already-blocked genome —
+    # whose newly-minted feature_idx the standing mirror can't know about — is
+    # caught by the re-resolve. Also fired on every blocklist mutation by the admin
+    # route. See qiita_control_plane.actions.library.sync_reference_exclusion.
     SYNC_REFERENCE_EXCLUSION = "sync-reference-exclusion"
 
 

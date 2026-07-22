@@ -47,6 +47,7 @@ from ...backfill.host_taxon import (
     plan_backfill,
 )
 from .. import _common
+from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
@@ -92,12 +93,6 @@ from .owner_id import (
     _OWNER_ID_POOL_COLUMNS,
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
-)
-from .reference_exclusion import (
-    _handle_exclusion_add,
-    _handle_exclusion_list,
-    _handle_exclusion_remove,
-    add_reference_exclusion_subparser,
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
 
@@ -240,7 +235,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_reference = sub.add_parser("reference", help="Reference maintenance operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
-    add_reference_exclusion_subparser(p_reference_sub)
+    add_admin_exclusion_subparsers(p_reference_sub)
 
     p_backfill = sub.add_parser("backfill", help="One-off data backfills")
     p_backfill_sub = p_backfill.add_subparsers(dest="backfill_cmd", required=True)
@@ -895,10 +890,7 @@ __all__ = [
     "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
-    "add_reference_exclusion_subparser",
-    "_handle_exclusion_add",
-    "_handle_exclusion_list",
-    "_handle_exclusion_remove",
+    "add_admin_exclusion_subparsers",
     "_count_non_failed_missing_mask_idx",
     "_export_stem",
     "_force_fail_ticket",

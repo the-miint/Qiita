@@ -21,6 +21,7 @@ it differently.
 import asyncio
 import itertools
 import json
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,8 @@ from ..repositories.reference_exclusion import resolve_excluded_features
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
+
+_log = logging.getLogger(__name__)
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535
 # scalar parameter limit, but large arrays increase memory pressure and
@@ -326,16 +329,29 @@ async def _write_membership_rows(
     return len(rows)
 
 
-def _do_action(action_type: str, data_plane_url: str, token: bytes) -> list:
+def _do_action(
+    action_type: str,
+    data_plane_url: str,
+    token: bytes,
+    timeout_seconds: float | None = None,
+) -> list:
     """Synchronous gRPC DoAction against the data plane — runs in a thread
     executor. Every CP-side DoAction primitive differs only by action name, so
     they share this one client-open/call/collect body: the single place the
     Flight client is constructed, hence the single place to add a timeout, TLS,
     or error mapping later. `action_type` is positional so it forwards cleanly
     through `run_in_executor(None, _do_action, name, url, token)`.
-    """
+
+    `timeout_seconds` (optional, 4th positional so existing callers are
+    unaffected) bounds the Flight call: a hung-but-reachable data plane raises
+    FlightTimedOutError (a FlightError subclass) instead of blocking forever. The
+    exclusion sync passes it because it makes the untimed call load-bearing under
+    a global advisory lock — see sync_reference_exclusion_data."""
+    options = (
+        _flight.FlightCallOptions(timeout=timeout_seconds) if timeout_seconds is not None else None
+    )
     with _flight.FlightClient(data_plane_url) as client:
-        return list(client.do_action(_flight.Action(action_type, token)))
+        return list(client.do_action(_flight.Action(action_type, token), options=options))
 
 
 # =============================================================================
@@ -889,12 +905,17 @@ async def _write_annotation_terms(
 # accession) per feature. `min(read_id)` picks the lex-smallest FASTA header
 # when identical bytes repeat under several headers — deterministic, and the
 # same representative hash_sequences' DISTINCT-ON keeps for the stored chunks.
-# feature_map's sequence_hashes are a subset of the manifest's (mint_features
-# derives feature_map FROM the manifest), so the INNER JOIN drops no feature.
+# feature_map's sequence_hashes ARE a subset of the manifest's today
+# (mint_features derives feature_map FROM the manifest). The join is a LEFT JOIN
+# from feature_map anyway, so if that invariant ever breaks (a filtered manifest,
+# a reordered step, a future caller) the membership row is still written with a
+# NULL accession — a silent DROPPED row (which would surface much later as a
+# feature absent from shard planning and every membership-scoped DoGet) is the
+# far worse failure. accession is nullable by design, so NULL is a legal value.
 MEMBERSHIP_ACCESSION_JOIN_SQL = (
     "SELECT fm.feature_idx, min(m.read_id) AS accession"
     " FROM read_parquet(?) AS fm"
-    " JOIN read_parquet(?) AS m ON fm.sequence_hash = m.sequence_hash"
+    " LEFT JOIN read_parquet(?) AS m ON fm.sequence_hash = m.sequence_hash"
     " GROUP BY fm.feature_idx"
 )
 
@@ -1754,6 +1775,14 @@ async def delete_mask_data(
 # sync_reference_exclusion_data). Chosen distinct from the sweepers' keys
 # (notify=…147, cli-login=…148) so it never blocks them.
 _EXCLUSION_SYNC_ADVISORY_LOCK_KEY = 4_310_290_149
+# Bound both ends so a hung-but-reachable data plane can't wedge the lock
+# forever: the holder's Flight call times out (raising FlightError → the route's
+# 502, the runner's retriable-fail), releasing the lock; and a waiter blocked on
+# the lock gives up after lock_timeout (fail-fast) instead of piling up and
+# draining the CP pool. lock_timeout is set comfortably above the Flight timeout
+# so ordinary back-to-back syncs still queue rather than error.
+_EXCLUSION_SYNC_DO_ACTION_TIMEOUT_S = 30.0
+_EXCLUSION_SYNC_LOCK_TIMEOUT_MS = 90_000
 
 
 async def sync_reference_exclusion_data(
@@ -1775,9 +1804,12 @@ async def sync_reference_exclusion_data(
 
     `dest` must live under the shared PATH_SCRATCH tree (the data plane
     re-validates it under its scratch root before reading). The set is tiny by
-    design (a curated blocklist), but it is streamed in `_CHUNK_SIZE` batches
-    like the sibling exporters so a pathologically large blocklist never
-    materializes one giant Arrow array.
+    design (a curated blocklist). The `feature_idx` list is resolved fully into
+    memory by `resolve_excluded_features` and then written in `_CHUNK_SIZE` Arrow
+    batches — the chunking bounds the Arrow allocation, not the Python-list peak.
+    That is fine at the intended scale; if a single genome block ever expanded to
+    a very large feature set (via `feature_genome`), switch the resolve to a
+    server-side cursor like `export_member_genome`.
 
     **Serialized by a transaction-scoped Postgres advisory lock** held across the
     whole resolve → parquet-write → DoAction. The mirror is a BLIND wholesale
@@ -1806,6 +1838,9 @@ async def sync_reference_exclusion_data(
         # Serialize with (and resolve under) the advisory lock so the snapshot
         # this sync replaces the mirror with is the latest committed Postgres
         # state — see the docstring for why a blind full-replace needs this.
+        # lock_timeout makes a waiter fail fast instead of blocking forever if the
+        # holder is stuck (belt to the Flight timeout on the holder below).
+        await conn.execute(f"SET LOCAL lock_timeout = '{_EXCLUSION_SYNC_LOCK_TIMEOUT_MS}ms'")
         await conn.execute("SELECT pg_advisory_xact_lock($1)", _EXCLUSION_SYNC_ADVISORY_LOCK_KEY)
         feature_idxs = await resolve_excluded_features(conn)
 
@@ -1828,8 +1863,15 @@ async def sync_reference_exclusion_data(
         )
         # Held under the lock so the data plane's DELETE+INSERT commits in
         # lock-acquisition order (no stale snapshot can win the last write).
+        # Bounded by a Flight timeout so a hung DP releases the lock instead of
+        # wedging every subsequent sync.
         results = await asyncio.get_event_loop().run_in_executor(
-            None, _do_action, "sync_reference_exclusion", data_plane_url, token
+            None,
+            _do_action,
+            "sync_reference_exclusion",
+            data_plane_url,
+            token,
+            _EXCLUSION_SYNC_DO_ACTION_TIMEOUT_S,
         )
     if not results:
         return 0
@@ -1845,28 +1887,51 @@ async def sync_reference_exclusion(
 ) -> dict[str, Any]:
     """Workflow-primitive wrapper around `sync_reference_exclusion_data`.
 
-    The runner dispatches the `sync-reference-exclusion` action step at the tail
-    of reference-add / local-reference-add (after register-files) so a reference
-    load that adds a fresh assembly of an already-blocked genome — minting new
-    feature_idx the standing lake mirror can't know about — re-resolves the whole
-    blocklist and REPLACES the mirror wholesale. `dest` is the per-attempt
+    The runner dispatches the `sync-reference-exclusion` action step as the tail
+    step of every reference-load workflow (reference-add, local-reference-add,
+    host-reference-add, local-host-reference-add) so a reference load that adds a
+    fresh assembly of an already-blocked genome — minting new feature_idx the
+    standing lake mirror can't know about — re-resolves the whole blocklist and
+    REPLACES the mirror wholesale. `dest` is the per-attempt
     workspace Parquet the runner supplies (under the shared PATH_SCRATCH tree the
     data plane re-validates). Mirrors the delete_read_mask_block ->
     delete_read_mask_block_data primitive/signer split: the pool-positional
     primitive is the runner-facing entry, the `_data` signer does the work.
 
-    Returns `{synced_feature_count}` for the workflow log (the data plane's loaded
-    row count). Raises pyarrow.flight.FlightError on transport / data-plane
-    failure, which the runner classifies and the ticket surfaces — failing loud is
-    the safe outcome here (a stale mirror would leak a blocked genome's new
-    features), and the full-replace makes the redrive idempotent."""
-    feature_count = await sync_reference_exclusion_data(
-        pool=pool,
-        dest=dest,
-        signing_key=signing_key,
-        data_plane_url=data_plane_url,
-    )
-    return {"synced_feature_count": feature_count}
+    Returns `{synced_feature_count, synced}`. A TRANSIENT data-plane failure
+    (`FlightError`) or a concurrent-sync lock timeout (`LockNotAvailableError`) is
+    caught and logged, NOT raised: this is the workflow TAIL step, and by the time
+    it runs the reference is `indexing` (host / mid-fan-out) or `active`, so letting
+    a transient blip propagate would drive the workflow-level `failure_status` PATCH
+    and clobber a fully-loaded, index-registered reference to `failed` (on the
+    sharded path it would even fail the still-running shard children). The mirror
+    sync is status-neutral, idempotent, and separately reconcilable, so a blip must
+    not fail the load. The (bounded, fail-OPEN) cost — a fresh assembly of an
+    already-blocked genome staying visible until the mirror is refreshed — is
+    reconciled out of band by the next blocklist mutation's sync or an operator
+    `POST /reference/exclusion/sync`. A non-transient error (a real bug) still
+    propagates. NOTE the swallow means a `/run` redrive does NOT re-attempt the sync
+    (the step records COMPLETED) — reconciliation is the out-of-band paths above,
+    by design. Contrast `sync_reference_exclusion_data` / the admin route, which
+    DO surface the failure (retriable 502/503) because there the caller — not a
+    half-built reference — bears the retry."""
+    try:
+        feature_count = await sync_reference_exclusion_data(
+            pool=pool,
+            dest=dest,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+    except (_flight.FlightError, asyncpg.LockNotAvailableError) as exc:
+        _log.warning(
+            "post-load reference-exclusion mirror sync failed transiently (%s: %s); "
+            "the reference load is unaffected but the data-plane mirror may be stale. "
+            "Reconcile via the next blocklist mutation or POST /reference/exclusion/sync.",
+            type(exc).__name__,
+            exc,
+        )
+        return {"synced_feature_count": None, "synced": False}
+    return {"synced_feature_count": feature_count, "synced": True}
 
 
 async def mask_metrics_data(

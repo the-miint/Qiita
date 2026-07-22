@@ -42,12 +42,17 @@ duplicates further down are historical strata; leave them where they are.
   genome so "future references inherit the block" holds on every load path.
   Adds `reference_membership.accession` (the FASTA-header record accession,
   persisted at load — previously dropped) surfaced as external provenance; a
-  system-admin curation surface `POST`/`DELETE /reference/exclusion` (new
-  `reference:exclusion:write` scope) + the reference-scoped query
-  `GET /reference/{reference_idx}/exclusion` (`reference:read`); and a
-  `qiita-admin reference exclusion add/remove/list` CLI. Phylogeny defers to a
-  documented `shear_tree` prune contract (no production tree consumer exists
-  yet). Two migrations: `reference_membership.accession`, `reference_exclusion`.
+  system-admin curation surface `POST`/`DELETE /reference/exclusion` (block /
+  soft-unblock, new `reference:exclusion:write` scope) plus a
+  `POST /reference/exclusion/sync` operator force-resync (re-materialize the
+  mirror from Postgres with no blocklist change — recovery after a failed sync, a
+  rebuilt DuckLake catalog, or a fresh data plane); the reference-scoped query
+  `GET /reference/{reference_idx}/exclusion` (`reference:read`); and the CLI —
+  `qiita-admin reference exclusion add/remove/sync` (the write surface) and
+  `qiita reference exclusion list` (the `reference:read` query any user can run).
+  Phylogeny defers to a documented `shear_tree` prune contract (no production tree
+  consumer exists yet). Two migrations: `reference_membership.accession`,
+  `reference_exclusion`.
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

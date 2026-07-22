@@ -466,12 +466,13 @@ class ReferenceStatusUpdate(BaseModel):
 
 class ReferenceExclusionCreateRequest(BaseModel):
     """Block exactly one of genome_idx / feature_idx (the DB CHECK enforces the
-    same invariant). `reason` is a required free-text curator note. The block is
-    GLOBAL — not scoped to a reference — so no reference_idx here."""
+    same invariant). `reason` is a required free-text curator note, bounded
+    1..2000 chars (matched by the DB CHECK). The block is GLOBAL — not scoped to a
+    reference — so no reference_idx here."""
 
     genome_idx: Annotated[int, Field(gt=0)] | None = None
     feature_idx: Annotated[int, Field(gt=0)] | None = None
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)
 
     @model_validator(mode="after")
     def _exactly_one_target(self):
@@ -495,12 +496,27 @@ class ReferenceExclusionMutationResponse(BaseModel):
     synced_feature_count: int
 
 
+class ReferenceExclusionSyncResponse(BaseModel):
+    """Result of a force-resync (POST /reference/exclusion/sync): the number of
+    excluded feature_idx now materialized in the data plane's exclusion mirror
+    after re-resolving the current Postgres blocklist and re-writing the mirror
+    wholesale. Carries no target — a force-resync makes no Postgres change, it just
+    reconciles a drifted mirror back to the committed blocklist (operator recovery
+    after a failed sync, a rebuilt DuckLake catalog, or a fresh data plane)."""
+
+    synced_feature_count: int
+
+
 class ReferenceExclusionListItem(BaseModel):
-    """One blocked feature that appears in a given reference, with why + external
-    ids. `direct_block` = a feature-level block; `via_genome` = blocked through
-    its genome. `source`/`source_id` are the genome's external provenance;
-    `accession` is the reference's own FASTA-header id for the feature. Global
-    blocks that touch no feature in the queried reference are absent."""
+    """One actively-blocked feature that appears in a given reference, with why +
+    external ids. `direct_block` / `via_genome` are reported as MUTUALLY EXCLUSIVE:
+    the listing keeps one row per feature and prefers the direct feature-level
+    block, so a feature blocked BOTH directly and through its genome reports
+    `direct_block=true, via_genome=false` (the direct block is the operative one).
+    `source`/`source_id` are the genome's external provenance; `accession` is the
+    reference's own FASTA-header id for the feature. Unblocked (soft-deleted)
+    history and global blocks that touch no feature in the queried reference are
+    absent."""
 
     feature_idx: int
     genome_idx: int | None = None

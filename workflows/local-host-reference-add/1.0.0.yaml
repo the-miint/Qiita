@@ -208,14 +208,6 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
-  # Post-load exclusion sync — identical to host-reference-add's post-register
-  # step (a host reference loads taxonomy into the `reference_taxonomy_visible`
-  # surface and can carry a genome_map). Unconditional; MUST follow register-files.
-  # See reference-add/1.0.0.yaml and actions.library.sync_reference_exclusion.
-  - action: sync-reference-exclusion
-    inputs: []
-    outputs: []
-
   # One register-index per builder. The runner's register-index arm reads
   # bound[entry.inputs[0]] (native-step outputs are path strings, so the build
   # params ride a meta JSON file), so each step's `inputs` selects which index
@@ -230,6 +222,16 @@ steps:
   - action: register-index
     inputs: [minimap2_index_meta]
     when: build_minimap2
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step, identical to host-reference-add's
+  # tail sync (a host reference loads taxonomy into the `reference_taxonomy_visible`
+  # surface and can carry a genome_map). Unconditional; MUST follow register-files
+  # and is placed DEAD LAST — after both register-index — so a transient sync
+  # FlightError can never strand an already-built rype/minimap2 index unregistered.
+  # See reference-add/1.0.0.yaml and actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
+    inputs: []
     outputs: []
 
 action_ceiling:

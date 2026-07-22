@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_REFERENCE_EXCLUSION, URL_REFERENCE_EXCLUSION_BY_IDX
+from qiita_common.api_paths import (
+    URL_REFERENCE_EXCLUSION,
+    URL_REFERENCE_EXCLUSION_BY_IDX,
+    URL_REFERENCE_EXCLUSION_SYNC,
+)
 
 pytestmark = pytest.mark.db
 
@@ -85,8 +89,18 @@ async def _seed_genome(pool) -> int:
 
 
 async def _cleanup(pool, *, feature_idxs=(), genome_idxs=()):
-    # reference_exclusion FK-cascades on both target deletes, so dropping the
-    # seeded features/genomes also removes any block rows the test created.
+    # reference_exclusion targets are NOT foreign keys (a block survives entity
+    # deletion), so delete the block rows explicitly before the features/genomes.
+    if feature_idxs:
+        await pool.execute(
+            "DELETE FROM qiita.reference_exclusion WHERE feature_idx = ANY($1::bigint[])",
+            list(feature_idxs),
+        )
+    if genome_idxs:
+        await pool.execute(
+            "DELETE FROM qiita.reference_exclusion WHERE genome_idx = ANY($1::bigint[])",
+            list(genome_idxs),
+        )
     if feature_idxs:
         await pool.execute(
             "DELETE FROM qiita.feature_genome WHERE feature_idx = ANY($1::bigint[])",
@@ -213,9 +227,12 @@ async def test_remove_exclusion_reaches_handler_and_reports(client, postgres_poo
         assert body["target_kind"] == "feature"
         assert body["changed"] is True
         assert len(_stub_sync) == 1
+        # Soft delete: no ACTIVE block remains (the row itself persists as history).
         assert (
             await postgres_pool.fetchval(
-                "SELECT count(*) FROM qiita.reference_exclusion WHERE feature_idx = $1", feat
+                "SELECT count(*) FROM qiita.reference_exclusion"
+                " WHERE feature_idx = $1 AND unblocked_at IS NULL",
+                feat,
             )
             == 0
         )
@@ -379,3 +396,45 @@ async def test_add_exclusion_sync_failure_is_502_but_postgres_row_persists(
         ), "the block row must persist after a sync failure so a retry converges"
     finally:
         await _cleanup(postgres_pool, feature_idxs=[feat])
+
+
+async def test_force_resync_reports_count_and_makes_no_postgres_change(
+    client, postgres_pool, _stub_sync
+):
+    # Operator force-resync: re-materializes the mirror from the committed blocklist
+    # WITHOUT any Postgres mutation, and echoes the synced feature count. Prove no
+    # blocklist row is created by comparing the total row count before and after.
+    before = await postgres_pool.fetchval("SELECT count(*) FROM qiita.reference_exclusion")
+    resp = await client.post(URL_REFERENCE_EXCLUSION_SYNC)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"synced_feature_count": 7}
+    assert len(_stub_sync) == 1
+    after = await postgres_pool.fetchval("SELECT count(*) FROM qiita.reference_exclusion")
+    assert after == before, "force-resync must not change the Postgres blocklist"
+
+
+async def test_force_resync_requires_write_scope(wet_lab_client):
+    # Same system_admin `reference:exclusion:write` gate as the mutations — a
+    # wet_lab_admin (no write scope) is refused.
+    resp = await wet_lab_client.post(URL_REFERENCE_EXCLUSION_SYNC)
+    assert resp.status_code == 403, resp.text
+
+
+async def test_force_resync_without_scratch_is_503(client_no_scratch):
+    # Fail-fast, same as the mutations: no shared scratch → the mirror can't be
+    # reached, so 503 before attempting the sync.
+    resp = await client_no_scratch.post(URL_REFERENCE_EXCLUSION_SYNC)
+    assert resp.status_code == 503, resp.text
+
+
+async def test_force_resync_sync_failure_is_502(client, monkeypatch):
+    # A data-plane FlightError surfaces as a retriable 502, exactly like the
+    # mutations' post-write sync (shared `_sync_exclusion_to_lake`).
+    import pyarrow.flight as _flight
+
+    async def _boom(*, pool, dest, signing_key, data_plane_url):
+        raise _flight.FlightError("data plane unreachable")
+
+    monkeypatch.setattr("qiita_control_plane.routes.reference.sync_reference_exclusion_data", _boom)
+    resp = await client.post(URL_REFERENCE_EXCLUSION_SYNC)
+    assert resp.status_code == 502, resp.text

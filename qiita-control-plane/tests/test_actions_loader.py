@@ -288,8 +288,10 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     step_names = [s.name for s in host.steps]
     # Shares the reference-add prefix, then adds the host-indexing tail: two
     # index builders (rype + minimap2) and a register-index per build. The
-    # post-load `sync-reference-exclusion` step follows register-files here too
-    # (a host reference writes the reference_taxonomy anti-join surface).
+    # post-load `sync-reference-exclusion` step is DEAD LAST — after both
+    # register-index — so a transient sync FlightError can't strand an
+    # already-built index unregistered (a host reference writes the
+    # reference_taxonomy anti-join surface, so the sync must still fire here).
     assert step_names == [
         "hash_sequences",
         "mint-features",
@@ -299,9 +301,9 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
         "build_rype_index",
         "build_minimap2_index",
         "register-files",
+        "register-index",
+        "register-index",
         "sync-reference-exclusion",
-        "register-index",
-        "register-index",
     ]
     # build_rype_index must precede register-files (move-on-register); the
     # minimap2 builder reads the RAW upload fasta, so it has no such ordering dep
@@ -502,9 +504,9 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "build_rype_index",
         "build_minimap2_index",
         "register-files",
+        "register-index",
+        "register-index",
         "sync-reference-exclusion",
-        "register-index",
-        "register-index",
     ]
 
     stage = next(s for s in local_host.steps if s.name == "stage_local_fasta")

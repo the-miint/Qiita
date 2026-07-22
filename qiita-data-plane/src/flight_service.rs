@@ -5021,8 +5021,8 @@ mod tests {
     /// rows before they stream: seed two features under one alignment run, block
     /// one in the exclusion mirror, and assert only the unblocked feature's row
     /// survives the projected DoGet query (the anti-join enforced at read time,
-    /// no aligner index rebuilt). This is the alignment half of the Phase 5 swap
-    /// exercised end-to-end through `build_query` + `stream_ducklake_batches`.
+    /// no aligner index rebuilt). This exercises the alignment anti-join view
+    /// end-to-end through `build_query` + `stream_ducklake_batches`.
     #[tokio::test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]

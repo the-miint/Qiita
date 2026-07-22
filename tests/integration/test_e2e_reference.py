@@ -362,7 +362,7 @@ async def test_e2e_exclusion_masks_taxonomy_and_reports_provenance(
     )
     assert result["work_ticket"]["state"] == "completed", result["work_ticket"]
 
-    # Phase 1: the FASTA-header read_id was persisted as the membership accession.
+    # The FASTA-header read_id was persisted as the membership accession.
     accessions = await postgres_pool.fetch(
         "SELECT accession FROM qiita.reference_membership WHERE reference_idx = $1",
         fresh_reference,

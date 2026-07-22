@@ -393,9 +393,13 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// a tiny curated list). A blocked genome/feature therefore never reaches an OGU
 /// feature table or a taxonomy lineage, even though it stays in the base table:
 /// exclusion is read-time only, so no aligner index is rebuilt. Phylogeny is
-/// deliberately NOT viewed here — a row-wise anti-join would orphan the tree; a
-/// consumer shears it with miint `shear_tree` against the blocklist instead (see
-/// `docs/reference-data-staging.md`).
+/// deliberately NOT viewed here — `reference_phylogeny` is not row-independent
+/// (a node carries parent/child structure; `feature_idx` is on tips only), so a
+/// row-wise anti-join would orphan internal parents and malform the tree. The
+/// contract instead is that a tree consumer shears the tree to the keep-set
+/// (`tips WHERE feature_idx NOT IN reference_exclusion`) with miint's
+/// `shear_tree`; there is no production tree consumer today, so no phylogeny view
+/// is built.
 ///
 /// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), like `read_masked`: the
 /// anti-join predicate IS the enforcement surface, so a definition change must
