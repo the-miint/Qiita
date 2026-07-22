@@ -58,6 +58,22 @@ def _empty_handler(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"unexpected URL: {url}")
 
 
+def _no_attributes_handler(request: httpx.Request) -> httpx.Response:
+    """A real sample exists (the `result=sample` search returns one
+    accession) but it carries zero `<SAMPLE_ATTRIBUTE>` elements -- the
+    live DDBJ shape (study PRJDB40364's sample SAMD01818724)."""
+    url = str(request.url)
+    if "result=sample" in url:
+        return httpx.Response(200, text="sample_accession\nSAMD01818724\n")
+    if "/browser/api/xml/" in url:
+        return httpx.Response(
+            200,
+            text='<?xml version="1.0"?>'
+            '<SAMPLE_SET><SAMPLE accession="SAMD01818724"></SAMPLE></SAMPLE_SET>',
+        )
+    raise AssertionError(f"unexpected URL: {url}")
+
+
 def _resolver_with(handler):
     from qiita_control_plane.ena_import.http_resolver import HttpEnaResolver
 
@@ -98,9 +114,23 @@ def test_resolve_sample_attributes_pivots_by_sample():
 
 
 def test_resolve_sample_attributes_zero_samples_is_not_found():
+    """Zero rows from the `result=sample` search means the study itself has
+    no samples -- a genuine existence failure, still raises (mirrors
+    resolve_runs)."""
     resolver = _resolver_with(_empty_handler)
     with pytest.raises(EnaAccessionNotFoundError, match="PRJEB00000000"):
         resolver.resolve_sample_attributes("PRJEB00000000")
+
+
+def test_resolve_sample_attributes_zero_attributes_for_real_sample_returns_empty_list():
+    """A real sample with zero `<SAMPLE_ATTRIBUTE>` elements (live DDBJ
+    shape) is a legitimate "no attributes" result, not "nonexistent" --
+    unlike the zero-samples case above, this must NOT raise."""
+    resolver = _resolver_with(_no_attributes_handler)
+
+    attrs = resolver.resolve_sample_attributes("PRJDB40364")
+
+    assert attrs == []
 
 
 def test_resolve_study_header_rejects_non_study_accession():

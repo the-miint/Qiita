@@ -64,6 +64,14 @@ harmonization *gap* does not fail the run; only a genuine harmonization error
 (an unparseable value, or a cross-study metadata slot collision) does, isolated
 per-run exactly like an unmappable platform.
 
+**A sample with zero ENA attributes is a legitimate, common result, not an import
+failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at
+all (confirmed live against DDBJ study `PRJDB40364`'s sample `SAMD01818724`). Such a
+sample still registers normally — study, biosample, and sequenced/prep rows are all
+created — it simply harmonizes against an empty attribute map, so it carries no
+globally-linked metadata and the checklist's required fields show up in the
+`missing_required` report rather than blocking the import.
+
 ## Scope and limits
 
 These are **hard limits** of the current import surface, not partial-implementation

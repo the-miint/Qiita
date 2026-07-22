@@ -130,7 +130,14 @@ class MiintEnaResolver(EnaResolver):
         accession = validate_study_accession(accession)
         columns, rows = _query_ena_sample_attributes(accession)
         if not rows:
-            raise EnaAccessionNotFoundError(
-                f"no ENA sample attributes found for study {accession!r}"
-            )
+            # Unlike resolve_study_header/resolve_runs, a 0-row result here
+            # is NOT "nothing resolved" -- a real ENA/DDBJ sample can
+            # genuinely carry zero <SAMPLE_ATTRIBUTE> elements (e.g. DDBJ
+            # study PRJDB40364's SAMD01818724), and this method is only
+            # ever called for a study whose samples resolve_runs already
+            # proved real. Return no entries rather than raise;
+            # registration.register_ena_study's attrs_by_sample_accession
+            # lookup already treats a missing sample as an empty attribute
+            # map.
+            return []
         return pivot_sample_attributes(columns, rows)

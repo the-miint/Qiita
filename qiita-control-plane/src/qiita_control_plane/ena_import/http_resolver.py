@@ -123,6 +123,9 @@ class HttpEnaResolver(EnaResolver):
 
     def resolve_sample_attributes(self, accession: str) -> list[EnaSampleAttributes]:
         accession = validate_study_accession(accession)
+        # This first check is a genuine existence check (mirrors
+        # resolve_runs): zero samples for a well-formed study accession
+        # means nothing resolved, and stays a hard raise.
         _, sample_rows = self._search(accession, "sample", "sample_accession")
         if not sample_rows:
             raise EnaAccessionNotFoundError(
@@ -135,7 +138,13 @@ class HttpEnaResolver(EnaResolver):
         response.raise_for_status()
         rows = _parse_sample_attributes_xml(response.text)
         if not rows:
-            raise EnaAccessionNotFoundError(
-                f"no ENA sample attributes found for study {accession!r}"
-            )
+            # Unlike the sample-existence check above, zero
+            # <SAMPLE_ATTRIBUTE> rows across a known-real sample set is a
+            # legitimate "no attributes" result, not "nonexistent" -- a
+            # real ENA/DDBJ sample can carry no submitter-defined
+            # attributes at all. Return no entries rather than raise;
+            # registration.register_ena_study's attrs_by_sample_accession
+            # lookup already treats a missing sample as an empty attribute
+            # map.
+            return []
         return pivot_sample_attributes(["sample_accession", "tag", "value"], rows)

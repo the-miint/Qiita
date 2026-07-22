@@ -61,7 +61,8 @@ class EnaResolver(ABC):
     always the STUDY accession (see `ena_import.accession`); every method
     validates it and raises `InvalidEnaAccessionError` (wrong kind/shape) or
     `EnaAccessionNotFoundError` (well-formed but nothing found) rather than
-    returning an empty result."""
+    returning an empty result -- with one deliberate carve-out, see
+    `resolve_sample_attributes` below."""
 
     @abstractmethod
     def resolve_study_header(self, accession: str) -> EnaStudyHeader:
@@ -75,4 +76,15 @@ class EnaResolver(ABC):
     @abstractmethod
     def resolve_sample_attributes(self, accession: str) -> list[EnaSampleAttributes]:
         """Resolve every sample's submitter-defined attribute map under a
-        study accession."""
+        study accession.
+
+        Carve-out from the class docstring's "never empty" rule: a sample
+        (or every sample in the study) can genuinely carry ZERO
+        submitter-defined attributes -- a real, common ENA/DDBJ shape, not
+        a resolution failure. Because callers only reach this method after
+        `resolve_runs` has already proven the study's samples are real
+        (see `ena_import.batch._process_one_study`), an empty attribute
+        result here returns fewer/no entries rather than raising
+        `EnaAccessionNotFoundError`. Existence checks that precede the
+        attribute fetch (e.g. `HttpEnaResolver`'s sample-list search) still
+        raise on zero rows -- only the attribute fetch itself does not."""

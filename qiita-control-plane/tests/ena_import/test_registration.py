@@ -450,6 +450,56 @@ async def test_harmonization_parse_failure_isolated_to_its_run(reg):
     assert orphan_biosample_count == 0
 
 
+async def test_empty_sample_attributes_registers_with_missing_required_report(reg):
+    """A sample with zero ENA attributes (e.g. `resolve_sample_attributes`
+    returning `[]` for a real DDBJ sample with no `<SAMPLE_ATTRIBUTE>`
+    elements) must not fail the study: it registers normally, harmonizes
+    against an empty attribute map (no globally-linked metadata), and the
+    ERC000011 missing-required report lists both mandatory fields -- a
+    report, never a rejection."""
+    study_accession = unique_accession("PRJDB")
+    header = _study_header(study_accession=study_accession)
+    sample_accession = unique_accession("SAMD")
+    run = _run(
+        run_accession=unique_accession("DRR"),
+        experiment_accession=unique_accession("DRX"),
+        sample_accession=sample_accession,
+        study_accession=study_accession,
+    )
+
+    # sample_attributes=[] -- no EnaSampleAttributes entry at all for this
+    # sample, exactly what MiintEnaResolver/HttpEnaResolver.
+    # resolve_sample_attributes now return for a study whose only sample has
+    # zero <SAMPLE_ATTRIBUTE> elements.
+    result = await _register(reg, study_header=header, runs=[run], sample_attributes=[])
+
+    assert result.runs[0].status == RunRegistrationStatus.REGISTERED
+    harmonization = result.runs[0].harmonization
+    assert harmonization is not None
+    assert harmonization.mapped_count == 0
+    assert harmonization.retained_unmapped == []
+    assert harmonization.checklist_name == "ERC000011"
+    assert harmonization.missing_required == [
+        "collection date",
+        "geographic location (country and/or sea)",
+    ]
+
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
+    )
+    global_metadata_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
+        biosample_idx,
+    )
+    assert global_metadata_count == 0
+
+    prep_sample_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1", result.study_idx
+    )
+    assert prep_sample_count == 1
+
+
 # ---------------------------------------------------------------------------
 # T02-1 -- study upsert
 # ---------------------------------------------------------------------------

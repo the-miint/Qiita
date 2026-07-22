@@ -95,9 +95,11 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
 
 
 def _fake_attrs(accession: str) -> tuple[list[str], list[tuple]]:
-    # At least one row -- an empty result raises EnaAccessionNotFoundError
-    # (resolver.py), which is correct for a real "nothing resolved" case but
-    # not what these tests are exercising.
+    # At least one row, so most tests exercise the harmonized-metadata path
+    # rather than the empty-attributes carve-out --
+    # test_process_one_study_empty_sample_attributes_registers_not_failed
+    # below monkeypatches _QUERY_ATTRS to zero rows specifically to cover
+    # that case (a legitimate "no attributes" result, not a resolve error).
     return (
         ["sample_accession", "tag", "value"],
         [(f"SAMN-{accession}", "collection date", "2020-01-01")],
@@ -571,6 +573,95 @@ async def test_process_one_study_registers_and_submits_download_ticket(
     context = json.loads(ticket_row["action_context"])
     assert context["ena_study_accession"] == accession
     assert context["download_method"] == "http"
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_process_one_study_empty_sample_attributes_registers_not_failed(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """Real DDBJ finding: a sample can have ZERO ENA attributes (study
+    PRJDB40364's SAMD01818724 has no `<SAMPLE_ATTRIBUTE>` elements at all).
+    `resolve_sample_attributes` returning `[]` for that case (rather than
+    raising `EnaAccessionNotFoundError`) must not fail the whole study --
+    it registers normally end to end through the batch driver, and the
+    item is never marked `failed`."""
+    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: (["sample_accession", "tag", "value"], []))
+
+    accession = unique_accession("PRJDB")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(
+        batch_app,
+        items=items,
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        resolver_kind=ResolverKind.MIINT,
+        download_method="http",
+    )
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, failure_reason"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    # NOT failed -- an empty attribute set is a legitimate resolve result,
+    # not a resolve error.
+    assert item_row["state"] == BatchItemState.DOWNLOADING.value
+    assert item_row["failure_reason"] is None
+    assert item_row["study_idx"] is not None
+
+    sample_accession = f"SAMN-{accession}"
+    biosample_row = await postgres_pool.fetchrow(
+        "SELECT idx, metadata_checklist_idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        sample_accession,
+    )
+    assert biosample_row is not None
+    assert biosample_row["metadata_checklist_idx"] is not None
+
+    # No harmonized global metadata -- there were no attributes to harmonize.
+    global_metadata_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
+        biosample_row["idx"],
+    )
+    assert global_metadata_count == 0
+
+    # Reported, not fatal: ERC000011's two mandatory fields are listed as
+    # missing.
+    missing_rows = await postgres_pool.fetch(
+        "SELECT gf.display_name"
+        " FROM qiita.metadata_checklist_field mcf"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = mcf.biosample_global_field_idx"
+        " WHERE mcf.metadata_checklist_idx = $1"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM qiita.biosample_metadata bm"
+        "      WHERE bm.biosample_idx = $2 AND bm.global_field_idx = gf.idx"
+        "   )"
+        " ORDER BY gf.display_name",
+        biosample_row["metadata_checklist_idx"],
+        biosample_row["idx"],
+    )
+    assert [r["display_name"] for r in missing_rows] == [
+        "collection date",
+        "geographic location (country and/or sea)",
+    ]
+
+    prep_sample_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1",
+        item_row["study_idx"],
+    )
+    assert prep_sample_count == 1
 
     await _cleanup_study(postgres_pool, accession)
 

@@ -277,6 +277,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **ENA import: an empty ENA sample attribute set no longer fails the whole
+  study.** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
+  whose sample (`SAMD01818724`) has zero `<SAMPLE_ATTRIBUTE>` elements —
+  genuinely common on real ENA/DDBJ data, but `MiintEnaResolver`/
+  `HttpEnaResolver.resolve_sample_attributes` hard-raised
+  `EnaAccessionNotFoundError` on the resulting 0-row result, marking the
+  entire study `failed`. `resolve_sample_attributes` now returns no entries
+  instead of raising for that case — `resolve_study_header`/`resolve_runs`
+  (and `HttpEnaResolver`'s own sample-existence search) are unchanged and
+  still raise on a genuine zero-row "nothing resolved." The study now
+  registers normally; the biosample harmonizes against an empty attribute
+  map (no globally-linked metadata) and the ERC000011 checklist's missing
+  required fields are reported, never fatal.
 - **ENA import batch driver: reconcile principal guard + `download_method`
   threading (batch-driver hardening).** `ena_import.batch._load_principal`
   (used by `reconcile_inflight_batches` to re-drive in-flight batch items

@@ -98,13 +98,18 @@ def test_resolve_sample_attributes_pivots_by_sample(monkeypatch):
     assert_prjna48739_sample_attributes(attrs)
 
 
-def test_resolve_sample_attributes_zero_rows_is_not_found(monkeypatch):
+def test_resolve_sample_attributes_zero_rows_returns_empty_list(monkeypatch):
+    """A real DDBJ shape (study PRJDB40364's sample SAMD01818724 has zero
+    <SAMPLE_ATTRIBUTE> elements): unlike resolve_study_header/resolve_runs,
+    a 0-row read_ena_attributes result is a legitimate "no attributes"
+    outcome, not "nonexistent" -- must NOT raise."""
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
     monkeypatch.setattr(_QUERY_ATTRS, lambda accession: (["sample_accession", "tag", "value"], []))
 
-    with pytest.raises(EnaAccessionNotFoundError, match="PRJEB00000000"):
-        MiintEnaResolver().resolve_sample_attributes("PRJEB00000000")
+    attrs = MiintEnaResolver().resolve_sample_attributes("PRJDB40364")
+
+    assert attrs == []
 
 
 def test_resolve_runs_rejects_empty_accession(monkeypatch):
