@@ -84,6 +84,23 @@ async def pool_ctx(postgres_pool):
     )
 
     samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
+    masks: list[int] = []
+
+    async def mint_mask(*, rype_ref=None, minimap2_ref=None):
+        """Insert a mask_definition whose params name host references, so the
+        reference-scoped completion can match a ticket's mask against a reference."""
+        mask_idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.mask_definition"
+            "  (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+            " VALUES ($1, 'read-mask', '1.0', $2::jsonb, $3) RETURNING mask_idx",
+            secrets.token_bytes(32),
+            json.dumps(
+                {"host_rype_reference_idx": rype_ref, "host_minimap2_reference_idx": minimap2_ref}
+            ),
+            owner_idx,
+        )
+        masks.append(mask_idx)
+        return mask_idx
 
     async def add_sample(*, retired=False):
         bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
@@ -108,22 +125,23 @@ async def pool_ctx(postgres_pool):
         samples.append((bs_idx, ps_idx, ss_idx))
         return ps_idx
 
-    async def add_ticket(prep_sample_idx, state):
+    async def add_ticket(prep_sample_idx, state, mask_idx=None):
         # The work_ticket_failure_consistent CHECK requires the failure columns to
         # be set together on a FAILED ticket and all-NULL otherwise.
         failed = state == "failed"
         await postgres_pool.execute(
             "INSERT INTO qiita.work_ticket"
             "  (action_id, action_version, originator_principal_idx,"
-            "   scope_target_kind, prep_sample_idx, state,"
+            "   scope_target_kind, prep_sample_idx, mask_idx, state,"
             "   failure_type, failure_stage, failure_reason)"
-            " VALUES ($1, $2, $3, 'prep_sample'::qiita.scope_target_kind, $4,"
-            "         $5::qiita.work_ticket_state,"
-            "         $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)",
+            " VALUES ($1, $2, $3, 'prep_sample'::qiita.scope_target_kind, $4, $5,"
+            "         $6::qiita.work_ticket_state,"
+            "         $7::qiita.failure_type, $8::qiita.work_ticket_failure_stage, $9)",
             action_id,
             action_version,
             owner_idx,
             prep_sample_idx,
+            mask_idx,
             state,
             "permanent" if failed else None,
             "finalize" if failed else None,
@@ -157,6 +175,7 @@ async def pool_ctx(postgres_pool):
         "add_sample": add_sample,
         "add_ticket": add_ticket,
         "add_demux_ticket": add_demux_ticket,
+        "mint_mask": mint_mask,
     }
 
     await postgres_pool.execute(
@@ -169,6 +188,12 @@ async def pool_ctx(postgres_pool):
         bcl_action_id,
         bcl_action_version,
     )
+    # Masks after the work_tickets that referenced them (mask_idx is ON DELETE
+    # SET NULL, so order isn't strictly required, but keep it FK-reverse).
+    if masks:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])", masks
+        )
     for _bs, _ps, ss_idx in samples:
         await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
@@ -344,3 +369,105 @@ async def test_demux_state_completed_wins_over_failed(pool_ctx):
     await pool_ctx["add_demux_ticket"]("completed")
     state = await fetch_sequenced_pool_demux_state(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert state == "completed"
+
+
+# ---------------------------------------------------------------------------
+# reference-scoped completion (per-host-reference breakdown)
+# ---------------------------------------------------------------------------
+
+
+async def test_reference_scoped_completion_distinguishes_per_reference(pool_ctx):
+    """With a reference_idx, host-masking completion counts only masks that used
+    that reference. Sample A is masked against reference 100, sample B against
+    reference 200. Scoped to 100: A completed, B not_submitted (masked, but not
+    against 100) — which the reference-agnostic form cannot tell apart."""
+    ref_a, ref_b = 100, 200
+    mask_a = await pool_ctx["mint_mask"](rype_ref=ref_a)
+    mask_b = await pool_ctx["mint_mask"](minimap2_ref=ref_b)
+
+    ps_a = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_a, "completed", mask_idx=mask_a)
+    ps_b = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_b, "completed", mask_idx=mask_b)
+
+    # Reference-agnostic: both masked → both completed.
+    allref = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert allref["sample_count"] == 2
+    assert allref["samples_completed"] == 2
+    assert allref["samples_not_submitted"] == 0
+
+    # Scoped to reference 100: only A counts as masked; B is not_submitted.
+    scoped = await fetch_sequenced_pool_completion(
+        pool_ctx["pool"], pool_ctx["pool_idx"], reference_idx=ref_a
+    )
+    assert scoped["sample_count"] == 2
+    assert scoped["samples_completed"] == 1
+    assert scoped["samples_not_submitted"] == 1
+
+    # A reference nobody masked against → every sample not_submitted.
+    none_match = await fetch_sequenced_pool_completion(
+        pool_ctx["pool"], pool_ctx["pool_idx"], reference_idx=999
+    )
+    assert none_match["samples_completed"] == 0
+    assert none_match["samples_not_submitted"] == 2
+
+
+async def test_reference_scoped_matches_rype_or_minimap2(pool_ctx):
+    """A reference used as EITHER the rype or the minimap2 host reference matches:
+    a mask that names reference 300 only as its minimap2 reference still counts
+    when scoped to 300."""
+    mask = await pool_ctx["mint_mask"](minimap2_ref=300)
+    ps = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask)
+    scoped = await fetch_sequenced_pool_completion(
+        pool_ctx["pool"], pool_ctx["pool_idx"], reference_idx=300
+    )
+    assert scoped["samples_completed"] == 1
+    assert scoped["samples_not_submitted"] == 0
+
+
+async def test_reference_scope_matches_real_build_mask_params_keys(pool_ctx):
+    """Pin the producer<->consumer JSONB-key contract. The reference-scoped
+    completion SQL reads md.params->>'host_rype_reference_idx' /
+    'host_minimap2_reference_idx'; those keys are produced by
+    runner._mask._build_mask_params (the single source of the mask identity
+    shape). Mint a mask with its REAL output and assert the scope matches — so a
+    future key rename there fails loudly here instead of silently reading every
+    sample as not_submitted."""
+    from qiita_control_plane.runner._mask import _build_mask_params
+
+    ref = 777
+    params = _build_mask_params(
+        action_id="read-mask",
+        action_version="1.0.0",
+        prep_protocol_idx=None,
+        instrument_model=None,
+        adapter_set_hash=None,
+        host_rype_reference_idx=ref,
+        host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+    db = pool_ctx["pool"]
+    mask_idx = await db.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        "  (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, $2, $3, $4::jsonb,"
+        "  (SELECT created_by_idx FROM qiita.sequenced_pool WHERE idx = $5))"
+        " RETURNING mask_idx",
+        secrets.token_bytes(32),
+        params["filter_workflow"],
+        params["filter_version"],
+        json.dumps(params),
+        pool_ctx["pool_idx"],
+    )
+    try:
+        ps = await pool_ctx["add_sample"]()
+        await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask_idx)
+        scoped = await fetch_sequenced_pool_completion(db, pool_ctx["pool_idx"], reference_idx=ref)
+        assert scoped["samples_completed"] == 1
+        assert scoped["samples_not_submitted"] == 0
+    finally:
+        # mask_idx on work_ticket is ON DELETE SET NULL, so deleting the mask
+        # clears the ticket's ref; the ticket itself is cleaned by the fixture.
+        await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)

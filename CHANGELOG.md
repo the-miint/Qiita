@@ -42,6 +42,25 @@ duplicates further down are historical strata; leave them where they are.
   term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
   is deprecated at source but appears in data we import), to the existing
   pre-release MVP terminologies.
+- **Pool / run summary + rollup endpoints (#236).** Server-side aggregation so
+  callers stop paging the per-sample list route and tallying by hand. All
+  compute-on-read (never drifts), no migration. (1) `PoolReadMetrics` gains a
+  read-outcome breakdown (`samples_unprocessed` / `samples_zero_reads` /
+  `samples_with_reads`, splitting the old `samples_with_metrics` into "no metrics
+  yet" vs "processed but everything filtered out") and accession-coverage counts
+  (per-accession + all-four `samples_fully_submitted_to_ena`); the pool + run
+  rollups share one SQL aggregate so they can't drift. (2) `GET /sequencing-run/{run}`
+  now nests `read_metrics` (the run-level twin, summed across the run's pools).
+  (3) New `GET .../sequenced-pool/{P}/sequenced-sample/exceptions` — only the
+  anomalous samples (no usable reads / missing any submission accession / failed
+  read-mask ticket), each with the flags naming why. (4) New
+  `GET .../sequenced-pool/{P}/work-ticket/summary` — read-mask ticket coverage +
+  per-state ticket counts (tickets as denominator), reconciled with the completion
+  rollup. (5) `GET /work-ticket` list rows now nest `read_outcome` (the ticket's
+  prep_sample read counts + passing fraction) for prep_sample-scoped tickets.
+  (6) `GET .../completion` gains an optional `?reference_idx=N` so host-masking
+  completion distinguishes "not masked against THIS reference" from the
+  reference-agnostic "not masked at all" (folded from #217 ask-4).
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a

@@ -72,6 +72,7 @@ from qiita_common.models import (
     WorkTicketCancelResponse,
     WorkTicketCancelResult,
     WorkTicketCreateRequest,
+    WorkTicketReadOutcome,
     WorkTicketResponse,
     WorkTicketState,
     WorkTicketStepLogs,
@@ -834,13 +835,28 @@ _WORK_TICKET_SUMMARY_FROM = (
     "   LIMIT 1"
     " ) cur ON true"
 )
+# The summary read also nests the ticket's prep_sample read outcome: a LEFT JOIN
+# to the sequenced_sample of wt.prep_sample_idx (1:1 with the
+# prep_sample), so a read-mask ticket is assessable without a separate lookup. The
+# join is NULL for a non-prep_sample-scoped ticket (prep_sample_idx NULL) or a
+# prep_sample with no sequenced_sample; `ro_present` (ss.idx) distinguishes "no
+# sequenced_sample" from "processed = has no counts yet".
+_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME = (
+    _WORK_TICKET_SUMMARY_FROM
+    + " LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = wt.prep_sample_idx"
+)
 _WORK_TICKET_SUMMARY_COLUMNS = (
     _WORK_TICKET_COLUMNS + ","
     " cur.step_index AS current_step_index,"
     " cur.step_name AS current_step_name,"
     " cur.compute_target AS current_compute_target,"
     " cur.slurm_job_id AS current_slurm_job_id,"
-    " cur.state AS current_step_state"
+    " cur.state AS current_step_state,"
+    " ss.idx AS ro_present,"
+    " ss.raw_read_count_r1r2 AS ro_raw_read_count_r1r2,"
+    " ss.biological_read_count_r1r2 AS ro_biological_read_count_r1r2,"
+    " ss.quality_filtered_read_count_r1r2 AS ro_quality_filtered_read_count_r1r2,"
+    " ss.spikein_read_count_r1r2 AS ro_spikein_read_count_r1r2"
 )
 
 
@@ -926,6 +942,21 @@ def _row_to_work_ticket_summary(row: asyncpg.Record) -> WorkTicketSummary:
         "slurm_job_id": data.pop("current_slurm_job_id"),
         "step_state": data.pop("current_step_state"),
     }
+    # Nest the prep_sample read outcome. `ro_present` (ss.idx) is NULL when the
+    # ticket has no sequenced_sample (non-prep_sample-scoped, or a prep_sample
+    # without one) → read_outcome None; otherwise build it from the counts (each
+    # individually None until processed). Pop all ro_* either way so they don't
+    # reach `_shape_work_ticket_columns`.
+    ro_present = data.pop("ro_present")
+    ro_counts = {
+        "raw_read_count_r1r2": data.pop("ro_raw_read_count_r1r2"),
+        "biological_read_count_r1r2": data.pop("ro_biological_read_count_r1r2"),
+        "quality_filtered_read_count_r1r2": data.pop("ro_quality_filtered_read_count_r1r2"),
+        "spikein_read_count_r1r2": data.pop("ro_spikein_read_count_r1r2"),
+    }
+    summary_fields["read_outcome"] = (
+        WorkTicketReadOutcome.model_validate(ro_counts) if ro_present is not None else None
+    )
     shaped = _shape_work_ticket_columns(data)
     return WorkTicketSummary.model_validate({**shaped, **summary_fields})
 
@@ -1038,7 +1069,7 @@ async def list_work_tickets(
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     args.append(limit)
     rows = await pool.fetch(
-        f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM}{where}"
+        f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME}{where}"
         f" ORDER BY wt.work_ticket_idx DESC LIMIT ${len(args)}",
         *args,
     )

@@ -537,6 +537,21 @@ PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
 PATH_SEQUENCED_POOL_ALIGN_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
 )
+# GET the pool's exception drill-down: only the anomalous non-retired
+# sequenced_samples — no usable reads (unprocessed or zero survived), missing any
+# of the four submission accessions, or a genuinely-failed read-mask ticket (failed
+# with no completed) — each with the flags naming why. The actionable subset of the
+# roster, so an operator sees what needs attention without scanning every sample.
+PATH_SEQUENCED_SAMPLE_EXCEPTIONS = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/sequenced-sample/exceptions"
+)
+# GET the pool's work-ticket state rollup: read-mask ticket coverage
+# (samples with / without a ticket) plus per-STATE ticket counts (tickets as the
+# denominator, no per-sample precedence collapse — distinct from the completion
+# rollup's per-sample buckets).
+PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/work-ticket/summary"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -557,6 +572,10 @@ URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
 URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
+URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"
+)
 
 
 # =============================================================================
