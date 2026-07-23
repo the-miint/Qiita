@@ -186,7 +186,9 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
 
       * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
         for the masked read_masked pass-set to assemble);
-      * the step chain is assembly_run_config (module) → assemble → binning →
+      * the step chain is assembly_run_config (module) → assemble →
+        assembly_coverage (module; the miint minimap2 pre-map whose BAM lets
+        metaWRAP skip its own bwa self-alignment) → binning →
         bin_refine → checkm (four container steps) → assembly_hash (module) →
         mint-features → write-assembly-membership → assembly_load (module) →
         register-files, in that order — the storage tail reuses the reference-add
@@ -216,6 +218,7 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     assert [s.name for s in assembly.steps] == [
         "assembly_run_config",
         "assemble",
+        "assembly_coverage",
         "binning",
         "bin_refine",
         "checkm",
@@ -233,6 +236,15 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     assert hash_step.module == "qiita_compute_orchestrator.jobs.assembly_hash"
     load_step = next(s for s in assembly.steps if s.name == "assembly_load")
     assert load_step.module == "qiita_compute_orchestrator.jobs.assembly_load"
+    # The coverage pre-map must sit BEFORE binning and feed it: binning stages
+    # `coverage_bam` into metaWRAP's work_files/ so it skips its own bwa mem.
+    # Reversed or unwired, metaWRAP silently self-aligns HiFi reads with a
+    # short-read aligner instead of failing.
+    coverage_step = next(s for s in assembly.steps if s.name == "assembly_coverage")
+    assert coverage_step.module == "qiita_compute_orchestrator.jobs.assembly_coverage"
+    assert "coverage_bam" in coverage_step.outputs
+    binning_step = next(s for s in assembly.steps if s.name == "binning")
+    assert "coverage_bam" in binning_step.inputs
     # assembly_load threads processing_idx via params so the runner mints the run
     # identity before the step loop; write-assembly-membership then reads it.
     assert load_step.params == {"processing_idx": "processing_idx"}
