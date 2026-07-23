@@ -70,7 +70,7 @@ class BlockMember(NamedTuple):
     """One sample's contiguous slice within a block: the inclusive
     `[min_sequence_idx, max_sequence_idx]` sub-range of `prep_sample_idx`'s reads
     this block covers. Maps 1:1 onto a qiita.block_member row and onto an
-    `export_read_block` member."""
+    block-read selector member."""
 
     prep_sample_idx: int
     min_sequence_idx: int
@@ -103,7 +103,7 @@ def tile_partition(
     into disjoint sub-ranges across consecutive blocks (each an exact
     `[min, max]`), and a sample's sub-ranges across its blocks together cover its
     whole `[start, stop]` with no gap or overlap — the invariant the reconcile
-    count-assertion and the exact `export_read_block` selector both rely on.
+    count-assertion and the exact block-read selector both rely on.
 
     Pure metadata arithmetic: no read data is touched. Deterministic and
     re-derivable from the same `samples` + `target_reads` (samples are sorted by

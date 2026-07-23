@@ -29,7 +29,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
-from qiita_common.api_paths import URL_ALIGNMENT_DOGET, URL_REFERENCE_DOGET
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_DOGET,
+    URL_READ_DOGET,
+    URL_REFERENCE_DOGET,
+)
 
 from .config import get_settings
 from .cp_client import make_cp_client
@@ -171,6 +175,84 @@ async def open_reference_chunk_stream(
             table="reference_sequence_chunks",
             feature_idx=feature_idx,
         )
+
+    async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
+        yield rel
+
+
+async def fetch_read_doget_ticket(
+    *,
+    http: httpx.AsyncClient,
+    work_ticket_idx: int,
+) -> bytes:
+    """POST /read/ticket/doget and return the raw signed ticket bytes.
+
+    Like `fetch_alignment_doget_ticket`, the body carries ONLY
+    ``work_ticket_idx``: the CP reads the block's ``(prep_sample_idx,
+    sequence_idx sub-range)`` members from ``qiita.block_member`` and picks the
+    selector — raw ``read_block`` for a read-mask block, mask-scoped
+    ``read_masked_block`` for an align block — from the ticket's
+    ``action_context``, so a block's (potentially large) member list stays
+    CP-side rather than on the wire. Called at job RUNTIME (short-TTL ticket; a
+    SLURM queue can outlive a submit-time ticket).
+
+    `http` is the authed httpx client (Bearer with the compute SA PAT, base_url =
+    the CP) from `cp_client.make_cp_client()`. The CP returns the ticket
+    base64-encoded; this decodes it to the raw bytes `open_doget_stream` wraps in
+    a `flight.Ticket`. Raises `httpx.HTTPStatusError` on any non-2xx (404 missing
+    ticket, 422 a non-block ticket / an empty block / an alignment deleted
+    mid-flight, 403 missing scope, 5xx) — the caller maps it to a BackendFailure.
+    """
+    resp = await http.post(URL_READ_DOGET, json={"work_ticket_idx": work_ticket_idx})
+    resp.raise_for_status()
+    return base64.b64decode(resp.json()["ticket"])
+
+
+@asynccontextmanager
+async def open_read_block_stream(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    work_ticket_idx: int,
+    relation: str = "block_reads",
+) -> AsyncIterator[str]:
+    """Mint a block-read DoGet ticket (CO→CP) and stream this block's reads
+    (CO→DP Flight) into `conn` as `relation`, yielding the registered relation
+    name for the caller to materialize from inside the `async with` body.
+
+    The seam that replaces "the CP asks the data plane to COPY a reads.parquet
+    onto shared scratch at submit time, then hands the job a path". The bytes and
+    the column shape are identical — `prep_sample_idx, sequence_idx, read_id,
+    sequence1, qual1, sequence2, qual2`, the data plane's shared
+    `EXPORT_READ_COLUMNS` projection — only the transport changes. What that buys:
+    the bulk read work happens at job runtime on a compute node (so it spreads
+    across data-plane instances behind nginx) instead of as a synchronous burst on
+    the CP's submit path, and the handoff no longer assumes a shared filesystem.
+
+    Whether the stream carries RAW or host-depleted/QC-passed reads is decided
+    CP-side from the work ticket, NOT by the caller — an align block gets masked
+    reads, a read-mask block gets raw ones (see the CP's `block_read` module). A
+    job therefore asks for "my block's reads" and cannot accidentally request the
+    wrong kind.
+
+    **Materialize, don't re-scan.** A Flight reader is consumed ONCE. Callers that
+    scan their reads more than a time (align_sharded builds two relations over
+    them) or hand them to miint (which resolves relation names on a SEPARATE
+    connection, so a registered stream relation is invisible there — see
+    docs/duckdb-miint.md) must `CREATE TABLE … AS SELECT` from `relation` inside
+    the body, exactly as `estimate_feature_table` does with its alignment slice.
+
+    An EMPTY stream is legitimate, not an error: a completed mask can carry 0
+    passing reads (a blank/no-template control, or a fully host/QC-filtered
+    sample), and a zero-row Arrow stream still carries its schema, so the caller
+    materializes a valid empty table and runs to a clean no-op.
+
+    Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
+    the ticket is minted; only the Flight client/stream stays open for the body's
+    duration. `data_plane_url` resolves from `get_settings()`.
+    """
+
+    async def _mint(http: httpx.AsyncClient) -> bytes:
+        return await fetch_read_doget_ticket(http=http, work_ticket_idx=work_ticket_idx)
 
     async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
         yield rel

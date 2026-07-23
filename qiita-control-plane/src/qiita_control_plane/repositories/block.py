@@ -42,8 +42,8 @@ async def fetch_block_members(
     """Return `block_idx`'s cover-map rows as `(prep_sample_idx, min_sequence_idx,
     max_sequence_idx)` tuples, ordered by prep_sample_idx.
 
-    The runner reads these to bind a block ticket's `reads` (each row is an
-    `export_read_block` member's sub-range) and the reconcile primitive reads them
+    The block-read DoGet mint route reads these to scope a ticket (each row is a
+    block-read selector member's sub-range) and the reconcile primitive reads them
     to walk the block's samples. Ordered deterministically (by prep_sample_idx) so
     concurrent reconcile finalizers lock mask_sample rows in a consistent order
     (deadlock-free). Accepts a pool or a connection so it composes standalone or

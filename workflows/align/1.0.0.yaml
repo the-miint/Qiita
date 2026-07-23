@@ -26,14 +26,15 @@ description: >
 
   The reads are the MASKED reads — the host-depleted, QC-passed reads the
   `read-mask-block` milestone produced (the DuckLake `read_masked` view). The
-  runner binds `reads` from the block's `block_member` sub-ranges via the
-  `export_read_masked_block` DoAction (the data plane materializes the union of
-  the members' `read_masked` sub-ranges, scoped to the ticket's `mask_idx`, into a
-  per-ticket `reads.parquet` — the bulk read bytes never transit the control
-  plane), binds `mask_idx` from the work_ticket (resolved at plan time as the
-  samples' completed host-depletion mask), and resolves the reference's
-  `router_index_path` + `shard_directory` from action_context (the
-  `_resolve_sharded_align_indexes`). This workflow never parses reads or mints a
+  `align_sharded` job STREAMS them from the data plane at runtime (POST
+  /read/ticket/doget, keyed on work_ticket_idx): the control plane resolves the
+  block's `block_member` sub-ranges, signs the `read_masked_block` selector scoped
+  to the ticket's completed `mask_idx`, and the job reads the stream directly — so
+  nothing is materialized onto shared scratch at submit time and the bulk read
+  bytes never transit the control plane. `mask_idx` is bound from the work_ticket
+  (resolved at plan time as the samples' completed host-depletion mask) and the
+  reference's `router_index_path` + `shard_directory` resolve from action_context
+  (`_resolve_sharded_align_indexes`). This workflow never parses reads or mints a
   sequence_idx range.
 
   `alignment_idx` is the CP-minted alignment-config identity (deduped on
@@ -44,17 +45,16 @@ description: >
   by the align planner.
 
 # reconcile-alignment-block flips each finalized sample's `alignment_sample` gate;
-# it re-materializes host-depleted (human-derived) reads into the ticket workspace
-# via export_read_masked_block, so submitters must hold prep_sample:write — the
-# same privileged scope read-mask-block declares. No new alignment:write scope
-# (reuse bounds the surface).
+# the workflow streams host-depleted (human-derived) reads to the compute node, so
+# submitters must hold prep_sample:write — the same privileged scope
+# read-mask-block declares. No new alignment:write scope (reuse bounds the
+# surface).
 scopes:
   - prep_sample:write
 
-# Admin-only, same rationale as read-mask-block: alignment makes the data plane
-# re-materialize host-depleted reads (derived from human-containing reads) into
-# the ticket workspace via the `export_read_masked_block` DoAction, so this is a
-# privileged lab operation.
+# Admin-only, same rationale as read-mask-block: alignment streams host-depleted
+# reads (derived from human-containing reads) from the data plane to the compute
+# node, so this is a privileged lab operation.
 audience:
   service: false
   human_roles: [wet_lab_admin, system_admin]
@@ -93,8 +93,11 @@ context_schema:
 
 steps:
   # Route + align the block's masked reads against the sharded reference. `reads`
-  # is runner-bound from the block's member sub-ranges over the read_masked view
-  # (_resolve_staged_masked_reads_block, keyed on work_ticket.mask_idx);
+  # is deliberately NOT an input: the job STREAMS the block's masked reads from
+  # the data plane at runtime (POST /read/ticket/doget, keyed on work_ticket_idx),
+  # so nothing is materialized onto shared scratch at submit time. The control
+  # plane picks the mask-scoped `read_masked_block` selector from the ticket, so
+  # this step cannot receive raw (un-host-depleted) reads.
   # `router_index_path` (the whole-reference rype router, router_paths[0]) +
   # `shard_directory` (the per-aligner shard root) are runner-bound from
   # action_context (_resolve_sharded_align_indexes on align_reference_idx +
@@ -105,7 +108,7 @@ steps:
   - step: align_sharded
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.align_sharded
-    inputs: [reads, router_index_path, shard_directory]
+    inputs: [router_index_path, shard_directory]
     params: {aligner: aligner, alignment_idx: alignment_idx}
     outputs: [alignment, alignment_staging_dir]
     baseline_resources:
