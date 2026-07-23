@@ -90,13 +90,31 @@ steps:
       mem_gb: 192
       walltime: PT16H
 
+  # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
+  # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step
+  # injects into metaWRAP's alignment cache. Native, because miint is not exposed
+  # to containers — see the module docstring for why this pre-map exists at all
+  # (metaWRAP would otherwise self-align HiFi reads with bwa, a short-read
+  # aligner, and offers no flag to choose).
+  - step: assembly_coverage
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_coverage
+    inputs: [genomes_dir, masked_reads_fastq]
+    outputs: [coverage_bam]
+    baseline_resources:
+      cpu: 16
+      mem_gb: 64
+      walltime: PT4H
+
   # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
   # reads. 0 bins → empty bins_dir (exit 0); downstream steps skip cleanly.
+  # `coverage_bam` is staged into work_files/ so metaWRAP skips its own bwa mem
+  # and derives depth from the minimap2 alignment instead.
   - step: binning
     step_type: singleton
     container: long-read-assembly-binning-1.0.0.sif
     entrypoint: /opt/qiita/binning.sh
-    inputs: [genomes_dir, masked_reads_fastq]
+    inputs: [genomes_dir, masked_reads_fastq, coverage_bam]
     outputs: [bins_dir]
     baseline_resources:
       cpu: 16

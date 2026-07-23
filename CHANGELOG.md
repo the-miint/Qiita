@@ -53,6 +53,27 @@ duplicates further down are historical strata; leave them where they are.
   Phylogeny defers to a documented `shear_tree` prune contract (no production tree
   consumer exists yet). Two migrations: `reference_membership.accession`,
   `reference_exclusion`.
+- **`assembly_coverage` — binning coverage from miint's minimap2, not bwa.** New native
+  step in `long-read-assembly`, between `assemble` and `binning`: it aligns the masked
+  HiFi reads back to the noLCG contigs with miint's embedded minimap2 (`map-hifi`) and
+  writes a coordinate-sorted BAM, which `binning.sh` stages into
+  `work_files/<sample>.bam`. metaWRAP guards its own `bwa mem` behind that file's
+  existence, so it skips self-alignment and derives depth from the minimap2 alignment —
+  the same seam qp-pacbio uses, and the only one available (`metawrap binning` has no
+  aligner-selection flag). Native rather than in-container because miint is deliberately
+  not exposed to containers. Three miint BAM-writer behaviours it rests on are pinned by
+  `tests/jobs/test_assembly_coverage.py`: `COPY … (FORMAT BAM)` requires
+  `REFERENCE_LENGTHS`; @SQ is emitted **reversed** from that table (undocumented — so the
+  table is built DESC to land @SQ ascending, which is what makes the coordinate sort valid,
+  since jgi checks tid order, not contig name); and `SEQUENCE_DATA` (documented upstream but
+  easy to miss) is required to write real SEQ, without which jgi's contig-end exclusion
+  window (`--maxEdgeBases`, default 75)
+  collapses — it sizes that window from the read length it reads out of SEQ — averaging the
+  under-covered contig ends in and dropping depth by ~`2*75/contig_length` (0.750% on a
+  20 kb contig), a bias inversely proportional to contig length that also inflates the
+  variance metabat2 consumes. With `SEQUENCE_DATA` the depth and variance match a real
+  `minimap2 | samtools sort` BAM to every printed digit, so the step is at parity with
+  qp-pacbio's coverage. (#365)
 - **`qiita-admin ticket cancel` — stop in-flight compute without raw scancel (#314).**
   A single ticket or a whole fan-out (explicit idxs and/or an `--action-id` +
   `--sequencing-run-idx`/`--sequenced-pool-idx` filter) can now be cancelled from the
@@ -179,6 +200,20 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **The `long-read-assembly` binning image shipped with zero binners.** `binning.def`
+  installed bioconda's `metawrap-mg`, which is metaWRAP's *scripts only* — it declares
+  none of the tools those scripts invoke. All **nine** were absent (bwa, samtools,
+  metabat2, jgi_summarize_bam_contig_depths, run_MaxBin.pl, concoct, cut_up_fasta.py,
+  concoct_coverage_table.py, merge_cutup_clustering.py); `bwa: command not found` was
+  simply the first one a job reached, after the step had allocated 16 CPU / 100 GB. Now
+  named explicitly, with `maxbin2>=2.2.6` pinned because 2.2.1's executable is `MaxBin`,
+  not the `run_MaxBin.pl` metaWRAP calls. The build check missed it because
+  `micromamba env list | grep metawrap` passes on an empty env: replaced by
+  `binning-verify.sh`, baked into the image and driving both the def's `%test` and the
+  spec's `VERIFY_CMD`, which asserts each tool and prints its sentinel only when all are
+  present. Neither the full `metawrap` package (unsolvable) nor `metawrap-binning`
+  (declares bowtie2, which the module never invokes; omits bwa and metabat2) is a
+  substitute. (#365)
 - **Empty control wells end `no_data`, not `samples_failed`, on the live read-mask
   path (#177).** On the live `bcl-convert → ingest_reads → read-mask` pipeline an
   empty well produces zero stored reads; the per-sample read-mask ticket then failed
