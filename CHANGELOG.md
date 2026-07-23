@@ -723,10 +723,12 @@ duplicates further down are historical strata; leave them where they are.
 ### Changed
 
 - **ENA ingest classifies an md5-verification failure as an explicit,
-  self-documented permanent error.** duckdb-miint's `read_ena_sequences` now
-  verifies every downloaded run's bytes against ENA's reported `fastq_md5` by
-  default; `ingest_ena_reads` relies on that default (it never passes
-  `verify_md5` itself). A mismatch raises a `duckdb.IOException` whose message
+  self-documented permanent error.** Once the data plane bundles the miint build
+  that adds `verify_md5` (default on there), `read_ena_sequences` verifies every
+  downloaded run's bytes against ENA's reported `fastq_md5`; `ingest_ena_reads`
+  relies on that default (it never passes `verify_md5` itself), so the branch is
+  dormant against an older bundled extension and activates on the bump. A mismatch
+  raises a `duckdb.IOException` whose message
   contains "md5" and none of the transient network markers; previously this
   fell through the classifier's default permanent case implicitly.
   `_classify_ena_fetch_error` now has a dedicated md5 branch (checked after

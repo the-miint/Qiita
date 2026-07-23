@@ -1199,3 +1199,112 @@ async def test_reconcile_inflight_batches_refuses_retired_principal(
     )
     assert item_row["state"] == BatchItemState.PENDING.value
     assert item_row["study_idx"] is None
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: batch-creation dedup, zero-pool terminal state, and
+# rollup strictness on a missing / unknown ticket state.
+# ---------------------------------------------------------------------------
+
+
+async def test_create_ena_import_batch_dedupes_repeated_accession(
+    postgres_pool, admin_principal, batch_cleanup
+):
+    """A repeated accession in one request fans out a single item, not two
+    concurrent items registering the same study."""
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession, accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    assert [item.ena_study_accession for item in items] == [accession]
+    item_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.ena_import_batch_item WHERE batch_idx = $1", batch_idx
+    )
+    assert item_count == 1
+
+
+async def test_process_one_study_zero_pools_reaches_terminal_failed(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study whose only run maps to a rejected platform registers zero pools.
+    The item must reach a terminal state (failed), not sit in `downloading`
+    forever with an empty ticket list."""
+
+    def _fake_runs_unmappable(accession):
+        cols, rows = _fake_runs(accession)
+        row = list(rows[0])
+        row[8] = "UNMAPPABLE_PLATFORM_XYZ"  # index 8 = instrument_platform
+        return cols, [tuple(row)]
+
+    monkeypatch.setattr(_QUERY_RUNS, _fake_runs_unmappable)
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(
+        batch_app,
+        items=items,
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        resolver_kind=ResolverKind.MIINT,
+        download_method="http",
+    )
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, download_work_ticket_idxs, failure_reason"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert list(item_row["download_work_ticket_idxs"]) == []
+    assert "no run mapped to a downloadable pool" in item_row["failure_reason"]
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_fetch_batch_status_missing_ticket_row_stays_downloading(
+    postgres_pool, admin_principal, batch_cleanup
+):
+    """A ticket idx with no matching work_ticket row yields state None in the
+    rollup -- not terminal-success -- so the item stays `downloading`, never
+    reads as `done`."""
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    batch_cleanup.append(batch_idx)
+
+    missing_ticket_idx = 2_000_000_000  # no work_ticket row exists for this idx
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item"
+        " SET state = 'downloading', download_work_ticket_idxs = $2"
+        " WHERE idx = $1",
+        items[0].idx,
+        [missing_ticket_idx],
+    )
+
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    assert status is not None
+    assert status.items[0].state == BatchItemState.DOWNLOADING

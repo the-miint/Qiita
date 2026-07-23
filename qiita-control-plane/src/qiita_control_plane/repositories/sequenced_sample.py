@@ -207,7 +207,7 @@ async def insert_sequenced_sample(
     row and are not parameters here.
 
     source_archive / resolver_kind / transport are the ENA-import
-    provenance columns added by db/migrations/20260721000000_sequenced_
+    provenance columns added by db/migrations/20260723000000_sequenced_
     sample_ena_provenance.sql (TEXT/CHECK, mirrored by
     qiita_common.models.ena.SourceArchive / ResolverKind); all three are
     plain strings here (not the enum types) so this repo module stays
@@ -409,7 +409,7 @@ async def set_sequenced_pool_transport(
     """Stamp every sequenced_sample row in a pool with the transport (http /
     aspera) used to download its reads.
 
-    Closes the provenance gap `db/migrations/20260721000000_sequenced_
+    Closes the provenance gap `db/migrations/20260723000000_sequenced_
     sample_ena_provenance.sql` documents: that migration adds the column but
     leaves it NULL, deferring the write to the download workflow —
     this is that write, called from the runner's `download-ena-study`

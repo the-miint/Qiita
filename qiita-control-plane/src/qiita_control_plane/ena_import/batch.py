@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import asyncpg
 from fastapi import FastAPI
 from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED
-from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, WorkTicketState
+from qiita_common.models import WorkTicketState
 from qiita_common.models.ena import ResolverKind, SourceArchive
 from qiita_common.models.ena_import import BatchImportItem, BatchImportStatus, BatchItemState
 
@@ -51,6 +51,13 @@ _STUDY_CONCURRENCY = 4
 
 # Shutdown-drain bound, mirroring dispatch.py's _DISPATCH_DRAIN_TIMEOUT_SECONDS.
 _BATCH_DRAIN_TIMEOUT_SECONDS = 60.0
+
+# Terminal-success work-ticket states: an item's download is `done` only when
+# every one of its tickets is explicitly one of these. Anything else (running,
+# unrecognized, or a missing row) must not read as success.
+_TERMINAL_SUCCESS_STATES = frozenset(
+    {WorkTicketState.COMPLETED.value, WorkTicketState.NO_DATA.value}
+)
 
 
 @dataclass(frozen=True)
@@ -117,7 +124,9 @@ async def create_ena_import_batch(
     `_process_one_study`. Returns the batch idx and item handles in submitted
     order; the route fires the background task next.
     """
-    validated = [validate_study_accession(a) for a in accessions]
+    # De-duplicate accessions, order-preserving: a repeated accession in one
+    # request would otherwise fan out concurrent items registering the same study.
+    validated = list(dict.fromkeys(validate_study_accession(a) for a in accessions))
     get_resolver(resolver_backend)  # fail loud on an unrecognized backend
 
     async with pool.acquire() as conn, conn.transaction():
@@ -216,6 +225,22 @@ async def _process_one_study(
             resolver_kind=resolver_kind,
         )
         await _set_item_registered(pool, item.idx, study_idx=result.study_idx)
+
+        if not result.created_pools:
+            # Registration succeeded (study + biosamples), but no run mapped to a
+            # downloadable pool -- e.g. every run hit an unmappable platform. There
+            # is nothing to download, so the item must reach a terminal state rather
+            # than sit in `downloading` forever with an empty ticket list.
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=(
+                    "study registered but no run mapped to a downloadable pool"
+                    " (no download tickets created)"
+                ),
+            )
+            return
 
         # Local import (narrow, deliberately unusual direction): reuse the exact
         # same audience/scope/disallow-without-delete gate a real
@@ -449,10 +474,13 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
             if failed_idxs:
                 state = BatchItemState.FAILED
                 failure_reason = f"download work_ticket(s) failed: {failed_idxs}"
-            elif any(s in NON_TERMINAL_WORK_TICKET_STATES for s in states):
-                state = BatchItemState.DOWNLOADING
-            else:
+            elif all(s in _TERMINAL_SUCCESS_STATES for s in states):
                 state = BatchItemState.DONE
+            else:
+                # Any ticket not explicitly terminal-success -- still running, an
+                # unrecognized state, or a missing work_ticket row (state None) --
+                # must not read as success.
+                state = BatchItemState.DOWNLOADING
         items.append(
             BatchImportItem(
                 ena_study_accession=row["ena_study_accession"],

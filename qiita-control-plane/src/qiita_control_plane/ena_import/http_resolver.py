@@ -7,6 +7,11 @@ and the Browser API (`/xml/...`) for per-sample attributes. URL/query shape mirr
 on results. Unlike miint's `read_ena_attributes`, this fallback does not push attribute
 filtering down into `/search` — it always resolves the sample accessions and fetches
 their XML.
+
+Because the whole point of this fallback is to avoid DuckDB/httpfs, the Portal TSV is
+parsed by hand (`_parse_tsv`) rather than routed through `read_csv` — it is small,
+header-stable metadata (not sequence data), so a stdlib split is deliberate and
+sufficient.
 """
 
 from __future__ import annotations
