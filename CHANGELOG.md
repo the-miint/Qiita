@@ -22,6 +22,174 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **ENA/SRA study metadata resolver (`ena_import`).** Adds the
+  control-plane seam for resolving an ENA/SRA study's metadata ahead of
+  ingestion: `qiita_common.models.ena` (`EnaStudyHeader` / `EnaRunRecord` /
+  `EnaSampleAttributes`, coercing `read_ena`'s ALL-VARCHAR numeric fields and
+  failing loud on garbage), `qiita_control_plane.ena_import.accession`
+  (study/sample/run/experiment accession validation), the `EnaResolver`
+  interface, its default `MiintEnaResolver` implementation (DuckDB + miint
+  `read_ena` / `read_ena_attributes`), an experimental `HttpEnaResolver`
+  fallback against the plain ENA Portal/Browser APIs, and a `get_resolver`
+  backend factory. An unresolved/invalid accession always raises
+  (`InvalidEnaAccessionError` / `EnaAccessionNotFoundError`) rather than
+  returning empty. No DB writes or read downloads yet — those land in later
+  tickets of this epic.
+- **ENA study & sample registration + cross-study de-dup (`ena_import.registration`).**
+  Turns a resolved ENA study (`EnaStudyHeader` + `EnaRunRecord` list)
+  into Qiita `study` / `biosample` / `prep_sample` / `sequenced_sample` rows,
+  idempotently: `register_ena_study` upserts the study keyed positionally on
+  the two ENA accessions, get-or-creates each biosample by
+  `ena_sample_accession` (so the same BioSample recurring across overlapping
+  studies registers once and links to each — the meta-analysis de-dup
+  requirement), maps every run's ENA `instrument_platform` to `qiita.platform`
+  (`ena_import.platform_mapping`, one `sequencing_run`/`sequenced_pool` per
+  distinct platform) and its `library_strategy`/`library_source` to one of the
+  five curated `prep_protocol` rows (`ena_import.protocol_mapping`) — both
+  fail loud on an unmappable value, isolated per run — then imports the
+  sequenced prep_sample via the existing composer. Each run registers inside
+  its own transaction, so a run that fails (e.g. an unmappable platform or
+  protocol) is recorded `failed` in the result without leaving orphan rows or
+  blocking its siblings or the rest of the study; a re-import skips runs
+  already present. `EnaRunRecord` gains `instrument_platform`
+  (a resolver amendment) and `qiita.sequenced_sample` gains three nullable
+  provenance columns (`source_archive` / `resolver_kind` / `transport`,
+  TEXT/CHECK — mirrored by new `SourceArchive`/`ResolverKind` enums in
+  `qiita_common.models.ena`) via an additive, reversible migration;
+  `transport` stays unpopulated until the download workflow lands. No
+  metadata harmonization or batch fan-out yet.
+- **ENA sample-attribute harmonization into the checklist model
+  (`ena_import.harmonization`).** Every ENA-imported biosample is now
+  bound to the ENA default sample checklist (`ERC000011`) and, the first time
+  its biosample is created (write-once — a later study reusing the same
+  BioSample via the existing cross-study de-dup does not re-harmonize it), its
+  submitter-defined attributes are split by a curated, conservative
+  `ena_import.attribute_mapping.map_ena_attributes` into globally-linked
+  metadata (cross-study comparable) and study-local metadata (retained
+  verbatim, never dropped). `known_missing_reasons` is wired into the shared
+  `preflight_global_metadata` helper so an INSDC missing-value string (`not
+  collected`, ...) resolves as a missing-value marker instead of raising a
+  parse error. A checklist-required field ENA did not supply is reported on
+  the new `HarmonizationResult.missing_required` — never rejected; only a
+  genuine parse/type/collision failure fails that run, isolated exactly like
+  a platform/protocol-mapping failure. `host`, `taxon_id`, `host_taxon_id`,
+  and the GSC-MIxS broad-scale/local/medium environmental-context tags are
+  deliberately left unmapped — resolving them onto their (NCBI Taxonomy- or
+  ENVO-)terminology-typed global fields would fabricate an ontology-term
+  resolution this ticket does not own. A new migration seeds `ERC000011`'s
+  real mandatory field set (fetched from ENA: `collection date` and
+  `geographic location (country and/or sea)` — the only two `<FIELD>` entries
+  the checklist marks `mandatory`) into `metadata_checklist_field`.
+  `biosample.get_or_create_biosample_by_ena_accession` now returns
+  `(idx, created)` so the registration composer can key harmonization off
+  whether the biosample was newly created.
+- **ENA study download workflow + CO job (`download-ena-study`,
+  `qiita_compute_orchestrator.jobs.ingest_ena_reads`).** Downloads a
+  registered ENA study's reads via miint `read_ena_sequences` and stores them
+  once into the DuckLake `read` table — the ENA-fetch analog of bcl-convert.
+  New `sequenced_pool`-scoped workflow `workflows/download-ena-study/1.0.0.yaml`
+  (`context_schema` requires `ena_study_accession`; `download_method` is
+  optional, pinned to `http` — no Aspera key-staging in this compute env)
+  replaces the inert placeholder of the same name. The CP runner materializes
+  the pool's `{prep_sample_idx, ena_run_accession}` roster from a LIVE
+  Postgres query (`run_map`, dispatched by declared-input name so it never
+  collides with bcl-convert's action-context-embedded `sample_map`, though
+  both are `sequenced_pool`-scoped) via a new
+  `repositories.sequenced_sample.fetch_sequenced_pool_run_roster`. The job
+  opens a FRESH DuckDB connection per run (`open_miint_ena_conn`, LOAD miint +
+  httpfs) so `miint_warnings()` stays scoped to exactly that run, mints the
+  `sequence_idx` range through the existing CO→CP callback, and fails loud
+  (new retriable `FailureKind.EXTERNAL_FETCH_TRANSIENT` for a
+  transport/network-shaped raised error; permanent `BAD_INPUT` for a
+  `miint_warnings()` skip/truncation entry or for zero reads with no
+  explanatory warning — never silently registers an incomplete or empty read
+  set). No md5 verification (`read_ena_sequences` performs none; tracked
+  separately as the D3-approved duckdb-miint escalation). The
+  sort/hardlink/per-slot-DuckDB-cap helpers `ingest_reads` already had are
+  extracted into a shared sibling module (`read_staging.py`) so both jobs
+  share one implementation. A new pure `ena_import.submit.
+  build_download_ena_study_ticket` composes the ticket body for the batch
+  driver to submit per `(study, platform)` pool. The runner's finalize
+  transaction now also closes the registration path's deferred
+  `qiita.sequenced_sample.transport` column: a new `repositories.sequenced_sample.
+  set_sequenced_pool_transport` stamps every row in the ticket's pool with
+  the ticket's `download_method` (falling back to the same `http` default
+  `ingest_ena_reads.Inputs` uses), gated on the SAME `run_map`
+  declared-input check `_stage_ena_run_roster` uses so it never fires for
+  bcl-convert or another `sequenced_pool`-scoped workflow.
+- **ENA-ingest DuckLake parity verification.** New
+  `tests/integration/test_ena_ingest_e2e.py` proves the download workflow's `ingest_ena_reads`
+  storage tail lands in the real DuckLake `read` table through the EXISTING
+  `register-files` action — no product/data-plane code change was needed. Calls
+  `ingest_ena_reads.execute()` directly against two seeded prep_samples (one
+  paired-end, one single-end) with the `read_ena_sequences` fetch monkeypatched
+  at the `_stage_run_reads` seam (no network, no checked-in fixture) and the CP
+  mint routed to the real `qiita.mint_sequence_range` via `postgres_pool`
+  (mirrors `test_native_step_smoke.py`), then drives the real `register-files`
+  YAML entry (parsed from `workflows/download-ena-study/1.0.0.yaml`, mirrors
+  `test_read_mask_e2e.py`'s `_entry_by_name`) into the real data plane. Asserts
+  the `read` table's 7-column schema, total/`DISTINCT prep_sample_idx` row
+  counts, per-sample contiguous minted `sequence_idx` ranges, and the
+  paired/single-end `sequence2` NULL split — plus that a same-work_ticket retry
+  (re-executing the idempotent hardlink-of-durable-copy path, then
+  re-registering) is REFUSED by the data plane's `move_file` AlreadyExists
+  guard rather than silently duplicating rows, leaving the `read` row count
+  unchanged. The bcl-convert/`ingest_reads` parity claim rests on CODE IDENTITY
+  (`read_staging.write_sorted_reads`/`hardlink`, shared verbatim by both jobs),
+  not an existing baseline test — none exists today for either producer.
+- **Batch multi-study ENA import driver (`ena_import.batch`).** New
+  `POST /api/v1/ena-import-batch` (`qiita_common.models.ena_import`,
+  `routes.ena_import`) accepts a list of ENA/SRA study accessions and returns
+  202 with a batch handle immediately; a new, additive-and-reversible
+  migration (`qiita.ena_import_batch` / `qiita.ena_import_batch_item`, both
+  TEXT/CHECK state — no `CREATE TYPE`) tracks each accession independently
+  through `pending -> resolving -> registered -> downloading -> done`, with
+  `failed` reachable from any non-terminal step, so one bad accession never
+  affects its siblings or the batch as a whole. The background driver
+  (`ena_import.batch._run_batch`) processes every item with bounded
+  concurrency (`asyncio.Semaphore`, capped at 4 — miint's `ENAClient`
+  rate-limits ENA Portal/Browser calls to ~3 req/s) on its own tracked
+  `asyncio.Task` set (`app.state.running_ena_import_batches`, drained at
+  shutdown and re-driven at startup via `reconcile_inflight_batches`, mirroring
+  `dispatch.py`'s pattern but kept separate since this task drives
+  `register_ena_study` + a new `submit_work_ticket_core` directly, not a
+  work_ticket/`ComputeBackendClient` run). `submit_work_ticket_core` is
+  `routes.work_ticket`'s submission logic (gating, INSERT, dispatch) extracted
+  from the `POST /work-ticket` route into a callable an in-process caller with
+  no live HTTP request can reuse verbatim — the batch driver submits each
+  study's `download-ena-study` ticket(s) through it, on the batch's own
+  submitting principal, so that ticket's audience/scope/disallow-without-delete
+  gates are enforced exactly as a real HTTP submission would be, never
+  bypassed (`routes.submit_work_ticket` is now a thin wrapper with no behavior
+  change). `GET /api/v1/ena-import-batch/{idx}` rolls up each item's
+  `download_work_ticket_idxs`' current `qiita.work_ticket.state` on demand
+  into a `done`/`downloading`/`failed(download)` display state, without
+  mutating the item row. Also fixes `ena_import.miint_resolver`'s
+  `_open_ena_connection` to `INSTALL httpfs` at most once per process
+  (double-checked lock, mirroring `connect_with_miint()`'s own guard) instead
+  of on every call.
+- **ENA import: full-span integration coverage, gated live tests, and an
+  operator runbook.** New `tests/integration/test_ena_import_e2e.py` threads
+  the batch driver's real registration (`create_ena_import_batch` /
+  `_process_one_study`, against a fixture study whose two runs share one
+  sample accession) into the `ingest_ena_reads` native job and the real
+  `register-files` tail, landing in a real DuckLake `read` table in one
+  process — asserting the study/biosample de-dup, the per-run read counts,
+  and that re-processing the same study a second time registers nothing new.
+  New `tests/integration/test_ena_import_live_e2e.py` adds two
+  `@pytest.mark.system`-gated tests (never run by CI, human-run only via
+  `make test-system`) that clean-skip on network absence: one drives the
+  real batch driver's metadata resolution and de-dup against a real, tiny
+  public study without downloading any read bytes, the other calls
+  `ingest_ena_reads.execute()` directly against a real, tiny public run and
+  verifies its reads land in DuckLake. New
+  `docs/runbooks/ena-import.md` documents the batch REST surface, the
+  resolve/register/submit flow, ERC000011 metadata harmonization, this
+  surface's hard scope limits (ENA/SRA and `http` transport only; DDBJ/
+  legacy-platform and ENVO harmonization are deferred gaps), and the
+  duckdb-miint dependency (including that read md5 verification awaits an
+  upstream miint change). `docs/architecture.md` gains a short cross-linked
+  ENA Study Import subsection.
 - **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
   A user CLI (`reference:read`) that exports one or more genomes'
   sequences: for each `--genome-idx` it resolves the genome's members, mints a
@@ -245,6 +413,54 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **ENA import: an empty ENA sample attribute set no longer fails the whole
+  study.** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
+  whose sample (`SAMD01818724`) has zero `<SAMPLE_ATTRIBUTE>` elements —
+  genuinely common on real ENA/DDBJ data, but `MiintEnaResolver`/
+  `HttpEnaResolver.resolve_sample_attributes` hard-raised
+  `EnaAccessionNotFoundError` on the resulting 0-row result, marking the
+  entire study `failed`. `resolve_sample_attributes` now returns no entries
+  instead of raising for that case — `resolve_study_header`/`resolve_runs`
+  (and `HttpEnaResolver`'s own sample-existence search) are unchanged and
+  still raise on a genuine zero-row "nothing resolved." The study now
+  registers normally; the biosample harmonizes against an empty attribute
+  map (no globally-linked metadata) and the ERC000011 checklist's missing
+  required fields are reported, never fatal.
+- **ENA import: harmonize the underscore MIxS attribute vocabulary
+  (`ena_import.attribute_mapping`).** The same live test found real DDBJ
+  MIGS samples use the underscore MIxS short names (`collection_date`,
+  `geo_loc_name`, `lat_lon`, `depth`) rather than the GSC-MIxS display-name
+  form the mapping table only recognized — so real imports mapped nothing
+  (`mapped_count=0`). Both vocabularies are now recognized side by side:
+  `collection_date`/`depth` map exactly like their display-name twins;
+  `geo_loc_name`'s `country:region:locality` value contributes only its
+  country/sea part; `lat_lon`'s combined `"<lat> <N|S> <lon> <E|W>"` value
+  splits into the separate latitude/longitude global fields (negated for
+  S/W), or is left as raw local metadata if it doesn't parse — including an
+  INSDC missing-value marker like `"missing"` (confirmed live: DDBJ sample
+  `SAMD01820063`'s own `lat_lon` is literally `"missing"`), which cannot be
+  split into two numbers without guessing. The underscore forms of the
+  environmental-context triad (`env_broad_scale`/`env_local_scale`/
+  `env_medium`) stay unmapped, same ENVO-resolution deferral as their
+  display-name twins.
+- **ENA import batch driver: reconcile principal guard + `download_method`
+  threading (batch-driver hardening).** `ena_import.batch._load_principal`
+  (used by `reconcile_inflight_batches` to re-drive in-flight batch items
+  after a CP restart) now rejects a since-disabled/retired submitting
+  principal, the same `MSG_PRINCIPAL_DISABLED_OR_RETIRED` guard
+  `auth.principal._build_human_user` already enforces on every live
+  request — a batch is no longer re-driven on behalf of an admin whose
+  access was revoked after submission; the reconcile skips that batch and
+  logs it, exactly like an unresolvable principal already did. Also:
+  `_run_batch` / `_process_one_study` previously always passed
+  `submit.DEFAULT_DOWNLOAD_METHOD` into `build_download_ena_study_ticket`
+  instead of reading the batch's own persisted `download_method`
+  (`qiita.ena_import_batch.download_method`, validated and stored at
+  submission time but never read back); `schedule_ena_import_batch` and
+  `reconcile_inflight_batches`'s SELECT now thread it through explicitly.
+  No behavior change today (`'http'` is the only value the route/DB CHECK
+  currently allow), but this closes the latent drift before a second
+  transport is ever added.
 - **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
   mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under
@@ -506,6 +722,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA ingest classifies an md5-verification failure as an explicit,
+  self-documented permanent error.** duckdb-miint's `read_ena_sequences` now
+  verifies every downloaded run's bytes against ENA's reported `fastq_md5` by
+  default; `ingest_ena_reads` relies on that default (it never passes
+  `verify_md5` itself). A mismatch raises a `duckdb.IOException` whose message
+  contains "md5" and none of the transient network markers; previously this
+  fell through the classifier's default permanent case implicitly.
+  `_classify_ena_fetch_error` now has a dedicated md5 branch (checked after
+  the transient-marker check, so an error that mentions both md5 and a
+  transient marker still classifies retriable) with a reason string that
+  names the failure explicitly instead of relying on the generic fallthrough
+  message.
 - **The reference DoGet ticket route now accepts `reference:read` in addition to
   `ticket:doget` (any-of) (#366).** `POST /reference/{reference_idx}/ticket/doget` mints
   a read ticket for reference sequences / chunks / taxonomy / phylogeny — all

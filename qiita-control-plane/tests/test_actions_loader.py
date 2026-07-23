@@ -824,6 +824,72 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
 
 
+def test_load_actions_loads_on_disk_download_ena_study_yaml():
+    """The actual on-disk `workflows/download-ena-study/1.0.0.yaml` loads as a
+    valid ActionDefinition — the ENA-fetch analog of bcl-convert:
+
+      * target_kind sequenced_pool (there is no `study` ScopeTargetKind);
+      * admin-only audience (not end-user-submittable), mirroring bcl-convert;
+      * context_schema REQUIRES `ena_study_accession`; `download_method` is
+        OPTIONAL and pinned to the single-value enum `["http"]` (no Aspera
+        key-staging in this compute env);
+      * steps `ingest_ena_reads` (module) -> `register-files`, in that order;
+      * the inert placeholder `workflows/download-ena-study/workflow.yaml`
+        (no top-level `action_id`, so the loader skipped it) is GONE now
+        that the real workflow has landed — this test's own `by_id` lookup
+        would otherwise still pass with a stale placeholder alongside, so
+        the placeholder's absence is asserted directly.
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "download-ena-study" in by_id, "workflows/download-ena-study/1.0.0.yaml must load"
+    dl = by_id["download-ena-study"]
+
+    assert dl.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert dl.audience.service is False
+
+    from qiita_common.auth_constants import SystemRole
+
+    assert set(dl.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+
+    # Pin the submit helper's hardcoded action_id/version against the YAML the
+    # operator's deploy syncs into qiita.action — mirrors the bcl-convert pin
+    # above. A drift here would submit tickets against a non-existent action.
+    from qiita_control_plane.ena_import import (
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+
+    assert DOWNLOAD_ENA_STUDY_ACTION_ID == dl.action_id == "download-ena-study"
+    assert DOWNLOAD_ENA_STUDY_ACTION_VERSION == dl.version == "1.0.0"
+
+    step_names = [s.name for s in dl.steps]
+    assert step_names == ["ingest_ena_reads", "register-files"]
+
+    ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
+    assert ingest.module == "qiita_compute_orchestrator.jobs.ingest_ena_reads"
+    assert ingest.container is None
+    assert ingest.inputs == ["run_map", "reads_staging_root"]
+    assert ingest.params == {"download_method": "download_method"}
+    assert ingest.outputs == ["read_staging_dir"]
+
+    # download_method is OPTIONAL (not in `required`) and pinned to 'http'.
+    assert dl.context_schema["required"] == ["ena_study_accession"]
+    props = dl.context_schema["properties"]
+    assert props["ena_study_accession"]["type"] == "string"
+    assert props["download_method"]["enum"] == ["http"]
+
+    # The inert placeholder must be gone now that the real workflow has landed.
+    assert not (repo_root / "workflows" / "download-ena-study" / "workflow.yaml").exists()
+
+
 def test_load_actions_loads_on_disk_read_mask_block_yaml():
     """The on-disk `workflows/read-mask-block/1.0.0.yaml` loads as a valid
     ActionDefinition with the block-compute shape:

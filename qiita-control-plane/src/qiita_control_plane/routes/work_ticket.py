@@ -50,7 +50,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
@@ -582,18 +582,36 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
 # =============================================================================
 
 
-@router.post(
-    PATH_WORK_TICKET_ROOT,
-    response_model=WorkTicketResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def submit_work_ticket(
+async def submit_work_ticket_core(
+    *,
+    app: FastAPI,
+    principal: Principal,
     body: WorkTicketCreateRequest,
-    request: Request,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    principal: Principal = Depends(get_current_principal),
-    _: None = Depends(_require_compute_backend_client),
 ) -> WorkTicketResponse:
+    """Submit one work ticket: the gating (audience/scope/context/
+    disallow-without-delete), the INSERT, and `schedule_dispatch` --
+    extracted from `POST /work-ticket` so an in-process caller with no live
+    HTTP request (the batch driver, submitting a `download-ena-study`
+    ticket on the batch's own submitting principal's behalf) gets the
+    IDENTICAL gates a real HTTP submission would go through, never a
+    bypass. In particular this enforces the TARGET action's own audience
+    against whatever `principal` is passed in — a batch caller cannot
+    submit a ticket for an action they are not personally audienced for
+    just because the batch route itself is admin-gated.
+
+    Takes `app` (not `Request`) so it has no dependency on an in-flight
+    HTTP request; `submit_work_ticket` below is now a thin wrapper that
+    resolves `app`/`principal` from the request and delegates here. No
+    behavior change versus the pre-extraction route -- see
+    `tests/routes/test_work_ticket.py`, unmodified by this refactor.
+    """
+    if app.state.compute_backend_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
+        )
+    pool: asyncpg.Pool = app.state.pool
+
     action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
     if action is None:
         raise HTTPException(
@@ -787,7 +805,7 @@ async def submit_work_ticket(
 
     # Fire-and-forget dispatch in the background. The route returns 202
     # immediately; the workflow runs in-process via asyncio.
-    schedule_dispatch(request.app, work_ticket_idx)
+    schedule_dispatch(app, work_ticket_idx)
 
     _log.info(
         "submitted work_ticket %d for action %s/%s by principal %d",
@@ -797,6 +815,22 @@ async def submit_work_ticket(
         principal.principal_idx,
     )
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+@router.post(
+    PATH_WORK_TICKET_ROOT,
+    response_model=WorkTicketResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_work_ticket(
+    body: WorkTicketCreateRequest,
+    request: Request,
+    principal: Principal = Depends(get_current_principal),
+) -> WorkTicketResponse:
+    """Thin wrapper over `submit_work_ticket_core`: resolve `app`/`principal`
+    from the request and delegate. See `submit_work_ticket_core` for the
+    gating + INSERT + dispatch logic itself."""
+    return await submit_work_ticket_core(app=request.app, principal=principal, body=body)
 
 
 # Two-row-source SELECT. work_ticket carries the scope_target_kind plus

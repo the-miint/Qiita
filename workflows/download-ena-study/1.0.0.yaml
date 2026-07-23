@@ -1,0 +1,101 @@
+action_id: download-ena-study
+version: 1.0.0
+target_kind: sequenced_pool
+
+description: >
+  Download a registered ENA study's reads via miint `read_ena_sequences`
+  and store them once into the DuckLake `read` table — the ENA-fetch
+  analog of the bcl-convert workflow (metadata + identity registration
+  happens beforehand, in the control plane's `ena_import` module; this
+  workflow is the read-storage half). There is no `study` ScopeTargetKind
+  in Qiita, so while the user-facing request is per-study, the download
+  work-ticket is `sequenced_pool`-scoped: `ena_import.registration.
+  register_ena_study` creates one sequenced_pool per (study, platform)
+  pair, and this ticket downloads exactly one such pool's runs. A
+  multi-platform study therefore yields multiple download tickets, fanned
+  out by the batch driver.
+
+  The runner materializes the pool's `{prep_sample_idx, ena_run_accession}`
+  roster from a LIVE Postgres query (`run_map`, unlike bcl-convert's
+  action-context-embedded `sample_map` — the orchestrator has no DB
+  access to enumerate the pool itself). The `ingest_ena_reads` step then
+  fetches every run with `read_ena_sequences`, mints a sequence_idx range
+  per run, and writes the FULL reads into the DuckLake `read` table (once,
+  independent of any mask) plus a durable per-sample copy the repeatable
+  read-mask workflow consumes. Transport is pinned to `download_method:
+  http` (no Aspera key-staging exists in the compute env; see
+  ARCHITECTURE.md's ENA Study Import download-ticket-granularity decision).
+
+scopes: []
+
+audience:
+  # Mirrors bcl-convert: the download touches ENA's live network surface
+  # and stores reads under the operator's control, so it stays an
+  # operator gesture (wet-lab-admin-or-higher), not end-user-submittable.
+  # Service-account submission disabled (no LIMS integration today).
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [ena_study_accession]
+  properties:
+    # The ENA study accession this pool's runs belong to (e.g. a
+    # PRJEB/PRJNA BioProject accession, or its ENA secondary study
+    # accession). Carried through for operator-visible provenance /
+    # logging; the actual run roster comes from `run_map`, not this
+    # field — `ingest_ena_reads` never re-resolves the study.
+    ena_study_accession:
+      type: string
+      minLength: 1
+    # ENA transport. Pinned to 'http' — the only value this compute
+    # environment supports today (no Aspera key-staging). Declared as a
+    # single-value enum (rather than omitting it) so a caller that
+    # supplies anything else 422s at submit time instead of failing
+    # deep inside the job.
+    download_method:
+      type: string
+      enum: [http]
+
+steps:
+  # Store the pool's reads once. For each run in `run_map`, fetch its
+  # reads via read_ena_sequences, mint a sequence_idx range, and write
+  # the full reads — into `read/<prep_sample_idx>.parquet` (the register
+  # part) and the durable per-sample copy under `reads_staging_root`.
+  # Idempotent: a run whose durable copy exists is skipped, so a ticket
+  # retry never re-mints or re-downloads.
+  - step: ingest_ena_reads
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.ingest_ena_reads
+    # `run_map` and `reads_staging_root` are runner-resolved before the
+    # loop (_stage_ena_run_roster / READS_STAGING_ROOT_BINDING).
+    # `download_method` rides through action_context via `params:` (a
+    # scalar, not a path) — optional; the job defaults to 'http' when
+    # a submitter omits it.
+    inputs: [run_map, reads_staging_root]
+    params: { download_method: download_method }
+    outputs: [read_staging_dir]
+    baseline_resources:
+      # Bounded-concurrent per-run loop (up to _CONCURRENCY=4 runs fetched at
+      # once, 2 DuckDB threads each -> cpu = 4*2 = 8, mem_gb split across the
+      # 4 slots from the cgroup — see ../read_staging.py per_slot_caps).
+      # Network-bound (ENA's ENAClient rate-limits to ~3 req/s), so walltime
+      # is sized well above ingest_reads' local-parse PT8H baseline to cover a
+      # pool of real-world-sized public runs over the network.
+      cpu: 8
+      mem_gb: 32
+      walltime: PT24H
+
+  # Load the per-run read parts into the DuckLake `read` table. The
+  # `read/` subdir of `read_staging_dir` holds one part per run; register
+  # maps the subdir -> the `read` table (subdir-of-parts convention).
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
+
+# Headroom above the single baseline for the runner's OOM/TIMEOUT
+# escalation retries (see docs/writing-a-job.md's resolution order).
+action_ceiling:
+  cpu: 16
+  mem_gb: 64
+  walltime: PT48H

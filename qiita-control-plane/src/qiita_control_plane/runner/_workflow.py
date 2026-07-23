@@ -25,7 +25,9 @@ from qiita_common.models import (
 )
 
 from .. import step_progress
+from ..ena_import.submit import DEFAULT_DOWNLOAD_METHOD
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.sequenced_sample import set_sequenced_pool_transport
 from ._base import (
     _STEP_POLL_INTERVAL_SECONDS,
     WorkflowAborted,
@@ -77,10 +79,12 @@ from ._processing import (
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
+    RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
+    _stage_ena_run_roster,
     _stage_shard_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
@@ -303,6 +307,22 @@ async def run_workflow(
             bound.update(await _resolve_sample_map(bound, workspace))
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
+
+        # ENA run-roster binding (download-ena-study workflow's
+        # `ingest_ena_reads` step): materialize the pool's `{prep_sample_idx,
+        # ena_run_accession}` roster from a LIVE Postgres query (unlike
+        # `sample_map`, which the CP composer embeds in action_context at
+        # submit time). Dispatched by DECLARED-INPUT NAME, not scope-kind:
+        # bcl-convert is also sequenced_pool-scoped, so keying off scope-kind
+        # would wire this resolver into its ticket too. Same inside-try
+        # placement as the resolvers above so an empty-pool / missing-
+        # accession failure lands in the outer FAILED handler.
+        if _workflow_declares_input(action.steps, RUN_MAP_BINDING):
+            bound.update(
+                await _stage_ena_run_roster(
+                    pool, scope_target["sequenced_pool_idx"], workspace=workspace
+                )
+            )
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.
@@ -634,6 +654,30 @@ async def run_workflow(
                     conn, scope_target, bound
                 ):
                     await _patch_resource_status(conn, scope_target, action.success_status)
+                # ENA read-download provenance: stamp the pool's
+                # sequenced_sample rows with the transport the download used,
+                # closing the gap `20260721000000_sequenced_sample_ena_
+                # provenance.sql` documents (column added, left NULL, "the
+                # download workflow populates it"). Gated on the SAME
+                # declared-input-name check `_stage_ena_run_roster` above uses
+                # (RUN_MAP_BINDING), NOT scope-kind: bcl-convert is ALSO
+                # sequenced_pool-scoped, so keying off scope-kind alone would
+                # fire this for bcl-convert's (and any other sequenced_pool
+                # workflow's) finalize too. `download_method` rides in
+                # action_context from submit
+                # (`ena_import.submit.build_download_ena_study_ticket`); a
+                # raw ticket that omitted it falls back to
+                # DEFAULT_DOWNLOAD_METHOD, matching `ingest_ena_reads.Inputs.
+                # download_method`'s own default so the recorded provenance
+                # always agrees with what the job actually did. Idempotent
+                # (same value on a redrive) and runs inside this same finalize
+                # transaction, so a mid-finalize failure rolls it back too.
+                if _workflow_declares_input(action.steps, RUN_MAP_BINDING):
+                    await set_sequenced_pool_transport(
+                        conn,
+                        scope_target["sequenced_pool_idx"],
+                        transport=bound.get("download_method", DEFAULT_DOWNLOAD_METHOD),
+                    )
                 await _atomic_transition(
                     conn,
                     work_ticket_idx,

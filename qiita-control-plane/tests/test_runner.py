@@ -5099,3 +5099,258 @@ async def test_skipped_gated_step_leaves_the_earlier_binding_standing(
     )
     assert calls == ["first", "consumer"]
     assert by_name["consumer"]["shared_out"] == first_out
+
+
+# =============================================================================
+# ENA download finalize: transport write-back
+# =============================================================================
+#
+# Closes the gap `db/migrations/20260721000000_sequenced_sample_ena_
+# provenance.sql` documents: `transport` is added but left NULL, "the
+# download workflow populates it once read_ena_sequences actually fetches
+# bytes". `run_workflow`'s finalize transaction now does that write, gated on
+# the RUN_MAP_BINDING declared input (the SAME gate `_stage_ena_run_roster`
+# uses) so a bcl-convert ticket -- ALSO sequenced_pool-scoped -- never
+# cross-fires it.
+
+
+@pytest.fixture
+async def ena_pool_with_run_map(postgres_pool, human_admin_session):
+    """One sequenced_pool holding one sequenced_sample with a non-NULL
+    ena_run_accession -- the minimal roster `_stage_ena_run_roster` needs to
+    stage `run_map` for a download-ena-study-shaped ticket. Committed (not
+    rolled back): `run_workflow` acquires its own connections from the pool,
+    so a wrapping rolled-back transaction on a separate connection would not
+    see (or undo) its writes -- mirrors the ena_import registration tests'
+    "Pattern 2" (committed fixture + FK-reverse cleanup)."""
+    from qiita_control_plane.repositories.biosample import insert_biosample
+    from qiita_control_plane.repositories.prep_sample import insert_prep_sample
+    from qiita_control_plane.repositories.sequenced_sample import insert_sequenced_sample
+    from qiita_control_plane.repositories.sequencing_run import (
+        insert_sequenced_pool,
+        insert_sequencing_run,
+    )
+
+    owner = human_admin_session["principal_idx"]
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        biosample_idx = await insert_biosample(conn, owner_idx=owner, created_by_idx=owner)
+        protocol_idx = await conn.fetchval(
+            "SELECT idx FROM qiita.prep_protocol WHERE name = 'short_read_metagenomics'"
+        )
+        prep_sample_idx = await insert_prep_sample(
+            conn,
+            biosample_idx=biosample_idx,
+            owner_idx=owner,
+            prep_protocol_idx=protocol_idx,
+            processing_kind="sequenced",
+            created_by_idx=owner,
+        )
+        run_idx, _ = await insert_sequencing_run(
+            conn,
+            instrument_run_id=f"runner-ena-test-{uuid.uuid4()}",
+            platform="illumina",
+            created_by_idx=owner,
+        )
+        pool_idx, _ = await insert_sequenced_pool(
+            conn, sequencing_run_idx=run_idx, created_by_idx=owner
+        )
+        ena_run_accession = f"SRR-{uuid.uuid4()}"
+        ss_idx = await insert_sequenced_sample(
+            conn,
+            prep_sample_idx=prep_sample_idx,
+            sequenced_pool_idx=pool_idx,
+            sequenced_pool_item_id=f"item-{uuid.uuid4()}",
+            created_by_idx=owner,
+            ena_run_accession=ena_run_accession,
+            source_archive="ena",
+            resolver_kind="miint",
+        )
+
+    yield {
+        "sequenced_pool_idx": pool_idx,
+        "sequencing_run_idx": run_idx,
+        "prep_sample_idx": prep_sample_idx,
+        "sequenced_sample_idx": ss_idx,
+        "ena_run_accession": ena_run_accession,
+    }
+
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
+    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
+# A minimal download-ena-study-shaped action: its single step declares
+# `run_map` (RUN_MAP_BINDING) among its inputs, exactly like the real
+# `workflows/download-ena-study/1.0.0.yaml`'s `ingest_ena_reads` step — that
+# declared-input NAME is the gate, both for `_stage_ena_run_roster` (pre-loop)
+# and the new finalize write-back, so this minimal shape exercises the same
+# gate the real workflow does without needing the real container/module.
+_ENA_DOWNLOAD_STEPS = [
+    {
+        "kind": "step",
+        "name": "ingest_ena_reads",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.ingest_ena_reads",
+        "inputs": ["run_map", "reads_staging_root"],
+        "outputs": ["read_staging_dir"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+# A bcl-convert-shaped sibling action for the same sequenced_pool scope_target
+# kind, but declaring `sample_map` (NOT `run_map`) -- proving the finalize
+# write-back does not cross-fire onto a non-ENA sequenced_pool workflow.
+_BCL_CONVERT_SHAPED_STEPS = [
+    {
+        "kind": "step",
+        "name": "ingest_reads",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.ingest_reads",
+        "inputs": ["sample_map"],
+        "outputs": ["read_staging_dir"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def _make_sequenced_pool_action(postgres_pool, *, action_id: str, steps: list[dict]) -> str:
+    """Insert a sequenced_pool-target_kind action row with a unique version,
+    mirroring `reference_add_action` but for the SEQUENCED_POOL scope. No
+    success_status/failure_status (the runner's `_patch_resource_status` only
+    implements the `reference` scope_target kind -- see `_dispatch.py` --
+    so a non-None success_status here would raise NotImplementedError at
+    finalize). Returns the version string; the caller deletes the row."""
+    version = f"runner-test-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience, "
+        "  context_schema, steps, "
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'sequenced_pool', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        [],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(steps),
+    )
+    return version
+
+
+async def _make_sequenced_pool_ticket(
+    postgres_pool,
+    *,
+    action_id: str,
+    version: str,
+    sequenced_pool_idx: int,
+    action_context: dict,
+) -> int:
+    return await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, sequenced_pool_idx, action_context"
+        ") VALUES ($1, $2, 1, 'sequenced_pool', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        sequenced_pool_idx,
+        json.dumps(action_context),
+    )
+
+
+async def test_download_ena_study_finalize_writes_transport(
+    postgres_pool, ena_pool_with_run_map, tmp_path
+):
+    """After a download-ena-study-shaped ticket finalizes, every
+    sequenced_sample row in its pool carries transport='http' -- the
+    write-back this ticket adds."""
+    action_id = "download-ena-study-test"
+    version = await _make_sequenced_pool_action(
+        postgres_pool, action_id=action_id, steps=_ENA_DOWNLOAD_STEPS
+    )
+    work_ticket_idx = await _make_sequenced_pool_ticket(
+        postgres_pool,
+        action_id=action_id,
+        version=version,
+        sequenced_pool_idx=ena_pool_with_run_map["sequenced_pool_idx"],
+        action_context={"ena_study_accession": "PRJTEST000001", "download_method": "http"},
+    )
+    try:
+        backend = FakeBackendClient()
+        workspace_root = tmp_path / "ws"
+        backend.outputs_for["ingest_ena_reads"] = {
+            "read_staging_dir": workspace_root / str(work_ticket_idx) / "read_staging"
+        }
+
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        assert state == "completed"
+        transport = await postgres_pool.fetchval(
+            "SELECT transport FROM qiita.sequenced_sample WHERE idx = $1",
+            ena_pool_with_run_map["sequenced_sample_idx"],
+        )
+        assert transport == "http"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+
+
+async def test_non_ena_sequenced_pool_finalize_does_not_cross_fire_transport(
+    postgres_pool, ena_pool_with_run_map, tmp_path
+):
+    """A bcl-convert-shaped ticket against the SAME sequenced_pool -- also
+    scope_target_kind='sequenced_pool', but its step declares `sample_map`,
+    not `run_map` -- must NOT stamp `transport` at finalize. Guards against a
+    gate that keyed off scope-kind instead of the declared-input name."""
+    action_id = "bcl-convert-test"
+    version = await _make_sequenced_pool_action(
+        postgres_pool, action_id=action_id, steps=_BCL_CONVERT_SHAPED_STEPS
+    )
+    work_ticket_idx = await _make_sequenced_pool_ticket(
+        postgres_pool,
+        action_id=action_id,
+        version=version,
+        sequenced_pool_idx=ena_pool_with_run_map["sequenced_pool_idx"],
+        action_context={
+            "sample_map": [
+                {
+                    "prep_sample_idx": ena_pool_with_run_map["prep_sample_idx"],
+                    "pool_item_id": "item-0",
+                }
+            ]
+        },
+    )
+    try:
+        backend = FakeBackendClient()
+        workspace_root = tmp_path / "ws"
+        backend.outputs_for["ingest_reads"] = {
+            "read_staging_dir": workspace_root / str(work_ticket_idx) / "read_staging"
+        }
+
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        assert state == "completed"
+        transport = await postgres_pool.fetchval(
+            "SELECT transport FROM qiita.sequenced_sample WHERE idx = $1",
+            ena_pool_with_run_map["sequenced_sample_idx"],
+        )
+        assert transport is None
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
