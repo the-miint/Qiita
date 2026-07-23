@@ -335,7 +335,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
     acc_tbl = pa.table(
         {
             "feature_idx": pa.array(list(accession_map.keys()), pa.int64()),
-            "accession": pa.array([accession_map[k] for k in accession_map], pa.string()),
+            "accession": pa.array(list(accession_map.values()), pa.string()),
         }
     )
     con.register("accession_map", acc_tbl)
@@ -463,10 +463,14 @@ def _handle_reference_genome_export(
 
     # The FASTA writer needs a miint DuckDB connection; open it once and reuse it
     # across every genome. Parquet streams straight to a ParquetWriter (no miint).
-    con = connect_with_miint() if args.format == "fasta" else None
-    flight_client = flight.FlightClient(args.data_plane_url)
+    # Both are built INSIDE the try so a failure constructing one (e.g. a malformed
+    # --data-plane-url) still runs the finally and closes the other.
+    con = None
+    flight_client = None
     written: list[Path] = []
     try:
+        con = connect_with_miint() if args.format == "fasta" else None
+        flight_client = flight.FlightClient(args.data_plane_url)
         for genome_idx in args.genome_idx:
             written.append(
                 _export_one_genome(
@@ -490,7 +494,8 @@ def _handle_reference_genome_export(
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
-        flight_client.close()
+        if flight_client is not None:
+            flight_client.close()
         if con is not None:
             con.close()
 

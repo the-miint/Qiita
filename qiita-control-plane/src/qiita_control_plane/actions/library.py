@@ -1134,8 +1134,9 @@ def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
     """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
     relations to one LineageItem per genome. The lineage is the semicolon-joined
     rank string of the genome's lowest-feature_idx *classified* member (via
-    `arg_min` under a `FILTER (WHERE concat_ws(...) <> '')`), so the representative
-    is deterministic regardless of scan order and skips members whose taxonomy is
+    `arg_min` under a `FILTER (WHERE lineage <> '')`, the per-member lineage
+    computed once in a CTE), so the representative is deterministic regardless of
+    scan order and skips members whose taxonomy is
     absent. That FILTER matters under exclusion: a genome is one organism, so its
     contigs share one lineage; blocking the lowest contig (its LEFT JOIN then
     misses) must not drag the healthy siblings to the unclassified shard. When NO
@@ -1144,12 +1145,14 @@ def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
     (unclassified, which sorts first in the tiler)."""
     ranks = ", ".join(f"t.{col}" for col in _TAXONOMY_RANK_COLUMNS)
     rows = con.execute(
-        f"SELECT mg.genome_idx,"
-        f"       arg_min(concat_ws(';', {ranks}), mg.feature_idx)"
-        f"         FILTER (WHERE concat_ws(';', {ranks}) <> '') AS lineage"
-        f"  FROM member_genome mg"
-        f"  LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
-        f" GROUP BY mg.genome_idx"
+        f"WITH member_lineage AS ("
+        f"  SELECT mg.genome_idx, mg.feature_idx, concat_ws(';', {ranks}) AS lineage"
+        f"    FROM member_genome mg"
+        f"    LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
+        f")"
+        f" SELECT genome_idx, arg_min(lineage, feature_idx) FILTER (WHERE lineage <> '') AS lineage"
+        f"  FROM member_lineage"
+        f" GROUP BY genome_idx"
     ).fetchall()
     return [LineageItem(item_id=genome_idx, lineage=lineage or "") for genome_idx, lineage in rows]
 
