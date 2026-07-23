@@ -235,7 +235,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
-            assert_single_end(conn, reads_sql, "reads", inputs.reads)
+            assert_single_end(conn, f"read_parquet('{reads_sql}')", "reads", inputs.reads)
             # The source of reads to export: all of them, or — when an upstream
             # mask is bound — only its still-`pass` reads (spike-ins excluded).
             if inputs.partial_mask is None:

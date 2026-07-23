@@ -21,7 +21,7 @@ from pydantic import (
 from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel
+from qiita_common.models._base import PatchRequestModel, _fraction_passing_quality_filter
 from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
@@ -59,6 +59,11 @@ class SequencingRunResponse(BaseModel):
     `idx` surfaced as `sequencing_run_idx`). `instrument_model` is the field the
     `submit-host-filter-pool` fan-out reads to forward QC's polyG gate per sample;
     it is nullable (non-bcl runs may not record it).
+
+    `read_metrics` is the run-level twin of the pool rollup — the identical
+    `PoolReadMetrics` shape summed across every pool in the run (compute-on-read,
+    so it never drifts). `sample_count` there is the run's total non-retired
+    sequenced_samples, not a pool count.
     """
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -74,6 +79,10 @@ class SequencingRunResponse(BaseModel):
     retired_by_idx: Annotated[int, Field(gt=0)] | None = None
     retired_at: AwareDatetime | None = None
     retire_reason: str | None = None
+    # Genuine forward ref: PoolReadMetrics is defined below, so the quotes are
+    # load-bearing (removing them NameErrors at class definition). Resolved by the
+    # explicit `SequencingRunResponse.model_rebuild()` right after that class.
+    read_metrics: "PoolReadMetrics"  # noqa: UP037
 
 
 # same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionRequest
@@ -151,7 +160,23 @@ class PoolReadMetrics(BaseModel):
     is None when raw is absent or 0. `sample_count` is the pool's non-retired
     sequenced_sample total; `samples_with_metrics` is how many of those carry
     read counts, so a partial rollup (some samples still unprocessed) is
-    interpretable rather than looking complete."""
+    interpretable rather than looking complete.
+
+    The read-outcome breakdown splits `samples_with_metrics`'s implicit
+    "processed" set so an operator can tell "no metrics yet" from "processed but
+    everything filtered out". The three partition every non-retired sample:
+    `samples_unprocessed` + `samples_zero_reads` + `samples_with_reads` ==
+    `sample_count` (and `samples_unprocessed` == `sample_count -
+    samples_with_metrics`). "Processed" means the sample carries a raw read count;
+    among processed samples the split keys on `quality_filtered_read_count_r1r2`
+    (the terminal survived-reads count, the same numerator
+    `fraction_passing_quality_filter` uses) — a processed sample whose quality-
+    filtered count is 0 or NULL is a `zero_reads` sample.
+
+    The accession-coverage counts are how many non-retired samples carry each of
+    the four submission accessions (biosample + ENA sample on the biosample, ENA
+    experiment + run on the sequenced_sample subtype); `samples_fully_submitted_to_ena`
+    requires all four. All are compute-on-read, like the read-count sums."""
 
     raw_read_count_r1r2: int | None
     biological_read_count_r1r2: int | None
@@ -161,6 +186,16 @@ class PoolReadMetrics(BaseModel):
     spikein_read_count_r1r2: int | None
     sample_count: int
     samples_with_metrics: int
+    # Read-outcome breakdown (partition of sample_count).
+    samples_unprocessed: int
+    samples_zero_reads: int
+    samples_with_reads: int
+    # Accession-coverage counts.
+    samples_with_biosample_accession: int
+    samples_with_ena_sample_accession: int
+    samples_with_ena_experiment_accession: int
+    samples_with_ena_run_accession: int
+    samples_fully_submitted_to_ena: int
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -170,6 +205,11 @@ class PoolReadMetrics(BaseModel):
         return _fraction_passing_quality_filter(
             self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
         )
+
+
+# SequencingRunResponse.read_metrics is a forward ref to PoolReadMetrics (defined
+# above but after that class); resolve it now that the target exists.
+SequencingRunResponse.model_rebuild()
 
 
 class SequencedPoolResponse(BaseModel):
@@ -398,6 +438,11 @@ class PoolCompletionStatus(BaseModel):
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
+    # Echo of the optional host-reference scope: when set, the host-masking
+    # buckets count only masks that used this reference, so `samples_not_submitted`
+    # means "not masked against THIS reference" (vs. the reference-agnostic "not
+    # masked at all" when None). The demux stage is pool-wide, unaffected.
+    reference_idx: Annotated[int, Field(gt=0)] | None = None
     demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
@@ -425,6 +470,74 @@ class PoolCompletionStatus(BaseModel):
         sample finished host-masking (`complete`). The single signal for
         "this pool is fully processed without error."""
         return self.demux_state == "completed" and self.complete
+
+
+# One anomaly a sequenced-sample can carry in the exceptions drill-down. `no_reads`
+# is processed-but-zero-survived; `unprocessed` is no-metrics-yet (mutually
+# exclusive with no_reads). `failed_ticket` is a FAILED read-mask ticket with no
+# COMPLETED one (a genuinely-failed sample, not one that succeeded on retry).
+SequencedSampleExceptionFlag = Literal[
+    "unprocessed",
+    "no_reads",
+    "missing_biosample_accession",
+    "missing_ena_sample_accession",
+    "missing_ena_experiment_accession",
+    "missing_ena_run_accession",
+    "failed_ticket",
+]
+
+
+class SequencedSampleException(BaseModel):
+    """One anomalous sequenced_sample in a pool's exceptions drill-down: its ids,
+    its biosample accession (for operator lookup), the quality-filtered read count
+    (None when unprocessed), and the non-empty `flags` list naming each anomaly."""
+
+    sequenced_sample_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None
+    quality_filtered_read_count_r1r2: int | None
+    flags: list[SequencedSampleExceptionFlag] = Field(min_length=1)
+
+
+class PoolExceptionsResponse(BaseModel):
+    """Returned by GET .../sequenced-pool/{P}/sequenced-sample/exceptions.
+
+    Only the anomalous non-retired sequenced_samples — no usable reads
+    (unprocessed or zero survived), missing any of the four submission accessions,
+    or a genuinely-failed read-mask ticket — so an operator sees the actionable
+    set without scanning the full roster. Compute-on-read; `count` is
+    `len(samples)`. A clean pool returns `count=0`, `samples=[]`."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    count: Annotated[int, Field(ge=0)]
+    samples: list[SequencedSampleException]
+
+
+class PoolReadMaskCoverage(BaseModel):
+    """Read-mask ticket coverage for a pool: how many non-retired samples have a
+    read-mask work ticket (any state) vs. none. `with + without == sample_count`."""
+
+    samples_with_read_mask_ticket: Annotated[int, Field(ge=0)]
+    samples_without_read_mask_ticket: Annotated[int, Field(ge=0)]
+
+
+class PoolWorkTicketSummary(BaseModel):
+    """Returned by GET .../sequenced-pool/{P}/work-ticket/summary.
+
+    The pool's read-mask work-ticket rollup with TICKETS (not samples) as the
+    denominator — distinct from `PoolCompletionStatus`, whose per-sample buckets
+    collapse each sample's tickets by precedence. `read_mask` reconciles with the
+    completion rollup (`samples_with_read_mask_ticket` == `sample_count -
+    samples_not_submitted`); `ticket_state_counts` maps each work_ticket_state to
+    the number of the pool's read-mask tickets in it (states with zero tickets are
+    present with a 0 value). Compute-on-read."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sample_count: Annotated[int, Field(ge=0)]
+    read_mask: PoolReadMaskCoverage
+    ticket_state_counts: dict[str, Annotated[int, Field(ge=0)]]
 
 
 class SequencedPoolPreflightResponse(BaseModel):
@@ -596,22 +709,6 @@ class SequencedSampleCreateResponse(BaseModel):
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
-
-
-def _fraction_passing_quality_filter(
-    raw_read_count_r1r2: int | None, quality_filtered_read_count_r1r2: int | None
-) -> float | None:
-    """quality_filtered / raw — the share of raw reads surviving the full QC +
-    host-filter pipeline. Computed on read so it can never drift from the counts.
-    None when either bound is absent or raw is 0 (no division). Shared
-    by the per-sample (SequencedSampleResponse) and pool-rollup (PoolReadMetrics)
-    surfaces; the pool passes its SUMMED counts here, so the pool fraction is
-    recomputed from the sums, never a mean of per-sample fractions."""
-    if raw_read_count_r1r2 is None or quality_filtered_read_count_r1r2 is None:
-        return None
-    if raw_read_count_r1r2 == 0:
-        return None
-    return quality_filtered_read_count_r1r2 / raw_read_count_r1r2
 
 
 class SequencedSampleResponse(BaseModel):

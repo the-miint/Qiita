@@ -390,6 +390,14 @@ async def test_get_sequencing_run_returns_metadata(ctx):
     assert body["instrument_serial"] == "LH00123"
     assert body["retired"] is False
     assert "instrument_run_id" in body
+    # The run-level read-metric twin is present with the PoolReadMetrics shape;
+    # a run with no samples reads as NULL sums / 0 counts.
+    rm = body["read_metrics"]
+    assert rm["sample_count"] == 0
+    assert rm["raw_read_count_r1r2"] is None
+    assert rm["samples_unprocessed"] == 0
+    assert rm["samples_fully_submitted_to_ena"] == 0
+    assert "fraction_passing_quality_filter" in rm
 
 
 async def test_get_sequencing_run_null_instrument_model(ctx):

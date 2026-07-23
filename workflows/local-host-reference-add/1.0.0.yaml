@@ -123,7 +123,10 @@ steps:
     outputs: [annotation_map]
 
   - action: write-membership
-    inputs: [feature_map]
+    # `manifest` supplies the representative source accession (FASTA-header
+    # read_id) per feature_idx; `feature_map` supplies feature_idx. Resolved by
+    # binding name in the runner, so order here is not load-bearing.
+    inputs: [manifest, feature_map]
     outputs: []
 
   - step: load
@@ -219,6 +222,16 @@ steps:
   - action: register-index
     inputs: [minimap2_index_meta]
     when: build_minimap2
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step, identical to host-reference-add's
+  # tail sync (a host reference loads taxonomy into the `reference_taxonomy_visible`
+  # surface and can carry a genome_map). Unconditional; MUST follow register-files
+  # and is placed DEAD LAST — after both register-index — so a transient sync
+  # FlightError can never strand an already-built rype/minimap2 index unregistered.
+  # See reference-add/1.0.0.yaml and actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
+    inputs: []
     outputs: []
 
 action_ceiling:

@@ -62,6 +62,23 @@ async def fetch_active_studies_for_prep_sample(
     return list(rows)
 
 
+async def fetch_biosample_idx_for_prep_sample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    prep_sample_idx: int,
+) -> int | None:
+    """Return the biosample_idx this prep_sample was prepped from, or None if the
+    prep_sample_idx does not exist.
+
+    qiita.prep_sample.biosample_idx is a NOT NULL FK, so a present row always has
+    one — None means the prep_sample itself is absent, which the caller treats as
+    "not a control" (fail-safe: an un-resolvable sample is disposed as a data
+    well, never silently benign)."""
+    return await pool_or_conn.fetchval(
+        "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1",
+        prep_sample_idx,
+    )
+
+
 # same-pattern-ok: per-entity existence reader, mirrors fetch_sequencing_run_exists
 async def fetch_prep_sample_exists(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,

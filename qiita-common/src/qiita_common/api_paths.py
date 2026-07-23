@@ -57,6 +57,22 @@ PATH_REFERENCE_STATUS = "/{reference_idx}/status"
 PATH_REFERENCE_INDEX = "/{reference_idx}/index"
 PATH_REFERENCE_SHARD_INDEX_STATUS = "/{reference_idx}/shard-index-status"
 PATH_REFERENCE_DOGET = "/{reference_idx}/ticket/doget"
+# Global exclusion-blocklist curation (POST/DELETE) — keyed on genome_idx /
+# feature_idx alone, NOT scoped to a reference. Literal segment, so it must be
+# registered before the `/{reference_idx}` routes (see routes/reference.py).
+PATH_REFERENCE_EXCLUSION = "/exclusion"
+# Operator force-resync: re-materialize the data-plane exclusion mirror from the
+# current Postgres blocklist with no Postgres change (recovery after a failed
+# sync / rebuilt catalog / fresh data plane). A longer literal than /exclusion, so
+# unambiguous; still a literal, registered before the `/{reference_idx}` routes.
+PATH_REFERENCE_EXCLUSION_SYNC = "/exclusion/sync"
+# Reference-scoped read of what the blocklist filters from one reference.
+PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
+# Resolve a genome to its member features (feature_idx + accession) within one
+# reference — the inverse of export_member_genome, keyed on (reference_idx,
+# genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
+# is per-reference. Param path, distinct 4-segment shape (no literal shadow).
+PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -64,6 +80,10 @@ URL_REFERENCE_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_STATUS}"
 URL_REFERENCE_INDEX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX}"
 URL_REFERENCE_SHARD_INDEX_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_SHARD_INDEX_STATUS}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
+URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
+URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
+URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
+URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 
 # =============================================================================
 # /host-filter-profile/*
@@ -155,6 +175,15 @@ class LibraryPrimitive(StrEnum):
     # No count-assertion (alignment rows are not 1:1 with reads — cross-shard + PE
     # multiplicity). See qiita_control_plane.actions.library.reconcile_alignment_block.
     RECONCILE_ALIGNMENT_BLOCK = "reconcile-alignment-block"
+    # Reference exclusion: re-materialize the GLOBAL curated blocklist onto the
+    # data plane's DuckLake `reference_exclusion` mirror (a wholesale, idempotent,
+    # replay-safe REPLACE). Runs as the post-load tail step of every reference-load
+    # workflow (reference-add, local-reference-add, host-reference-add,
+    # local-host-reference-add) so a fresh assembly of an already-blocked genome —
+    # whose newly-minted feature_idx the standing mirror can't know about — is
+    # caught by the re-resolve. Also fired on every blocklist mutation by the admin
+    # route. See qiita_control_plane.actions.library.sync_reference_exclusion.
+    SYNC_REFERENCE_EXCLUSION = "sync-reference-exclusion"
 
 
 # =============================================================================
@@ -179,6 +208,10 @@ PATH_STEP_PLAN = "/plan"
 # Recovery / idempotency: look up live SLURM jobs by their deterministic
 # name so the CP can adopt a job it submitted but never recorded the id for.
 PATH_STEP_FIND_BY_NAME = "/find-by-name"
+# Cancel: scancel every live SLURM job of a work_ticket (all attempts, by the
+# `qiita-wt{idx}-` name prefix). The CP calls this AFTER flipping the ticket
+# terminal, so no new attempt spawns between the find and the scancel.
+PATH_STEP_CANCEL = "/cancel"
 
 URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
 URL_STEP_SUBMIT = f"{URL_STEP_PREFIX}{PATH_STEP_SUBMIT}"
@@ -186,6 +219,7 @@ URL_STEP_STATUS = f"{URL_STEP_PREFIX}{PATH_STEP_STATUS}"
 URL_STEP_RESULT = f"{URL_STEP_PREFIX}{PATH_STEP_RESULT}"
 URL_STEP_PLAN = f"{URL_STEP_PREFIX}{PATH_STEP_PLAN}"
 URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
+URL_STEP_CANCEL = f"{URL_STEP_PREFIX}{PATH_STEP_CANCEL}"
 
 
 # =============================================================================
@@ -218,6 +252,12 @@ PATH_WORK_TICKET_PREFIX = "/work-ticket"
 PATH_WORK_TICKET_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_WORK_TICKET_BY_IDX = "/{work_ticket_idx}"
 PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
+# Operator-cancel (system_admin, work_ticket:cancel): flip the selected tickets
+# terminal (`cancelled`) so the CP stops driving them AND scancel their SLURM
+# job(s). Selects by an explicit idx list AND/OR an action_id (+ run/pool) filter —
+# one collection-level verb path serves both single and bulk, so it hangs off the
+# prefix, not `/{idx}`.
+PATH_WORK_TICKET_CANCEL = "/cancel"
 # Read a single step attempt's stdout/stderr tail (operator diagnosis without
 # a host shell — the logs live under PATH_SCRATCH/ticket, served by the CP).
 PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
@@ -228,6 +268,7 @@ URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 URL_WORK_TICKET_LIST = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_ROOT}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
+URL_WORK_TICKET_CANCEL = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_CANCEL}"
 URL_WORK_TICKET_STEP_LOGS = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_STEP_LOGS}"
 
 
@@ -390,6 +431,28 @@ PATH_READ_MASKED_DOGET = "/ticket/doget"
 URL_READ_MASKED_PREFIX = f"{API_PREFIX}{PATH_READ_MASKED_PREFIX}"
 URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
 
+# =============================================================================
+# /read/* — Flight DoGet ticket for a block's reads (block-compute streaming)
+# =============================================================================
+# Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
+# sub-range)` members, so a block-scoped compute job streams its reads from the
+# data plane instead of reading a Parquet the control plane materialized onto
+# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
+# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
+# ticket), the same shape as /alignment/ticket/doget.
+#
+# The body carries only work_ticket_idx. The route reads the block's members
+# from qiita.block_member (keeping a large member list CP-side, off the wire)
+# and picks the selector — raw `read_block` for a read-mask block, mask-scoped
+# `read_masked_block` for an align block — from the ticket's action_context (see
+# block_read.resolve_block_read_scope).
+
+PATH_READ_PREFIX = "/read"
+PATH_READ_DOGET = "/ticket/doget"
+
+URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
+URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
+
 
 # =============================================================================
 # /auth/* — OIDC handoff, PAT mint/list/revoke, CLI device flow
@@ -542,6 +605,21 @@ PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
 PATH_SEQUENCED_POOL_ALIGN_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
 )
+# GET the pool's exception drill-down: only the anomalous non-retired
+# sequenced_samples — no usable reads (unprocessed or zero survived), missing any
+# of the four submission accessions, or a genuinely-failed read-mask ticket (failed
+# with no completed) — each with the flags naming why. The actionable subset of the
+# roster, so an operator sees what needs attention without scanning every sample.
+PATH_SEQUENCED_SAMPLE_EXCEPTIONS = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/sequenced-sample/exceptions"
+)
+# GET the pool's work-ticket state rollup: read-mask ticket coverage
+# (samples with / without a ticket) plus per-STATE ticket counts (tickets as the
+# denominator, no per-sample precedence collapse — distinct from the completion
+# rollup's per-sample buckets).
+PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/work-ticket/summary"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -562,6 +640,10 @@ URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
 URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
+URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"
+)
 
 
 # =============================================================================

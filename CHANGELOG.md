@@ -190,6 +190,142 @@ duplicates further down are historical strata; leave them where they are.
   duckdb-miint dependency (including that read md5 verification awaits an
   upstream miint change). `docs/architecture.md` gains a short cross-linked
   ENA Study Import subsection.
+- **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
+  A user CLI (`reference:read`) that exports one or more genomes'
+  sequences: for each `--genome-idx` it resolves the genome's members, mints a
+  chunk DoGet ticket, streams the bytes over Flight, and writes
+  `<reference_idx>.<genome_idx>.{fasta.gz|parquet}` (one file per genome). FASTA
+  is reassembled via miint's `FORMAT FASTA` writer with the reference's accessions
+  as headers; Parquet is the raw `reference_sequence_chunks` rows. A plasmid shared
+  across genomes is exported for each of its genomes (the payoff of the
+  feature_genome many-to-many fix). Exported bytes are the stored original strand
+  of the representative record — the feature_idx dedup is by canonical hash, so a
+  reverse-complement-equal input exports the representative's orientation. A short
+  export (fewer sequences written than the genome has members — e.g. an `indexing`
+  reference whose chunks are not yet in DuckLake, or one with a partial delete) is
+  a hard error: the incomplete file is removed and the CLI exits non-zero rather
+  than leaving a file that looks complete.
+- **Resolve a genome to its member features within a reference —
+  `GET /reference/{reference_idx}/genome/{genome_idx}/member` (`reference:read`) (#366).**
+  Returns each member feature's `feature_idx` + the reference's FASTA-header
+  `accession`, feature_idx-ordered — the inverse of the internal
+  `export_member_genome`, keyed on `(reference_idx, genome_idx)` because the
+  accession is per-`(reference, feature)` and a DoGet ticket is per-reference. A
+  feature shared across genomes (a plasmid → one content-hash-global `feature_idx`)
+  is returned for each of its genomes. 404s when the pair has no members (unknown
+  reference, unknown genome, or a genome in a different reference) — an empty
+  export is a fail-loud caller error. The resolution step the genome-export CLI
+  runs before a DoGet for the sequence bytes.
+- **Reference feature/genome exclusion — a curated global blocklist (#361).**
+  Bad reference data (a contaminated genome, a mislabelled contig) can now be
+  **masked at consumption** without deleting rows or rebuilding aligner indexes.
+  A `genome_idx` or `feature_idx` is blocked in a new authoritative Postgres
+  table `qiita.reference_exclusion` (global — no `reference_idx`, so future
+  references inherit the block) and mirrored to a small DuckLake table that two
+  `CREATE OR REPLACE VIEW … _visible` anti-join views consume
+  (`alignment_visible`, `reference_taxonomy_visible`). The raw `alignment` /
+  `reference_taxonomy` tables are removed from both DoGet allowlists, so only the
+  views are Flight-reachable — the `read_masked`-style unbypassable enforcement
+  surface. `woltka_ogu` renormalizes over survivors, so feature tables are
+  corrected immediately with existing data intact. The Postgres→DuckLake mirror
+  is refreshed by a wholesale idempotent `sync_reference_exclusion` DoAction
+  (`REPLAY_SAFE_ACTIONS`) fired on every blocklist mutation **and** as the
+  post-load `sync-reference-exclusion` step of every reference-load workflow
+  (`reference-add`, `local-reference-add`, `host-reference-add`,
+  `local-host-reference-add`) — catching a fresh assembly of an already-blocked
+  genome so "future references inherit the block" holds on every load path.
+  Adds `reference_membership.accession` (the FASTA-header record accession,
+  persisted at load — previously dropped) surfaced as external provenance; a
+  system-admin curation surface `POST`/`DELETE /reference/exclusion` (block /
+  soft-unblock, new `reference:exclusion:write` scope) plus a
+  `POST /reference/exclusion/sync` operator force-resync (re-materialize the
+  mirror from Postgres with no blocklist change — recovery after a failed sync, a
+  rebuilt DuckLake catalog, or a fresh data plane); the reference-scoped query
+  `GET /reference/{reference_idx}/exclusion` (`reference:read`); and the CLI —
+  `qiita-admin reference exclusion add/remove/sync` (the write surface) and
+  `qiita reference exclusion list` (the `reference:read` query any user can run).
+  Phylogeny defers to a documented `shear_tree` prune contract (no production tree
+  consumer exists yet). Two migrations: `reference_membership.accession`,
+  `reference_exclusion`.
+- **`assembly_coverage` — binning coverage from miint's minimap2, not bwa.** New native
+  step in `long-read-assembly`, between `assemble` and `binning`: it aligns the masked
+  HiFi reads back to the noLCG contigs with miint's embedded minimap2 (`map-hifi`) and
+  writes a coordinate-sorted BAM, which `binning.sh` stages into
+  `work_files/<sample>.bam`. metaWRAP guards its own `bwa mem` behind that file's
+  existence, so it skips self-alignment and derives depth from the minimap2 alignment —
+  the same seam qp-pacbio uses, and the only one available (`metawrap binning` has no
+  aligner-selection flag). Native rather than in-container because miint is deliberately
+  not exposed to containers. Three miint BAM-writer behaviours it rests on are pinned by
+  `tests/jobs/test_assembly_coverage.py`: `COPY … (FORMAT BAM)` requires
+  `REFERENCE_LENGTHS`; @SQ is emitted **reversed** from that table (undocumented — so the
+  table is built DESC to land @SQ ascending, which is what makes the coordinate sort valid,
+  since jgi checks tid order, not contig name); and `SEQUENCE_DATA` (documented upstream but
+  easy to miss) is required to write real SEQ, without which jgi's contig-end exclusion
+  window (`--maxEdgeBases`, default 75)
+  collapses — it sizes that window from the read length it reads out of SEQ — averaging the
+  under-covered contig ends in and dropping depth by ~`2*75/contig_length` (0.750% on a
+  20 kb contig), a bias inversely proportional to contig length that also inflates the
+  variance metabat2 consumes. With `SEQUENCE_DATA` the depth and variance match a real
+  `minimap2 | samtools sort` BAM to every printed digit, so the step is at parity with
+  qp-pacbio's coverage. (#365)
+- **`qiita-admin ticket cancel` — stop in-flight compute without raw scancel (#314).**
+  A single ticket or a whole fan-out (explicit idxs and/or an `--action-id` +
+  `--sequencing-run-idx`/`--sequenced-pool-idx` filter) can now be cancelled from the
+  CLI, replacing the fragile "scancel as the compute account + hand-written job-name
+  regex + race the re-driver" recovery. The CP does it **terminal-first**: it flips
+  each ticket to a new terminal `cancelled` state (distinct from `failed` so an
+  operator stop is legible in `ticket list` / rollups / the notify digest, with NULL
+  failure_*) so the runner's poll loop aborts and no new attempt spawns, THEN scancels
+  every attempt of the ticket via a new CO `POST /step/cancel` endpoint (matched by the
+  `qiita-wt{idx}-` job-name prefix, not just the recorded slurm_job_id). Idempotent
+  (already-terminal is a no-op but still reaps any stray job — the same primitive
+  #312's orphan-reaping needs); a cancelled ticket is redrivable in place with
+  `qiita ticket run` once the blocker is fixed. New `work_ticket:cancel` scope
+  (system_admin), `ALTER TYPE work_ticket_state ADD VALUE 'cancelled'` migration,
+  `ComputeBackend.cancel` / `ComputeBackendClient.cancel`, and `POST /work-ticket/cancel`.
+- **Mouse gut terminology seeds (#360).** Appends the NCBI Taxonomy terms
+  `410661` (mouse gut metagenome) and `10090` (Mus musculus), plus the ENVO
+  term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
+  is deprecated at source but appears in data we import), to the existing
+  pre-release MVP terminologies.
+- **Block-read DoGet: block-scoped compute jobs stream their reads.** New
+  `read_block` / `read_masked_block` ticket selectors on the data plane, scoped
+  by a block's `(prep_sample_idx, sequence_idx sub-range)` members rather than a
+  flat column filter, plus `POST /read/ticket/doget` to mint one at job runtime
+  and the `open_read_block_stream` / `bind_step_reads` seams on the compute side.
+  This replaces "the control plane asks the data plane to COPY a `reads.parquet`
+  onto shared scratch at submit time, then hands the job a path" for the
+  `read-mask-block` and `align` workflows: same bytes, same column shape, but the
+  bulk work moves off the CP submit path onto compute nodes where it spreads
+  across data-plane instances, and the handoff stops assuming a shared
+  filesystem. DoGet itself is unchanged — it already streamed RecordBatches
+  through a bounded channel; what the retired export DoActions did was bypass
+  that with a server-side `COPY … TO parquet`. The selectors reuse the data
+  plane's existing `block_read_where_clause` and `EXPORT_READ_COLUMNS`, so a
+  block's read footprint and its delete footprint cannot drift. (#364)
+  Gated on a new `read:doget` scope rather than the generic `ticket:doget`:
+  `read_block` streams RAW reads, a strict superset of the `read_masked` surface
+  that already carries its own privacy-sensitive scope, so reusing the
+  reference-read scope would have inverted the model.
+- **Pool / run summary + rollup endpoints (#236).** Server-side aggregation so
+  callers stop paging the per-sample list route and tallying by hand. All
+  compute-on-read (never drifts), no migration. (1) `PoolReadMetrics` gains a
+  read-outcome breakdown (`samples_unprocessed` / `samples_zero_reads` /
+  `samples_with_reads`, splitting the old `samples_with_metrics` into "no metrics
+  yet" vs "processed but everything filtered out") and accession-coverage counts
+  (per-accession + all-four `samples_fully_submitted_to_ena`); the pool + run
+  rollups share one SQL aggregate so they can't drift. (2) `GET /sequencing-run/{run}`
+  now nests `read_metrics` (the run-level twin, summed across the run's pools).
+  (3) New `GET .../sequenced-pool/{P}/sequenced-sample/exceptions` — only the
+  anomalous samples (no usable reads / missing any submission accession / failed
+  read-mask ticket), each with the flags naming why. (4) New
+  `GET .../sequenced-pool/{P}/work-ticket/summary` — read-mask ticket coverage +
+  per-state ticket counts (tickets as denominator), reconciled with the completion
+  rollup. (5) `GET /work-ticket` list rows now nest `read_outcome` (the ticket's
+  prep_sample read counts + passing fraction) for prep_sample-scoped tickets.
+  (6) `GET .../completion` gains an optional `?reference_idx=N` so host-masking
+  completion distinguishes "not masked against THIS reference" from the
+  reference-agnostic "not masked at all" (folded from #217 ask-4).
 - **Control-plane throttle for fan-out dispatch (#329).** A fan-out action
   (sharded reference-index build, bulk read-mask block, bulk sharded-alignment
   block) no longer dispatches all of its child work_tickets at once — which for a
@@ -325,6 +461,110 @@ duplicates further down are historical strata; leave them where they are.
   No behavior change today (`'http'` is the only value the route/DB CHECK
   currently allow), but this closes the latent drift before a second
   transport is ever added.
+- **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
+  `feature_idx` is content-hash-global, so two organisms carrying an identical
+  mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under
+  different `genome_idx`. The `qiita.feature_genome` table had a standalone
+  `UNIQUE(feature_idx)`, so the second genome's association collided on load and
+  was silently dropped (`ON CONFLICT DO NOTHING`) — the second genome lost the
+  shared feature. Dropped the standalone UNIQUE (new migration
+  `feature_genome_allow_multi_genome`); the composite PK `(feature_idx, genome_idx)`
+  already models the many-to-many correctly and keeps feature→genome lookups
+  indexed. The shard planner (`_compute_shards`) now dedups a feature shared across
+  genomes tiled into different shards to its lowest `shard_id`, so shard lists stay
+  disjoint and `write_shard_assignment` never stamps a membership row twice. The
+  load path needed no code change (composite PK + `ON CONFLICT DO NOTHING` is
+  already many-to-many-correct). **Operator note:** references loaded before this
+  fix stay lossful — RE-LOAD affected references to recover the dropped shared-
+  feature associations (no backfill).
+- **`GET /reference/{reference_idx}/exclusion` reports deterministic, correct
+  genome provenance for a shared feature (#366).** With `feature_genome` now
+  many-to-many, a shared feature fans to one candidate row per genome, and the
+  listing's `DISTINCT ON (feature_idx)` picker had no tiebreak beyond direct-vs-
+  via — so which genome's `(genome_idx, source, source_id)` was reported flipped
+  on heap order, and a feature blocked directly could report an *unblocked*
+  genome as its provenance. The picker now prefers a genome that is itself
+  actively blocked, then the lowest `genome_idx`, so the reported provenance is
+  stable and always names a blocked genome when a genome-level block applies.
+- **Shard placement no longer regresses when a genome's lowest contig is excluded (#366).**
+  The reference shard planner reduces each genome to one representative lineage via
+  `arg_min(lineage, feature_idx)` over its members. Blocking the lowest-`feature_idx`
+  member of a multi-contig genome made its exclusion-filtered taxonomy row disappear,
+  so the representative reduced to `''` and the **whole** genome — healthy siblings
+  included — tiled to the unclassified shard on the next re-plan. `_genome_lineages`
+  now filters to the lowest *classified* member (`FILTER (WHERE concat_ws(...) <> '')`),
+  so a genome keeps its real lineage as long as ≥1 member survives classified;
+  only a fully-excluded genome sorts unclassified (moot — its features never surface
+  post-exclusion). Given the biology invariant (a genome is one organism → its
+  contigs share one lineage) this is the correct representative in the normal case,
+  not merely a mitigation.
+- **The `long-read-assembly` binning image shipped with zero binners.** `binning.def`
+  installed bioconda's `metawrap-mg`, which is metaWRAP's *scripts only* — it declares
+  none of the tools those scripts invoke. All **nine** were absent (bwa, samtools,
+  metabat2, jgi_summarize_bam_contig_depths, run_MaxBin.pl, concoct, cut_up_fasta.py,
+  concoct_coverage_table.py, merge_cutup_clustering.py); `bwa: command not found` was
+  simply the first one a job reached, after the step had allocated 16 CPU / 100 GB. Now
+  named explicitly, with `maxbin2>=2.2.6` pinned because 2.2.1's executable is `MaxBin`,
+  not the `run_MaxBin.pl` metaWRAP calls. The build check missed it because
+  `micromamba env list | grep metawrap` passes on an empty env: replaced by
+  `binning-verify.sh`, baked into the image and driving both the def's `%test` and the
+  spec's `VERIFY_CMD`, which asserts each tool and prints its sentinel only when all are
+  present. Neither the full `metawrap` package (unsolvable) nor `metawrap-binning`
+  (declares bowtie2, which the module never invokes; omits bwa and metabat2) is a
+  substitute. (#365)
+- **Empty control wells end `no_data`, not `samples_failed`, on the live read-mask
+  path (#177).** On the live `bcl-convert → ingest_reads → read-mask` pipeline an
+  empty well produces zero stored reads; the per-sample read-mask ticket then failed
+  at input binding (`_resolve_staged_reads` → `BAD_INPUT` → FAILED), so *every* empty
+  well — a legitimate blank / no-template control included — landed in the pool's
+  `samples_failed`, burying real failures among blanks doing their job (the #164
+  defect re-manifested after the store-once/mask-many split orphaned the old
+  `fastq_to_parquet` `no_data` path). The zero-read branch now splits on the persisted
+  biosample control marker (`host_taxon_id == "missing: control sample"`, reused via
+  the host-filter resolver's `is_control_sample` so "what is a control" stays defined
+  once): an expected-empty **control** raises `StepNoData` → terminal `no_data`
+  (counted under `samples_no_data`); an unexpected-empty **data** well keeps the
+  `BAD_INPUT` → failure it gets today. No schema or rollup change — the completion
+  rollup already buckets `no_data` separately from `failed`.
+- **`long-read-assembly` could never stream a sample's masked reads (#352).**
+  Every ticket failed at submission with DuckDB's `IO Error: Can't find the home
+  directory at '/dev/null'`. The CP runner's masked-read streamer
+  (`_stream_masked_reads_to_fastq`) called `connect_with_miint()` — the helper
+  documented for the **client** CLI, which runs `INSTALL miint` then `LOAD`.
+  `INSTALL` resolves DuckDB's extension directory, defaulting to
+  `$HOME/.duckdb/extensions`, and the `qiita-api` service account's home is
+  `/dev/null`. This was the control plane's first *service-side* miint consumer;
+  the helper's other callers are CLIs that have so far only run from hosts with a
+  real `$HOME`, so it had never surfaced. (That is a property of where they run,
+  not of which CLI they are — `qiita-admin` subcommands *are* run as `qiita-api`
+  on the deploy host, so `qiita-admin masked-read-export` would hit the same wall
+  if it were ever invoked that way.) Service-side miint is now LOAD-only from the
+  deploy-staged directory via a new `connect_with_miint_staged()`, mirroring the
+  cluster paths (which are LOAD-only precisely so no node "depends on mirror
+  reachability, or needs a writable `$HOME`"). Requires `MIINT_EXTENSION_DIRECTORY`
+  in the control plane's env, byte-identical to the CO's and DP's; unset or
+  non-directory now fails with a message naming the variable and the service
+  instead of a DuckDB IOException. A read-only staged directory is sufficient —
+  `LOAD` writes nothing. `make verify-deploy` gains a `cp-miint` check, since a
+  missing var takes nothing down at boot and would otherwise stay invisible until
+  the next assembly submission.
+- **The staged-directory requirement is single-sourced (#352)** as
+  `qiita_common.duckdb_miint.require_staged_extension_directory`, and
+  `MIINT_EXTENSION_DIRECTORY` is now named once (`MIINT_EXTENSION_DIRECTORY_VAR`)
+  instead of spelled as a literal across the connect config, the job-env
+  allowlist, and the orchestrator's staging gate. The **orchestrator
+  deliberately does not adopt the check**: a slurm CO already requires the var at
+  boot (`_resolve_slurm_settings`), its native jobs get a writable per-ticket
+  `HOME` (`slurm/payload.py` points HOME at the workspace so DuckDB can cache
+  extensions there), and a `COMPUTE_BACKEND=local` dev run legitimately has
+  neither — so requiring it there would guard an unreachable state on the deploy
+  while breaking local development. The helper is pure Python; qiita-common
+  imports no duckdb, so each component keeps its own connect.
+- **`make preflight` now checks `MIINT_EXTENSION_DIRECTORY` byte-identity across
+  the CP/DP/CO env files (#352)**, the way it already did for `PATH_SCRATCH` —
+  both name a shared path every component must resolve identically, so a per-file
+  typo was a silent divergence. The comparison is now a helper called twice
+  rather than a copied loop.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket
@@ -494,6 +734,21 @@ duplicates further down are historical strata; leave them where they are.
   transient marker still classifies retriable) with a reason string that
   names the failure explicitly instead of relying on the generic fallthrough
   message.
+- **The reference DoGet ticket route now accepts `reference:read` in addition to
+  `ticket:doget` (any-of) (#366).** `POST /reference/{reference_idx}/ticket/doget` mints
+  a read ticket for reference sequences / chunks / taxonomy / phylogeny — all
+  public reference data — so minting it is now also a `reference:read` capability
+  (held by every human role), which is what lets the `qiita reference export` user
+  CLI pull a genome's sequences. Strictly additive: the service-only `ticket:doget`
+  stays an accepted scope, so the compute service account (which holds
+  `ticket:doget`, not `reference:read`) keeps minting the feature_idx-scoped
+  build/OGU tickets exactly as before — no principal loses access, no
+  re-provisioning. Reader-set change, intentional: beyond the export CLI, a
+  whole-reference ticket (no `feature_idx`) now lets **any authenticated human**
+  bulk-egress a reference's entire sequence set, uncapped — by design, since
+  reference data is public; a resource/bandwidth cap can come later if it proves
+  necessary. `ticket:doget` also still solely gates the alignment DoGet
+  (`POST /alignment/ticket/doget`), whose rows are sample-derived, not public.
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately
   minted below the ceiling), a scope-gated route 403s even though the role

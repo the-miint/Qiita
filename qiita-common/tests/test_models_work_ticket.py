@@ -275,11 +275,12 @@ def test_terminal_and_non_terminal_partition_the_enum():
     assert terminal | non_terminal == {s.value for s in WorkTicketState}
 
 
-def test_terminal_set_carries_all_three_terminal_states():
-    """NO_DATA is terminal — it is an outcome (an empty well), not a pending one."""
+def test_terminal_set_carries_all_terminal_states():
+    """NO_DATA is terminal (an empty-well outcome, not pending); CANCELLED is
+    terminal (an operator stop). Both are outcomes, not in-flight states."""
     from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
-    assert TERMINAL_WORK_TICKET_STATES == ("completed", "no_data", "failed")
+    assert TERMINAL_WORK_TICKET_STATES == ("completed", "no_data", "failed", "cancelled")
 
 
 def test_non_terminal_states_are_in_lifecycle_order():
@@ -300,3 +301,24 @@ def test_membership_works_for_plain_strings():
     assert "processing" not in TERMINAL_WORK_TICKET_STATES
     assert "processing" in NON_TERMINAL_WORK_TICKET_STATES
     assert "no_data" not in NON_TERMINAL_WORK_TICKET_STATES
+
+
+def test_work_ticket_cancel_request_selector_and_cap():
+    """WorkTicketCancelRequest requires a selector, ties run/pool narrowing to
+    action_id, and caps the explicit idx list."""
+    from qiita_common.models import WorkTicketCancelRequest
+
+    # At least one selector required.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest()
+    # run/pool narrowing without action_id is rejected.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest(sequencing_run_idx=3)
+    # The explicit idx list is capped.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest(work_ticket_idxs=list(range(1, 1002)))
+    # Valid shapes.
+    assert WorkTicketCancelRequest(work_ticket_idxs=[1, 2]).action_id is None
+    filtered = WorkTicketCancelRequest(action_id="read-mask", sequenced_pool_idx=9)
+    assert filtered.action_id == "read-mask"
+    assert filtered.sequenced_pool_idx == 9

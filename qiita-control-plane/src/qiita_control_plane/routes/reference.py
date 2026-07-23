@@ -15,6 +15,7 @@ workflow runners and HTTP callers share one transport.
 
 import base64
 import json
+from pathlib import Path
 from typing import Annotated
 
 import asyncpg
@@ -25,6 +26,10 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
+    PATH_REFERENCE_EXCLUSION,
+    PATH_REFERENCE_EXCLUSION_BY_IDX,
+    PATH_REFERENCE_EXCLUSION_SYNC,
+    PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
@@ -37,6 +42,11 @@ from qiita_common.models import (
     DoGetTicketResponse,
     ReferenceCreateRequest,
     ReferenceDeleteResponse,
+    ReferenceExclusionCreateRequest,
+    ReferenceExclusionListItem,
+    ReferenceExclusionMutationResponse,
+    ReferenceExclusionSyncResponse,
+    ReferenceGenomeMember,
     ReferenceIndex,
     ReferenceKind,
     ReferenceResponse,
@@ -46,7 +56,7 @@ from qiita_common.models import (
     WorkTicketState,
 )
 
-from ..actions.library import delete_reference_data
+from ..actions.library import delete_reference_data, sync_reference_exclusion_data
 from ..actions.reference import (
     REFERENCE_RETURNING,
     IllegalStatusTransition,
@@ -57,6 +67,7 @@ from ..actions.reference import (
     transition_reference_status,
 )
 from ..auth.guards import (
+    require_any_scope,
     require_complete_profile,
     require_scope,
 )
@@ -66,12 +77,19 @@ from ..auth.principal import (
     get_current_principal,
 )
 from ..auth.tickets import sign_ticket
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
     get_db_pool,
     get_flight_signing_key,
+    get_scratch_staging,
     get_tx_conn_factory,
+)
+from ..repositories.reference_exclusion import (
+    add_exclusion,
+    list_for_reference,
+    remove_exclusion,
 )
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
@@ -279,6 +297,45 @@ async def get_reference_shard_index_status(
     )
 
 
+@router.get(PATH_REFERENCE_GENOME_MEMBER)
+async def get_reference_genome_members(
+    reference_idx: Annotated[int, Field(gt=0)],
+    genome_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> list[ReferenceGenomeMember]:
+    """A genome's member features within one reference: feature_idx + the
+    reference's accession, feature_idx-ordered. The inverse of
+    export_member_genome, and the resolution step the genome-export CLI runs
+    before a DoGet for the sequence bytes.
+
+    Keyed on (reference_idx, genome_idx): the accession is per-(reference,
+    feature) and a DoGet ticket is per-reference, so a bare-genome export would
+    face N references with ambiguous accessions. A feature shared across genomes
+    (a plasmid → one content-hash-global feature_idx) is returned for each of its
+    genomes — the many-to-many payoff.
+
+    404 when the (reference, genome) pair has no members: an unknown reference, an
+    unknown genome, or a genome that belongs only to a different reference all
+    resolve to zero rows, and an empty export is a caller error worth surfacing
+    loudly (unlike the exclusion listing, where [] is a meaningful clean state)."""
+    rows = await pool.fetch(
+        "SELECT rm.feature_idx, rm.accession"
+        " FROM qiita.reference_membership rm"
+        " JOIN qiita.feature_genome fg USING (feature_idx)"
+        " WHERE rm.reference_idx = $1 AND fg.genome_idx = $2"
+        " ORDER BY rm.feature_idx",
+        reference_idx,
+        genome_idx,
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No members for genome {genome_idx} in reference {reference_idx}",
+        )
+    return [ReferenceGenomeMember.model_validate(dict(r)) for r in rows]
+
+
 @router.get(PATH_REFERENCE_BY_IDX)
 async def get_reference(
     reference_idx: Annotated[int, Field(gt=0)],
@@ -310,6 +367,228 @@ async def update_reference_status(
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     except IllegalStatusTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _require_exclusion_sync_dest(staging_root: Path | None) -> Path:
+    """The shared-scratch Parquet the data plane reads to refresh its exclusion
+    mirror. Requires PATH_SCRATCH (path_scratch_staging): the enforcement surface
+    is the data plane's anti-join views, so a curation call that can't reach the
+    shared scratch cannot take effect — fail loud (503) rather than silently
+    updating Postgres only. Checked BEFORE any Postgres write so the mutation is
+    fail-fast.
+
+    The filename is fixed (not per-call-unique): concurrent writers to it are
+    impossible because `sync_reference_exclusion_data` serializes every sync under
+    a transaction-scoped advisory lock held across the parquet write and the
+    data-plane read, so exactly one writer touches this path at a time and the
+    next sync's overwrite can't race a reader."""
+    if staging_root is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "reference exclusion requires PATH_SCRATCH (the shared data-plane"
+                " scratch) to be configured"
+            ),
+        )
+    return staging_root / "reference_exclusion" / "reference_exclusion.parquet"
+
+
+async def _sync_exclusion_to_lake(
+    pool: asyncpg.Pool, dest: Path, signing_key: bytes, data_plane_url: str
+) -> int:
+    """Re-materialize the resolved blocklist into the data-plane mirror. A Flight
+    failure is a 502, NOT a 500: the Postgres blocklist row was already written,
+    so the state is degraded-but-consistent-on-retry — re-issuing the (idempotent)
+    request re-runs the wholesale sync.
+
+    Concurrency: the mirror is a BLIND wholesale replace from a CP-resolved
+    snapshot (not commutative), so overlapping mutations — or a mutation racing a
+    reference load's post-load sync — must not commit at the data plane out of
+    resolve order, or a stale snapshot could clobber a fresher block (fail-OPEN).
+    `sync_reference_exclusion_data` prevents this by holding a transaction-scoped
+    Postgres advisory lock across the whole resolve → replace (a DB-level lock, so
+    it serializes across a multi-instance CP, unlike an in-process asyncio.Lock);
+    the last sync to run resolves the latest committed Postgres state and commits
+    last, reflecting Postgres exactly. A Flight failure is still a bare 502 (same
+    degraded-but-safe handling `delete_reference` uses for its DuckLake purge); the
+    caller retries the idempotent request."""
+    try:
+        return await sync_reference_exclusion_data(
+            pool=pool,
+            dest=dest,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+    except asyncpg.LockNotAvailableError as exc:
+        # Another sync held the serialization lock past lock_timeout (a concurrent
+        # curation call or a stuck post-load sync). The Postgres row is committed;
+        # this is transient — retry once the other sync clears.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "blocklist updated in Postgres but a concurrent exclusion sync held"
+                " the lock; re-issue the request to retry the sync"
+            ),
+        ) from exc
+    except _flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "blocklist updated in Postgres but the data-plane exclusion sync"
+                f" failed; re-issue the request to retry the sync: {exc}"
+            ),
+        ) from exc
+
+
+@router.post(PATH_REFERENCE_EXCLUSION, status_code=201)
+async def add_reference_exclusion(
+    body: ReferenceExclusionCreateRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_EXCLUSION_WRITE)),
+) -> ReferenceExclusionMutationResponse:
+    """Block a bad genome_idx / feature_idx (system_admin, `reference:exclusion:write`).
+
+    The block is GLOBAL — keyed on the id alone, no reference_idx — so future
+    references that load the entity inherit it. Writes the Postgres blocklist row
+    (idempotent: a re-block keeps the original reason and reports `changed=false`),
+    then re-materializes the resolved exclusion set into the data plane's lake
+    mirror so the anti-join views stop surfacing the entity immediately. No aligner
+    index is rebuilt — exclusion is read-time only.
+
+    Postgres-first then sync is retriable: on a data-plane failure (502) the block
+    persists and re-POSTing re-runs the sync. NOTE the failure window is fail-OPEN:
+    between the Postgres commit and a successful sync the entity is still visible in
+    the anti-join views, so the block has NOT taken effect until a 201 returns — a
+    502 means "not yet protected, retry", never "protected"."""
+    dest = _require_exclusion_sync_dest(staging_root)
+    target_kind = "genome" if body.genome_idx is not None else "feature"
+    # Explicit existence check: the target columns are NOT foreign keys (a block
+    # deliberately outlives its entity — see the migration), so there is no FK to
+    # 404 an unknown idx. Non-atomic with the insert, which is fine — a target
+    # deleted in the race just yields a block that re-attaches on re-ingest.
+    if target_kind == "genome":
+        exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.genome WHERE genome_idx = $1", body.genome_idx
+        )
+    else:
+        exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", body.feature_idx
+        )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=f"No such {target_kind} to block")
+    changed = await add_exclusion(
+        pool,
+        reason=body.reason,
+        excluded_by_idx=user.principal_idx,
+        genome_idx=body.genome_idx,
+        feature_idx=body.feature_idx,
+    )
+    synced = await _sync_exclusion_to_lake(pool, dest, signing_key, data_plane_url)
+    return ReferenceExclusionMutationResponse(
+        target_kind=target_kind,
+        genome_idx=body.genome_idx,
+        feature_idx=body.feature_idx,
+        reason=body.reason,
+        changed=changed,
+        synced_feature_count=synced,
+    )
+
+
+@router.delete(PATH_REFERENCE_EXCLUSION)
+async def remove_reference_exclusion(
+    genome_idx: Annotated[int | None, Query(gt=0)] = None,
+    feature_idx: Annotated[int | None, Query(gt=0)] = None,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_EXCLUSION_WRITE)),
+) -> ReferenceExclusionMutationResponse:
+    """Unblock exactly one genome_idx / feature_idx (system_admin,
+    `reference:exclusion:write`). The target rides as a query param
+    (`?genome_idx=` or `?feature_idx=`). A SOFT delete: the block row is kept and
+    stamped `unblocked_at`/`unblocked_by_idx` (the actor — hence the complete
+    profile, symmetric with the add), preserving the curatorial record.
+    Idempotent: unblocking something not actively blocked reports `changed=false`.
+    Re-syncs the lake mirror so the entity is surfaced again. Retriable like the
+    add (502 on data-plane failure); the failure window here is fail-CLOSED (the
+    mirror over-excludes the entity until a successful re-sync), the safe
+    direction."""
+    if (genome_idx is None) == (feature_idx is None):
+        raise HTTPException(
+            status_code=422,
+            detail="exactly one of genome_idx / feature_idx must be given",
+        )
+    dest = _require_exclusion_sync_dest(staging_root)
+    target_kind = "genome" if genome_idx is not None else "feature"
+    removed = await remove_exclusion(
+        pool,
+        unblocked_by_idx=user.principal_idx,
+        genome_idx=genome_idx,
+        feature_idx=feature_idx,
+    )
+    synced = await _sync_exclusion_to_lake(pool, dest, signing_key, data_plane_url)
+    return ReferenceExclusionMutationResponse(
+        target_kind=target_kind,
+        genome_idx=genome_idx,
+        feature_idx=feature_idx,
+        changed=removed > 0,
+        synced_feature_count=synced,
+    )
+
+
+@router.post(PATH_REFERENCE_EXCLUSION_SYNC, status_code=200)
+async def sync_reference_exclusion_mirror(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_EXCLUSION_WRITE)),
+) -> ReferenceExclusionSyncResponse:
+    """Force-resync the data-plane exclusion mirror from the current Postgres
+    blocklist (system_admin, `reference:exclusion:write`). Makes NO Postgres change
+    — it re-resolves the committed blocklist and re-writes the DuckLake
+    `reference_exclusion` mirror wholesale (idempotent, replay-safe), the same sync
+    every mutation and reference-load runs.
+
+    For operator recovery when the mirror has drifted from Postgres: a prior sync's
+    502/503 was never retried, the DuckLake catalog was rebuilt, or a fresh data
+    plane came up with an empty mirror. Unlike add/remove there is no complete-profile
+    requirement (no actor is recorded — nothing is curated). A data-plane failure is
+    a 502 / a concurrent-sync lock timeout a 503, both retriable, exactly as for the
+    mutations (see `_sync_exclusion_to_lake`)."""
+    dest = _require_exclusion_sync_dest(staging_root)
+    synced = await _sync_exclusion_to_lake(pool, dest, signing_key, data_plane_url)
+    return ReferenceExclusionSyncResponse(synced_feature_count=synced)
+
+
+@router.get(PATH_REFERENCE_EXCLUSION_BY_IDX)
+async def list_reference_exclusions(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> list[ReferenceExclusionListItem]:
+    """What the global blocklist filters from THIS reference, and why: one row per
+    blocked feature that appears in the reference, with the exclusion reason,
+    whether it was blocked directly or via its genome, the genome provenance
+    (source, source_id), and the reference's own accession for the feature.
+
+    404s an unknown reference (matching `get_reference_index` /
+    `get_reference_shard_index_status`) so a typo'd idx is distinguishable from a
+    genuinely clean reference — an existing reference with no blocked features
+    yields `[]`."""
+    exists = await pool.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    rows = await list_for_reference(pool, reference_idx)
+    return [ReferenceExclusionListItem.model_validate(dict(r)) for r in rows]
 
 
 @router.delete(PATH_REFERENCE_BY_IDX)
@@ -405,33 +684,51 @@ async def delete_reference(
 
 
 # Tables that can appear in a DoGet ticket, CP-side mirror of the data plane's
-# ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it.
-# `read_masked` (the masked-read surface) is the one the data plane reaches via
-# Flight in addition to the reference_* tables; raw `read`/`read_mask` are
-# deliberately absent from both allowlists (privacy by construction).
+# ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it
+# (test_cp_doget_allowlist_matches_the_rust_one_exactly parses the Rust const and
+# fails on drift). `read_masked` (the masked-read surface) and the two block-read
+# selectors are what the data plane reaches via Flight in addition to the
+# reference_* tables; the bare `read` / `read_mask` TABLES are deliberately absent
+# from both allowlists (privacy by construction — see the PRIVACY note on the
+# Rust const for why the members-scoped `read_block` selector is not a hole).
 _DOGET_ALLOWED_TABLES = frozenset(
     {
         "reference_sequences",
         "reference_sequence_chunks",
-        "reference_taxonomy",
+        # The exclusion-aware taxonomy VIEW, not the raw base table: taxonomy
+        # reads go through the anti-join view so a curated exclusion can't be
+        # bypassed (the read_masked-over-read model). Raw `reference_taxonomy` is
+        # the register-files write target but is NOT Flight-readable.
+        "reference_taxonomy_visible",
         "reference_phylogeny",
         "reference_placements",
         "reference_annotation",
         "read_masked",
-        # The alignment sink's DoGet read-side (feature-table OGU consumer). Like
+        # The alignment sink's DoGet read-side (feature-table OGU consumer), as the
+        # exclusion-aware VIEW (raw `alignment` is not Flight-readable). Like
         # read_masked it is served by its own route (routes/alignment.py), scoped
         # by alignment_idx + prep_sample_idx, so it is excluded from
         # _REFERENCE_DOGET_TABLES below.
-        "alignment",
+        "alignment_visible",
+        # Block-read selectors, served by routes/read.py and scoped by a block's
+        # members. Named from the shared constants rather than re-spelled, so the
+        # signer, the allowlist, and the scope rule cannot drift from each other.
+        READ_BLOCK_TABLE,
+        READ_MASKED_BLOCK_TABLE,
     }
 )
 
-# The subset the reference DoGet route below can sign. `read_masked` is reached
-# through the dedicated /read-masked/ticket/doget route (routes/read_masked.py),
-# whose ticket carries (prep_sample_idx, mask_idx) — not reference_idx — and
-# which enforces the mandatory-filter invariant. The reference route restricts
-# itself to the reference_* tables whose membership it resolves.
-_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset({"read_masked", "alignment"})
+# The subset the reference DoGet route below can sign. Each excluded table is
+# reached through its own dedicated route, which enforces a scope the generic
+# reference route cannot: `read_masked` via /read-masked/ticket/doget
+# (prep_sample_idx + mask_idx), `alignment_visible` via /alignment/ticket/doget
+# (alignment_idx + cohort), and the block-read selectors via /read/ticket/doget
+# (a block's members). The reference route restricts itself to the reference_*
+# tables whose membership it resolves — including `reference_taxonomy_visible`,
+# so external taxonomy reads also go through the exclusion view.
+_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
+    {"read_masked", "alignment_visible", READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE}
+)
 
 
 @router.post(PATH_REFERENCE_DOGET, status_code=201)
@@ -440,7 +737,7 @@ async def create_doget_ticket(
     body: DoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
-    _scope: Principal = Depends(require_scope(Scope.TICKET_DOGET)),
+    _scope: Principal = Depends(require_any_scope(Scope.REFERENCE_READ, Scope.TICKET_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to a reference.
 
@@ -458,9 +755,20 @@ async def create_doget_ticket(
     not yet in DuckLake simply yields an empty stream. `pending`/`loading`
     (pre-DuckLake) are 409; a missing reference is 404.
 
-    Authorization is scope-only at this layer: any principal with
-    `tickets:doget` can request a ticket. Row-level visibility (private
-    references) is not yet implemented.
+    Authorization accepts EITHER `reference:read` OR `ticket:doget` (any-of):
+    reference sequences / taxonomy / phylogeny are public reference data (every
+    table this route can sign is reference data), so minting a read ticket for
+    them is a `reference:read` capability — held by every human role — which is
+    what lets the `qiita reference export` user CLI pull a genome's sequences. The
+    service-only `ticket:doget` is retained as an accepted scope so the compute
+    service account (which holds `ticket:doget`, not `reference:read`) keeps
+    minting the feature_idx-scoped build/OGU tickets it always has — the change is
+    strictly additive, no principal loses access. Reader set: a whole-reference
+    ticket (no `feature_idx`) now lets ANY authenticated human bulk-egress a
+    reference's entire sequence set, uncapped — intentional, since reference data
+    is public; a resource/bandwidth cap can come later if it proves necessary.
+    Row-level visibility (private references) is not implemented, so that caveat
+    now applies to every authenticated human, not only the service account.
     """
     if body.table not in _REFERENCE_DOGET_TABLES:
         raise HTTPException(

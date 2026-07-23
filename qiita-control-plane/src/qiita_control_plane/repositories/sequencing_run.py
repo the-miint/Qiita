@@ -20,7 +20,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import BCL_CONVERT_ACTION_ID, READ_MASK_ACTION_ID
-from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, Platform
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, Platform, WorkTicketState
 
 
 class PayloadMismatch(Exception):
@@ -412,6 +412,66 @@ async def fetch_sequenced_pool(
     )
 
 
+# The compute-on-read read-metric aggregate column list — the SAME expressions
+# for the pool rollup and the run-level rollup, factored here so the two report an
+# IDENTICAL PoolReadMetrics shape and can never drift. Every aggregate references
+# only the `ss`/`ps`/`bs` aliases (sequenced_sample / prep_sample / biosample),
+# which both callers provide by the same LEFT-JOIN chain; the callers differ only
+# in where the chain is rooted (a single pool vs. every pool in a run) and in the
+# non-aggregate metadata columns the pool caller also selects. No leading/trailing
+# comma so a caller splices it between its own SELECT list and FROM.
+#
+# Each aggregate carries `FILTER (WHERE ps.retired IS NOT TRUE)` so a retired
+# prep_sample contributes to no sum or count. The SUMs cast `::bigint` (SUM of
+# BIGINT is NUMERIC in Postgres) so asyncpg hands back plain ints. The read-outcome
+# breakdown partitions sample_count — count(ss.idx) (not count(*)) so a zero-sample
+# scope's LEFT-JOIN'd all-NULL phantom row contributes 0 to every bucket; "processed"
+# = raw IS NOT NULL (the indicator samples_with_metrics counts), and among processed
+# the split keys on quality_filtered (COALESCE NULL->0 so a processed-but-null count
+# lands in zero_reads, keeping the three buckets summing to sample_count).
+_READ_METRIC_AGGREGATE_COLUMNS = (
+    " SUM(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS raw_read_count_r1r2,"
+    " SUM(ss.biological_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS biological_read_count_r1r2,"
+    " SUM(ss.quality_filtered_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS quality_filtered_read_count_r1r2,"
+    " SUM(ss.spikein_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+    "   AS spikein_read_count_r1r2,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE) AS sample_count,"
+    " count(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)"
+    "   AS samples_with_metrics,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.raw_read_count_r1r2 IS NULL) AS samples_unprocessed,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.raw_read_count_r1r2 IS NOT NULL"
+    "   AND COALESCE(ss.quality_filtered_read_count_r1r2, 0) = 0) AS samples_zero_reads,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.raw_read_count_r1r2 IS NOT NULL"
+    "   AND COALESCE(ss.quality_filtered_read_count_r1r2, 0) > 0) AS samples_with_reads,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND bs.biosample_accession IS NOT NULL) AS samples_with_biosample_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND bs.ena_sample_accession IS NOT NULL) AS samples_with_ena_sample_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.ena_experiment_accession IS NOT NULL) AS samples_with_ena_experiment_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND ss.ena_run_accession IS NOT NULL) AS samples_with_ena_run_accession,"
+    " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE"
+    "   AND bs.biosample_accession IS NOT NULL AND bs.ena_sample_accession IS NOT NULL"
+    "   AND ss.ena_experiment_accession IS NOT NULL AND ss.ena_run_accession IS NOT NULL)"
+    "   AS samples_fully_submitted_to_ena"
+)
+
+# The LEFT-JOIN chain sequenced_sample -> prep_sample -> biosample the aggregates
+# above resolve their `ss`/`ps`/`bs` aliases against. LEFT joins so a scope with no
+# samples keeps its anchor row (all-NULL ss/ps/bs -> NULL sums, 0 counts).
+_READ_METRIC_SAMPLE_JOINS = (
+    " LEFT JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+    " LEFT JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+)
+
+
 async def fetch_sequenced_pool_read_metrics(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
@@ -419,40 +479,47 @@ async def fetch_sequenced_pool_read_metrics(
     """Return the pool's caller-visible metadata (minus the BYTEA preflight
     blob) plus the compute-on-read read-metric rollup, or None on a missing pool.
 
-    The three `SUM(...)::bigint` columns aggregate the per-stage read counts
-    over the pool's sequenced_samples; `count(ss.idx)` is the pool's sample
-    total and `count(ss.raw_read_count_r1r2)` is how many of those carry metrics.
-    Every aggregate uses `FILTER (WHERE ps.retired IS NOT TRUE)` so a retired
-    prep_sample contributes to neither the sums nor the counts (matching the
-    roster route's retired exclusion). `prep_sample.retired` is `NOT NULL`, so on
-    a real sample `IS NOT TRUE` is equivalent to the roster's `= false`; the
-    NULL-tolerant form is just defensive against the LEFT-JOIN'd all-NULL `ps` of
-    a zero-sample pool (whose row the LEFT JOIN keeps regardless — sums NULL,
-    counts 0). `SUM` of BIGINT is NUMERIC in Postgres, so
-    the explicit `::bigint` cast hands asyncpg a clean int (a single pool's read
-    total is far below the BIGINT ceiling). The passing fraction is recomputed
-    from these sums in PoolReadMetrics — never a mean of per-sample fractions."""
+    The aggregate columns are the shared `_READ_METRIC_AGGREGATE_COLUMNS` (the same
+    expressions the run-level rollup uses, so the two report an identical
+    PoolReadMetrics shape). The passing fraction is recomputed from these sums in
+    PoolReadMetrics — never a mean of per-sample fractions."""
     return await pool_or_conn.fetchrow(
         "SELECT sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
         " sp.extra_metadata, sp.created_by_idx, sp.created_at,"
-        " SUM(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS raw_read_count_r1r2,"
-        " SUM(ss.biological_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS biological_read_count_r1r2,"
-        " SUM(ss.quality_filtered_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS quality_filtered_read_count_r1r2,"
-        " SUM(ss.spikein_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
-        "   AS spikein_read_count_r1r2,"
-        " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE) AS sample_count,"
-        " count(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)"
-        "   AS samples_with_metrics"
-        " FROM qiita.sequenced_pool sp"
+        + _READ_METRIC_AGGREGATE_COLUMNS
+        + " FROM qiita.sequenced_pool sp"
         " LEFT JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = sp.idx"
-        " LEFT JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        " WHERE sp.idx = $1"
+        + _READ_METRIC_SAMPLE_JOINS
+        + " WHERE sp.idx = $1"
         " GROUP BY sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
         " sp.extra_metadata, sp.created_by_idx, sp.created_at",
         sequenced_pool_idx,
+    )
+
+
+async def fetch_sequencing_run_read_metrics(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+) -> asyncpg.Record | None:
+    """Return the run-level compute-on-read read-metric rollup — the same
+    PoolReadMetrics shape as `fetch_sequenced_pool_read_metrics`, summed across
+    every pool in the run — or None on a missing run.
+
+    Same aggregate expressions (`_READ_METRIC_AGGREGATE_COLUMNS`), rooted at the
+    run and walking run -> sequenced_pool -> sequenced_sample -> prep_sample ->
+    biosample by LEFT joins, so a run with no samples reads as NULL sums / 0
+    counts (its row is kept by the LEFT joins) rather than None. None is returned
+    only for a run idx that does not exist. No pool metadata columns — the caller
+    reads run metadata via `fetch_sequencing_run` and nests this under
+    `read_metrics`."""
+    return await pool_or_conn.fetchrow(
+        "SELECT" + _READ_METRIC_AGGREGATE_COLUMNS + " FROM qiita.sequencing_run sr"
+        " LEFT JOIN qiita.sequenced_pool sp ON sp.sequencing_run_idx = sr.idx"
+        " LEFT JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = sp.idx"
+        + _READ_METRIC_SAMPLE_JOINS
+        + " WHERE sr.idx = $1"
+        " GROUP BY sr.idx",
+        sequencing_run_idx,
     )
 
 
@@ -484,6 +551,8 @@ async def fetch_sequenced_pool_sample_qc_reports(
 async def fetch_sequenced_pool_completion(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
+    *,
+    reference_idx: int | None = None,
 ) -> asyncpg.Record:
     """Return the pool's host-masking completion rollup: counts of its
     non-retired sequenced_samples bucketed by the state of their read-mask
@@ -517,20 +586,37 @@ async def fetch_sequenced_pool_completion(
     bound from NON_TERMINAL_WORK_TICKET_STATES; it appears only inside a bool_or
     in the target list, never in a WHERE, so no partial-index predicate depends
     on its spelling. Retired samples are excluded (`ps.retired IS NOT TRUE`) to match the other pool
-    rollups' sample set."""
+    rollups' sample set.
+
+    `reference_idx` optionally scopes the read-mask ticket match to tickets whose
+    mask (`work_ticket.mask_idx` → `mask_definition`) used that host reference —
+    as its rype OR its minimap2 reference, read from the mask's `params` JSONB. So
+    a per-host-reference completion answers "masked against THIS reference?"
+    instead of the reference-agnostic "masked at all?": a sample masked only
+    against a DIFFERENT reference reads `not_submitted` here (`ticket_count = 0`),
+    which the pool-wide (`reference_idx=None`) form cannot distinguish. None keeps
+    the reference-agnostic behavior — the `$4 IS NULL` short-circuit includes every
+    read-mask ticket."""
     return await pool_or_conn.fetchrow(
         "WITH sample_state AS ("
         "  SELECT ss.prep_sample_idx,"
-        "    bool_or(wt.state = 'completed') AS has_completed,"
+        "    bool_or(wt.state = $5::qiita.work_ticket_state) AS has_completed,"
         "    bool_or(wt.state = ANY($3::qiita.work_ticket_state[])) AS has_inflight,"
-        "    bool_or(wt.state = 'no_data') AS has_no_data,"
-        "    bool_or(wt.state = 'failed') AS has_failed,"
+        "    bool_or(wt.state = $6::qiita.work_ticket_state) AS has_no_data,"
+        "    bool_or(wt.state = $7::qiita.work_ticket_state) AS has_failed,"
         "    count(wt.work_ticket_idx) AS ticket_count"
         "  FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         "  LEFT JOIN qiita.work_ticket wt"
         "    ON wt.prep_sample_idx = ss.prep_sample_idx"
         "   AND wt.action_id = $2"
+        # Reference scoping rides the JOIN's ON (not a WHERE) so a sample whose
+        # only read-mask ticket targets another reference keeps its row with 0
+        # matching tickets → not_submitted, rather than being dropped entirely.
+        "   AND ($4::bigint IS NULL OR wt.mask_idx IN ("
+        "     SELECT md.mask_idx FROM qiita.mask_definition md"
+        "     WHERE (md.params->>'host_rype_reference_idx')::bigint = $4"
+        "        OR (md.params->>'host_minimap2_reference_idx')::bigint = $4))"
         "  WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
         "  GROUP BY ss.prep_sample_idx"
         ")"
@@ -549,6 +635,10 @@ async def fetch_sequenced_pool_completion(
         sequenced_pool_idx,
         READ_MASK_ACTION_ID,
         list(NON_TERMINAL_WORK_TICKET_STATES),
+        reference_idx,
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.FAILED.value,
     )
 
 
@@ -571,16 +661,19 @@ async def fetch_sequenced_pool_demux_state(
     predicate depends on its spelling."""
     row = await pool_or_conn.fetchrow(
         "SELECT"
-        "  bool_or(state = 'completed') AS has_completed,"
+        "  bool_or(state = $4::qiita.work_ticket_state) AS has_completed,"
         "  bool_or(state = ANY($3::qiita.work_ticket_state[])) AS has_in_flight,"
-        "  bool_or(state = 'no_data') AS has_no_data,"
-        "  bool_or(state = 'failed') AS has_failed,"
+        "  bool_or(state = $5::qiita.work_ticket_state) AS has_no_data,"
+        "  bool_or(state = $6::qiita.work_ticket_state) AS has_failed,"
         "  count(*) AS ticket_count"
         " FROM qiita.work_ticket"
         " WHERE sequenced_pool_idx = $1 AND action_id = $2",
         sequenced_pool_idx,
         BCL_CONVERT_ACTION_ID,
         list(NON_TERMINAL_WORK_TICKET_STATES),
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.FAILED.value,
     )
     if row["has_completed"]:
         return "completed"
@@ -591,6 +684,81 @@ async def fetch_sequenced_pool_demux_state(
     if row["has_failed"]:
         return "failed"
     return "not_submitted"
+
+
+async def fetch_sequenced_pool_sample_exceptions(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> list[asyncpg.Record]:
+    """Return one row per ANOMALOUS non-retired sequenced_sample in the pool — no
+    usable reads (raw NULL, i.e. unprocessed, or processed with 0 quality-filtered),
+    missing any of the four submission accessions, or a genuinely-failed read-mask
+    ticket (a FAILED ticket with no COMPLETED one, matching the completion rollup's
+    precedence). Each row carries the raw fields the route's flag computation reads;
+    the SQL WHERE is exactly "at least one flag would fire", so the two stay in
+    agreement. A clean pool yields []. Retired samples excluded, matching the other
+    pool rollups. Uncapped per-pool fetch, like fetch_sequenced_pool_sample_qc_reports
+    — the anomalous set is a subset of the pool's bounded roster."""
+    return await pool_or_conn.fetch(
+        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
+        " bs.biosample_accession, bs.ena_sample_accession,"
+        " ss.ena_experiment_accession, ss.ena_run_accession,"
+        " ss.raw_read_count_r1r2, ss.quality_filtered_read_count_r1r2,"
+        " EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "   ss.prep_sample_idx AND wt.action_id = $2"
+        "   AND wt.state = $3::qiita.work_ticket_state) AS has_failed,"
+        " EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "   ss.prep_sample_idx AND wt.action_id = $2"
+        "   AND wt.state = $4::qiita.work_ticket_state) AS has_completed"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        "   AND ("
+        "     ss.raw_read_count_r1r2 IS NULL"
+        "     OR COALESCE(ss.quality_filtered_read_count_r1r2, 0) = 0"
+        "     OR bs.biosample_accession IS NULL"
+        "     OR bs.ena_sample_accession IS NULL"
+        "     OR ss.ena_experiment_accession IS NULL"
+        "     OR ss.ena_run_accession IS NULL"
+        "     OR (EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "           ss.prep_sample_idx AND wt.action_id = $2"
+        "           AND wt.state = $3::qiita.work_ticket_state)"
+        "         AND NOT EXISTS (SELECT 1 FROM qiita.work_ticket wt WHERE wt.prep_sample_idx ="
+        "           ss.prep_sample_idx AND wt.action_id = $2"
+        "           AND wt.state = $4::qiita.work_ticket_state))"
+        "   )"
+        " ORDER BY ss.idx",
+        sequenced_pool_idx,
+        READ_MASK_ACTION_ID,
+        WorkTicketState.FAILED.value,
+        WorkTicketState.COMPLETED.value,
+    )
+
+
+async def fetch_sequenced_pool_read_mask_ticket_state_counts(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> dict[str, int]:
+    """Return per-STATE counts of the pool's non-retired samples' READ-MASK work
+    tickets — tickets as the denominator (a sample with three read-mask tickets
+    contributes three), the raw view `PoolCompletionStatus`'s per-sample buckets
+    (which collapse each sample by precedence) deliberately does not give. States
+    with zero tickets are absent from the map; the route fills them in from the
+    WorkTicketState enum. Scoped to read-mask (`READ_MASK_ACTION_ID`) so it
+    reconciles with the completion rollup, not the all-actions delete/edit gate."""
+    rows = await pool_or_conn.fetch(
+        "SELECT wt.state, count(*) AS n"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " JOIN qiita.work_ticket wt ON wt.prep_sample_idx = ss.prep_sample_idx"
+        "   AND wt.action_id = $2"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        " GROUP BY wt.state",
+        sequenced_pool_idx,
+        READ_MASK_ACTION_ID,
+    )
+    return {r["state"]: r["n"] for r in rows}
 
 
 async def fetch_sequenced_pool_created_by(

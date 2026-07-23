@@ -47,6 +47,7 @@ from ...backfill.host_taxon import (
     plan_backfill,
 )
 from .. import _common
+from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
@@ -94,6 +95,7 @@ from .owner_id import (
     _write_owner_biosample_id_tsv,
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .ticket_cancel import _handle_ticket_cancel
 
 # ---------------------------------------------------------------------------
 # argparse entry point
@@ -164,6 +166,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_force_fail.set_defaults(handler=_handle_ticket_force_fail)
 
+    p_cancel = p_ticket_sub.add_parser(
+        "cancel",
+        help=(
+            "Cancel in-flight work_ticket(s): flip terminal (cancelled) so the CP"
+            " stops driving them AND scancel their SLURM job(s), via the CP route"
+            " (work_ticket:cancel scope). One ticket or a whole fan-out — no raw"
+            " scancel across the compute account. Idempotent; redrive later with"
+            " `qiita ticket run`."
+        ),
+    )
+    p_cancel.add_argument(
+        "work_ticket_idx",
+        nargs="*",
+        type=int,
+        help="explicit work_ticket idx(s) to cancel (reaped regardless of state)",
+    )
+    p_cancel.add_argument(
+        "--action-id",
+        dest="action_id",
+        default=None,
+        help=(
+            "cancel all NON-terminal tickets for this action_id (e.g. read-mask);"
+            " combine with --sequencing-run-idx / --sequenced-pool-idx to narrow"
+        ),
+    )
+    p_cancel.add_argument(
+        "--sequencing-run-idx",
+        dest="sequencing_run_idx",
+        type=int,
+        default=None,
+        help="narrow --action-id to tickets under this sequencing run",
+    )
+    p_cancel.add_argument(
+        "--sequenced-pool-idx",
+        dest="sequenced_pool_idx",
+        type=int,
+        default=None,
+        help="narrow --action-id to tickets under this sequenced pool",
+    )
+    p_cancel.set_defaults(handler=_handle_ticket_cancel)
+
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
     p_mask_delete = p_mask_sub.add_parser(
@@ -231,6 +274,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="After each resubmit, poll the new ticket to a terminal state and report it.",
     )
     p_purge.set_defaults(handler=_handle_mask_purge_failed)
+
+    p_reference = sub.add_parser("reference", help="Reference maintenance operations")
+    p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
+    add_admin_exclusion_subparsers(p_reference_sub)
 
     p_backfill = sub.add_parser("backfill", help="One-off data backfills")
     p_backfill_sub = p_backfill.add_subparsers(dest="backfill_cmd", required=True)
@@ -885,6 +932,7 @@ __all__ = [
     "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
+    "add_admin_exclusion_subparsers",
     "_count_non_failed_missing_mask_idx",
     "_export_stem",
     "_force_fail_ticket",

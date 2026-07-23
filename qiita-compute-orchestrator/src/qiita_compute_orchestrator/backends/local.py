@@ -126,3 +126,10 @@ class LocalBackend(ComputeBackend):
         backend without an isinstance check."""
         del job_name
         return []
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """LocalBackend runs steps in-process, so there is never a live SLURM job
+        to scancel. Always empty — interface parity so the CP→CO cancel route works
+        against either backend without an isinstance check."""
+        del work_ticket_idx
+        return []

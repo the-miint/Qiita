@@ -2085,6 +2085,40 @@ async def test_run_on_failed_resets_to_pending(
     assert row["failure_reason"] is None
 
 
+async def test_run_on_cancelled_resets_to_pending(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """CANCELLED → /run redrives just like FAILED: state → PENDING with a clean
+    retry budget, so an operator can restart a cancelled ticket once the blocker
+    is fixed. A cancelled ticket already carries NULL failure_*."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, retry_count)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state, 3)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+    assert row["state"] == WorkTicketState.PENDING.value
+    assert row["retry_count"] == 0
+
+
 async def test_run_on_failed_resets_reference_scope_target_to_pending(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
 ):
@@ -2613,6 +2647,52 @@ async def test_list_work_ticket_reports_current_slurm_entry(
     assert summary["compute_target"] == ComputeTarget.SLURM.value
     assert summary["slurm_job_id"] == 4242
     assert summary["step_state"] == StepProgressState.RUNNING.value
+    # A reference-scoped ticket has no prep_sample, so no read outcome.
+    assert summary["read_outcome"] is None
+
+
+async def test_list_work_ticket_reports_prep_sample_read_outcome(
+    wt_client, postgres_pool, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """A prep_sample-scoped ticket's summary nests read_outcome from the ticket's
+    sequenced_sample — the per-stage read counts plus the recomputed passing
+    fraction — so a read-mask ticket is assessable without a separate lookup."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    action_id, version = prep_sample_action
+    await postgres_pool.execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2=1000,"
+        " biological_read_count_r1r2=900, quality_filtered_read_count_r1r2=800,"
+        " spikein_read_count_r1r2=10 WHERE prep_sample_idx=$1",
+        prep_sample_idx,
+    )
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  prep_sample_idx, state)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, 'processing'::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        prep_sample_idx,
+    )
+    try:
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+        )
+        assert resp.status_code == 200, resp.text
+        summary = _summary_by_idx(resp.json(), idx)
+        assert summary is not None
+        ro = summary["read_outcome"]
+        assert ro is not None
+        assert ro["raw_read_count_r1r2"] == 1000
+        assert ro["biological_read_count_r1r2"] == 900
+        assert ro["quality_filtered_read_count_r1r2"] == 800
+        assert ro["spikein_read_count_r1r2"] == 10
+        assert ro["fraction_passing_quality_filter"] == pytest.approx(0.8)
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx=$1", idx)
 
 
 async def test_list_work_ticket_reports_control_plane_entry_without_job_id(

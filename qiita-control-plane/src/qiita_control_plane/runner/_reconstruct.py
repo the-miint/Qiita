@@ -339,9 +339,19 @@ async def _run_action_primitive(
         return {entry.outputs[0]: annotation_map_path}
 
     if entry.name == LibraryPrimitive.WRITE_MEMBERSHIP:
-        feature_map_path = Path(bound[entry.inputs[0]])
+        # Resolved by fixed binding NAME, not positionally (manifest + feature_map
+        # both carry a sequence_hash column; a YAML reorder must not swap them).
+        # manifest supplies the representative read_id (accession) per feature_idx;
+        # feature_map supplies feature_idx. Mirrors write-assembly-membership below.
+        if set(entry.inputs) != {"manifest", "feature_map"}:
+            raise RuntimeError(
+                f"write-membership expects inputs [manifest, feature_map]; got {entry.inputs!r}"
+            )
         await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-            pool, scope_target["reference_idx"], feature_map_path
+            pool,
+            scope_target["reference_idx"],
+            Path(bound["manifest"]),
+            Path(bound["feature_map"]),
         )
         return {}
 
@@ -643,6 +653,22 @@ async def _run_action_primitive(
             pool,
             block_idx=scope_target["block_idx"],
             alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.SYNC_REFERENCE_EXCLUSION:
+        # Post-load exclusion sync: re-resolve the GLOBAL blocklist and REPLACE the
+        # data plane's `reference_exclusion` mirror wholesale, so a fresh assembly
+        # of an already-blocked genome (new feature_idx the standing mirror can't
+        # know about) is caught. No file inputs; the dest Parquet lands in this
+        # attempt's workspace, which is under the shared PATH_SCRATCH tree the data
+        # plane re-validates under its scratch_root (same containment the DoGet
+        # exporters rely on). Idempotent full-replace ⇒ safe to re-run on a redrive.
+        await LIBRARY[LibraryPrimitive.SYNC_REFERENCE_EXCLUSION](
+            pool,
+            dest=workspace / "reference_exclusion.parquet",
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
         )
         return {}
 

@@ -186,7 +186,9 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
 
       * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
         for the masked read_masked pass-set to assemble);
-      * the step chain is assembly_run_config (module) → assemble → binning →
+      * the step chain is assembly_run_config (module) → assemble →
+        assembly_coverage (module; the miint minimap2 pre-map whose BAM lets
+        metaWRAP skip its own bwa self-alignment) → binning →
         bin_refine → checkm (four container steps) → assembly_hash (module) →
         mint-features → write-assembly-membership → assembly_load (module) →
         register-files, in that order — the storage tail reuses the reference-add
@@ -216,6 +218,7 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     assert [s.name for s in assembly.steps] == [
         "assembly_run_config",
         "assemble",
+        "assembly_coverage",
         "binning",
         "bin_refine",
         "checkm",
@@ -233,6 +236,15 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     assert hash_step.module == "qiita_compute_orchestrator.jobs.assembly_hash"
     load_step = next(s for s in assembly.steps if s.name == "assembly_load")
     assert load_step.module == "qiita_compute_orchestrator.jobs.assembly_load"
+    # The coverage pre-map must sit BEFORE binning and feed it: binning stages
+    # `coverage_bam` into metaWRAP's work_files/ so it skips its own bwa mem.
+    # Reversed or unwired, metaWRAP silently self-aligns HiFi reads with a
+    # short-read aligner instead of failing.
+    coverage_step = next(s for s in assembly.steps if s.name == "assembly_coverage")
+    assert coverage_step.module == "qiita_compute_orchestrator.jobs.assembly_coverage"
+    assert "coverage_bam" in coverage_step.outputs
+    binning_step = next(s for s in assembly.steps if s.name == "binning")
+    assert "coverage_bam" in binning_step.inputs
     # assembly_load threads processing_idx via params so the runner mints the run
     # identity before the step loop; write-assembly-membership then reads it.
     assert load_step.params == {"processing_idx": "processing_idx"}
@@ -287,7 +299,11 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
 
     step_names = [s.name for s in host.steps]
     # Shares the reference-add prefix, then adds the host-indexing tail: two
-    # index builders (rype + minimap2) and a register-index per build.
+    # index builders (rype + minimap2) and a register-index per build. The
+    # post-load `sync-reference-exclusion` step is DEAD LAST — after both
+    # register-index — so a transient sync FlightError can't strand an
+    # already-built index unregistered (a host reference writes the
+    # reference_taxonomy anti-join surface, so the sync must still fire here).
     assert step_names == [
         "hash_sequences",
         "mint-features",
@@ -299,6 +315,7 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
         "register-files",
         "register-index",
         "register-index",
+        "sync-reference-exclusion",
     ]
     # build_rype_index must precede register-files (move-on-register); the
     # minimap2 builder reads the RAW upload fasta, so it has no such ordering dep
@@ -501,6 +518,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "register-files",
         "register-index",
         "register-index",
+        "sync-reference-exclusion",
     ]
 
     stage = next(s for s in local_host.steps if s.name == "stage_local_fasta")
@@ -561,6 +579,35 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
 
     assert _LOCAL_HOST_REFERENCE_ADD_ACTION_ID == local_host.action_id == "local-host-reference-add"
     assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
+
+
+def test_every_write_membership_step_declares_the_runner_contract_inputs():
+    """Every on-disk `write-membership` action must declare `inputs:` exactly
+    {manifest, feature_map} — the runner's `_run_action_primitive` dispatch arm
+    hard-asserts that set and raises (failing the whole ticket) on any other
+    shape. This guards against the drift that a per-workflow-shape unit test can't
+    see: when `write-membership` gained its second input (`manifest`, for the
+    persisted accession), a workflow left on the old single-input form crashes at
+    runtime, not at load. Enumerating the real YAML here catches it at build time.
+    Same guard-by-enumeration applies to any future primitive-contract change."""
+    from pathlib import Path
+
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    offenders = {
+        f"{a.action_id}:{s.name}": s.inputs
+        for a in actions
+        for s in a.steps
+        if s.name == LibraryPrimitive.WRITE_MEMBERSHIP
+        and set(s.inputs) != {"manifest", "feature_map"}
+    }
+    assert not offenders, (
+        "these write-membership steps don't match the runner's required "
+        f"[manifest, feature_map] contract and will crash at dispatch: {offenders}"
+    )
 
 
 def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
@@ -901,7 +948,13 @@ def test_load_actions_loads_on_disk_read_mask_block_yaml():
 
     host_filter = next(s for s in rmb.steps if s.name == "host_filter")
     assert host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
-    assert host_filter.inputs == ["reads", "qc_mask"]
+    # No `reads` input: a block's steps STREAM their reads from the data plane at
+    # runtime, so the control plane stages nothing at submit time. qc likewise
+    # declares only its optional adapter_parquet.
+    assert host_filter.inputs == ["qc_mask"]
+    qc_step = next(s for s in rmb.steps if s.name == "qc")
+    assert qc_step.inputs == []
+    assert qc_step.optional_inputs == ["adapter_parquet"]
     assert host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
     assert host_filter.params == {"mask_idx": "mask_idx"}
 

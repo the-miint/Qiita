@@ -19,12 +19,14 @@ description: >
 
   The reads are stored ONCE by the bcl-convert workflow's `ingest_reads` step
   (DuckLake `read` table). This workflow never parses FASTQ or mints a
-  sequence_idx range. The runner binds `reads` from the block's `block_member`
-  sub-ranges via the `export_read_block` DoAction (the data plane materializes
-  the union of the members' `read` sub-ranges into a per-ticket `reads.parquet` —
-  the bulk read bytes never transit the control plane), and binds `mask_idx` from
-  the work_ticket (resolved at plan time as the partition key — never re-minted,
-  since a block has no single prep_sample the per-sample mint keys on).
+  sequence_idx range. Its `qc` and `host_filter` steps STREAM the block's reads
+  from the data plane at runtime (POST /read/ticket/doget, keyed on
+  work_ticket_idx; the control plane resolves the block's `block_member`
+  sub-ranges and signs the raw `read_block` selector), so nothing is materialized
+  onto shared scratch at submit time and the bulk read bytes never transit the
+  control plane. `mask_idx` is bound from the work_ticket (resolved at plan time
+  as the partition key — never re-minted, since a block has no single prep_sample
+  the per-sample mint keys on).
 
   The `qc` and `host_filter` steps are the SAME native modules as `read-mask`.
   qc keys its partial mask on the globally-unique sequence_idx (never on the
@@ -48,9 +50,9 @@ description: >
 scopes:
   - prep_sample:write
 
-# Admin-only, same rationale as read-mask: masking makes the data plane
-# re-materialize RAW reads (human-containing) into the ticket workspace via the
-# `export_read_block` DoAction, so this is a privileged lab operation.
+# Admin-only, same rationale as read-mask: masking streams RAW reads
+# (human-containing) from the data plane to the compute node, so this is a
+# privileged lab operation.
 audience:
   service: false
   human_roles: [wet_lab_admin, system_admin]
@@ -79,8 +81,8 @@ context_schema:
 steps:
   # Always-on QC over the block's stored reads. Emits a PARTIAL read mask
   # (qc_mask: per read, reason + per-end trims) keyed by sequence_idx — order- and
-  # owner-independent, so a multi-sample block is fine. `reads` is runner-bound
-  # from the block's member sub-ranges (_resolve_staged_reads_block);
+  # owner-independent, so a multi-sample block is fine. `reads` is NOT an input:
+  # the job streams the block's raw reads from the data plane at runtime;
   # `adapter_parquet` is materialized by the runner before the loop when QC
   # adapter trimming is enabled (short-read) and left unbound for a long-read /
   # PacBio block (no adapter trim). `instrument_model` rides through `params:` to
@@ -88,7 +90,6 @@ steps:
   - step: qc
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.qc
-    inputs: [reads]
     optional_inputs: [adapter_parquet]
     params: {instrument_model: instrument_model}
     outputs: [qc_mask]
@@ -98,13 +99,14 @@ steps:
       walltime: PT4H
 
   # Merge host hits into the qc_mask and emit the final read_mask. Stamps each
-  # row's prep_sample_idx per-row from `reads` (multi-sample block). `mask_idx`
+  # row's prep_sample_idx per-row from its own streamed reads (multi-sample
+  # block); like qc, it streams rather than reading a staged Parquet. `mask_idx`
   # is threaded via `params:` — its presence signals the runner to bind the mask
   # before the loop (from work_ticket.mask_idx, resolved at plan time).
   - step: host_filter
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.host_filter
-    inputs: [reads, qc_mask]
+    inputs: [qc_mask]
     optional_inputs: [host_rype_path, host_minimap2_path]
     params: {mask_idx: mask_idx}
     outputs: [read_mask, read_mask_staging_dir]

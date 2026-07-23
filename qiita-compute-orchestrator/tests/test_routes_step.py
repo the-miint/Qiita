@@ -51,6 +51,10 @@ class _RecordingBackend(ComputeBackend):
         # and read `find_by_name_calls` to assert what was looked up.
         self.found_jobs: list[FoundJob] = []
         self.find_by_name_calls: list[str] = []
+        # cancel: tests set `cancel_ids` to script the response and read
+        # `cancel_calls` to assert which ticket was reaped.
+        self.cancel_ids: list[int] = []
+        self.cancel_calls: list[int] = []
 
     # Stubbed as a synchronous backend: submit_step records the forwarded
     # call and returns a terminal handle (no SLURM hop), so the route tests
@@ -98,6 +102,10 @@ class _RecordingBackend(ComputeBackend):
     async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:
         self.find_by_name_calls.append(job_name)
         return list(self.found_jobs)
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        self.cancel_calls.append(work_ticket_idx)
+        return list(self.cancel_ids)
 
 
 @pytest.fixture
@@ -715,3 +723,28 @@ def test_step_submit_rejects_absolute_derived_input(http_client, cp_to_co_token,
     )
     assert resp.status_code == 422, resp.text
     assert len(backend.calls) == before
+
+
+def test_step_cancel_requires_bearer_token(http_client):
+    from qiita_common.api_paths import URL_STEP_CANCEL
+
+    client, _ = http_client
+    resp = client.post(URL_STEP_CANCEL, json={"work_ticket_idx": 1})
+    assert resp.status_code == 401
+
+
+def test_step_cancel_dispatches_and_returns_ids(http_client, cp_to_co_token):
+    """POST /step/cancel forwards the ticket idx to backend.cancel and serializes
+    the scancelled job ids."""
+    from qiita_common.api_paths import URL_STEP_CANCEL
+
+    client, backend = http_client
+    backend.cancel_ids = [518235, 518236]
+    resp = client.post(
+        URL_STEP_CANCEL,
+        json={"work_ticket_idx": 4837},
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cancelled_job_ids"] == [518235, 518236]
+    assert backend.cancel_calls == [4837]

@@ -706,6 +706,14 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
         spikein_read_count_r1r2=50,
         sample_count=2,
         samples_with_metrics=2,
+        samples_unprocessed=0,
+        samples_zero_reads=0,
+        samples_with_reads=2,
+        samples_with_biosample_accession=2,
+        samples_with_ena_sample_accession=2,
+        samples_with_ena_experiment_accession=2,
+        samples_with_ena_run_accession=2,
+        samples_fully_submitted_to_ena=2,
     )
     assert rm.fraction_passing_quality_filter == pytest.approx(0.1)
     # An unprocessed pool: NULL sums -> None fraction, but counts still present.
@@ -716,6 +724,14 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
         spikein_read_count_r1r2=None,
         sample_count=3,
         samples_with_metrics=0,
+        samples_unprocessed=3,
+        samples_zero_reads=0,
+        samples_with_reads=0,
+        samples_with_biosample_accession=0,
+        samples_with_ena_sample_accession=0,
+        samples_with_ena_experiment_accession=0,
+        samples_with_ena_run_accession=0,
+        samples_fully_submitted_to_ena=0,
     )
     assert empty.fraction_passing_quality_filter is None
     assert empty.sample_count == 3

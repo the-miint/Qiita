@@ -379,6 +379,56 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// Create the reference-exclusion table and the exclusion-aware `_visible` views.
+///
+/// `reference_exclusion` is the data-plane mirror of the control-plane blocklist
+/// (`qiita.reference_exclusion`): the RESOLVED set of `feature_idx` to exclude
+/// (direct feature blocks plus every feature of a blocked genome). The control
+/// plane recomputes and ships it WHOLESALE via the `sync_reference_exclusion`
+/// DoAction; here it is just a one-column table the views anti-join against.
+///
+/// `alignment_visible` / `reference_taxonomy_visible` are the ONLY
+/// exclusion-aware read surfaces: each is its base table minus every row whose
+/// `feature_idx` is blocked (an `ANTI JOIN` — cheap in DuckDB; the build side is
+/// a tiny curated list). A blocked genome/feature therefore never reaches an OGU
+/// feature table or a taxonomy lineage, even though it stays in the base table:
+/// exclusion is read-time only, so no aligner index is rebuilt. Phylogeny is
+/// deliberately NOT viewed here — `reference_phylogeny` is not row-independent
+/// (a node carries parent/child structure; `feature_idx` is on tips only), so a
+/// row-wise anti-join would orphan internal parents and malform the tree. The
+/// contract instead is that a tree consumer shears the tree to the keep-set
+/// (`tips WHERE feature_idx NOT IN reference_exclusion`) with miint's
+/// `shear_tree`; there is no production tree consumer today, so no phylogeny view
+/// is built.
+///
+/// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), like `read_masked`: the
+/// anti-join predicate IS the enforcement surface, so a definition change must
+/// reconcile on every DP startup rather than silently keep a stale view on an
+/// already-attached catalog. Must run AFTER `ensure_reference_tables` +
+/// `ensure_alignment_tables` (the views reference `reference_taxonomy` +
+/// `alignment`).
+pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- Resolved excluded feature_idx set, mirrored wholesale from the CP
+        -- blocklist. Same DuckLake constraint story as the sibling tables: no
+        -- PK/UNIQUE/FK (the CP owns integrity; a replayed sync is a full replace).
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_exclusion (
+            feature_idx BIGINT NOT NULL
+        );
+
+        CREATE OR REPLACE VIEW qiita_lake.alignment_visible AS
+        SELECT a.*
+        FROM qiita_lake.alignment a
+        ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);
+
+        CREATE OR REPLACE VIEW qiita_lake.reference_taxonomy_visible AS
+        SELECT t.*
+        FROM qiita_lake.reference_taxonomy t
+        ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);",
+    )?;
+    Ok(())
+}
+
 /// Create the assembly-result tables in DuckLake — the assembly analogue of the
 /// reference-sequence tables, following the SAME chunked + content-hashed model.
 ///
@@ -819,6 +869,194 @@ mod tests {
         ];
         let got: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
         assert_eq!(got, expected, "alignment table schema/order drift");
+    }
+
+    /// ensure_exclusion_tables is idempotent (run on every DP restart) and lays
+    /// down the blocklist mirror table plus both `_visible` anti-join views.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_exclusion_tables_is_idempotent() {
+        let conn = setup_conn();
+        ensure_reference_tables(&conn).unwrap();
+        ensure_alignment_tables(&conn).unwrap();
+        ensure_exclusion_tables(&conn).expect("first ensure_exclusion_tables");
+        ensure_exclusion_tables(&conn).expect("second ensure_exclusion_tables (idempotent)");
+
+        for name in [
+            "reference_exclusion",
+            "alignment_visible",
+            "reference_taxonomy_visible",
+        ] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_name = '{name}'"
+                ))
+                .unwrap();
+            let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(n, 1, "{name} should exist exactly once");
+        }
+    }
+
+    /// The `_visible` views anti-join the blocklist: a blocked feature_idx is
+    /// absent from alignment_visible / reference_taxonomy_visible while the base
+    /// tables retain it (read-time exclusion), and an unblocked feature passes
+    /// through. Scoped to this test's own alignment_idx / reference_idx so it is
+    /// robust against rows other #[serial] tests leave in the shared catalog.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn visible_views_anti_join_the_blocklist() {
+        let conn = setup_conn();
+        ensure_reference_tables(&conn).unwrap();
+        ensure_alignment_tables(&conn).unwrap();
+        ensure_exclusion_tables(&conn).unwrap();
+
+        let alignment_idx = next_test_id();
+        let reference_idx = next_test_id();
+        let feat_kept = next_test_id();
+        let feat_blocked = next_test_id();
+
+        let _c_align = Cleanup {
+            conn: &conn,
+            table: "alignment",
+            column: "alignment_idx",
+            id: alignment_idx,
+        };
+        let _c_tax = Cleanup {
+            conn: &conn,
+            table: "reference_taxonomy",
+            column: "reference_idx",
+            id: reference_idx,
+        };
+        let _c_excl = Cleanup {
+            conn: &conn,
+            table: "reference_exclusion",
+            column: "feature_idx",
+            id: feat_blocked,
+        };
+
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.alignment
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)
+               VALUES ({alignment_idx}, 1, 1, {feat_kept}),
+                      ({alignment_idx}, 1, 2, {feat_blocked});
+             INSERT INTO qiita_lake.reference_taxonomy (reference_idx, feature_idx)
+               VALUES ({reference_idx}, {feat_kept}), ({reference_idx}, {feat_blocked});
+             INSERT INTO qiita_lake.reference_exclusion (feature_idx)
+               VALUES ({feat_blocked});"
+        ))
+        .unwrap();
+
+        // Base table keeps both rows — exclusion is read-time, not a delete.
+        let base_align: i64 = conn
+            .prepare(&format!(
+                "SELECT count(*) FROM qiita_lake.alignment WHERE alignment_idx = {alignment_idx}"
+            ))
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .unwrap();
+        assert_eq!(base_align, 2, "base alignment retains the blocked row");
+
+        let vis_align: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.alignment_visible \
+                     WHERE alignment_idx = {alignment_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis_align,
+            vec![feat_kept],
+            "alignment_visible excludes the blocked feature"
+        );
+
+        let vis_tax: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.reference_taxonomy_visible \
+                     WHERE reference_idx = {reference_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis_tax,
+            vec![feat_kept],
+            "reference_taxonomy_visible excludes the blocked feature"
+        );
+    }
+
+    /// The `_visible` views are catalog-stored, not session-local: a fresh ATTACH
+    /// (a real DP restart) sees them WITHOUT re-running ensure_exclusion_tables and
+    /// they still anti-join the mirror. Parity with
+    /// read_masked_view_persists_across_reattach.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn visible_views_persist_across_reattach() {
+        let alignment_idx = next_test_id();
+        let feat_kept = next_test_id();
+        let feat_blocked = next_test_id();
+
+        // Connection 1: ensure tables + views, insert a base + blocklist row.
+        {
+            let conn1 = setup_conn();
+            ensure_reference_tables(&conn1).unwrap();
+            ensure_alignment_tables(&conn1).unwrap();
+            ensure_exclusion_tables(&conn1).unwrap();
+            conn1
+                .execute_batch(&format!(
+                    "INSERT INTO qiita_lake.alignment
+                         (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)
+                       VALUES ({alignment_idx}, 1, 1, {feat_kept}),
+                              ({alignment_idx}, 1, 2, {feat_blocked});
+                     INSERT INTO qiita_lake.reference_exclusion (feature_idx)
+                       VALUES ({feat_blocked});"
+                ))
+                .unwrap();
+        }
+
+        // Connection 2: fresh ATTACH, NO ensure_* — the catalog-stored view must
+        // already exist and still exclude the blocked feature.
+        let conn2 = setup_conn();
+        let _c_align = Cleanup {
+            conn: &conn2,
+            table: "alignment",
+            column: "alignment_idx",
+            id: alignment_idx,
+        };
+        let _c_excl = Cleanup {
+            conn: &conn2,
+            table: "reference_exclusion",
+            column: "feature_idx",
+            id: feat_blocked,
+        };
+        let vis: Vec<i64> = {
+            let mut stmt = conn2
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.alignment_visible \
+                     WHERE alignment_idx = {alignment_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis,
+            vec![feat_kept],
+            "alignment_visible persists + anti-joins after reattach"
+        );
     }
 
     #[test]

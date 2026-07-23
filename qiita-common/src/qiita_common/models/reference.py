@@ -462,3 +462,85 @@ VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
 
 class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
+
+
+class ReferenceExclusionCreateRequest(BaseModel):
+    """Block exactly one of genome_idx / feature_idx (the DB CHECK enforces the
+    same invariant). `reason` is a required free-text curator note, bounded
+    1..2000 chars (matched by the DB CHECK). The block is GLOBAL — not scoped to a
+    reference — so no reference_idx here."""
+
+    genome_idx: Annotated[int, Field(gt=0)] | None = None
+    feature_idx: Annotated[int, Field(gt=0)] | None = None
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self):
+        if (self.genome_idx is None) == (self.feature_idx is None):
+            raise ValueError("exactly one of genome_idx / feature_idx must be given")
+        return self
+
+
+class ReferenceExclusionMutationResponse(BaseModel):
+    """Result of a block (POST) / unblock (DELETE). `target_kind` names which id
+    was targeted; `changed` is whether the blocklist actually changed — False for
+    a no-op re-block (already blocked) or an unblock that found nothing.
+    `synced_feature_count` is the number of excluded feature_idx now materialized
+    in the data plane's exclusion mirror after the wholesale re-sync."""
+
+    target_kind: Literal["genome", "feature"]
+    genome_idx: int | None = None
+    feature_idx: int | None = None
+    reason: str | None = None
+    changed: bool
+    synced_feature_count: int
+
+
+class ReferenceExclusionSyncResponse(BaseModel):
+    """Result of a force-resync (POST /reference/exclusion/sync): the number of
+    excluded feature_idx now materialized in the data plane's exclusion mirror
+    after re-resolving the current Postgres blocklist and re-writing the mirror
+    wholesale. Carries no target — a force-resync makes no Postgres change, it just
+    reconciles a drifted mirror back to the committed blocklist (operator recovery
+    after a failed sync, a rebuilt DuckLake catalog, or a fresh data plane)."""
+
+    synced_feature_count: int
+
+
+class ReferenceExclusionListItem(BaseModel):
+    """One actively-blocked feature that appears in a given reference, with why +
+    external ids. `direct_block` / `via_genome` are reported as MUTUALLY EXCLUSIVE:
+    the listing keeps one row per feature and prefers the direct feature-level
+    block, so a feature blocked BOTH directly and through its genome reports
+    `direct_block=true, via_genome=false` (the direct block is the operative one).
+    `source`/`source_id` are the genome's external provenance; `accession` is the
+    reference's own FASTA-header id for the feature. Unblocked (soft-deleted)
+    history and global blocks that touch no feature in the queried reference are
+    absent."""
+
+    feature_idx: int
+    genome_idx: int | None = None
+    reason: str
+    excluded_by_idx: int
+    excluded_at: AwareDatetime
+    source: str | None = None
+    source_id: str | None = None
+    accession: str | None = None
+    direct_block: bool
+    via_genome: bool
+
+
+class ReferenceGenomeMember(BaseModel):
+    """One member feature of a genome within a reference: the feature_idx and the
+    reference's own FASTA-header accession for it. Returned by
+    GET /reference/{reference_idx}/genome/{genome_idx}/member (the inverse of
+    export_member_genome), feature_idx-ordered. A feature shared across genomes
+    (a plasmid → one content-hash-global feature_idx) appears in each of its
+    genomes' member lists. `accession` is nullable — a feature with no FASTA-header
+    accession for this reference (a non-FASTA ingest path, or a load whose manifest
+    had no match for it) carries none. The sequence
+    bytes / length live in the data plane (DuckLake), not here; the genome-export
+    CLI pairs this resolution with a DoGet for the bytes."""
+
+    feature_idx: int
+    accession: str | None = None

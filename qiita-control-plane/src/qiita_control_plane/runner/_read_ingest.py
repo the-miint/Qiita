@@ -18,8 +18,10 @@ from qiita_common.parquet import validate_parquet_path
 import qiita_control_plane.runner as _runner_pkg
 
 from ..auth.tickets import sign_action, sign_ticket
-from ..miint import connect_with_miint
+from ..host_filter_resolver import is_control_sample
+from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
+from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import fetch_sequenced_pool_run_roster
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
@@ -364,8 +366,8 @@ async def _stage_ena_run_roster(
 
 
 def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:
-    """Shared body for the read-export DoActions (`export_read`,
-    `export_read_block`): run a synchronous Flight DoAction of `action_type` in a
+    """Shared body for the read-export DoActions (`export_read` is the only one
+    left — block reads stream): run a synchronous Flight DoAction of `action_type` in a
     thread executor (pyarrow.flight is sync). The data plane writes the file; the
     bulk read bytes never transit the control plane. Returns `{"count": int,
     "dest": str}` with `count` already coerced to int, raising ValueError on a
@@ -399,24 +401,6 @@ def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
     return _do_action_export("export_read", data_plane_url, token)
 
 
-def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str, Any]:
-    """`export_read_block` DoAction: the data plane materializes the UNION of a
-    block's `(prep_sample_idx, sequence_idx sub-range)` members from its DuckLake
-    `read` table into one per-ticket Parquet. Isolated (thin wrapper over
-    `_do_action_export`) so unit tests stub the real call by name."""
-    return _do_action_export("export_read_block", data_plane_url, token)
-
-
-def _do_action_export_read_masked_block(data_plane_url: str, token: bytes) -> dict[str, Any]:
-    """`export_read_masked_block` DoAction: the data plane materializes the UNION
-    of a block's members from its DuckLake `read_masked` VIEW (trimmed +
-    host/QC-`pass`-filtered), scoped to the ticket's `mask_idx`, into one
-    per-ticket Parquet — the MASKED-reads sibling of `export_read_block` (same
-    output column shape). Isolated (thin wrapper over `_do_action_export`) so unit
-    tests stub the real call by name."""
-    return _do_action_export("export_read_masked_block", data_plane_url, token)
-
-
 def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest: Path) -> int:
     """Stream one prep_sample's `read_masked` pass-set from the data plane and write
     it as gzip FASTQ with miint's native `COPY … (FORMAT FASTQ)` — the EXACT
@@ -436,7 +420,7 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     read_opts = flight.FlightCallOptions(
         read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
     )
-    with flight.FlightClient(data_plane_url) as client, connect_with_miint() as con:
+    with flight.FlightClient(data_plane_url) as client, connect_with_miint_staged() as con:
         reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
         con.register("masked", reader)
         # Single-end long reads: sequence2/qual2 are NULL, so FORMAT FASTQ writes a
@@ -448,7 +432,25 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     return int(count)
 
 
+async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample_idx: int) -> bool:
+    """True when this prep_sample's biosample is flagged an expected-empty control
+    (host_taxon_id == "missing: control sample"). Resolves prep_sample → biosample,
+    then defers the control classification to `is_control_sample` so the definition
+    of "control" stays shared with the host-filter resolver. Fail-safe on a missing
+    prep_sample (returns False → the zero-read ticket FAILs as a data well).
+
+    Covers BOTH positive and negative controls, because the persisted control
+    marker cannot yet tell them apart — see the KNOWN LIMITATION in
+    `is_control_sample`: a positive control (katharoseq) that yields zero reads is
+    currently classified `no_data` too, though it is really a failure."""
+    biosample_idx = await fetch_biosample_idx_for_prep_sample(pool, prep_sample_idx)
+    if biosample_idx is None:
+        return False
+    return await is_control_sample(pool, biosample_idx=biosample_idx)
+
+
 async def _resolve_staged_reads(
+    pool: asyncpg.Pool,
     scope_target: dict[str, Any],
     staging_root: Path,
     *,
@@ -467,9 +469,14 @@ async def _resolve_staged_reads(
     Either source binds the same `reads` path; they are byte-equivalent modulo row
     order, and qc / host_filter are order-independent.
 
-    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if the sample has no
-    stored reads in either place — it must be ingested before a mask can be
-    created over it — or if the data plane is unreachable."""
+    Zero stored reads splits on whether the well is an expected-empty control: a
+    blank / no-template control legitimately produces no reads, so it ends the
+    ticket at a benign terminal `no_data` (StepNoData); a data well with no reads
+    is a genuine failure and stays SUBMISSION/BAD_INPUT (FAILED) — it must be
+    ingested before a mask can be created over it. (An unreachable data plane is
+    likewise SUBMISSION/BAD_INPUT.) Without this split every empty well — control
+    or data — lands in the pool's `samples_failed`, burying real failures among
+    blanks doing their job."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     durable = compute_reads_staging_path(staging_root, prep_sample_idx)
@@ -505,7 +512,20 @@ async def _resolve_staged_reads(
     # `count` is already an int (coerced in `_do_action_export_read`).
     if result.get("count", 0) == 0:
         # The persistent store has no reads for this sample either (the data plane
-        # writes no file for an empty result) — same "must be ingested" semantics.
+        # writes no file for an empty result). Split control from data: an
+        # expected-empty control (blank / NTC) reading zero is the benign, correct
+        # outcome → terminal no_data; a data well reading zero is a real failure →
+        # BAD_INPUT (must be ingested before a mask can be created over it). The
+        # control marker is the persisted biosample host_taxon_id == "missing:
+        # control sample" (see `is_control_sample`).
+        if await _prep_sample_is_expected_empty_control(pool, prep_sample_idx):
+            raise StepNoData(
+                reason=(
+                    f"prep_sample {prep_sample_idx} is an expected-empty control "
+                    "(blank / no-template control) with no stored reads; recording "
+                    "no_data rather than a failure"
+                )
+            )
         raise _submission_bad_input(
             f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
             "ingested (submit-bcl-convert stores reads) before a read mask can be "
@@ -611,189 +631,3 @@ async def _resolve_staged_masked_reads(
             f"(mask_idx {mask_idx}) but no fastq landed at {dest}"
         )
     return {STAGED_MASKED_READS_BINDING: dest}
-
-
-async def _resolve_staged_reads_block(
-    members: list[dict[str, int]],
-    *,
-    data_plane_url: str,
-    signing_key: bytes,
-    workspace: Path,
-) -> dict[str, Path]:
-    """Bind `reads` to a BLOCK's reads for a read-mask-block workflow — the
-    multi-sample analog of `_resolve_staged_reads`.
-
-    A block spans a set of `(prep_sample_idx, sequence_idx sub-range)` `members`
-    that all resolve to one `mask_idx`. Because a block may hold only a sub-range
-    of a large sample, the per-sample durable staging copy cannot serve it, so we
-    always source from the PERSISTENT DuckLake `read` table: ask the data plane to
-    materialize the union of the members' sub-ranges into a per-ticket
-    `reads.parquet` via the `export_read_block` DoAction (the data plane writes
-    the file; the bulk read bytes never transit the control plane). `qc` /
-    `host_filter` read `prep_sample_idx` per-row, so a multi-sample file is fine.
-
-    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly, step_name=None) if:
-    `members` is empty (a planning bug); the data plane is unreachable; the block
-    selects zero reads (its members' ranges match nothing — a planning bug, since
-    blocks are tiled from `sequence_range` bounds that must exist); or the data
-    plane reported reads but no file landed."""
-    if not members:
-        raise _submission_bad_input("a read-mask block requires a non-empty members list")
-    workspace.mkdir(parents=True, exist_ok=True)
-    dest = workspace / "reads.parquet"
-    # Coerce the member shape up front (a malformed member is a planner bug):
-    # a missing key or non-int value must FAIL the ticket cleanly as BAD_INPUT,
-    # not escape as an untyped KeyError/TypeError that strands it in PROCESSING.
-    try:
-        member_payload = [
-            {
-                "prep_sample_idx": int(m["prep_sample_idx"]),
-                "sequence_idx_start": int(m["sequence_idx_start"]),
-                "sequence_idx_stop": int(m["sequence_idx_stop"]),
-            }
-            for m in members
-        ]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise _submission_bad_input(
-            f"malformed read-mask block member (a planning bug): {type(exc).__name__}: {exc}"
-        ) from exc
-    token = sign_action(
-        action="export_read_block",
-        payload={"dest": str(dest), "members": member_payload},
-        secret=signing_key,
-    )
-    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
-    # wrap it as a SUBMISSION BAD_INPUT like the per-sample resolver so the outer
-    # handler FAILs the ticket cleanly rather than stranding it in PROCESSING.
-    try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._do_action_export_read_block, data_plane_url, token
-        )
-    except Exception as exc:
-        raise _submission_dp_fetch_failure(
-            f"could not materialize reads for the block from the data plane: "
-            f"{type(exc).__name__}: {exc}",
-            exc,
-        ) from exc
-
-    # `count` is already an int (coerced in `_do_action_export`).
-    if result.get("count", 0) == 0:
-        raise _submission_bad_input(
-            "the block selected zero reads from the data plane; its members' "
-            "sequence_idx ranges match no stored reads (a planning bug — blocks "
-            "are tiled from qiita.sequence_range bounds that must exist)"
-        )
-    if not dest.exists():
-        raise _submission_bad_input(
-            f"the data plane reported reads for the block but wrote no file at {dest}"
-        )
-    return {STAGED_READS_BINDING: dest}
-
-
-def _write_empty_reads_parquet(dest: Path) -> None:
-    """Write a schema-correct 0-row `reads.parquet` at `dest`, in the exact
-    `export_read_block` column shape (`prep_sample_idx, sequence_idx, read_id,
-    sequence1, qual1, sequence2, qual2`) `align_sharded` binds. Used for the
-    zero-masked-block no-op (see `_resolve_staged_masked_reads_block`): the data
-    plane writes no file for an empty selection, so the align step still needs a
-    valid empty input file to align over (emitting an empty alignment.parquet).
-    pyarrow (already this module's Flight dependency) writes it directly."""
-    import pyarrow as pa  # noqa: PLC0415
-    import pyarrow.parquet as pq  # noqa: PLC0415
-
-    table = pa.table(
-        {
-            "prep_sample_idx": pa.array([], type=pa.int64()),
-            "sequence_idx": pa.array([], type=pa.int64()),
-            "read_id": pa.array([], type=pa.string()),
-            "sequence1": pa.array([], type=pa.string()),
-            "qual1": pa.array([], type=pa.string()),
-            "sequence2": pa.array([], type=pa.string()),
-            "qual2": pa.array([], type=pa.string()),
-        }
-    )
-    pq.write_table(table, str(dest))
-
-
-async def _resolve_staged_masked_reads_block(
-    members: list[dict[str, int]],
-    *,
-    mask_idx: int,
-    data_plane_url: str,
-    signing_key: bytes,
-    workspace: Path,
-) -> dict[str, Path]:
-    """Bind `reads` to a BLOCK's MASKED reads for an align workflow — the
-    host-depleted, QC-passed twin of `_resolve_staged_reads_block`.
-
-    Same block-member shape and per-ticket `reads.parquet` contract as the raw
-    path, but the data plane sources the `read_masked` VIEW (trimmed +
-    `pass`-filtered) scoped to `mask_idx` via the `export_read_masked_block`
-    DoAction, so `align_sharded` aligns exactly the reads that survived the
-    host-depletion mask. The output column shape is identical to
-    `export_read_block`, so the `align_sharded.reads` contract is unchanged.
-
-    `mask_idx` is the ticket's pre-resolved (plan-time) mask — the SAME
-    completed mask the block's samples were masked under. Fails
-    SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly, step_name=None) if:
-    `members` is empty (a planning bug); the data plane is unreachable; or the
-    data plane reported reads but no file landed. **Unlike the raw path, zero
-    selected reads is NOT a failure** — a completed mask can legitimately carry 0
-    passing reads (a blank/control or fully host/QC-filtered sample the planner
-    still tiles), so an empty selection binds an empty (schema-correct)
-    reads.parquet and the block runs to a clean no-op completion (empty
-    alignment.parquet → register 0 rows → gate flip)."""
-    if not members:
-        raise _submission_bad_input("an align block requires a non-empty members list")
-    workspace.mkdir(parents=True, exist_ok=True)
-    dest = workspace / "reads.parquet"
-    try:
-        member_payload = [
-            {
-                "prep_sample_idx": int(m["prep_sample_idx"]),
-                "sequence_idx_start": int(m["sequence_idx_start"]),
-                "sequence_idx_stop": int(m["sequence_idx_stop"]),
-            }
-            for m in members
-        ]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise _submission_bad_input(
-            f"malformed align block member (a planning bug): {type(exc).__name__}: {exc}"
-        ) from exc
-    token = sign_action(
-        action="export_read_masked_block",
-        payload={"dest": str(dest), "mask_idx": int(mask_idx), "members": member_payload},
-        secret=signing_key,
-    )
-    try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._do_action_export_read_masked_block, data_plane_url, token
-        )
-    except Exception as exc:
-        raise _submission_dp_fetch_failure(
-            f"could not materialize masked reads for the block from the data plane: "
-            f"{type(exc).__name__}: {exc}",
-            exc,
-        ) from exc
-
-    if result.get("count", 0) == 0:
-        # Zero passing masked reads is a LEGITIMATE no-op, NOT a failure — unlike
-        # the raw `_resolve_staged_reads_block` path, where zero reads is a planning
-        # bug. A block ticket is only fanned out over samples whose mask_sample gate
-        # is `completed`, and a completed mask can carry 0 passing reads (a
-        # blank/no-template control, or a fully host/QC-filtered sample); a block's
-        # tail sub-range can also be entirely masked out. Failing here would
-        # permanently wedge the ticket (the count is 0 on every redrive) and strand
-        # the sample's alignment_sample gate at `pending` forever. Instead, bind an
-        # empty (schema-correct) reads.parquet: `align_sharded` emits an empty
-        # alignment.parquet (it guards the empty-read_to_shard case miint rejects),
-        # register-files registers 0 rows, and reconcile flips the gate with no
-        # rows (it has no count-assertion). The data plane writes NO file for an
-        # empty selection, so materialize the empty file here.
-        _write_empty_reads_parquet(dest)
-        return {STAGED_READS_BINDING: dest}
-    if not dest.exists():
-        raise _submission_bad_input(
-            f"the data plane reported masked reads for the block but wrote no file at {dest}"
-        )
-    return {STAGED_READS_BINDING: dest}

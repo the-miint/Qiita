@@ -27,7 +27,6 @@ from qiita_common.models import (
 from .. import step_progress
 from ..ena_import.submit import DEFAULT_DOWNLOAD_METHOD
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
-from ..repositories.block import fetch_block_members
 from ..repositories.sequenced_sample import set_sequenced_pool_transport
 from ._base import (
     _STEP_POLL_INTERVAL_SECONDS,
@@ -64,7 +63,6 @@ from ._feature_table import (
     _resolve_feature_table_bindings,
 )
 from ._mask import (
-    ALIGNMENT_IDX_BINDING,
     LIMA_ARGS_BINDING,
     MASK_IDX_BINDING,
     _mint_read_mask,
@@ -85,9 +83,7 @@ from ._read_ingest import (
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
-    _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
-    _resolve_staged_reads_block,
     _stage_ena_run_roster,
     _stage_shard_roster,
     _workflow_declares_input,
@@ -338,6 +334,7 @@ async def run_workflow(
             if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
                 bound.update(
                     await _resolve_staged_reads(
+                        pool,
                         scope_target,
                         upload_staging_root,
                         data_plane_url=data_plane_url,
@@ -346,65 +343,23 @@ async def run_workflow(
                     )
                 )
             elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
-                members = [
-                    {
-                        "prep_sample_idx": ps,
-                        "sequence_idx_start": lo,
-                        "sequence_idx_stop": hi,
-                    }
-                    for (ps, lo, hi) in await fetch_block_members(pool, scope_target["block_idx"])
-                ]
-                # An ALIGN block ticket carries a non-NULL alignment_idx and aligns
-                # the block's HOST-DEPLETED reads: stage the MASKED reads (the
-                # read_masked view scoped to the ticket's completed mask_idx). A
-                # read-mask-block ticket (alignment_idx NULL) masks the RAW reads,
-                # so it stages the raw `read` table. mask_idx is pre-resolved at
-                # plan time on both paths (the align planner sets it to the samples'
-                # completed mask; the block-mask planner to the partition mask).
+                # A block's steps STREAM their reads from the data plane at
+                # runtime (POST /read/ticket/doget, keyed on work_ticket_idx), so
+                # the control plane stages nothing — a block step declares NO
+                # `reads` input, and that absence is the signal. Reaching here
+                # means a BLOCK workflow declared one anyway, which nothing binds:
+                # the step would receive an unbound input and fail obscurely
+                # inside the job. Fail at submit instead.
                 #
-                # Discriminate on the action_context alignment_idx (the value the
-                # rest of the run already trusts — _reconstruct reads
-                # bound[ALIGNMENT_IDX_BINDING]), NOT the work_ticket.alignment_idx
-                # COLUMN: that column is ON DELETE SET NULL, so a mid-flight
-                # DELETE /alignment-definition NULLs it while action_context still
-                # carries the idx. Trusting the column would silently fall to the
-                # raw-reads branch and realign non-host-depleted, un-QC'd reads. Fail
-                # loud on any disagreement (the delete case) instead.
-                context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
-                if context_alignment_idx is not None:
-                    if work_ticket.get("alignment_idx") != context_alignment_idx:
-                        raise _submission_bad_input(
-                            "align block ticket action_context alignment_idx "
-                            f"{context_alignment_idx} disagrees with "
-                            "work_ticket.alignment_idx "
-                            f"{work_ticket.get('alignment_idx')!r} — the alignment "
-                            "definition was likely deleted mid-flight (the column is "
-                            "ON DELETE SET NULL); refusing to silently realign raw reads"
-                        )
-                    align_mask_idx = work_ticket["mask_idx"]
-                    if align_mask_idx is None:
-                        raise _submission_bad_input(
-                            "an align block ticket must carry the completed mask_idx its "
-                            "reads were masked under (set at plan time); found NULL"
-                        )
-                    bound.update(
-                        await _resolve_staged_masked_reads_block(
-                            members,
-                            mask_idx=align_mask_idx,
-                            data_plane_url=data_plane_url,
-                            signing_key=signing_key,
-                            workspace=workspace,
-                        )
-                    )
-                else:
-                    bound.update(
-                        await _resolve_staged_reads_block(
-                            members,
-                            data_plane_url=data_plane_url,
-                            signing_key=signing_key,
-                            workspace=workspace,
-                        )
-                    )
+                # (The raw-vs-masked decision that used to live here moved to
+                # `block_read.resolve_block_read_scope`, applied by the mint route
+                # at runtime — where it also sees an alignment deleted after
+                # submission.)
+                raise _submission_bad_input(
+                    "a block-scoped workflow must not declare a `reads` input: a "
+                    "block's steps stream their reads from the data plane at "
+                    "runtime, so nothing binds it"
+                )
             else:
                 raise _submission_bad_input(
                     "a workflow that masks stored reads must be prep_sample- or "

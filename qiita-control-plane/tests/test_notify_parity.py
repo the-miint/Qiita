@@ -19,11 +19,15 @@ from qiita_control_plane.notify.sweeper import (
     _TERMINAL_STATE_LITERALS,
 )
 
+# The migration that defines the CURRENT owed-set index predicate. The index is
+# recreated whenever the terminal-state set changes (a CONCURRENTLY drop+create
+# pair) — point this at the latest CREATE so the byte-match check reads the live
+# predicate, not a superseded one.
 _INDEX_MIGRATION = (
     Path(__file__).resolve().parent.parent
     / "db"
     / "migrations"
-    / "20260701000001_work_ticket_notified_idx.sql"
+    / "20260721000002_email_owed_idx_with_cancelled.sql"
 )
 
 # The shared retriable carve-out: completed / no_data / permanent-failed

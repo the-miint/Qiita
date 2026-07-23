@@ -64,6 +64,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # wet_lab_admin (who can create/load references via REFERENCE_WRITE
             # but not destroy them). Service accounts never get it.
             Scope.REFERENCE_DELETE,
+            # Curate the reference exclusion blocklist — system_admin-only, same
+            # rationale as REFERENCE_DELETE (masking a bad genome/feature is a
+            # curatorial act above wet_lab_admin's create/load capability).
+            Scope.REFERENCE_EXCLUSION_WRITE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
@@ -95,6 +99,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # masked-read pull, admin-gated until there's a model for picking the
             # right mask. Service accounts use READ_MASKED_DOGET, not this.
             Scope.ADMIN_MASKED_READ_EXPORT,
+            # Operator-cancel of in-flight compute (flip terminal + scancel) is
+            # system_admin-only — it stops running work and reaps SLURM jobs on the
+            # operator's behalf, same privilege tier as the destructive deletes.
+            Scope.WORK_TICKET_CANCEL,
             Scope.TICKET_DOPUT,
         }
     ),
@@ -117,6 +125,10 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         # only — the masked-read consumer path is service-driven; no human role
         # carries it (privacy-sensitive read surface, see Scope.READ_MASKED_DOGET).
         Scope.READ_MASKED_DOGET,
+        # Sign block-read DoGet tickets so a block-scoped compute job can stream
+        # its reads. Workers only, and the most privacy-sensitive of the three
+        # doget scopes — `read_block` streams RAW reads (see Scope.READ_DOGET).
+        Scope.READ_DOGET,
     }
 )
 

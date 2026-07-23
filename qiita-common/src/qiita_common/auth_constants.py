@@ -43,6 +43,13 @@ class Scope(StrEnum):
     # destructive and admin-only, granted solely to system_admin in
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     REFERENCE_DELETE = "reference:delete"
+    # Curate the global reference exclusion blocklist (block/unblock a bad
+    # genome_idx / feature_idx so it stops contributing to downstream products).
+    # Destructive-adjacent and admin-only: granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. Mirrors
+    # REFERENCE_DELETE (the read-only GET /reference/{idx}/exclusion rides
+    # REFERENCE_READ instead).
+    REFERENCE_EXCLUSION_WRITE = "reference:exclusion:write"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
     # Sign DoGet tickets for the data plane's reference-data surfaces AND the
@@ -58,6 +65,18 @@ class Scope(StrEnum):
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
     READ_MASKED_DOGET = "read_masked:doget"
+    # DoGet against the data plane's BLOCK-read selectors (`read_block` /
+    # `read_masked_block`) — one block's `(prep_sample_idx, sequence_idx
+    # sub-range)` members, streamed to a block-scoped compute job.
+    #
+    # Distinct from BOTH neighbours, and strictly the most privileged of the
+    # three. `read_block` streams RAW `read` rows: host/human sequence that the
+    # `read_masked` view exists to exclude, so it is a strict superset of what
+    # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
+    # `alignment` slice) would let any service account minting reference tickets
+    # pull raw reads — an inversion of the model the two scopes above establish.
+    # Granted only to the service account that drives block compute.
+    READ_DOGET = "read:doget"
     # Full purge of a mask (the mask_definition row + its DuckLake read_mask
     # rows). Deliberately distinct from the mask-minting capability: deletion
     # is destructive and admin-only, granted solely to system_admin in
@@ -122,6 +141,14 @@ class Scope(StrEnum):
     # the correct mask; granted solely to system_admin in ROLE_IMPLIED_SCOPES,
     # never wet_lab_admin or service accounts.
     ADMIN_MASKED_READ_EXPORT = "admin:masked_read_export"
+
+    # Operator-cancel of in-flight compute: flip a work_ticket terminal
+    # (cancelled) so the CP stops driving it AND scancel its SLURM job(s). Privileged
+    # — it stops running work and crosses into the compute account's reap on the
+    # operator's behalf — so it is granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES, never to wet_lab_admin or service accounts. Mirrors the
+    # destructive-delete scopes (REFERENCE_DELETE / SEQUENCED_POOL_DELETE).
+    WORK_TICKET_CANCEL = "work_ticket:cancel"
 
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"

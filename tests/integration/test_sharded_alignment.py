@@ -30,8 +30,9 @@ Parametrized over both aligners (minimap2, bowtie2). The index BUILDS stream
 reference chunks from the DP, so their `open_reference_chunk_stream` is
 monkeypatched to sign a ticket directly against the fixture DP's HMAC secret
 (the CP mint route has its own tests) — feature-scoped for the per-shard builders,
-whole-reference for the router. `align_sharded` itself reads only local artifacts
-(the staged reads Parquet + the on-disk router/shard indexes), so it needs no
+whole-reference for the router. `align_sharded` reads only local artifacts here
+(its block-read stream is stubbed from a local Parquet, plus the on-disk
+router/shard indexes), so it needs no
 patch.
 """
 
@@ -45,6 +46,7 @@ import duckdb
 import pytest
 
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_compute_orchestrator import read_source
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.derived_store import (
     shard_bowtie2_dir,
@@ -121,6 +123,32 @@ def _seed_reference_rows(data_plane):
         )
     finally:
         conn.close()
+
+
+def _fake_read_block_stream(reads_path):
+    """Serve `align_sharded`'s block reads from a local Parquet.
+
+    The job streams its reads (it has no `reads` input), so without this the test
+    would try to mint a block-read ticket against a control plane that isn't
+    running here. Stubbed at `open_read_block_stream` — the CO→CP/DP seam — so the
+    real drain-to-Parquet + lazy-view binding in `bind_step_reads` stays exercised.
+
+    The DP-side selector this stands in for (`read_block` / `read_masked_block`)
+    is covered by the Rust block-read DoGet tests, which run the exact SQL
+    `build_query` emits against real DuckLake rows.
+    """
+
+    @asynccontextmanager
+    async def fake(conn, *, work_ticket_idx, relation):
+        conn.execute(
+            f"CREATE VIEW {relation} AS SELECT * FROM read_parquet('{reads_path}')"
+        )
+        try:
+            yield relation
+        finally:
+            conn.execute(f"DROP VIEW IF EXISTS {relation}")
+
+    return fake
 
 
 def _fake_stream(data_plane):
@@ -288,8 +316,11 @@ def test_sharded_alignment_end_to_end(
     )
 
     def _align(reads_path):
+        # align_sharded streams its reads; point the seam at this batch's Parquet.
+        monkeypatch.setattr(
+            read_source, "open_read_block_stream", _fake_read_block_stream(reads_path)
+        )
         inputs = align_sharded.Inputs(
-            reads=reads_path,
             reference_idx=_REF_IDX,
             aligner=aligner,
             router_index_path=router_dir,

@@ -49,6 +49,22 @@ from typing import Any
 from qiita_common.actions import NATIVE_MODULE_PREFIX, BaselineResources
 
 
+def job_name_prefix(work_ticket_idx: int) -> str:
+    """The deterministic SLURM job-name prefix shared by ALL of a work_ticket's
+    attempts: `qiita-wt{idx}-`. Cancel/reap matches every attempt against this
+    prefix — the trailing `-` disambiguates `qiita-wt5-` from `qiita-wt50-...`.
+    Kept next to `job_name` so the prefix and the full name can't drift."""
+    return f"qiita-wt{work_ticket_idx}-"
+
+
+def job_name(work_ticket_idx: int, step_name: str, attempt: int) -> str:
+    """The deterministic, recovery-findable SLURM job name:
+    `qiita-wt{idx}-{step}-a{attempt}`. `find_jobs_by_name` re-adopts a job by this
+    exact shape (the write-ahead gap); the attempt suffix keeps a retry's job from
+    colliding with the terminal previous attempt's."""
+    return f"{job_name_prefix(work_ticket_idx)}{step_name}-a{attempt}"
+
+
 def number_envelope(value: int) -> dict[str, Any]:
     """slurmrestd's typed-numeric envelope. Used for memory / cpus /
     time fields so missing values can be expressed as set=False rather
@@ -359,7 +375,7 @@ def build_job_submit_payload(
         # shape to re-adopt a job the control plane submitted but may not
         # have persisted the id for. The attempt suffix keeps a retry's
         # job from colliding with the terminal previous attempt's job.
-        "name": f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+        "name": job_name(work_ticket_idx, step_name, attempt),
         "account": account,
         "partition": partition,
         "current_working_directory": str(workspace),

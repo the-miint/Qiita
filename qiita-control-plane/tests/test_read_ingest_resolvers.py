@@ -26,9 +26,7 @@ from qiita_control_plane.runner import (
     STAGED_READS_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
-    _resolve_staged_masked_reads_block,
     _resolve_staged_reads,
-    _resolve_staged_reads_block,
     _stage_ena_run_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
@@ -138,6 +136,22 @@ def test_workflow_declares_run_map_binding_gate():
 
 
 _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"
+# The zero-read control-split lookup, monkeypatched so these pure-unit tests
+# exercise the routing decision without a DB. The seam's real DB behavior
+# (prep_sample -> biosample -> control marker) is pinned by the DB-bound tests
+# in test_host_filter_resolver.py.
+_CONTROL_LOOKUP = "qiita_control_plane.runner._read_ingest._prep_sample_is_expected_empty_control"
+# `_resolve_staged_reads` now takes a pool first; the branches these tests reach
+# either don't touch it or monkeypatch the one helper that would, so a sentinel
+# stands in for it.
+_FAKE_POOL = object()
+
+
+def _control_lookup(is_control: bool):
+    async def _fn(_pool, _prep_sample_idx):
+        return is_control
+
+    return _fn
 
 
 def _staged_kwargs(tmp_path):
@@ -162,7 +176,9 @@ def test_resolve_staged_reads_binds_existing(tmp_path, monkeypatch):
     monkeypatch.setattr(_EXPORT_READ, _boom)
 
     bound = asyncio.run(
-        _resolve_staged_reads({"prep_sample_idx": 42}, staging_root, **_staged_kwargs(tmp_path))
+        _resolve_staged_reads(
+            _FAKE_POOL, {"prep_sample_idx": 42}, staging_root, **_staged_kwargs(tmp_path)
+        )
     )
     assert bound[STAGED_READS_BINDING] == reads
 
@@ -183,6 +199,7 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
 
     bound = asyncio.run(
         _resolve_staged_reads(
+            _FAKE_POOL,
             {"prep_sample_idx": 42},
             tmp_path / "staging",
             data_plane_url="grpc://unused",
@@ -194,18 +211,36 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
     assert dest.exists()
 
 
-def test_resolve_staged_reads_empty_export_fails_must_be_ingested(tmp_path, monkeypatch):
-    """Durable absent and the data plane returns 0 rows → BAD_INPUT 'must be
-    ingested' — the no-stored-reads semantics are preserved."""
+def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, monkeypatch):
+    """Durable absent, the data plane returns 0 rows, and the well is NOT a control
+    → BAD_INPUT 'must be ingested' — an unexpected-empty data well is a real
+    failure, the no-stored-reads semantics preserved."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(False))
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_reads(
-                {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
             )
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "must be ingested" in exc.value.reason
+
+
+def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatch):
+    """Durable absent, the data plane returns 0 rows, and the well IS an
+    expected-empty control (blank / NTC) → StepNoData (terminal no_data), NOT a
+    failure — an empty control must not land in the pool's samples_failed."""
+    monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(True))
+    with pytest.raises(StepNoData) as exc:
+        asyncio.run(
+            _resolve_staged_reads(
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+            )
+        )
+    assert "expected-empty control" in exc.value.reason
+    assert "7" in exc.value.reason
 
 
 def test_resolve_staged_reads_export_failure_is_bad_input(tmp_path, monkeypatch):
@@ -219,7 +254,7 @@ def test_resolve_staged_reads_export_failure_is_bad_input(tmp_path, monkeypatch)
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_reads(
-                {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
             )
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
@@ -236,6 +271,7 @@ def test_resolve_staged_reads_missing_file_is_bad_input(tmp_path, monkeypatch):
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
             _resolve_staged_reads(
+                _FAKE_POOL,
                 {"prep_sample_idx": 7},
                 tmp_path / "staging",
                 data_plane_url="grpc://unused",
@@ -365,268 +401,39 @@ def test_workflow_declares_input_checks_optional_too():
     assert _workflow_declares_input(steps, "sample_map") is False
 
 
-# --- block-export resolver (_resolve_staged_reads_block) -------------------
-
-_EXPORT_READ_BLOCK = "qiita_control_plane.runner._do_action_export_read_block"
-
-
-def _decode_token_payload(token: bytes) -> dict:
-    """Extract the canonical-JSON payload from a signed action token. Wire
-    format: <1B version><4B big-endian len><payload><64B Ed25519 sig><8B expiry>."""
-    import json
-    import struct
-
-    (plen,) = struct.unpack(">I", token[1:5])
-    return json.loads(token[5 : 5 + plen])
-
-
-_BLOCK_MEMBERS = [
-    {"prep_sample_idx": 101, "sequence_idx_start": 100, "sequence_idx_stop": 109},
-    {"prep_sample_idx": 103, "sequence_idx_start": 300, "sequence_idx_stop": 309},
-]
-
-
-def test_resolve_staged_reads_block_binds_workspace_parquet_and_signs_members(
-    tmp_path, monkeypatch
-):
-    """A block always sources from the DP `export_read_block` action (a block may
-    hold a partial sample, so no per-sample durable copy serves it). `reads` binds
-    to the written file, and the signed token carries the members verbatim."""
-    workspace = tmp_path / "ticket" / "900"
-    dest = workspace / "reads.parquet"
-    captured: dict = {}
-
-    def _fake_export(_url, token):
-        captured["payload"] = _decode_token_payload(token)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text("parquet-bytes")
-        return {"count": 5, "dest": str(dest)}
-
-    monkeypatch.setattr(_EXPORT_READ_BLOCK, _fake_export)
-
-    bound = asyncio.run(
-        _resolve_staged_reads_block(
-            _BLOCK_MEMBERS,
-            data_plane_url="grpc://unused",
-            signing_key=b"x" * 32,
-            workspace=workspace,
-        )
-    )
-    assert bound[STAGED_READS_BINDING] == dest
-    assert dest.exists()
-
-    payload = captured["payload"]
-    assert payload["action"] == "export_read_block"
-    assert payload["dest"] == str(dest)
-    assert payload["members"] == _BLOCK_MEMBERS
+# --- block reads: no resolver by design -------------------------------------
+#
+# `_resolve_staged_reads_block` / `_resolve_staged_masked_reads_block` are GONE.
+# A block's steps stream their reads from the data plane at runtime
+# (POST /read/ticket/doget), so the control plane no longer materializes a
+# per-ticket reads.parquet onto shared scratch at submit time. What those
+# resolvers tested moved, it was not dropped:
+#
+#   * the raw-vs-masked decision (including the ON DELETE SET NULL trap) ->
+#     tests/test_block_read.py, on the shared rule both boundaries use;
+#   * the signed member/mask scope -> tests/routes/test_read_doget.py;
+#   * the member selector's row semantics (gap excluded, split sub-range exact)
+#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service.rs.
+#
+# The empty-block case changed MEANING and is worth stating: the masked block
+# export used to write a schema-correct 0-row parquet so an all-masked-out block
+# ran to a clean no-op. A zero-row Arrow stream carries its schema, so the job
+# now binds a valid empty relation with no special case at all
+# (tests/test_read_source.py::test_empty_stream_is_not_an_error in the
+# orchestrator). An empty MEMBER LIST is a different thing — a planning bug — and
+# is refused at three boundaries: the route, sign_ticket, and the data plane.
 
 
-def test_resolve_staged_reads_block_empty_members_is_bad_input(tmp_path, monkeypatch):
-    """An empty block is a planning bug → BAD_INPUT, and the DP is never called."""
+def test_block_read_resolvers_are_gone():
+    """Pin the removal so a future change re-adding submit-time block staging is
+    a deliberate act, not an accident."""
+    from qiita_control_plane import runner
 
-    def _boom(_url, _token):
-        raise AssertionError("export_read_block must not fire for an empty block")
-
-    monkeypatch.setattr(_EXPORT_READ_BLOCK, _boom)
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_reads_block(
-                [],
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=tmp_path / "ws",
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-
-
-def test_resolve_staged_reads_block_zero_count_is_bad_input(tmp_path, monkeypatch):
-    """The block selected zero reads (its members' ranges match nothing) →
-    BAD_INPUT: a planning bug, since blocks are tiled from sequence_range bounds."""
-    monkeypatch.setattr(_EXPORT_READ_BLOCK, lambda _u, _t: {"count": 0, "dest": "x"})
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_reads_block(
-                _BLOCK_MEMBERS,
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=tmp_path / "ws",
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-
-
-def test_resolve_staged_reads_block_export_failure_is_bad_input(tmp_path, monkeypatch):
-    """A Flight failure is wrapped as BAD_INPUT, never an untyped exception."""
-
-    def _boom(_url, _token):
-        raise RuntimeError("Flight: connection refused")
-
-    monkeypatch.setattr(_EXPORT_READ_BLOCK, _boom)
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_reads_block(
-                _BLOCK_MEMBERS,
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=tmp_path / "ws",
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-    assert "data plane" in exc.value.reason
-
-
-def test_resolve_staged_reads_block_malformed_member_is_bad_input(tmp_path, monkeypatch):
-    """A member missing a key (a planner bug) fails BAD_INPUT — not an untyped
-    KeyError that would strand the ticket in PROCESSING. The DP is never called."""
-
-    def _boom(_url, _token):
-        raise AssertionError("export_read_block must not fire for a malformed member")
-
-    monkeypatch.setattr(_EXPORT_READ_BLOCK, _boom)
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_reads_block(
-                [{"prep_sample_idx": 101, "sequence_idx_start": 100}],  # missing stop
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=tmp_path / "ws",
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-
-
-def test_resolve_staged_reads_block_missing_file_is_bad_input(tmp_path, monkeypatch):
-    """count>0 but no file landed → BAD_INPUT at submission, not a downstream
-    FileNotFoundError."""
-    workspace = tmp_path / "ticket" / "900"
-    dest = workspace / "reads.parquet"
-    monkeypatch.setattr(_EXPORT_READ_BLOCK, lambda _u, _t: {"count": 5, "dest": str(dest)})
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_reads_block(
-                _BLOCK_MEMBERS,
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=workspace,
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-    assert "wrote no file" in exc.value.reason
-
-
-# --- masked block-export resolver (_resolve_staged_masked_reads_block) ------
-
-_EXPORT_MASKED_BLOCK = "qiita_control_plane.runner._do_action_export_read_masked_block"
-
-
-def test_resolve_staged_masked_reads_block_binds_and_signs_mask_and_members(tmp_path, monkeypatch):
-    """An align block sources the DP `export_read_masked_block` action; `reads`
-    binds to the written file, and the signed token carries the mask_idx + the
-    members verbatim (the MASKED-reads twin of the raw block resolver)."""
-    workspace = tmp_path / "ticket" / "901"
-    dest = workspace / "reads.parquet"
-    captured: dict = {}
-
-    def _fake_export(_url, token):
-        captured["payload"] = _decode_token_payload(token)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text("parquet-bytes")
-        return {"count": 3, "dest": str(dest)}
-
-    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, _fake_export)
-
-    bound = asyncio.run(
-        _resolve_staged_masked_reads_block(
-            _BLOCK_MEMBERS,
-            mask_idx=42,
-            data_plane_url="grpc://unused",
-            signing_key=b"x" * 32,
-            workspace=workspace,
-        )
-    )
-    assert bound[STAGED_READS_BINDING] == dest
-    assert dest.exists()
-
-    payload = captured["payload"]
-    assert payload["action"] == "export_read_masked_block"
-    assert payload["dest"] == str(dest)
-    assert payload["mask_idx"] == 42
-    assert payload["members"] == _BLOCK_MEMBERS
-
-
-def test_resolve_staged_masked_reads_block_empty_members_is_bad_input(tmp_path, monkeypatch):
-    def _boom(_url, _token):
-        raise AssertionError("export_read_masked_block must not fire for an empty block")
-
-    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, _boom)
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_masked_reads_block(
-                [],
-                mask_idx=1,
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=tmp_path / "ws",
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-
-
-def test_resolve_staged_masked_reads_block_zero_count_binds_empty_parquet(tmp_path, monkeypatch):
-    """Zero MASKED reads is a LEGITIMATE no-op, NOT a failure — a completed mask
-    can carry 0 passing reads (a blank/control or fully host/QC-filtered sample the
-    planner still tiles). The resolver binds an empty (schema-correct)
-    reads.parquet (the DP writes no file for an empty selection) so the block runs
-    to a clean no-op completion instead of permanently wedging its ticket."""
-    import duckdb
-
-    workspace = tmp_path / "ws"
-    # The DP reports 0 and writes NO file (matches export_select_to_parquet).
-    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, lambda _u, _t: {"count": 0, "dest": "x"})
-    bound = asyncio.run(
-        _resolve_staged_masked_reads_block(
-            _BLOCK_MEMBERS,
-            mask_idx=1,
-            data_plane_url="grpc://unused",
-            signing_key=b"x" * 32,
-            workspace=workspace,
-        )
-    )
-    dest = bound[STAGED_READS_BINDING]
-    assert dest == workspace / "reads.parquet"
-    assert dest.exists()
-    # A valid, 0-row parquet in the export_read_block column shape align_sharded binds.
-    with duckdb.connect(":memory:") as conn:
-        desc = conn.execute(f"SELECT * FROM read_parquet('{dest}') LIMIT 0").description
-        cols = [c[0] for c in desc]
-        (n,) = conn.execute(f"SELECT count(*) FROM read_parquet('{dest}')").fetchone()
-    assert n == 0
-    assert cols == [
-        "prep_sample_idx",
-        "sequence_idx",
-        "read_id",
-        "sequence1",
-        "qual1",
-        "sequence2",
-        "qual2",
-    ]
-
-
-def test_resolve_staged_masked_reads_block_export_failure_is_bad_input(tmp_path, monkeypatch):
-    def _boom(_url, _token):
-        raise RuntimeError("Flight: connection refused")
-
-    monkeypatch.setattr(_EXPORT_MASKED_BLOCK, _boom)
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
-            _resolve_staged_masked_reads_block(
-                _BLOCK_MEMBERS,
-                mask_idx=1,
-                data_plane_url="grpc://unused",
-                signing_key=b"x" * 32,
-                workspace=tmp_path / "ws",
-            )
-        )
-    assert exc.value.kind == FailureKind.BAD_INPUT
-    assert "masked reads" in exc.value.reason
+    for name in (
+        "_resolve_staged_reads_block",
+        "_resolve_staged_masked_reads_block",
+        "_do_action_export_read_block",
+        "_do_action_export_read_masked_block",
+        "_write_empty_reads_parquet",
+    ):
+        assert not hasattr(runner, name), f"{name} should have been removed"
