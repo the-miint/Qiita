@@ -609,7 +609,7 @@ async def test_e2e_export_genome_with_shared_plasmid(
             ("A", genome_a, "chromA"),
             ("B", genome_b, "chromB"),
         ):
-            # 1. Member route (Phase 3): feature_idx + accession for this genome.
+            # 1. Member route: feature_idx + accession for this genome.
             members_resp = await cli_cp_client.get(
                 URL_REFERENCE_GENOME_MEMBER.format(
                     reference_idx=fresh_reference, genome_idx=genome_idx
@@ -648,7 +648,7 @@ async def test_e2e_export_genome_with_shared_plasmid(
             reader2 = flight_client.do_get(flight.Ticket(ticket)).to_reader()
             ref_cli._write_genome_parquet(reader2, parquet_out)
 
-            fasta_records = _parse_fasta_gz(fasta_out)
+            fasta_records = _read_fasta_gz(con, fasta_out)
             pq_features = set(
                 pq.read_table(parquet_out).column("feature_idx").to_pylist()
             )
@@ -685,27 +685,15 @@ async def test_e2e_export_genome_with_shared_plasmid(
         )
 
 
-def _parse_fasta_gz(path: Path) -> dict[str, str]:
-    """Parse a gzipped FASTA into {header: sequence} (single-line sequences, as the
-    miint writer emits for these short fixtures)."""
-    import gzip
-
-    records: dict[str, str] = {}
-    header = None
-    seq_parts: list[str] = []
-    with gzip.open(path, "rt") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                if header is not None:
-                    records[header] = "".join(seq_parts)
-                header = line[1:]
-                seq_parts = []
-            elif line:
-                seq_parts.append(line)
-    if header is not None:
-        records[header] = "".join(seq_parts)
-    return records
+def _read_fasta_gz(con, path: Path) -> dict[str, str]:
+    """Parse a gzipped FASTA into {read_id: sequence} using miint's read_fastx —
+    the reader side of the write→read round-trip, never a hand-rolled parser (we
+    do not reimplement fundamental parsers). read_fastx yields one row per record
+    with `read_id` (the FASTA header) and `sequence1` (the sequence)."""
+    rows = con.execute(
+        "SELECT read_id, sequence1 FROM read_fastx(?)", [str(path)]
+    ).fetchall()
+    return {read_id: sequence for read_id, sequence in rows}
 
 
 async def test_ticket_endpoint_rejects_non_active_reference(

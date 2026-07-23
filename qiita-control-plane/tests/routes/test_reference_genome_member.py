@@ -172,10 +172,23 @@ async def test_genome_members_genome_not_in_reference_is_404(client, postgres_po
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref)
 
 
+async def test_genome_members_below_scope_is_403(make_pat_client):
+    """A principal WHOSE TOKEN lacks reference:read is refused 403 — the route's
+    require_scope guard runs before the handler, so this holds even for a
+    reference/genome that doesn't exist. A token's granted scopes are
+    authoritative; the role ceiling only bounds what may be minted, it does not
+    grant a scope the token was issued without."""
+    from qiita_common.auth_constants import Scope
+
+    client = await make_pat_client(label="member-no-ref-read", scopes=[Scope.SELF_PROFILE])
+    resp = await client.get(URL_REFERENCE_GENOME_MEMBER.format(reference_idx=1, genome_idx=1))
+    assert resp.status_code == 403, resp.text
+
+
 async def test_genome_members_requires_auth(postgres_pool):
-    """The route is gated by reference:read (held by every human role + service
-    account, so no principal can be used to prove a 403); an unauthenticated
-    request is rejected 401, proving the scope dependency is wired."""
+    """An unauthenticated request is rejected 401, proving the scope dependency is
+    wired. (A principal whose token lacks reference:read gets 403 —
+    test_genome_members_below_scope_is_403.)"""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
