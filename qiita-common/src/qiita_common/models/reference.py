@@ -528,3 +528,18 @@ class ReferenceExclusionListItem(BaseModel):
     accession: str | None = None
     direct_block: bool
     via_genome: bool
+
+
+class ReferenceGenomeMember(BaseModel):
+    """One member feature of a genome within a reference: the feature_idx and the
+    reference's own FASTA-header accession for it. Returned by
+    GET /reference/{reference_idx}/genome/{genome_idx}/member (the inverse of
+    export_member_genome), feature_idx-ordered. A feature shared across genomes
+    (a plasmid → one content-hash-global feature_idx) appears in each of its
+    genomes' member lists. `accession` is nullable — a non-FASTA ingest path or a
+    membership row predating the accession column may not carry one. The sequence
+    bytes / length live in the data plane (DuckLake), not here; the genome-export
+    CLI pairs this resolution with a DoGet for the bytes."""
+
+    feature_idx: int
+    accession: str | None = None

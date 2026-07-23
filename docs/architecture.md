@@ -226,7 +226,7 @@ Reference databases — curated collections of sequences, taxonomies, annotation
 erDiagram
     REFERENCE ||--o{ REFERENCE_MEMBERSHIP : contains
     REFERENCE_MEMBERSHIP }o--|| FEATURE : includes
-    FEATURE }o--o| FEATURE_GENOME : "belongs to"
+    FEATURE ||--o{ FEATURE_GENOME : "belongs to"
     FEATURE_GENOME }o--|| GENOME : "is part of"
     REFERENCE ||--o{ PHYLOGENY_TIP_FEATURE : "has tree"
     PHYLOGENY_TIP_FEATURE }o--|| FEATURE : "tip maps to"
@@ -281,10 +281,10 @@ Junction tables:
 | Table | Key | Purpose |
 |---|---|---|
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features belong to which reference version |
-| `feature_genome` | `(feature_idx, genome_idx)` | Which genome a feature belongs to (not all features have a genome) |
+| `feature_genome` | `(feature_idx, genome_idx)` | Which genome(s) a feature belongs to — many-to-many: not all features have a genome, and one feature can belong to several genomes (a plasmid shared across organisms shares one content-hash `feature_idx`) |
 | `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Maps phylogeny tip nodes to their corresponding feature sequences |
 
-A feature may belong to multiple references (e.g., the same contig in WoL3 and RS225). A genome may contain multiple features (e.g., a multi-contig assembly). MD5-based deduplication ensures that if two references include the same sequence bytes, they share one `feature_idx` — no data is duplicated.
+A feature may belong to multiple references (e.g., the same contig in WoL3 and RS225). A genome may contain multiple features (e.g., a multi-contig assembly). A feature may also belong to multiple genomes: two organisms sharing an identical mobile element (a plasmid) resolve to one content-hash `feature_idx` under both `genome_idx` (`feature_genome` is a true many-to-many — the composite PK `(feature_idx, genome_idx)`, no standalone `UNIQUE(feature_idx)`). MD5-based deduplication ensures that if two references include the same sequence bytes, they share one `feature_idx` — no data is duplicated.
 
 #### Control Plane vs. Data Plane Split
 

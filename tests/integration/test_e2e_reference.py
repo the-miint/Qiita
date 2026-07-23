@@ -178,6 +178,52 @@ def genome_map_e2e(tmp_path):
     return path
 
 
+# A shared plasmid: two genomes each carry a distinct chromosome plus an
+# IDENTICAL plasmid sequence. Identical bytes → one content-hash-global
+# feature_idx under BOTH genomes (the many-to-many the feature_genome fix
+# enables). The plasmid's membership accession is the lex-smallest of its two
+# read_ids ("plasmidA" < "plasmidB").
+_SHARED_PLASMID_SEQS = {
+    "chromA": "ATCGATCGATCGAA",
+    "chromB": "GCTAGCTAGCTAGG",
+    "plasmidA": "AAATTTCCCGGGTTT",
+    "plasmidB": "AAATTTCCCGGGTTT",  # identical bytes to plasmidA -> same feature_idx
+}
+
+
+@pytest.fixture
+def fasta_shared_plasmid(tmp_path):
+    path = tmp_path / "shared_plasmid.fasta"
+    with open(path, "w") as f:
+        for name, seq in _SHARED_PLASMID_SEQS.items():
+            f.write(f">{name}\n{seq}\n")
+    return path
+
+
+@pytest.fixture
+def genome_map_shared_plasmid(tmp_path):
+    """chromA + plasmidA -> genome A; chromB + plasmidB -> genome B. Since
+    plasmidA/plasmidB are identical bytes, the single plasmid feature_idx is
+    associated with BOTH genomes."""
+    suffix = uuid.uuid4().hex[:8]
+    path = tmp_path / "genome_map_shared.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE g (read_id VARCHAR, genome_source VARCHAR, genome_source_id VARCHAR)"
+        )
+        conn.executemany(
+            "INSERT INTO g VALUES (?, 'refseq', ?)",
+            [
+                ("chromA", f"GCF_{suffix}_A"),
+                ("plasmidA", f"GCF_{suffix}_A"),
+                ("chromB", f"GCF_{suffix}_B"),
+                ("plasmidB", f"GCF_{suffix}_B"),
+            ],
+        )
+        conn.execute(f"COPY g TO '{path}' (FORMAT PARQUET)")
+    return path
+
+
 @pytest.fixture
 async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_plane):
     """Configure cp_app.state for dispatch — pool + settings (with the
@@ -475,6 +521,191 @@ async def test_e2e_exclusion_masks_taxonomy_and_reports_provenance(
             "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])",
             all_genome_idxs,
         )
+
+
+async def test_e2e_export_genome_with_shared_plasmid(
+    postgres_pool,
+    data_plane,
+    signing_key,
+    flight_client,
+    synced_reference_add_action,
+    fresh_reference,
+    fasta_shared_plasmid,
+    genome_map_shared_plasmid,
+    human_admin_session,
+    cli_cp_client,
+    tmp_path,
+):
+    """End-to-end proof of the feature_genome many-to-many fix + the genome-export
+    CLI writers: load a reference whose two genomes share an IDENTICAL plasmid,
+    then export EACH genome (FASTA.gz + Parquet) through the CLI's writer path
+    (member route → DoGet ticket route → Flight DoGet → miint FASTA / pyarrow
+    Parquet). Both genomes' exports must contain the shared plasmid — the payoff
+    of dropping the standalone UNIQUE(feature_idx)."""
+    import pyarrow.parquet as pq
+    from qiita_common.api_paths import URL_REFERENCE_GENOME_MEMBER
+
+    from qiita_control_plane.auth.tickets import sign_ticket
+    from qiita_control_plane.cli.reference_load import do_reference_load
+    from qiita_control_plane.cli.user import reference as ref_cli
+    from qiita_control_plane.miint import connect_with_miint
+
+    result = await do_reference_load(
+        http=cli_cp_client,
+        token=human_admin_session["token"],
+        flight_client=flight_client,
+        fasta_path=fasta_shared_plasmid,
+        genome_map_path=genome_map_shared_plasmid,
+        reference_idx=fresh_reference,
+        watch=True,
+        poll_interval_seconds=0.1,
+        timeout_seconds=60,
+    )
+    assert result["work_ticket"]["state"] == "completed", result["work_ticket"]
+
+    # The plasmid's two read_ids collapsed to ONE membership row (lex-min accession).
+    accessions = {
+        r["accession"]
+        for r in await postgres_pool.fetch(
+            "SELECT accession FROM qiita.reference_membership WHERE reference_idx = $1",
+            fresh_reference,
+        )
+    }
+    assert accessions == {"chromA", "chromB", "plasmidA"}
+
+    # The single plasmid feature_idx is associated with BOTH genomes (many-to-many).
+    plasmid_feature = await postgres_pool.fetchval(
+        "SELECT feature_idx FROM qiita.reference_membership"
+        " WHERE reference_idx = $1 AND accession = 'plasmidA'",
+        fresh_reference,
+    )
+    genome_rows = await postgres_pool.fetch(
+        "SELECT genome_idx FROM qiita.feature_genome WHERE feature_idx = $1 ORDER BY genome_idx",
+        plasmid_feature,
+    )
+    assert len(genome_rows) == 2, "the shared plasmid must belong to both genomes"
+
+    # Resolve each genome_idx via its OWN chromosome's accession (unambiguous —
+    # a chromosome belongs to exactly one genome).
+    async def _genome_of(accession: str) -> int:
+        return await postgres_pool.fetchval(
+            "SELECT fg.genome_idx FROM qiita.reference_membership m"
+            " JOIN qiita.feature_genome fg ON fg.feature_idx = m.feature_idx"
+            " WHERE m.reference_idx = $1 AND m.accession = $2",
+            fresh_reference,
+            accession,
+        )
+
+    genome_a = await _genome_of("chromA")
+    genome_b = await _genome_of("chromB")
+    all_genome_idxs = [r["genome_idx"] for r in genome_rows]
+
+    output_dir = tmp_path / "export"
+    output_dir.mkdir()
+    con = connect_with_miint()
+    try:
+        results: dict[int, dict] = {}
+        for label, genome_idx, own_chrom in (
+            ("A", genome_a, "chromA"),
+            ("B", genome_b, "chromB"),
+        ):
+            # 1. Member route (Phase 3): feature_idx + accession for this genome.
+            members_resp = await cli_cp_client.get(
+                URL_REFERENCE_GENOME_MEMBER.format(
+                    reference_idx=fresh_reference, genome_idx=genome_idx
+                )
+            )
+            assert members_resp.status_code == 200, members_resp.text
+            members = members_resp.json()
+            accession_map = {m["feature_idx"]: m["accession"] for m in members}
+            # Each genome's member set = its own chromosome + the shared plasmid.
+            assert plasmid_feature in accession_map
+            assert {own_chrom, "plasmidA"} == set(accession_map.values())
+            feature_idxs = [m["feature_idx"] for m in members]
+
+            # 2. Chunk-bytes DoGet ticket. Signed directly (as the sibling e2e
+            # tests do) rather than via the ticket route — this test's focus is the
+            # member route + the writers + the many-to-many data flow, not the
+            # ticket route's auth (the human session holds reference:read, which the
+            # route now accepts, and the CLI's own ticket-route call is covered by
+            # the pure-unit test + test_auth_boundary).
+            ticket = sign_ticket(
+                table="reference_sequence_chunks",
+                filter={
+                    "reference_idx": [fresh_reference],
+                    "feature_idx": feature_idxs,
+                },
+                secret=signing_key,
+            )
+
+            # 3. FASTA export via the CLI writer (real miint FORMAT FASTA).
+            fasta_out = output_dir / f"{fresh_reference}.{genome_idx}.fasta.gz"
+            reader = flight_client.do_get(flight.Ticket(ticket)).to_reader()
+            ref_cli._write_genome_fasta(reader, accession_map, fasta_out, con)
+
+            # 4. Parquet export via the CLI writer (raw chunk rows).
+            parquet_out = output_dir / f"{fresh_reference}.{genome_idx}.parquet"
+            reader2 = flight_client.do_get(flight.Ticket(ticket)).to_reader()
+            ref_cli._write_genome_parquet(reader2, parquet_out)
+
+            fasta_records = _parse_fasta_gz(fasta_out)
+            pq_features = set(
+                pq.read_table(parquet_out).column("feature_idx").to_pylist()
+            )
+            results[genome_idx] = {"fasta": fasta_records, "pq_features": pq_features}
+
+        # Genome A's FASTA: its chromosome + the shared plasmid, headed by accession.
+        # Stored chunk_data is the ORIGINAL strand (never strand-normalized — the
+        # canonical hash is used only for feature_idx dedup), so exported bytes ==
+        # the submitted bytes for these byte-identical fixture records.
+        a = results[genome_a]["fasta"]
+        assert set(a) == {"chromA", "plasmidA"}
+        assert a["chromA"] == _SHARED_PLASMID_SEQS["chromA"]
+        assert a["plasmidA"] == _SHARED_PLASMID_SEQS["plasmidA"]
+
+        # Genome B's FASTA carries the SAME plasmid record (shared accession + bytes)
+        # PLUS its own chromosome — the many-to-many payoff.
+        b = results[genome_b]["fasta"]
+        assert set(b) == {"chromB", "plasmidA"}
+        assert b["chromB"] == _SHARED_PLASMID_SEQS["chromB"]
+        assert b["plasmidA"] == a["plasmidA"]  # identical shared-plasmid bytes
+
+        # The plasmid feature appears in both genomes' parquet chunk exports.
+        assert plasmid_feature in results[genome_a]["pq_features"]
+        assert plasmid_feature in results[genome_b]["pq_features"]
+    finally:
+        con.close()
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature_genome WHERE genome_idx = ANY($1::bigint[])",
+            all_genome_idxs,
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])",
+            all_genome_idxs,
+        )
+
+
+def _parse_fasta_gz(path: Path) -> dict[str, str]:
+    """Parse a gzipped FASTA into {header: sequence} (single-line sequences, as the
+    miint writer emits for these short fixtures)."""
+    import gzip
+
+    records: dict[str, str] = {}
+    header = None
+    seq_parts: list[str] = []
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if header is not None:
+                    records[header] = "".join(seq_parts)
+                header = line[1:]
+                seq_parts = []
+            elif line:
+                seq_parts.append(line)
+    if header is not None:
+        records[header] = "".join(seq_parts)
+    return records
 
 
 async def test_ticket_endpoint_rejects_non_active_reference(

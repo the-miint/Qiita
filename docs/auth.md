@@ -343,6 +343,14 @@ The curated global blocklist that masks bad genomes/features from downstream pro
 | `/api/v1/reference/exclusion/sync` | POST | Force-resync the DuckLake mirror from the current Postgres blocklist — makes **no** blocklist change. Operator recovery when the mirror drifts (a prior sync's 502/503 never retried, a rebuilt DuckLake catalog, or a fresh data plane came up empty). Same retriable `502` (data plane unreachable) / `503` (no scratch, or a concurrent sync held the lock) as the mutations. Requires `reference:exclusion:write` (no complete-profile — nothing is curated, so no actor is recorded). Literal path, registered *before* the `/{reference_idx}` routes. |
 | `/api/v1/reference/{reference_idx}/exclusion` | GET | Intersect the global blocklist with this reference's membership; returns each blocked member with `reason`, `direct_block`/`via_genome`, and external provenance — genome `(source, source_id)` + the reference's `reference_membership.accession`. `[]` for a clean reference, `404` for an unknown one (fail-loud, matches `get_reference_index`). Requires `reference:read`. |
 
+### Reference (read)
+
+General `reference:read` resolvers, unrelated to the curation blocklist above.
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/reference/{reference_idx}/genome/{genome_idx}/member` | GET | Resolve a genome to its member features within one reference: each `feature_idx` + the reference's `accession`, feature_idx-ordered (the inverse of `export_member_genome`). A feature shared across genomes (a plasmid) is returned for each of its genomes. `404` when the pair has no members (fail-loud — an empty export is a caller error). Requires `reference:read`. The resolution step behind `qiita reference export` (added in the same change). |
+
 ## CLI (`qiita-admin`)
 
 Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproject. Subcommands:
@@ -372,6 +380,7 @@ End-user companion to `qiita-admin`, installed as the `qiita` console script via
 | `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
 | `reference load --fasta F --data-plane-url U [--name …/--version … or --reference-idx N] [--taxonomy/--tree/--jplace/--genome-map …] [--no-watch]` | HTTP | Uploads FASTA + optional inputs (Arrow `do_put` to the data plane) and submits the reference-add work-ticket, then watches it to terminal. Needs `reference:write` / `ticket:doput` (wet_lab_admin tier), not `admin:*` — a credentialed API call, so it lives here rather than in `qiita-admin`. |
 | `reference exclusion list --reference-idx N` | HTTP | Calls `GET /reference/{idx}/exclusion` — what the global blocklist filters from one reference (blocked members + `reason` + external ids). A `reference:read` query any authenticated user can run, so it lives here; the `add`/`remove`/`sync` write surface is `qiita-admin`. |
+| `reference export --reference-idx N --genome-idx M [--genome-idx …] [--format fasta\|parquet] --output-dir D --data-plane-url U` | HTTP + Flight | Export one or more genomes' sequences to `<reference_idx>.<genome_idx>.{fasta.gz\|parquet}`. Resolves each genome's members (`GET …/genome/{idx}/member`), mints a chunk DoGet ticket (`POST …/ticket/doget`), and streams the bytes over Flight — FASTA reassembled via miint's `FORMAT FASTA` writer with accession headers, or the raw `reference_sequence_chunks` rows as Parquet. Needs only `reference:read` — the member route requires it, and the DoGet ticket route accepts it (any-of with the service-only `ticket:doget`), since reference sequences are public reference data. A shared plasmid is exported for each of its genomes. |
 
 Both CLIs share `cli/_common`: PAT file I/O, the loopback flow, the authenticated HTTP call helper, the `--base-url` / `--token-file` argparse helpers, and an HTTPS guard on `--base-url` (refuses plain `http://` to a non-localhost host unless `--insecure` is passed, because the PAT in the `Authorization` header would otherwise be sent in cleartext on the wire).
 

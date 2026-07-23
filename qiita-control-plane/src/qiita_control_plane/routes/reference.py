@@ -29,6 +29,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_EXCLUSION,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
     PATH_REFERENCE_EXCLUSION_SYNC,
+    PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
@@ -45,6 +46,7 @@ from qiita_common.models import (
     ReferenceExclusionListItem,
     ReferenceExclusionMutationResponse,
     ReferenceExclusionSyncResponse,
+    ReferenceGenomeMember,
     ReferenceIndex,
     ReferenceKind,
     ReferenceResponse,
@@ -65,6 +67,7 @@ from ..actions.reference import (
     transition_reference_status,
 )
 from ..auth.guards import (
+    require_any_scope,
     require_complete_profile,
     require_scope,
 )
@@ -291,6 +294,45 @@ async def get_reference_shard_index_status(
         registered_shards=registered_shards,
         failed_shard_tickets=failed_shard_tickets,
     )
+
+
+@router.get(PATH_REFERENCE_GENOME_MEMBER)
+async def get_reference_genome_members(
+    reference_idx: Annotated[int, Field(gt=0)],
+    genome_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> list[ReferenceGenomeMember]:
+    """A genome's member features within one reference: feature_idx + the
+    reference's accession, feature_idx-ordered. The inverse of
+    export_member_genome, and the resolution step the genome-export CLI runs
+    before a DoGet for the sequence bytes.
+
+    Keyed on (reference_idx, genome_idx): the accession is per-(reference,
+    feature) and a DoGet ticket is per-reference, so a bare-genome export would
+    face N references with ambiguous accessions. A feature shared across genomes
+    (a plasmid → one content-hash-global feature_idx) is returned for each of its
+    genomes — the many-to-many payoff.
+
+    404 when the (reference, genome) pair has no members: an unknown reference, an
+    unknown genome, or a genome that belongs only to a different reference all
+    resolve to zero rows, and an empty export is a caller error worth surfacing
+    loudly (unlike the exclusion listing, where [] is a meaningful clean state)."""
+    rows = await pool.fetch(
+        "SELECT rm.feature_idx, rm.accession"
+        " FROM qiita.reference_membership rm"
+        " JOIN qiita.feature_genome fg USING (feature_idx)"
+        " WHERE rm.reference_idx = $1 AND fg.genome_idx = $2"
+        " ORDER BY rm.feature_idx",
+        reference_idx,
+        genome_idx,
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No members for genome {genome_idx} in reference {reference_idx}",
+        )
+    return [ReferenceGenomeMember.model_validate(dict(r)) for r in rows]
 
 
 @router.get(PATH_REFERENCE_BY_IDX)
@@ -684,7 +726,7 @@ async def create_doget_ticket(
     body: DoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
-    _scope: Principal = Depends(require_scope(Scope.TICKET_DOGET)),
+    _scope: Principal = Depends(require_any_scope(Scope.REFERENCE_READ, Scope.TICKET_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to a reference.
 
@@ -702,8 +744,15 @@ async def create_doget_ticket(
     not yet in DuckLake simply yields an empty stream. `pending`/`loading`
     (pre-DuckLake) are 409; a missing reference is 404.
 
-    Authorization is scope-only at this layer: any principal with
-    `tickets:doget` can request a ticket. Row-level visibility (private
+    Authorization accepts EITHER `reference:read` OR `ticket:doget` (any-of):
+    reference sequences / taxonomy / phylogeny are public reference data (every
+    table this route can sign is reference data), so minting a read ticket for
+    them is a `reference:read` capability — held by every human role — which is
+    what lets the `qiita reference export` user CLI pull a genome's sequences. The
+    service-only `ticket:doget` is retained as an accepted scope so the compute
+    service account (which holds `ticket:doget`, not `reference:read`) keeps
+    minting the feature_idx-scoped build/OGU tickets it always has — the change is
+    strictly additive, no principal loses access. Row-level visibility (private
     references) is not yet implemented.
     """
     if body.table not in _REFERENCE_DOGET_TABLES:

@@ -4,10 +4,15 @@ A GLOBAL (not reference-scoped) blocklist of bad genome_idx / feature_idx that
 must be excluded from downstream reference-data consumption. Each row targets
 exactly one of genome_idx / feature_idx (a CHECK enforces it). Enforcement is a
 query-time anti-join in the data plane over the RESOLVED feature set — a genome
-block expands to all its features via feature_genome (feature_idx is UNIQUE in
-feature_genome, so a feature maps to at most one genome) — so consumers never
-touch a blocked feature, even one blocked through a genome before that feature
-was loaded.
+block expands to all its features via feature_genome — so consumers never touch
+a blocked feature, even one blocked through a genome before that feature was
+loaded. feature_genome is many-to-many (a plasmid can be shared across genomes),
+so blocking one genome over-excludes a feature it shares with an unblocked genome
+(correct — the block is on the feature bytes); and LIST_FOR_REFERENCE_SQL's
+reported (genome_idx, source, source_id) for a via-genome block is an arbitrary
+one of the feature's BLOCKED genomes (deterministically the sole blocking genome
+in the common single-block case; arbitrary only when 2+ are blocked — cosmetic,
+like the direct/via_genome pick below).
 
 The base data is never deleted. The blocklist is a DURABLE CURATORIAL RECORD:
 

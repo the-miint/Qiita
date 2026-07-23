@@ -1023,8 +1023,9 @@ async def write_shard_assignment(
         # set-based UPDATE...FROM unnest per _CHUNK_SIZE slice — a handful of
         # round-trips instead of one per shard. `itertools.islice` keeps only a
         # slice in memory at a time (the generator never materializes all pairs).
-        # Each feature is in exactly one shard (feature_genome.feature_idx is
-        # UNIQUE), so no pair targets a row twice. RETURNING preserves the count.
+        # Each feature appears in exactly one shard because _compute_shards dedups
+        # a many-to-many feature (shared plasmid) to its lowest shard_id, so no
+        # pair targets a row twice. RETURNING preserves the count.
         pair_stream = (
             (feature_idx, shard_id)
             for shard_id, feature_idxs in enumerate(shards)
@@ -1061,10 +1062,14 @@ _TAXONOMY_RANK_COLUMNS = (
 
 # The shard planner streams taxonomy through the exclusion-aware VIEW, never the
 # raw base table, so a curated exclusion can't be bypassed. Accepted consequence:
-# an excluded feature loses its taxonomy row, so it sorts as unclassified in the
-# lineage tiler and still gets sharded (harmless — it never surfaces post-exclusion
-# in any feature table or lineage). Reads go through _visible; register-files still
-# writes the raw base.
+# an excluded feature loses its taxonomy row (its LEFT JOIN in _genome_lineages
+# misses). A genome keeps its real lineage as long as >=1 of its members survives
+# classified — the arg_min FILTER picks the lowest classified member, so blocking
+# one contig of a multi-contig genome does not relocate the whole genome to the
+# unclassified shard. Only a genome whose every member is excluded sorts as
+# unclassified, and that is moot (its features never surface post-exclusion in any
+# feature table or lineage). Reads go through _visible; register-files still writes
+# the raw base.
 _REFERENCE_TAXONOMY_TABLE = "reference_taxonomy_visible"
 
 
@@ -1128,15 +1133,20 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
 def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
     """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
     relations to one LineageItem per genome. The lineage is the semicolon-joined
-    rank string of the genome's LOWEST-feature_idx member (via `arg_min`), so the
-    representative is deterministic regardless of scan order and independent of
-    which sibling features carry divergent taxonomy. `concat_ws` skips NULL
-    ranks, so an unclassified genome (all ranks NULL, or no taxonomy row via the
-    LEFT JOIN) reduces to lineage '' — which sorts first in the tiler."""
+    rank string of the genome's lowest-feature_idx *classified* member (via
+    `arg_min` under a `FILTER (WHERE concat_ws(...) <> '')`), so the representative
+    is deterministic regardless of scan order and skips members whose taxonomy is
+    absent. That FILTER matters under exclusion: a genome is one organism, so its
+    contigs share one lineage; blocking the lowest contig (its LEFT JOIN then
+    misses) must not drag the healthy siblings to the unclassified shard. When NO
+    member is classified (all ranks NULL, or every taxonomy row missing), the
+    filtered aggregate is empty → NULL → the `lineage or ''` fallback yields ''
+    (unclassified, which sorts first in the tiler)."""
     ranks = ", ".join(f"t.{col}" for col in _TAXONOMY_RANK_COLUMNS)
     rows = con.execute(
         f"SELECT mg.genome_idx,"
-        f"       arg_min(concat_ws(';', {ranks}), mg.feature_idx) AS lineage"
+        f"       arg_min(concat_ws(';', {ranks}), mg.feature_idx)"
+        f"         FILTER (WHERE concat_ws(';', {ranks}) <> '') AS lineage"
         f"  FROM member_genome mg"
         f"  LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
         f" GROUP BY mg.genome_idx"
@@ -1151,9 +1161,13 @@ def _compute_shards(
     return `shards[k]` = the feature_idxs assigned to shard `k`: reduce to one
     lineage per genome, tile lineage-sorted (`tile_by_lineage`), then expand each
     genome back to ITS features via a DuckDB join (keeping the fan-out in DuckDB,
-    not Python). Every genome-bearing member feature lands in exactly one shard;
-    a no-genome feature is absent from `member_genome` and so from every shard.
-    A zero-genome reference yields `[]`."""
+    not Python). Every genome-bearing member feature lands in exactly one shard: a
+    feature shared across genomes (a plasmid → one feature_idx under several
+    genome_idx) is deduped to its lowest shard_id so the lists stay disjoint. A
+    no-genome feature is absent from `member_genome` and so from every shard. A
+    zero-genome reference yields `[]`; a shard whose every feature migrated to a
+    lower shard drops out, so `len(shards)` is the non-empty shard count (each
+    returned shard is non-empty, positions contiguous)."""
     shards = tile_by_lineage(_genome_lineages(con), num_shards)
     if not shards:
         return []
@@ -1174,12 +1188,26 @@ def _compute_shards(
     con.register("shard_pairs", shard_pairs)
     con.execute("INSERT INTO shard_map SELECT genome_idx, shard_id FROM shard_pairs")
     con.unregister("shard_pairs")
+    # feature_genome is many-to-many (a plasmid can be shared across genomes), so
+    # a feature can map to genomes tiled into different shards. Reduce each feature
+    # to ONE deterministic home (its lowest shard_id) BEFORE bucketing — a feature
+    # needs exactly one index home, and reference_membership.shard_id is a single
+    # column, so a double-write would non-deterministically pick a shard and inflate
+    # write_shard_assignment's count. A shard whose every feature migrated to a
+    # lower shard drops out entirely; the ORDER BY re-buckets the survivors into
+    # contiguous positions, so `len()` reflects the non-empty shard count and the
+    # fan-out never dispatches an empty child.
     rows = con.execute(
-        "SELECT sm.shard_id, list(mg.feature_idx ORDER BY mg.feature_idx) AS features"
-        "  FROM member_genome mg"
-        "  JOIN shard_map sm USING (genome_idx)"
-        " GROUP BY sm.shard_id"
-        " ORDER BY sm.shard_id"
+        "WITH feature_shard AS ("
+        "  SELECT mg.feature_idx, min(sm.shard_id) AS shard_id"
+        "    FROM member_genome mg"
+        "    JOIN shard_map sm USING (genome_idx)"
+        "   GROUP BY mg.feature_idx"
+        ")"
+        " SELECT shard_id, list(feature_idx ORDER BY feature_idx) AS features"
+        "  FROM feature_shard"
+        " GROUP BY shard_id"
+        " ORDER BY shard_id"
     ).fetchall()
     return [features for _shard_id, features in rows]
 
@@ -1196,8 +1224,9 @@ async def plan_shards(
     """Assign this reference's genome-bearing features to `num_shards`
     lineage-sorted shards, persisting the result onto
     reference_membership.shard_id. Returns N, the number of shards actually
-    produced (`min(num_shards, genome_count)`; 0 for a reference with no
-    genomes — nothing to shard).
+    produced (at most `min(num_shards, genome_count)` — fewer if deduping a
+    shared feature to its lowest shard empties a higher one; 0 for a reference
+    with no genomes — nothing to shard).
 
     The cross-store assembly stays off the CP event loop's Python heap: the
     (feature_idx, genome_idx) map streams from Postgres to a Parquet in chunks,

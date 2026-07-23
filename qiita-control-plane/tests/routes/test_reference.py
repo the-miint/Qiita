@@ -481,11 +481,11 @@ async def test_shard_index_status_tolerates_non_object_context(client, postgres_
 # ---------------------------------------------------------------------------
 # POST /reference/{idx}/ticket/doget — feature_idx-scoped ticket
 # ---------------------------------------------------------------------------
-# The doget route is scope-gated on tickets:doget, which SYSTEM_ADMIN does NOT
-# hold (only the service-account ceiling does), so these tests drive it with the
-# compute SA client rather than the module's admin `client`. The app's HMAC
-# secret is pinned to a known value so the test decodes the signed ticket
-# payload (not the MAC) and asserts the exact filter shape.
+# The doget route is scope-gated on reference:read (reference data is public —
+# see routes/reference.py). These tests drive it with the compute SA client
+# (which holds reference:read like every principal); an admin client would work
+# too. The app's HMAC secret is pinned to a known value so the test decodes the
+# signed ticket payload (not the MAC) and asserts the exact filter shape.
 
 # Any 32-byte value works — the test parses the payload, never verifies the MAC.
 _DOGET_HMAC_SECRET = b"\x00" * 32
@@ -503,7 +503,7 @@ def _decode_ticket_payload(ticket_b64: str) -> dict:
 
 @pytest.fixture
 async def doget_ctx(postgres_pool, compute_worker_service_account):
-    """SA client (holds tickets:doget) + a reference-seeding helper, with the
+    """SA client (holds reference:read) + a reference-seeding helper, with the
     app HMAC secret pinned so the test can decode the signed ticket payload.
 
     `seed_reference(status)` inserts a reference directly at an arbitrary
