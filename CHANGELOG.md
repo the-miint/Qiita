@@ -48,6 +48,10 @@ duplicates further down are historical strata; leave them where they are.
   reference, unknown genome, or a genome in a different reference) — an empty
   export is a fail-loud caller error. The resolution step the genome-export CLI
   runs before a DoGet for the sequence bytes.
+- **`ERC000013` "GSC MIxS host associated" metadata checklist (#368).** Seeds
+  the checklist under `ERC000011` (ENA default) and re-parents `ERC000014`
+  ("GSC MIxS human associated") beneath it, so the inheritance chain becomes
+  `ERC000011 → ERC000013 → ERC000014 → ERC000015`.
 - **Reference feature/genome exclusion — a curated global blocklist (#361).**
   Bad reference data (a contaminated genome, a mislabelled contig) can now be
   **masked at consumption** without deleting rows or rebuilding aligner indexes.
