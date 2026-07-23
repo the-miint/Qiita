@@ -752,8 +752,12 @@ async def create_doget_ticket(
     service-only `ticket:doget` is retained as an accepted scope so the compute
     service account (which holds `ticket:doget`, not `reference:read`) keeps
     minting the feature_idx-scoped build/OGU tickets it always has — the change is
-    strictly additive, no principal loses access. Row-level visibility (private
-    references) is not yet implemented.
+    strictly additive, no principal loses access. Reader set: a whole-reference
+    ticket (no `feature_idx`) now lets ANY authenticated human bulk-egress a
+    reference's entire sequence set, uncapped — intentional, since reference data
+    is public; a resource/bandwidth cap can come later if it proves necessary.
+    Row-level visibility (private references) is not implemented, so that caveat
+    now applies to every authenticated human, not only the service account.
     """
     if body.table not in _REFERENCE_DOGET_TABLES:
         raise HTTPException(

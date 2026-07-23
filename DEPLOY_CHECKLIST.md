@@ -84,7 +84,10 @@ _None yet._
   this lets the new `qiita reference export` user CLI stream a genome's sequences.
   Strictly additive: `ticket:doget` stays accepted, so the compute service account
   (which holds `ticket:doget`, not `reference:read`) keeps minting its build/OGU
-  tickets — nothing loses access, no re-provisioning.
+  tickets — nothing loses access, no re-provisioning. Reader-set note (no host
+  action, but be aware): a whole-reference ticket now lets any authenticated human
+  bulk-egress a reference's entire sequence set, uncapped — intentional (reference
+  data is public); a resource/bandwidth cap may be added later if needed.
   (#366)
 
 ---

@@ -230,8 +230,8 @@ def _sql_str(path: Path) -> str:
 
 def _resolve_genome_members(base_url: str, token: str, *, reference_idx: int, genome_idx: int):
     """GET a genome's member features (feature_idx + the reference's accession)
-    within one reference, via the Phase-3 resolver route. Returns the list of
-    `{feature_idx, accession}` (404 → HTTPStatusError, surfaced by the caller)."""
+    within one reference, via the genome-member resolver route. Returns the list
+    of `{feature_idx, accession}` (404 → HTTPStatusError, surfaced by the caller)."""
     path = (
         f"{PATH_REFERENCE_PREFIX}"
         f"{PATH_REFERENCE_GENOME_MEMBER.format(reference_idx=reference_idx, genome_idx=genome_idx)}"

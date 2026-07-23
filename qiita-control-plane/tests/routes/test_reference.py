@@ -481,9 +481,12 @@ async def test_shard_index_status_tolerates_non_object_context(client, postgres_
 # ---------------------------------------------------------------------------
 # POST /reference/{idx}/ticket/doget — feature_idx-scoped ticket
 # ---------------------------------------------------------------------------
-# The doget route is scope-gated on reference:read (reference data is public —
-# see routes/reference.py). These tests drive it with the compute SA client
-# (which holds reference:read like every principal); an admin client would work
+# The doget route accepts EITHER reference:read OR ticket:doget (any-of) —
+# reference data is public (see routes/reference.py). These tests drive it with
+# the compute SA client; note the compute-worker FIXTURE holds reference:read
+# (COMPUTE_WORKER_FIXTURE_SCOPES), broader than the live SA grant
+# ([sequence_range:mint, ticket:doget]) — so it authorizes here via reference:read
+# whereas the live SA would authorize via ticket:doget. An admin client would work
 # too. The app's HMAC secret is pinned to a known value so the test decodes the
 # signed ticket payload (not the MAC) and asserts the exact filter shape.
 

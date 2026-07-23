@@ -461,7 +461,11 @@ duplicates further down are historical strata; leave them where they are.
   stays an accepted scope, so the compute service account (which holds
   `ticket:doget`, not `reference:read`) keeps minting the feature_idx-scoped
   build/OGU tickets exactly as before — no principal loses access, no
-  re-provisioning. `ticket:doget` also still solely gates the alignment DoGet
+  re-provisioning. Reader-set change, intentional: beyond the export CLI, a
+  whole-reference ticket (no `feature_idx`) now lets **any authenticated human**
+  bulk-egress a reference's entire sequence set, uncapped — by design, since
+  reference data is public; a resource/bandwidth cap can come later if it proves
+  necessary. `ticket:doget` also still solely gates the alignment DoGet
   (`POST /alignment/ticket/doget`), whose rows are sample-derived, not public.
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately

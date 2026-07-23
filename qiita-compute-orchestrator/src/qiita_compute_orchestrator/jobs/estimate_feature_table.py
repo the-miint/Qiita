@@ -6,7 +6,9 @@ resolved CP-side into the alignment DoGet ticket), build a genome-keyed OGU
 feature table via duckdb-miint `woltka_ogu`, filtered to genomes meeting a
 breadth-of-coverage threshold POOLED over the whole cohort. The OGU key is
 `genome_idx` (counts and coverage roll `feature_idx -> genome_idx`, so a
-multi-contig genome is handled natively even though today's references are 1:1).
+multi-contig genome is handled natively; a feature shared across genomes — a
+plasmid, under the feature_genome many-to-many — rolls up to each genome it
+belongs to, and woltka handles the resulting multi-mappers by design).
 
 Three inputs, three sources:
 
