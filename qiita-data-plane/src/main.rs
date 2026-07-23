@@ -32,6 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ducklake::ensure_read_tables(&setup_conn)?;
     ducklake::ensure_alignment_tables(&setup_conn)?;
     ducklake::ensure_assembly_tables(&setup_conn)?;
+    // Must run after reference + alignment tables — the `_visible` views join them.
+    ducklake::ensure_exclusion_tables(&setup_conn)?;
     drop(setup_conn);
 
     // Build Flight service — each request opens its own DuckDB connection

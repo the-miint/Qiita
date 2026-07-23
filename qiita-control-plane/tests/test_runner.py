@@ -164,8 +164,8 @@ def library_spy(monkeypatch):
         feature_map.touch(exist_ok=True)
         return feature_map, 0, 0
 
-    async def write_membership(pool, reference_idx, feature_map_path):
-        calls.append(("write-membership", reference_idx, feature_map_path))
+    async def write_membership(pool, reference_idx, manifest_path, feature_map_path):
+        calls.append(("write-membership", reference_idx, manifest_path, feature_map_path))
         if state["fail_on"] == LibraryPrimitive.WRITE_MEMBERSHIP:
             raise RuntimeError("simulated write-membership failure")
         return 0, 0
@@ -214,7 +214,7 @@ _REFERENCE_ADD_STEPS = [
     {
         "kind": "action",
         "name": "write-membership",
-        "inputs": ["feature_map"],
+        "inputs": ["manifest", "feature_map"],
         "outputs": [],
     },
     {
@@ -1764,6 +1764,51 @@ async def test_run_action_primitive_plan_shards_is_opt_in(postgres_pool, tmp_pat
     # Opt-in true + no dispatch_cb => the fan-out precondition still fails loud.
     with pytest.raises(RuntimeError, match="requires a dispatch_cb"):
         await _call({"shard_index": True}, dispatch_cb=None)
+
+
+async def test_run_action_primitive_sync_reference_exclusion_stages_under_workspace(
+    tmp_path, monkeypatch
+):
+    """The sync-reference-exclusion arm re-materializes the GLOBAL blocklist onto
+    the lake mirror after a reference load. It has no file inputs; the arm derives
+    the dest Parquet in the per-attempt workspace (under the shared PATH_SCRATCH
+    tree the data plane re-validates under its scratch_root) and threads
+    pool / signing_key / data_plane_url straight through. The arm returns `{}`
+    (no bound outputs) even though the primitive reports a feature_count."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library as _lib
+    from qiita_control_plane.runner import _run_action_primitive
+
+    captured: dict = {}
+
+    async def _spy(pool, *, dest, signing_key, data_plane_url):
+        captured.update(
+            pool=pool, dest=dest, signing_key=signing_key, data_plane_url=data_plane_url
+        )
+        return {"synced_feature_count": 7}
+
+    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.SYNC_REFERENCE_EXCLUSION, _spy)
+
+    pool = object()  # the arm forwards it unchanged; the DB read lives in the primitive
+    entry = WorkflowAction(kind="action", name="sync-reference-exclusion", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        pool,
+        entry,
+        {},
+        tmp_path,
+        {"kind": "reference", "reference_idx": 1},
+        work_ticket_idx=1,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert out == {}
+    assert captured["pool"] is pool
+    assert captured["dest"] == tmp_path / "reference_exclusion.parquet"
+    assert captured["signing_key"] == b"\x00" * 32
+    assert captured["data_plane_url"] == "grpc://dp:50051"
 
 
 # =============================================================================
@@ -4737,7 +4782,7 @@ _LOCAL_REFERENCE_ADD_STEPS = [
     {
         "kind": "action",
         "name": "write-membership",
-        "inputs": ["feature_map"],
+        "inputs": ["manifest", "feature_map"],
         "outputs": [],
     },
     {

@@ -48,6 +48,7 @@ _None yet._
   so re-running is a no-op. It appends terms rather than running the terminology
   reload pipeline, so `version` / `loaded_at` on the parent NCBI Taxonomy and ENVO
   rows are deliberately left as originally seeded. (#360)
+- `make migrate` applies two new migrations — both plain (nullable `ADD COLUMN` / `CREATE TABLE`, no backfill, no `CREATE EXTENSION`): `20260721000004_reference_membership_accession.sql` (persist the FASTA-header record accession per reference membership) and `20260721000005_reference_exclusion.sql` (the curated global feature/genome blocklist table). (#361)
 
 ### 4. Deploy
 
@@ -55,6 +56,7 @@ _None yet._
 
 ### 5. Verify
 
+- Reference exclusion wired: `GET /api/v1/reference/{idx}/exclusion` on any active reference returns `200` with `[]` (confirms the new route + the `reference_exclusion` migration reached the CP; read-only, creates no block). (#361)
 - **`cp-miint`** — new `make verify-deploy` check (no separate command): asserts the control plane can LOAD miint, the masked-read streaming path `long-read-assembly` depends on. A red row here means bucket 1 was missed. `(#352)`
 
 ### 6. After the deploy verifies green
@@ -63,6 +65,9 @@ _None yet._
 
 ### Notes (no host action)
 
+- New `system_admin`-only scope `reference:exclusion:write` (a code-defined ceiling, no DB grant) plus new routes `POST`/`DELETE /reference/exclusion`, `POST /reference/exclusion/sync` (operator force-resync of the mirror when it drifts — a failed sync, a rebuilt DuckLake catalog, or a fresh data plane), and `GET /reference/{idx}/exclusion`. CLI: `qiita-admin reference exclusion add/remove/sync` (the write surface) and `qiita reference exclusion list` (the `reference:read` query any user can run). Soft API addition — no existing client breaks. (#361)
+- The data-plane build now creates two anti-join views at boot (`alignment_visible`, `reference_taxonomy_visible`) and **removes the raw `alignment` / `reference_taxonomy` tables from the DoGet allowlist** — a DoGet ticket signed for a raw name is now rejected. No in-repo consumer named the raw tables directly (the CP mint routes choose the table, and both were flipped to the views there), so no in-repo action is needed — but an **out-of-repo** client that signs tickets for the raw names will break. A standard redeploy (which rebuilds + restarts the DP, i.e. **don't `SKIP_BUILD`**) is required for the views and the `sync_reference_exclusion` DoAction to exist. (#361)
+- All four reference-load workflows (`reference-add`, `local-reference-add`, `host-reference-add`, `local-host-reference-add`) gained a post-load `sync-reference-exclusion` step (no version bump); `qiita-admin actions sync` (run by `activate.sh`) re-upserts them at deploy — no separate action. (#361)
 - New `work_ticket:cancel` scope (system_admin) gates `qiita-admin ticket cancel`.
   PATs minted before this deploy are frozen and won't carry it, so an admin must
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel

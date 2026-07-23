@@ -47,6 +47,7 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.RECONCILE_BLOCK] is lib.reconcile_block
     assert LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK] is lib.delete_alignment_block
     assert LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK] is lib.reconcile_alignment_block
+    assert LIBRARY[LibraryPrimitive.SYNC_REFERENCE_EXCLUSION] is lib.sync_reference_exclusion
 
 
 async def test_delete_pool_reads_data_empty_set_short_circuits():
@@ -89,6 +90,252 @@ async def test_delete_alignment_block_data_empty_members_short_circuits():
         data_plane_url="grpc://unreachable:1",
     )
     assert rows == 0
+
+
+class _FakeBody:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def to_pybytes(self) -> bytes:
+        return self._data
+
+
+class _FakeResult:
+    def __init__(self, data: bytes) -> None:
+        self.body = _FakeBody(data)
+
+
+class _FakeExclusionPool:
+    """Minimal async pool satisfying `sync_reference_exclusion_data`'s
+    advisory-lock transaction (`async with pool.acquire() as conn,
+    conn.transaction(): await conn.execute(...)`). The real advisory-lock
+    serialization needs concurrency + a live Postgres to exercise; these unit
+    tests stub `resolve_excluded_features` + `_do_action`, so the connection only
+    has to accept the lock `execute` and the two async-context enters. It records
+    the lock acquisition so a test can assert the sync took the lock."""
+
+    def __init__(self) -> None:
+        self.lock_keys: list[int] = []
+
+    class _Conn:
+        def __init__(self, pool: _FakeExclusionPool) -> None:
+            self._pool = pool
+
+        async def execute(self, sql: str, *args):
+            if "pg_advisory_xact_lock" in sql:
+                self._pool.lock_keys.append(args[0])
+            return "SELECT 1"
+
+        def transaction(self):
+            conn = self
+
+            class _Txn:
+                async def __aenter__(self):
+                    return conn
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Txn()
+
+    def acquire(self):
+        conn = _FakeExclusionPool._Conn(self)
+
+        class _Acquire:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Acquire()
+
+
+def _decode_action_payload(token: bytes) -> dict:
+    """Recover the JSON payload from a signed action token without the key.
+
+    Wire format (qiita_control_plane.auth.tickets): 1B version, 4B big-endian
+    payload_len, then the canonical-JSON payload."""
+    import json
+    import struct
+
+    (payload_len,) = struct.unpack(">I", token[1:5])
+    return json.loads(token[5 : 5 + payload_len])
+
+
+async def test_sync_reference_exclusion_data_stages_resolved_set_and_signs(tmp_path, monkeypatch):
+    """The signer resolves the blocklist to its feature_idx set, writes a
+    single-column Parquet at `dest`, and signs a `sync_reference_exclusion`
+    action carrying that dest. Returns the data plane's loaded feature_count."""
+    import json
+
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane.actions import library as lib
+
+    async def _fake_resolve(pool):
+        return [10, 20, 30]
+
+    captured: dict = {}
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        captured["action_type"] = action_type
+        captured["data_plane_url"] = data_plane_url
+        captured["token"] = token
+        captured["timeout_seconds"] = timeout_seconds
+        return [_FakeResult(json.dumps({"feature_count": 3}).encode())]
+
+    monkeypatch.setattr(lib, "resolve_excluded_features", _fake_resolve)
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    fake_pool = _FakeExclusionPool()
+    dest = tmp_path / "reference_exclusion.parquet"
+    count = await lib.sync_reference_exclusion_data(
+        pool=fake_pool,
+        dest=dest,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert count == 3
+    # Serialized under the exclusion advisory lock (resolve + replace happen once
+    # under it — see sync_reference_exclusion_data), and the data-plane call is
+    # bounded so a hung DP can't hold the lock forever.
+    assert fake_pool.lock_keys == [lib._EXCLUSION_SYNC_ADVISORY_LOCK_KEY]
+    assert captured["timeout_seconds"] == lib._EXCLUSION_SYNC_DO_ACTION_TIMEOUT_S
+    assert captured["action_type"] == "sync_reference_exclusion"
+    assert captured["data_plane_url"] == "grpc://dp:50051"
+    # The signed payload carries exactly the dest — the data plane reads it.
+    assert _decode_action_payload(captured["token"]) == {
+        "action": "sync_reference_exclusion",
+        "dest": str(dest),
+    }
+    # The staged Parquet is a single int64 feature_idx column with the set.
+    table = pq.read_table(dest)
+    assert table.column_names == ["feature_idx"]
+    assert table.column("feature_idx").to_pylist() == [10, 20, 30]
+
+
+async def test_sync_reference_exclusion_data_empty_set_writes_clearing_parquet(
+    tmp_path, monkeypatch
+):
+    """An empty blocklist still writes a valid zero-row Parquet and still calls
+    the DoAction — so the data plane's wholesale replace CLEARS its mirror
+    (re-enabling everything), rather than short-circuiting and leaving stale
+    exclusions in the lake."""
+    import json
+
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane.actions import library as lib
+
+    async def _fake_resolve(pool):
+        return []
+
+    called = {"n": 0}
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        called["n"] += 1
+        return [_FakeResult(json.dumps({"feature_count": 0}).encode())]
+
+    monkeypatch.setattr(lib, "resolve_excluded_features", _fake_resolve)
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    dest = tmp_path / "empty.parquet"
+    count = await lib.sync_reference_exclusion_data(
+        pool=_FakeExclusionPool(),
+        dest=dest,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert count == 0
+    assert called["n"] == 1, "the clearing sync still hits the data plane"
+    table = pq.read_table(dest)
+    assert table.column_names == ["feature_idx"]
+    assert table.num_rows == 0
+
+
+async def test_sync_reference_exclusion_primitive_delegates_to_signer(tmp_path, monkeypatch):
+    """The workflow-facing `sync_reference_exclusion` primitive is a thin
+    wrapper over `sync_reference_exclusion_data` (mirroring the
+    delete_read_mask_block -> delete_read_mask_block_data pattern): it forwards
+    pool / dest / signing_key / data_plane_url unchanged and surfaces the data
+    plane's loaded feature_count as `synced_feature_count` for the workflow log."""
+    from qiita_control_plane.actions import library as lib
+
+    captured: dict = {}
+
+    async def _fake_signer(*, pool, dest, signing_key, data_plane_url):
+        captured.update(
+            pool=pool, dest=dest, signing_key=signing_key, data_plane_url=data_plane_url
+        )
+        return 5
+
+    monkeypatch.setattr(lib, "sync_reference_exclusion_data", _fake_signer)
+
+    pool = object()
+    dest = tmp_path / "reference_exclusion.parquet"
+    out = await lib.sync_reference_exclusion(
+        pool, dest=dest, signing_key=b"\x00" * 32, data_plane_url="grpc://dp:50051"
+    )
+
+    assert out == {"synced_feature_count": 5, "synced": True}
+    assert captured == {
+        "pool": pool,
+        "dest": dest,
+        "signing_key": b"\x00" * 32,
+        "data_plane_url": "grpc://dp:50051",
+    }
+
+
+async def test_sync_reference_exclusion_primitive_swallows_transient(tmp_path, monkeypatch):
+    """The workflow TAIL primitive must NOT raise on a transient data-plane
+    failure: it runs after the reference is fully loaded + index-registered (and
+    is at `indexing`/`active`), so a propagated error would drive the workflow
+    failure_status PATCH and clobber the built reference to `failed`. A FlightError
+    or a concurrent-sync LockNotAvailableError is caught and reported `synced=False`
+    (reconciled out of band); the load is unaffected. Contrast the signer/route,
+    which surface these as retriable 502/503."""
+    import asyncpg
+    import pyarrow.flight as _flight
+
+    from qiita_control_plane.actions import library as lib
+
+    for exc in (_flight.FlightError("dp down"), asyncpg.LockNotAvailableError("lock held")):
+
+        async def _boom(*, pool, dest, signing_key, data_plane_url, _exc=exc):
+            raise _exc
+
+        monkeypatch.setattr(lib, "sync_reference_exclusion_data", _boom)
+        out = await lib.sync_reference_exclusion(
+            object(),
+            dest=tmp_path / "reference_exclusion.parquet",
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )
+        assert out == {"synced_feature_count": None, "synced": False}
+
+
+async def test_sync_reference_exclusion_primitive_still_raises_non_transient(tmp_path, monkeypatch):
+    """A non-transient error (a real bug — e.g. bad SQL, a programming fault) is
+    NOT swallowed: it propagates so the ticket fails loudly. Only the two known
+    transient classes are contained."""
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+
+    async def _boom(*, pool, dest, signing_key, data_plane_url):
+        raise RuntimeError("programming bug")
+
+    monkeypatch.setattr(lib, "sync_reference_exclusion_data", _boom)
+    with pytest.raises(RuntimeError, match="programming bug"):
+        await lib.sync_reference_exclusion(
+            object(),
+            dest=tmp_path / "reference_exclusion.parquet",
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )
 
 
 def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path):
@@ -143,6 +390,86 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     assert sorted(rows) == sorted(
         [("LCG", "circ1", 100), ("MAG", "bin.1", 200), ("MAG", "bin.2", 200)]
     )
+
+
+def test_membership_accession_join_resolves_representative_read_id(tmp_path):
+    """The DuckDB join behind write-membership resolves each feature_idx to a
+    representative accession — the FASTA-header read_id — via manifest
+    (read_id -> sequence_hash) and the already-minted feature_map
+    (sequence_hash -> feature_idx). Identical bytes shared under multiple
+    read_ids collapse to one feature_idx, and the lex-smallest read_id wins
+    (deterministic, mirroring hash_sequences' DISTINCT-ON convention)."""
+    import uuid
+
+    import duckdb
+
+    from qiita_control_plane.actions.library import MEMBERSHIP_ACCESSION_JOIN_SQL
+
+    h1 = uuid.UUID(int=1)
+    h2 = uuid.UUID(int=2)
+
+    def _write(path, schema, rows):
+        with duckdb.connect(":memory:") as c:
+            c.execute(f"CREATE TEMP TABLE t ({schema})")
+            c.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in rows[0])})", rows)
+            c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+
+    manifest = tmp_path / "manifest.parquet"
+    feature_map = tmp_path / "feature_map.parquet"
+    _write(
+        manifest,
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [
+            ("NZ_CP0001", str(h1), 10),
+            # Same bytes under two headers -> one feature_idx; lex-smallest wins.
+            ("NZ_CP0002.2", str(h2), 20),
+            ("NZ_CP0002.1", str(h2), 20),
+        ],
+    )
+    _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(str(h1), 100), (str(h2), 200)])
+
+    with duckdb.connect(":memory:") as c:
+        rows = c.execute(
+            MEMBERSHIP_ACCESSION_JOIN_SQL, [str(feature_map), str(manifest)]
+        ).fetchall()
+    assert sorted(rows) == sorted([(100, "NZ_CP0001"), (200, "NZ_CP0002.1")])
+
+
+def test_membership_accession_join_keeps_features_with_no_manifest_match(tmp_path):
+    """The accession join is a LEFT JOIN from feature_map: a feature_idx whose
+    sequence_hash isn't in the manifest still yields a membership row, with a NULL
+    accession — never a silently DROPPED feature. Guards the documented
+    manifest ⊇ feature_map invariant so a future break degrades to a NULL
+    accession, not a missing member (which would surface far downstream)."""
+    import uuid
+
+    import duckdb
+
+    from qiita_control_plane.actions.library import MEMBERSHIP_ACCESSION_JOIN_SQL
+
+    h1 = uuid.UUID(int=1)
+    h_orphan = uuid.UUID(int=99)  # in feature_map, absent from the manifest
+
+    def _write(path, schema, rows):
+        with duckdb.connect(":memory:") as c:
+            c.execute(f"CREATE TEMP TABLE t ({schema})")
+            c.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in rows[0])})", rows)
+            c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+
+    manifest = tmp_path / "manifest.parquet"
+    feature_map = tmp_path / "feature_map.parquet"
+    _write(manifest, "read_id VARCHAR, sequence_hash UUID", [("ACC1", str(h1))])
+    _write(
+        feature_map,
+        "sequence_hash UUID, feature_idx BIGINT",
+        [(str(h1), 100), (str(h_orphan), 999)],
+    )
+
+    with duckdb.connect(":memory:") as c:
+        rows = dict(
+            c.execute(MEMBERSHIP_ACCESSION_JOIN_SQL, [str(feature_map), str(manifest)]).fetchall()
+        )
+    assert rows == {100: "ACC1", 999: None}, "orphan feature survives with NULL accession"
 
 
 def test_reap_staged_reads_none_root_is_noop():

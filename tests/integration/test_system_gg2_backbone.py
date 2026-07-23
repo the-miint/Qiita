@@ -306,8 +306,10 @@ async def test_gg2_backbone_full_pipeline(
         set(seq_table.column_names)
     )
 
-    # reference_taxonomy — locked count for the 2024.09 snapshot.
-    tax_table = _doget("reference_taxonomy")
+    # reference_taxonomy — locked count for the 2024.09 snapshot. Read through the
+    # exclusion-aware view (raw reference_taxonomy is not Flight-readable); no
+    # exclusions are seeded for this snapshot, so the count is unchanged.
+    tax_table = _doget("reference_taxonomy_visible")
     assert tax_table.num_rows == _EXPECTED_TAXONOMY
     assert "domain" in tax_table.column_names
 

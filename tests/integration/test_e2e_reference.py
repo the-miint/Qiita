@@ -153,6 +153,32 @@ def tree_e2e(tmp_path):
 
 
 @pytest.fixture
+def genome_map_e2e(tmp_path):
+    """Parquet mapping each FASTA read_id to a genome (source, source_id), so the
+    load writes qiita.genome + qiita.feature_genome. That is the provenance the
+    exclusion query endpoint surfaces (source/source_id) and the junction a
+    genome-level block resolves through (genome_idx → feature_idx). source_ids
+    carry a per-run suffix so a re-run within one session can't collide on the
+    genome UNIQUE(source, source_id)."""
+    suffix = uuid.uuid4().hex[:8]
+    path = tmp_path / "genome_map.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE g (read_id VARCHAR, genome_source VARCHAR, genome_source_id VARCHAR)"
+        )
+        conn.executemany(
+            "INSERT INTO g VALUES (?, 'refseq', ?)",
+            [
+                ("seq1", f"GCF_{suffix}_1"),
+                ("seq2", f"GCF_{suffix}_2"),
+                ("seq3", f"GCF_{suffix}_3"),
+            ],
+        )
+        conn.execute(f"COPY g TO '{path}' (FORMAT PARQUET)")
+    return path
+
+
+@pytest.fixture
 async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_plane):
     """Configure cp_app.state for dispatch — pool + settings (with the
     data plane's actual gRPC URL and the spawned PATH_SCRATCH/staging) +
@@ -279,7 +305,7 @@ async def test_e2e_create_to_doget(
         canon_seqs.add(min(seq.upper(), rc))
     assert set(chunks.column("chunk_data").to_pylist()) == canon_seqs
 
-    tax = _doget("reference_taxonomy")
+    tax = _doget("reference_taxonomy_visible")
     assert tax.num_rows == 3
     assert set(tax.column("domain").to_pylist()) == {"Bacteria", "Archaea"}
 
@@ -287,6 +313,168 @@ async def test_e2e_create_to_doget(
     tip_rows = [r for r in phylo.to_pylist() if r["is_tip"]]
     assert len(tip_rows) == 3
     assert all(r["feature_idx"] is not None for r in tip_rows)
+
+
+async def test_e2e_exclusion_masks_taxonomy_and_reports_provenance(
+    postgres_pool,
+    data_plane,
+    signing_key,
+    flight_client,
+    synced_reference_add_action,
+    fresh_reference,
+    fasta_e2e,
+    taxonomy_e2e,
+    genome_map_e2e,
+    human_admin_session,
+    cli_cp_client,
+):
+    """Full curated-exclusion path against a live data plane:
+
+    load (FASTA + taxonomy + genome_map) → accession persisted on
+    reference_membership → block a GENOME via POST /reference/exclusion (which
+    re-materializes the DuckLake mirror synchronously) → reference_taxonomy_visible
+    DoGet omits the blocked genome's feature → GET /reference/{idx}/exclusion
+    reports it with source/source_id (genome) + accession (membership) and
+    via_genome=True → DELETE re-enables it (taxonomy view whole again).
+
+    The alignment_visible anti-join shares the identical mirror + view mechanism;
+    its wire-level omission is pinned by the Rust integration test
+    `alignment_visible_doget_omits_blocked_feature` (this workflow produces no
+    alignment rows — those come from the separate `align` path over samples)."""
+    from qiita_common.api_paths import (
+        URL_REFERENCE_EXCLUSION,
+        URL_REFERENCE_EXCLUSION_BY_IDX,
+    )
+    from qiita_control_plane.auth.tickets import sign_ticket
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    result = await do_reference_load(
+        http=cli_cp_client,
+        token=human_admin_session["token"],
+        flight_client=flight_client,
+        fasta_path=fasta_e2e,
+        taxonomy_path=taxonomy_e2e,
+        genome_map_path=genome_map_e2e,
+        reference_idx=fresh_reference,
+        watch=True,
+        poll_interval_seconds=0.1,
+        timeout_seconds=60,
+    )
+    assert result["work_ticket"]["state"] == "completed", result["work_ticket"]
+
+    # The FASTA-header read_id was persisted as the membership accession.
+    accessions = await postgres_pool.fetch(
+        "SELECT accession FROM qiita.reference_membership WHERE reference_idx = $1",
+        fresh_reference,
+    )
+    assert {r["accession"] for r in accessions} == {"seq1", "seq2", "seq3"}
+
+    # Resolve seq1's (feature_idx, genome_idx, source_id) via the load-written
+    # junction — decoupled from the fixture's suffixed source_id value. Capture
+    # ALL of this reference's genome_idxs up front so cleanup drops exactly the
+    # rows this test's load created (not other tests' genomes).
+    row = await postgres_pool.fetchrow(
+        "SELECT m.feature_idx, g.genome_idx, g.source_id"
+        " FROM qiita.reference_membership m"
+        " JOIN qiita.feature_genome fg ON fg.feature_idx = m.feature_idx"
+        " JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
+        " WHERE m.reference_idx = $1 AND m.accession = 'seq1'",
+        fresh_reference,
+    )
+    blocked_feature, blocked_genome, blocked_source_id = (
+        row["feature_idx"],
+        row["genome_idx"],
+        row["source_id"],
+    )
+    all_genome_idxs = [
+        r["genome_idx"]
+        for r in await postgres_pool.fetch(
+            "SELECT DISTINCT fg.genome_idx FROM qiita.feature_genome fg"
+            " JOIN qiita.reference_membership m ON m.feature_idx = fg.feature_idx"
+            " WHERE m.reference_idx = $1",
+            fresh_reference,
+        )
+    ]
+
+    def _visible_features() -> set[int]:
+        ticket_bytes = sign_ticket(
+            table="reference_taxonomy_visible",
+            filter={"reference_idx": [fresh_reference]},
+            secret=signing_key,
+        )
+        table = flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
+        return set(table.column("feature_idx").to_pylist())
+
+    try:
+        # Baseline: all three features' taxonomy is visible.
+        assert _visible_features() == {
+            r["feature_idx"]
+            for r in await postgres_pool.fetch(
+                "SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1",
+                fresh_reference,
+            )
+        }
+        assert blocked_feature in _visible_features()
+
+        # Block the GENOME. The route resolves genome → feature(s), writes the
+        # Postgres blocklist row, and synchronously REPLACES the lake mirror.
+        add = await cli_cp_client.post(
+            URL_REFERENCE_EXCLUSION,
+            json={"genome_idx": blocked_genome, "reason": "e2e contaminant"},
+        )
+        assert add.status_code == 201, add.text
+        assert add.json()["synced_feature_count"] >= 1
+
+        # The anti-join view now omits the blocked genome's feature; the base is
+        # untouched (reference_sequences still has all three).
+        assert blocked_feature not in _visible_features()
+        assert len(_visible_features()) == 2
+
+        # Query endpoint reports the block with full provenance.
+        listing = await cli_cp_client.get(
+            URL_REFERENCE_EXCLUSION_BY_IDX.format(reference_idx=fresh_reference)
+        )
+        assert listing.status_code == 200, listing.text
+        items = listing.json()
+        assert len(items) == 1
+        item = items[0]
+        assert item["feature_idx"] == blocked_feature
+        assert item["genome_idx"] == blocked_genome
+        assert item["source"] == "refseq"
+        assert item["source_id"] == blocked_source_id
+        assert item["accession"] == "seq1"
+        assert item["via_genome"] is True
+        assert item["direct_block"] is False
+
+        # Unblock → the mirror clears the feature → the taxonomy view is whole.
+        remove = await cli_cp_client.delete(
+            URL_REFERENCE_EXCLUSION, params={"genome_idx": blocked_genome}
+        )
+        assert remove.status_code == 200, remove.text
+        assert blocked_feature in _visible_features()
+        assert len(_visible_features()) == 3
+    finally:
+        # Idempotent unblock + UNCONDITIONAL re-sync (the DELETE route always
+        # re-materializes) clears seq1's feature from the GLOBAL lake mirror even
+        # when an assertion above failed before the happy-path DELETE — critical
+        # because seq1's content-hash feature_idx is shared with
+        # test_e2e_create_to_doget (same fixture bytes), so a leaked block would
+        # wrongly drop a row there. Do this BEFORE dropping the genome (the FK
+        # CASCADE would remove the Postgres row without refreshing the mirror).
+        await cli_cp_client.delete(
+            URL_REFERENCE_EXCLUSION, params={"genome_idx": blocked_genome}
+        )
+        # Drop exactly this load's genome/junction rows (fresh_reference cleans
+        # membership + reference; feature rows accumulate as they do for the
+        # sibling e2e — a pre-existing property of content-hash features).
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature_genome WHERE genome_idx = ANY($1::bigint[])",
+            all_genome_idxs,
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])",
+            all_genome_idxs,
+        )
 
 
 async def test_ticket_endpoint_rejects_non_active_reference(

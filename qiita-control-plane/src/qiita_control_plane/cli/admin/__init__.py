@@ -47,6 +47,7 @@ from ...backfill.host_taxon import (
     plan_backfill,
 )
 from .. import _common
+from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
@@ -273,6 +274,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="After each resubmit, poll the new ticket to a terminal state and report it.",
     )
     p_purge.set_defaults(handler=_handle_mask_purge_failed)
+
+    p_reference = sub.add_parser("reference", help="Reference maintenance operations")
+    p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
+    add_admin_exclusion_subparsers(p_reference_sub)
 
     p_backfill = sub.add_parser("backfill", help="One-off data backfills")
     p_backfill_sub = p_backfill.add_subparsers(dest="backfill_cmd", required=True)
@@ -927,6 +932,7 @@ __all__ = [
     "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
+    "add_admin_exclusion_subparsers",
     "_count_non_failed_missing_mask_idx",
     "_export_stem",
     "_force_fail_ticket",

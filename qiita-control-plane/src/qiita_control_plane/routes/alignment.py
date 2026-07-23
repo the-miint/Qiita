@@ -42,10 +42,13 @@ from ..feature_table import parse_feature_table_scope
 
 _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 
-# The DuckLake table this route signs DoGet tickets for. Must stay in sync with
-# the CP-side _DOGET_ALLOWED_TABLES (routes/reference.py) and the data plane's
-# ALLOWED_TABLES. A constant so the alignment table name has one definition here.
-_ALIGNMENT_TABLE = "alignment"
+# The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
+# VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
+# so a blocked feature's alignment rows never reach the feature-table (OGU)
+# consumer. Must stay in sync with the CP-side _DOGET_ALLOWED_TABLES
+# (routes/reference.py) and the data plane's ALLOWED_TABLES. A constant so the
+# name has one definition here.
+_ALIGNMENT_TABLE = "alignment_visible"
 
 alignment_definition_router = APIRouter(
     prefix=PATH_ALIGNMENT_DEFINITION_PREFIX, tags=["alignment-definition"]

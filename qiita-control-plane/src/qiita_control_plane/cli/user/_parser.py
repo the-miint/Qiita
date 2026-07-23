@@ -32,6 +32,7 @@ from qiita_common.models import (
 )
 
 from .. import _common
+from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import _handle_patch, _handle_read, _lane_arg
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
@@ -848,6 +849,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_reference_load.set_defaults(handler=_handle_reference_load)
+
+    # `reference exclusion list` — the reference:read query surface any user can
+    # run to see what the global blocklist filtered from their feature table
+    # (add/remove live under qiita-admin; see cli/_reference_exclusion.py).
+    add_user_exclusion_subparsers(p_reference_sub)
 
     p_prep_protocol = sub.add_parser(
         "prep-protocol", help="Prep-protocol discovery (idxes for --prep-protocol-idx)"
