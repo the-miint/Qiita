@@ -49,7 +49,7 @@ _None yet._
   reload pipeline, so `version` / `loaded_at` on the parent NCBI Taxonomy and ENVO
   rows are deliberately left as originally seeded. (#360)
 - `make migrate` applies two new migrations — both plain (nullable `ADD COLUMN` / `CREATE TABLE`, no backfill, no `CREATE EXTENSION`): `20260721000004_reference_membership_accession.sql` (persist the FASTA-header record accession per reference membership) and `20260721000005_reference_exclusion.sql` (the curated global feature/genome blocklist table). (#361)
-- `make migrate` also applies `20260722000000_feature_genome_allow_multi_genome.sql`, no out-of-band setup: a plain `ALTER TABLE qiita.feature_genome DROP CONSTRAINT feature_genome_feature_idx_key`, letting a feature (a shared plasmid → one content-hash-global `feature_idx`) belong to multiple genomes. The composite PK `(feature_idx, genome_idx)` already models the many-to-many. See the Notes re-load caveat. (#feat/reference-genome-followups — retag once the PR number exists)
+- `make migrate` also applies `20260722000000_feature_genome_allow_multi_genome.sql`, no out-of-band setup: a plain `ALTER TABLE qiita.feature_genome DROP CONSTRAINT feature_genome_feature_idx_key`, letting a feature (a shared plasmid → one content-hash-global `feature_idx`) belong to multiple genomes. The composite PK `(feature_idx, genome_idx)` already models the many-to-many. See the Notes re-load caveat. (#366)
 
 ### 4. Deploy
 
@@ -77,7 +77,7 @@ _None yet._
   silently dropped the second genome's association for any feature shared across
   genomes (a shared plasmid). There is **no backfill migration** — RE-LOAD affected
   references to recover the dropped associations. New loads are correct
-  automatically. (#feat/reference-genome-followups — retag once the PR number exists)
+  automatically. (#366)
 - **Soft contract change (no host action):** `POST /reference/{idx}/ticket/doget`
   now accepts `reference:read` in addition to the service-only `ticket:doget`
   (any-of) — reference sequences/taxonomy/phylogeny are public reference data, and
@@ -85,7 +85,7 @@ _None yet._
   Strictly additive: `ticket:doget` stays accepted, so the compute service account
   (which holds `ticket:doget`, not `reference:read`) keeps minting its build/OGU
   tickets — nothing loses access, no re-provisioning.
-  (#feat/reference-genome-followups — retag once the PR number exists)
+  (#366)
 
 ---
 

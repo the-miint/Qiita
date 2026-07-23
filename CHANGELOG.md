@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet.**
+- **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
   A user CLI (`reference:read`) that exports one or more genomes'
   sequences: for each `--genome-idx` it resolves the genome's members, mints a
   chunk DoGet ticket, streams the bytes over Flight, and writes
@@ -34,7 +34,7 @@ duplicates further down are historical strata; leave them where they are.
   of the representative record — the feature_idx dedup is by canonical hash, so a
   reverse-complement-equal input exports the representative's orientation.
 - **Resolve a genome to its member features within a reference —
-  `GET /reference/{reference_idx}/genome/{genome_idx}/member` (`reference:read`).**
+  `GET /reference/{reference_idx}/genome/{genome_idx}/member` (`reference:read`) (#366).**
   Returns each member feature's `feature_idx` + the reference's FASTA-header
   `accession`, feature_idx-ordered — the inverse of the internal
   `export_member_genome`, keyed on `(reference_idx, genome_idx)` because the
@@ -201,7 +201,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **A feature shared across genomes (a plasmid) no longer causes a lossful load.**
+- **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
   mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under
   different `genome_idx`. The `qiita.feature_genome` table had a standalone
@@ -217,7 +217,7 @@ duplicates further down are historical strata; leave them where they are.
   already many-to-many-correct). **Operator note:** references loaded before this
   fix stay lossful — RE-LOAD affected references to recover the dropped shared-
   feature associations (no backfill).
-- **Shard placement no longer regresses when a genome's lowest contig is excluded.**
+- **Shard placement no longer regresses when a genome's lowest contig is excluded (#366).**
   The reference shard planner reduces each genome to one representative lineage via
   `arg_min(lineage, feature_idx)` over its members. Blocking the lowest-`feature_idx`
   member of a multi-contig genome made its exclusion-filtered taxonomy row disappear,
@@ -440,7 +440,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Changed
 
 - **The reference DoGet ticket route now accepts `reference:read` in addition to
-  `ticket:doget` (any-of).** `POST /reference/{reference_idx}/ticket/doget` mints
+  `ticket:doget` (any-of) (#366).** `POST /reference/{reference_idx}/ticket/doget` mints
   a read ticket for reference sequences / chunks / taxonomy / phylogeny — all
   public reference data — so minting it is now also a `reference:read` capability
   (held by every human role), which is what lets the `qiita reference export` user
