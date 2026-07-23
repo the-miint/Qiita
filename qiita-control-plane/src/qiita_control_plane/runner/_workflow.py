@@ -656,7 +656,7 @@ async def run_workflow(
                     await _patch_resource_status(conn, scope_target, action.success_status)
                 # ENA read-download provenance: stamp the pool's
                 # sequenced_sample rows with the transport the download used,
-                # closing the gap `20260723000000_sequenced_sample_ena_
+                # closing the gap `20260724000000_sequenced_sample_ena_
                 # provenance.sql` documents (column added, left NULL, "the
                 # download workflow populates it"). Gated on the SAME
                 # declared-input-name check `_stage_ena_run_roster` above uses
