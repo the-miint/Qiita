@@ -217,6 +217,15 @@ duplicates further down are historical strata; leave them where they are.
   already many-to-many-correct). **Operator note:** references loaded before this
   fix stay lossful — RE-LOAD affected references to recover the dropped shared-
   feature associations (no backfill).
+- **`GET /reference/{reference_idx}/exclusion` reports deterministic, correct
+  genome provenance for a shared feature (#366).** With `feature_genome` now
+  many-to-many, a shared feature fans to one candidate row per genome, and the
+  listing's `DISTINCT ON (feature_idx)` picker had no tiebreak beyond direct-vs-
+  via — so which genome's `(genome_idx, source, source_id)` was reported flipped
+  on heap order, and a feature blocked directly could report an *unblocked*
+  genome as its provenance. The picker now prefers a genome that is itself
+  actively blocked, then the lowest `genome_idx`, so the reported provenance is
+  stable and always names a blocked genome when a genome-level block applies.
 - **Shard placement no longer regresses when a genome's lowest contig is excluded (#366).**
   The reference shard planner reduces each genome to one representative lineage via
   `arg_min(lineage, feature_idx)` over its members. Blocking the lowest-`feature_idx`

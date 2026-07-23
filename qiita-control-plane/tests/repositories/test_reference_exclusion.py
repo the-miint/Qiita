@@ -317,6 +317,87 @@ async def test_list_for_reference_feature_block_carries_accession(ref):
     assert r["via_genome"] is False
 
 
+async def _seed_shared_feature(ctx, *, accession, genome_idxs):
+    """Insert a feature into the reference and link it to several genomes via
+    feature_genome (a shared plasmid). Links are inserted in the given order so a
+    test can control which genome's fan-out is scanned first. Returns feature_idx."""
+    pool = ctx["pool"]
+    feature_idx = await _seed_feature(ctx, accession=accession)
+    for genome_idx in genome_idxs:
+        await pool.execute(
+            "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
+            feature_idx,
+            genome_idx,
+        )
+    return feature_idx
+
+
+async def test_list_multi_genome_direct_block_reports_the_blocked_genome(ref):
+    """A feature shared by two genomes, blocked DIRECTLY, where one of its genomes
+    is ALSO blocked: the listing must report the BLOCKED genome's provenance, not
+    an arbitrary/unblocked one, with direct precedence for the flag. Guards the
+    many-to-many regression — with feature_genome fanning a shared feature to one
+    candidate row per genome, the DISTINCT ON picker needs a tiebreak that prefers
+    a genome that is itself blocked. The shared feature's link to the UNBLOCKED
+    genome is inserted first so a picker with no such tiebreak would surface it."""
+    pool = ref["pool"]
+    actor = ref["principal_idx"]
+    g_blocked, _ = await _seed_genome(ref, source_id="GCF_BLOCKED", n_features=1)
+    g_unblocked, _ = await _seed_genome(ref, source_id="GCF_UNBLOCKED", n_features=1)
+    plasmid = await _seed_shared_feature(
+        ref, accession="shared_plasmid", genome_idxs=[g_unblocked, g_blocked]
+    )
+    await add_exclusion(pool, feature_idx=plasmid, reason="chimeric plasmid", excluded_by_idx=actor)
+    await add_exclusion(pool, genome_idx=g_blocked, reason="contaminated", excluded_by_idx=actor)
+
+    rows = await list_for_reference(pool, ref["reference_idx"])
+    (r,) = [row for row in rows if row["feature_idx"] == plasmid]
+    assert r["direct_block"] is True
+    assert r["via_genome"] is False
+    assert r["genome_idx"] == g_blocked
+
+
+async def test_list_multi_genome_via_block_reports_lowest_blocked_genome(ref):
+    """A feature shared by two genomes, both blocked via their genome (no direct
+    block): reported once, via_genome=True, deterministically naming the lowest
+    blocked genome_idx. The higher genome's link is inserted first so a scan-order
+    pick would surface it."""
+    pool = ref["pool"]
+    actor = ref["principal_idx"]
+    g_low, _ = await _seed_genome(ref, source_id="GCF_LOW", n_features=1)
+    g_high, _ = await _seed_genome(ref, source_id="GCF_HIGH", n_features=1)
+    assert g_low < g_high
+    plasmid = await _seed_shared_feature(ref, accession="shared", genome_idxs=[g_high, g_low])
+    await add_exclusion(pool, genome_idx=g_low, reason="a", excluded_by_idx=actor)
+    await add_exclusion(pool, genome_idx=g_high, reason="b", excluded_by_idx=actor)
+
+    rows = await list_for_reference(pool, ref["reference_idx"])
+    (r,) = [row for row in rows if row["feature_idx"] == plasmid]
+    assert r["via_genome"] is True
+    assert r["direct_block"] is False
+    assert r["genome_idx"] == g_low
+
+
+async def test_list_multi_genome_direct_block_no_genome_blocked_is_lowest(ref):
+    """A feature shared by two genomes, blocked DIRECTLY, with NEITHER genome
+    blocked: reported once, direct_block=True, deterministically naming the lowest
+    genome_idx (no blocked genome to prefer). The higher genome's link is inserted
+    first so a scan-order pick would surface it."""
+    pool = ref["pool"]
+    actor = ref["principal_idx"]
+    g_low, _ = await _seed_genome(ref, source_id="GCF_LO", n_features=1)
+    g_high, _ = await _seed_genome(ref, source_id="GCF_HI", n_features=1)
+    assert g_low < g_high
+    plasmid = await _seed_shared_feature(ref, accession="shared", genome_idxs=[g_high, g_low])
+    await add_exclusion(pool, feature_idx=plasmid, reason="chimera", excluded_by_idx=actor)
+
+    rows = await list_for_reference(pool, ref["reference_idx"])
+    (r,) = [row for row in rows if row["feature_idx"] == plasmid]
+    assert r["direct_block"] is True
+    assert r["via_genome"] is False
+    assert r["genome_idx"] == g_low
+
+
 async def test_direct_feature_block_survives_feature_deletion(ref):
     """A block SURVIVES hard-deletion of its feature (targets are NOT foreign
     keys). delete_reference_cascade's orphan-GC can drop the feature row, but the

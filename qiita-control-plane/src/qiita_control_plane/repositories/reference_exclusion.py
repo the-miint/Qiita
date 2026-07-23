@@ -8,11 +8,10 @@ block expands to all its features via feature_genome — so consumers never touc
 a blocked feature, even one blocked through a genome before that feature was
 loaded. feature_genome is many-to-many (a plasmid can be shared across genomes),
 so blocking one genome over-excludes a feature it shares with an unblocked genome
-(correct — the block is on the feature bytes); and LIST_FOR_REFERENCE_SQL's
-reported (genome_idx, source, source_id) for a via-genome block is an arbitrary
-one of the feature's BLOCKED genomes (deterministically the sole blocking genome
-in the common single-block case; arbitrary only when 2+ are blocked — cosmetic,
-like the direct/via_genome pick below).
+(correct — the block is on the feature bytes); and when a shared feature fans to
+several genomes, LIST_FOR_REFERENCE_SQL reports its provenance deterministically —
+preferring a genome that is itself blocked, then the lowest genome_idx (see the
+constant's own comment for the full tiebreak).
 
 The base data is never deleted. The blocklist is a DURABLE CURATORIAL RECORD:
 
@@ -49,10 +48,18 @@ RESOLVE_EXCLUDED_FEATURES_SQL = (
 )
 
 # Blocked features that appear in one reference, with why + external ids. The
-# reference's members joined to the ACTIVE exclusion rows that block them;
-# DISTINCT ON collapses a feature blocked both ways to one row, preferring the
-# direct feature block's reason (so a dual-blocked feature reports
-# direct_block=true, via_genome=false — see ReferenceExclusionListItem).
+# reference's members joined to the ACTIVE exclusion rows that block them.
+# feature_genome is many-to-many, so a shared feature fans to one candidate row
+# per genome; DISTINCT ON collapses them to one row, preferring, in order:
+# (1) the direct feature block (so a dual-blocked feature reports
+#     direct_block=true, via_genome=false — see ReferenceExclusionListItem),
+# (2) a genome that is itself actively blocked (via an EXISTS against the
+#     blocklist — the direct-block candidate rows carry a feature-target x whose
+#     own genome_idx is NULL, so the JOINed x cannot answer this),
+# (3) the lowest genome_idx.
+# So the reported (genome_idx, source, source_id) is deterministic and, whenever
+# a genome-level block applies, names an actually-blocked genome, never an
+# arbitrary or unblocked one.
 LIST_FOR_REFERENCE_SQL = (
     "WITH member AS ("
     "  SELECT rm.feature_idx, rm.accession, fg.genome_idx, g.source, g.source_id"
@@ -70,7 +77,10 @@ LIST_FOR_REFERENCE_SQL = (
     " JOIN qiita.reference_exclusion x"
     "   ON (x.feature_idx = m.feature_idx OR x.genome_idx = m.genome_idx)"
     "  AND x.unblocked_at IS NULL"
-    " ORDER BY m.feature_idx, (x.feature_idx IS NOT NULL) DESC"
+    " ORDER BY m.feature_idx, (x.feature_idx IS NOT NULL) DESC,"
+    "   (EXISTS (SELECT 1 FROM qiita.reference_exclusion b"
+    "             WHERE b.genome_idx = m.genome_idx AND b.unblocked_at IS NULL)) DESC,"
+    "   m.genome_idx"
 )
 
 
