@@ -9,14 +9,20 @@ that seam — it pre-maps with `minimap2 -x map-hifi` and drops the sorted BAM i
 work_files/. This step is our version of that pre-map, done with miint's embedded
 minimap2 instead of a container-local binary.
 
-It has to be a NATIVE step: miint is deliberately not exposed to containers
-(`slurm/payload.py` forwards only the container contract vars, never the miint
-dirs), so the aligner cannot run inside the binning image. The BAM therefore
-crosses a step boundary as a file path. That is the intermediate-materialisation
-the repo's streaming rule tells us to avoid, and it is called out rather than
-hidden: metaWRAP's interface *is* "a BAM at this path", so the handoff is forced
-by the third-party tool, not chosen. It is the thing to design away if metaWRAP is
-ever replaced, not a pattern to copy.
+Why this is its OWN native step. Each command in this workflow is one step —
+`assemble` (hifiasm_meta), `binning` (metawrap), `bin_refine` (dastool), `checkm`
+— and the minimap2 pre-map is a distinct command from metawrap's binners, so it
+gets its own step, exactly as qp-pacbio splits its step 3 (`minimap2`) from step 4
+(`metawrap binning`). It is a `module:` (native) step rather than a container SIF
+for the ordinary reason any step is native here: its tool — minimap2 — ships
+inside miint, a core dependency already staged for the orchestrator. (miint runs
+in containers too; that is not the reason this is native — the reason is that we
+already have the tool natively, like `assembly_hash` / `assembly_load`.)
+
+The one cost is that the BAM crosses a step boundary as a file path — the
+intermediate-materialisation the repo's streaming rule warns about. It is forced
+by metaWRAP's interface (which *is* "a BAM at work_files/<sample>.bam"), not
+chosen, and is the thing to design away if metaWRAP is ever replaced.
 
 Three behaviours of miint's BAM writer this step depends on. The parameters are
 documented upstream (<https://the-miint.github.io/duckdb-miint/writing/>); the
@@ -28,10 +34,10 @@ notes below are what a probe against the shipped build adds on top:
   * @SQ comes out **reversed** from the reference-lengths table's physical order,
     and jgi's sortedness check is on the @SQ index (tid), not the contig name. So
     the table is built DESC to land @SQ ascending, after which `ORDER BY reference,
-    position` is a genuine coordinate sort. Feeding the table ascending produces a
-    BAM jgi rejects outright. That reversal is undocumented, so `_assert_sq_order`
-    below re-checks it on every run and the contract test pins it; a miint version
-    bump that changes it fails here, loudly, at the producer.
+    position` is a genuine coordinate sort — the BAM is correct BY CONSTRUCTION,
+    since we control the reflen order and thus the @SQ order. This reversal is not
+    in the upstream docs, so `tests/jobs/test_assembly_coverage.py` pins it
+    directly against miint; a version bump that changes it fails there.
   * `SEQUENCE_DATA` RAISES on a lookup miss (`Invalid Input Error: Read '<id>' not
     found in SEQUENCE_DATA table`) rather than falling back to `*` for that record
     — so a partial lookup cannot silently reintroduce the depth bias below. Probed
@@ -73,8 +79,6 @@ escalation cannot fix. See the memory-split note at `_DUCKDB_CAP_GB`.
 
 from __future__ import annotations
 
-import gzip
-import struct
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -158,55 +162,6 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-def _read_bam_reference_names(path: Path) -> list[str]:
-    """Return the @SQ reference names, in header order, from a BAM.
-
-    Parsed directly rather than shelled out to samtools: the orchestrator's native
-    env has miint, not samtools, and this must run in the same process that wrote
-    the file. BAM is BGZF, which is gzip-compatible, so the stdlib reads it.
-
-    Layout after decompression: magic `BAM\\1`, int32 l_text, l_text bytes of
-    header text, int32 n_ref, then per reference int32 l_name, l_name bytes of
-    NUL-terminated name, int32 l_ref.
-    """
-    with gzip.open(path, "rb") as fh:
-        magic = fh.read(4)
-        if magic != b"BAM\x01":
-            raise ValueError(f"{path} is not a BAM file (magic={magic!r})")
-        (l_text,) = struct.unpack("<i", fh.read(4))
-        fh.read(l_text)
-        (n_ref,) = struct.unpack("<i", fh.read(4))
-        names: list[str] = []
-        for _ in range(n_ref):
-            (l_name,) = struct.unpack("<i", fh.read(4))
-            names.append(fh.read(l_name).rstrip(b"\x00").decode())
-            fh.read(4)  # l_ref, unused
-        return names
-
-
-def _assert_sq_order(bam: Path, expected: list[str]) -> None:
-    """Fail the step if @SQ is not in the order the coordinate sort assumed.
-
-    This is the guard on the undocumented reversal described in the module
-    docstring. Without it, a miint change to @SQ ordering would produce a BAM
-    whose records are sorted by NAME while its tids run the other way — which jgi
-    rejects three steps later with "the bam file is not sorted!", pointing at the
-    binning container rather than at the writer that actually caused it.
-    """
-    actual = _read_bam_reference_names(bam)
-    if actual != expected:
-        raise RuntimeError(
-            "miint's FORMAT BAM emitted @SQ in an unexpected order, so the "
-            "coordinate sort in this step is no longer valid.\n"
-            f"  expected (ascending): {expected}\n"
-            f"  actual:               {actual}\n"
-            "This step builds the REFERENCE_LENGTHS table in DESCENDING name "
-            "order because miint reverses it when writing @SQ. If that reversal "
-            "changed, drop the ORDER BY ... DESC on the reflen table and re-pin "
-            "tests/jobs/test_assembly_coverage.py."
-        )
-
-
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     nolcg = inputs.genomes_dir / _NOLCG_NAME
     if not inputs.genomes_dir.is_dir():
@@ -248,8 +203,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # intact — so remove the assumption rather than rely on it: with
             # preservation ON, the explicit ORDER BY is authoritative. (Probed
             # fine either way at 9600 rows / 4 threads, but "fine when I tested it"
-            # is exactly the assumption worth deleting.) `_assert_sq_order` still
-            # backstops the header side.
+            # is exactly the assumption worth deleting.)
             conn.execute("SET preserve_insertion_order=true")
 
             # Persistent relations, not TEMP/CTE: miint's table functions resolve
@@ -299,19 +253,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [_READS, _CONTIGS, _MM2_PRESET],
             )
 
-            # DESC on purpose — see the module docstring. This lands @SQ ascending,
-            # which is what makes the ORDER BY below a real coordinate sort.
+            # DESC on purpose — see the module docstring. miint reverses the
+            # reflen order when writing @SQ, so DESC here lands @SQ ascending,
+            # which is what makes the ORDER BY below a genuine coordinate sort.
+            # The BAM is correct by construction (we own both the reflen order and
+            # the record ORDER BY); the reversal itself is pinned by the contract
+            # test rather than re-read from the header at runtime.
             conn.execute(
                 f"CREATE OR REPLACE TABLE {_REFLEN} AS "
                 "SELECT read_id AS reference, length(sequence1) AS length "
                 f"FROM {_CONTIGS} ORDER BY read_id DESC"
             )
-            expected_sq = [
-                r[0]
-                for r in conn.execute(
-                    f"SELECT read_id FROM {_CONTIGS} ORDER BY read_id ASC"
-                ).fetchall()
-            ]
 
             # Contigs exist, so alignments must too. Zero here is NOT the
             # no-contig case handled above: it would write a header-only BAM,
@@ -319,11 +271,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # which metaWRAP skips bwa, jgi reports every contig at depth 0, and
             # the ticket COMPLETES with an empty bins_dir — indistinguishable
             # from "nothing was binnable". Fail loudly instead.
+            n_contigs = conn.execute(f"SELECT count(*) FROM {_CONTIGS}").fetchone()[0]
             aligned = conn.execute(f"SELECT count(*) FROM {_ALIGNMENT}").fetchone()[0]
             if aligned == 0:
                 raise RuntimeError(
                     f"align_minimap2 produced no alignments for {inputs.masked_reads_fastq} "
-                    f"against {nolcg} ({len(expected_sq)} contigs). Emitting a "
+                    f"against {nolcg} ({n_contigs} contigs). Emitting a "
                     "header-only BAM would let binning complete with zero depth and "
                     "no bins, reported as success."
                 )
@@ -337,7 +290,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{bam_sql}' (FORMAT BAM, REFERENCE_LENGTHS '{_REFLEN}', "
                 f"SEQUENCE_DATA '{_SEQDATA}')"
             )
-        _assert_sq_order(bam, expected_sq)
         success = True
     finally:
         if not success:

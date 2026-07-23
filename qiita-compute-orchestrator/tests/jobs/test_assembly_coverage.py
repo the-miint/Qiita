@@ -32,7 +32,9 @@ in-repo proxy for it.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import random
+import struct
 from pathlib import Path
 
 import pytest
@@ -40,10 +42,38 @@ import pytest
 from qiita_compute_orchestrator.jobs import assembly_coverage
 from qiita_compute_orchestrator.jobs.assembly_coverage import (
     Inputs,
-    _read_bam_reference_names,
     execute,
 )
 from qiita_compute_orchestrator.miint import open_miint_conn
+
+
+def _sq_reference_names(path) -> list[str]:
+    """The @SQ reference names in header order.
+
+    Lives in the TEST, not the job: the production step is correct BY
+    CONSTRUCTION (it owns the reflen order and the record ORDER BY) and never
+    reads the header back. But miint exposes no @SQ-header reader — `read_sam` /
+    `read_alignments` return per-record columns, and `SELECT DISTINCT reference`
+    drops zero-coverage contigs — so pinning miint's undocumented reflen→@SQ
+    REVERSAL, which the construction relies on, requires reading the header
+    directly here. (If miint ever grows a header reader, replace this.)
+
+    BAM is BGZF (gzip-compatible). Layout: magic `BAM\\1`, int32 l_text, l_text
+    header bytes, int32 n_ref, then per ref int32 l_name, l_name NUL-terminated
+    name bytes, int32 l_ref.
+    """
+    with gzip.open(path, "rb") as fh:
+        assert fh.read(4) == b"BAM\x01", "not a BAM file"
+        (l_text,) = struct.unpack("<i", fh.read(4))
+        fh.read(l_text)
+        (n_ref,) = struct.unpack("<i", fh.read(4))
+        names = []
+        for _ in range(n_ref):
+            (l_name,) = struct.unpack("<i", fh.read(4))
+            names.append(fh.read(l_name).rstrip(b"\x00").decode())
+            fh.read(4)
+        return names
+
 
 # Names chosen so ASCII order and insertion order differ from length order — a
 # fixture where all three coincide could not tell the orderings apart.
@@ -135,17 +165,26 @@ def test_sq_header_is_ascending_and_covers_every_contig(assembly, tmp_path):
     `ORDER BY reference, position` a genuine coordinate sort.
     """
     bam = _run(assembly, tmp_path)
-    assert _read_bam_reference_names(bam) == [_CTG_A, _CTG_B, _CTG_UNCOVERED]
+    assert _sq_reference_names(bam) == [_CTG_A, _CTG_B, _CTG_UNCOVERED]
 
 
 def test_records_are_coordinate_sorted(assembly, tmp_path):
-    """Records are non-decreasing in (tid, position).
+    """Records are non-decreasing in (tid, position) — what jgi checks.
 
-    This is what jgi checks. Read back through miint's own reader so the test
-    needs no samtools.
+    Two halves, together the coordinate-sort jgi requires: the RECORD stream
+    (read back through miint's `read_alignments`, in file order) must be sorted by
+    (reference-tid, position), and the tid order is the @SQ order — which
+    `test_sq_header_is_ascending_and_covers_every_contig` pins as ascending name.
+    So map each record's reference to its @SQ index and assert non-decreasing.
+
+    This rests on `read_alignments` returning rows IN FILE ORDER (not re-sorting),
+    else an unsorted BAM could pass silently. Probed against the shipped build: a
+    BAM written deliberately in reverse (reference,position) order reads back
+    reversed, not re-sorted — so the reader preserves file order and this test
+    genuinely exercises the on-disk record order.
     """
     bam = _run(assembly, tmp_path)
-    order = {name: i for i, name in enumerate(_read_bam_reference_names(bam))}
+    order = {name: i for i, name in enumerate(_sq_reference_names(bam))}
 
     with open_miint_conn() as conn:
         rows = conn.execute(
@@ -363,8 +402,8 @@ def test_reflen_order_is_reversed_in_sq(tmp_path):
             conn.execute(
                 f"COPY (SELECT * FROM aln) TO '{bam}' (FORMAT BAM, REFERENCE_LENGTHS 'reflen')"
             )
-            assert _read_bam_reference_names(bam) == expected, (
-                f"reflen order {order} produced @SQ {_read_bam_reference_names(bam)}; "
+            assert _sq_reference_names(bam) == expected, (
+                f"reflen order {order} produced @SQ {_sq_reference_names(bam)}; "
                 "assembly_coverage assumes miint reverses it"
             )
 

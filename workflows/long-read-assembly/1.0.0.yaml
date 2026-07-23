@@ -92,10 +92,12 @@ steps:
 
   # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
   # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step
-  # injects into metaWRAP's alignment cache. Native, because miint is not exposed
-  # to containers — see the module docstring for why this pre-map exists at all
-  # (metaWRAP would otherwise self-align HiFi reads with bwa, a short-read
-  # aligner, and offers no flag to choose).
+  # injects into metaWRAP's alignment cache. Its own step because the minimap2
+  # pre-map is a distinct command from metawrap's binners (qp-pacbio splits them
+  # the same way); native (`module:`) because minimap2 ships in miint, an
+  # orchestrator-native dep — like assembly_hash/assembly_load. Without it
+  # metaWRAP self-aligns HiFi reads with bwa, a short-read aligner, and offers no
+  # flag to choose. See the module docstring.
   - step: assembly_coverage
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_coverage
