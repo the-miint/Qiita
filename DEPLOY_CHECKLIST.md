@@ -59,6 +59,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   reload pipeline, so `version` / `loaded_at` on the parent NCBI Taxonomy and ENVO
   rows are deliberately left as originally seeded. (#360)
 - `make migrate` applies two new migrations — both plain (nullable `ADD COLUMN` / `CREATE TABLE`, no backfill, no `CREATE EXTENSION`): `20260721000004_reference_membership_accession.sql` (persist the FASTA-header record accession per reference membership) and `20260721000005_reference_exclusion.sql` (the curated global feature/genome blocklist table). (#361)
+- `make migrate` also applies `20260722000000_feature_genome_allow_multi_genome.sql`, no out-of-band setup: a plain `ALTER TABLE qiita.feature_genome DROP CONSTRAINT feature_genome_feature_idx_key`, letting a feature (a shared plasmid → one content-hash-global `feature_idx`) belong to multiple genomes. The composite PK `(feature_idx, genome_idx)` already models the many-to-many. See the Notes re-load caveat. (#366)
 
 ### 4. Deploy
 
@@ -99,6 +100,22 @@ _None yet._
   PATs minted before this deploy are frozen and won't carry it, so an admin must
   **re-login** (`qiita-admin login`, or re-mint) to pick it up before the cancel
   command works — a stale-scope 403 otherwise names the fix. (#350)
+- References loaded before the `feature_genome_allow_multi_genome` migration
+  silently dropped the second genome's association for any feature shared across
+  genomes (a shared plasmid). There is **no backfill migration** — RE-LOAD affected
+  references to recover the dropped associations. New loads are correct
+  automatically. (#366)
+- **Soft contract change (no host action):** `POST /reference/{idx}/ticket/doget`
+  now accepts `reference:read` in addition to the service-only `ticket:doget`
+  (any-of) — reference sequences/taxonomy/phylogeny are public reference data, and
+  this lets the new `qiita reference export` user CLI stream a genome's sequences.
+  Strictly additive: `ticket:doget` stays accepted, so the compute service account
+  (which holds `ticket:doget`, not `reference:read`) keeps minting its build/OGU
+  tickets — nothing loses access, no re-provisioning. Reader-set note (no host
+  action, but be aware): a whole-reference ticket now lets any authenticated human
+  bulk-egress a reference's entire sequence set, uncapped — intentional (reference
+  data is public); a resource/bandwidth cap may be added later if needed.
+  (#366)
 - **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. The scope grant this needs is in bucket 2 above. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces — a block job now drains its stream to a short-lived Parquet inside its OWN workspace instead. The per-sample `read-mask` path is unchanged and still stages a Parquet. (#364)
 
 ---

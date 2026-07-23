@@ -82,6 +82,44 @@ def test_genome_lineages_min_feature_representative():
     assert _genome_lineages(con) == [LineageItem(item_id=1, lineage="Alpha;Beta")]
 
 
+def test_genome_lineages_lowest_classified_member_when_lowest_feature_unclassified():
+    """When the LOWEST feature_idx member carries no taxonomy row (e.g. it was
+    excluded, so its LEFT JOIN misses), the representative lineage falls to the
+    lowest feature_idx member that IS classified — the genome keeps a real
+    lineage instead of tiling as unclassified. Biology: a genome is one organism,
+    so its contigs share one lineage; blocking the lowest contig must not relocate
+    the healthy siblings to the unclassified shard."""
+    con = _con(
+        [(11, 1), (99, 1)],  # feature 11 (lowest) has NO taxonomy row
+        [(99, "Zeta", None, None, None, None, None, None, None)],
+    )
+    assert _genome_lineages(con) == [LineageItem(item_id=1, lineage="Zeta")]
+
+
+def test_genome_lineages_no_classified_member_stays_unclassified():
+    """A multi-member genome where NO member has taxonomy (every LEFT JOIN misses)
+    still reduces to '' — the classified-member FILTER yields an empty aggregate
+    → NULL → the `lineage or ''` fallback."""
+    con = _con([(11, 1), (99, 1)], [])
+    assert _genome_lineages(con) == [LineageItem(item_id=1, lineage="")]
+
+
+def test_genome_lineages_lowest_classified_member_wins_the_feature_idx_tiebreak():
+    """The representative is the lowest-feature_idx CLASSIFIED member — not the
+    lexicographically smallest lineage. Here the lowest member (3) is unclassified,
+    the lowest CLASSIFIED member (20) carries a lex-LARGER lineage ('Zeta') than a
+    higher member (99, 'Alpha'), so the arg_min-over-feature_idx tie-break must
+    still pick 20's 'Zeta'. Pins the tie-break against a `min(lineage)` refactor."""
+    con = _con(
+        [(3, 1), (20, 1), (99, 1)],  # feature 3 (lowest) has NO taxonomy row
+        [
+            (20, "Zeta", None, None, None, None, None, None, None),  # lowest CLASSIFIED
+            (99, "Alpha", None, None, None, None, None, None, None),  # higher, lex-smaller
+        ],
+    )
+    assert _genome_lineages(con) == [LineageItem(item_id=1, lineage="Zeta")]
+
+
 def test_compute_shards_round_trip_every_member_feature_once():
     """Every genome-bearing member feature lands in exactly one shard; the
     returned shards are feature lists indexed by shard_id."""
@@ -101,6 +139,49 @@ def test_compute_shards_round_trip_every_member_feature_once():
     # Every member feature appears exactly once across all shards.
     flat = sorted(f for shard in shards for f in shard)
     assert flat == [10, 11, 20, 30]
+
+
+def test_compute_shards_shared_feature_lands_in_exactly_one_shard():
+    """A feature shared by two genomes (an identical plasmid → one feature_idx
+    under both) whose lineages tile to DIFFERENT shards must land in exactly one
+    shard — deterministically the lowest shard_id — so the shard lists stay
+    disjoint and write_shard_assignment never stamps the row twice. Before the
+    many-to-many fix the feature appeared in BOTH shard lists."""
+    # feature 100 is shared by genome 1 ('Aaa' -> low shard) and genome 2
+    # ('Zzz' -> high shard); each genome also has a unique classified contig so
+    # neither shard empties.
+    member = [(10, 1), (100, 1), (20, 2), (100, 2)]
+    tax = [
+        (10, "Aaa", None, None, None, None, None, None, None),
+        (20, "Zzz", None, None, None, None, None, None, None),
+    ]
+    shards = _compute_shards(_con(member, tax), num_shards=2)
+    # 'Aaa' (g1) sorts before 'Zzz' (g2): g1 -> shard 0, g2 -> shard 1. The shared
+    # feature 100 (min shard_id 0) joins shard 0 and is absent from shard 1.
+    assert shards == [[10, 100], [20]]
+    flat = [f for shard in shards for f in shard]
+    assert flat.count(100) == 1
+
+
+def test_compute_shards_shared_feature_that_empties_a_shard_is_dropped_and_reindexed():
+    """If deduping a shared feature to its lowest shard leaves a higher shard with
+    no features, that shard drops out and the survivors re-index to contiguous
+    positions — so `len(shards)` is the non-empty count and the fan-out (which
+    dispatches one child per returned shard) never gets an empty one."""
+    # g1: unique contig 10 ('Aaa') + shared plasmid 100 ('Mmm').
+    # g2: ONLY the shared plasmid 100 -> its shard empties when 100 migrates down.
+    # g3: unique contig 30 ('Zzz').
+    member = [(10, 1), (100, 1), (100, 2), (30, 3)]
+    tax = [
+        (10, "Aaa", None, None, None, None, None, None, None),
+        (100, "Mmm", None, None, None, None, None, None, None),
+        (30, "Zzz", None, None, None, None, None, None, None),
+    ]
+    shards = _compute_shards(_con(member, tax), num_shards=3)
+    # Tiling: g1 'Aaa'->0, g2 'Mmm'->1, g3 'Zzz'->2. Feature 100's min shard is 0,
+    # so g2's shard 1 empties and drops; g3 (was shard 2) re-buckets to position 1.
+    assert shards == [[10, 100], [30]]
+    assert len(shards) == 2  # 3 genomes, num_shards=3, but one shard emptied
 
 
 def test_compute_shards_fewer_genomes_than_num_shards():

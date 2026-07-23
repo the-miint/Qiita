@@ -68,6 +68,11 @@ PATH_REFERENCE_EXCLUSION = "/exclusion"
 PATH_REFERENCE_EXCLUSION_SYNC = "/exclusion/sync"
 # Reference-scoped read of what the blocklist filters from one reference.
 PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
+# Resolve a genome to its member features (feature_idx + accession) within one
+# reference — the inverse of export_member_genome, keyed on (reference_idx,
+# genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
+# is per-reference. Param path, distinct 4-segment shape (no literal shadow).
+PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -78,6 +83,7 @@ URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
 URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
 URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
 URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
+URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 
 # =============================================================================
 # /host-filter-profile/*

@@ -417,8 +417,13 @@ async def test_feature_genome_fk_on_genome(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_feature_genome_unique_feature(postgres_pool):
-    """A feature can belong to at most one genome (UNIQUE on feature_idx)."""
+async def test_feature_genome_allows_a_feature_in_multiple_genomes(postgres_pool):
+    """A feature can belong to MULTIPLE genomes — two organisms sharing an
+    identical mobile element (e.g. a plasmid) resolve to the same feature_idx
+    (content-hash-global) under different genome_idx. The composite PK
+    (feature_idx, genome_idx) models this many-to-many; the old standalone
+    UNIQUE(feature_idx) that silently dropped the second genome's row is gone. An
+    exact-duplicate (feature_idx, genome_idx) is still rejected by the PK."""
     conn = await postgres_pool.acquire()
     try:
         tr = conn.transaction()
@@ -430,23 +435,36 @@ async def test_feature_genome_unique_feature(postgres_pool):
         g1 = await conn.fetchval(
             "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
-            "GCF_unique_test_1",
+            "GCF_shared_plasmid_1",
         )
         g2 = await conn.fetchval(
             "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
-            "GCF_unique_test_2",
+            "GCF_shared_plasmid_2",
         )
         await conn.execute(
             "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
             feat_idx,
             g1,
         )
+        # The second genome's association must survive — no UniqueViolationError.
+        await conn.execute(
+            "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
+            feat_idx,
+            g2,
+        )
+        genomes = await conn.fetch(
+            "SELECT genome_idx FROM qiita.feature_genome WHERE feature_idx = $1"
+            " ORDER BY genome_idx",
+            feat_idx,
+        )
+        assert [r["genome_idx"] for r in genomes] == sorted([g1, g2])
+        # The composite PK still rejects an exact (feature_idx, genome_idx) dup.
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
                 "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
                 feat_idx,
-                g2,
+                g1,
             )
         await tr.rollback()
     finally:

@@ -66,6 +66,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_EXCLUSION_BY_IDX",
     ),
+    (
+        "URL_REFERENCE_GENOME_MEMBER",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_GENOME_MEMBER",
+    ),
     # /host-filter-profile
     (
         "URL_HOST_FILTER_PROFILE_LIST",

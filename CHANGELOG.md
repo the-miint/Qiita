@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
+  A user CLI (`reference:read`) that exports one or more genomes'
+  sequences: for each `--genome-idx` it resolves the genome's members, mints a
+  chunk DoGet ticket, streams the bytes over Flight, and writes
+  `<reference_idx>.<genome_idx>.{fasta.gz|parquet}` (one file per genome). FASTA
+  is reassembled via miint's `FORMAT FASTA` writer with the reference's accessions
+  as headers; Parquet is the raw `reference_sequence_chunks` rows. A plasmid shared
+  across genomes is exported for each of its genomes (the payoff of the
+  feature_genome many-to-many fix). Exported bytes are the stored original strand
+  of the representative record — the feature_idx dedup is by canonical hash, so a
+  reverse-complement-equal input exports the representative's orientation. A short
+  export (fewer sequences written than the genome has members — e.g. an `indexing`
+  reference whose chunks are not yet in DuckLake, or one with a partial delete) is
+  a hard error: the incomplete file is removed and the CLI exits non-zero rather
+  than leaving a file that looks complete.
+- **Resolve a genome to its member features within a reference —
+  `GET /reference/{reference_idx}/genome/{genome_idx}/member` (`reference:read`) (#366).**
+  Returns each member feature's `feature_idx` + the reference's FASTA-header
+  `accession`, feature_idx-ordered — the inverse of the internal
+  `export_member_genome`, keyed on `(reference_idx, genome_idx)` because the
+  accession is per-`(reference, feature)` and a DoGet ticket is per-reference. A
+  feature shared across genomes (a plasmid → one content-hash-global `feature_idx`)
+  is returned for each of its genomes. 404s when the pair has no members (unknown
+  reference, unknown genome, or a genome in a different reference) — an empty
+  export is a fail-loud caller error. The resolution step the genome-export CLI
+  runs before a DoGet for the sequence bytes.
 - **Reference feature/genome exclusion — a curated global blocklist (#361).**
   Bad reference data (a contaminated genome, a mislabelled contig) can now be
   **masked at consumption** without deleting rows or rebuilding aligner indexes.
@@ -219,6 +245,43 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
+  `feature_idx` is content-hash-global, so two organisms carrying an identical
+  mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under
+  different `genome_idx`. The `qiita.feature_genome` table had a standalone
+  `UNIQUE(feature_idx)`, so the second genome's association collided on load and
+  was silently dropped (`ON CONFLICT DO NOTHING`) — the second genome lost the
+  shared feature. Dropped the standalone UNIQUE (new migration
+  `feature_genome_allow_multi_genome`); the composite PK `(feature_idx, genome_idx)`
+  already models the many-to-many correctly and keeps feature→genome lookups
+  indexed. The shard planner (`_compute_shards`) now dedups a feature shared across
+  genomes tiled into different shards to its lowest `shard_id`, so shard lists stay
+  disjoint and `write_shard_assignment` never stamps a membership row twice. The
+  load path needed no code change (composite PK + `ON CONFLICT DO NOTHING` is
+  already many-to-many-correct). **Operator note:** references loaded before this
+  fix stay lossful — RE-LOAD affected references to recover the dropped shared-
+  feature associations (no backfill).
+- **`GET /reference/{reference_idx}/exclusion` reports deterministic, correct
+  genome provenance for a shared feature (#366).** With `feature_genome` now
+  many-to-many, a shared feature fans to one candidate row per genome, and the
+  listing's `DISTINCT ON (feature_idx)` picker had no tiebreak beyond direct-vs-
+  via — so which genome's `(genome_idx, source, source_id)` was reported flipped
+  on heap order, and a feature blocked directly could report an *unblocked*
+  genome as its provenance. The picker now prefers a genome that is itself
+  actively blocked, then the lowest `genome_idx`, so the reported provenance is
+  stable and always names a blocked genome when a genome-level block applies.
+- **Shard placement no longer regresses when a genome's lowest contig is excluded (#366).**
+  The reference shard planner reduces each genome to one representative lineage via
+  `arg_min(lineage, feature_idx)` over its members. Blocking the lowest-`feature_idx`
+  member of a multi-contig genome made its exclusion-filtered taxonomy row disappear,
+  so the representative reduced to `''` and the **whole** genome — healthy siblings
+  included — tiled to the unclassified shard on the next re-plan. `_genome_lineages`
+  now filters to the lowest *classified* member (`FILTER (WHERE concat_ws(...) <> '')`),
+  so a genome keeps its real lineage as long as ≥1 member survives classified;
+  only a fully-excluded genome sorts unclassified (moot — its features never surface
+  post-exclusion). Given the biology invariant (a genome is one organism → its
+  contigs share one lineage) this is the correct representative in the normal case,
+  not merely a mitigation.
 - **The `long-read-assembly` binning image shipped with zero binners.** `binning.def`
   installed bioconda's `metawrap-mg`, which is metaWRAP's *scripts only* — it declares
   none of the tools those scripts invoke. All **nine** were absent (bwa, samtools,
@@ -443,6 +506,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **The reference DoGet ticket route now accepts `reference:read` in addition to
+  `ticket:doget` (any-of) (#366).** `POST /reference/{reference_idx}/ticket/doget` mints
+  a read ticket for reference sequences / chunks / taxonomy / phylogeny — all
+  public reference data — so minting it is now also a `reference:read` capability
+  (held by every human role), which is what lets the `qiita reference export` user
+  CLI pull a genome's sequences. Strictly additive: the service-only `ticket:doget`
+  stays an accepted scope, so the compute service account (which holds
+  `ticket:doget`, not `reference:read`) keeps minting the feature_idx-scoped
+  build/OGU tickets exactly as before — no principal loses access, no
+  re-provisioning. Reader-set change, intentional: beyond the export CLI, a
+  whole-reference ticket (no `feature_idx`) now lets **any authenticated human**
+  bulk-egress a reference's entire sequence set, uncapped — by design, since
+  reference data is public; a resource/bandwidth cap can come later if it proves
+  necessary. `ticket:doget` also still solely gates the alignment DoGet
+  (`POST /alignment/ticket/doget`), whose rows are sample-derived, not public.
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately
   minted below the ceiling), a scope-gated route 403s even though the role

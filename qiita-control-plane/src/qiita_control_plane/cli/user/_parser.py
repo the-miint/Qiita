@@ -44,7 +44,12 @@ from .pool import (
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
 )
-from .reference import _handle_reference_list, _handle_reference_load
+from .reference import (
+    _EXPORT_FORMATS,
+    _handle_reference_genome_export,
+    _handle_reference_list,
+    _handle_reference_load,
+)
 from .sequencing import (
     _handle_prep_protocol_list,
     _handle_prep_sample_retire,
@@ -849,6 +854,49 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_reference_load.set_defaults(handler=_handle_reference_load)
+
+    # `reference export` — pull specific genomes' sequences to FASTA.gz or
+    # Parquet. A user feature (reference:read — both the member route and the
+    # reference DoGet ticket route accept it), and the end-to-end verification that
+    # a genome round-trips with all its contigs incl. a shared plasmid. One output
+    # file per genome: <reference_idx>.<genome_idx>.{fasta.gz|parquet}.
+    p_reference_export = p_reference_sub.add_parser(
+        "export",
+        help="Export one or more genomes' sequences (FASTA.gz or Parquet)",
+    )
+    p_reference_export.add_argument(
+        "--reference-idx", type=int, required=True, dest="reference_idx"
+    )
+    p_reference_export.add_argument(
+        "--genome-idx",
+        type=int,
+        action="append",
+        required=True,
+        dest="genome_idx",
+        help="Genome to export; repeat for several (one file per genome).",
+    )
+    p_reference_export.add_argument(
+        "--format",
+        choices=_EXPORT_FORMATS,
+        default="fasta",
+        help=(
+            "fasta (default) → gzipped FASTA, headers = the reference's accessions,"
+            " sequences reassembled from chunks; parquet → the raw"
+            " reference_sequence_chunks rows (feature_idx, chunk_index, chunk_data)."
+            " Exported bytes are the stored original strand of the representative"
+            " record (reverse-complement-equal inputs collapse to one feature_idx)."
+        ),
+    )
+    p_reference_export.add_argument("--output-dir", type=Path, required=True, dest="output_dir")
+    p_reference_export.add_argument(
+        "--data-plane-url",
+        required=True,
+        help=(
+            "gRPC URL of the data plane the sequence bytes stream from (e.g."
+            " grpc+tls://qiita.example.com:443, or grpc://<host>:50051 on-host)."
+        ),
+    )
+    p_reference_export.set_defaults(handler=_handle_reference_genome_export)
 
     # `reference exclusion list` — the reference:read query surface any user can
     # run to see what the global blocklist filtered from their feature table
