@@ -57,8 +57,9 @@ that connection; see docs/duckdb-miint.md).
 `mask_idx` is a per-run constant stamped onto every `read_mask` row at emit
 time — the CP-minted filtering-config identity (the runner mints it before this
 step and threads it in via `params`); multiple masks coexist over the same
-reads. `prep_sample_idx`, by contrast, is stamped PER ROW from the reads
-parquet: a block spans many prep_samples, so there is no single owner. A
+reads. `prep_sample_idx`, by contrast, is stamped PER ROW from the bound reads
+relation (a staged Parquet on the per-sample path, a data-plane stream on the
+block path): a block spans many prep_samples, so there is no single owner. A
 single-sample ticket has one prep_sample_idx on every read, so this is a strict
 generalization — identical output for the per-sample read-mask path.
 """
@@ -73,6 +74,7 @@ from qiita_common.models import ReadMaskReason
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS, apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn
+from ..read_source import bind_step_reads
 
 YAML_STEP_NAME = "host_filter"
 
@@ -111,8 +113,8 @@ _QUERY = "host_filter_query"
 _SURVIVORS = "host_filter_survivors"
 _RYPE_HOST = "host_filter_rype_hits"
 _MM2_HOST = "host_filter_minimap2_hits"
-# The per-read (sequence_idx -> prep_sample_idx) map, projected from the reads
-# parquet so the final mask can stamp prep_sample_idx PER ROW rather than as a
+# The per-read (sequence_idx -> prep_sample_idx) map, projected from the bound
+# reads relation so the final mask can stamp prep_sample_idx PER ROW rather than as a
 # per-run constant — a block spans many prep_samples (see the COPY below).
 _READ_META = "host_filter_read_meta"
 
@@ -133,7 +135,7 @@ _TRIM_SEQ2 = (
 class Inputs(BaseModel):
     """Typed input contract for host_filter.
 
-    `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
+    `reads` (OPTIONAL — see the note below on why) is a staged read Parquet:
     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`
     — the FULL reads. `qc_mask` is the partial mask the `qc` step emitted
     `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
@@ -150,9 +152,16 @@ class Inputs(BaseModel):
     the framework inject it (one sample), but the kernel ignores it — the per-row
     value is authoritative and identical for the single-sample case. A block
     ticket flows no prep_sample_idx scalar at all (None here).
+
+    `reads` is OPTIONAL because its SOURCE is a property of the workflow, not of
+    this job: the per-sample `read-mask` workflow stages a Parquet, while
+    `read-mask-block` binds none and the block's reads STREAM from the data plane
+    at runtime. `bind_step_reads` resolves whichever applies and yields one
+    relation name, so the kernel below is source-agnostic — including the per-row
+    `prep_sample_idx` stamping, which reads the same column either way.
     """
 
-    reads: Path
+    reads: Path | None = None
     qc_mask: Path
     mask_idx: int
     host_rype_path: Path | None = None
@@ -227,8 +236,6 @@ def _validate_minimap2_index(path: Path) -> None:
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    if not inputs.reads.exists():
-        raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     if not inputs.qc_mask.exists():
         raise FileNotFoundError(f"qc_mask parquet not found: {inputs.qc_mask}")
     if inputs.host_rype_path is not None:
@@ -243,7 +250,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     # COPY / CREATE VIEW path literals can't take a bound param; route them
     # through validate_parquet_path rather than inline-escaping.
-    reads_sql = validate_parquet_path(inputs.reads)
     qc_mask_sql = validate_parquet_path(inputs.qc_mask)
     out_sql = validate_parquet_path(read_mask)
 
@@ -253,93 +259,104 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
-
-            # qc_mask as a VIEW (read on this connection by both the query view
-            # and the final COPY).
-            conn.execute(f"CREATE VIEW {_QC_MASK} AS SELECT * FROM read_parquet('{qc_mask_sql}')")
-
-            # Per-read (sequence_idx -> prep_sample_idx) map. The final COPY joins
-            # it to stamp each mask row's owner FROM THE READS rather than from a
-            # per-run constant — a block's reads span many prep_samples. Projected
-            # to the two key columns so DuckDB reads only them from the (wide)
-            # reads parquet; sequence_idx is globally unique, so the join is 1:1.
-            conn.execute(
-                f"CREATE VIEW {_READ_META} AS "
-                f"SELECT sequence_idx, prep_sample_idx FROM read_parquet('{reads_sql}')"
-            )
-
-            # The host-classify query: the TRIMMED QC-pass reads, keyed by
-            # sequence_idx AS read_id (the tools' id column), carrying the trimmed
-            # R1/R2 the tools k-mer/align. Only reason='pass' rows — a QC-failed
-            # read is already excluded from read_masked, and host classify must
-            # never run on (and so never reclassify) a non-pass read. The tools
-            # handle PE natively. A non-temp VIEW so miint's separate connection
-            # can resolve it by name.
-            conn.execute(
-                f"CREATE VIEW {_QUERY} AS "
-                f"SELECT r.sequence_idx AS read_id, "
-                f"{_TRIM_SEQ1} AS sequence1, {_TRIM_SEQ2} AS sequence2 "
-                f"FROM read_parquet('{reads_sql}') r "
-                f"JOIN {_QC_MASK} q USING (sequence_idx) "
-                f"WHERE q.reason = '{ReadMaskReason.PASS.value}'"
-            )
-            # Always-present accumulators (empty when a stage is skipped) so the
-            # merge below references them unconditionally.
-            conn.execute(f"CREATE TABLE {_RYPE_HOST} (sequence_idx BIGINT)")
-            conn.execute(f"CREATE TABLE {_MM2_HOST} (sequence_idx BIGINT)")
-
-            if inputs.host_rype_path is not None:
-                _run_rype_classify(
-                    conn, inputs.host_rype_path, _QUERY, _RYPE_HOST, threshold=_RYPE_THRESHOLD
-                )
-
-            if inputs.host_minimap2_path is not None:
-                # Stage 2 sees only the QC-pass reads rype didn't flag (empty rype
-                # set -> all QC-pass reads). An ANTI JOIN is NULL-safe by
-                # construction — unlike `NOT IN`, a stray NULL can't collapse the
-                # result to empty. Carries the trimmed sequence1/sequence2 so
-                # minimap2 still aligns in PE.
+            # Bind the block/sample reads: a staged Parquet on the per-sample
+            # path, a data-plane stream on the block path. One relation either
+            # way, so the per-row owner stamping below is source-agnostic.
+            async with bind_step_reads(
+                conn,
+                reads=inputs.reads,
+                work_ticket_idx=inputs.work_ticket_idx,
+                workspace=duckdb_tmp,
+            ) as reads_rel:
+                # qc_mask as a VIEW (read on this connection by both the query view
+                # and the final COPY).
                 conn.execute(
-                    f"CREATE VIEW {_SURVIVORS} AS "
-                    f"SELECT q.read_id, q.sequence1, q.sequence2 FROM {_QUERY} q "
-                    f"ANTI JOIN {_RYPE_HOST} h ON h.sequence_idx = q.read_id"
-                )
-                _run_align_minimap2(
-                    conn,
-                    inputs.host_minimap2_path,
-                    _SURVIVORS,
-                    _MM2_HOST,
-                    preset=_MINIMAP2_PRESET,
+                    f"CREATE VIEW {_QC_MASK} AS SELECT * FROM read_parquet('{qc_mask_sql}')"
                 )
 
-            # Merge host hits into the qc_mask under the privacy precedence:
-            # minimap2 > rype > the qc_mask's own reason. Host only ever overrides
-            # 'pass' (the query view restricted classify to pass reads), so a
-            # qc_* row is untouched. mask_idx is the per-run constant stamped here;
-            # prep_sample_idx is stamped PER ROW from the reads (the _READ_META
-            # join) so a multi-sample block records each read's true owner. The
-            # inner join is 1:1 (every qc_mask row is a read qc emitted from these
-            # same reads). ORDER BY (mask_idx, prep_sample_idx, sequence_idx) — the
-            # read_mask table's sort key (sequence_idx last for row-group pruning).
-            conn.execute(
-                "COPY (SELECT "
-                "  ?::BIGINT AS mask_idx, "
-                "  rm.prep_sample_idx, "
-                "  q.sequence_idx, "
-                "  CASE "
-                f"    WHEN mm.sequence_idx IS NOT NULL THEN '{ReadMaskReason.HOST_MINIMAP2.value}' "
-                f"    WHEN ry.sequence_idx IS NOT NULL THEN '{ReadMaskReason.HOST_RYPE.value}' "
-                "    ELSE q.reason "
-                "  END AS reason, "
-                "  q.left_trim1, q.right_trim1, q.left_trim2, q.right_trim2 "
-                f"FROM {_QC_MASK} q "
-                f"JOIN {_READ_META} rm USING (sequence_idx) "
-                f"LEFT JOIN {_RYPE_HOST} ry USING (sequence_idx) "
-                f"LEFT JOIN {_MM2_HOST} mm USING (sequence_idx) "
-                "ORDER BY mask_idx, prep_sample_idx, sequence_idx) "
-                f"TO '{out_sql}' ({PARQUET_OPTS})",
-                [inputs.mask_idx],
-            )
+                # Per-read (sequence_idx -> prep_sample_idx) map. The final COPY joins
+                # it to stamp each mask row's owner FROM THE READS rather than from a
+                # per-run constant — a block's reads span many prep_samples. Projected
+                # to the two key columns so DuckDB reads only them from the (wide)
+                # reads parquet; sequence_idx is globally unique, so the join is 1:1.
+                conn.execute(
+                    f"CREATE VIEW {_READ_META} AS "
+                    f"SELECT sequence_idx, prep_sample_idx FROM {reads_rel}"
+                )
+
+                # The host-classify query: the TRIMMED QC-pass reads, keyed by
+                # sequence_idx AS read_id (the tools' id column), carrying the trimmed
+                # R1/R2 the tools k-mer/align. Only reason='pass' rows — a QC-failed
+                # read is already excluded from read_masked, and host classify must
+                # never run on (and so never reclassify) a non-pass read. The tools
+                # handle PE natively. A non-temp VIEW so miint's separate connection
+                # can resolve it by name.
+                conn.execute(
+                    f"CREATE VIEW {_QUERY} AS "
+                    f"SELECT r.sequence_idx AS read_id, "
+                    f"{_TRIM_SEQ1} AS sequence1, {_TRIM_SEQ2} AS sequence2 "
+                    f"FROM {reads_rel} r "
+                    f"JOIN {_QC_MASK} q USING (sequence_idx) "
+                    f"WHERE q.reason = '{ReadMaskReason.PASS.value}'"
+                )
+                # Always-present accumulators (empty when a stage is skipped) so the
+                # merge below references them unconditionally.
+                conn.execute(f"CREATE TABLE {_RYPE_HOST} (sequence_idx BIGINT)")
+                conn.execute(f"CREATE TABLE {_MM2_HOST} (sequence_idx BIGINT)")
+
+                if inputs.host_rype_path is not None:
+                    _run_rype_classify(
+                        conn, inputs.host_rype_path, _QUERY, _RYPE_HOST, threshold=_RYPE_THRESHOLD
+                    )
+
+                if inputs.host_minimap2_path is not None:
+                    # Stage 2 sees only the QC-pass reads rype didn't flag (empty rype
+                    # set -> all QC-pass reads). An ANTI JOIN is NULL-safe by
+                    # construction — unlike `NOT IN`, a stray NULL can't collapse the
+                    # result to empty. Carries the trimmed sequence1/sequence2 so
+                    # minimap2 still aligns in PE.
+                    conn.execute(
+                        f"CREATE VIEW {_SURVIVORS} AS "
+                        f"SELECT q.read_id, q.sequence1, q.sequence2 FROM {_QUERY} q "
+                        f"ANTI JOIN {_RYPE_HOST} h ON h.sequence_idx = q.read_id"
+                    )
+                    _run_align_minimap2(
+                        conn,
+                        inputs.host_minimap2_path,
+                        _SURVIVORS,
+                        _MM2_HOST,
+                        preset=_MINIMAP2_PRESET,
+                    )
+
+                # Merge host hits into the qc_mask under the privacy precedence:
+                # minimap2 > rype > the qc_mask's own reason. Host only ever overrides
+                # 'pass' (the query view restricted classify to pass reads), so a
+                # qc_* row is untouched. mask_idx is the per-run constant stamped here;
+                # prep_sample_idx is stamped PER ROW from the reads (the _READ_META
+                # join) so a multi-sample block records each read's true owner. The
+                # inner join is 1:1 (every qc_mask row is a read qc emitted from these
+                # same reads). ORDER BY (mask_idx, prep_sample_idx, sequence_idx) — the
+                # read_mask table's sort key (sequence_idx last for row-group pruning).
+                conn.execute(
+                    "COPY (SELECT "
+                    "  ?::BIGINT AS mask_idx, "
+                    "  rm.prep_sample_idx, "
+                    "  q.sequence_idx, "
+                    "  CASE "
+                    "    WHEN mm.sequence_idx IS NOT NULL THEN "
+                    f"'{ReadMaskReason.HOST_MINIMAP2.value}' "
+                    f"    WHEN ry.sequence_idx IS NOT NULL THEN '{ReadMaskReason.HOST_RYPE.value}' "
+                    "    ELSE q.reason "
+                    "  END AS reason, "
+                    "  q.left_trim1, q.right_trim1, q.left_trim2, q.right_trim2 "
+                    f"FROM {_QC_MASK} q "
+                    f"JOIN {_READ_META} rm USING (sequence_idx) "
+                    f"LEFT JOIN {_RYPE_HOST} ry USING (sequence_idx) "
+                    f"LEFT JOIN {_MM2_HOST} mm USING (sequence_idx) "
+                    "ORDER BY mask_idx, prep_sample_idx, sequence_idx) "
+                    f"TO '{out_sql}' ({PARQUET_OPTS})",
+                    [inputs.mask_idx],
+                )
         success = True
     finally:
         # On failure remove a partial output so the SLURM launcher's manifest

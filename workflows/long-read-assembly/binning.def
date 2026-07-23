@@ -7,8 +7,9 @@ From: mambaorg/micromamba:1.5.8
 # `apptainer exec <sif> /opt/qiita/binning.sh` (per-step entrypoint), so the
 # %runscript is unused.
 #
-# metawrap-mg is the heaviest bioconda solve of the four images (metabat2 + maxbin2
-# + concoct + its aligners in one env), so this SIF is the slowest to build.
+# This is the heaviest bioconda solve of the four images — metaWRAP's scripts plus
+# every binner and aligner they shell out to, in one env — so this SIF is the
+# slowest to build.
 
 %labels
     workflow long-read-assembly
@@ -23,6 +24,8 @@ From: mambaorg/micromamba:1.5.8
     ../_shared/_lib.sh /opt/qiita/_lib.sh
     # This image's per-step entrypoint.
     binning.sh /opt/qiita/binning.sh
+    # Required-tool assertion, shared by %test and the spec's VERIFY_CMD.
+    binning-verify.sh /opt/qiita/binning-verify.sh
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -44,10 +47,25 @@ From: mambaorg/micromamba:1.5.8
 
     # One env for this tool. Channels bioconda + conda-forge; versions pinned
     # loosely here and tightened after the first Linux build resolves the solve.
-    #  - binning: metawrap bundles metabat2 + maxbin2 + concoct + its aligners.
-    micromamba create -y -n metawrap -c bioconda -c conda-forge metawrap-mg
+    #
+    # `metawrap-mg` is metaWRAP's SCRIPTS ONLY — it declares none of the tools
+    # those scripts invoke, so it must NOT be installed alone. Every binner has
+    # to be named explicitly; see binning-verify.sh for the derivation of this
+    # list from metaWRAP's own binning.sh. Two packages that look like
+    # alternatives and are not:
+    #   - the full `metawrap` bioconda package is unsolvable (1.0/1.1 pin a
+    #     cairo that no longer exists; 1.2 pins megahit/salmon with
+    #     irreconcilable icu/libboost/zlib conflicts). Unqualified `metawrap`
+    #     also resolves to an UNRELATED conda-forge package (0.0.2).
+    #   - `metawrap-binning` declares bowtie2 (invoked zero times by the module)
+    #     and omits both bwa and metabat2.
+    # maxbin2 is pinned >=2.2.6 because 2.2.1's executable is `MaxBin`, not the
+    # `run_MaxBin.pl` metaWRAP invokes — an unpinned solve takes 2.2.1 and the
+    # image passes every build check, then fails inside the job.
+    micromamba create -y -n metawrap -c bioconda -c conda-forge \
+        metawrap-mg bwa samtools metabat2 "maxbin2>=2.2.6" concoct
 
-    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh /opt/qiita/binning-verify.sh
     chmod 0644 /opt/qiita/manifest_writer.py
 
     micromamba clean -a -y
@@ -67,6 +85,10 @@ From: mambaorg/micromamba:1.5.8
     export HOME="$(mktemp -d)"
     micromamba env list | grep -q metawrap
     micromamba run -n metawrap metawrap --version >/dev/null 2>&1 || micromamba run -n metawrap metawrap -h >/dev/null
+    # The two lines above pass on an env with ZERO binners — that is exactly how
+    # a binner-less image shipped. This asserts every tool metaWRAP actually
+    # invokes, and fails the BUILD when one is absent.
+    /opt/qiita/binning-verify.sh
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep
     # rather than at the end of a long job.

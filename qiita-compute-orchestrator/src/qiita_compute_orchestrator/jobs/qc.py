@@ -94,6 +94,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ..read_source import bind_step_reads
 from . import JobPlan, JobResourcePlan
 from ._partial_mask import assert_single_end
 
@@ -182,7 +183,7 @@ _SE_REASON_CASE = (
 class Inputs(BaseModel):
     """Typed input contract for qc.
 
-    `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
+    `reads` (OPTIONAL — see the note below on why) is a staged read Parquet:
     `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`.
     `adapter_parquet` is the canonical adapter set the runner materializes
     (`_resolve_qc_adapters`) — OPTIONAL. Unbound (None) means NO adapter trim: the
@@ -205,9 +206,15 @@ class Inputs(BaseModel):
     ticket still has the framework inject it; a BLOCK-scoped ticket (many samples)
     flows no such scalar (None here). Kept as an accepted field so both scopes
     validate against one Inputs shape.
+
+    `reads` is OPTIONAL because its SOURCE is a property of the workflow, not of
+    this job: the per-sample `read-mask` workflow binds a staged Parquet, while
+    `read-mask-block` binds nothing and the block's reads STREAM from the data
+    plane at runtime. `bind_step_reads` resolves whichever applies and hands back
+    one relation name, so everything below is source-agnostic.
     """
 
-    reads: Path
+    reads: Path | None = None
     adapter_parquet: Path | None = None
     partial_mask: Path | None = None
     instrument_model: str | None = None
@@ -232,6 +239,15 @@ _PLAN_WALLTIME_SECONDS_PER_MILLION_PAIRS = 30.0
 def plan(inputs: Inputs) -> JobPlan:
     """Size qc's WALLTIME from the read count (Parquet footer, no data scan).
 
+    Returns an EMPTY plan when `reads` is unbound (the block path, where the reads
+    stream from the data plane): a stream has no footer to count, and plan() runs
+    at submit time in the orchestrator process, so it must not open a Flight
+    stream to find out. The step then takes the workflow YAML baseline with
+    TIMEOUT escalation as the backstop — the same posture `estimate_feature_table`
+    takes. A block's exact read count IS derivable control-plane-side from the
+    block members, so this sizing can be restored by threading that count through
+    the workflow `params:`; left for a follow-up.
+
     Returns a walltime hint only — memory and cpu are left to the YAML baseline.
     qc streams, so its peak memory is ~flat in row count (see the coefficient
     comment above); walltime is the axis that tracks input cardinality. The
@@ -240,6 +256,8 @@ def plan(inputs: Inputs) -> JobPlan:
     covers an under-estimate. Advisory: any failure here (e.g. an unreadable
     input) is caught upstream in the /step/plan route, which falls back to the
     baseline."""
+    if inputs.reads is None:
+        return JobPlan()
     read_pairs = count_read_pairs(inputs.reads)
     walltime = linear_walltime(
         read_pairs,
@@ -457,8 +475,6 @@ def _qc_carry_select(incoming_view: str) -> str:
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    if not inputs.reads.exists():
-        raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
     if inputs.adapter_parquet is not None and not inputs.adapter_parquet.exists():
         raise FileNotFoundError(f"adapter_parquet not found: {inputs.adapter_parquet}")
     if inputs.partial_mask is not None and not inputs.partial_mask.exists():
@@ -472,7 +488,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # COPY / CREATE VIEW path literals can't take a bound param; route them
     # through validate_parquet_path (fail-fast on quote/backslash/control chars)
     # rather than inline-escaping.
-    reads_sql = validate_parquet_path(inputs.reads)
     out_sql = validate_parquet_path(qc_mask)
 
     success = False
@@ -484,85 +499,97 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
-
-            # Read + render the adapter set from the staged Parquet (fail fast on
-            # an empty/unreadable *file*). The constant VARCHAR[] is inlined into
-            # the QC SQL — miint requires a bind-time constant adapter list. No
-            # bound set (long-read / PacBio) -> an empty list, which miint's
-            # trim_adapters treats as a no-op (0 trims; pinned in the qc contract
-            # test), so only polyG + the length/quality filter run.
-            adapters = (
-                _read_adapter_parquet(conn, inputs.adapter_parquet)
-                if inputs.adapter_parquet is not None
-                else []
-            )
-            adapters_sql = _adapters_sql(adapters)
-
-            # Route by layout: SE (sequence2 IS NULL) and PE rows take different
-            # miint overloads. The qual columns ride along (QC needs decoded
-            # phred). read_id is not needed — the mask keys on sequence_idx only.
-            #
-            # This does NOT assume a read set can be both. A prep_sample's reads come
-            # from one library on one run, so in practice every row is SE or every row
-            # is PE and the other view is empty (contributing no rows to the union).
-            # The split is layout ROUTING to the right miint overload, not a claim that
-            # the two mix; keeping both branches unconditional means one code path
-            # instead of an `if` that would have to re-derive the layout to pick a seam.
-            #
-            # Both SE shapes expose `in_left1`/`in_right1`, so `_qc_se_select` has
-            # one code path: with no incoming mask they are literal zeros and
-            # `sequence1`/`qual1` are the raw columns; with one, they are the
-            # incoming trims and the seq/qual are sliced by them in lockstep.
-            if inputs.partial_mask is None:
-                carry_select: str | None = None
-                conn.execute(
-                    f"CREATE VIEW {_SE} AS "
-                    "SELECT sequence_idx, sequence1, qual1, "
-                    "0::UINTEGER AS in_left1, 0::UINTEGER AS in_right1 "
-                    f"FROM read_parquet('{reads_sql}') WHERE sequence2 IS NULL"
+            # Bind the reads. The per-sample `read-mask` workflow stages a
+            # Parquet (bound as a lazy view — qc streams, so peak memory must stay
+            # flat in row count); `read-mask-block` binds none and the block's
+            # reads stream from the data plane. One relation name either way, so
+            # every view below is source-agnostic.
+            async with bind_step_reads(
+                conn,
+                reads=inputs.reads,
+                work_ticket_idx=inputs.work_ticket_idx,
+                workspace=duckdb_tmp,
+            ) as reads_rel:
+                # Read + render the adapter set from the staged Parquet (fail fast on
+                # an empty/unreadable *file*). The constant VARCHAR[] is inlined into
+                # the QC SQL — miint requires a bind-time constant adapter list. No
+                # bound set (long-read / PacBio) -> an empty list, which miint's
+                # trim_adapters treats as a no-op (0 trims; pinned in the qc contract
+                # test), so only polyG + the length/quality filter run.
+                adapters = (
+                    _read_adapter_parquet(conn, inputs.adapter_parquet)
+                    if inputs.adapter_parquet is not None
+                    else []
                 )
-            else:
-                mask_sql = validate_parquet_path(inputs.partial_mask)
-                conn.execute(f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')")
-                # The one condition our own construction does NOT establish: the
-                # gates are client-supplied, so a caller can ask for the long-read
-                # chain over a paired-end read set. The mask's SHAPE (one row per
-                # read, trims within the read) is guaranteed by its producers and
-                # pinned in their tests — see `_partial_mask`.
-                assert_single_end(conn, reads_sql, "partial_mask", inputs.partial_mask)
-                # Only still-`pass` rows are re-classified, on the trimmed insert.
+                adapters_sql = _adapters_sql(adapters)
+
+                # Route by layout: SE (sequence2 IS NULL) and PE rows take different
+                # miint overloads. The qual columns ride along (QC needs decoded
+                # phred). read_id is not needed — the mask keys on sequence_idx only.
+                #
+                # This does NOT assume a read set can be both. A prep_sample's reads come
+                # from one library on one run, so in practice every row is SE or every row
+                # is PE and the other view is empty (contributing no rows to the union).
+                # The split is layout ROUTING to the right miint overload, not a claim that
+                # the two mix; keeping both branches unconditional means one code path
+                # instead of an `if` that would have to re-derive the layout to pick a seam.
+                #
+                # Both SE shapes expose `in_left1`/`in_right1`, so `_qc_se_select` has
+                # one code path: with no incoming mask they are literal zeros and
+                # `sequence1`/`qual1` are the raw columns; with one, they are the
+                # incoming trims and the seq/qual are sliced by them in lockstep.
+                if inputs.partial_mask is None:
+                    carry_select: str | None = None
+                    conn.execute(
+                        f"CREATE VIEW {_SE} AS "
+                        "SELECT sequence_idx, sequence1, qual1, "
+                        "0::UINTEGER AS in_left1, 0::UINTEGER AS in_right1 "
+                        f"FROM {reads_rel} WHERE sequence2 IS NULL"
+                    )
+                else:
+                    mask_sql = validate_parquet_path(inputs.partial_mask)
+                    conn.execute(
+                        f"CREATE VIEW {_INCOMING} AS SELECT * FROM read_parquet('{mask_sql}')"
+                    )
+                    # The one condition our own construction does NOT establish: the
+                    # gates are client-supplied, so a caller can ask for the long-read
+                    # chain over a paired-end read set. The mask's SHAPE (one row per
+                    # read, trims within the read) is guaranteed by its producers and
+                    # pinned in their tests — see `_partial_mask`.
+                    assert_single_end(conn, reads_rel, "partial_mask", inputs.partial_mask)
+                    # Only still-`pass` rows are re-classified, on the trimmed insert.
+                    conn.execute(
+                        f"CREATE VIEW {_SE} AS "
+                        "SELECT r.sequence_idx, "
+                        f"{_INCOMING_SEQ1} AS sequence1, "
+                        f"{_INCOMING_QUAL1} AS qual1, "
+                        "m.left_trim1 AS in_left1, m.right_trim1 AS in_right1 "
+                        f"FROM {reads_rel} r JOIN {_INCOMING} m "
+                        "USING (sequence_idx) "
+                        f"WHERE r.sequence2 IS NULL AND m.reason = '{ReadMaskReason.PASS.value}'"
+                    )
+                    carry_select = _qc_carry_select(_INCOMING)
                 conn.execute(
-                    f"CREATE VIEW {_SE} AS "
-                    "SELECT r.sequence_idx, "
-                    f"{_INCOMING_SEQ1} AS sequence1, "
-                    f"{_INCOMING_QUAL1} AS qual1, "
-                    "m.left_trim1 AS in_left1, m.right_trim1 AS in_right1 "
-                    f"FROM read_parquet('{reads_sql}') r JOIN {_INCOMING} m "
-                    "USING (sequence_idx) "
-                    f"WHERE r.sequence2 IS NULL AND m.reason = '{ReadMaskReason.PASS.value}'"
+                    f"CREATE VIEW {_PE} AS "
+                    "SELECT sequence_idx, sequence1, qual1, sequence2, qual2 "
+                    f"FROM {reads_rel} WHERE sequence2 IS NOT NULL"
                 )
-                carry_select = _qc_carry_select(_INCOMING)
-            conn.execute(
-                f"CREATE VIEW {_PE} AS "
-                "SELECT sequence_idx, sequence1, qual1, sequence2, qual2 "
-                f"FROM read_parquet('{reads_sql}') WHERE sequence2 IS NOT NULL"
-            )
-            # Stream the whole transform: the SE and PE seams each emit a 6-col
-            # mask SELECT, UNION ALL'd (plus the incoming mask's non-pass carry
-            # branch, when there is one) and sorted straight into the COPY — no
-            # intermediate accumulator table. ORDER BY keeps the lake-friendly
-            # sorted `sequence_idx` layout and makes the output deterministic; an
-            # empty source view contributes no rows. The SE seam stays FIRST:
-            # DuckDB takes the Parquet column names from the union's first branch.
-            se_select = _qc_se_select(_SE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
-            pe_select = _qc_pe_select(_PE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
-            branches = [se_select, pe_select]
-            if carry_select is not None:
-                branches.append(carry_select)
-            union_sql = " UNION ALL ".join(f"({b})" for b in branches)
-            conn.execute(
-                f"COPY ({union_sql} ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
-            )
+                # Stream the whole transform: the SE and PE seams each emit a 6-col
+                # mask SELECT, UNION ALL'd (plus the incoming mask's non-pass carry
+                # branch, when there is one) and sorted straight into the COPY — no
+                # intermediate accumulator table. ORDER BY keeps the lake-friendly
+                # sorted `sequence_idx` layout and makes the output deterministic; an
+                # empty source view contributes no rows. The SE seam stays FIRST:
+                # DuckDB takes the Parquet column names from the union's first branch.
+                se_select = _qc_se_select(_SE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
+                pe_select = _qc_pe_select(_PE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
+                branches = [se_select, pe_select]
+                if carry_select is not None:
+                    branches.append(carry_select)
+                union_sql = " UNION ALL ".join(f"({b})" for b in branches)
+                conn.execute(
+                    f"COPY ({union_sql} ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
+                )
         success = True
     finally:
         # On failure remove a partial output so the SLURM launcher's manifest

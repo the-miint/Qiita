@@ -77,6 +77,7 @@ from ..auth.principal import (
     get_current_principal,
 )
 from ..auth.tickets import sign_ticket
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -683,10 +684,13 @@ async def delete_reference(
 
 
 # Tables that can appear in a DoGet ticket, CP-side mirror of the data plane's
-# ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it.
-# `read_masked` (the masked-read surface) is the one the data plane reaches via
-# Flight in addition to the reference_* tables; raw `read`/`read_mask` are
-# deliberately absent from both allowlists (privacy by construction).
+# ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it
+# (test_cp_doget_allowlist_matches_the_rust_one_exactly parses the Rust const and
+# fails on drift). `read_masked` (the masked-read surface) and the two block-read
+# selectors are what the data plane reaches via Flight in addition to the
+# reference_* tables; the bare `read` / `read_mask` TABLES are deliberately absent
+# from both allowlists (privacy by construction — see the PRIVACY note on the
+# Rust const for why the members-scoped `read_block` selector is not a hole).
 _DOGET_ALLOWED_TABLES = frozenset(
     {
         "reference_sequences",
@@ -706,18 +710,25 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # by alignment_idx + prep_sample_idx, so it is excluded from
         # _REFERENCE_DOGET_TABLES below.
         "alignment_visible",
+        # Block-read selectors, served by routes/read.py and scoped by a block's
+        # members. Named from the shared constants rather than re-spelled, so the
+        # signer, the allowlist, and the scope rule cannot drift from each other.
+        READ_BLOCK_TABLE,
+        READ_MASKED_BLOCK_TABLE,
     }
 )
 
-# The subset the reference DoGet route below can sign. `read_masked` is reached
-# through the dedicated /read-masked/ticket/doget route (routes/read_masked.py),
-# whose ticket carries (prep_sample_idx, mask_idx) — not reference_idx — and
-# which enforces the mandatory-filter invariant. `alignment_visible` is served by
-# routes/alignment.py (scoped by alignment_idx + prep_sample_idx). The reference
-# route restricts itself to the reference_* tables whose membership it resolves —
-# including `reference_taxonomy_visible`, so external taxonomy reads also go
-# through the exclusion view.
-_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset({"read_masked", "alignment_visible"})
+# The subset the reference DoGet route below can sign. Each excluded table is
+# reached through its own dedicated route, which enforces a scope the generic
+# reference route cannot: `read_masked` via /read-masked/ticket/doget
+# (prep_sample_idx + mask_idx), `alignment_visible` via /alignment/ticket/doget
+# (alignment_idx + cohort), and the block-read selectors via /read/ticket/doget
+# (a block's members). The reference route restricts itself to the reference_*
+# tables whose membership it resolves — including `reference_taxonomy_visible`,
+# so external taxonomy reads also go through the exclusion view.
+_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
+    {"read_masked", "alignment_visible", READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE}
+)
 
 
 @router.post(PATH_REFERENCE_DOGET, status_code=201)
