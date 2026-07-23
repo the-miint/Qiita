@@ -32,7 +32,11 @@ duplicates further down are historical strata; leave them where they are.
   across genomes is exported for each of its genomes (the payoff of the
   feature_genome many-to-many fix). Exported bytes are the stored original strand
   of the representative record — the feature_idx dedup is by canonical hash, so a
-  reverse-complement-equal input exports the representative's orientation.
+  reverse-complement-equal input exports the representative's orientation. A short
+  export (fewer sequences written than the genome has members — e.g. an `indexing`
+  reference whose chunks are not yet in DuckLake, or one with a partial delete) is
+  a hard error: the incomplete file is removed and the CLI exits non-zero rather
+  than leaving a file that looks complete.
 - **Resolve a genome to its member features within a reference —
   `GET /reference/{reference_idx}/genome/{genome_idx}/member` (`reference:read`) (#366).**
   Returns each member feature's `feature_idx` + the reference's FASTA-header

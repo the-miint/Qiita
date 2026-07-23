@@ -255,39 +255,46 @@ def _create_chunks_doget_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-def _atomic_write(target: Path, write_fn) -> None:
+def _atomic_write(target: Path, write_fn):
     """Run `write_fn(partial)` then atomically rename the partial into place; on
     any failure remove the partial so a retry never finds a half-written file. No
     restrictive chmod — reference sequences are public reference data, unlike the
-    privacy-masked read export."""
+    privacy-masked read export. Returns whatever `write_fn(partial)` returns."""
     partial = target.parent / f"{target.name}.partial"
     try:
-        write_fn(partial)
+        result = write_fn(partial)
         os.replace(partial, target)
+        return result
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             partial.unlink()
         raise
 
 
-def _write_genome_parquet(reader, target: Path) -> None:
+def _write_genome_parquet(reader, target: Path) -> int:
     """Stream the DoGet chunk reader straight to a zstd Parquet (the raw
     `reference_sequence_chunks` rows: feature_idx, chunk_index, chunk_data). No
     DuckDB hop, so the bulk sequence bytes are never materialized into DuckDB
     vectors. Batches are buffered up to one row group's worth of bytes so a
     genome-scale export doesn't fragment into tiny row groups (mirrors the
-    masked-read export's parquet writer). A zero-row stream still writes a valid
-    empty Parquet from the reader's schema."""
+    masked-read export's parquet writer). Returns the number of DISTINCT
+    feature_idx written (reduced per batch, so the set stays feature-scale, not
+    chunk-scale) so the caller can detect a short export — fewer features than
+    were requested, e.g. an indexing reference whose chunks are not in DuckLake
+    yet."""
     import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.compute as pc  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
     from qiita_common.parquet import ROW_GROUP_SIZE_BYTES  # noqa: PLC0415
 
-    def _write(partial: Path) -> None:
+    def _write(partial: Path) -> int:
         writer = pq.ParquetWriter(partial, reader.schema, compression="zstd")
+        seen: set[int] = set()
         try:
             buffer: list = []
             buffered_bytes = 0
             for batch in reader:
+                seen.update(pc.unique(batch.column("feature_idx")).to_pylist())
                 buffer.append(batch)
                 buffered_bytes += batch.nbytes
                 if buffered_bytes >= ROW_GROUP_SIZE_BYTES:
@@ -298,14 +305,17 @@ def _write_genome_parquet(reader, target: Path) -> None:
                 writer.write_table(pa.Table.from_batches(buffer, reader.schema))
         finally:
             writer.close()
+        return len(seen)
 
-    _atomic_write(target, _write)
+    return _atomic_write(target, _write)
 
 
-def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Path, con) -> None:
+def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Path, con) -> int:
     """Reassemble each feature's sequence from the DoGet chunk stream and write a
     gzipped FASTA via miint's FORMAT FASTA writer, using the reference's accession
-    as each record header. `con` is a shared miint DuckDB connection.
+    as each record header. `con` is a shared miint DuckDB connection. Returns the
+    number of FASTA records (one per distinct feature_idx) written, so the caller
+    can detect a short export.
 
     The header (accession) is carried as DATA (a registered column), never inlined
     into the COPY SQL — so it presents no SQL-injection surface; only the output
@@ -331,20 +341,31 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
     con.register("accession_map", acc_tbl)
     try:
 
-        def _write(partial: Path) -> None:
-            con.execute(
+        def _write(partial: Path) -> int:
+            # COPY ... TO returns a single-row `Count` = records written.
+            (count,) = con.execute(
                 "COPY (SELECT coalesce(m.accession, 'feature_' || c.feature_idx) AS read_id,"
                 "        string_agg(c.chunk_data, '' ORDER BY c.chunk_index) AS sequence1"
                 "   FROM chunks c JOIN accession_map m USING (feature_idx)"
                 "  GROUP BY c.feature_idx, m.accession"
                 "  ORDER BY c.feature_idx)"
                 f" TO '{_sql_str(partial)}' (FORMAT FASTA, COMPRESSION 'gzip')"
-            )
+            ).fetchone()
+            return count
 
-        _atomic_write(target, _write)
+        return _atomic_write(target, _write)
     finally:
         con.unregister("chunks")
         con.unregister("accession_map")
+
+
+class _IncompleteExportError(Exception):
+    """A genome's export wrote fewer sequences than the reference reports as its
+    members — the sequence bytes are not (yet) fully registered in DuckLake (an
+    indexing reference, or one with a partial delete). Raised rather than handing
+    back a file that looks complete but silently drops contigs (the member route
+    already 404s an empty genome; this is the same fail-loud contract for the
+    export writers)."""
 
 
 def _export_one_genome(
@@ -361,7 +382,13 @@ def _export_one_genome(
     """Resolve one genome's members, DoGet its sequence chunks, and write the
     requested format to `<reference_idx>.<genome_idx>.{fasta.gz|parquet}` under
     output_dir. Returns the written path. A feature shared across genomes (a
-    plasmid) is included for each of its genomes — the many-to-many payoff."""
+    plasmid) is included for each of its genomes — the many-to-many payoff.
+
+    Fails loud on a SHORT export: if the writer emits fewer distinct features than
+    the genome has members (the reference's sequence bytes are not fully in
+    DuckLake), the just-written file is removed and `_IncompleteExportError` is
+    raised, so a not-fully-registered reference never yields a silently truncated
+    export that looks complete."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
     members = _resolve_genome_members(
@@ -376,7 +403,7 @@ def _export_one_genome(
         # Parquet streams straight to a ParquetWriter (no Acero), keeping the bulk
         # chunk buffers zero-copy — so no buffer realignment is needed.
         target = output_dir / f"{reference_idx}.{genome_idx}.parquet"
-        _write_genome_parquet(flight_client.do_get(ticket_obj).to_reader(), target)
+        written = _write_genome_parquet(flight_client.do_get(ticket_obj).to_reader(), target)
     else:
         # The FASTA path registers the reader into DuckDB (miint FORMAT FASTA via
         # Acero), so ask the Flight reader to realign each buffer on receive —
@@ -389,8 +416,18 @@ def _export_one_genome(
         )
         target = output_dir / f"{reference_idx}.{genome_idx}.fasta.gz"
         accession_map = {m["feature_idx"]: m["accession"] for m in members}
-        _write_genome_fasta(
+        written = _write_genome_fasta(
             flight_client.do_get(ticket_obj, read_opts).to_reader(), accession_map, target, con
+        )
+    expected = len(feature_idxs)
+    if written < expected:
+        with contextlib.suppress(FileNotFoundError):
+            target.unlink()
+        raise _IncompleteExportError(
+            f"genome {genome_idx}: wrote {written} of {expected} member sequence(s) — the "
+            "reference's sequence bytes are not fully registered in DuckLake (e.g. an "
+            "indexing reference, or one with a partial delete); refusing to leave an "
+            "incomplete export on disk."
         )
     return target
 
@@ -403,9 +440,10 @@ def _handle_reference_genome_export(
     writes one file per genome (FASTA.gz or Parquet). Requires `reference:read`
     (the member route requires it and the reference DoGet ticket route accepts it —
     reference sequences are public reference data). Fails loudly (exit 1) on the
-    first HTTP / Flight error, never a silent skip; genomes written before the
-    failure remain on disk (each file is written atomically, so every one present
-    is complete)."""
+    first HTTP / Flight error or a short export (fewer sequences than the genome's
+    members — a not-fully-registered reference; the incomplete file is removed),
+    never a silent skip; genomes written before the failure remain on disk (each
+    file is written atomically, so every one present is complete)."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
     from ...miint import connect_with_miint
@@ -447,6 +485,9 @@ def _handle_reference_genome_export(
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
+        return 1
+    except _IncompleteExportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
         flight_client.close()
