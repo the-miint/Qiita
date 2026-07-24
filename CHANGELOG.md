@@ -252,7 +252,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
-  `binning.sh` runs the `samtools sort` metaWRAP skipped (#TBD).** A production
+  `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
   `ERROR: the bam file 'reads.bam' is not sorted!`. Two causes, both fixed here:
   metaWRAP's own `samtools sort` sits inside the *same*
@@ -265,7 +265,7 @@ duplicates further down are historical strata; leave them where they are.
   and renames it into place (so a killed sort cannot leave a truncated BAM at the
   name metaWRAP reads), replacing the old `ln`-else-`cp` staging.
 - **Container steps are told their own allocation: `QIITA_CPUS` / `QIITA_MEM_MB`
-  (#TBD).** `apptainer exec --containall` scrubs the environment, so no `SLURM_*`
+  (#370).** `apptainer exec --containall` scrubs the environment, so no `SLURM_*`
   var reaches a container entrypoint — measured on the deploy host: zero survive.
   `SLURM_CPUS_PER_TASK` was therefore always unset in `workflows/_shared/_lib.sh`
   and in `workflows/bcl-convert/entrypoint.sh`, and `THREADS` came from the `nproc`
@@ -280,7 +280,7 @@ duplicates further down are historical strata; leave them where they are.
   production BAM at 16 cpu: peak RSS 11.1 GiB / 19 s wall, unchanged between a
   12.75 GiB and a 34 GiB budget.
 - **Corrected the miint `FORMAT BAM` `@SQ`-order claim in `docs/duckdb-miint.md`,
-  `assembly_coverage`'s docstring, and `test_assembly_coverage.py` (#TBD).** Those
+  `assembly_coverage`'s docstring, and `test_assembly_coverage.py` (#370).** Those
   three asserted that `@SQ` is emitted in the *reverse* of the `REFERENCE_LENGTHS`
   table's physical order, so that building the table `ORDER BY … DESC` lands `@SQ`
   ascending and makes `ORDER BY reference, position` a genuine coordinate sort.
@@ -294,7 +294,7 @@ duplicates further down are historical strata; leave them where they are.
   it is replaced by `test_sq_order_is_not_derivable_from_reflen`, which pins the
   probe finding and fails loudly if a miint bump gives `@SQ` a defined order.
 - **`assembly_coverage` drops both now-inert `ORDER BY`s and its
-  `preserve_insertion_order` override (#TBD).** With the `@SQ` reversal disproven,
+  `preserve_insertion_order` override (#370).** With the `@SQ` reversal disproven,
   the reflen table's `ORDER BY read_id DESC` steered nothing, and the COPY's
   `ORDER BY reference ASC, position ASC` was a name sort — not the tid sort a BAM
   is sorted by — over a read-set-sized relation that the module's own memory split
@@ -305,9 +305,6 @@ duplicates further down are historical strata; leave them where they are.
   `test_writer_output_is_not_tid_sorted`, which pins the property the production
   failure was actually about.
 
-**NOTE ON `#TBD`:** these entries were written before the PR existed. Replace every
-`(#TBD)` above (and in `DEPLOY_CHECKLIST.md`) with the real PR number when it is
-opened, and delete this note.
 - **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
   mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under
