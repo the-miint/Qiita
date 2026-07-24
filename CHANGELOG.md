@@ -264,21 +264,23 @@ duplicates further down are historical strata; leave them where they are.
   zero. `binning.sh` now sorts into a `.partial` staging name inside `work_files/`
   and renames it into place (so a killed sort cannot leave a truncated BAM at the
   name metaWRAP reads), replacing the old `ln`-else-`cp` staging.
-- **`samtools` is pinned (`=1.10`) in the `binning` image, and the sort is pinned
-  by a test that needs no binary (#370).** Nothing in `binning.def` named samtools
-  before — it arrived through `metawrap-mg`'s solve, so any later rebuild could
-  have moved it, under a `samtools sort` whose memory budget is sized from a peak
-  RSS measured on one specific build. 1.10 is what the deployed image ships, and a
-  dry-run solve with the pin reproduces every build string unchanged (samtools
-  `h2e538c0_3`). The behavioural test for the sort needs the samtools binary and is
-  skipped wherever it is absent (CI included), and it exercises samtools rather
-  than us — so `test_binning_coverage_sort_pin.py` asserts the parts that are ours:
-  that the entrypoint still sorts `${COVERAGE_BAM}`, has not regressed to copying
-  it into place, still stages atomically inside `work_files/`, and still derives
-  the sort budget from `MEM_MB`. It reads the script with comments stripped and
-  `\`-continuations folded, so it cannot be satisfied by a comment mentioning the
-  command — the failure mode the first deploy-checklist grep for this same change
-  actually had. Each assertion was mutation-checked.
+- **The `binning` image pins `samtools=1.10` and `metabat2=2.15`, and asserts both
+  at build time (#370).** Neither was named in `binning.def` — both arrived through
+  `metawrap-mg`'s solve, so a rebuild could move either with no change to this
+  repo. They are the two tools the sort fix depends on: samtools provides the
+  `samtools sort`, and metabat2 owns `jgi_summarize_bam_contig_depths`, the tool
+  whose `is not sorted!` rejection the sort exists to satisfy — pinning the
+  producer of the sort order while leaving the consumer that adjudicates it free
+  to move would have been half a fix. A solver pin is invisible in the built
+  image, so `binning-verify.sh` now reads each tool's own reported version and
+  fails the build on drift; it runs as both the def's `%test` and the spec's
+  `VERIFY_CMD`. The sort itself is pinned by `test_binning_coverage_sort_pin.py`,
+  which needs no binary: the behavioural test needs the samtools binary (so it is
+  skipped wherever samtools is absent, CI included) and invokes samtools directly,
+  pinning samtools' behaviour rather than ours. The new test asserts the parts
+  that are ours — the entrypoint still sorts `${COVERAGE_BAM}`, the only thing
+  written to the path metaWRAP reads is the sorted BAM, staging stays atomic
+  inside `work_files/`, and the sort budget still derives from `MEM_MB`.
 - **Container steps are told their own allocation: `QIITA_CPUS` / `QIITA_MEM_MB`
   (#370).** `apptainer exec --containall` scrubs the environment, so no `SLURM_*`
   var reaches a container entrypoint — measured on the deploy host: zero survive.

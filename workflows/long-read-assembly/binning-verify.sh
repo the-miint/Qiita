@@ -87,7 +87,54 @@ if (( ${#missing[@]} > 0 || ${#unrunnable[@]} > 0 )); then
     exit 1
 fi
 
+# Presence is not enough for the two tools whose BEHAVIOUR the workflow depends
+# on. Both are pinned in binning.def; assert the pins actually took, because the
+# solver is otherwise the only thing enforcing them and a drifted solve would
+# ship a green image. This is the one place that can observe the built result —
+# a test in the repo can only read the spec string, which is already visible in
+# a diff.
+#   samtools .... binning.sh runs `samtools sort` on the staged coverage BAM.
+#   metabat2 .... owns jgi_summarize_bam_contig_depths, whose "is not sorted!"
+#                 rejection is the acceptance criterion that sort exists to meet.
+# Version is read from the tool, not the package metadata, so a hand-modified
+# env cannot satisfy it. The two disagree about HOW to ask, and guessing gets it
+# wrong: samtools takes --version, while jgi REJECTS it ("unrecognized option")
+# and prints its version on the first line of its no-argument usage banner, on
+# stderr. Hence the per-tool argument — an empty value means "invoke bare".
+declare -A PINNED=(
+    [samtools]=1.10
+    [jgi_summarize_bam_contig_depths]=2.15
+)
+declare -A VERSION_ARG=(
+    [samtools]="--version"
+    [jgi_summarize_bam_contig_depths]=""
+)
+drifted=()
+for tool in "${!PINNED[@]}"; do
+    want="${PINNED[$tool]}"
+    arg="${VERSION_ARG[$tool]}"
+    if [[ -n "${arg}" ]]; then
+        got=$("${ENV_BIN}/${tool}" "${arg}" 2>&1 | head -1)
+    else
+        got=$("${ENV_BIN}/${tool}" 2>&1 | head -1)
+    fi
+    # Match the version as a whole token so 1.10 does not accept 1.100.
+    if ! grep -qE "(^|[^0-9.])${want}([^0-9.]|$)" <<<"${got}"; then
+        drifted+=("${tool}: want ${want}, got '${got}'")
+    fi
+done
+if (( ${#drifted[@]} > 0 )); then
+    echo "binning image resolved ${#drifted[@]} pinned tool(s) at the wrong version:" >&2
+    printf '  - %s\n' "${drifted[@]}" >&2
+    echo "binning.def pins these; the solve moved anyway. Reconcile the two before" >&2
+    echo "shipping — binning.sh's sort and jgi's acceptance of it are version-bound." >&2
+    exit 1
+fi
+
 # maxbin2 2.2.1 ships `MaxBin`, not `run_MaxBin.pl`, so the presence check above
 # already excludes it — this pins the version in the output for the build log.
 echo "binning image: all ${#REQUIRED[@]} required tools present in ${ENV_BIN}"
+for tool in "${!PINNED[@]}"; do
+    echo "binning image: ${tool} at pinned ${PINNED[$tool]}"
+done
 echo "BINNING_IMAGE_OK"
