@@ -249,6 +249,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
+  `binning.sh` runs the `samtools sort` metaWRAP skipped.** A production ticket
+  failed in `jgi_summarize_bam_contig_depths` 2.15 with
+  `ERROR: the bam file 'reads.bam' is not sorted!`. Two causes, both fixed here:
+  metaWRAP's own `samtools sort` sits inside the *same*
+  `if [[ ! -f work_files/<sample>.bam ]]` guard as its `bwa mem`, so pre-placing
+  our minimap2 BAM to skip the aligner silently skipped the sort as well; and the
+  BAM was not sorted to begin with, because `assembly_coverage` relied on a miint
+  contract that turned out to be false. `binning.sh` now sorts the staged BAM
+  (`samtools sort -@ $THREADS -m 2G -T $WORK/...`) instead of hardlinking/copying
+  it — which subsumes the old `ln`-to-avoid-a-second-copy path. The write logic in
+  `assembly_coverage` is unchanged.
+- **Corrected the miint `FORMAT BAM` `@SQ`-order claim in `docs/duckdb-miint.md`,
+  `assembly_coverage`'s docstring, and `test_assembly_coverage.py`.** Those three
+  asserted that `@SQ` is emitted in the *reverse* of the `REFERENCE_LENGTHS`
+  table's physical order, so that building the table `ORDER BY … DESC` lands `@SQ`
+  ascending and makes `ORDER BY reference, position` a genuine coordinate sort.
+  Probed 2026-07-24 (miint `v1.5.4`, reproduced standalone on the deploy host):
+  the emitted `@SQ` order matches neither the table's row order, nor its reverse,
+  nor `ORDER BY reference` — at n = 5, 10, 64, 300, 2000, whether the table is
+  built ASC, DESC or shuffled. It is deterministic run to run and preserves the
+  *set* of names, but the rule is unknown (miint's source was not read). The
+  reversal holds only at tiny n and only for some naming schemes, which is why the
+  old `test_reflen_order_is_reversed_in_sq` passed on its three-contig fixture;
+  it is replaced by `test_sq_order_is_not_derivable_from_reflen`, which pins the
+  probe finding and fails loudly if a miint bump gives `@SQ` a defined order.
 - **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
   mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under

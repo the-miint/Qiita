@@ -31,13 +31,22 @@ notes below are what a probe against the shipped build adds on top:
   * `COPY … (FORMAT BAM)` REQUIRES `REFERENCE_LENGTHS`, and emits an @SQ line for
     every contig in that table — including zero-coverage ones, which is what makes
     jgi report them at depth 0 instead of dropping them.
-  * @SQ comes out **reversed** from the reference-lengths table's physical order,
-    and jgi's sortedness check is on the @SQ index (tid), not the contig name. So
-    the table is built DESC to land @SQ ascending, after which `ORDER BY reference,
-    position` is a genuine coordinate sort — the BAM is correct BY CONSTRUCTION,
-    since we control the reflen order and thus the @SQ order. This reversal is not
-    in the upstream docs, so `tests/jobs/test_assembly_coverage.py` pins it
-    directly against miint; a version bump that changes it fails there.
+  * @SQ ORDER IS NOT OURS TO CHOOSE, so THIS BAM IS NOT COORDINATE SORTED. jgi's
+    sortedness check is on the @SQ index (tid), not the contig name, and the @SQ
+    order miint emits is derivable from neither the reference-lengths table's row
+    order nor its reverse nor the contig names (probed 2026-07-24 at n up to 2000,
+    with the table built ASC, DESC and shuffled; deterministic run to run, but the
+    rule is unknown — see docs/duckdb-miint.md). The `ORDER BY reference ASC,
+    position ASC` below is therefore a NAME sort, not a coordinate sort: it makes
+    the records well-grouped and the output reproducible, and nothing more.
+    Whoever needs a coordinate-sorted BAM must sort it — `binning.sh` runs
+    `samtools sort` on this file before staging it for metaWRAP, which is exactly
+    the sort metaWRAP itself skips when a pre-made BAM is present. An earlier
+    version of this docstring claimed a reflen→@SQ REVERSAL and called the BAM
+    correct by construction; that claim was false and cost a production ticket
+    (jgi: "ERROR: the bam file 'reads.bam' is not sorted!"), so do not reinstate
+    the DESC-reflen strategy. `tests/jobs/test_assembly_coverage.py` pins the
+    probe finding directly against miint.
   * `SEQUENCE_DATA` RAISES on a lookup miss (`Invalid Input Error: Read '<id>' not
     found in SEQUENCE_DATA table`) rather than falling back to `*` for that record
     — so a partial lookup cannot silently reintroduce the depth bias below. Probed
@@ -253,12 +262,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [_READS, _CONTIGS, _MM2_PRESET],
             )
 
-            # DESC on purpose — see the module docstring. miint reverses the
-            # reflen order when writing @SQ, so DESC here lands @SQ ascending,
-            # which is what makes the ORDER BY below a genuine coordinate sort.
-            # The BAM is correct by construction (we own both the reflen order and
-            # the record ORDER BY); the reversal itself is pinned by the contract
-            # test rather than re-read from the header at runtime.
+            # The ORDER BY buys NOTHING for @SQ — see the module docstring. It was
+            # DESC because this code believed miint reversed the reflen order into
+            # @SQ; the probe disproved that, and @SQ lands in an order we do not
+            # control whatever we do here. It is kept only so the reflen table
+            # itself is deterministic; the coordinate sort the BAM needs happens in
+            # binning.sh's `samtools sort`, not here. Do not re-derive a sort
+            # strategy from this line.
             conn.execute(
                 f"CREATE OR REPLACE TABLE {_REFLEN} AS "
                 "SELECT read_id AS reference, length(sequence1) AS length "

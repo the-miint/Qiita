@@ -31,7 +31,12 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- The rebuilt `long-read-assembly` binning image carries the `samtools sort` staging step (#fix/long-read-assembly-coverage-bam-sort):
+  ```bash
+  cd /tmp && sudo -u qiita-orch apptainer exec --no-home \
+    "${PATH_DERIVED}/images/long-read-assembly-binning-1.0.0.sif" \
+    grep -q 'samtools sort' /opt/qiita/binning.sh && echo BINNING_SORT_OK
+  ```
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +44,9 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- The `long-read-assembly` binning SIF **auto-rebuilds** on this deploy (`binning.sh` is in its `HASH_INPUTS`) to pick up the `samtools sort` that stages the coverage BAM — metaWRAP's own sort was being skipped along with its `bwa mem`, and `jgi_summarize_bam_contig_depths` rejected the unsorted file. No manual build step (#fix/long-read-assembly-coverage-bam-sort).
+- `workflows/long-read-assembly/1.0.0.yaml` changed in **comments only** — `qiita-admin actions sync` will re-upsert the same `long-read-assembly` `1.0.0` row; no new action version, nothing to re-verify beyond the generic `make verify-deploy` action list (#fix/long-read-assembly-coverage-bam-sort).
+- Tickets that already failed at `binning` with `ERROR: the bam file 'reads.bam' is not sorted!` need a resubmit after this deploy; nothing on the host to change (#fix/long-read-assembly-coverage-bam-sort).
 
 ---
 
