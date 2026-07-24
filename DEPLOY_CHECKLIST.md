@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `make migrate` applies `20260723000000_backfill_mask_sample_per_sample.sql` — a data backfill (no schema change): it writes a `'completed'` `qiita.mask_sample` gate row for every already-completed per-sample mask-model ticket (`read-mask` / `fastq-to-parquet`, `prep_sample`-scoped, non-NULL `mask_idx`), so the newly-tightened readers (masked-read export, long-read-assembly input, align-plan) don't 409 historical masks that predate the first-class completion gate. Idempotent (`ON CONFLICT DO NOTHING`); a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT covered here (dbmate applies a migration once) — the bucket-6 re-run below closes that edge. (#feat/block-align-mask-selection)
+- `make migrate` applies `20260724000000_backfill_mask_sample_per_sample.sql` — a data backfill (no schema change): it writes a `'completed'` `qiita.mask_sample` gate row for every already-completed per-sample mask-model ticket (`read-mask` / `fastq-to-parquet`, `prep_sample`-scoped, non-NULL `mask_idx`), so the newly-tightened readers (masked-read export, long-read-assembly input, align-plan) don't 409 historical masks that predate the first-class completion gate. Idempotent (`ON CONFLICT DO NOTHING`); a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT covered here (dbmate applies a migration once) — the bucket-6 re-run below closes that edge. (#feat/block-align-mask-selection)
 
 ### 4. Deploy
 

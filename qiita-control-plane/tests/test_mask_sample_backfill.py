@@ -1,6 +1,6 @@
 """DB test for the per-sample mask_sample backfill migration.
 
-The backfill (db/migrations/20260723000000_backfill_mask_sample_per_sample.sql)
+The backfill (db/migrations/20260724000000_backfill_mask_sample_per_sample.sql)
 populates a 'completed' qiita.mask_sample gate row for every COMPLETED per-sample
 read-mask work_ticket, so the tightened first-class-completion readers don't 409
 already-masked samples that predate the per-sample writer. This test runs the
@@ -31,7 +31,7 @@ def _backfill_up_sql() -> str:
         Path(__file__).resolve().parents[1]
         / "db"
         / "migrations"
-        / "20260723000000_backfill_mask_sample_per_sample.sql"
+        / "20260724000000_backfill_mask_sample_per_sample.sql"
     )
     text = path.read_text()
     return text.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0].strip()
