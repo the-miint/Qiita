@@ -8,6 +8,7 @@ from .alignment import alignment_definition_router, alignment_router
 from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
 from .biosample import router as biosample_router
+from .ena_import import router as ena_import_batch_router
 from .host_filter_profile import router as host_filter_profile_router
 from .prep_protocol import router as prep_protocol_router
 from .prep_sample import router as prep_sample_router
@@ -51,3 +52,4 @@ api_router.include_router(user_router)
 api_router.include_router(auth_router)
 api_router.include_router(admin_router)
 api_router.include_router(work_ticket_router)
+api_router.include_router(ena_import_batch_router)

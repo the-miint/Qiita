@@ -671,6 +671,25 @@ other CP process is concurrently dispatching; a CP HA topology requires
 fencing it (per-process owner column or advisory lock) before lifting that
 restriction.
 
+## ENA Study Import
+
+Admin-facing bulk import of public ENA/SRA studies' metadata and reads, distinct
+from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study
+accessions and returns immediately with a batch handle, while a background task
+(`qiita_control_plane.ena_import.batch`) resolves each accession's metadata (via
+`duckdb-miint`'s `read_ena` / `read_ena_attributes`), registers it into
+`study`/`biosample`/`sequenced_sample` rows (de-duplicating biosamples that share
+an ENA sample accession across studies), and submits one `download-ena-study`
+work ticket per `(study, platform)` `sequenced_pool` it created. That ticket then
+runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
++ the same mint-then-sort-and-assign pipeline `ingest_reads` uses) followed by the
+standard `register-files` action into DuckLake. One accession's failure — resolver
+error, unmappable platform, a DB conflict — is isolated to that accession; it never
+aborts the batch or its siblings. See
+[`docs/runbooks/ena-import.md`](runbooks/ena-import.md) for the operator-facing
+walkthrough, the REST surface, and this surface's hard scope limits (ENA/SRA only,
+`http` transport only, no DDBJ/legacy-platform or ENVO harmonization yet).
+
 ## Compute Orchestrator
 
 Separate Python service responsible for the full compute job lifecycle. SLURM-backend operational setup — cluster prerequisites, identity model, the `qiita-job` JWT auto-refresh timer — lives in [`docs/runbooks/slurm-backend-setup.md`](runbooks/slurm-backend-setup.md).

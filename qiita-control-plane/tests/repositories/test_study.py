@@ -27,6 +27,7 @@ from qiita_control_plane.repositories.study import (
     fetch_study,
     fetch_study_exists,
     fetch_study_idxs_by_accession,
+    get_or_create_study_by_ena_accessions,
     update_study,
 )
 
@@ -659,6 +660,113 @@ async def test_update_study_duplicate_bioproject_accession_raises_unique_error(p
             with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
                 await update_study(conn, study_b, fields={"bioproject_accession": accession})
             assert excinfo.value.constraint_name == "study_bioproject_accession_unique"
+        finally:
+            await tr.rollback()
+
+
+# ---------------------------------------------------------------------------
+# get_or_create_study_by_ena_accessions (ena_import.registration)
+#
+# Known coverage gap, documented rather than papered over with a synthetic
+# test: exercising the UniqueViolationError-catch-and-refetch branch needs a
+# genuinely concurrent second writer racing between this function's own
+# pre-check and its create_study attempt -- single-threaded, the pre-check
+# always sees a row this same function created moments earlier, so the
+# except branch is never reached from a single caller. test__sample_helpers.py
+# documents the identical gap for write_global_metadata_or_diagnose's
+# equivalent savepoint race.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_or_create_study_by_ena_accessions_creates_on_miss(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bioproject = _suffix("PRJNA")
+            ena = _suffix("ERP")
+
+            row, created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=bioproject,
+                ena_study_accession=ena,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="a new ena study",
+            )
+
+            assert created is True
+            assert row["bioproject_accession"] == bioproject
+            assert row["ena_study_accession"] == ena
+            assert row["owner_idx"] == owner
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_reuses_on_hit(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bioproject = _suffix("PRJNA")
+            ena = _suffix("ERP")
+
+            first_row, first_created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=bioproject,
+                ena_study_accession=ena,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="first call",
+            )
+            second_row, second_created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=bioproject,
+                ena_study_accession=ena,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="second call -- title is ignored on the reuse path",
+            )
+
+            assert first_created is True
+            assert second_created is False
+            assert first_row["idx"] == second_row["idx"]
+            # The reuse path never re-attempts create_study, so the second
+            # call's title argument never reaches the row.
+            assert second_row["title"] == "first call"
+
+            count = await conn.fetchval(
+                "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", bioproject
+            )
+            assert count == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_null_secondary_accession(postgres_pool):
+    """ena_study_accession is optional on EnaStudyHeader (a study may lack a
+    secondary accession); None must round-trip as NULL, not a stringified
+    'None'."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bioproject = _suffix("PRJNA")
+
+            row, created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=bioproject,
+                ena_study_accession=None,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="no secondary accession",
+            )
+
+            assert created is True
+            assert row["ena_study_accession"] is None
         finally:
             await tr.rollback()
 

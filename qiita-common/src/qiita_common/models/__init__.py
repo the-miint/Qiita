@@ -100,6 +100,20 @@ from qiita_common.models.biosample import (
     StudyLookupByAccessionResponse,
     TerminologyTermRef,
 )
+from qiita_common.models.ena import (
+    EnaRunRecord,
+    EnaSampleAttributes,
+    EnaStudyHeader,
+    ResolverKind,
+    SourceArchive,
+)
+from qiita_common.models.ena_import import (
+    BatchImportItem,
+    BatchImportRequest,
+    BatchImportResponse,
+    BatchImportStatus,
+    BatchItemState,
+)
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
@@ -387,6 +401,18 @@ __all__ = [
     "StudyLookupByAccessionRequest",
     "StudyLookupByAccessionResponse",
     "TerminologyTermRef",
+    # ENA/SRA metadata.
+    "EnaRunRecord",
+    "EnaSampleAttributes",
+    "EnaStudyHeader",
+    "ResolverKind",
+    "SourceArchive",
+    # Batch ENA import.
+    "BatchImportItem",
+    "BatchImportRequest",
+    "BatchImportResponse",
+    "BatchImportStatus",
+    "BatchItemState",
     # Study.
     "StudyCreate",
     "StudyPatchRequest",

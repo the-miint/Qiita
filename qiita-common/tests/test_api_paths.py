@@ -99,6 +99,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     # /upload
     ("URL_UPLOAD_BY_IDX", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_BY_IDX"),
     ("URL_UPLOAD_DONE", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_DONE"),
+    # /ena-import-batch
+    (
+        "URL_ENA_IMPORT_BATCH_BY_IDX",
+        "PATH_ENA_IMPORT_BATCH_PREFIX",
+        "PATH_ENA_IMPORT_BATCH_BY_IDX",
+    ),
     # /sequence-range
     (
         "URL_SEQUENCE_RANGE_BY_PREP_SAMPLE",

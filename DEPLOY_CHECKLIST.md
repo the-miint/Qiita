@@ -31,7 +31,10 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `make verify-deploy`'s workflow-actions check already lists every
+  row; confirm it includes `download-ena-study 1.0.0` (new `workflows/`
+  entry, picked up by the standing `qiita-admin actions sync` inside
+  `activate.sh` — no extra operator step).
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +42,21 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- Soft API change, additive, no host action. New `POST` /
+  `GET /api/v1/ena-import-batch` (batch multi-study ENA import driver) —
+  admin-only, no client is required to call either. The new migration
+  (`qiita.ena_import_batch` / `qiita.ena_import_batch_item`) is a plain
+  additive `CREATE TABLE`, handled autonomously by the standing `make
+  migrate` step (bucket 3) — no out-of-band setup (no `CREATE EXTENSION`,
+  no backfill), so it needs no bucket-3 entry.
+- miint deploy staging (`stage_miint_extension`, run at deploy via
+  `scripts/stage-miint-extension.sh`) now also installs DuckDB's own
+  `httpfs` extension into the same `MIINT_EXTENSION_DIRECTORY` — the new
+  `ingest_ena_reads` job's `open_miint_ena_conn` LOADs it for
+  `read_ena_sequences`'s HTTP transport. No new operator action: the
+  standing staging step already covers it (a plain `INSTALL`, not `FORCE` —
+  httpfs is DuckDB's own signed extension, not the team mirror, so a warm
+  cache is always current).
 
 ---
 

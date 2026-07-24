@@ -291,6 +291,23 @@ URL_UPLOAD_BY_IDX = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_BY_IDX}"
 URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 
 
+# =============================================================================
+# /ena-import-batch/* — batch multi-study ENA import driver
+# =============================================================================
+# POST accepts a list of ENA/SRA study accessions and returns a batch handle
+# immediately (202); the resolve+register+download-submit work runs in a
+# background task (qiita_control_plane.ena_import.batch). GET polls the
+# per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see
+# routes/ena_import.py.
+
+PATH_ENA_IMPORT_BATCH_PREFIX = "/ena-import-batch"
+PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) against the prefix itself
+PATH_ENA_IMPORT_BATCH_BY_IDX = "/{ena_import_batch_idx}"
+
+URL_ENA_IMPORT_BATCH_PREFIX = f"{API_PREFIX}{PATH_ENA_IMPORT_BATCH_PREFIX}"
+URL_ENA_IMPORT_BATCH_BY_IDX = f"{URL_ENA_IMPORT_BATCH_PREFIX}{PATH_ENA_IMPORT_BATCH_BY_IDX}"
+
+
 def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     """Canonical filesystem path for a staged DoPut upload.
 

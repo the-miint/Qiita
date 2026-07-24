@@ -1,0 +1,56 @@
+{
+  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count&limit=0&format=tsv on 2026-07-21 (instrument_platform column added during registration work, R3, re-recorded same date)",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "study_accession",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count"
+  ],
+  "rows": [
+    [
+      "SRR096342",
+      "SRX039368",
+      "SAMN00199006",
+      "PRJNA48739",
+      "SINGLE",
+      "WGS",
+      "GENOMIC",
+      "RANDOM",
+      "LS454",
+      "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz",
+      "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz",
+      "89054035",
+      "791595268ae7a965664652bde3444a2b",
+      "298966",
+      "158722947"
+    ],
+    [
+      "SRR096343",
+      "SRX039369",
+      "SAMN00199006",
+      "PRJNA48739",
+      "PAIRED",
+      "WGS",
+      "GENOMIC",
+      "RANDOM",
+      "LS454",
+      "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz",
+      "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz;fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz;fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz",
+      "5686490;22054785;24627105",
+      "9dbbfcd6b19ac17ba166959c912ad9f3;b7aefae0806e3d29f29c8d2ac0686a92;00c8c44e0faf783fac38598e21315fdf",
+      "238252",
+      "87391853"
+    ]
+  ]
+}

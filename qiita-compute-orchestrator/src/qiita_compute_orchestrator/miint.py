@@ -255,13 +255,48 @@ def open_miint_conn() -> duckdb.DuckDBPyConnection:
     return conn
 
 
+def open_miint_ena_conn() -> duckdb.DuckDBPyConnection:
+    """Open a FRESH DuckDB connection with miint AND httpfs LOADed — the
+    ENA-download job's (`jobs/ingest_ena_reads.py`) per-run connection helper.
+
+    A DEDICATED helper rather than adding httpfs to the shared
+    `open_miint_conn()`: `read_ena_sequences(..., download_method => 'http')`
+    opens its FASTQ URLs through DuckDB's own FileSystem abstraction (see
+    duckdb-miint's `PerRunReader::OpenHTTP` / `CreateDuckDBSeqStream`), which
+    dispatches `https://` to httpfs's registered filesystem — so httpfs must be
+    LOADed for this one job. No other native job touches the network, so
+    loading an unused extension into every job's connection would be needless
+    footprint.
+
+    LOAD-only for both extensions: httpfs (DuckDB's own signed extension) is
+    installed once at deploy time (`stage_miint_extension`) into the SAME
+    `MIINT_EXTENSION_DIRECTORY` every native job's `extension_directory` config
+    already points at (`miint_connect_config`), so this never installs,
+    downloads, or touches the network — a missing/failed stage surfaces as a
+    DuckDB error on LOAD, fail loud as intended (mirrors `open_miint_conn`).
+
+    The caller owns the connection and must close it — `ingest_ena_reads`
+    opens ONE fresh connection PER RUN (never reused across its roster loop),
+    so `miint_warnings()` stays scoped to exactly that run's fetch."""
+    conn = open_conn()
+    conn.execute(miint_load_sql())
+    conn.execute("LOAD httpfs;")
+    return conn
+
+
 def stage_miint_extension() -> str:
     """Deploy-time staging: FORCE INSTALL miint into the configured
     extension_directory, then LOAD it to prove the staged build is usable.
+    Also installs DuckDB's own `httpfs` extension into the same directory (see
+    `open_miint_ena_conn`) — a plain `INSTALL` (no FORCE): httpfs is DuckDB's
+    own signed, official extension (not the team mirror miint installs from),
+    so there is no "mirror bump" to chase and a warm cache is always current;
+    FORCE would only cost an unnecessary re-download from DuckDB's CDN every
+    deploy.
 
     Runs **once per deploy** (via `scripts/stage-miint-extension.sh`), not per
     job — so FORCE (refresh to the mirror's current build) is the right call
-    here, unlike the retired per-job install. Returns the resolved
+    for miint itself, unlike the retired per-job install. Returns the resolved
     extension_directory for the caller to report (or the DuckDB default marker
     when MIINT_EXTENSION_DIRECTORY is unset, e.g. in a dev/test stage)."""
     with open_conn() as conn:
@@ -275,6 +310,11 @@ def stage_miint_extension() -> str:
         # that owns the extension directory (qiita-orch in prod), the same account
         # the SLURM jobs run as, so the cached binary is reachable at job runtime.
         conn.execute("SELECT install_gpl_boundary()")
+        # httpfs: staged once here so ingest_ena_reads' open_miint_ena_conn can
+        # LOAD it on the cluster with no per-job download or writable $HOME —
+        # same rationale as miint itself.
+        conn.execute("INSTALL httpfs;")
+        conn.execute("LOAD httpfs;")
     # Record the staged build's fingerprint so the next deploy can skip a
     # redundant FORCE INSTALL when the mirror hasn't moved (see miint_staging).
     write_staging_marker()
