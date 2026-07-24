@@ -492,18 +492,19 @@ async def _resolve_staged_masked_reads(
     is SUBMISSION/BAD_INPUT."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
-    # Completion gate: a non-completed `mask_sample` row means a covering block is
-    # still masking this sample, so read_masked would expose only a partial
-    # pass-set. Reject rather than assemble partial reads. No gate row (the
-    # per-sample read-mask path) ⇒ allowed. Mirrors routes/admin masked-export.
+    # Completion gate (contract: see `fetch_mask_sample_state`): the sample must be
+    # 'completed' under this mask_idx. A 'pending' row or no row means read_masked
+    # would expose an absent or partial pass-set — reject rather than assemble
+    # partial/empty reads. Mirrors routes/admin masked-export.
     gate_state = await fetch_mask_sample_state(
         pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
     )
-    if gate_state is not None and gate_state != "completed":
+    if gate_state != "completed":
         raise _submission_bad_input(
-            f"mask_idx {mask_idx} is not completed for prep_sample {prep_sample_idx} "
-            f"(mask_sample.state={gate_state!r}); a covering block is still masking. "
-            "Resubmit once reconcile marks the mask completed."
+            f"mask_idx {mask_idx} is not masked-complete for prep_sample {prep_sample_idx} "
+            f"(mask_sample.state={gate_state!r}); no completed read-mask exists for this "
+            "pair (a covering block may still be masking). Resubmit once masking is "
+            "completed."
         )
 
     # The SAME read_masked DoGet ticket the admin masked-read export mints — a

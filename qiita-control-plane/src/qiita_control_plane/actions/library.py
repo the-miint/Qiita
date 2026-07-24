@@ -55,6 +55,7 @@ from ..repositories.block import (
     lock_alignment_sample,
     lock_mask_sample,
     set_block_state,
+    upsert_mask_sample_completed,
 )
 from ..repositories.reference_exclusion import resolve_excluded_features
 from ..repositories.reference_membership import count_reference_shards
@@ -2279,6 +2280,46 @@ async def reconcile_block(
     return {"block_idx": block_idx, "finalized_samples": finalized}
 
 
+async def finalize_mask_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of the per-sample read-mask workflow: record this sample's
+    masking as completed in the qiita.mask_sample gate.
+
+    The per-sample twin of `reconcile_block`'s gate flip. Per-sample masking is
+    atomic per ticket (one ticket produces the whole mask, made durable by the
+    preceding register-files step), so there is no partial state to model — the gate
+    goes straight to 'completed' via an idempotent upsert. Runs AFTER register-files
+    so the gate never reads 'completed' before the masked reads are in DuckLake. A
+    workflow retried from the start re-runs this and re-affirms 'completed'.
+
+    `mask_idx` is a config hash shared with the block path, so a sample can (in the
+    pathological cross-path case) be masked by BOTH a per-sample ticket and an
+    in-flight block under the SAME mask_idx. Blindly upserting to 'completed' would
+    stomp the block's legitimate 'pending' gate row and make `reconcile_block`
+    short-circuit (it reads 'completed' as "already finalized"), silently dropping
+    the block's per-sample finalize over a now-double-written read_mask footprint. So
+    refuse loudly when a covering block is still masking this footprint — the block
+    path owns that gate; the operator must delete the conflicting block-mask (or the
+    per-sample duplicate) rather than let two masking runs race the same footprint."""
+    async with pool.acquire() as conn, conn.transaction():
+        if await has_incomplete_covering_block(
+            conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
+        ):
+            raise RuntimeError(
+                f"refusing to finalize the mask_sample gate for (mask={mask_idx}, "
+                f"prep_sample={prep_sample_idx}): a covering block is still masking the "
+                "same footprint under this mask_idx (cross-path double-mask). The block "
+                "path owns this gate — delete the conflicting block-mask (or the "
+                "per-sample duplicate) before masking the same config twice."
+            )
+        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2420,6 +2461,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
+    LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,

@@ -60,6 +60,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   rows are deliberately left as originally seeded. (#360)
 - `make migrate` applies two new migrations — both plain (nullable `ADD COLUMN` / `CREATE TABLE`, no backfill, no `CREATE EXTENSION`): `20260721000004_reference_membership_accession.sql` (persist the FASTA-header record accession per reference membership) and `20260721000005_reference_exclusion.sql` (the curated global feature/genome blocklist table). (#361)
 - `make migrate` also applies `20260722000000_feature_genome_allow_multi_genome.sql`, no out-of-band setup: a plain `ALTER TABLE qiita.feature_genome DROP CONSTRAINT feature_genome_feature_idx_key`, letting a feature (a shared plasmid → one content-hash-global `feature_idx`) belong to multiple genomes. The composite PK `(feature_idx, genome_idx)` already models the many-to-many. See the Notes re-load caveat. (#366)
+- `make migrate` also applies `20260723000000_backfill_mask_sample_per_sample.sql` — a data backfill (no schema change): it writes a `'completed'` `qiita.mask_sample` gate row for every already-completed per-sample mask-model ticket (`read-mask` / `fastq-to-parquet`, `prep_sample`-scoped, non-NULL `mask_idx`), so the newly-tightened readers (masked-read export, long-read-assembly input, align-plan) don't 409 historical masks that predate the first-class completion gate. Idempotent (`ON CONFLICT DO NOTHING`); a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT covered here (dbmate applies a migration once) — the bucket-6 re-run below closes that edge. (#feat/block-align-mask-selection)
 
 ### 4. Deploy
 
@@ -81,9 +82,19 @@ _None yet._
   psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%assembly_coverage%'\'' FROM qiita.action WHERE action_id='\''long-read-assembly'\'' AND version='\''1.0.0'\'';"'
   ```
 
+- **`read-mask` 1.0.0 and `fastq-to-parquet` 1.3.0 carry the new `finalize-mask-sample` terminal step** — `make verify-deploy` already confirms `qiita.action` is queryable; this additionally confirms both per-sample masking workflows were re-synced, so they now write the `mask_sample` completion gate first-class. Expect `t` for both rows. (#feat/block-align-mask-selection)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT action_id, steps::text LIKE '\''%finalize-mask-sample%'\'' FROM qiita.action WHERE (action_id, version) IN (('\''read-mask'\'', '\''1.0.0'\''), ('\''fastq-to-parquet'\'', '\''1.3.0'\''));"'
+  ```
+
 ### 6. After the deploy verifies green
 
-_None yet._
+- **Re-run the idempotent per-sample `mask_sample` backfill** to close the migrate→restart deploy-window: a `read-mask` / `fastq-to-parquet` ticket that completed after `make migrate` (bucket 3) but before the restart ran under old code that did not yet write the completion gate, so its historical mask has no gate row and the tightened readers would 409 it. dbmate will not re-apply the migration, so run its `migrate:up` body by hand. Idempotent (`ON CONFLICT DO NOTHING`) — safe to re-run and it does NOT burn the rollback path (it only adds `completed` rows for already-completed masks). (#feat/block-align-mask-selection)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) SELECT wt.mask_idx, wt.prep_sample_idx, '\''completed'\'' FROM qiita.work_ticket wt WHERE wt.action_id IN ('\''read-mask'\'', '\''fastq-to-parquet'\'') AND wt.scope_target_kind = '\''prep_sample'\'' AND wt.state = '\''completed'\'' AND wt.mask_idx IS NOT NULL ON CONFLICT (mask_idx, prep_sample_idx) DO NOTHING;"'
+  ```
 
 ### Notes (no host action)
 
@@ -117,6 +128,7 @@ _None yet._
   data is public); a resource/bandwidth cap may be added later if needed.
   (#366)
 - **Block reads now stream from the data plane instead of being staged to scratch.** The `read-mask-block` and `align` workflows no longer have the control plane ask the data plane to COPY a `reads.parquet` onto shared scratch at submit time; the compute job mints a short-TTL DoGet ticket at runtime (`POST /read/ticket/doget`) and streams its block's reads. The scope grant this needs is in bucket 2 above. Two visible consequences for an operator reading logs: block work-ticket submission gets faster (the bulk COPY leaves the CP's submit path), and per-ticket `reads.parquet` files stop appearing under the ticket workspaces — a block job now drains its stream to a short-lived Parquet inside its OWN workspace instead. The per-sample `read-mask` path is unchanged and still stages a Parquet. (#364)
+- **Breaking API contract — `align-plan` request shape changed (no host action, downstream-client awareness).** `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now **requires** `mask_idx` and **drops** `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx`. A caller sending the old body gets a 422; a caller that omits `mask_idx` cannot submit a plan. Any out-of-repo align-plan client must be updated to name the `mask_idx` its reads were masked under. Rationale: align no longer re-derives the mask config server-side — the reconstruction matched the real per-sample mask only by coincidence and returned `AlignNoMasksFound` for every pool on this deployment; a nonexistent `mask_idx` is now a 404 (`AlignMaskNotFound`). (#feat/block-align-mask-selection)
 
 ---
 

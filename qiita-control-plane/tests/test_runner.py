@@ -1891,6 +1891,60 @@ async def test_run_action_primitive_reconcile_block_rejects_non_block_scope(tmp_
         )
 
 
+async def test_run_action_primitive_finalize_mask_sample_dispatches(monkeypatch, tmp_path):
+    """The finalize-mask-sample arm calls the FINALIZE_MASK_SAMPLE primitive with
+    mask_idx from the runner-bound `bound` (the ticket's mask_idx) and prep_sample_idx
+    from the scope target. No file inputs, no data-plane hop."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_finalize(pool, *, mask_idx, prep_sample_idx):
+        recorded.update(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+        return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.FINALIZE_MASK_SAMPLE, fake_finalize)
+
+    entry = WorkflowAction(kind="action", name="finalize-mask-sample", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"mask_idx": 77},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {"mask_idx": 77, "prep_sample_idx": 5}
+
+
+async def test_run_action_primitive_finalize_mask_sample_rejects_non_prep_sample_scope(tmp_path):
+    """finalize-mask-sample is only meaningful for a prep_sample-scoped ticket; a
+    block- or otherwise-scoped ticket is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="finalize-mask-sample", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="prep_sample-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1},
+            tmp_path,
+            {"kind": "block", "block_idx": 42},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
 async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tmp_path):
     """The delete-block-mask arm calls the DELETE_READ_MASK_BLOCK primitive with
     block_idx from the scope target and mask_idx from the runner-bound `bound`,

@@ -22,6 +22,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#TBD).**
+  The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
+  now record masking completion in `qiita.mask_sample` first-class, via a new
+  terminal `finalize-mask-sample` library action that runs after `register-files`
+  (so the gate never reads `completed` before the masked reads are durable in
+  DuckLake). Previously only the block masking path wrote this gate, so downstream
+  consumers carried an unsafe "no gate row ⇒ allowed" carve-out. An idempotent
+  backfill migration populates a `completed` row for every historical completed
+  per-sample mask. The `finalize-mask-sample` writer refuses when a covering block
+  is still masking the same footprint under the shared `mask_idx` (cross-path
+  double-mask), so it cannot stomp a block's in-flight gate.
 - **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
   A user CLI (`reference:read`) that exports one or more genomes'
   sequences: for each `--genome-idx` it resolves the genome's members, mints a
@@ -506,6 +517,24 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#TBD).**
+  `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
+  `mask_idx` and aligns the pool's samples whose `mask_sample` gate is `completed`
+  under it. The server-side reconstruction of each sample's mask config (host refs
+  from biosample metadata / `force`, adapter hash, lima/syndna) is removed: it
+  matched the real mask only by coincidence — per-sample masks are minted from the
+  submitter's `action_context`, a different source of truth — so `align-plan`
+  returned `AlignNoMasksFound` for every pool on this deployment. `AlignPlanRequest`
+  drops `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx` and
+  adds the required `mask_idx`; a nonexistent `mask_idx` is a new 404
+  (`AlignMaskNotFound`), distinct from the repurposed `AlignNoMasksFound` (422 — the
+  mask exists but no pool sample is masked-complete under it).
+- **The masked-read export and long-read-assembly readers now require a `completed` `mask_sample` gate (#TBD).**
+  Both consumers previously treated the ABSENCE of a `mask_sample` row as "allowed".
+  With completion now written first-class by every masking path, absence means "not
+  masked-complete", so both reject it (export 409; assembly SUBMISSION/BAD_INPUT)
+  rather than stream an absent or partial pass-set. The backfill above keeps
+  historical per-sample masks passing across the deploy.
 - **The reference DoGet ticket route now accepts `reference:read` in addition to
   `ticket:doget` (any-of) (#366).** `POST /reference/{reference_idx}/ticket/doget` mints
   a read ticket for reference sequences / chunks / taxonomy / phylogeny — all

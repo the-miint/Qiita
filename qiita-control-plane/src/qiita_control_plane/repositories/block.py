@@ -192,13 +192,19 @@ async def fetch_mask_sample_state(
     """Read-only companion to `lock_mask_sample`: return the `(mask_idx,
     prep_sample_idx)` gate row's state, or None when no row exists.
 
-    None means "no block-mask gate for this sample" — the per-sample read-mask
-    path (or an unmasked sample), which consumers treat as allowed. A non-None
-    state other than 'completed' means a covering block is still in flight, so a
-    consumer that must not read a PARTIAL pass-set (the masked-read export, the
-    long-read-assembly input) rejects it. Point-in-time read: no FOR UPDATE / no
-    transaction requirement — it gates a read, it does not finalize. Mirrors the
-    fail-closed gate the admin masked-read export enforces inline (routes/admin)."""
+    THE mask_sample gate contract (canonical statement; the other consumers point
+    here rather than restate it). The gate has two states, 'pending' and
+    'completed', and every masking workflow writes it first-class: the block path
+    materializes 'pending' at plan time and flips it to 'completed' at reconcile;
+    the per-sample mask-model workflows (read-mask, fastq-to-parquet) write
+    'completed' at their `finalize-mask-sample` terminal step. So absence (`None`)
+    means "no mask has completed for this (mask_idx, prep_sample)" — NOT an exempt
+    sample. A consumer that must not read an absent or PARTIAL pass-set (the
+    masked-read export, the long-read-assembly input, align-plan selection) proceeds
+    ONLY on 'completed' and rejects both `None` and 'pending'.
+
+    Point-in-time read: no FOR UPDATE / no transaction requirement — it gates a
+    read, it does not finalize."""
     return await conn.fetchval(
         "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
         mask_idx,
@@ -229,6 +235,31 @@ async def finalize_mask_sample(
         prep_sample_idx,
     )
     return updated is not None
+
+
+async def upsert_mask_sample_completed(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Upsert the `(mask_idx, prep_sample_idx)` gate row straight to 'completed'.
+
+    The per-sample read-mask path's writer (the `finalize-mask-sample` terminal
+    action). Unlike the block path — which materializes a PENDING row at plan time
+    (`create_mask_sample_pending`) and flips it at reconcile (`finalize_mask_sample`)
+    — per-sample masking is atomic per ticket, so there is no PENDING phase: the row
+    is written 'completed' in one idempotent upsert. ON CONFLICT keeps it robust to a
+    workflow retry and composes with a block-path row already present for the same
+    pair (it can only move a stale row forward to 'completed', never backward)."""
+    require_transaction(conn)
+    await conn.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')"
+        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = 'completed'",
+        mask_idx,
+        prep_sample_idx,
+    )
 
 
 async def has_incomplete_covering_block(

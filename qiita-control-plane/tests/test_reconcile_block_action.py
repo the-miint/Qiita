@@ -22,7 +22,7 @@ import pytest
 import pytest_asyncio
 
 from qiita_control_plane.actions import library
-from qiita_control_plane.actions.library import reconcile_block
+from qiita_control_plane.actions.library import finalize_mask_sample_gate, reconcile_block
 from qiita_control_plane.repositories.block import (
     add_block_members,
     create_block,
@@ -190,6 +190,36 @@ async def _metrics(pool, ss_idx):
         " quality_filtered_read_count_r1r2 FROM qiita.sequenced_sample WHERE idx = $1",
         ss_idx,
     )
+
+
+# ---------------------------------------------------------------------------
+# finalize-mask-sample (per-sample path) must not stomp an in-flight block gate.
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_mask_sample_gate_refuses_when_covering_block_in_flight(rb):
+    """The per-sample writer shares mask_idx with the block path. If a covering
+    block is still masking the same footprint under this mask_idx, finalizing the
+    gate would stomp the block's legitimate 'pending' row (and make reconcile
+    short-circuit over double-written reads). It must refuse loudly and leave the
+    gate untouched."""
+    pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
+    start = rb["seq_start"]
+    await rb["make_block"](members=[(ps, start, start + _SAMPLE_READS - 1)], state="processing")
+
+    with pytest.raises(RuntimeError, match="cross-path double-mask"):
+        await finalize_mask_sample_gate(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+
+    # The block's PENDING gate row is untouched — not stomped to 'completed'.
+    assert await _mask_sample_state(pool, mask_idx, ps) == "pending"
+
+
+async def test_finalize_mask_sample_gate_completes_when_no_covering_block(rb):
+    """With no covering block (the ordinary per-sample path), the writer upserts the
+    gate straight to 'completed'."""
+    pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
+    await finalize_mask_sample_gate(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+    assert await _mask_sample_state(pool, mask_idx, ps) == "completed"
 
 
 # ---------------------------------------------------------------------------

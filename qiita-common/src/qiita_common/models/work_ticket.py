@@ -422,21 +422,15 @@ class AlignPlanRequest(BaseModel):
     """Request body for `POST .../sequenced-pool/{P}/align-plan` — the bulk-block
     alignment entrypoint (the align analog of `block-mask-plan`).
 
-    Aligns the pool's HOST-DEPLETED, QC-passed reads (the completed read-mask the
-    block-mask-plan produced) against a sharded `reference_idx`. The aligner is NOT
-    a caller choice — the server derives it from the run's sequencing platform
-    (short-read Illumina → bowtie2, long-read PacBio HiFi / Nanopore → minimap2) and
-    reports it in the response.
-
-    Which mask each sample's reads were depleted under is resolved PER SAMPLE,
-    server-side — the SAME resolution the block-mask-plan minted under — so the
-    planner looks up each sample's already-minted mask_idx (it never mints a mask)
-    for that sample's own decision. So the normal request carries NO host reference.
-    `host_rype_reference_idx` (+ optional `host_minimap2_reference_idx`) is a
-    `--force` OVERRIDE only, mirroring block-mask-plan: it looks the mask up under
-    the given reference(s) pool-wide, bypassing resolution (use it to align a pool
-    that was block-masked with `force`). A host reference without `force=True` is
-    rejected. minimap2 is the optional second host stage and never rides without rype.
+    Aligns the pool's samples whose reads are masked-complete under an explicit
+    `mask_idx` against a sharded `reference_idx`. The caller names the mask directly
+    — alignment does NOT re-derive it from pool metadata — so a pool masked any way
+    (per-sample or block; any host / adapter / lima / syndna config) aligns by
+    pointing at the `mask_idx` it produced. Only samples with a `completed`
+    `mask_sample` gate under that `mask_idx` are aligned; the rest are reported
+    skipped. The aligner is NOT a caller choice — the server derives it from the
+    run's sequencing platform (short-read Illumina → bowtie2, long-read PacBio HiFi
+    / Nanopore → minimap2) and reports it in the response.
 
     `only_missing` drops samples already carrying a completion gate for their
     resolved alignment, so an interrupted plan re-runs only the gap; off by default
@@ -444,19 +438,8 @@ class AlignPlanRequest(BaseModel):
     sample is already gated — DELETE the alignment first or pass only_missing)."""
 
     reference_idx: Annotated[int, Field(gt=0)]
-    host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
-    host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
-    force: bool = False
+    mask_idx: Annotated[int, Field(gt=0)]
     only_missing: bool = False
-
-    @model_validator(mode="after")
-    def _validate_host_ref_override(self) -> AlignPlanRequest:
-        _check_host_ref_override(
-            host_rype_reference_idx=self.host_rype_reference_idx,
-            host_minimap2_reference_idx=self.host_minimap2_reference_idx,
-            force=self.force,
-        )
-        return self
 
 
 class AlignPlanPartition(BaseModel):
@@ -497,8 +480,8 @@ class AlignPlanResponse(BaseModel):
     samples_planned: Annotated[int, Field(ge=0)]
     # Dropped by only_missing (already carry an alignment_sample gate).
     samples_skipped_existing: Annotated[int, Field(ge=0)]
-    # No read-mask minted for the sample's resolved filtering config (it was never
-    # block-masked under this host config).
+    # No `mask_sample` gate row exists for the sample under the given `mask_idx`
+    # (it was never masked under that mask).
     samples_skipped_no_mask: Annotated[int, Field(ge=0)]
     # A mask exists but is not `completed` for the sample (its masking is still
     # in-flight / failed) — align only fully-masked samples.
