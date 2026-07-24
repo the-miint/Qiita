@@ -31,11 +31,14 @@ _None yet._
 
 ### 5. Verify
 
-- The rebuilt `long-read-assembly` binning image carries the `samtools sort` staging step (#fix/long-read-assembly-coverage-bam-sort):
+- The rebuilt `long-read-assembly` binning image carries the `samtools sort` staging step, and `_lib.sh` resolves the allocation from `QIITA_CPUS`/`QIITA_MEM_MB` (#TBD). Both greps are anchored at start-of-line so a comment mentioning the command cannot satisfy them:
   ```bash
   cd /tmp && sudo -u qiita-orch apptainer exec --no-home \
     "${PATH_DERIVED}/images/long-read-assembly-binning-1.0.0.sif" \
-    grep -q 'samtools sort' /opt/qiita/binning.sh && echo BINNING_SORT_OK
+    bash -c "grep -q '^micromamba run -n metawrap samtools sort' /opt/qiita/binning.sh \
+             && grep -q '^THREADS=\"\${QIITA_CPUS:-' /opt/qiita/_lib.sh \
+             && grep -q '^MEM_MB=\"\${QIITA_MEM_MB:-' /opt/qiita/_lib.sh" \
+    && echo BINNING_SORT_OK
   ```
 
 ### 6. After the deploy verifies green
@@ -44,9 +47,11 @@ _None yet._
 
 ### Notes (no host action)
 
-- The `long-read-assembly` binning SIF **auto-rebuilds** on this deploy (`binning.sh` is in its `HASH_INPUTS`) to pick up the `samtools sort` that stages the coverage BAM — metaWRAP's own sort was being skipped along with its `bwa mem`, and `jgi_summarize_bam_contig_depths` rejected the unsorted file. No manual build step (#fix/long-read-assembly-coverage-bam-sort).
-- `workflows/long-read-assembly/1.0.0.yaml` changed in **comments only** — `qiita-admin actions sync` will re-upsert the same `long-read-assembly` `1.0.0` row; no new action version, nothing to re-verify beyond the generic `make verify-deploy` action list (#fix/long-read-assembly-coverage-bam-sort).
-- Tickets that already failed at `binning` with `ERROR: the bam file 'reads.bam' is not sorted!` need a resubmit after this deploy; nothing on the host to change (#fix/long-read-assembly-coverage-bam-sort).
+- Every workflow SIF **auto-rebuilds** on this deploy — `binning.sh` changed (it is in the binning image's `HASH_INPUTS`) and `workflows/_shared/_lib.sh` changed, which is hashed into *every* image's build-inputs digest. No manual build step (#TBD).
+- Container steps now receive `QIITA_CPUS` / `QIITA_MEM_MB` (the step's resolved `baseline_resources`) via `apptainer --env`; entrypoints read them through `_lib.sh`. This is internal to the orchestrator — **no host env var to set**. The entrypoints fall back to the old `nproc` chain when the vars are absent, so a SIF that rebuilds before the orchestrator restarts still runs (#TBD).
+- `workflows/long-read-assembly/1.0.0.yaml` changed in **comments only** — `qiita-admin actions sync` will re-upsert the same `long-read-assembly` `1.0.0` row; no new action version, nothing to re-verify beyond the generic `make verify-deploy` action list (#TBD).
+- Tickets that already failed at `binning` with `ERROR: the bam file 'reads.bam' is not sorted!` need a resubmit after this deploy; nothing on the host to change (#TBD).
+- `(#TBD)` above is a placeholder — replace with the PR number when the PR is opened (same note in `CHANGELOG.md`).
 
 ---
 

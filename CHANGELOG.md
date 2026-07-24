@@ -86,16 +86,18 @@ duplicates further down are historical strata; leave them where they are.
 - **`assembly_coverage` — binning coverage from miint's minimap2, not bwa.** New native
   step in `long-read-assembly`, between `assemble` and `binning`: it aligns the masked
   HiFi reads back to the noLCG contigs with miint's embedded minimap2 (`map-hifi`) and
-  writes a coordinate-sorted BAM, which `binning.sh` stages into
+  writes a BAM, which `binning.sh` stages into
   `work_files/<sample>.bam`. metaWRAP guards its own `bwa mem` behind that file's
   existence, so it skips self-alignment and derives depth from the minimap2 alignment —
   the same seam qp-pacbio uses, and the only one available (`metawrap binning` has no
   aligner-selection flag). Native rather than in-container because miint is deliberately
-  not exposed to containers. Three miint BAM-writer behaviours it rests on are pinned by
-  `tests/jobs/test_assembly_coverage.py`: `COPY … (FORMAT BAM)` requires
-  `REFERENCE_LENGTHS`; @SQ is emitted **reversed** from that table (undocumented — so the
-  table is built DESC to land @SQ ascending, which is what makes the coordinate sort valid,
-  since jgi checks tid order, not contig name); and `SEQUENCE_DATA` (documented upstream but
+  not exposed to containers. **SUPERSEDED IN PART — see the `Fixed` entry below on the
+  unsorted coverage BAM.** As shipped, this entry claimed the BAM was coordinate sorted
+  because miint emits `@SQ` **reversed** from the `REFERENCE_LENGTHS` table (so the table
+  was built DESC to land `@SQ` ascending). That reversal claim is false; the BAM was not
+  sorted, and `binning.sh` now runs `samtools sort`. The two behaviours that DID hold, and
+  are still pinned by `tests/jobs/test_assembly_coverage.py`: `COPY … (FORMAT BAM)` requires
+  `REFERENCE_LENGTHS`; and `SEQUENCE_DATA` (documented upstream but
   easy to miss) is required to write real SEQ, without which jgi's contig-end exclusion
   window (`--maxEdgeBases`, default 75)
   collapses — it sizes that window from the read length it reads out of SEQ — averaging the
@@ -250,20 +252,36 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
-  `binning.sh` runs the `samtools sort` metaWRAP skipped.** A production ticket
-  failed in `jgi_summarize_bam_contig_depths` 2.15 with
+  `binning.sh` runs the `samtools sort` metaWRAP skipped (#TBD).** A production
+  ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
   `ERROR: the bam file 'reads.bam' is not sorted!`. Two causes, both fixed here:
   metaWRAP's own `samtools sort` sits inside the *same*
   `if [[ ! -f work_files/<sample>.bam ]]` guard as its `bwa mem`, so pre-placing
   our minimap2 BAM to skip the aligner silently skipped the sort as well; and the
   BAM was not sorted to begin with, because `assembly_coverage` relied on a miint
-  contract that turned out to be false. `binning.sh` now sorts the staged BAM
-  (`samtools sort -@ $THREADS -m 2G -T $WORK/...`) instead of hardlinking/copying
-  it — which subsumes the old `ln`-to-avoid-a-second-copy path. The write logic in
-  `assembly_coverage` is unchanged.
+  contract that turned out to be false. Measured on that ticket's BAM: 11,390 of
+  925,483 records step backwards in tid across 20,975 contigs; after the sort,
+  zero. `binning.sh` now sorts into a `.partial` staging name inside `work_files/`
+  and renames it into place (so a killed sort cannot leave a truncated BAM at the
+  name metaWRAP reads), replacing the old `ln`-else-`cp` staging.
+- **Container steps are told their own allocation: `QIITA_CPUS` / `QIITA_MEM_MB`
+  (#TBD).** `apptainer exec --containall` scrubs the environment, so no `SLURM_*`
+  var reaches a container entrypoint — measured on the deploy host: zero survive.
+  `SLURM_CPUS_PER_TASK` was therefore always unset in `workflows/_shared/_lib.sh`
+  and in `workflows/bcl-convert/entrypoint.sh`, and `THREADS` came from the `nproc`
+  fallback; it happened to equal the allocation only because SLURM cpuset-binds the
+  step (`nproc` reports the cpuset — 16 under a 16-cpu allocation on a 64-core
+  node). Memory had no equivalent: nothing inside the container exposes the cgroup
+  ceiling, though the ceiling is real (`memory.max` = the step's `--mem`), so a
+  per-thread tool budget could overshoot it. `slurm/payload.py` now forwards both
+  values from the step's resolved `baseline_resources`, and `binning.sh` sizes
+  `samtools sort -m` (which is PER THREAD) so the total is a third of `MEM_MB`
+  regardless of thread count. Measured in the binning image on the 2.0 GB
+  production BAM at 16 cpu: peak RSS 11.1 GiB / 19 s wall, unchanged between a
+  12.75 GiB and a 34 GiB budget.
 - **Corrected the miint `FORMAT BAM` `@SQ`-order claim in `docs/duckdb-miint.md`,
-  `assembly_coverage`'s docstring, and `test_assembly_coverage.py`.** Those three
-  asserted that `@SQ` is emitted in the *reverse* of the `REFERENCE_LENGTHS`
+  `assembly_coverage`'s docstring, and `test_assembly_coverage.py` (#TBD).** Those
+  three asserted that `@SQ` is emitted in the *reverse* of the `REFERENCE_LENGTHS`
   table's physical order, so that building the table `ORDER BY … DESC` lands `@SQ`
   ascending and makes `ORDER BY reference, position` a genuine coordinate sort.
   Probed 2026-07-24 (miint `v1.5.4`, reproduced standalone on the deploy host):
@@ -275,6 +293,21 @@ duplicates further down are historical strata; leave them where they are.
   old `test_reflen_order_is_reversed_in_sq` passed on its three-contig fixture;
   it is replaced by `test_sq_order_is_not_derivable_from_reflen`, which pins the
   probe finding and fails loudly if a miint bump gives `@SQ` a defined order.
+- **`assembly_coverage` drops both now-inert `ORDER BY`s and its
+  `preserve_insertion_order` override (#TBD).** With the `@SQ` reversal disproven,
+  the reflen table's `ORDER BY read_id DESC` steered nothing, and the COPY's
+  `ORDER BY reference ASC, position ASC` was a name sort — not the tid sort a BAM
+  is sorted by — over a read-set-sized relation that the module's own memory split
+  says can spill to `temp_directory`. Its only consumer, `binning.sh`, now
+  `samtools sort`s regardless. The `SET preserve_insertion_order=true` existed
+  solely to protect that ORDER BY, so it goes with it and the shared helper's
+  `false` stands. `test_records_are_in_reference_name_order` is replaced by
+  `test_writer_output_is_not_tid_sorted`, which pins the property the production
+  failure was actually about.
+
+**NOTE ON `#TBD`:** these entries were written before the PR existed. Replace every
+`(#TBD)` above (and in `DEPLOY_CHECKLIST.md`) with the real PR number when it is
+opened, and delete this note.
 - **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
   mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under

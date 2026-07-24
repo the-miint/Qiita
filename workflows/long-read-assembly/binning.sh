@@ -14,18 +14,13 @@
 # `if [[ ! -f ... ]]` and skips it when that file already exists, then derives
 # depth from `work_files/*.bam`. This is the same seam qp-pacbio uses.
 #
-# THE GUARD WRAPS MORE THAN THE ALIGNMENT — this is the part that is easy to miss
-# and that cost a production ticket. In metaWRAP's binning.sh the `bwa mem` and the
-# `samtools sort` that follows it live INSIDE THE SAME
+# THE GUARD WRAPS THE SORT TOO. In metaWRAP's binning.sh the `bwa mem` and the
+# `samtools sort` that follows it are both inside that one
 # `if [[ ! -f ${out}/work_files/${sample}.bam ]]` block (verified against
-# /opt/conda/envs/metawrap/bin/metawrap-modules/binning.sh in the deployed image:
-# `bwa mem` and `samtools sort` are both under that one test). Pre-placing the BAM
-# therefore skips the SORT as well as the alignment — silently. metaWRAP never
-# sorts what we hand it, and `jgi_summarize_bam_contig_depths` rejects an unsorted
-# BAM outright ("ERROR: the bam file ... is not sorted!"), failing the step. So
-# whatever we stage must ALREADY be coordinate sorted, and this entrypoint is the
-# only place that can guarantee it — hence the `samtools sort` below, which is
-# literally the command metaWRAP would have run.
+# /opt/conda/envs/metawrap/bin/metawrap-modules/binning.sh in the deployed image),
+# so pre-placing the BAM skips the sort as well as the alignment, silently. Hence
+# the `samtools sort` below: whatever we stage must already be coordinate sorted,
+# and this is the only place left that can guarantee it.
 #
 # So the native `assembly_coverage` step pre-maps with miint's embedded minimap2
 # (`map-hifi`) and this entrypoint sorts that BAM into work_files/ under the name
@@ -88,36 +83,62 @@ if [[ ! -s "${COVERAGE_BAM}" ]]; then
 fi
 WORK_FILES="${OUT}/work_files"
 mkdir -p "${WORK_FILES}"
-# Coordinate-sort the pre-mapped BAM into the name metaWRAP will look for. This
-# IS the `samtools sort` metaWRAP skipped along with its `bwa mem` (see the
-# header) — same tool, same env, run at the one point in the pipeline that can
-# still put it back.
+# Coordinate-sort the pre-mapped BAM into the name metaWRAP will look for — the
+# `samtools sort` metaWRAP skips along with its `bwa mem` (see the header).
 #
-# Sorting on tid/position rather than trusting the writer's record order is also
-# the only robust option. assembly_coverage writes its records `ORDER BY reference
-# ASC, position ASC`, but a BAM is coordinate sorted by TID — the @SQ index — and
-# the @SQ order that miint's `FORMAT BAM` writer emits is NOT derivable from the
-# REFERENCE_LENGTHS table's row order (established by probe 2026-07-24; see
-# docs/duckdb-miint.md). Name order and tid order therefore diverge on a real
-# multi-thousand-contig assembly, which is what jgi rejected in production. Sorting
-# here makes the staged BAM correct regardless of what the writer emits.
+# DO NOT "optimise" this back into a copy or a hardlink of coverage_bam. The
+# durable rule: a BAM is coordinate sorted by TID (the @SQ index), and the @SQ
+# order miint's `FORMAT BAM` writer emits is not derivable from the
+# REFERENCE_LENGTHS table it is built from (see docs/duckdb-miint.md), so no
+# ordering assembly_coverage can apply makes its output sorted. Measured on the
+# production BAM that exposed this: 11,390 of 925,483 records step backwards in
+# tid across 20,975 contigs, and jgi_summarize_bam_contig_depths rejects the file
+# outright. After this sort, zero.
 #
-# `-m` is PER THREAD, so the sort's ceiling is roughly (THREADS + 1) * -m: 2G at
-# this step's 16 cpu is ~34 GB against a 100 GB allocation. It does not stack with
-# metaWRAP's own `-m 90` because the sort finishes before metawrap is invoked.
-# Reference point: the 2.0 GB BAM from the production ticket that exposed this
-# sorted in 13.5 s wall at `-@ 8 -m 2G`.
+# SIZING. `-m` is PER THREAD and `-@` is ADDITIONAL threads, so samtools' ceiling
+# is about (-@ + 1) * -m. Deriving that from the thread count alone is what makes
+# it unbounded, so do the opposite: fix the TOTAL at a third of the step's own
+# allocation and divide it out. The result is bounded by MEM_MB no matter what
+# THREADS resolves to (33 GB against this step's 100 GB at 1, 16 or 128 threads).
+# Threads come DOWN before per-thread memory goes below 256 MB, so the floor can
+# never push the total past the budget either.
 #
-# `-T` lands the spill prefix in WORK (a mktemp -d with an EXIT trap), not next to
-# the output — a failed sort must not leave `.tmp.NNNN.bam` shards inside
-# QIITA_OUTPUT_PATH, where qiita_finish would chmod them into the manifest's
-# neighbourhood.
+# Measured inside this image on the 2.0 GB production BAM at 16 cpu: peak RSS
+# 11.1 GiB, 19 s wall, unchanged between a 12.75 GiB and a 34 GiB budget — past
+# the budget samtools spills to `-T` rather than growing, so a smaller total costs
+# nothing here and cannot OOM the step's cgroup (which is set at exactly --mem).
+SORT_TOTAL_MB=$(( MEM_MB / 3 ))
+SORT_THREADS=$(( SORT_TOTAL_MB / 256 - 1 ))
+if (( SORT_THREADS > THREADS )); then SORT_THREADS="${THREADS}"; fi
+if (( SORT_THREADS < 1 )); then SORT_THREADS=1; fi
+SORT_MEM_MB=$(( SORT_TOTAL_MB / (SORT_THREADS + 1) ))
+if (( SORT_MEM_MB < 256 )); then SORT_MEM_MB=256; fi
+
+# Sort to a staging name and rename. `mv` within one directory is a rename, so a
+# sort killed mid-write can never leave a truncated file at the name metaWRAP
+# reads. It has to be a name inside work_files/ rather than WORK: payload.py binds
+# the workspace and QIITA_OUTPUT_PATH as separate mounts, so a rename across them
+# is EXDEV and degrades to copying a reads-sized BAM (coverage_bam carries SEQ+QUAL
+# for the whole read set). The `.partial` name is not caught by metaWRAP's
+# `work_files/*.bam` globs. `-T` still lands the spill shards in WORK — a mktemp -d
+# with an EXIT trap — so a failure leaves nothing under QIITA_OUTPUT_PATH for
+# qiita_finish to sweep into the manifest's neighbourhood.
 #
-# No `|| true`: an unsorted or absent BAM makes metaWRAP fail two commands later
-# with jgi's error rather than this one, so fail here, loudly.
+# DISK COST, unavoidable now: the sorted BAM is a SECOND reads-sized artifact
+# under QIITA_OUTPUT_PATH for the life of the ticket (coverage_bam carries SEQ+QUAL
+# for the whole read set, so it is roughly FASTQ-sized — 2.0 GB on the ticket
+# measured above). The previous `ln`-then-`cp` staging tried to avoid that with a
+# hardlink; it cannot survive here, because a sort has to produce a new file, and
+# in production the `ln` never fired anyway (input and output are separate binds,
+# so `link()` returns EXDEV and only the shared-mount local backend hardlinked).
+#
+# No `|| true`: an unsorted or absent BAM surfaces two commands later as jgi's
+# error rather than this one, so fail here, loudly.
+STAGED_BAM="${WORK_FILES}/.${READS_STEM}.bam.partial"
 micromamba run -n metawrap samtools sort \
-    -@ "${THREADS}" -m 2G -T "${WORK}/samtools-sort" \
-    -o "${WORK_FILES}/${READS_STEM}.bam" "${COVERAGE_BAM}"
+    -@ "${SORT_THREADS}" -m "${SORT_MEM_MB}M" -T "${WORK}/samtools-sort" \
+    -o "${STAGED_BAM}" "${COVERAGE_BAM}"
+mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 
 # A single binner finding nothing is non-fatal — bin_refine consolidates whatever
 # bin dirs exist. Only a hard metaWRAP crash should fail the step, so we let its

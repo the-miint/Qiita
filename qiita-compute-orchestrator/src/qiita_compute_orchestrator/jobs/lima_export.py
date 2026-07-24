@@ -109,11 +109,13 @@ _EMPTY_SOURCE_MOVIE = "qiita_no_reads"
 _MAX_ZMW = 2**31 - 1
 
 # miint's `COPY ... TO (FORMAT UBAM)` (duckdb-miint#156, shipped in #157). The
-# pre-existing `FORMAT SAM|BAM` is an ALIGNMENT writer and cannot serve — it never
-# emits SEQ/QUAL, demands a non-empty REFERENCE_LENGTHS @SQ header, and exposes no
-# read-group option. `read_id` is the record name (the column `FORMAT FASTQ` names
-# records from); `zmw` is an ordinary column of this projection that `TAGS` binds to
-# the `zm` tag.
+# pre-existing `FORMAT SAM|BAM` is an ALIGNMENT writer and cannot serve — it demands
+# a non-empty REFERENCE_LENGTHS @SQ header and exposes no read-group option. (It can
+# emit SEQ/QUAL, via its `SEQUENCE_DATA` table parameter — see docs/duckdb-miint.md
+# and `assembly_coverage`, which depends on exactly that. The @SQ requirement alone
+# is disqualifying here: an unaligned export has no references.) `read_id` is the
+# record name (the column `FORMAT FASTQ` names records from); `zmw` is an ordinary
+# column of this projection that `TAGS` binds to the `zm` tag.
 _UBAM_COPY_SQL = """
 COPY (
     SELECT read_id,

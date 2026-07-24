@@ -29,18 +29,37 @@ if [[ ! -f "${PARAMS_JSON}" ]]; then
     exit 64
 fi
 
-# Thread count from the SLURM allocation. SLURM_CPUS_PER_TASK is exactly the cpu
-# the resolved profile asked for (SlurmBackend sets cpus_per_task =
-# baseline_resources.cpu in slurm/payload.py), so a per-step cpu change in
-# 1.0.0.yaml needs no entrypoint change. Off SLURM (local apptainer runs) it is
-# unset — fall back to the box's real cpu count (nproc), then 1, never a bare
-# hardcoded 1. Mirrors workflows/bcl-convert/entrypoint.sh. Exported so the tool
-# subprocesses (and sourcing entrypoints) both see it.
-THREADS="${SLURM_CPUS_PER_TASK:-}"
+# The step's resolved allocation: THREADS (cpu) and MEM_MB (memory ceiling).
+#
+# QIITA_CPUS / QIITA_MEM_MB come straight from the step's resolved
+# baseline_resources, forwarded into the container by slurm/payload.py, so a
+# per-step cpu/mem change in the workflow YAML needs no entrypoint change.
+#
+# DO NOT reach for SLURM_CPUS_PER_TASK or SLURM_MEM_PER_NODE here: `apptainer exec
+# --containall` scrubs the environment, so NO SLURM_* var survives into a container
+# step (measured on the deploy host: zero of them). They are still read below as a
+# second choice because this file is also sourced outside a container.
+#
+# Off SLURM entirely (a local apptainer run) both are unset:
+#   * cpu falls back to `nproc`, which is the honest answer there. Note `nproc`
+#     reports the CPUSET, not the node — under SLURM it happens to equal the
+#     allocation whenever the site cpuset-binds steps, which is why the old
+#     SLURM_CPUS_PER_TASK-or-nproc chain produced a correct number for the wrong
+#     reason. Do not rely on that accident; QIITA_CPUS is the contract.
+#   * memory has NO such fallback available — nothing inside the container exposes
+#     the cgroup ceiling — so it takes a deliberately small literal. A tool sized
+#     off MEM_MB then under-uses a big dev box rather than OOM-killing a real step.
+THREADS="${QIITA_CPUS:-${SLURM_CPUS_PER_TASK:-}}"
 if [[ -z "${THREADS}" ]]; then
     THREADS=$(nproc 2>/dev/null || echo 1)
 fi
 export THREADS
+
+MEM_MB="${QIITA_MEM_MB:-${SLURM_MEM_PER_NODE:-}}"
+if [[ -z "${MEM_MB}" ]]; then
+    MEM_MB=4096
+fi
+export MEM_MB
 
 # Read a required .inputs.<key> host path (or scalar) from params.json.
 qiita_input() { jq -er ".inputs.$1" "${PARAMS_JSON}"; }
