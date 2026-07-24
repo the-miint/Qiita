@@ -66,7 +66,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import duckdb
 from pydantic import BaseModel
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
@@ -79,10 +78,9 @@ from ..miint import (
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
-    open_conn,
     open_miint_conn,
 )
-from ..read_staging import hardlink, per_slot_caps, write_sorted_reads
+from ..read_staging import hardlink, per_slot_caps, read_roster_parquet, write_sorted_reads
 from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 # YAML step name this module implements. Hard-coded because execute()
@@ -126,25 +124,6 @@ class Inputs(BaseModel):
     sequenced_pool_idx: int
     sequencing_run_idx: int
     work_ticket_idx: int
-
-
-def _read_sample_map(path: Path) -> list[tuple[int, str]]:
-    """Read the `(prep_sample_idx, pool_item_id)` roster from the staged
-    Parquet. Ordered by prep_sample_idx for deterministic processing /
-    error reporting. Raises ValueError (BAD_INPUT via the dispatcher) on an
-    empty or unreadable roster — a bcl-convert pool always has samples."""
-    try:
-        with open_conn() as conn:
-            rows = conn.execute(
-                "SELECT prep_sample_idx, pool_item_id FROM read_parquet(?) "
-                "ORDER BY prep_sample_idx",
-                [str(path)],
-            ).fetchall()
-    except duckdb.Error as exc:
-        raise ValueError(f"sample_map could not be read: {path}: {exc}") from exc
-    if not rows:
-        raise ValueError(f"sample_map is empty: {path}")
-    return [(int(r[0]), str(r[1])) for r in rows]
 
 
 def _match_fastq(convert_dir: Path, pool_item_id: str, read_tag: str) -> Path | None:
@@ -213,7 +192,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     module docstring for the per-sample pipeline and idempotency model."""
     if not inputs.convert_dir.is_dir():
         raise FileNotFoundError(f"convert_dir not found: {inputs.convert_dir}")
-    roster = _read_sample_map(inputs.sample_map)
+    roster = read_roster_parquet(
+        inputs.sample_map, value_column="pool_item_id", roster_name="sample_map"
+    )
 
     workspace.mkdir(parents=True, exist_ok=True)
     # register-files maps the `read/` subdir's part files -> the `read` table.

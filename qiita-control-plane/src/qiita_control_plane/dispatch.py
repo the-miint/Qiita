@@ -249,25 +249,37 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
     return len(idxs)
 
 
-async def drain_running_dispatches(running: set[asyncio.Task], *, timeout_seconds: float) -> None:
-    """Wait for in-flight dispatches at shutdown.
+async def drain_running_dispatches(
+    running: set[asyncio.Task],
+    *,
+    timeout_seconds: float,
+    label: str = "dispatch",
+    reconcile_note: str = "reconcile_inflight_tickets",
+) -> None:
+    """Wait for in-flight background tasks at shutdown.
 
-    Bounded by `timeout_seconds` so a stuck workflow can't block service
-    restart. Anything still running after the deadline is cancelled; the
-    cancellation leaves the ticket non-terminal (a CancelledError is not
-    caught by the runner's `except Exception`), and the next CP startup
-    re-attaches it via `reconcile_inflight_tickets`.
+    Bounded by `timeout_seconds` so a stuck task can't block service restart.
+    Anything still running after the deadline is cancelled; the cancellation
+    leaves the work non-terminal (a CancelledError is not caught by an
+    `except Exception`), and the next CP startup re-attaches it via
+    `reconcile_note`.
+
+    Parameterized on `label` / `reconcile_note` so it drains both dispatch.py's
+    task set and ena_import.batch's own tracked set (kept separate because the
+    batch driver runs register_ena_study + submit_work_ticket_core directly, not
+    a work_ticket / ComputeBackendClient run).
 
     Snapshots `running` at call time. Relies on FastAPI lifespan
     ordering — uvicorn closes the listener and finishes outstanding
     requests before yielding to the lifespan-exit block where this runs,
-    so no new dispatches register after the snapshot."""
+    so no new tasks register after the snapshot."""
     if not running:
         return
     pending = list(running)
     _log.info(
-        "draining %d in-flight dispatch task(s) (timeout=%.0fs)",
+        "draining %d in-flight %s task(s) (timeout=%.0fs)",
         len(pending),
+        label,
         timeout_seconds,
     )
     _, still_pending = await asyncio.wait(pending, timeout=timeout_seconds)
@@ -275,9 +287,11 @@ async def drain_running_dispatches(running: set[asyncio.Task], *, timeout_second
         task.cancel()
     if still_pending:
         _log.warning(
-            "cancelled %d dispatch task(s) that did not drain in time; "
-            "their tickets will be re-attached by reconcile_inflight_tickets on next startup",
+            "cancelled %d %s task(s) that did not drain in time; "
+            "their work will be re-attached by %s on next startup",
             len(still_pending),
+            label,
+            reconcile_note,
         )
 
 

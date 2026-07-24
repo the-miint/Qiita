@@ -43,7 +43,7 @@ from qiita_common.models.ena_import import (
     RunImportOutcome,
 )
 
-from ..auth.principal import HumanUser
+from ..auth.principal import HumanUser, _human_user_from_row
 from ..auth.scopes import role_ceiling
 from .accession import validate_study_accession
 from .miint_resolver import BACKEND_MIINT, MiintEnaResolver
@@ -66,9 +66,6 @@ _log = logging.getLogger(__name__)
 # is miint's to set and is not measured here, so this is a conservative constant,
 # not a value derived from that limit.
 _STUDY_CONCURRENCY = 4
-
-# Shutdown-drain bound, mirroring dispatch.py's _DISPATCH_DRAIN_TIMEOUT_SECONDS.
-_BATCH_DRAIN_TIMEOUT_SECONDS = 60.0
 
 # Terminal-success work-ticket states: an item's download is `done` only when
 # every one of its tickets is explicitly one of these. Anything else (running,
@@ -114,15 +111,9 @@ async def _load_principal(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
             f"principal {principal_idx}: {MSG_PRINCIPAL_DISABLED_OR_RETIRED};"
             " cannot submit/re-drive ena_import_batch work on its behalf"
         )
-    return HumanUser(
-        principal_idx=row["idx"],
-        email=row["email"],
-        system_role=row["system_role"],
-        scopes=role_ceiling(row["system_role"]),
-        profile_complete=row["profile_complete"],
-        disabled=row["disabled"],
-        retired=row["retired"],
-    )
+    # Same construction the OIDC/token loaders use; the guard above is this
+    # loader's addition (a disabled/retired principal must not be re-driven).
+    return _human_user_from_row(row, scopes=role_ceiling(row["system_role"]))
 
 
 async def create_ena_import_batch(
@@ -439,32 +430,6 @@ def schedule_ena_import_batch(
     app.state.running_ena_import_batches.add(task)
     task.add_done_callback(app.state.running_ena_import_batches.discard)
     return task
-
-
-async def drain_running_ena_import_batches(
-    running: set[asyncio.Task], *, timeout_seconds: float = _BATCH_DRAIN_TIMEOUT_SECONDS
-) -> None:
-    """Shutdown-drain twin of `dispatch.drain_running_dispatches`, scoped to this
-    module's task set. Anything past the deadline is cancelled; its items keep
-    their state and are re-driven by `reconcile_inflight_batches` next startup."""
-    if not running:
-        return
-    pending = list(running)
-    _log.info(
-        "draining %d in-flight ena_import_batch task(s) (timeout=%.0fs)",
-        len(pending),
-        timeout_seconds,
-    )
-    _, still_pending = await asyncio.wait(pending, timeout=timeout_seconds)
-    for task in still_pending:
-        task.cancel()
-    if still_pending:
-        _log.warning(
-            "cancelled %d ena_import_batch task(s) that did not drain in time;"
-            " their in-flight items will be re-driven by"
-            " reconcile_inflight_batches on next startup",
-            len(still_pending),
-        )
 
 
 async def reconcile_inflight_batches(app: FastAPI) -> int:

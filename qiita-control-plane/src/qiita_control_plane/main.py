@@ -26,7 +26,7 @@ from .dispatch import (
     drain_running_dispatches,
     reconcile_inflight_tickets,
 )
-from .ena_import.batch import drain_running_ena_import_batches, reconcile_inflight_batches
+from .ena_import.batch import reconcile_inflight_batches
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -34,17 +34,11 @@ from .routes import api_router
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# Bound on how long we wait for in-flight dispatches at shutdown. systemd's
-# default TimeoutStopSec is 90s; staying under that lets us cancel cleanly
-# before SIGKILL. Unfinished tasks are re-attached by reconcile_inflight_tickets
-# on the next startup as a safety net.
-_DISPATCH_DRAIN_TIMEOUT_SECONDS = 60.0
-
-# Twin of _DISPATCH_DRAIN_TIMEOUT_SECONDS, for ena_import_batch's own tracked
-# task set (see ena_import.batch — it does not share dispatch.py's task set
-# because it drives register_ena_study + submit_work_ticket_core directly,
-# not a work_ticket/ComputeBackendClient run).
-_ENA_IMPORT_BATCH_DRAIN_TIMEOUT_SECONDS = 60.0
+# Bound on how long we wait for in-flight background tasks at shutdown (both the
+# dispatch set and ena_import_batch's own set). systemd's default TimeoutStopSec
+# is 90s; staying under that lets us cancel cleanly before SIGKILL. Unfinished
+# tasks are re-attached by the matching reconcile on the next startup.
+_DRAIN_TIMEOUT_SECONDS = 60.0
 
 
 @asynccontextmanager
@@ -130,11 +124,13 @@ async def lifespan(app: FastAPI):
         await close_pool(app.state.notify_pool)
         await drain_running_dispatches(
             app.state.running_dispatches,
-            timeout_seconds=_DISPATCH_DRAIN_TIMEOUT_SECONDS,
+            timeout_seconds=_DRAIN_TIMEOUT_SECONDS,
         )
-        await drain_running_ena_import_batches(
+        await drain_running_dispatches(
             app.state.running_ena_import_batches,
-            timeout_seconds=_ENA_IMPORT_BATCH_DRAIN_TIMEOUT_SECONDS,
+            timeout_seconds=_DRAIN_TIMEOUT_SECONDS,
+            label="ena_import_batch",
+            reconcile_note="reconcile_inflight_batches",
         )
         if app.state.compute_backend_client is not None:
             await app.state.compute_backend_client.close()

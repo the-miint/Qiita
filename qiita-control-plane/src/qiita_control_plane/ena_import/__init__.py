@@ -16,7 +16,6 @@ from .attribute_mapping import map_ena_attributes
 from .batch import (
     BatchImportItemHandle,
     create_ena_import_batch,
-    drain_running_ena_import_batches,
     fetch_batch_status,
     reconcile_inflight_batches,
     schedule_ena_import_batch,
@@ -63,7 +62,6 @@ __all__ = [
     "build_download_ena_study_ticket",
     "create_ena_import_batch",
     "detect_accession_kind",
-    "drain_running_ena_import_batches",
     "fetch_batch_status",
     "harmonize_biosample_attributes",
     "map_ena_attributes",

@@ -20,6 +20,7 @@ import os
 import shutil
 from pathlib import Path
 
+import duckdb
 from qiita_common.parquet import validate_parquet_path
 
 from .miint import (
@@ -111,3 +112,30 @@ def hardlink(src: Path, dst: Path) -> None:
         os.link(src, dst)
     except OSError:
         shutil.copyfile(src, dst)
+
+
+def read_roster_parquet(
+    path: Path, *, value_column: str, roster_name: str
+) -> list[tuple[int, str]]:
+    """Read a two-column `(prep_sample_idx, <value_column>)` roster Parquet,
+    ordered by prep_sample_idx for deterministic processing / error reporting;
+    returns `(int, str)` tuples. Raises ValueError (BAD_INPUT via the dispatcher)
+    on an empty or unreadable roster.
+
+    The one place the roster-reading shape lives, so `ingest_reads`
+    (`sample_map` / `pool_item_id`) and `ingest_ena_reads` (`run_map` /
+    `ena_run_accession`) cannot silently diverge. `value_column` and
+    `roster_name` are trusted internal literals from the two callers, never user
+    input (DuckDB can't bind an identifier, hence the interpolation)."""
+    try:
+        with open_conn() as conn:
+            rows = conn.execute(
+                f"SELECT prep_sample_idx, {value_column} FROM read_parquet(?) "
+                "ORDER BY prep_sample_idx",
+                [str(path)],
+            ).fetchall()
+    except duckdb.Error as exc:
+        raise ValueError(f"{roster_name} could not be read: {path}: {exc}") from exc
+    if not rows:
+        raise ValueError(f"{roster_name} is empty: {path}")
+    return [(int(r[0]), str(r[1])) for r in rows]
