@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#TBD).**
+- **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
   The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
   now record masking completion in `qiita.mask_sample` first-class, via a new
   terminal `finalize-mask-sample` library action that runs after `register-files`
@@ -521,7 +521,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
-- **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#TBD).**
+- **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#371).**
   `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
   `mask_idx` and aligns the pool's samples whose `mask_sample` gate is `completed`
   under it. The server-side reconstruction of each sample's mask config (host refs
@@ -533,7 +533,7 @@ duplicates further down are historical strata; leave them where they are.
   adds the required `mask_idx`; a nonexistent `mask_idx` is a new 404
   (`AlignMaskNotFound`), distinct from the repurposed `AlignNoMasksFound` (422 — the
   mask exists but no pool sample is masked-complete under it).
-- **The masked-read export and long-read-assembly readers now require a `completed` `mask_sample` gate (#TBD).**
+- **The masked-read export and long-read-assembly readers now require a `completed` `mask_sample` gate (#371).**
   Both consumers previously treated the ABSENCE of a `mask_sample` row as "allowed".
   With completion now written first-class by every masking path, absence means "not
   masked-complete", so both reject it (export 409; assembly SUBMISSION/BAD_INPUT)

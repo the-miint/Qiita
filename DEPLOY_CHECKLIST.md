@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `make migrate` applies `20260724000000_backfill_mask_sample_per_sample.sql` — a data backfill (no schema change): it writes a `'completed'` `qiita.mask_sample` gate row for every already-completed per-sample mask-model ticket (`read-mask` / `fastq-to-parquet`, `prep_sample`-scoped, non-NULL `mask_idx`), so the newly-tightened readers (masked-read export, long-read-assembly input, align-plan) don't 409 historical masks that predate the first-class completion gate. Idempotent (`ON CONFLICT DO NOTHING`); a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT covered here (dbmate applies a migration once) — the bucket-6 re-run below closes that edge. (#feat/block-align-mask-selection)
+- `make migrate` applies `20260724000000_backfill_mask_sample_per_sample.sql` — a data backfill (no schema change): it writes a `'completed'` `qiita.mask_sample` gate row for every already-completed per-sample mask-model ticket (`read-mask` / `fastq-to-parquet`, `prep_sample`-scoped, non-NULL `mask_idx`), so the newly-tightened readers (masked-read export, long-read-assembly input, align-plan) don't 409 historical masks that predate the first-class completion gate. Idempotent (`ON CONFLICT DO NOTHING`); a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT covered here (dbmate applies a migration once) — the bucket-6 re-run below closes that edge. (#371)
 
 ### 4. Deploy
 
@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- **`read-mask` 1.0.0 and `fastq-to-parquet` 1.3.0 carry the new `finalize-mask-sample` terminal step** — `make verify-deploy` already confirms `qiita.action` is queryable; this additionally confirms both per-sample masking workflows were re-synced, so they now write the `mask_sample` completion gate first-class. Expect `t` for both rows. (#feat/block-align-mask-selection)
+- **`read-mask` 1.0.0 and `fastq-to-parquet` 1.3.0 carry the new `finalize-mask-sample` terminal step** — `make verify-deploy` already confirms `qiita.action` is queryable; this additionally confirms both per-sample masking workflows were re-synced, so they now write the `mask_sample` completion gate first-class. Expect `t` for both rows. (#371)
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -Atc "SELECT action_id, steps::text LIKE '\''%finalize-mask-sample%'\'' FROM qiita.action WHERE (action_id, version) IN (('\''read-mask'\'', '\''1.0.0'\''), ('\''fastq-to-parquet'\'', '\''1.3.0'\''));"'
@@ -39,7 +39,7 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- **Re-run the idempotent per-sample `mask_sample` backfill** to close the migrate→restart deploy-window: a `read-mask` / `fastq-to-parquet` ticket that completed after `make migrate` (bucket 3) but before the restart ran under old code that did not yet write the completion gate, so its historical mask has no gate row and the tightened readers would 409 it. dbmate will not re-apply the migration, so run its `migrate:up` body by hand. Idempotent (`ON CONFLICT DO NOTHING`) — safe to re-run and it does NOT burn the rollback path (it only adds `completed` rows for already-completed masks). (#feat/block-align-mask-selection)
+- **Re-run the idempotent per-sample `mask_sample` backfill** to close the migrate→restart deploy-window: a `read-mask` / `fastq-to-parquet` ticket that completed after `make migrate` (bucket 3) but before the restart ran under old code that did not yet write the completion gate, so its historical mask has no gate row and the tightened readers would 409 it. dbmate will not re-apply the migration, so run its `migrate:up` body by hand. Idempotent (`ON CONFLICT DO NOTHING`) — safe to re-run and it does NOT burn the rollback path (it only adds `completed` rows for already-completed masks). (#371)
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -c "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) SELECT wt.mask_idx, wt.prep_sample_idx, '\''completed'\'' FROM qiita.work_ticket wt WHERE wt.action_id IN ('\''read-mask'\'', '\''fastq-to-parquet'\'') AND wt.scope_target_kind = '\''prep_sample'\'' AND wt.state = '\''completed'\'' AND wt.mask_idx IS NOT NULL ON CONFLICT (mask_idx, prep_sample_idx) DO NOTHING;"'
@@ -47,7 +47,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **Breaking API contract — `align-plan` request shape changed (no host action, downstream-client awareness).** `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now **requires** `mask_idx` and **drops** `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx`. A caller sending the old body gets a 422; a caller that omits `mask_idx` cannot submit a plan. Any out-of-repo align-plan client must be updated to name the `mask_idx` its reads were masked under. Rationale: align no longer re-derives the mask config server-side — the reconstruction matched the real per-sample mask only by coincidence and returned `AlignNoMasksFound` for every pool on this deployment; a nonexistent `mask_idx` is now a 404 (`AlignMaskNotFound`). (#feat/block-align-mask-selection)
+- **Breaking API contract — `align-plan` request shape changed (no host action, downstream-client awareness).** `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now **requires** `mask_idx` and **drops** `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx`. A caller sending the old body gets a 422; a caller that omits `mask_idx` cannot submit a plan. Any out-of-repo align-plan client must be updated to name the `mask_idx` its reads were masked under. Rationale: align no longer re-derives the mask config server-side — the reconstruction matched the real per-sample mask only by coincidence and returned `AlignNoMasksFound` for every pool on this deployment; a nonexistent `mask_idx` is now a 404 (`AlignMaskNotFound`). (#371)
 
 ---
 
