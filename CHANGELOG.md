@@ -264,6 +264,21 @@ duplicates further down are historical strata; leave them where they are.
   zero. `binning.sh` now sorts into a `.partial` staging name inside `work_files/`
   and renames it into place (so a killed sort cannot leave a truncated BAM at the
   name metaWRAP reads), replacing the old `ln`-else-`cp` staging.
+- **`samtools` is pinned (`=1.10`) in the `binning` image, and the sort is pinned
+  by a test that needs no binary (#370).** Nothing in `binning.def` named samtools
+  before — it arrived through `metawrap-mg`'s solve, so any later rebuild could
+  have moved it, under a `samtools sort` whose memory budget is sized from a peak
+  RSS measured on one specific build. 1.10 is what the deployed image ships, and a
+  dry-run solve with the pin reproduces every build string unchanged (samtools
+  `h2e538c0_3`). The behavioural test for the sort needs the samtools binary and is
+  skipped wherever it is absent (CI included), and it exercises samtools rather
+  than us — so `test_binning_coverage_sort_pin.py` asserts the parts that are ours:
+  that the entrypoint still sorts `${COVERAGE_BAM}`, has not regressed to copying
+  it into place, still stages atomically inside `work_files/`, and still derives
+  the sort budget from `MEM_MB`. It reads the script with comments stripped and
+  `\`-continuations folded, so it cannot be satisfied by a comment mentioning the
+  command — the failure mode the first deploy-checklist grep for this same change
+  actually had. Each assertion was mutation-checked.
 - **Container steps are told their own allocation: `QIITA_CPUS` / `QIITA_MEM_MB`
   (#370).** `apptainer exec --containall` scrubs the environment, so no `SLURM_*`
   var reaches a container entrypoint — measured on the deploy host: zero survive.

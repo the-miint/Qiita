@@ -62,8 +62,16 @@ From: mambaorg/micromamba:1.5.8
     # maxbin2 is pinned >=2.2.6 because 2.2.1's executable is `MaxBin`, not the
     # `run_MaxBin.pl` metaWRAP invokes — an unpinned solve takes 2.2.1 and the
     # image passes every build check, then fails inside the job.
+    #
+    # samtools is pinned =1.10 because binning.sh now runs `samtools sort` on the
+    # staged coverage BAM, sized against a peak RSS MEASURED on this build. Both
+    # the sizing and the sort semantics are version-bound, and the dependency was
+    # transitive: nothing here named samtools before, so it arrived via
+    # metawrap-mg's solve and would move under any later re-solve. 1.10 is what
+    # the deployed image ships; a dry-run solve with this pin reproduces every
+    # build string unchanged, samtools h2e538c0_3 included.
     micromamba create -y -n metawrap -c bioconda -c conda-forge \
-        metawrap-mg bwa samtools metabat2 "maxbin2>=2.2.6" concoct
+        metawrap-mg bwa samtools=1.10 metabat2 "maxbin2>=2.2.6" concoct
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh /opt/qiita/binning-verify.sh
     chmod 0644 /opt/qiita/manifest_writer.py

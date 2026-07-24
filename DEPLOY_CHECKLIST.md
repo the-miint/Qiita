@@ -47,7 +47,8 @@ _None yet._
 
 ### Notes (no host action)
 
-- Every workflow SIF **auto-rebuilds** on this deploy — `binning.sh` changed (it is in the binning image's `HASH_INPUTS`) and `workflows/_shared/_lib.sh` changed, which is hashed into *every* image's build-inputs digest. No manual build step (#370).
+- Every workflow SIF **auto-rebuilds** on this deploy — `binning.sh` changed (it is in the binning image's `HASH_INPUTS`), `binning.def` changed (`build-sif.sh` seeds the def into the digest unconditionally), and `workflows/_shared/_lib.sh` changed, which is hashed into *every* image's build-inputs digest. No manual build step (#370).
+- The binning image now pins `samtools=1.10` (it was transitive via `metawrap-mg`). This is the version the currently-deployed image already ships, and a dry-run solve with the pin reproduces every build string unchanged — so the rebuilt image is equivalent, not a tool upgrade. Nothing to check beyond the existing `binning-verify.sh` sentinel (#370).
 - Container steps now receive `QIITA_CPUS` / `QIITA_MEM_MB` (the step's resolved `baseline_resources`) via `apptainer --env`; entrypoints read them through `_lib.sh`. This is internal to the orchestrator — **no host env var to set**. The entrypoints fall back to the old `nproc` chain when the vars are absent, so a SIF that rebuilds before the orchestrator restarts still runs (#370).
 - `workflows/long-read-assembly/1.0.0.yaml` changed in **comments only** — `qiita-admin actions sync` will re-upsert the same `long-read-assembly` `1.0.0` row; no new action version, nothing to re-verify beyond the generic `make verify-deploy` action list (#370).
 - Tickets that already failed at `binning` with `ERROR: the bam file 'reads.bam' is not sorted!` need a resubmit after this deploy; nothing on the host to change (#370).
