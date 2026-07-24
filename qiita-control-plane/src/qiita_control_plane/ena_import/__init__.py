@@ -1,9 +1,9 @@
 """ENA-study import package — batch, per-study ingestion of ENA/SRA metadata
 and reads into Qiita.
 
-Layers: the metadata resolver seam (`EnaResolver` contract, `MiintEnaResolver`
-default, `HttpEnaResolver` fallback, accession validation, `get_resolver`
-factory); the registration path (`platform_mapping` / `protocol_mapping` and
+Layers: the metadata resolver (`MiintEnaResolver`, miint `read_ena` /
+`read_ena_attributes`, plus accession validation); the registration path
+(`platform_mapping` / `protocol_mapping` and
 `registration.register_ena_study`, the composer that turns resolved metadata
 into study/biosample/prep_sample/sequenced_sample rows); metadata harmonization
 (`attribute_mapping` + `harmonization.harmonize_biosample_attributes`); the
@@ -21,10 +21,8 @@ from .batch import (
     reconcile_inflight_batches,
     schedule_ena_import_batch,
 )
-from .factory import BACKEND_HTTP, BACKEND_MIINT, get_resolver
 from .harmonization import HarmonizationResult, harmonize_biosample_attributes
-from .http_resolver import HttpEnaResolver
-from .miint_resolver import MiintEnaResolver
+from .miint_resolver import BACKEND_MIINT, MiintEnaResolver
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
 from .protocol_mapping import (
     UnmappableEnaLibraryStrategyError,
@@ -37,7 +35,7 @@ from .registration import (
     RunRegistrationStatus,
     register_ena_study,
 )
-from .resolver import EnaAccessionNotFoundError, EnaResolver
+from .resolver import EnaAccessionNotFoundError
 from .submit import (
     DEFAULT_DOWNLOAD_METHOD,
     DOWNLOAD_ENA_STUDY_ACTION_ID,
@@ -46,7 +44,6 @@ from .submit import (
 )
 
 __all__ = [
-    "BACKEND_HTTP",
     "BACKEND_MIINT",
     "DEFAULT_DOWNLOAD_METHOD",
     "DOWNLOAD_ENA_STUDY_ACTION_ID",
@@ -55,10 +52,8 @@ __all__ = [
     "CreatedPool",
     "EnaAccessionKind",
     "EnaAccessionNotFoundError",
-    "EnaResolver",
     "EnaStudyRegistrationResult",
     "HarmonizationResult",
-    "HttpEnaResolver",
     "InvalidEnaAccessionError",
     "MiintEnaResolver",
     "RunRegistrationOutcome",
@@ -70,7 +65,6 @@ __all__ = [
     "detect_accession_kind",
     "drain_running_ena_import_batches",
     "fetch_batch_status",
-    "get_resolver",
     "harmonize_biosample_attributes",
     "map_ena_attributes",
     "map_ena_platform",

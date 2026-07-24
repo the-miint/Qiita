@@ -20,7 +20,7 @@ ALTER TABLE qiita.sequenced_sample
   ADD COLUMN source_archive TEXT
     CHECK (source_archive IS NULL OR source_archive IN ('ena', 'sra')),
   ADD COLUMN resolver_kind TEXT
-    CHECK (resolver_kind IS NULL OR resolver_kind IN ('miint', 'http')),
+    CHECK (resolver_kind IS NULL OR resolver_kind IN ('miint')),
   ADD COLUMN transport TEXT
     CHECK (transport IS NULL OR transport IN ('http', 'aspera'));
 

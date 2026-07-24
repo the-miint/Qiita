@@ -1,4 +1,4 @@
-"""Tests for `MiintEnaResolver`: the default `EnaResolver`, driving DuckDB + the miint
+"""Tests for `MiintEnaResolver`, driving DuckDB + the miint
 `read_ena` / `read_ena_attributes` table functions.
 
 Network-free: the module-level query functions (`_query_ena_*`) are monkeypatched by

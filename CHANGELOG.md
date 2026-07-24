@@ -27,11 +27,9 @@ duplicates further down are historical strata; leave them where they are.
   ingestion: `qiita_common.models.ena` (`EnaStudyHeader` / `EnaRunRecord` /
   `EnaSampleAttributes`, coercing `read_ena`'s ALL-VARCHAR numeric fields and
   failing loud on garbage), `qiita_control_plane.ena_import.accession`
-  (study/sample/run/experiment accession validation), the `EnaResolver`
-  interface, its default `MiintEnaResolver` implementation (DuckDB + miint
-  `read_ena` / `read_ena_attributes`), an experimental `HttpEnaResolver`
-  fallback against the plain ENA Portal/Browser APIs, and a `get_resolver`
-  backend factory. An unresolved/invalid accession always raises
+  (study/sample/run/experiment accession validation), and `MiintEnaResolver`
+  (DuckDB + miint `read_ena` / `read_ena_attributes`), the sole ENA metadata
+  resolver. An unresolved/invalid accession always raises
   (`InvalidEnaAccessionError` / `EnaAccessionNotFoundError`) rather than
   returning empty. No DB writes or read downloads yet — those land in later
   tickets of this epic.
@@ -416,12 +414,12 @@ duplicates further down are historical strata; leave them where they are.
 - **ENA import: an empty ENA sample attribute set no longer fails the whole
   study.** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
   whose sample (`SAMD01818724`) has zero `<SAMPLE_ATTRIBUTE>` elements —
-  genuinely common on real ENA/DDBJ data, but `MiintEnaResolver`/
-  `HttpEnaResolver.resolve_sample_attributes` hard-raised
+  genuinely common on real ENA/DDBJ data, but
+  `MiintEnaResolver.resolve_sample_attributes` hard-raised
   `EnaAccessionNotFoundError` on the resulting 0-row result, marking the
   entire study `failed`. `resolve_sample_attributes` now returns no entries
   instead of raising for that case — `resolve_study_header`/`resolve_runs`
-  (and `HttpEnaResolver`'s own sample-existence search) are unchanged and
+  are unchanged and
   still raise on a genuine zero-row "nothing resolved." The study now
   registers normally; the biosample harmonizes against an empty attribute
   map (no globally-linked metadata) and the ERC000011 checklist's missing

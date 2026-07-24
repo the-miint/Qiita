@@ -38,7 +38,7 @@ from qiita_common.models.ena_import import BatchImportItem, BatchImportStatus, B
 from ..auth.principal import HumanUser
 from ..auth.scopes import role_ceiling
 from .accession import validate_study_accession
-from .factory import get_resolver
+from .miint_resolver import BACKEND_MIINT, MiintEnaResolver
 from .registration import register_ena_study
 from .submit import build_download_ena_study_ticket
 
@@ -127,7 +127,10 @@ async def create_ena_import_batch(
     # De-duplicate accessions, order-preserving: a repeated accession in one
     # request would otherwise fan out concurrent items registering the same study.
     validated = list(dict.fromkeys(validate_study_accession(a) for a in accessions))
-    get_resolver(resolver_backend)  # fail loud on an unrecognized backend
+    if resolver_backend != BACKEND_MIINT:  # fail loud on an unrecognized backend
+        raise ValueError(
+            f"unknown ENA resolver backend={resolver_backend!r}; expected {BACKEND_MIINT!r}"
+        )
 
     async with pool.acquire() as conn, conn.transaction():
         batch_idx = await conn.fetchval(
@@ -205,7 +208,7 @@ async def _process_one_study(
     """
     try:
         await _set_item_state(pool, item.idx, BatchItemState.RESOLVING)
-        resolver = get_resolver(resolver_backend)
+        resolver = MiintEnaResolver()
         study_header = await asyncio.to_thread(
             resolver.resolve_study_header, item.ena_study_accession
         )

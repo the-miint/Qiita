@@ -38,8 +38,8 @@ class BatchImportRequest(BaseModel):
     """Body for `POST /api/v1/ena-import-batch`.
 
     `accessions`: ENA/SRA STUDY accessions, one `qiita.study` per entry.
-    `backend`: `EnaResolver` implementation (`'miint'` default, `'http'`
-    fallback). `source`: the archive reads come from (`SourceArchive`, `'ena'`
+    `backend`: metadata resolver backend (`'miint'`, the only value today).
+    `source`: the archive reads come from (`SourceArchive`, `'ena'`
     default). `download_method`: transport for each spawned ticket (only `'http'`
     supported today).
     """

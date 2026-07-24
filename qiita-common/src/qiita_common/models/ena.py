@@ -1,5 +1,5 @@
 """Pydantic models for ENA/SRA study metadata resolved via miint `read_ena` /
-`read_ena_attributes`, or the plain-HTTP fallback.
+`read_ena_attributes`.
 
 `read_ena` returns an ALL-VARCHAR relation — every field, including numeric
 ones, arrives as text. These models are the boundary where that becomes typed:
@@ -138,12 +138,11 @@ class SourceArchive(StrEnum):
 
 
 class ResolverKind(StrEnum):
-    """Which `EnaResolver` implementation produced a `sequenced_sample` row's
-    imported metadata — matches `ena_import.BACKEND_MIINT` / `BACKEND_HTTP`.
+    """Which resolver produced a `sequenced_sample` row's imported metadata.
+    Only `miint` (`ena_import.BACKEND_MIINT`) today.
 
     Mirrored by the `qiita.sequenced_sample.resolver_kind` TEXT/CHECK constraint
     — not a Postgres ENUM; same carve-out as `UploadStatus` / `ReferenceStatus`;
     see CLAUDE.md "Enum parity". Keep both sides in sync by hand."""
 
     MIINT = "miint"
-    HTTP = "http"

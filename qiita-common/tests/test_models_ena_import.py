@@ -23,12 +23,10 @@ def test_batch_import_request_accepts_overrides():
 
     req = BatchImportRequest(
         accessions=["PRJEB1234", "PRJNA5678"],
-        backend="http",
         source="sra",
         download_method="http",
     )
     assert req.accessions == ["PRJEB1234", "PRJNA5678"]
-    assert req.backend == "http"
     assert req.source == "sra"
 
 

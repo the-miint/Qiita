@@ -1,5 +1,5 @@
 """Shared field-by-field assertions against the PRJNA48739 fixture data, run by
-both resolver test suites so both `EnaResolver` implementations meet one contract."""
+the resolver test suite to pin the resolver's contract."""
 
 from __future__ import annotations
 

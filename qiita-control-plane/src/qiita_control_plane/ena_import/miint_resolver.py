@@ -1,4 +1,4 @@
-"""`MiintEnaResolver` — the default `EnaResolver` implementation.
+"""`MiintEnaResolver` — the ENA metadata resolver.
 
 Drives a DuckDB session with the miint extension loaded and calls `read_ena`
 (study header + runs) and `read_ena_attributes` (per-sample attributes). See
@@ -19,7 +19,11 @@ from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyH
 from qiita_control_plane.miint import connect_with_miint
 
 from .accession import validate_study_accession
-from .resolver import EnaAccessionNotFoundError, EnaResolver, pivot_sample_attributes
+from .resolver import EnaAccessionNotFoundError, pivot_sample_attributes
+
+# The only ENA metadata resolver backend. Kept as a named constant so the batch
+# route/driver validate the request's `backend` against one source of truth.
+BACKEND_MIINT = "miint"
 
 # Double-checked-lock guard for the one-time `INSTALL httpfs`, mirroring
 # `connect_with_miint`'s own guard for the miint extension. `INSTALL` is a no-op on a
@@ -89,8 +93,8 @@ def _query_ena_sample_attributes(accession: str) -> tuple[list[str], list[tuple]
         return [d[0] for d in rel.description], rel.fetchall()
 
 
-class MiintEnaResolver(EnaResolver):
-    """Default `EnaResolver` — miint `read_ena` / `read_ena_attributes`."""
+class MiintEnaResolver:
+    """The ENA metadata resolver — miint `read_ena` / `read_ena_attributes`."""
 
     def resolve_study_header(self, accession: str) -> EnaStudyHeader:
         accession = validate_study_accession(accession)
