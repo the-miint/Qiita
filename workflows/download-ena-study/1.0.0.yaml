@@ -24,7 +24,7 @@ description: >
   independent of any mask) plus a durable per-sample copy the repeatable
   read-mask workflow consumes. Transport is pinned to `download_method:
   http` (no Aspera key-staging exists in the compute env; see
-  ARCHITECTURE.md's ENA Study Import download-ticket-granularity decision).
+  `docs/architecture.md`'s ENA Study Import download-ticket-granularity decision).
 
 scopes: []
 
@@ -78,12 +78,16 @@ steps:
     baseline_resources:
       # Bounded-concurrent per-run loop (up to _CONCURRENCY=4 runs fetched at
       # once, 2 DuckDB threads each -> cpu = 4*2 = 8, mem_gb split across the
-      # 4 slots from the cgroup — see ../read_staging.py per_slot_caps).
-      # Network-bound (ENA's ENAClient rate-limits to ~3 req/s), so walltime
-      # is sized well above ingest_reads' local-parse PT8H baseline to cover a
-      # pool of real-world-sized public runs over the network.
+      # 4 slots from the cgroup — see per_slot_caps in
+      # qiita_compute_orchestrator/read_staging.py).
+      # Network-bound (well under miint's ENAClient outbound rate limit), so
+      # walltime is sized well above ingest_reads' local-parse PT8H baseline to
+      # cover a pool of real-world-sized public runs over the network.
+      # mem_gb tracks ingest_reads' baseline (bcl-convert/1.0.0.yaml) -- the two
+      # share the read_staging per-slot DuckDB path -- rather than diverging on an
+      # unmeasured figure.
       cpu: 8
-      mem_gb: 32
+      mem_gb: 56
       walltime: PT24H
 
   # Load the per-run read parts into the DuckLake `read` table. The

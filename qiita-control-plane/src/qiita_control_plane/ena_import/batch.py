@@ -9,8 +9,8 @@ this module's own tracked set `app.state.running_ena_import_batches` (mirroring
 `ComputeBackendClient` workflow run).
 
 The task (`_run_batch`) processes every item with bounded concurrency
-(`_STUDY_CONCURRENCY`) -- respecting miint's ~3 req/s ENAClient rate limit and
-bounding concurrent DB writers. Each item (`_process_one_study`): resolve
+(`_STUDY_CONCURRENCY`) -- staying well under miint's ENAClient outbound rate
+limit and bounding concurrent DB writers. Each item (`_process_one_study`): resolve
 (blocking calls under `asyncio.to_thread`) -> `register_ena_study` -> one
 `download-ena-study` ticket per created pool, submitted in-process through
 `submit_work_ticket_core` with the BATCH's submitting principal (so the ticket's
@@ -18,13 +18,16 @@ audience gate is enforced against a real principal) and the batch's own persiste
 `download_method`. One accession's failure marks only that item `failed`.
 
 `reconcile_inflight_batches` (from `main.py` lifespan startup) re-drives every
-item still `pending`/`resolving` after a CP restart -- `register_ena_study` is
-idempotent, so re-driving is safe even if a prior resolve partially ran.
+item still `pending`/`resolving`/`registered` after a CP restart --
+`register_ena_study` is idempotent and the submit loop reuses any already-created
+download ticket, so re-driving is safe even if a prior resolve or ticket-submit
+partially ran.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 
@@ -33,20 +36,35 @@ from fastapi import FastAPI
 from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena import ResolverKind, SourceArchive
-from qiita_common.models.ena_import import BatchImportItem, BatchImportStatus, BatchItemState
+from qiita_common.models.ena_import import (
+    BatchImportItem,
+    BatchImportStatus,
+    BatchItemState,
+    RunImportOutcome,
+)
 
 from ..auth.principal import HumanUser
 from ..auth.scopes import role_ceiling
 from .accession import validate_study_accession
 from .miint_resolver import BACKEND_MIINT, MiintEnaResolver
-from .registration import register_ena_study
-from .submit import build_download_ena_study_ticket
+from .registration import (
+    EnaStudyRegistrationResult,
+    RunRegistrationStatus,
+    register_ena_study,
+)
+from .submit import (
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    build_download_ena_study_ticket,
+)
 
 _log = logging.getLogger(__name__)
 
-# Bounded concurrency for resolve+register. Small on purpose: miint's ENAClient
-# rate-limits outbound calls to ~3 req/s, so a few in-flight studies stay under
-# that ceiling without serializing the whole run.
+# Bounded concurrency for resolve+register. Deliberately small: it keeps one batch
+# from opening many concurrent ENA connections and DB writers at once, and stays
+# comfortably under miint's ENAClient outbound rate limit. The exact request rate
+# is miint's to set and is not measured here, so this is a conservative constant,
+# not a value derived from that limit.
 _STUDY_CONCURRENCY = 4
 
 # Shutdown-drain bound, mirroring dispatch.py's _DISPATCH_DRAIN_TIMEOUT_SECONDS.
@@ -165,27 +183,80 @@ async def _set_item_state(
     )
 
 
-async def _set_item_registered(pool: asyncpg.Pool, item_idx: int, *, study_idx: int) -> None:
+def _serialize_run_outcomes(result: EnaStudyRegistrationResult) -> str:
+    """JSON-encode the per-run outcomes for the item's `run_outcomes` JSONB
+    column (asyncpg has no default jsonb codec, so write a string + `::jsonb`).
+    Carries each run's status, failure reason, and harmonization gap
+    (`missing_required`) so `GET /ena-import-batch/{idx}` can surface them."""
+    return json.dumps(
+        [
+            {
+                "run_accession": o.run_accession,
+                "status": o.status.value,
+                "failure_reason": o.failure_reason,
+                "missing_required": (
+                    list(o.harmonization.missing_required) if o.harmonization else []
+                ),
+            }
+            for o in result.runs
+        ]
+    )
+
+
+async def _set_item_registered(
+    pool: asyncpg.Pool, item_idx: int, *, study_idx: int, run_outcomes_json: str
+) -> None:
     await pool.execute(
         "UPDATE qiita.ena_import_batch_item"
-        " SET state = $2, study_idx = $3, failure_reason = NULL"
+        " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb, failure_reason = NULL"
         " WHERE idx = $1",
         item_idx,
         BatchItemState.REGISTERED.value,
         study_idx,
+        run_outcomes_json,
     )
 
 
-async def _set_item_downloading(
-    pool: asyncpg.Pool, item_idx: int, *, work_ticket_idxs: list[int]
-) -> None:
+async def _append_item_download_ticket(pool: asyncpg.Pool, item_idx: int, ticket_idx: int) -> None:
+    """Append one submitted download-ticket idx to the item's array the moment
+    it is submitted, so a crash mid-loop leaves the tickets already sent
+    recorded (nothing orphaned). Idempotent: a re-drive that reuses an existing
+    ticket does not duplicate the idx."""
     await pool.execute(
         "UPDATE qiita.ena_import_batch_item"
-        " SET state = $2, download_work_ticket_idxs = $3"
+        " SET download_work_ticket_idxs = CASE"
+        "   WHEN $2 = ANY(download_work_ticket_idxs) THEN download_work_ticket_idxs"
+        "   ELSE array_append(download_work_ticket_idxs, $2) END"
         " WHERE idx = $1",
         item_idx,
+        ticket_idx,
+    )
+
+
+async def _mark_item_downloading(pool: asyncpg.Pool, item_idx: int) -> None:
+    """Flip a fully-submitted item to `downloading`. Its ticket idxs are already
+    persisted by `_append_item_download_ticket` as each was submitted, so this
+    only advances the state."""
+    await pool.execute(
+        "UPDATE qiita.ena_import_batch_item SET state = $2 WHERE idx = $1",
+        item_idx,
         BatchItemState.DOWNLOADING.value,
-        work_ticket_idxs,
+    )
+
+
+async def _existing_download_ticket_idx(pool: asyncpg.Pool, sequenced_pool_idx: int) -> int | None:
+    """The idx of an existing download-ena-study work_ticket for this pool, if
+    any (any state). Lets a re-driven `registered` item reuse a ticket a prior
+    run already submitted instead of re-submitting -- a sequenced_pool re-submit
+    would 409 (disallow-without-delete / the COMPLETED-pool gate), which would
+    wrongly fail the whole item."""
+    return await pool.fetchval(
+        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        " WHERE action_id = $1 AND action_version = $2 AND sequenced_pool_idx = $3"
+        " ORDER BY work_ticket_idx LIMIT 1",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        sequenced_pool_idx,
     )
 
 
@@ -227,7 +298,12 @@ async def _process_one_study(
             source_archive=source_archive,
             resolver_kind=resolver_kind,
         )
-        await _set_item_registered(pool, item.idx, study_idx=result.study_idx)
+        await _set_item_registered(
+            pool,
+            item.idx,
+            study_idx=result.study_idx,
+            run_outcomes_json=_serialize_run_outcomes(result),
+        )
 
         if not result.created_pools:
             # Registration succeeded (study + biosamples), but no run mapped to a
@@ -245,23 +321,49 @@ async def _process_one_study(
             )
             return
 
+        if not any(o.status is not RunRegistrationStatus.FAILED for o in result.runs):
+            # Pools exist (a platform mapped), but every run then failed inside
+            # register_ena_study (protocol mapping, harmonization, or a DB error),
+            # so the pools hold no sequenced_sample rows. Submitting downloads
+            # against them would report success over an all-failed study. Terminal
+            # `failed`; the per-run reasons are already persisted on `run_outcomes`.
+            reasons = "; ".join(
+                f"{o.run_accession}: {o.failure_reason}"
+                for o in result.runs
+                if o.status is RunRegistrationStatus.FAILED
+            )
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=f"study registered but every run failed to register ({reasons})",
+            )
+            return
+
         # Local import (narrow, deliberately unusual direction): reuse the exact
         # same audience/scope/disallow-without-delete gate a real
         # `POST /work-ticket` goes through, not a parallel copy.
         from ..routes.work_ticket import submit_work_ticket_core
 
-        work_ticket_idxs: list[int] = []
         for created_pool in result.created_pools:
-            body = build_download_ena_study_ticket(
-                sequenced_pool_idx=created_pool.sequenced_pool_idx,
-                sequencing_run_idx=created_pool.sequencing_run_idx,
-                ena_study_accession=study_header.study_accession,
-                download_method=download_method,
-            )
-            response = await submit_work_ticket_core(app=app, principal=principal, body=body)
-            work_ticket_idxs.append(response.work_ticket_idx)
+            # Re-drive safety: a prior run may have already submitted this pool's
+            # ticket before crashing. Reuse it rather than re-submit (a
+            # sequenced_pool re-submit 409s and would fail the whole item);
+            # otherwise submit fresh. Each idx is persisted as it lands so a crash
+            # mid-loop orphans nothing.
+            ticket_idx = await _existing_download_ticket_idx(pool, created_pool.sequenced_pool_idx)
+            if ticket_idx is None:
+                body = build_download_ena_study_ticket(
+                    sequenced_pool_idx=created_pool.sequenced_pool_idx,
+                    sequencing_run_idx=created_pool.sequencing_run_idx,
+                    ena_study_accession=study_header.study_accession,
+                    download_method=download_method,
+                )
+                response = await submit_work_ticket_core(app=app, principal=principal, body=body)
+                ticket_idx = response.work_ticket_idx
+            await _append_item_download_ticket(pool, item.idx, ticket_idx)
 
-        await _set_item_downloading(pool, item.idx, work_ticket_idxs=work_ticket_idxs)
+        await _mark_item_downloading(pool, item.idx)
     except Exception as exc:  # noqa: BLE001 -- per-study isolation: one
         # accession's failure must never abort siblings; recorded on this item,
         # visible via GET /ena-import-batch/{idx}, never swallowed silently.
@@ -366,13 +468,17 @@ async def drain_running_ena_import_batches(
 
 
 async def reconcile_inflight_batches(app: FastAPI) -> int:
-    """Re-drive every batch item still `pending`/`resolving` at startup.
+    """Re-drive every batch item still `pending`/`resolving`/`registered` at startup.
 
-    Mirrors `dispatch.reconcile_inflight_tickets`: a CP restart leaves any item
-    short of `registered` with no live owner. `register_ena_study` is idempotent,
-    so re-driving is safe. Items are grouped by batch so each shares one task +
-    semaphore, same as a fresh submission. Returns the count scheduled, for
-    logging.
+    Mirrors `dispatch.reconcile_inflight_tickets`: a CP restart (or a
+    drain-cancellation) leaves any non-terminal item with no live owner.
+    `registered` is included because the `registered` -> `downloading` window
+    still owes its download-ticket submissions -- a crash there would otherwise
+    strand the item forever. Re-driving is safe: `register_ena_study` is
+    idempotent, and the submit loop reuses any download ticket a prior run
+    already created rather than re-submitting. Items are grouped by batch so each
+    shares one task + semaphore, same as a fresh submission. Returns the count
+    scheduled, for logging.
     """
     pool = app.state.pool
     rows = await pool.fetch(
@@ -383,7 +489,11 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
         " JOIN qiita.ena_import_batch b ON b.idx = bi.batch_idx"
         " WHERE bi.state = ANY($1::text[])"
         " ORDER BY bi.batch_idx, bi.idx",
-        [BatchItemState.PENDING.value, BatchItemState.RESOLVING.value],
+        [
+            BatchItemState.PENDING.value,
+            BatchItemState.RESOLVING.value,
+            BatchItemState.REGISTERED.value,
+        ],
     )
     if not rows:
         return 0
@@ -396,13 +506,20 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     for batch_idx, batch_rows in by_batch.items():
         principal_idx = batch_rows[0]["submitted_by_principal_idx"]
         resolver_backend = batch_rows[0]["resolver_backend"]
-        source_archive = SourceArchive(batch_rows[0]["source_archive"])
         download_method = batch_rows[0]["download_method"]
         try:
+            # Convert the persisted enum-backed columns INSIDE the guard: a
+            # malformed value (e.g. a hand-written 'http' resolver_backend the
+            # CHECK now forbids) must fail only this batch, not raise out of the
+            # lifespan reconcile and keep the whole control plane down -- the same
+            # per-accession isolation this module promises everywhere else.
+            source_archive = SourceArchive(batch_rows[0]["source_archive"])
+            resolver_kind = ResolverKind(resolver_backend)
             principal = await _load_principal(pool, principal_idx)
-        except RuntimeError:
+        except RuntimeError, ValueError:
             _log.exception(
-                "cannot re-drive ena_import_batch %d -- submitting principal %d unresolvable",
+                "cannot re-drive ena_import_batch %d -- unresolvable submitting"
+                " principal %d or malformed persisted batch metadata",
                 batch_idx,
                 principal_idx,
             )
@@ -422,7 +539,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
             principal=principal,
             resolver_backend=resolver_backend,
             source_archive=source_archive,
-            resolver_kind=ResolverKind(resolver_backend),
+            resolver_kind=resolver_kind,
             download_method=download_method,
         )
         total += len(items)
@@ -445,7 +562,7 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
 
     item_rows = await pool.fetch(
         "SELECT idx, ena_study_accession, state, failure_reason, study_idx,"
-        "       download_work_ticket_idxs"
+        "       download_work_ticket_idxs, run_outcomes"
         " FROM qiita.ena_import_batch_item"
         " WHERE batch_idx = $1"
         " ORDER BY idx",
@@ -484,6 +601,9 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
                 # unrecognized state, or a missing work_ticket row (state None) --
                 # must not read as success.
                 state = BatchItemState.DOWNLOADING
+        # run_outcomes is a JSONB column; asyncpg has no default jsonb codec, so
+        # it comes back as a JSON string. Empty ('[]') until register_ena_study ran.
+        runs = [RunImportOutcome(**o) for o in json.loads(row["run_outcomes"])]
         items.append(
             BatchImportItem(
                 ena_study_accession=row["ena_study_accession"],
@@ -491,6 +611,7 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
                 study_idx=row["study_idx"],
                 failure_reason=failure_reason,
                 download_work_ticket_idxs=ticket_idxs,
+                runs=runs,
             )
         )
     return BatchImportStatus(ena_import_batch_idx=batch_idx, items=items)

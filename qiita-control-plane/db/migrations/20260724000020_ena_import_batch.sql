@@ -14,7 +14,7 @@
 -- qiita_common.models.ena_import.BatchItemState):
 --   pending     -> INSERTed alongside the batch; not yet picked up.
 --   resolving   -> the background task is resolving study/runs/attributes
---                  (ena_import.get_resolver) for this accession.
+--                  (via MiintEnaResolver) for this accession.
 --   registered  -> ena_import.registration.register_ena_study succeeded;
 --                  study_idx is set.
 --   downloading -> one download-ena-study work_ticket was submitted per
@@ -43,10 +43,14 @@ CREATE TABLE qiita.ena_import_batch (
 
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    -- Which EnaResolver backend every item in this batch resolves through.
-    -- Mirrors qiita_control_plane.ena_import.{BACKEND_MIINT,BACKEND_HTTP}.
+    -- Which resolver backend every item in this batch resolves through.
+    -- Mirrors qiita_control_plane.ena_import.miint_resolver.BACKEND_MIINT. A
+    -- single-value CHECK -- the HTTP resolver was removed, leaving miint the sole
+    -- backend -- so a future backend is a deliberate migration, not silent drift.
+    -- It also keeps a hand-written 'http' row from reaching the startup enum
+    -- conversion in reconcile_inflight_batches (ResolverKind has only MIINT).
     resolver_backend             TEXT NOT NULL DEFAULT 'miint'
-        CHECK (resolver_backend IN ('miint', 'http')),
+        CHECK (resolver_backend IN ('miint')),
 
     -- Which public archive this batch's reads/metadata come from. Mirrors
     -- qiita_common.models.ena.SourceArchive.
@@ -55,7 +59,7 @@ CREATE TABLE qiita.ena_import_batch (
 
     -- Transport pinned into every download-ena-study ticket this batch
     -- submits. Only 'http' is supported today -- no Aspera key-staging in
-    -- this compute environment (see ARCHITECTURE.md's ENA Study Import
+    -- this compute environment (see docs/architecture.md's ENA Study Import
     -- download-ticket-granularity decision); a single-value CHECK so a
     -- future transport addition is a deliberate migration, not a silent
     -- drift.
@@ -99,12 +103,24 @@ CREATE TABLE qiita.ena_import_batch_item (
     study_idx                 BIGINT REFERENCES qiita.study(idx) ON DELETE RESTRICT,
 
     -- One work_ticket_idx per sequenced_pool register_ena_study created for
-    -- this study (one per distinct platform, R3) -- populated once the
-    -- batch driver submits that pool's download-ena-study ticket via
-    -- submit_work_ticket_core. Array, not a join table: this is a small,
-    -- write-once-per-item fan-out the batch driver itself produces, not an
-    -- independently-queried relationship.
+    -- this study (one per distinct platform) -- appended as the batch driver
+    -- submits each pool's download-ena-study ticket via submit_work_ticket_core,
+    -- so a crash mid-submit leaves the tickets already sent recorded here (a
+    -- REGISTERED item is re-driven at startup, which reuses them). Array, not a
+    -- join table: a small, per-item fan-out the batch driver produces. It is
+    -- read back at GET-time (fetch_batch_status rolls up each ticket's state);
+    -- there is no FK (Postgres cannot FK an array's elements), so a deleted
+    -- work_ticket would leave a dangling idx that the rollup treats as
+    -- non-terminal -- work_ticket rows are not deleted in this flow.
     download_work_ticket_idxs BIGINT[] NOT NULL DEFAULT '{}',
+
+    -- Per-run registration outcomes for this item's study, one JSON object per
+    -- run: {run_accession, status, failure_reason, missing_required}. Written
+    -- once register_ena_study runs (mirrors
+    -- qiita_common.models.ena_import.RunImportOutcome). Surfaced by
+    -- GET /ena-import-batch/{idx} so per-run failures and harmonization gaps
+    -- (checklist-required fields ENA did not supply) are visible, not dropped.
+    run_outcomes              JSONB NOT NULL DEFAULT '[]',
 
     created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -125,11 +141,22 @@ COMMENT ON COLUMN qiita.ena_import_batch_item.download_work_ticket_idxs IS
 CREATE INDEX ena_import_batch_item_batch_idx_idx
     ON qiita.ena_import_batch_item (batch_idx);
 
--- Startup reconcile (reconcile_inflight_batches) re-drives every item still
--- pending/resolving; this index makes that scan cheap.
+-- One item per (batch, study accession): create_ena_import_batch already
+-- de-duplicates accessions in Python before insert, so this makes that a DB
+-- invariant too -- it is what bounds concurrent registration to one writer per
+-- study within a batch.
+ALTER TABLE qiita.ena_import_batch_item
+    ADD CONSTRAINT ena_import_batch_item_unique_accession_per_batch
+    UNIQUE (batch_idx, ena_study_accession);
+
+-- Startup reconcile (reconcile_inflight_batches) re-drives every item that has
+-- not reached a terminal/self-owning state -- pending/resolving AND registered
+-- (a registered item still owes its download-ticket submissions, which the
+-- REGISTERED->downloading window can crash before finishing). This index makes
+-- that scan cheap.
 CREATE INDEX ena_import_batch_item_state_idx
     ON qiita.ena_import_batch_item (state)
-    WHERE state IN ('pending', 'resolving');
+    WHERE state IN ('pending', 'resolving', 'registered');
 
 CREATE TRIGGER ena_import_batch_item_set_updated_at
     BEFORE UPDATE ON qiita.ena_import_batch_item

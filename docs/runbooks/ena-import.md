@@ -58,11 +58,14 @@ it once submitted.
 Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA default
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. A checklist-required field ENA did not supply for a given sample is
-reported back on the registration outcome (visible via the batch status endpoint's
-failure/harmonization detail), never silently dropped or defaulted — but a
-harmonization *gap* does not fail the run; only a genuine harmonization error
-(an unparseable value, or a cross-study metadata slot collision) does, isolated
-per-run exactly like an unmappable platform.
+reported back on the registration outcome, never silently dropped or defaulted:
+`GET /api/v1/ena-import-batch/{idx}` returns a `runs` array per item, one entry per
+ENA run carrying its `status`, a `failure_reason` when it failed, and
+`missing_required` (the checklist-required fields ENA did not supply). A
+harmonization *gap* (`missing_required`) does not fail the run; only a genuine
+harmonization error (an unparseable value, or a cross-study metadata slot collision)
+does, surfacing as that run's `status: failed` + `failure_reason`, isolated per-run
+exactly like an unmappable platform.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at

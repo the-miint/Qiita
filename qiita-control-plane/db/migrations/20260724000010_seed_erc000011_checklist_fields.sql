@@ -18,8 +18,10 @@
 --   <MANDATORY>mandatory</MANDATORY>
 --
 -- Both are covered by an existing seeded biosample_global_field row (matched
--- here by display_name against 20260501000007_biosample_field.sql's seed):
--- 'collection date' and 'geographic location (country and/or sea)'. No
+-- here by internal_name against 20260501000007_biosample_field.sql's seed:
+-- 'collection_date' and 'geographic_location_country_or_sea' -- internal_name
+-- is the UNIQUE, format-constrained key, so this seed can't silently match
+-- nothing if a future migration edits the free-text display_name). No
 -- ERC000011-mandatory field is left uncovered, so this migration seeds
 -- exactly these two metadata_checklist_field rows and invents nothing for
 -- fields the checklist does not actually require (lat/long, the
@@ -34,9 +36,9 @@ INSERT INTO qiita.metadata_checklist_field (metadata_checklist_idx, biosample_gl
 SELECT mc.idx, gf.idx
   FROM qiita.metadata_checklist mc
   JOIN qiita.biosample_global_field gf
-    ON gf.display_name IN (
-        'collection date',
-        'geographic location (country and/or sea)'
+    ON gf.internal_name IN (
+        'collection_date',
+        'geographic_location_country_or_sea'
     )
  WHERE mc.name = 'ERC000011'
 ON CONFLICT DO NOTHING;
@@ -48,8 +50,8 @@ DELETE FROM qiita.metadata_checklist_field
  WHERE metadata_checklist_idx = (SELECT idx FROM qiita.metadata_checklist WHERE name = 'ERC000011')
    AND biosample_global_field_idx IN (
        SELECT idx FROM qiita.biosample_global_field
-        WHERE display_name IN (
-            'collection date',
-            'geographic location (country and/or sea)'
+        WHERE internal_name IN (
+            'collection_date',
+            'geographic_location_country_or_sea'
         )
    );

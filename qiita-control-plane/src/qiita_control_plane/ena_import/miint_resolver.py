@@ -11,12 +11,10 @@ DuckDB+miint session (mirrors `runner._stream_masked_reads_to_fastq`)."""
 
 from __future__ import annotations
 
-import threading
-
 import duckdb
 from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyHeader
 
-from qiita_control_plane.miint import connect_with_miint
+from qiita_control_plane.miint import connect_with_miint_staged
 
 from .accession import validate_study_accession
 from .resolver import EnaAccessionNotFoundError, pivot_sample_attributes
@@ -24,13 +22,6 @@ from .resolver import EnaAccessionNotFoundError, pivot_sample_attributes
 # The only ENA metadata resolver backend. Kept as a named constant so the batch
 # route/driver validate the request's `backend` against one source of truth.
 BACKEND_MIINT = "miint"
-
-# Double-checked-lock guard for the one-time `INSTALL httpfs`, mirroring
-# `connect_with_miint`'s own guard for the miint extension. `INSTALL` is a no-op on a
-# warm cache but still round-trips to disk/network per call without this; `LOAD` stays
-# per-connection and always runs below.
-_httpfs_install_lock = threading.Lock()
-_httpfs_installed = False
 
 # Explicit fields for read_run: only the columns EnaRunRecord models, not read_ena's
 # full default set (which also carries sample-descriptive fields out of scope here).
@@ -43,23 +34,26 @@ _RUN_FIELDS = (
 
 
 def _open_ena_connection() -> duckdb.DuckDBPyConnection:
-    """`connect_with_miint()` plus an explicit `httpfs` install+load.
+    """`connect_with_miint_staged()` plus an explicit `LOAD httpfs`.
 
-    `read_ena`/`read_ena_attributes` need `httpfs` for their outbound ENA API calls.
-    The docs claim it autoloads, but that isn't reliable under `connect_with_miint()`'s
-    config (`allow_unsigned_extensions` + private `extension_directory`) — confirmed
-    empirically: the query fails with `'https' scheme is not supported` rather than
-    degrading. So install+load it explicitly, like `connect_with_miint()` does for
-    `miint`. `INSTALL` runs once per process (double-checked lock); `LOAD` is
-    per-connection. Scoped here rather than in `connect_with_miint()`, which other
-    local, non-network call sites also share."""
-    global _httpfs_installed
-    con = connect_with_miint()
-    if not _httpfs_installed:
-        with _httpfs_install_lock:
-            if not _httpfs_installed:
-                con.execute("INSTALL httpfs;")
-                _httpfs_installed = True
+    Service-side: `MiintEnaResolver` runs inside the CP service (the
+    `POST /ena-import-batch` background task, `batch._process_one_study`), so both
+    extensions are LOAD-only. `qiita-api`'s `$HOME` is `/dev/null`, so any INSTALL
+    dies resolving `~/.duckdb/extensions` — the rule `qiita_control_plane.miint`
+    spells out. Use the staged (LOAD-only) helper, never the client INSTALL one.
+
+    miint AND httpfs are both pre-staged into `MIINT_EXTENSION_DIRECTORY` by the
+    deploy (`stage_miint_extension` INSTALLs httpfs into the same directory), so
+    `LOAD httpfs` resolves from there with no mirror round-trip or writable
+    `$HOME`. This is the CP counterpart to the orchestrator's `open_miint_ena_conn`
+    — the LOAD-only, both-extensions helper the `ingest_ena_reads` job uses.
+
+    The explicit `LOAD httpfs` is required because `read_ena`/`read_ena_attributes`
+    need `httpfs` for their outbound ENA API calls and it does NOT reliably autoload
+    under the miint connect config (`allow_unsigned_extensions` + a private
+    `extension_directory`): the query fails with `'https' scheme is not supported`
+    rather than degrading."""
+    con = connect_with_miint_staged()
     con.execute("LOAD httpfs;")
     return con
 

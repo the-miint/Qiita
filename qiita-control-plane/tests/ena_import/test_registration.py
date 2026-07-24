@@ -190,7 +190,7 @@ async def _register(reg, *, study_header, runs, sample_attributes=()):
 
 
 # ---------------------------------------------------------------------------
-# T03 -- metadata harmonization into the checklist model
+# metadata harmonization into the checklist model
 # ---------------------------------------------------------------------------
 # A MIxS-tagged fixture: five mappable tags, one "hard" value (`depth` = an INSDC
 # missing-value string, exercising the known_missing_reasons wiring), and four

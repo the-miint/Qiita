@@ -50,6 +50,24 @@ class BatchImportRequest(BaseModel):
     download_method: str = "http"
 
 
+class RunImportOutcome(BaseModel):
+    """One ENA run's registration outcome within a batch item, surfaced on
+    `GET /api/v1/ena-import-batch/{idx}`.
+
+    `status` is the `RunRegistrationStatus` value
+    (`registered` / `skipped_already_present` / `failed`). `failure_reason` is
+    set only on `failed`. `missing_required` lists the checklist-required fields
+    ENA did not supply for a newly-created biosample (the harmonization gap) —
+    computed at import and reported here, never silently dropped. It is empty
+    for a reused/re-imported biosample (no harmonization write ran).
+    """
+
+    run_accession: str
+    status: str
+    failure_reason: str | None = None
+    missing_required: list[str] = Field(default_factory=list)
+
+
 class BatchImportItem(BaseModel):
     """One accession's current state within a batch."""
 
@@ -58,6 +76,10 @@ class BatchImportItem(BaseModel):
     study_idx: int | None = None
     failure_reason: str | None = None
     download_work_ticket_idxs: list[int] = Field(default_factory=list)
+    # Per-run registration outcomes for this item's study, populated once
+    # register_ena_study runs (so an operator sees per-run failures and the
+    # harmonization gaps, not just the rolled-up item state). Empty until then.
+    runs: list[RunImportOutcome] = Field(default_factory=list)
 
 
 class BatchImportResponse(BaseModel):

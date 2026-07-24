@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **ENA/SRA study metadata resolver (`ena_import`).** Adds the
+- **ENA/SRA study metadata resolver (`ena_import`) (#369).** Adds the
   control-plane seam for resolving an ENA/SRA study's metadata ahead of
   ingestion: `qiita_common.models.ena` (`EnaStudyHeader` / `EnaRunRecord` /
   `EnaSampleAttributes`, coercing `read_ena`'s ALL-VARCHAR numeric fields and
@@ -33,7 +33,7 @@ duplicates further down are historical strata; leave them where they are.
   (`InvalidEnaAccessionError` / `EnaAccessionNotFoundError`) rather than
   returning empty. No DB writes or read downloads yet — those land in later
   tickets of this epic.
-- **ENA study & sample registration + cross-study de-dup (`ena_import.registration`).**
+- **ENA study & sample registration + cross-study de-dup (`ena_import.registration`) (#369).**
   Turns a resolved ENA study (`EnaStudyHeader` + `EnaRunRecord` list)
   into Qiita `study` / `biosample` / `prep_sample` / `sequenced_sample` rows,
   idempotently: `register_ena_study` upserts the study keyed positionally on
@@ -57,7 +57,7 @@ duplicates further down are historical strata; leave them where they are.
   `transport` stays unpopulated until the download workflow lands. No
   metadata harmonization or batch fan-out yet.
 - **ENA sample-attribute harmonization into the checklist model
-  (`ena_import.harmonization`).** Every ENA-imported biosample is now
+  (`ena_import.harmonization`) (#369).** Every ENA-imported biosample is now
   bound to the ENA default sample checklist (`ERC000011`) and, the first time
   its biosample is created (write-once — a later study reusing the same
   BioSample via the existing cross-study de-dup does not re-harmonize it), its
@@ -82,7 +82,7 @@ duplicates further down are historical strata; leave them where they are.
   `(idx, created)` so the registration composer can key harmonization off
   whether the biosample was newly created.
 - **ENA study download workflow + CO job (`download-ena-study`,
-  `qiita_compute_orchestrator.jobs.ingest_ena_reads`).** Downloads a
+  `qiita_compute_orchestrator.jobs.ingest_ena_reads`) (#369).** Downloads a
   registered ENA study's reads via miint `read_ena_sequences` and stores them
   once into the DuckLake `read` table — the ENA-fetch analog of bcl-convert.
   New `sequenced_pool`-scoped workflow `workflows/download-ena-study/1.0.0.yaml`
@@ -102,7 +102,7 @@ duplicates further down are historical strata; leave them where they are.
   `miint_warnings()` skip/truncation entry or for zero reads with no
   explanatory warning — never silently registers an incomplete or empty read
   set). No md5 verification (`read_ena_sequences` performs none; tracked
-  separately as the D3-approved duckdb-miint escalation). The
+  separately as an owner-approved duckdb-miint escalation). The
   sort/hardlink/per-slot-DuckDB-cap helpers `ingest_reads` already had are
   extracted into a shared sibling module (`read_staging.py`) so both jobs
   share one implementation. A new pure `ena_import.submit.
@@ -115,7 +115,7 @@ duplicates further down are historical strata; leave them where they are.
   `ingest_ena_reads.Inputs` uses), gated on the SAME `run_map`
   declared-input check `_stage_ena_run_roster` uses so it never fires for
   bcl-convert or another `sequenced_pool`-scoped workflow.
-- **ENA-ingest DuckLake parity verification.** New
+- **ENA-ingest DuckLake parity verification (#369).** New
   `tests/integration/test_ena_ingest_e2e.py` proves the download workflow's `ingest_ena_reads`
   storage tail lands in the real DuckLake `read` table through the EXISTING
   `register-files` action — no product/data-plane code change was needed. Calls
@@ -135,7 +135,7 @@ duplicates further down are historical strata; leave them where they are.
   unchanged. The bcl-convert/`ingest_reads` parity claim rests on CODE IDENTITY
   (`read_staging.write_sorted_reads`/`hardlink`, shared verbatim by both jobs),
   not an existing baseline test — none exists today for either producer.
-- **Batch multi-study ENA import driver (`ena_import.batch`).** New
+- **Batch multi-study ENA import driver (`ena_import.batch`) (#369).** New
   `POST /api/v1/ena-import-batch` (`qiita_common.models.ena_import`,
   `routes.ena_import`) accepts a list of ENA/SRA study accessions and returns
   202 with a batch handle immediately; a new, additive-and-reversible
@@ -145,8 +145,8 @@ duplicates further down are historical strata; leave them where they are.
   `failed` reachable from any non-terminal step, so one bad accession never
   affects its siblings or the batch as a whole. The background driver
   (`ena_import.batch._run_batch`) processes every item with bounded
-  concurrency (`asyncio.Semaphore`, capped at 4 — miint's `ENAClient`
-  rate-limits ENA Portal/Browser calls to ~3 req/s) on its own tracked
+  concurrency (`asyncio.Semaphore`, capped at a conservative 4 to stay well
+  under miint's `ENAClient` outbound rate limit) on its own tracked
   `asyncio.Task` set (`app.state.running_ena_import_batches`, drained at
   shutdown and re-driven at startup via `reconcile_inflight_batches`, mirroring
   `dispatch.py`'s pattern but kept separate since this task drives
@@ -167,7 +167,7 @@ duplicates further down are historical strata; leave them where they are.
   (double-checked lock, mirroring `connect_with_miint()`'s own guard) instead
   of on every call.
 - **ENA import: full-span integration coverage, gated live tests, and an
-  operator runbook.** New `tests/integration/test_ena_import_e2e.py` threads
+  operator runbook (#369).** New `tests/integration/test_ena_import_e2e.py` threads
   the batch driver's real registration (`create_ena_import_batch` /
   `_process_one_study`, against a fixture study whose two runs share one
   sample accession) into the `ingest_ena_reads` native job and the real
@@ -412,7 +412,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **ENA import: an empty ENA sample attribute set no longer fails the whole
-  study.** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
+  study (#369).** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
   whose sample (`SAMD01818724`) has zero `<SAMPLE_ATTRIBUTE>` elements —
   genuinely common on real ENA/DDBJ data, but
   `MiintEnaResolver.resolve_sample_attributes` hard-raised
@@ -425,7 +425,7 @@ duplicates further down are historical strata; leave them where they are.
   map (no globally-linked metadata) and the ERC000011 checklist's missing
   required fields are reported, never fatal.
 - **ENA import: harmonize the underscore MIxS attribute vocabulary
-  (`ena_import.attribute_mapping`).** The same live test found real DDBJ
+  (`ena_import.attribute_mapping`) (#369).** The same live test found real DDBJ
   MIGS samples use the underscore MIxS short names (`collection_date`,
   `geo_loc_name`, `lat_lon`, `depth`) rather than the GSC-MIxS display-name
   form the mapping table only recognized — so real imports mapped nothing
@@ -442,7 +442,7 @@ duplicates further down are historical strata; leave them where they are.
   `env_medium`) stay unmapped, same ENVO-resolution deferral as their
   display-name twins.
 - **ENA import batch driver: reconcile principal guard + `download_method`
-  threading (batch-driver hardening).** `ena_import.batch._load_principal`
+  threading (batch-driver hardening) (#369).** `ena_import.batch._load_principal`
   (used by `reconcile_inflight_batches` to re-drive in-flight batch items
   after a CP restart) now rejects a since-disabled/retired submitting
   principal, the same `MSG_PRINCIPAL_DISABLED_OR_RETIRED` guard
@@ -721,7 +721,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Changed
 
 - **ENA ingest classifies an md5-verification failure as an explicit,
-  self-documented permanent error.** Once the data plane bundles the miint build
+  self-documented permanent error (#369).** Once the data plane bundles the miint build
   that adds `verify_md5` (default on there), `read_ena_sequences` verifies every
   downloaded run's bytes against ENA's reported `fastq_md5`; `ingest_ena_reads`
   relies on that default (it never passes `verify_md5` itself), so the branch is

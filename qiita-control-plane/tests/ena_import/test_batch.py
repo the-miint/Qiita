@@ -29,6 +29,7 @@ from qiita_control_plane.ena_import.batch import (
     reconcile_inflight_batches,
     schedule_ena_import_batch,
 )
+from qiita_control_plane.ena_import.registration import RunRegistrationStatus
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
     retire_principal,
@@ -1308,3 +1309,185 @@ async def test_fetch_batch_status_missing_ticket_row_stays_downloading(
     status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
     assert status is not None
     assert status.items[0].state == BatchItemState.DOWNLOADING
+
+
+# ---------------------------------------------------------------------------
+# Per-run outcomes surfaced on the status endpoint; all-runs-failed terminal;
+# registered-item re-drive durability + idempotent re-submit.
+# ---------------------------------------------------------------------------
+
+
+async def _drive_one_study(batch_app, postgres_pool, admin_principal, accession):
+    """Create a one-accession batch and run it to completion; return (batch_idx, items)."""
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool,
+        accessions=[accession],
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        download_method="http",
+    )
+    task = schedule_ena_import_batch(
+        batch_app,
+        items=items,
+        principal=admin_principal,
+        resolver_backend="miint",
+        source_archive=SourceArchive.ENA,
+        resolver_kind=ResolverKind.MIINT,
+        download_method="http",
+    )
+    await task
+    return batch_idx, items
+
+
+async def test_process_one_study_surfaces_per_run_outcomes(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """GET /ena-import-batch/{idx} carries per-run outcomes: each run's status and
+    its harmonization gap (checklist-required fields ENA did not supply), which the
+    driver used to compute and drop."""
+    accession = unique_accession("PRJNA")
+    batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    assert status is not None
+    item = status.items[0]
+    assert len(item.runs) == 1
+    run = item.runs[0]
+    assert run.status == RunRegistrationStatus.REGISTERED.value
+    assert run.failure_reason is None
+    # _fake_attrs supplies only 'collection date', so the ERC000011 checklist's
+    # other required fields surface as a harmonization gap rather than being dropped.
+    assert run.missing_required
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study whose platform maps (a pool IS created) but whose every run then
+    fails registration must reach terminal `failed`, not `downloading` -- otherwise
+    it reports success over an all-failed study, and submits doomed download
+    tickets. The per-run reason is surfaced on the endpoint."""
+
+    def _bad_latitude_attrs(accession):
+        # ILLUMINA maps (pool created), but an unparseable latitude fails the run
+        # in harmonization -- the created_pools-non-empty / all-runs-failed case.
+        sample = f"SAMN-{accession}"
+        return (
+            ["sample_accession", "tag", "value"],
+            [(sample, "geographic location (latitude)", "not-a-number")],
+        )
+
+    monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
+
+    accession = unique_accession("PRJNA")
+    batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason, download_work_ticket_idxs"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "every run failed to register" in item_row["failure_reason"]
+    assert list(item_row["download_work_ticket_idxs"]) == []
+    ticket_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+    assert ticket_count == 0
+
+    # The failed run's detail is on the endpoint, not only the item-level reason.
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    failed_run = status.items[0].runs[0]
+    assert failed_run.status == RunRegistrationStatus.FAILED.value
+    assert failed_run.failure_reason is not None
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reconcile_redrives_registered_item_stranded_before_submit(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """A crash in the registered->downloading window leaves the item at `registered`
+    with no tickets. reconcile must re-drive it -- previously it stranded because
+    the filter matched pending/resolving only."""
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    # Simulate the crash: delete the submitted ticket, clear the array, and rewind
+    # the item to `registered` (its study + pool already exist, and are idempotent).
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item"
+        " SET state = 'registered', download_work_ticket_idxs = '{}'"
+        " WHERE idx = $1",
+        items[0].idx,
+    )
+
+    scheduled = await reconcile_inflight_batches(batch_app)
+    assert scheduled == 1
+    await asyncio.gather(*list(batch_app.state.running_ena_import_batches))
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, download_work_ticket_idxs FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.DOWNLOADING.value
+    assert len(item_row["download_work_ticket_idxs"]) == 1
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reconcile_registered_item_reuses_already_submitted_ticket(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """Re-driving a `registered` item that already submitted its ticket must REUSE
+    it, not re-submit -- a sequenced_pool re-submit would 409 and wrongly fail the
+    whole item. Exactly one ticket, no duplicate."""
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    ticket_idxs_before = await postgres_pool.fetchval(
+        "SELECT download_work_ticket_idxs FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert len(ticket_idxs_before) == 1
+
+    # Rewind to `registered` but KEEP the ticket + array (crash after the submit,
+    # before the downloading flip).
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item SET state = 'registered' WHERE idx = $1",
+        items[0].idx,
+    )
+
+    scheduled = await reconcile_inflight_batches(batch_app)
+    assert scheduled == 1
+    await asyncio.gather(*list(batch_app.state.running_ena_import_batches))
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, download_work_ticket_idxs FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.DOWNLOADING.value
+    assert list(item_row["download_work_ticket_idxs"]) == list(ticket_idxs_before)
+
+    ticket_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+    assert ticket_count == 1
+
+    await _cleanup_study(postgres_pool, accession)

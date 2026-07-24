@@ -9,14 +9,14 @@ the same mint-then-sort-and-assign pipeline as `ingest_reads` (`..read_staging`)
 Two-write-target and idempotent/re-runnable semantics are identical too.
 
 Gotchas specific to the ENA source:
-- md5 verification is miint's, not this job's. `read_ena_sequences` verifies
-  downloaded bytes against ENA's `fastq_md5` once the data plane bundles the miint
-  build that adds `verify_md5` (on by default there). This job relies on that
-  default rather than passing it, so it stays a no-op against an older bundled
-  extension and activates automatically on the bump -- no code change. When active,
-  a mismatch raises `duckdb.IOException` with "md5" in the message and is classified
-  BAD_INPUT (permanent, re-downloading yields the same bytes); the classification
-  branch is dormant until then.
+- md5 verification is miint's, not this job's. If the bundled `read_ena_sequences`
+  verifies downloaded bytes against ENA's `fastq_md5`, a mismatch raises
+  `duckdb.IOException` with "md5" in the message, which this job classifies
+  BAD_INPUT (permanent -- re-downloading yields the same bytes). Whether the miint
+  build the deploy stages verifies (and its default) is miint's to define and is
+  not asserted here: the classification branch handles a mismatch if one is raised
+  and is inert otherwise. (miint's md5 behavior on the bulk path is tracked
+  separately as an owner-approved duckdb-miint escalation.)
 - One FRESH DuckDB connection PER RUN. `miint_warnings()` accumulates across
   queries in a session (duckdb-miint/docs/utilities.md), so a reused connection
   would leak one run's warnings into the next run's fail-loud check.

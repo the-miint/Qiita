@@ -245,7 +245,19 @@ async def _get_or_create_pool_for_platform(
     """Get-or-create the one sequencing_run + sequenced_pool for a
     (study, platform) pair (both repo calls are single statements). Returns
     `(sequenced_pool_idx, sequencing_run_idx)` so the caller can surface them on
-    `created_pools` without a second lookup."""
+    `created_pools` without a second lookup.
+
+    Concurrency assumption: single-writer-per-study. This get-or-create is a
+    SELECT-then-INSERT with no arbitrating constraint on the no-preflight ENA
+    path -- `sequenced_pool`'s unique indexes are partial
+    (`WHERE run_preflight_sha256 IS NOT NULL`) and the ENA path sets no run
+    preflight, so two concurrent batches for the same (study, platform) would
+    each fall through the SELECT and mint a pool plus a redundant download
+    ticket. In-batch fan-out is already bounded to one writer per study by the
+    accession de-dup in `create_ena_import_batch`; closing the cross-batch
+    window is tracked as a follow-up (candidate: serialize this path with an
+    advisory / row lock inside a transaction, off the shared no-preflight pool
+    contract)."""
     instrument_run_id = f"{study_accession}:{platform.value}"
     sequencing_run_idx, _ = await insert_sequencing_run(
         conn,

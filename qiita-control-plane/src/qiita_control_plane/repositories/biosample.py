@@ -168,7 +168,7 @@ async def get_or_create_biosample_by_ena_accession(
 
     Returns (idx, created). created is True only on the insert branch; the
     caller (ena_import.registration) uses it to harmonize a newly-created
-    biosample's ENA attributes exactly once (T03's write-once rule) -- a
+    biosample's ENA attributes exactly once (the write-once rule) -- a
     later study reusing the same biosample via the reuse branch below must
     not re-harmonize (and must not re-write metadata another study's import
     already wrote through the shared global-field slot).
