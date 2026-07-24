@@ -525,6 +525,17 @@ duplicates further down are historical strata; leave them where they are.
   reference data is public; a resource/bandwidth cap can come later if it proves
   necessary. `ticket:doget` also still solely gates the alignment DoGet
   (`POST /alignment/ticket/doget`), whose rows are sample-derived, not public.
+- **Sample-metadata import can key global fields by internal_name.** The
+  biosample and sequenced-prep-sample import surfaces gained an optional
+  `global_internal_names` flag (`--global-internal-names` on both `qiita
+  biosample create` and `qiita sequenced-sample create`): when set, a metadata
+  column naming a global field is resolved against the field's machine-facing
+  `internal_name` instead of its `display_name`, while purely-local fields stay
+  display-name-keyed and the coincidental-collision shadow check is skipped.
+  Defaults off, so existing callers are unaffected. Internally, one resolver
+  now emits a single ordered list of resolved fields, and the pre-write
+  resolution errors report the caller's field key namespace-neutrally. No env
+  var, migration, scope, route, or wire change. (#TBD)
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately
   minted below the ceiling), a scope-gated route 403s even though the role

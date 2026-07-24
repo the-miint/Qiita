@@ -183,6 +183,7 @@ async def import_biosample(
                 biosample_accession=body.biosample_accession,
                 ena_sample_accession=body.ena_sample_accession,
                 matrix_tube_id=body.matrix_tube_id,
+                global_internal_names=body.global_internal_names,
             )
         except BiosampleOwnerIdFieldCollisionError as exc:
             raise HTTPException(
@@ -216,13 +217,13 @@ async def import_biosample(
         except MetadataUnknownFieldsError as exc:
             raise HTTPException(
                 status_code=422,
-                detail=f"unknown metadata fields: {', '.join(exc.unknown_display_names)}",
+                detail=f"unknown metadata fields: {', '.join(exc.field_keys)}",
             )
         except MetadataParseError as exc:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"could not parse metadata field {exc.display_name!r}"
+                    f"could not parse metadata field {exc.field_key!r}"
                     f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
                 ),
             )
@@ -243,9 +244,7 @@ async def import_biosample(
         except DuplicateGlobalFieldTargetError as exc:
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    f"metadata fields {exc.display_names!r} all resolve to the same global field"
-                ),
+                detail=(f"metadata fields {exc.field_keys!r} all resolve to the same global field"),
             )
         except SlotOccupiedError as exc:
             # SlotOccupiedError is its own exception family (not an

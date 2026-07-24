@@ -44,15 +44,18 @@ class BiosampleImportRequest(BaseModel):
     (study owner, an ADMIN study_access row, or wet_lab_admin+ via the
     role bypass). owner_idx names the user the biosample is being
     created for and must be supplied explicitly. The metadata dict
-    carries text values keyed on biosample_global_field display_name;
-    the route parses each value into the global field's data type
-    before insert. An empty dict is allowed.
+    carries text values keyed on a biosample field's display_name — or,
+    when global_internal_names is set, on a biosample_global_field's
+    internal_name for global fields (local fields stay display-name-keyed);
+    the route parses each value into the field's data type before insert.
+    An empty dict is allowed.
     """
 
     owner_idx: Annotated[int, Field(gt=0)]
     owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     owner_biosample_id_value: str = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
+    global_internal_names: bool = False
     metadata_checklist_name: str | None = Field(default=None, min_length=1)
     biosample_accession: str | None = Field(default=None, min_length=1)
     ena_sample_accession: str | None = Field(default=None, min_length=1)

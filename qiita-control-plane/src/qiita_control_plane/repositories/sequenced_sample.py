@@ -245,6 +245,7 @@ async def import_sequenced_prep_sample(
     metadata_checklist_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
+    global_internal_names: bool = False,
 ) -> SequencedPrepSampleImportResult:
     """Create one sequenced prep sample with its study links and metadata.
 
@@ -266,9 +267,10 @@ async def import_sequenced_prep_sample(
          and raises asyncpg.RaiseError if any requested study lacks a
          non-retired biosample_to_study link.
       6. Validate and write the supplied metadata against primary_study_idx
-         (the field-owning study): resolve every value against
-         prep_sample_global_field, parse each into its typed Python value
-         (or a MissingReasonRef / TerminologyTermRef marker), then INSERT
+         (the field-owning study): resolve every key against
+         prep_sample_global_field — on display_name, or on internal_name when
+         global_internal_names is set — parse each value into its typed Python
+         value (or a MissingReasonRef / TerminologyTermRef marker), then INSERT
          one prep_sample_metadata row per entry through a globally-linked
          prep_sample_study_field. Only global fields are accepted; an
          unknown name raises. This must follow step 5 because the
@@ -344,6 +346,7 @@ async def import_sequenced_prep_sample(
         metadata=metadata,
         caller_idx=caller_idx,
         allow_local=False,
+        global_internal_names=global_internal_names,
     )
 
     return SequencedPrepSampleImportResult(

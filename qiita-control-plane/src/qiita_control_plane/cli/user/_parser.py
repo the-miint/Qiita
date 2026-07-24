@@ -223,6 +223,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--matrix-tube-id",
         help="Matrix-tube identifier (digits only); validated server-side",
     )
+    p_biosample_create.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Interpret --metadata KEYs for global fields as their internal_name"
+            " rather than display_name (local fields stay display-name-keyed)"
+        ),
+    )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
     p_biosample_get = p_biosample_sub.add_parser(
@@ -470,6 +480,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_seqsample_create.add_argument(
         "--ena-run-accession",
         help="ENA run accession (ERR…), if this sample already has one",
+    )
+    p_seqsample_create.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=("Interpret --metadata KEYs as global-field internal_names rather than display_names"),
     )
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 

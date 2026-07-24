@@ -654,6 +654,40 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
     }
 
 
+def test_biosample_create_global_internal_names_sent_only_when_passed(monkeypatch):
+    """--global-internal-names is three-state: passing it puts
+    global_internal_names=true on the POST body, and omitting it leaves the
+    field off the wire (the server model default fills in False)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-idx",
+            "11",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--global-internal-names",
+        ]
+    )
+    assert rc == 0
+    post_req = next(r for r in captured["requests"] if r["method"] == "POST")
+    assert post_req["json"] == {
+        "owner_idx": 11,
+        "owner_biosample_id_field_name": "owner_sample_id",
+        "owner_biosample_id_value": "SMK-001",
+        "global_internal_names": True,
+    }
+
+
 def test_biosample_create_explicit_owner_idx_skips_whoami(monkeypatch):
     """When --owner-idx is supplied, no whoami round-trip — the caller
     is acting on someone else's behalf (lab-tech-on-behalf path)."""

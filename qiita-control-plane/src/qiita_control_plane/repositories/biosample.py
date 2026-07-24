@@ -277,6 +277,7 @@ async def import_biosample_from_owner_biosample_id(
     biosample_accession: str | None = None,
     ena_sample_accession: str | None = None,
     matrix_tube_id: str | None = None,
+    global_internal_names: bool = False,
 ) -> BiosampleImportResult:
     """Import one biosample with its owner-id and any supplied metadata.
 
@@ -288,12 +289,13 @@ async def import_biosample_from_owner_biosample_id(
     the new biosample plus the owner-biosample-id field row.
 
     Each metadata key resolves against primary_study_idx: a global
-    field's display_name writes globally (auto-creating the linked
-    study field on first use); an existing purely-local study field
-    writes locally; an existing study-local alias of a global field
-    writes through to that global field. No new purely-local field is
-    ever created for a metadata key — only the owner-biosample-id field
-    is created on import.
+    field's display_name (or its internal_name when global_internal_names
+    is set) writes globally (auto-creating the linked study field on first
+    use); an existing purely-local study field writes locally by
+    display_name; an existing study-local alias of a global field writes
+    through to that global field. No new purely-local field is ever created
+    for a metadata key — only the owner-biosample-id field is created on
+    import.
 
     primary_study_idx owns the globally-linked field rows and the
     owner-biosample-id local field row; secondary studies share the
@@ -381,7 +383,10 @@ async def import_biosample_from_owner_biosample_id(
     # what stops a sample arriving with no `host_taxon_id`, which would resolve
     # UNRESOLVED and abort its pool at submit.
     await assert_required_global_fields_supplied(
-        conn, spec=BIOSAMPLE_METADATA_SPEC, metadata=metadata
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        metadata=metadata,
+        global_internal_names=global_internal_names,
     )
 
     bs_idx = await insert_biosample(
@@ -454,6 +459,7 @@ async def import_biosample_from_owner_biosample_id(
         caller_idx=caller_idx,
         allow_local=True,
         known_missing_reasons=known_missing_reasons,
+        global_internal_names=global_internal_names,
     )
 
     return BiosampleImportResult(

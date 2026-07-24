@@ -413,17 +413,20 @@ async def _seed_secondary_studies_for_entity(ctx, spec, entity_idx, count):
 
 
 async def _seed_global_field_for_spec(
-    ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None
+    ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None, internal_name=None
 ):
     """Seed one global field of the given data_type for spec.entity_kind
     and track the row for cleanup. Returns a FieldRow shape so the
     caller can drive metadata writes against it directly. terminology_idx
     must be supplied when data_type=TERMINOLOGY (the *_global_field
-    CHECK enforces the iff coupling) and omitted otherwise.
+    CHECK enforces the iff coupling) and omitted otherwise. internal_name
+    defaults to a generated unique value; pass it when a test keys on the
+    internal_name (internal-name resolution), since FieldRow carries only
+    the display_name.
     """
     # Token suffix defends against unique-name collisions across re-runs.
     suffix = secrets.token_hex(4)
-    internal_name = f"gf_{suffix}"
+    internal_name = internal_name if internal_name is not None else f"gf_{suffix}"
     display_name = f"GF {suffix}"
 
     # Branch on the spec's entity_kind to pick the matching seed helper;

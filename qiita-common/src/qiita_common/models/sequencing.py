@@ -666,6 +666,7 @@ class SequencedSampleCreateRequest(BaseModel):
     collapsed (order-preserving) rather than rejected.
 
     `metadata` keys must match seeded prep_sample_global_field display_name
+    values — or, when global_internal_names is set, their internal_name
     values; unknown names surface as a single 422 listing every bad key.
     The two ENA accession fields are nullable: a sample may already carry
     ENA accessions when it is created (e.g. ingesting already-submitted
@@ -681,6 +682,7 @@ class SequencedSampleCreateRequest(BaseModel):
     primary_study_idx: Annotated[int, Field(gt=0)]
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
+    global_internal_names: bool = False
     metadata_checklist_name: str | None = Field(default=None, min_length=1)
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)

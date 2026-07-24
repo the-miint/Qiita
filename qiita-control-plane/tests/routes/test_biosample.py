@@ -199,9 +199,12 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
     the untracked host_taxon_id metadata row would block the biosample delete.
     """
     metadata = dict(body.get("metadata") or {})
-    injected_host_taxon = "host taxon id" not in metadata
+    # Inject host_taxon_id under whichever name namespace this POST resolves
+    # global fields by, so the required-field gate sees it either way.
+    host_key = "host_taxon_id" if body.get("global_internal_names") else "host taxon id"
+    injected_host_taxon = host_key not in metadata
     if injected_host_taxon:
-        metadata["host taxon id"] = "not applicable"
+        metadata[host_key] = "not applicable"
     body["metadata"] = metadata
     resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
@@ -877,6 +880,51 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
         key=lambda r: r["global_field_idx"],
     )
     assert [dict(r) for r in rows] == expected
+
+
+async def test_post_biosample_metadata_global_internal_names_resolves(ctx):
+    # With global_internal_names, a metadata KEY equal to a global field's
+    # internal_name resolves to that field (its display_name would not), and
+    # the required-field gate accepts host_taxon_id supplied by internal_name.
+    suffix = secrets.token_hex(4)
+    num_global = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"r_int_{suffix}",
+        display_name=f"Latitude {suffix}",
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(num_global)
+
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="int-meta"
+    )
+
+    # Key on internal_name, not display_name; the flag is on.
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name(),
+        owner_biosample_id_value="INT-WRITE-1",
+        metadata={f"r_int_{suffix}": "32.7"},
+        global_internal_names=True,
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [num_global]
+    )
+
+    # The value landed against the internal-name-resolved global field.
+    row = await ctx["pool"].fetchrow(
+        "SELECT value_numeric FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx = $2",
+        bs_idx,
+        num_global,
+    )
+    assert row["value_numeric"] == Decimal("32.7")
 
 
 async def test_post_biosample_globally_linked_owner_field_409(ctx):

@@ -760,7 +760,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metada
                     caller_idx=ctx["principal_idx"],
                     metadata={**_REQUIRED_METADATA, unknown_a: "x", unknown_b: "y"},
                 )
-    assert sorted(excinfo.value.unknown_display_names) == sorted([unknown_a, unknown_b])
+    assert sorted(excinfo.value.field_keys) == sorted([unknown_a, unknown_b])
 
 
 async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse_failure(ctx):
@@ -790,7 +790,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
                     caller_idx=ctx["principal_idx"],
                     metadata={**_REQUIRED_METADATA, numeric_field_name: "not-a-number"},
                 )
-    assert excinfo.value.display_name == numeric_field_name
+    assert excinfo.value.field_key == numeric_field_name
     assert excinfo.value.data_type == FieldDataType.NUMERIC
 
 

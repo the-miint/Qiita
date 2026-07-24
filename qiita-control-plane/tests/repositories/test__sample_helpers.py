@@ -53,6 +53,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     MetadataRow,
     MetadataUnknownFieldsError,
     OwnerSampleIdMetadataWriteError,
+    ResolvedField,
     SampleEntityKind,
     SampleMetadataFieldResult,
     SlotOccupiedByMissingReasonError,
@@ -64,7 +65,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_local_study_field,
     _insert_metadata,
     _update_metadata,
-    fetch_global_fields_by_display_names,
+    fetch_global_fields_by_keys,
     fetch_global_metadata,
     fetch_local_metadata,
     fetch_missing_value_reason_idxs_by_names,
@@ -75,10 +76,9 @@ from qiita_control_plane.repositories._sample_helpers import (
     parse_text_for_data_type,
     preflight_sample_metadata,
     validate_primary_secondary_studies,
-    write_global_metadata_entries,
     write_global_metadata_or_diagnose,
-    write_local_metadata_entries,
     write_local_metadata_or_diagnose,
+    write_resolved_metadata_entries,
     write_sample_metadata,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
@@ -1701,7 +1701,7 @@ def test_parse_text_for_data_type_raises_parse_error(data_type, text_value):
     """
     with pytest.raises(MetadataParseError) as excinfo:
         parse_text_for_data_type("field_x", data_type, text_value)
-    assert excinfo.value.display_name == "field_x"
+    assert excinfo.value.field_key == "field_x"
     assert excinfo.value.data_type == data_type
     assert excinfo.value.text_value == text_value
 
@@ -1794,7 +1794,7 @@ async def test__fetch_slot_occupant_rejects_both_or_neither_idx(ctx):
 
 
 # ---------------------------------------------------------------------------
-# fetch_global_fields_by_display_names (spec-parameterized over both entities)
+# fetch_global_fields_by_keys (spec-parameterized over both entities)
 # ---------------------------------------------------------------------------
 
 
@@ -1806,7 +1806,7 @@ async def test__fetch_slot_occupant_rejects_both_or_neither_idx(ctx):
     ],
     ids=["biosample", "prep_sample"],
 )
-async def test_fetch_global_fields_by_display_names_returns_matching(
+async def test_fetch_global_fields_by_keys_returns_matching(
     ctx, spec, seed_global_field, created_key
 ):
     # Seed two global fields with collision-resistant names.
@@ -1831,9 +1831,7 @@ async def test_fetch_global_fields_by_display_names_returns_matching(
 
     # Fetch both names; verify the dict carries both rows with correct fields.
     async with ctx["pool"].acquire() as conn:
-        result = await fetch_global_fields_by_display_names(
-            conn, spec=spec, display_names=[name_a, name_b]
-        )
+        result = await fetch_global_fields_by_keys(conn, spec=spec, keys=[name_a, name_b])
 
     expected = {
         name_a: FieldRow(
@@ -1862,9 +1860,7 @@ async def test_fetch_global_fields_by_display_names_returns_matching(
     ],
     ids=["biosample", "prep_sample"],
 )
-async def test_fetch_global_fields_by_display_names_omits_unknown(
-    ctx, spec, seed_global_field, created_key
-):
+async def test_fetch_global_fields_by_keys_omits_unknown(ctx, spec, seed_global_field, created_key):
     # Seed one global field; ask for it plus a name that does not exist.
     suffix = secrets.token_hex(4)
     known_name = f"Known Field {suffix}"
@@ -1879,9 +1875,7 @@ async def test_fetch_global_fields_by_display_names_omits_unknown(
     ctx["created"][created_key].append(idx)
 
     async with ctx["pool"].acquire() as conn:
-        result = await fetch_global_fields_by_display_names(
-            conn, spec=spec, display_names=[known_name, unknown_name]
-        )
+        result = await fetch_global_fields_by_keys(conn, spec=spec, keys=[known_name, unknown_name])
 
     # Only the known name appears; unknown is silently absent.
     expected = {
@@ -3309,6 +3303,40 @@ async def test_link_entity_to_studies_empty_secondaries_links_primary_only(ctx, 
 # ---------------------------------------------------------------------------
 
 
+def _global_resolved(field_row, *, caller_key=None, study_field_idx=None):
+    """The ResolvedField preflight_sample_metadata emits for a global-field
+    match on field_row (a FieldRow from _seed_global_field_for_spec). caller_key
+    defaults to the field's display_name (display-name resolution); pass it for
+    internal-name resolution. study_field_idx is None on a direct global match
+    and the alias row's idx when a study-local alias was resolved.
+    """
+    return ResolvedField(
+        caller_key=caller_key if caller_key is not None else field_row.display_name,
+        scope="global",
+        global_field_idx=field_row.global_field_idx,
+        study_field_idx=study_field_idx,
+        canonical_display=field_row.display_name,
+        data_type=field_row.data_type,
+        terminology_idx=field_row.terminology_idx,
+    )
+
+
+def _local_resolved(field_row, *, caller_key=None):
+    """The ResolvedField preflight_sample_metadata emits for a purely-local
+    study-field match on field_row (a FieldRow carrying the local row's idx and
+    own data_type). caller_key defaults to the field's display_name.
+    """
+    return ResolvedField(
+        caller_key=caller_key if caller_key is not None else field_row.display_name,
+        scope="local",
+        global_field_idx=None,
+        study_field_idx=field_row.idx,
+        canonical_display=field_row.display_name,
+        data_type=field_row.data_type,
+        terminology_idx=field_row.terminology_idx,
+    )
+
+
 @pytest.mark.parametrize(
     "spec",
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
@@ -3322,13 +3350,12 @@ async def test_preflight_sample_metadata_returns_parsed_pairs(ctx, spec):
 
     metadata = {gf_row.display_name: "  hello  "}
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn, spec=spec, study_idx=ctx["study_idx"], metadata=metadata
         )
 
     # parse_text_for_data_type strips outer whitespace for the TEXT arm.
-    assert global_pairs == [(gf_row, "hello")]
-    assert local_pairs == []
+    assert resolved == [(_global_resolved(gf_row), "hello")]
 
 
 @pytest.mark.parametrize(
@@ -3350,7 +3377,7 @@ async def test_preflight_sample_metadata_raises_unknown_with_spec_entity_kind(ct
     # The unknown-name list is preserved verbatim, and the exception
     # message interpolates spec.entity_kind so it reads naturally for
     # whichever entity the call targeted.
-    assert excinfo.value.unknown_display_names == ["definitely_not_a_field_xyz123"]
+    assert excinfo.value.field_keys == ["definitely_not_a_field_xyz123"]
     assert spec.entity_kind.value in str(excinfo.value)
 
 
@@ -3391,7 +3418,7 @@ async def test_preflight_sample_metadata_routes_missing_marker(ctx, spec):
 
     metadata = {gf_row.display_name: reason_name}
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -3399,8 +3426,9 @@ async def test_preflight_sample_metadata_routes_missing_marker(ctx, spec):
             known_missing_reasons={reason_name: reason_idx},
         )
 
-    assert global_pairs == [(gf_row, MissingReasonRef(idx=reason_idx, name=reason_name))]
-    assert local_pairs == []
+    assert resolved == [
+        (_global_resolved(gf_row), MissingReasonRef(idx=reason_idx, name=reason_name))
+    ]
 
 
 @pytest.mark.parametrize(
@@ -3416,7 +3444,7 @@ async def test_preflight_sample_metadata_unchanged_for_typed_values_with_empty_m
 
     metadata = {gf_row.display_name: "  hello  "}
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -3425,8 +3453,7 @@ async def test_preflight_sample_metadata_unchanged_for_typed_values_with_empty_m
         )
 
     # Outer whitespace is stripped from the TEXT value.
-    assert global_pairs == [(gf_row, "hello")]
-    assert local_pairs == []
+    assert resolved == [(_global_resolved(gf_row), "hello")]
 
 
 @pytest.mark.parametrize(
@@ -3448,7 +3475,7 @@ async def test_preflight_sample_metadata_recognizes_padded_marker(ctx, spec):
 
     metadata = {gf_row.display_name: f"  {reason_name}  "}
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -3456,8 +3483,9 @@ async def test_preflight_sample_metadata_recognizes_padded_marker(ctx, spec):
             known_missing_reasons={reason_name: reason_idx},
         )
 
-    assert global_pairs == [(gf_row, MissingReasonRef(idx=reason_idx, name=reason_name))]
-    assert local_pairs == []
+    assert resolved == [
+        (_global_resolved(gf_row), MissingReasonRef(idx=reason_idx, name=reason_name))
+    ]
 
 
 def test_parse_text_for_data_type_unchanged_for_missing_reason_name():
@@ -3470,7 +3498,7 @@ def test_parse_text_for_data_type_unchanged_for_missing_reason_name():
 
 
 # ---------------------------------------------------------------------------
-# write_global_metadata_entries (parametrized over both specs)
+# write_resolved_metadata_entries (parametrized over both specs)
 # ---------------------------------------------------------------------------
 
 
@@ -3479,8 +3507,8 @@ def test_parse_text_for_data_type_unchanged_for_missing_reason_name():
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test_write_global_metadata_entries_writes_each_entry(ctx, spec):
-    """Each parsed entry produces one metadata row bound to the input
+async def test_write_resolved_metadata_entries_writes_each_entry(ctx, spec):
+    """Each resolved global entry produces one metadata row bound to the input
     study_idx; values land in the value_text column for TEXT entries."""
     entity_idx = await (
         _create_biosample_with_link(ctx)
@@ -3489,31 +3517,34 @@ async def test_write_global_metadata_entries_writes_each_entry(ctx, spec):
     )
     gf_first = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     gf_second = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
-    parsed_metadata = [(gf_first, "alpha"), (gf_second, "beta")]
+    resolved_metadata = [
+        (_global_resolved(gf_first), "alpha"),
+        (_global_resolved(gf_second), "beta"),
+    ]
 
     # Write all entries inside one committed transaction so the rows
     # persist for the post-call SELECT below.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            results = await write_global_metadata_entries(
+            results = await write_resolved_metadata_entries(
                 conn,
                 spec=spec,
                 entity_idx=entity_idx,
                 study_idx=ctx["study_idx"],
                 caller_idx=ctx["principal_idx"],
-                parsed_metadata=parsed_metadata,
+                resolved_metadata=resolved_metadata,
             )
 
     # One global-scope INSERTED result per entry, in input order.
     assert results == [
         SampleMetadataFieldResult(
-            display_name=gf_first.display_name,
+            field_key=gf_first.display_name,
             scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="alpha",
         ),
         SampleMetadataFieldResult(
-            display_name=gf_second.display_name,
+            field_key=gf_second.display_name,
             scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="beta",
@@ -3556,8 +3587,8 @@ async def test_write_global_metadata_entries_writes_each_entry(ctx, spec):
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test_write_global_metadata_entries_empty_input_is_noop(ctx, spec):
-    """Empty parsed_metadata writes nothing; the helper short-circuits
+async def test_write_resolved_metadata_entries_empty_input_is_noop(ctx, spec):
+    """Empty resolved_metadata writes nothing; the helper short-circuits
     without touching the DB."""
     entity_idx = await (
         _create_biosample_with_link(ctx)
@@ -3567,13 +3598,13 @@ async def test_write_global_metadata_entries_empty_input_is_noop(ctx, spec):
 
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            results = await write_global_metadata_entries(
+            results = await write_resolved_metadata_entries(
                 conn,
                 spec=spec,
                 entity_idx=entity_idx,
                 study_idx=ctx["study_idx"],
                 caller_idx=ctx["principal_idx"],
-                parsed_metadata=[],
+                resolved_metadata=[],
             )
 
     # Empty input yields no results and touches no rows.
@@ -3660,7 +3691,7 @@ async def test_preflight_sample_metadata_routes_terminology_term(ctx, spec):
     """Tests the case where a TERMINOLOGY-typed field's text value matches
     a qiita.terminology_term row in the field's terminology: preflight
     emits a TerminologyTermRef carrying idx, term_id, and label and the
-    field's data_type is reflected on the FieldRow.
+    field's data_type is reflected on the ResolvedField.
     """
     term_row = await fetch_seeded_metagenome_term(ctx["pool"])
     terminology_idx = term_row["terminology_idx"]
@@ -3669,7 +3700,7 @@ async def test_preflight_sample_metadata_routes_terminology_term(ctx, spec):
     )
 
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -3679,8 +3710,7 @@ async def test_preflight_sample_metadata_routes_terminology_term(ctx, spec):
     expected_ref = TerminologyTermRef(
         idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
     )
-    assert global_pairs == [(global_row, expected_ref)]
-    assert local_pairs == []
+    assert resolved == [(_global_resolved(global_row), expected_ref)]
 
 
 @pytest.mark.parametrize(
@@ -3709,7 +3739,7 @@ async def test_preflight_sample_metadata_unresolved_terminology_raises(ctx, spec
                 metadata={global_row.display_name: bogus_term},
             )
 
-    assert excinfo.value.display_name == global_row.display_name
+    assert excinfo.value.field_key == global_row.display_name
     assert excinfo.value.data_type is FieldDataType.TERMINOLOGY
     assert excinfo.value.text_value == bogus_term
     assert excinfo.value.reason == "no matching terminology term"
@@ -3727,9 +3757,9 @@ async def test_preflight_sample_metadata_unresolved_terminology_raises(ctx, spec
 )
 async def test_preflight_sample_metadata_allow_local_partitions_global_and_local(ctx, spec):
     """Tests the case where allow_local is True and metadata names both a
-    global field and an existing purely-local study field: the global entry
-    lands in global_pairs, the local one in local_pairs (parsed against the
-    local field's own data_type), each in input order.
+    global field and an existing purely-local study field: both resolve into
+    one ordered list — the global entry then the local one (parsed against the
+    local field's own data_type) — mirroring input order.
     """
     study_idx = ctx["study_idx"]
     study_field_key = f"{spec.entity_kind}_study_field"
@@ -3746,10 +3776,10 @@ async def test_preflight_sample_metadata_allow_local_partitions_global_and_local
         )
     ctx["created"][study_field_key].append(local_idx)
 
-    # Global name first, local name second; the partitions preserve that order.
+    # Global name first, local name second; the list preserves that order.
     metadata = {gf_row.display_name: "hi", local_name: "42"}
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=study_idx,
@@ -3764,8 +3794,10 @@ async def test_preflight_sample_metadata_allow_local_partitions_global_and_local
         terminology_idx=None,
         global_field_idx=None,
     )
-    assert global_pairs == [(gf_row, "hi")]
-    assert local_pairs == [(local_field_row, Decimal("42"))]
+    assert resolved == [
+        (_global_resolved(gf_row), "hi"),
+        (_local_resolved(local_field_row), Decimal("42")),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -3789,7 +3821,7 @@ async def test_preflight_sample_metadata_allow_local_raises_unknown(ctx, spec):
                 allow_local=True,
             )
 
-    assert excinfo.value.unknown_display_names == [bogus]
+    assert excinfo.value.field_keys == [bogus]
 
 
 @pytest.mark.parametrize(
@@ -3800,8 +3832,8 @@ async def test_preflight_sample_metadata_allow_local_raises_unknown(ctx, spec):
 async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, spec):
     """Tests the case where allow_local is True and a metadata name resolves to
     a lone study-local alias (a study field linked to a global field, its
-    global's own label absent from the input): the value is written through to
-    that global field, joining global_pairs.
+    global's own label absent from the input): it resolves at global scope,
+    written through to that global field while recording the alias row.
     """
     study_idx = ctx["study_idx"]
     study_field_key = f"{spec.entity_kind}_study_field"
@@ -3819,7 +3851,7 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
     ctx["created"][study_field_key].append(alias_idx)
 
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=study_idx,
@@ -3828,7 +3860,8 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
         )
 
     # The alias row carries the inherited data_type (TEXT) and its target
-    # global via global_field_idx; it joins the global partition.
+    # global via global_field_idx; it resolves at global scope, recording the
+    # existing alias study_field_idx.
     alias_row = FieldRow(
         idx=alias_idx,
         display_name=alias_name,
@@ -3836,8 +3869,7 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
         terminology_idx=None,
         global_field_idx=gf_row.idx,
     )
-    assert global_pairs == [(alias_row, "hello")]
-    assert local_pairs == []
+    assert resolved == [(_global_resolved(alias_row, study_field_idx=alias_idx), "hello")]
 
 
 @pytest.mark.parametrize(
@@ -3876,7 +3908,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_alias_and_global_
             )
 
     assert excinfo.value.global_field_idx == gf_row.idx
-    assert set(excinfo.value.display_names) == {gf_row.display_name, alias_name}
+    assert set(excinfo.value.field_keys) == {gf_row.display_name, alias_name}
 
 
 @pytest.mark.parametrize(
@@ -3924,7 +3956,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_two_aliases_same_
             )
 
     assert excinfo.value.global_field_idx == gf_row.idx
-    assert set(excinfo.value.display_names) == {alias_a, alias_b}
+    assert set(excinfo.value.field_keys) == {alias_a, alias_b}
 
 
 @pytest.mark.parametrize(
@@ -3934,8 +3966,8 @@ async def test_preflight_sample_metadata_allow_local_raises_on_two_aliases_same_
 )
 async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, spec):
     """Tests the case where allow_local is True and an existing local field's
-    value matches a known missing-reason name: it resolves to a
-    MissingReasonRef in local_pairs.
+    value matches a known missing-reason name: it resolves at local scope to a
+    MissingReasonRef.
     """
     study_idx = ctx["study_idx"]
     study_field_key = f"{spec.entity_kind}_study_field"
@@ -3955,7 +3987,7 @@ async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, 
     reason_idx = await _seed_missing_value_reason(ctx, reason_name)
 
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=study_idx,
@@ -3971,8 +4003,9 @@ async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, 
         terminology_idx=None,
         global_field_idx=None,
     )
-    assert global_pairs == []
-    assert local_pairs == [(local_field_row, MissingReasonRef(idx=reason_idx, name=reason_name))]
+    assert resolved == [
+        (_local_resolved(local_field_row), MissingReasonRef(idx=reason_idx, name=reason_name))
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4063,7 +4096,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_different_global_
 async def test_preflight_sample_metadata_allow_local_same_global_puppet_resolves(ctx, spec):
     """Tests the case where a metadata name is a global field and the study
     already holds that global field's own puppet (a study field linked to the
-    same global field): the value resolves normally into global_pairs.
+    same global field): the value resolves normally at global scope.
     """
     study_idx = ctx["study_idx"]
     study_field_key = f"{spec.entity_kind}_study_field"
@@ -4080,7 +4113,7 @@ async def test_preflight_sample_metadata_allow_local_same_global_puppet_resolves
     ctx["created"][study_field_key].append(puppet_idx)
 
     async with ctx["pool"].acquire() as conn:
-        global_pairs, local_pairs = await preflight_sample_metadata(
+        resolved = await preflight_sample_metadata(
             conn,
             spec=spec,
             study_idx=study_idx,
@@ -4088,17 +4121,234 @@ async def test_preflight_sample_metadata_allow_local_same_global_puppet_resolves
             allow_local=True,
         )
 
-    assert global_pairs == [(gf_row, "hello")]
-    assert local_pairs == []
+    assert resolved == [(_global_resolved(gf_row), "hello")]
 
 
 # ---------------------------------------------------------------------------
-# write_local_metadata_entries
+# preflight_sample_metadata global-internal-name resolution (both specs)
 # ---------------------------------------------------------------------------
 
 
-async def test_write_local_metadata_entries_persists(ctx):
-    """Tests the case where resolved local entries are written: the value
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_sample_metadata_global_internal_names_resolves_global(ctx, spec):
+    """Tests the case where global_internal_names is set and a metadata key is a
+    global field's internal_name: it resolves at global scope, keyed on the
+    caller's internal_name while canonical_display stays the display_name.
+    """
+    internal_name = f"gf_int_{secrets.token_hex(4)}"
+    gf_row = await _seed_global_field_for_spec(
+        ctx, spec, FieldDataType.TEXT, internal_name=internal_name
+    )
+
+    async with ctx["pool"].acquire() as conn:
+        resolved = await preflight_sample_metadata(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            metadata={internal_name: "hello"},
+            global_internal_names=True,
+        )
+
+    assert resolved == [(_global_resolved(gf_row, caller_key=internal_name), "hello")]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_sample_metadata_global_internal_names_falls_through_to_local(ctx, spec):
+    """Tests the case where global_internal_names is set with allow_local: a
+    global internal_name resolves at global scope, and a key matching no global
+    internal_name falls through to an existing study-local field by display_name.
+    """
+    study_idx = ctx["study_idx"]
+    study_field_key = f"{spec.entity_kind}_study_field"
+    internal_name = f"gf_int_{secrets.token_hex(4)}"
+    gf_row = await _seed_global_field_for_spec(
+        ctx, spec, FieldDataType.TEXT, internal_name=internal_name
+    )
+    local_name = unique_field_name()
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        local_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=local_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+        )
+    ctx["created"][study_field_key].append(local_idx)
+
+    # Global internal_name first, local display_name second; order preserved.
+    metadata = {internal_name: "hi", local_name: "42"}
+    async with ctx["pool"].acquire() as conn:
+        resolved = await preflight_sample_metadata(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            metadata=metadata,
+            allow_local=True,
+            global_internal_names=True,
+        )
+
+    local_field_row = FieldRow(
+        idx=local_idx,
+        display_name=local_name,
+        data_type=FieldDataType.NUMERIC,
+        terminology_idx=None,
+        global_field_idx=None,
+    )
+    assert resolved == [
+        (_global_resolved(gf_row, caller_key=internal_name), "hi"),
+        (_local_resolved(local_field_row), Decimal("42")),
+    ]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_sample_metadata_global_internal_names_rejects_global_display_name(
+    ctx, spec
+):
+    """Tests the case where global_internal_names is set and a key is a global
+    field's display_name (not its internal_name) with no local match: internal
+    resolution does not accept display names for globals, so it raises unknown.
+    """
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(MetadataUnknownFieldsError) as excinfo:
+            await preflight_sample_metadata(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                metadata={gf_row.display_name: "v"},
+                global_internal_names=True,
+            )
+
+    assert excinfo.value.field_keys == [gf_row.display_name]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_sample_metadata_global_internal_names_suppresses_shadow(ctx, spec):
+    """Tests the case where a global field's internal_name coincides with a
+    study-local field's display_name bound to a DIFFERENT global: with
+    global_internal_names the internal-name match wins (no StudyFieldConflictError,
+    no misroute), whereas plain display-name resolution routes to the other global.
+    """
+    study_idx = ctx["study_idx"]
+    study_field_key = f"{spec.entity_kind}_study_field"
+    collide = f"collide_{secrets.token_hex(4)}"
+    # The global whose internal_name is the colliding token.
+    gf_internal = await _seed_global_field_for_spec(
+        ctx, spec, FieldDataType.TEXT, internal_name=collide
+    )
+    # A different global, aliased in-study under display_name == collide.
+    gf_other = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        alias_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            global_field_idx=gf_other.idx,
+            display_name=collide,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][study_field_key].append(alias_idx)
+
+    # Flag on: the internal-name match wins, resolving to the internal global.
+    async with ctx["pool"].acquire() as conn:
+        resolved_internal = await preflight_sample_metadata(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            metadata={collide: "v"},
+            allow_local=True,
+            global_internal_names=True,
+        )
+    assert resolved_internal == [(_global_resolved(gf_internal, caller_key=collide), "v")]
+
+    # Flag off (contrast): the same key is a display_name matching the other
+    # global's in-study alias, proving the suppression above is flag-driven.
+    alias_row = FieldRow(
+        idx=alias_idx,
+        display_name=collide,
+        data_type=FieldDataType.TEXT,
+        terminology_idx=None,
+        global_field_idx=gf_other.idx,
+    )
+    async with ctx["pool"].acquire() as conn:
+        resolved_display = await preflight_sample_metadata(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            metadata={collide: "v"},
+            allow_local=True,
+        )
+    assert resolved_display == [(_global_resolved(alias_row, study_field_idx=alias_idx), "v")]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_sample_metadata_global_internal_names_duplicate_target(ctx, spec):
+    """Tests the case where two keys target one global under global_internal_names:
+    the global's internal_name and a study-local alias's display_name both resolve
+    to it, which is rejected with DuplicateGlobalFieldTargetError.
+    """
+    study_idx = ctx["study_idx"]
+    study_field_key = f"{spec.entity_kind}_study_field"
+    internal_name = f"gf_int_{secrets.token_hex(4)}"
+    gf_row = await _seed_global_field_for_spec(
+        ctx, spec, FieldDataType.TEXT, internal_name=internal_name
+    )
+    alias_name = unique_field_name()
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        alias_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            global_field_idx=gf_row.idx,
+            display_name=alias_name,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][study_field_key].append(alias_idx)
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(DuplicateGlobalFieldTargetError) as excinfo:
+            await preflight_sample_metadata(
+                conn,
+                spec=spec,
+                study_idx=study_idx,
+                metadata={internal_name: "1", alias_name: "2"},
+                allow_local=True,
+                global_internal_names=True,
+            )
+
+    assert excinfo.value.global_field_idx == gf_row.idx
+    assert set(excinfo.value.field_keys) == {internal_name, alias_name}
+
+
+# ---------------------------------------------------------------------------
+# write_resolved_metadata_entries: local scope
+# ---------------------------------------------------------------------------
+
+
+async def test_write_resolved_metadata_entries_persists_local(ctx):
+    """Tests the case where a resolved local entry is written: the value
     lands in a metadata row against its existing purely-local study_field,
     with global_field_idx NULL and no field created here.
     """
@@ -4115,8 +4365,8 @@ async def test_write_local_metadata_entries_persists(ctx):
         )
     ctx["created"]["biosample_study_field"].append(local_idx)
 
-    # The field is pre-resolved: write_local_metadata_entries writes to
-    # local_idx directly and must not create a study_field.
+    # The field is pre-resolved: the local-scope entry writes to local_idx
+    # directly and must not create a study_field.
     field_row = FieldRow(
         idx=local_idx,
         display_name=local_name,
@@ -4125,19 +4375,19 @@ async def test_write_local_metadata_entries_persists(ctx):
         global_field_idx=None,
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        results = await write_local_metadata_entries(
+        results = await write_resolved_metadata_entries(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,
             study_idx=ctx["study_idx"],
             caller_idx=ctx["principal_idx"],
-            resolved_metadata=[(field_row, "hello")],
+            resolved_metadata=[(_local_resolved(field_row), "hello")],
         )
 
     # One local-scope INSERTED result for the single entry.
     assert results == [
         SampleMetadataFieldResult(
-            display_name=local_name,
+            field_key=local_name,
             scope="local",
             outcome=FieldWriteOutcome.INSERTED,
             value="hello",
@@ -4567,13 +4817,13 @@ async def test_write_sample_metadata_writes_global_and_local(ctx):
     # global field first, the local field second, each scoped and INSERTED.
     assert results == [
         SampleMetadataFieldResult(
-            display_name=gf_row.display_name,
+            field_key=gf_row.display_name,
             scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="g",
         ),
         SampleMetadataFieldResult(
-            display_name=local_name,
+            field_key=local_name,
             scope="local",
             outcome=FieldWriteOutcome.INSERTED,
             value="l",
@@ -4624,7 +4874,7 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
 
     assert inserted == [
         SampleMetadataFieldResult(
-            display_name=gf_row.display_name,
+            field_key=gf_row.display_name,
             scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="v1",
@@ -4632,7 +4882,7 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
     ]
     assert updated == [
         SampleMetadataFieldResult(
-            display_name=gf_row.display_name,
+            field_key=gf_row.display_name,
             scope="global",
             outcome=FieldWriteOutcome.UPDATED,
             value="v2",
@@ -4640,12 +4890,58 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
     ]
     assert unchanged == [
         SampleMetadataFieldResult(
-            display_name=gf_row.display_name,
+            field_key=gf_row.display_name,
             scope="global",
             outcome=FieldWriteOutcome.UNCHANGED,
             value="v2",
         )
     ]
+
+
+async def test_write_sample_metadata_global_internal_names_echoes_caller_key(ctx):
+    """Tests the case where write_sample_metadata runs with global_internal_names:
+    the result echoes the caller's internal_name as field_key, and the minted
+    study-local alias carries the global field's canonical display_name rather
+    than the internal name the caller keyed on.
+    """
+    entity_idx = await _create_biosample_with_link(ctx)
+    internal_name = f"gf_int_{secrets.token_hex(4)}"
+    gf_row = await _seed_global_field_for_spec(
+        ctx, BIOSAMPLE_METADATA_SPEC, FieldDataType.TEXT, internal_name=internal_name
+    )
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        results = await write_sample_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            metadata={internal_name: "hello"},
+            caller_idx=ctx["principal_idx"],
+            allow_local=False,
+            global_internal_names=True,
+        )
+    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
+
+    # The result key is the caller's internal_name, not the display_name.
+    assert results == [
+        SampleMetadataFieldResult(
+            field_key=internal_name,
+            scope="global",
+            outcome=FieldWriteOutcome.INSERTED,
+            value="hello",
+        )
+    ]
+
+    # The minted study-local alias is labelled with the global's display_name,
+    # never the internal name the caller keyed on.
+    alias_display = await ctx["pool"].fetchval(
+        "SELECT sf.display_name FROM qiita.biosample_study_field sf"
+        " JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = sf.idx"
+        " WHERE m.biosample_idx = $1",
+        entity_idx,
+    )
+    assert alias_display == gf_row.display_name
 
 
 async def test_write_sample_metadata_rejects_owner_sample_id_field(ctx):
@@ -4748,7 +5044,7 @@ async def test_write_sample_metadata_allow_local_false_rejects_local_field(ctx):
                     caller_idx=ctx["principal_idx"],
                     allow_local=False,
                 )
-    assert excinfo.value.unknown_display_names == [local_name]
+    assert excinfo.value.field_keys == [local_name]
 
 
 @pytest.mark.parametrize(
@@ -4775,7 +5071,7 @@ async def test_write_sample_metadata_raises_unknown_field(ctx, spec):
                     caller_idx=ctx["principal_idx"],
                     allow_local=True,
                 )
-    assert excinfo.value.unknown_display_names == [bogus]
+    assert excinfo.value.field_keys == [bogus]
 
 
 @pytest.mark.parametrize(
