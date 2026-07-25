@@ -193,6 +193,31 @@ class StudyFieldConflictError(Exception):
         )
 
 
+class StudyFieldAlreadyExistsError(Exception):
+    """A create collided with a {entity_kind}_study_field row already present
+    at (study_idx, display_name); the create does not reuse that row, so it
+    reports the name as taken rather than minting a duplicate.
+
+    A globally-linked create instead raises StudyFieldConflictError when the
+    colliding row is bound to a *different* global field than the create requested
+    (or is purely-local) since reusing that one would attach the value to the wrong field.
+    """
+
+    def __init__(
+        self,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        display_name: str,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.display_name = display_name
+        super().__init__(
+            f"{entity_kind}_study_field at study_idx={study_idx},"
+            f" display_name={display_name!r} already exists"
+        )
+
+
 class DuplicateGlobalFieldTargetError(Exception):
     """Raised when two or more input metadata columns resolve to the same
     global field — directly, or through a study-local alias. One entity's
@@ -1524,6 +1549,123 @@ async def _get_or_create_local_study_field(
             slot_summary=(f"study_idx={study_idx}, display_name={display_name!r}"),
         )
     return row["idx"], False, row["found_global_field_idx"]
+
+
+async def fetch_study_field(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    idx: int,
+) -> asyncpg.Record | None:
+    """Return one {entity}_study_field row by idx, or None on miss.
+
+    A globally-linked row leaves data_type / required / terminology_idx NULL
+    (they live on the global-field row), so the read LEFT JOINs the global
+    field and COALESCEs those three into their effective values. tier_override
+    has no global counterpart (the global row carries default_tier, a distinct
+    concept) and is returned as stored. The global FK column comes through
+    under its entity-specific name (spec.study_field_global_fk_column); the
+    row's own idx comes through as `idx`. Accepts either a pool or a
+    connection.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    fk_column = spec.study_field_global_fk_column
+    return await pool_or_conn.fetchrow(
+        f"SELECT"
+        f"    sf.idx,"
+        f"    sf.study_idx,"
+        f"    sf.{fk_column},"
+        f"    sf.display_name,"
+        f"    sf.description,"
+        f"    COALESCE(sf.data_type, gf.data_type) AS data_type,"
+        f"    COALESCE(sf.required, gf.required) AS required,"
+        f"    COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
+        f"    sf.tier_override,"
+        f"    sf.created_by_idx,"
+        f"    sf.created_at"
+        f" FROM {spec.study_field_table} sf"
+        f" LEFT JOIN {spec.global_field_table} gf"
+        f"     ON gf.idx = sf.{fk_column}"
+        f" WHERE sf.idx = $1",
+        idx,
+    )
+
+
+async def create_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    global_field_idx: int | None = None,
+    data_type: FieldDataType | None = None,
+    required: bool | None = None,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+) -> int:
+    """Create one {entity}_study_field and return its idx, failing if the name
+    is already used on the study.
+
+    Dispatches on global_field_idx: non-None mints a globally-linked row
+    (inherited columns must be omitted); None mints a purely-local row and
+    requires data_type. Unlike the get-or-create write entry points, a row
+    already at (study_idx, display_name) is not reused — it raises
+    StudyFieldAlreadyExistsError. StudyFieldConflictError (a globally-linked
+    create hitting a same-name row bound to a different global field) and
+    TransientWriteRaceError propagate from the underlying primitive. The
+    caller owns the transaction; a raised exception rolls the row back.
+    """
+    # Both branches INSERT-then-diagnose across two statements; require a
+    # wrapping transaction so a raised exception rolls the row back.
+    require_transaction(conn)
+
+    # Globally-linked mode: the inherited columns live on the global-field row,
+    # so the caller must omit them here — reject rather than silently drop.
+    if global_field_idx is not None:
+        if any(x is not None for x in (data_type, required, terminology_idx, tier_override)):
+            raise ValueError(
+                "data_type/required/terminology_idx/tier_override must be omitted "
+                "for a globally-linked study field"
+            )
+        idx, created = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            global_field_idx=global_field_idx,
+            display_name=display_name,
+            created_by_idx=created_by_idx,
+            description=description,
+        )
+    else:
+        # Purely-local mode: data_type is mandatory here (the DB defaults it,
+        # but this create requires the caller to state it); required
+        # defaults to False.
+        if data_type is None:
+            raise ValueError("data_type is required for a purely-local study field")
+        idx, created, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=display_name,
+            created_by_idx=created_by_idx,
+            description=description,
+            data_type=data_type,
+            required=required if required is not None else False,
+            terminology_idx=terminology_idx,
+            tier_override=tier_override,
+        )
+
+    # A row already at this name is an error here, not a silent reuse.
+    if not created:
+        raise StudyFieldAlreadyExistsError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+        )
+    return idx
 
 
 async def write_local_metadata_or_diagnose(

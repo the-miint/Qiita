@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
     URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
@@ -4874,3 +4875,153 @@ def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
         )
     assert exc.value.code == 1
     assert "no sample in this pool carries SynDNA" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# biosample create-field
+# ---------------------------------------------------------------------------
+
+
+def test_biosample_create_field_local_sends_expected_body(monkeypatch):
+    """`biosample create-field` for a purely-local field POSTs display_name +
+    data_type to /study/{S}/biosample-field, omitting unset optionals."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = json
+        return _httpx.Response(
+            201, json={"biosample_study_field_idx": 9}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "create-field",
+            "--study-idx",
+            "5",
+            "--display-name",
+            "pH",
+            "--data-type",
+            "numeric",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=5)}"
+    )
+    assert captured["json"] == {"display_name": "pH", "data_type": "numeric"}
+
+
+def test_biosample_create_field_linked_omits_type_columns(monkeypatch):
+    """Linked mode sends only display_name + biosample_global_field_idx; the
+    inherited type columns stay absent from the body."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(
+            201, json={"biosample_study_field_idx": 9}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "biosample",
+            "create-field",
+            "--study-idx",
+            "5",
+            "--display-name",
+            "Sample pH",
+            "--biosample-global-field-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {"display_name": "Sample pH", "biosample_global_field_idx": 7}
+
+
+def test_biosample_create_field_required_boolean_optional(monkeypatch):
+    """--required sends True, --no-required sends False, neither omits the
+    field entirely (three-state, so a local field defaults required server-side)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    bodies: list[dict] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        bodies.append(json)
+        return _httpx.Response(
+            201, json={"biosample_study_field_idx": 9}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    base = [
+        "biosample",
+        "create-field",
+        "--study-idx",
+        "5",
+        "--display-name",
+        "pH",
+        "--data-type",
+        "text",
+    ]
+    main(base + ["--required"])
+    main(base + ["--no-required"])
+    main(base)
+
+    assert bodies == [
+        {"display_name": "pH", "data_type": "text", "required": True},
+        {"display_name": "pH", "data_type": "text", "required": False},
+        {"display_name": "pH", "data_type": "text"},
+    ]
+
+
+def test_biosample_create_field_linked_with_data_type_exits_2(capsys):
+    """A linked create that also passes an inherited attribute fails the
+    model's mode-coupling validator and exits 2 without a POST."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "biosample",
+                "create-field",
+                "--study-idx",
+                "5",
+                "--display-name",
+                "X",
+                "--biosample-global-field-idx",
+                "7",
+                "--data-type",
+                "text",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "BiosampleStudyFieldCreateRequest" in capsys.readouterr().err

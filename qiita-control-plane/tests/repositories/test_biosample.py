@@ -25,14 +25,17 @@ from qiita_control_plane.repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
+    StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
     insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
+    create_biosample_study_field,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
+    fetch_biosample_study_field,
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
@@ -1965,3 +1968,116 @@ async def test_biosample_created_by_idx_accepts_service_account(postgres_pool):
             assert bs_idx is not None
         finally:
             await tr.rollback()
+
+
+# ---------------------------------------------------------------------------
+# fetch_biosample_study_field / create_biosample_study_field
+# ---------------------------------------------------------------------------
+
+
+async def test_create_biosample_study_field_local(ctx):
+    """Tests the case where create_biosample_study_field mints a purely-local
+    field and reads it back: the Record carries the local data_type, a
+    defaulted-False required, and NULL global FK / terminology_idx / tier.
+    """
+    display_name = unique_field_name("Local Field")
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        record = await create_biosample_study_field(
+            conn,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+        )
+    ctx["created"]["biosample_study_field"].append(record["idx"])
+
+    expected = {
+        "idx": record["idx"],
+        "study_idx": ctx["study_idx"],
+        "biosample_global_field_idx": None,
+        "display_name": display_name,
+        "description": None,
+        "data_type": FieldDataType.NUMERIC,
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+        # created_at is DB-assigned; copy it from the actual row.
+        "created_at": record["created_at"],
+    }
+    assert dict(record) == expected
+
+
+async def test_create_biosample_study_field_globally_linked_inherits(ctx):
+    """Tests the case where create_biosample_study_field mints a globally-linked
+    field: the read-back Record COALESCEs the inherited data_type / required
+    from the global-field row even though the study-field columns are NULL.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = unique_field_name("Linked Field")
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"gl_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        record = await create_biosample_study_field(
+            conn,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_idx,
+            description="linked",
+        )
+    ctx["created"]["biosample_study_field"].append(record["idx"])
+
+    expected = {
+        "idx": record["idx"],
+        "study_idx": ctx["study_idx"],
+        "biosample_global_field_idx": global_idx,
+        "display_name": display_name,
+        "description": "linked",
+        # data_type / required inherited from the global row via COALESCE.
+        "data_type": FieldDataType.NUMERIC,
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+        "created_at": record["created_at"],
+    }
+    assert dict(record) == expected
+
+
+async def test_create_biosample_study_field_raise_already_exists(ctx):
+    """Tests the case where a field of that name already exists on the study:
+    the create raises StudyFieldAlreadyExistsError instead of reusing it.
+    """
+    display_name = unique_field_name("Dup Field")
+    existing_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(existing_idx)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldAlreadyExistsError):
+            await create_biosample_study_field(
+                conn,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                created_by_idx=ctx["principal_idx"],
+                data_type=FieldDataType.TEXT,
+            )
+
+
+async def test_fetch_biosample_study_field_returns_none_when_missing(ctx):
+    """Tests the case where the idx matches no row: fetch returns None."""
+    result = await fetch_biosample_study_field(ctx["pool"], 987654321)
+    assert result is None

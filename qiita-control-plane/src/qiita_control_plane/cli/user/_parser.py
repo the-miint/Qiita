@@ -24,6 +24,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     BiosamplePatchRequest,
+    FieldDataType,
     Platform,
     SequencedSamplePatchRequest,
     StudyPatchRequest,
@@ -35,7 +36,7 @@ from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import _handle_patch, _handle_read, _lane_arg
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
-from .biosample import _handle_biosample_create
+from .biosample import _handle_biosample_create, _handle_biosample_create_field
 from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
@@ -234,6 +235,48 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
+
+    p_biosample_create_field = p_biosample_sub.add_parser(
+        "create-field",
+        help="Create a study-local biosample field (POST /study/{S}/biosample-field)",
+    )
+    p_biosample_create_field.add_argument("--study-idx", type=int, required=True)
+    p_biosample_create_field.add_argument(
+        "--display-name",
+        required=True,
+        help="the field's display_name (unique within the study)",
+    )
+    p_biosample_create_field.add_argument("--description")
+    p_biosample_create_field.add_argument(
+        "--biosample-global-field-idx",
+        type=int,
+        help=(
+            "link the new field to this existing biosample_global_field;"
+            " omit for a purely-local field (then --data-type is required)"
+        ),
+    )
+    p_biosample_create_field.add_argument(
+        "--data-type",
+        choices=tuple(d.value for d in FieldDataType),
+        help="field data type; local-mode only",
+    )
+    p_biosample_create_field.add_argument(
+        "--required",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="whether the field is required; local-mode only (defaults to false server-side)",
+    )
+    p_biosample_create_field.add_argument(
+        "--terminology-idx",
+        type=int,
+        help="terminology idx; required iff --data-type is terminology (local-mode only)",
+    )
+    p_biosample_create_field.add_argument(
+        "--tier-override",
+        choices=tuple(t.value for t in Tier),
+        help="visibility tier override; local-mode only",
+    )
+    p_biosample_create_field.set_defaults(handler=_handle_biosample_create_field)
 
     p_biosample_get = p_biosample_sub.add_parser(
         "get",

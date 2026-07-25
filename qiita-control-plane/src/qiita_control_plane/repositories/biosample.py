@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import BiosampleAccessionField, Tier
+from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from . import require_transaction, update_row
 from ._sample_helpers import (
@@ -22,7 +22,9 @@ from ._sample_helpers import (
     SampleEntityKind,
     _get_or_create_local_study_field,
     assert_required_global_fields_supplied,
+    create_study_field,
     fetch_missing_value_reason_idxs_by_names,
+    fetch_study_field,
     link_entity_to_studies,
     validate_primary_secondary_studies,
     write_sample_metadata,
@@ -110,6 +112,74 @@ async def fetch_biosample(
     if for_update:
         sql += " FOR UPDATE"
     return await pool_or_conn.fetchrow(sql, biosample_idx)
+
+
+async def fetch_biosample_study_field(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_study_field_idx: int,
+) -> asyncpg.Record | None:
+    """Return the qiita.biosample_study_field row for the given idx, or None.
+
+    Thin biosample-bound wrapper over the spec-driven fetch_study_field; see
+    that function for the inheritance-aware column resolution. The row carries
+    its own idx as `idx` and the global link as `biosample_global_field_idx`.
+    Accepts either a pool or a connection.
+    """
+    return await fetch_study_field(
+        pool_or_conn, spec=BIOSAMPLE_METADATA_SPEC, idx=biosample_study_field_idx
+    )
+
+
+async def create_biosample_study_field(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    global_field_idx: int | None = None,
+    data_type: FieldDataType | None = None,
+    required: bool | None = None,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+) -> asyncpg.Record:
+    """Create a study-local biosample field and read it back, failing if the
+    name is already used on the study.
+
+    Mints the biosample_study_field row via the spec-driven create primitive
+    (which rejects a name already in use and enforces the local/linked mode
+    rules), then re-reads it through fetch_biosample_study_field so the
+    returned Record carries the resolved, inheritance-aware column values.
+    Returns a Record, consistent with the other resource-create repository
+    functions. The caller owns the transaction; StudyFieldAlreadyExistsError /
+    StudyFieldConflictError / TransientWriteRaceError propagate from the create
+    primitive.
+    """
+    # The mint and the read-back span two statements against the same row;
+    # require a wrapping transaction so the read sees the just-minted row.
+    require_transaction(conn)
+    created_idx = await create_study_field(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=display_name,
+        created_by_idx=created_by_idx,
+        description=description,
+        global_field_idx=global_field_idx,
+        data_type=data_type,
+        required=required,
+        terminology_idx=terminology_idx,
+        tier_override=tier_override,
+    )
+    created_row = await fetch_biosample_study_field(conn, created_idx)
+    # The row was just inserted inside this transaction, so a miss here means
+    # corruption, not an ordinary absence; fail loud rather than returning None
+    # up a Record-typed contract.
+    if created_row is None:
+        raise RuntimeError(
+            f"biosample_study_field idx={created_idx} vanished immediately after insert"
+        )
+    return created_row
 
 
 # Columns this repo's PATCH composer is allowed to write. Held as a

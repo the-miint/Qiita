@@ -950,3 +950,100 @@ def test_metadata_entry_round_trips_ref_values():
 
     assert MetadataEntry.model_validate(missing.model_dump()) == missing
     assert MetadataEntry.model_validate(term.model_dump()) == term
+
+
+def test_biosample_study_field_create_request_local_valid():
+    """Tests the case where a purely-local field supplies data_type (and an
+    optional required flag) with no global link — the local mode accepts it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    req = BiosampleStudyFieldCreateRequest(display_name="pH", data_type=FieldDataType.NUMERIC)
+
+    assert req.data_type is FieldDataType.NUMERIC
+    assert req.biosample_global_field_idx is None
+    assert req.required is None
+
+
+def test_biosample_study_field_create_request_local_requires_data_type():
+    """Tests the case where a purely-local field omits data_type — the local
+    mode rejects it, since the type lives on this row.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(display_name="pH")
+
+
+def test_biosample_study_field_create_request_linked_valid():
+    """Tests the case where a globally-linked field supplies only the global
+    idx and display_name — the linked mode accepts it and leaves the inherited
+    attributes unset.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest
+
+    req = BiosampleStudyFieldCreateRequest(
+        display_name="Sample pH", biosample_global_field_idx=7, description="acidity"
+    )
+
+    assert req.biosample_global_field_idx == 7
+    assert req.data_type is None
+    assert req.required is None
+    assert req.terminology_idx is None
+    assert req.tier_override is None
+
+
+def test_biosample_study_field_create_request_linked_rejects_inherited():
+    """Tests the case where a globally-linked field also supplies an inherited
+    attribute (data_type) — the linked mode rejects it, since inherited columns
+    live on the global-field row.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="Sample pH",
+            biosample_global_field_idx=7,
+            data_type=FieldDataType.NUMERIC,
+        )
+
+
+def test_biosample_study_field_create_request_terminology_requires_idx():
+    """Tests the case where a local terminology field omits terminology_idx —
+    the coupling validator rejects it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="Env Material", data_type=FieldDataType.TERMINOLOGY
+        )
+
+
+def test_biosample_study_field_create_request_terminology_idx_requires_terminology_type():
+    """Tests the case where a local non-terminology field supplies a
+    terminology_idx — the coupling validator rejects it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="pH", data_type=FieldDataType.TEXT, terminology_idx=3
+        )
+
+
+def test_biosample_study_field_create_request_terminology_valid():
+    """Tests the case where a local terminology field supplies both
+    data_type=terminology and terminology_idx — the coupling validator accepts
+    it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    req = BiosampleStudyFieldCreateRequest(
+        display_name="Env Material",
+        data_type=FieldDataType.TERMINOLOGY,
+        terminology_idx=3,
+    )
+
+    assert req.data_type is FieldDataType.TERMINOLOGY
+    assert req.terminology_idx == 3

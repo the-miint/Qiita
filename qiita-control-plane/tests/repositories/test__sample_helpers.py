@@ -38,6 +38,7 @@ from qiita_common.models import (
     FieldWriteOutcome,
     MissingReasonRef,
     TerminologyTermRef,
+    Tier,
 )
 
 from qiita_control_plane.repositories._sample_helpers import (
@@ -58,6 +59,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     SampleMetadataFieldResult,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
+    StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
     TransientWriteRaceError,
     _fetch_slot_occupant,
@@ -65,10 +67,12 @@ from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_local_study_field,
     _insert_metadata,
     _update_metadata,
+    create_study_field,
     fetch_global_fields_by_keys,
     fetch_global_metadata,
     fetch_local_metadata,
     fetch_missing_value_reason_idxs_by_names,
+    fetch_study_field,
     fetch_study_fields_by_display_names,
     fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
@@ -5580,3 +5584,397 @@ async def test__update_metadata_raises_transient_write_race_on_missing_row(ctx):
                 value="x",
                 existing_value_column="value_text",
             )
+
+
+# ---------------------------------------------------------------------------
+# create_study_field (parametrized over both specs)
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_raw_study_field(ctx, *, spec, idx: int) -> dict:
+    """Read the raw *_study_field columns for idx, aliasing the entity-specific
+    global FK column to a stable name so the assertion is spec-independent.
+    """
+    row = await ctx["pool"].fetchrow(
+        f"SELECT study_idx, {spec.study_field_global_fk_column} AS global_field_idx,"
+        f" display_name, description, data_type, required,"
+        f" terminology_idx, tier_override, created_by_idx"
+        f" FROM {spec.study_field_table} WHERE idx = $1",
+        idx,
+    )
+    return dict(row)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_local(ctx, spec):
+    """Tests the case where create_study_field mints a purely-local field,
+    leaving the global FK NULL.
+    """
+    display_name = f"Local {secrets.token_hex(4)}"
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    actual = await _fetch_raw_study_field(ctx, spec=spec, idx=idx)
+    expected = {
+        "study_idx": ctx["study_idx"],
+        "global_field_idx": None,
+        "display_name": display_name,
+        "description": None,
+        "data_type": FieldDataType.NUMERIC,
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+    }
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_globally_linked(ctx, spec):
+    """Tests the case where create_study_field mints a globally-linked field:
+    the row populates the global FK and leaves every inherited column NULL.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = f"Linked {suffix}"
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"gl_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.TEXT,
+    )
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_idx,
+            description="linked field",
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    actual = await _fetch_raw_study_field(ctx, spec=spec, idx=idx)
+    expected = {
+        "study_idx": ctx["study_idx"],
+        "global_field_idx": global_idx,
+        "display_name": display_name,
+        "description": "linked field",
+        "data_type": None,
+        "required": None,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+    }
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_raise_inherited_kwarg_on_linked(ctx, spec):
+    """Tests the case where a globally-linked create is passed an inherited
+    column (tier_override): the linked branch rejects it rather than silently
+    dropping the value.
+    """
+    suffix = secrets.token_hex(4)
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"gl_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.TEXT,
+    )
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(ValueError, match="globally-linked study field"):
+            await create_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                display_name=f"Linked {suffix}",
+                created_by_idx=ctx["principal_idx"],
+                global_field_idx=global_idx,
+                tier_override=Tier.ADMIN,
+            )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_raise_already_exists_local(ctx, spec):
+    """Tests the case where a purely-local field already occupies
+    (study_idx, display_name): strict create raises rather than reusing it.
+    """
+    display_name = f"Dup Local {secrets.token_hex(4)}"
+    existing_idx = await _seed_local_study_field(ctx, spec=spec, display_name=display_name)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldAlreadyExistsError) as excinfo:
+            await create_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                created_by_idx=ctx["principal_idx"],
+                data_type=FieldDataType.TEXT,
+            )
+    assert excinfo.value.entity_kind == spec.entity_kind
+    assert excinfo.value.study_idx == ctx["study_idx"]
+    assert excinfo.value.display_name == display_name
+    # The raise left the pre-existing row untouched.
+    assert existing_idx in ctx["created"][f"{spec.entity_kind}_study_field"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_raise_already_exists_linked(ctx, spec):
+    """Tests the case where a globally-linked field already exists with
+    the name and a second create is attempted with the same name and same global link;
+    this raises AlreadyExists rather than returning the existing row.
+    Trying to link the same name to a different global would instead raise
+    StudyFieldConflictError.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = f"Dup Linked {suffix}"
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"dl_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.TEXT,
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        first_idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_idx,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(first_idx)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldAlreadyExistsError):
+            await create_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                created_by_idx=ctx["principal_idx"],
+                global_field_idx=global_idx,
+            )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_raise_conflict_on_different_global(ctx, spec):
+    """Tests the case where a field linked to one global already occupies the
+    name and a second create tries to link the same name to a *different* global:
+    StudyFieldConflictError propagates, not AlreadyExists.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = f"Diff Global {suffix}"
+    global_a = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"da_{suffix}",
+        display_name=f"Global A {suffix}",
+        data_type=FieldDataType.TEXT,
+    )
+    global_b = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"db_{suffix}",
+        display_name=f"Global B {suffix}",
+        data_type=FieldDataType.TEXT,
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        first_idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_a,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(first_idx)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldConflictError) as excinfo:
+            await create_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                created_by_idx=ctx["principal_idx"],
+                global_field_idx=global_b,
+            )
+    assert excinfo.value.found_global_field_idx == global_a
+    assert excinfo.value.expected_global_field_idx == global_b
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_raise_conflict_on_local_shadow(ctx, spec):
+    """Tests the case where a purely-local field shadows the name a linked
+    create targets: StudyFieldConflictError propagates from the primitive.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = f"Shadow {suffix}"
+    await _seed_local_study_field(ctx, spec=spec, display_name=display_name)
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"sh_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.TEXT,
+    )
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldConflictError) as excinfo:
+            await create_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                created_by_idx=ctx["principal_idx"],
+                global_field_idx=global_idx,
+            )
+    assert excinfo.value.found_global_field_idx is None
+    assert excinfo.value.expected_global_field_idx == global_idx
+
+
+# ---------------------------------------------------------------------------
+# fetch_study_field (parametrized over both specs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_field_local(ctx, spec):
+    """Tests the case where fetch_study_field reads back a purely-local field:
+    the row carries its own data_type / required and a NULL global FK.
+    """
+    display_name = f"Fetch Local {secrets.token_hex(4)}"
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    row = await fetch_study_field(ctx["pool"], spec=spec, idx=idx)
+    expected = {
+        "idx": idx,
+        "study_idx": ctx["study_idx"],
+        spec.study_field_global_fk_column: None,
+        "display_name": display_name,
+        "description": None,
+        "data_type": FieldDataType.NUMERIC,
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+        # created_at is DB-assigned; copy it from the actual row.
+        "created_at": row["created_at"],
+    }
+    assert dict(row) == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_field_globally_linked_inherits(ctx, spec):
+    """Tests the case where fetch_study_field reads back a globally-linked
+    field: data_type / required are COALESCEd from the global-field row even
+    though the study-field columns are NULL.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = f"Fetch Linked {suffix}"
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"fl_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.NUMERIC,
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_idx,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    row = await fetch_study_field(ctx["pool"], spec=spec, idx=idx)
+    expected = {
+        "idx": idx,
+        "study_idx": ctx["study_idx"],
+        spec.study_field_global_fk_column: global_idx,
+        "display_name": display_name,
+        "description": None,
+        # data_type / required inherited from the global row via COALESCE.
+        "data_type": FieldDataType.NUMERIC,
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+        "created_at": row["created_at"],
+    }
+    assert dict(row) == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_field_returns_none_when_missing(ctx, spec):
+    """Tests the case where the idx matches no row: fetch returns None."""
+    result = await fetch_study_field(ctx["pool"], spec=spec, idx=987654321)
+    assert result is None

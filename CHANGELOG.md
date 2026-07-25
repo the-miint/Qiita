@@ -22,6 +22,15 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Create a study-local biosample field — `POST /study/{study_idx}/biosample-field`
+  and `qiita biosample create-field` (#TBD).** Mints one
+  `biosample_study_field` definition (no metadata value) in either mode: purely-local
+  (supply `--data-type`, optional `--required`/`--terminology-idx`/`--tier-override`)
+  or globally-linked (supply `--biosample-global-field-idx`, inheriting the type
+  columns from the global field). Requires `biosample:write` scope and `Tier.MEMBER`
+  study access (wet_lab_admin+ role bypass). A field of that name already on the study
+  is a 409; the 201 body is the created field, with a linked field's inherited
+  `data_type`/`required`/`terminology_idx` resolved on read.
 - **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
   A user CLI (`reference:read`) that exports one or more genomes'
   sequences: for each `--genome-idx` it resolves the genome's members, mints a

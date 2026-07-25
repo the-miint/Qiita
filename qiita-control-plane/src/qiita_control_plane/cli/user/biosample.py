@@ -5,8 +5,14 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 
 import argparse
 
+from qiita_common.api_paths import (
+    PATH_BIOSAMPLE_BY_STUDY,
+    PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_STUDY_PREFIX,
+)
 from qiita_common.models import (
     BiosampleImportRequest,
+    BiosampleStudyFieldCreateRequest,
 )
 
 from .. import _common
@@ -21,7 +27,8 @@ def _post_biosample(base_url: str, token: str, study_idx: int, body: dict) -> di
     caller can run `qiita biosample create` for themselves without first
     chasing their own principal_idx.
     """
-    return _common.call("POST", base_url, token, f"/study/{study_idx}/biosample", json=body)
+    path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}".format(study_idx=study_idx)
+    return _common.call("POST", base_url, token, path, json=body)
 
 
 def _handle_biosample_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -38,5 +45,25 @@ def _handle_biosample_create(args: argparse.Namespace, parser: argparse.Argument
         _common.resolve_owner_idx(args, args.base_url, token)
         body = _build_body(BiosampleImportRequest, args, parser)
         return _post_biosample(args.base_url, token, args.study_idx, body)
+
+    return _common.run_http_subcommand(_run)
+
+
+def _handle_biosample_create_field(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    """Create a study-local biosample field (POST /study/{S}/biosample-field).
+
+    The mode-coupling (purely-local vs globally-linked) is enforced by
+    BiosampleStudyFieldCreateRequest, so an invalid flag combination exits 2
+    at body construction rather than reaching the server.
+    """
+
+    def _run(token: str) -> dict:
+        body = _build_body(BiosampleStudyFieldCreateRequest, args, parser)
+        path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}".format(
+            study_idx=args.study_idx
+        )
+        return _common.call("POST", args.base_url, token, path, json=body)
 
     return _common.run_http_subcommand(_run)
