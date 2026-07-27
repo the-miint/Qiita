@@ -3,7 +3,8 @@
 Owns qiita.block (the compute unit — a fixed ~10M-read slice from prep_samples
 sharing one mask_idx, run as one work ticket), qiita.block_member (the
 block↔sample cover-map), and qiita.mask_sample (the per-(mask_idx, prep_sample)
-completion gate the masked-read export path reads).
+completion gate; its contract — read ONLY on 'completed' — lives on
+`fetch_mask_sample_state`, which consumers point to rather than restate).
 
 The mint-ordering cycle (block.work_ticket_idx ↔ work_ticket.block_idx) is
 broken by creating the block first with a NULL work_ticket_idx (create_block),
@@ -183,6 +184,38 @@ async def lock_mask_sample(
     )
 
 
+async def lock_mask_sample_gate_advisory(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Take a transaction-scoped advisory lock keyed on `(mask_idx,
+    prep_sample_idx)`, held until commit/rollback.
+
+    Serializes the two mask-writer paths that both check-then-write the gate for
+    the same footprint but cannot see each other's uncommitted state: the
+    per-sample `finalize_mask_sample_gate` (`has_incomplete_covering_block` SELECT
+    → `upsert_mask_sample_completed`) and the block planner (conflicting-gate SELECT
+    → `create_mask_sample_pending`). Without a shared lock both can read "no
+    conflict" before either writes, then both proceed — the cross-path double-mask.
+    Holding this lock across each path's check→write means whoever is second
+    observes the first's committed row and refuses.
+
+    A single-bigint key (`hashtextextended` of the pair) — NOT the two-int32 form,
+    whose halves would overflow a bigint idx. This is a distinct lock namespace from
+    `lock_mask_sample`'s row-level FOR UPDATE; the two compose (a writer may hold
+    both). Callers acquiring locks for many samples must order them (e.g. sorted by
+    the pair) to avoid deadlock between two concurrent planners."""
+    require_transaction(conn)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock("
+        "  hashtextextended(format('%s:%s', $1::bigint, $2::bigint), 0))",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
 async def fetch_mask_sample_state(
     conn: asyncpg.Connection,
     *,
@@ -192,13 +225,20 @@ async def fetch_mask_sample_state(
     """Read-only companion to `lock_mask_sample`: return the `(mask_idx,
     prep_sample_idx)` gate row's state, or None when no row exists.
 
-    None means "no block-mask gate for this sample" — the per-sample read-mask
-    path (or an unmasked sample), which consumers treat as allowed. A non-None
-    state other than 'completed' means a covering block is still in flight, so a
-    consumer that must not read a PARTIAL pass-set (the masked-read export, the
-    long-read-assembly input) rejects it. Point-in-time read: no FOR UPDATE / no
-    transaction requirement — it gates a read, it does not finalize. Mirrors the
-    fail-closed gate the admin masked-read export enforces inline (routes/admin)."""
+    THE mask_sample gate contract (canonical statement; the other consumers point
+    here rather than restate it). The gate has two states, 'pending' and
+    'completed', and every masking workflow writes it first-class: the block path
+    materializes 'pending' at plan time and flips it to 'completed' at reconcile;
+    the per-sample mask-model workflows (read-mask, fastq-to-parquet) write
+    'completed' at their `finalize-mask-sample` terminal step. So absence (`None`)
+    means "no mask has completed for this (mask_idx, prep_sample)" — NOT an exempt
+    sample. THE INVARIANT: any consumer that must not read an absent or PARTIAL
+    pass-set proceeds ONLY on 'completed', rejecting both `None` (absence is never
+    "pass") and 'pending'. Stated as a contract, not a roster — callers point here;
+    an enumerated consumer list would only go stale.
+
+    Point-in-time read: no FOR UPDATE / no transaction requirement — it gates a
+    read, it does not finalize."""
     return await conn.fetchval(
         "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
         mask_idx,
@@ -231,6 +271,31 @@ async def finalize_mask_sample(
     return updated is not None
 
 
+async def upsert_mask_sample_completed(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Upsert the `(mask_idx, prep_sample_idx)` gate row straight to 'completed'.
+
+    The per-sample read-mask path's writer (the `finalize-mask-sample` terminal
+    action). Unlike the block path — which materializes a PENDING row at plan time
+    (`create_mask_sample_pending`) and flips it at reconcile (`finalize_mask_sample`)
+    — per-sample masking is atomic per ticket, so there is no PENDING phase: the row
+    is written 'completed' in one idempotent upsert. ON CONFLICT keeps it robust to a
+    workflow retry and composes with a block-path row already present for the same
+    pair (it can only move a stale row forward to 'completed', never backward)."""
+    require_transaction(conn)
+    await conn.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')"
+        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = 'completed'",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
 async def has_incomplete_covering_block(
     conn: asyncpg.Connection,
     *,
@@ -246,12 +311,18 @@ async def has_incomplete_covering_block(
     OR a failed sibling block leaves reads unmasked, so the sample must not
     finalize. Checking `state <> 'completed'` (rather than "non-terminal") means a
     failed block correctly blocks finalize until it is re-driven to completion —
-    the strict, fail-closed reading of the export gate this invariant protects."""
+    the strict, fail-closed reading of the export gate this invariant protects.
+
+    Only READ-MASK blocks count: `wt.alignment_idx IS NULL` (the codebase's
+    read-mask-vs-align block discriminator — align blocks carry BOTH mask_idx and
+    alignment_idx). Without it a pending/failed ALIGN block over the same
+    (mask_idx, sample) would spuriously wedge this sample's read-mask finalize."""
     incomplete = await conn.fetchval(
         "SELECT 1 FROM qiita.block b"
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
-        " WHERE bm.prep_sample_idx = $1 AND wt.mask_idx = $2 AND b.state <> 'completed'"
+        " WHERE bm.prep_sample_idx = $1 AND wt.mask_idx = $2"
+        "   AND wt.alignment_idx IS NULL AND b.state <> 'completed'"
         " LIMIT 1",
         prep_sample_idx,
         mask_idx,

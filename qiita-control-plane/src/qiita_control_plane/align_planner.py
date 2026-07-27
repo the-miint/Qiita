@@ -2,18 +2,17 @@
 
 The align analog of `block_planner`: decouples the COMPUTE unit (a fixed
 ~10M-read block) from the ACCOUNTING unit (per-sample completion). Given a pool's
-samples + a sharded reference + an aligner, the planner:
+samples + a sharded reference + a caller-named `mask_idx`, the planner:
 
-  1. LOOKS UP each sample's already-minted host-depletion `mask_idx` (the same
-     `_build_mask_params` shape the block-mask planner minted under — a pure
-     lookup, NEVER a mint) and requires the sample's `mask_sample` gate to be
-     `completed` (align only fully-masked samples);
+  1. selects the pool's samples whose `mask_sample` gate is `completed` under the
+     caller-named `mask_idx`. Alignment does NOT re-derive the mask config — it is
+     TOLD which mask its reads were produced under (a nonexistent `mask_idx` is a
+     404; a pool with no sample masked-complete under it is a 422);
   2. asserts the reference is ACTIVE + sharded (router + per-aligner shard rows)
      via the resolver, failing 4xx early otherwise;
-  3. partitions the to-align samples by resolved `mask_idx` and mints one
-     `alignment_idx` per partition over `{reference_idx, aligner, mask_idx,
-     shard_ids}` (the mask-style identity, deduped fleet-wide);
-  4. tiles each partition into ≤`_BLOCK_TARGET_READS`-read blocks (reusing the
+  3. mints one `alignment_idx` over `{reference_idx, aligner, mask_idx, shard_ids}`
+     (the mask-style identity, deduped fleet-wide) for the single mask being aligned;
+  4. tiles the to-align samples into ≤`_BLOCK_TARGET_READS`-read blocks (reusing the
      PURE `block_planner.tile_partition` over `qiita.sequence_range` bounds),
      persists the `block` / `block_member` cover-map + an `alignment_sample`
      PENDING gate per sample, creates one block `work_ticket` per block (carrying
@@ -32,15 +31,11 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
-from qiita_common.host_filter_plan import SampleHostFilter
-from qiita_common.models import Platform
 
 from .actions.reference import ReferenceNotFound
 from .block_planner import (
     _BLOCK_TARGET_READS,
     _enumerate_pool_samples,
-    _mask_params_for,
-    resolve_pool_sample_decisions,
     tile_partition,
 )
 from .dispatch import schedule_dispatch
@@ -52,7 +47,6 @@ from .repositories.block import (
     create_block,
     set_block_work_ticket,
 )
-from .repositories.mask_definition import lookup_mask_idx_by_params
 from .repositories.reference_membership import reference_shard_ids
 from .runner import (
     ReferenceIndexNotBuilt,
@@ -71,6 +65,13 @@ ALIGN_ACTION_VERSION = "1.0.0"
 
 class AlignReferenceNotFound(RuntimeError):
     """The requested `reference_idx` does not exist. The route maps this to 404."""
+
+
+class AlignMaskNotFound(RuntimeError):
+    """The requested `mask_idx` does not exist. The caller names the mask to align
+    under (a client-supplied identifier), so a nonexistent one is a 404 — distinct
+    from a valid mask under which no pool sample is masked-complete
+    (`AlignNoMasksFound`, 422)."""
 
 
 class AlignReferenceNotReady(RuntimeError):
@@ -141,20 +142,19 @@ class AlignResubmitError(RuntimeError):
 
 
 class AlignNoMasksFound(RuntimeError):
-    """NOT ONE of the pool's samples has a host-mask minted under the resolved
-    filtering config, so there is nothing this plan could align.
+    """NOT ONE of the pool's samples is masked under the caller-named `mask_idx`
+    (no `mask_sample` gate row at all for any of them), so there is nothing this
+    plan could align.
 
-    A partially-masked pool is normal (its unmasked samples are reported
-    `samples_skipped_no_mask` and the rest align); this fires only when the WHOLE
-    pool misses, which is never a benign no-op — either the pool was never
-    block-masked, or it was masked under a DIFFERENT config than align resolved to.
-    The commonest cause of the latter is a `--force` mismatch: a pool block-masked
-    with `--force <ref>` must be aligned with the same `--force <ref>`, or align
-    re-resolves per sample, hashes a different mask identity, and finds nothing.
-    Surfaced as a 422 rather than a silent 202/0 so that override-does-nothing
-    outcome is loud. Distinct from `samples_skipped_mask_incomplete` (a mask
-    EXISTS but its masking hasn't finished — a legitimate in-flight state that
-    stays a 202)."""
+    A partially-masked pool is normal (its unmasked-under-this-mask samples are
+    reported `samples_skipped_no_mask` and the rest align); this fires only when the
+    WHOLE pool misses, which is never a benign no-op — the caller named a mask this
+    pool was not masked under (a wrong `mask_idx`, or the pool was masked under a
+    different config). Surfaced as a 422 rather than a silent 202/0 so the
+    names-the-wrong-mask outcome is loud. Distinct from `AlignMaskNotFound` (the
+    mask does not exist at all — a 404) and from `samples_skipped_mask_incomplete`
+    (a gate row EXISTS but masking hasn't finished — a legitimate in-flight state
+    that stays a 202)."""
 
 
 async def plan_and_submit_alignments(
@@ -164,9 +164,8 @@ async def plan_and_submit_alignments(
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
     reference_idx: int,
-    force_decision: SampleHostFilter | None,
+    mask_idx: int,
     only_missing: bool,
-    adapter_set_hash: str | None,
     originator_principal_idx: int,
     align_action_id: str,
     align_action_version: str,
@@ -174,46 +173,49 @@ async def plan_and_submit_alignments(
 ) -> dict[str, Any]:
     """Plan + submit a pool's bulk-block sharded-alignment work.
 
-    Resolves each sample's already-minted `mask_idx` at submit time (a LOOKUP, not
-    a mint) and requires its `mask_sample` gate `completed`; partitions the
-    to-align samples by `mask_idx`, mints one `alignment_idx` per partition, tiles
-    each into ≤`target_reads`-read blocks, then in ONE transaction persists the
-    `block` / `block_member` cover-map, a PENDING `alignment_sample` gate per
-    sample, and one block `work_ticket` per block (scope `block`, carrying the
-    partition's `mask_idx` + `alignment_idx` + the align `action_context`),
-    back-filling `block.work_ticket_idx`. After commit each ticket is dispatched.
+    Aligns the pool's samples whose reads are masked-complete under the
+    caller-named `mask_idx`. Alignment does NOT re-derive the mask config — the
+    caller names the mask its reads were produced under, so a pool masked any way
+    (per-sample or block; any host / adapter / lima / syndna config) aligns by
+    pointing at the `mask_idx` it produced. Selects the samples whose `mask_sample`
+    gate is `completed` under that `mask_idx`, mints one `alignment_idx` over
+    `{reference_idx, aligner, mask_idx, shard_ids}`, tiles them into
+    ≤`target_reads`-read blocks, then in ONE transaction persists the `block` /
+    `block_member` cover-map, a PENDING `alignment_sample` gate per sample, and one
+    block `work_ticket` per block (scope `block`, carrying `mask_idx` +
+    `alignment_idx` + the align `action_context`), back-filling
+    `block.work_ticket_idx`. After commit each ticket is dispatched.
 
-    Each sample's host-depletion mask is the one the block-mask plan minted under
-    its PER-SAMPLE resolved decision (`resolve_pool_sample_decisions`), so the
-    lookup key varies by decision — a heterogeneous pool finds each sample's own
-    mask, not one pool-wide answer. `force_decision` (the `--force` override)
-    bypasses resolution to look up the forced mask, exactly as the block plan
-    minted it under `--force`. A pool that cannot resolve (UNRESOLVED / multi-host)
-    raises `PoolHostFilterRefusal` (the route maps it to 422).
-
-    `adapter_set_hash` is resolved by the caller (matching the per-sample read-mask
-    mint) so the mask LOOKUP finds the same mask the block-mask plan minted.
     `only_missing` drops samples already carrying an `alignment_sample` row for
     their resolved alignment (an interrupted plan re-runs only the gap). On a fresh
     plan any already-gated sample raises `AlignResubmitError` (409).
 
-    Raises `AlignReferenceNotFound` (404) / `AlignReferenceNotReady` (409) if the
-    reference can't be aligned against; asyncpg errors on a genuine DB fault (fail
-    loud). Samples that can't be planned are reported (not raised) in the
+    Raises `AlignMaskNotFound` (404) if `mask_idx` does not exist,
+    `AlignNoMasksFound` (422) if no pool sample is masked under it,
+    `AlignReferenceNotFound` (404) / `AlignReferenceNotReady` (409) if the reference
+    can't be aligned against; asyncpg errors on a genuine DB fault (fail loud).
+    Samples that can't be planned are reported (not raised) in the
     `samples_skipped_*` counts.
     """
     # The aligner is derived from the run's PLATFORM (short-read Illumina → bowtie2,
     # long-read PacBio HiFi / Nanopore → minimap2), NOT chosen by the caller, so it
-    # always matches the read chemistry. instrument_model is part of the mask
-    # identity (gates QC polyG); read both in one row. `platform` is NOT NULL in the
-    # schema, so a missing row would surface as an AttributeError on `.` below (the
-    # run existence is fronted by the route's `require_sequencing_run_exists`).
+    # always matches the read chemistry. `platform` is NOT NULL in the schema, so a
+    # missing row would surface as an AttributeError on `.` below (the run existence
+    # is fronted by the route's `require_sequencing_run_exists`).
     run_row = await pool.fetchrow(
-        "SELECT platform, instrument_model FROM qiita.sequencing_run WHERE idx = $1",
+        "SELECT platform FROM qiita.sequencing_run WHERE idx = $1",
         sequencing_run_idx,
     )
     aligner = _aligner_for_platform(run_row["platform"])
-    instrument_model = run_row["instrument_model"]
+
+    # The caller names the mask to align under; it must exist. A pool with no sample
+    # masked under an EXISTING mask is AlignNoMasksFound (422, below); a nonexistent
+    # mask_idx is a client error (404).
+    if (
+        await pool.fetchval("SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+        is None
+    ):
+        raise AlignMaskNotFound(f"no mask_definition with mask_idx={mask_idx}")
 
     # Assert ACTIVE + sharded (fail-fast; the route maps the typed errors to 4xx).
     # We don't need the resolved paths here — the runner resolves them per block at
@@ -251,87 +253,54 @@ async def plan_and_submit_alignments(
         sequenced_pool_idx,
     )
 
-    # Resolve each sample's host-filter decision the SAME way block_planner minted
-    # under (the shared seam), so the mask lookup below reconstructs the identity
-    # the block plan wrote. Refuses an UNRESOLVED / multi-host pool; `force_decision`
-    # bypasses resolution.
-    decision_by_prep_sample = await resolve_pool_sample_decisions(
-        pool,
-        samples=all_samples,
-        platform=Platform(run_row["platform"]),
-        force_decision=force_decision,
+    # Which of the pool's samples are masked under the caller-named mask_idx, and in
+    # what gate state? Alignment does NOT re-derive the mask config — the caller
+    # names the mask its reads were produced under (per-sample or block, any host /
+    # adapter / lima / syndna config), and we select the samples whose mask_sample
+    # gate is 'completed' (gate contract: see `fetch_mask_sample_state` — a sample
+    # with NO gate row under this mask was never masked under it).
+    gate_rows = await pool.fetch(
+        "SELECT prep_sample_idx, state FROM qiita.mask_sample"
+        " WHERE mask_idx = $1 AND prep_sample_idx = ANY($2::bigint[])",
+        mask_idx,
+        [s.prep_sample_idx for s in all_samples],
+    )
+    gate_state_by_prep_sample = {r["prep_sample_idx"]: r["state"] for r in gate_rows}
+
+    # No gate row under this mask ⇒ the sample was never masked under it — skip.
+    skipped_no_mask = sum(
+        1 for s in all_samples if s.prep_sample_idx not in gate_state_by_prep_sample
     )
 
-    # LOOK UP mask_idx per sample (never mint). The identity depends on the
-    # prep_protocol AND the sample's resolved decision, so memoize by that pair —
-    # mirroring block_planner's mint memoization exactly, or the reconstructed hash
-    # won't match the mask the block path minted.
-    mask_by_key: dict[tuple[int | None, SampleHostFilter], int | None] = {}
-    mask_by_prep_sample: dict[int, int | None] = {}
-    for s in all_samples:
-        decision = decision_by_prep_sample[s.prep_sample_idx]
-        key = (s.prep_protocol_idx, decision)
-        if key not in mask_by_key:
-            params = _mask_params_for(
-                decision,
-                prep_protocol_idx=s.prep_protocol_idx,
-                instrument_model=instrument_model,
-                adapter_set_hash=adapter_set_hash,
-            )
-            mask_by_key[key] = await lookup_mask_idx_by_params(pool, params)
-        mask_by_prep_sample[s.prep_sample_idx] = mask_by_key[key]
-
-    # A sample with no minted mask for its config was never block-masked under this
-    # host config — skip it (align only masked samples).
-    samples_with_mask = [
-        (s, mask_by_prep_sample[s.prep_sample_idx])
-        for s in all_samples
-        if mask_by_prep_sample[s.prep_sample_idx] is not None
-    ]
-    skipped_no_mask = len(all_samples) - len(samples_with_mask)
-
-    # If the pool has samples to align but NONE resolved to a minted mask, refuse
-    # loudly rather than return a silent 202/0. A partial miss is normal (those
-    # samples are just skipped_no_mask); a total miss means the pool was never
-    # block-masked, or was masked under a different config than align resolved to —
-    # most often a `--force` mismatch between the two plans.
-    if all_samples and not samples_with_mask:
+    # If the pool has samples but NONE is masked under this mask_idx at all (no gate
+    # rows), refuse loudly rather than return a silent 202/0 — the caller named a
+    # mask this pool was not masked under. A PARTIAL miss (some samples masked, some
+    # not) is normal and stays a 202 with skipped_no_mask counts.
+    if all_samples and not gate_state_by_prep_sample:
         raise AlignNoMasksFound(
-            f"none of the pool's {len(all_samples)} sample(s) has a host-mask minted under the"
-            " resolved filtering config; there is nothing to align. Block-mask the pool first,"
-            " and if it was masked with --force, pass the same --force so the mask identity"
-            " matches."
+            f"none of the pool's {len(all_samples)} sample(s) is masked under "
+            f"mask_idx={mask_idx}; there is nothing to align. Check the mask_idx names the "
+            "read-mask this pool was actually masked under."
         )
 
-    # Require the sample's mask to be COMPLETED (the read-mask-block milestone flips
-    # mask_sample once every covering block is done). Align only fully-masked
-    # samples — a partially-masked sample would align an incomplete read set. One
-    # batched query over the (mask_idx, prep_sample_idx) pairs.
-    completed_prep_sample_idxs: set[int] = set()
-    if samples_with_mask:
-        completed_rows = await pool.fetch(
-            "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
-            "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
-            "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx"
-            " WHERE ms.state = 'completed'",
-            [m for (_s, m) in samples_with_mask],
-            [s.prep_sample_idx for (s, _m) in samples_with_mask],
-        )
-        completed_prep_sample_idxs = {r["prep_sample_idx"] for r in completed_rows}
+    # Require the gate 'completed' (align only fully-masked samples — a non-completed
+    # row means a covering block is still masking, so the read set is partial). A
+    # sample with a non-completed gate row is reported skipped_mask_incomplete (a
+    # legitimate in-flight state, retry later), distinct from skipped_no_mask.
     to_consider = [
-        (s, m) for (s, m) in samples_with_mask if s.prep_sample_idx in completed_prep_sample_idxs
+        (s, mask_idx)
+        for s in all_samples
+        if gate_state_by_prep_sample.get(s.prep_sample_idx) == "completed"
     ]
-    skipped_mask_incomplete = len(samples_with_mask) - len(to_consider)
+    skipped_mask_incomplete = len(gate_state_by_prep_sample) - len(to_consider)
 
-    # Mint one alignment_idx per DISTINCT resolved mask (idempotent upsert on the
-    # config hash — a re-plan of the same config resolves to the same
-    # alignment_idx). shard_ids is reference-constant, so different partitions
-    # differ only by mask_idx. The real per-mask sample grouping is `plan_partitions`
-    # below (built over `to_plan` after only_missing drops gated samples) — here we
-    # only need the distinct mask set to mint over.
+    # Mint the alignment_idx for {reference_idx, aligner, mask_idx, shard_ids} — the
+    # mask-style identity, idempotent on the config hash (a re-plan of the same
+    # config resolves to the same alignment_idx). shard_ids is reference-constant.
+    # Skipped when nothing is to-align (an all-incomplete pool returns a 202/0).
     alignment_by_mask: dict[int, int] = {}
-    async with pool.acquire() as conn:
-        for mask_idx in {m for (_s, m) in to_consider}:
+    if to_consider:
+        async with pool.acquire() as conn:
             row = await mint_alignment_definition(
                 conn,
                 params={
@@ -384,19 +353,17 @@ async def plan_and_submit_alignments(
         if conflicting:
             raise AlignResubmitError(sorted(r["prep_sample_idx"] for r in conflicting))
 
-    # Re-partition the to-plan samples by mask_idx (only_missing may have dropped
-    # some), preserving the minted alignment_idx per partition.
-    plan_partitions: dict[int, list[Any]] = {}
-    for s, m in to_plan:
-        plan_partitions.setdefault(m, []).append(s)
-
     # Persist the whole plan in ONE transaction — a partial plan must roll back
     # (the alignment_definitions minted above are idempotent and survive a rollback
-    # harmlessly).
+    # harmlessly). By construction there is a single partition: every `to_plan` entry
+    # is keyed by the caller's `mask_idx` and its one minted `alignment_idx`, so we
+    # persist that partition directly instead of block_planner's per-mask loop. An
+    # empty `to_plan` (all samples skipped) persists nothing and returns a 202/0.
     block_summaries: list[dict[str, Any]] = []
     partition_summaries: list[dict[str, Any]] = []
-    async with pool.acquire() as conn, conn.transaction():
-        for mask_idx, samples in sorted(plan_partitions.items()):
+    if to_plan:
+        samples = [s for (s, _m) in to_plan]
+        async with pool.acquire() as conn, conn.transaction():
             alignment_idx = alignment_by_mask[mask_idx]
             await create_alignment_sample_pending(
                 conn,

@@ -240,6 +240,185 @@ async def test_delete_pool_happy_path(admin_client, postgres_pool, human_admin_s
         await _cleanup(postgres_pool, ids)
 
 
+async def test_delete_pool_clears_mask_and_alignment_gate_rows(
+    admin_client, postgres_pool, human_admin_session
+):
+    """Regression: a completion-gate row for one of the pool's prep_samples must
+    not block the cascade. `qiita.mask_sample` and `qiita.alignment_sample` both
+    reference `prep_sample` ON DELETE RESTRICT, so before this fix the prep_sample
+    delete 500'd once a gate row existed. This PR makes those rows live (the
+    backfill + finalize write them where the per-sample deployment had none), so
+    the cascade must clear both gates before deleting prep_sample."""
+    ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
+    prep = ids["prep_sample_idx"]
+    mask_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb,"
+        "         (SELECT MIN(idx) FROM qiita.principal))"
+        " RETURNING mask_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+    )
+    alignment_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.alignment_definition (params_hash, params, created_by_idx)"
+        " VALUES ($1, '{}'::jsonb, (SELECT MIN(idx) FROM qiita.principal))"
+        " RETURNING alignment_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        mask_idx,
+        prep,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        alignment_idx,
+        prep,
+    )
+    try:
+        resp = await admin_client.delete(_url(ids))
+        assert resp.status_code == 200, resp.text
+        # prep_sample gone — the FK RESTRICT would otherwise have 500'd the cascade.
+        assert (
+            await postgres_pool.fetchval("SELECT 1 FROM qiita.prep_sample WHERE idx = $1", prep)
+            is None
+        )
+        # Both gate rows gone.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.mask_sample WHERE prep_sample_idx = $1", prep
+            )
+            is None
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.alignment_sample WHERE prep_sample_idx = $1", prep
+            )
+            is None
+        )
+        # The mask / alignment *definition* rows survive — not pool-owned.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+            )
+            == 1
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1",
+                alignment_idx,
+            )
+            == 1
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
+        await _cleanup(postgres_pool, ids)
+
+
+async def test_delete_pool_tears_down_block_cover_map(
+    admin_client, postgres_pool, human_admin_session
+):
+    """Regression: a bulk-block cover-map (`qiita.block_member`, ON DELETE RESTRICT
+    on prep_sample) for one of the pool's samples must not block the cascade.
+    Block-scoped work_tickets carry NULL pool/sample idxs (a CHECK), so the pool-/
+    sample-scoped work_ticket delete cannot reach them — the cascade must tear down
+    the block work_ticket + block (→ block_member CASCADEs) explicitly, else the
+    prep_sample delete 500s. This branch's flagship feature (bulk-block masking /
+    alignment) populates block_member on every plan."""
+    ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
+    prep = ids["prep_sample_idx"]
+    block_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.block (state) VALUES ('completed') RETURNING block_idx"
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.block_member"
+        " (block_idx, prep_sample_idx, min_sequence_idx, max_sequence_idx)"
+        " VALUES ($1, $2, 0, 999)",
+        block_idx,
+        prep,
+    )
+    action_id = "pool-del-block-action"
+    version = f"v-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'block', $3::text[], $4::jsonb, $5::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        ["prep_sample:write"],
+        '{"service": false, "human_roles": ["system_admin"]}',
+        "[]",
+    )
+    # Block-scoped ticket: block_idx set, pool/sample idxs NULL (the CHECK the
+    # pool-/sample-scoped work_ticket delete relies on to NOT reach block tickets).
+    wt_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  block_idx, state)"
+        " VALUES ($1, $2, (SELECT MIN(idx) FROM qiita.principal), 'block', $3,"
+        "         'completed'::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        block_idx,
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.block SET work_ticket_idx = $1 WHERE block_idx = $2", wt_idx, block_idx
+    )
+    try:
+        resp = await admin_client.delete(_url(ids))
+        assert resp.status_code == 200, resp.text
+        # prep_sample gone — block_member RESTRICT would otherwise have 500'd it.
+        assert (
+            await postgres_pool.fetchval("SELECT 1 FROM qiita.prep_sample WHERE idx = $1", prep)
+            is None
+        )
+        # Cover-map, block, and the block ticket all torn down.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.block_member WHERE block_idx = $1", block_idx
+            )
+            is None
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.block WHERE block_idx = $1", block_idx
+            )
+            is None
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+            )
+            is None
+        )
+    finally:
+        # Tolerant of rows a successful delete already removed.
+        await postgres_pool.execute(
+            "UPDATE qiita.block SET work_ticket_idx = NULL WHERE block_idx = $1", block_idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE block_idx = $1", block_idx)
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+        await _cleanup(postgres_pool, ids)
+
+
 async def test_delete_pool_not_found(admin_client):
     resp = await admin_client.delete(
         URL_SEQUENCED_POOL_BY_IDX.format(sequencing_run_idx=1, sequenced_pool_idx=99_999_999)

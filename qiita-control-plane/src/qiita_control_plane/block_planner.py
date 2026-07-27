@@ -46,6 +46,7 @@ from .repositories.block import (
     add_block_members,
     create_block,
     create_mask_sample_pending,
+    lock_mask_sample_gate_advisory,
     set_block_work_ticket,
 )
 from .repositories.mask_definition import mint_mask_definition
@@ -608,32 +609,6 @@ async def plan_and_submit_blocks(
         to_plan = [s for s in all_samples if s.prep_sample_idx not in gated_prep_sample_idxs]
         skipped_existing = len(all_samples) - len(to_plan)
 
-    # disallow-without-delete: on a fresh plan (only_missing=False) refuse to
-    # re-plan ANY sample that already carries a mask_sample gate for its resolved
-    # mask — regardless of the gate's state:
-    #   - COMPLETED → re-masking double-writes its read_mask (DuckLake has no
-    #     uniqueness), and the sample is already exportable.
-    #   - PENDING → a prior plan's covering block is in-flight or failed; minting a
-    #     fresh same-footprint block would wedge the sample's finalize forever
-    #     (has_incomplete_covering_block keeps seeing the stale non-completed block,
-    #     so the gate never flips). `create_mask_sample_pending` is ON CONFLICT DO
-    #     NOTHING and each plan mints new block_idxes, so nothing else stops the dup.
-    # Mirrors the sequenced_pool COMPLETED-resubmit gate. `only_missing` already
-    # dropped ALL gated samples above (pending or completed), so this fires only
-    # when only_missing is False (a fresh plan over an already-block-masked pool).
-    # One batched query over the (mask_idx, prep_sample_idx) pairs; a genuine
-    # re-mask DELETEs first, an interrupted plan resumes with only_missing=true.
-    if to_plan:
-        conflicting = await pool.fetch(
-            "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
-            "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
-            "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx",
-            [mask_by_prep_sample[s.prep_sample_idx] for s in to_plan],
-            [s.prep_sample_idx for s in to_plan],
-        )
-        if conflicting:
-            raise BlockMaskResubmitError(sorted(r["prep_sample_idx"] for r in conflicting))
-
     # Partition the to-plan samples by resolved mask_idx.
     partitions: dict[int, list[_PlanSample]] = {}
     for s in to_plan:
@@ -644,6 +619,47 @@ async def plan_and_submit_blocks(
     block_summaries: list[dict[str, Any]] = []
     partition_summaries: list[dict[str, Any]] = []
     async with pool.acquire() as conn, conn.transaction():
+        # NB1: serialize the cross-path double-mask race. Take a per-sample advisory
+        # lock (mask_idx, prep_sample), held to commit, BEFORE the disallow-without-
+        # delete check + create_mask_sample_pending below, so that check→write is
+        # atomic w.r.t. the per-sample finalize_mask_sample_gate writer (which takes
+        # the same lock). Sorted acquisition avoids deadlock between two concurrent
+        # plans over overlapping samples. (contract: lock_mask_sample_gate_advisory.)
+        for lock_mask_idx, lock_prep_sample_idx in sorted(
+            (mask_by_prep_sample[s.prep_sample_idx], s.prep_sample_idx) for s in to_plan
+        ):
+            await lock_mask_sample_gate_advisory(
+                conn, mask_idx=lock_mask_idx, prep_sample_idx=lock_prep_sample_idx
+            )
+
+        # disallow-without-delete: on a fresh plan (only_missing=False) refuse to
+        # re-plan ANY sample that already carries a mask_sample gate for its resolved
+        # mask — regardless of the gate's state:
+        #   - COMPLETED → re-masking double-writes its read_mask (DuckLake has no
+        #     uniqueness), and the sample is already exportable.
+        #   - PENDING → a prior plan's covering block is in-flight or failed; minting a
+        #     fresh same-footprint block would wedge the sample's finalize forever
+        #     (has_incomplete_covering_block keeps seeing the stale non-completed block,
+        #     so the gate never flips). `create_mask_sample_pending` is ON CONFLICT DO
+        #     NOTHING and each plan mints new block_idxes, so nothing else stops the dup.
+        # Mirrors the sequenced_pool COMPLETED-resubmit gate. `only_missing` already
+        # dropped ALL gated samples above (pending or completed), so this fires only
+        # when only_missing is False (a fresh plan over an already-block-masked pool).
+        # One batched query over the (mask_idx, prep_sample_idx) pairs; a genuine
+        # re-mask DELETEs first, an interrupted plan resumes with only_missing=true.
+        # Runs INSIDE the lock+txn (above) so a concurrent per-sample finalize cannot
+        # slip a 'completed' row between this check and create_mask_sample_pending.
+        if to_plan:
+            conflicting = await conn.fetch(
+                "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
+                "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
+                "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx",
+                [mask_by_prep_sample[s.prep_sample_idx] for s in to_plan],
+                [s.prep_sample_idx for s in to_plan],
+            )
+            if conflicting:
+                raise BlockMaskResubmitError(sorted(r["prep_sample_idx"] for r in conflicting))
+
         for mask_idx, samples in sorted(partitions.items()):
             # Each partition carries ITS OWN host refs — the decision that minted
             # this mask_idx, not a pool-wide flag. `when:` is DEFAULT-ON and this

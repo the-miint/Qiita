@@ -282,6 +282,26 @@ async def test_block_mask_plan_happy_path(ctx, planned):
     assert gate == 2
 
 
+async def test_block_mask_plan_takes_advisory_lock_per_sample(ctx, planned, monkeypatch):
+    """NB1: the planner takes the (mask_idx, prep_sample) advisory gate lock for
+    every planned sample — held inside the persist txn across the
+    disallow-without-delete check and create_mask_sample_pending — so it serializes
+    against the per-sample finalize writer. Spies on the helper, calling through."""
+    await _seed_block_action(planned["db"])
+    real = block_planner.lock_mask_sample_gate_advisory
+    locked: list[int] = []
+
+    async def spy(conn, *, mask_idx, prep_sample_idx):
+        locked.append(prep_sample_idx)
+        await real(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+
+    monkeypatch.setattr(block_planner, "lock_mask_sample_gate_advisory", spy)
+    resp = await ctx["wet"].post(_url(planned), json={})
+    assert resp.status_code == 202, resp.text
+    # One lock acquired per planned sample.
+    assert sorted(locked) == sorted(planned["prep_samples"])
+
+
 async def test_block_mask_plan_host_filter_context(ctx, planned):
     """A `force` override applies the given (ready) rype reference pool-wide,
     bypassing resolution; the per-partition summary carries that ref (the removed
