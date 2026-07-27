@@ -310,6 +310,23 @@ duplicates further down are historical strata; leave them where they are.
   old `test_reflen_order_is_reversed_in_sq` passed on its three-contig fixture;
   it is replaced by `test_sq_order_is_not_derivable_from_reflen`, which pins the
   probe finding and fails loudly if a miint bump gives `@SQ` a defined order.
+  Filed upstream as duckdb-miint#173 (a defined or steerable `@SQ` order) and
+  duckdb-miint#174 (no SQL access to a SAM/BAM header, which is why the contract
+  test hand-parses the BAM binary layout to see `@SQ` at all); the removal of the
+  `samtools sort` the first one forces is tracked at #374.
+- **A miint workaround now has to carry an issue, and `docs/duckdb-miint.md` has
+  an *Open upstream gaps* table to carry it in (#370).** New rule in `CLAUDE.md`'s
+  miint section: when miint's behaviour doesn't match what we expected, the
+  upstream issue is filed **in the PR that lands the workaround**, named by
+  qualified number (`duckdb-miint#173`) at the code comment, the
+  `docs/duckdb-miint.md` entry and the changelog line — and if the workaround is
+  code we mean to delete once upstream fixes it, a Qiita issue with exit criteria
+  plus a row in the new table. The table is the standing list of what qiita
+  carries for miint's sake; a row is deleted by the PR that deletes its
+  workaround. Motivated by this PR: the `@SQ`-order defect was found, documented
+  in three places and worked around, and nothing filed it — so the workaround
+  would have become permanent by default and the next reader could not have told
+  whether it still applied.
 - **`assembly_coverage` drops both now-inert `ORDER BY`s and its
   `preserve_insertion_order` override (#370).** With the `@SQ` reversal disproven,
   the reflen table's `ORDER BY read_id DESC` steered nothing, and the COPY's

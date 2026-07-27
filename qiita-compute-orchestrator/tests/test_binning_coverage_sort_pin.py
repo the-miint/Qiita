@@ -3,10 +3,12 @@
 metaWRAP guards its own `bwa mem` AND its own `samtools sort` behind one
 `if [[ ! -f <out>/work_files/<sample>.bam ]]`. The workflow pre-places that BAM
 to skip bwa (a short-read aligner) in favour of a minimap2 pre-map -- which
-silently skips the sort along with it. miint's `COPY ... FORMAT BAM` orders
-records by reference NAME, and its `@SQ` order (which assigns tid) is not that
-order, so the file is not coordinate-sorted and
-`jgi_summarize_bam_contig_depths` refuses it outright:
+silently skips the sort along with it. And the writer's output was not sorted to
+begin with: a BAM is coordinate-sorted by tid, i.e. by `@SQ` index, and miint's
+`@SQ` order is not derivable from the REFERENCE_LENGTHS table it is built from
+(duckdb-miint#173), so the reference-NAME `ORDER BY` the step used to apply was
+never the sort it looked like. `jgi_summarize_bam_contig_depths` refuses such a
+file outright:
 
     ERROR: the bam file 'reads.bam' is not sorted!
 
@@ -29,11 +31,15 @@ it therefore cannot prove the command *works*, only that it is still there and
 still shaped correctly. Correct-operation evidence lives in the skipped test
 above and in the deploy-checklist verify step.
 
-The sort is defensive FOREVER, not pending an upstream fix. Nothing here pins
-that miint still emits a non-monotonic `@SQ` order, so if miint ever gives that
-order a definition, the sort silently becomes pure cost (~19 s and a second
-reads-sized artifact per ticket) and no test would say so. Removing it would
-need a fresh probe of miint's writer, not an inference from its changelog.
+The sort stays until duckdb-miint#173 lands -- a request for a defined or
+steerable `@SQ` order -- and its removal is tracked (see the "Open upstream gaps"
+table in docs/duckdb-miint.md, which carries the exit criteria). Until then it is
+load-bearing, and nothing HERE pins that miint's order is still undefined: the
+canary is `test_sq_order_is_not_derivable_from_reflen` in
+`jobs/test_assembly_coverage.py`, which fails the moment `@SQ` gains a defined
+order. If that test starts failing, this sort has become pure cost (~19 s and a
+second reads-sized artifact per ticket) -- but removing it still needs a fresh
+probe of miint's writer, not an inference from its changelog.
 """
 
 from __future__ import annotations

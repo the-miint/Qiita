@@ -18,7 +18,9 @@ is not controlled by the REFERENCE_LENGTHS table.** A BAM's sort order is on tid
 (the @SQ index), so no ORDER BY the step can apply makes its output coordinate
 sorted; `binning.sh` runs `samtools sort` instead.
 `test_sq_order_is_not_derivable_from_reflen` pins the writer's behaviour and
-`test_contig_name_order_is_not_tid_order` pins the consequence.
+`test_contig_name_order_is_not_tid_order` pins the consequence. Filed upstream as
+duckdb-miint#173 (a defined or steerable @SQ order); docs/duckdb-miint.md's
+"Open upstream gaps" table tracks it and the removal of the sort.
 
 Not pinned here, because it needs metabat2 which the test env does not have: that
 jgi accepts the BAM and agrees with a samtools-written one. Established by probe
@@ -58,7 +60,8 @@ def _sq_reference_names(path) -> list[str]:
     miint exposes no @SQ-header reader — `read_sam` / `read_alignments` return
     per-record columns, and `SELECT DISTINCT reference` drops zero-coverage
     contigs — so pinning what the writer does with @SQ requires reading the header
-    directly here. (If miint ever grows a header reader, replace this.)
+    directly here. Requested upstream as duckdb-miint#174; replace this helper
+    with the reader when it lands.
 
     BAM is BGZF (gzip-compatible). Layout: magic `BAM\\1`, int32 l_text, l_text
     header bytes, int32 n_ref, then per ref int32 l_name, l_name NUL-terminated
@@ -484,7 +487,9 @@ def test_sq_order_is_not_derivable_from_reflen(tmp_path):
     `jgi_summarize_bam_contig_depths` rejected outright in production. This is the
     canary. If a miint bump makes @SQ track the reflen order, this test fails —
     at which point `binning.sh`'s `samtools sort` could be revisited, but not
-    before.
+    before. That is the exit condition on duckdb-miint#173; the removal work and
+    its full criteria are tracked from docs/duckdb-miint.md's "Open upstream gaps"
+    table.
     """
     bam = tmp_path / "order.bam"
     names = sorted(f"s{i}.ctg{i:06d}l" for i in range(1, _SQ_PROBE_N + 1))

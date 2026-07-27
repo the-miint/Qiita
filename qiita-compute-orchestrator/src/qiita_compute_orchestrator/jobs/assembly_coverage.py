@@ -43,14 +43,16 @@ notes below are what a probe against the shipped build adds on top:
 
 THIS BAM IS NOT COORDINATE SORTED, and cannot be made so here. A BAM's sort order
 is on *tid* — the @SQ index — and the @SQ order miint's writer emits is not
-derivable from the REFERENCE_LENGTHS table's row order (probed; see
-docs/duckdb-miint.md). So no ORDER BY on either the reflen table or the copied
-relation can produce a coordinate sort, and none is attempted: whoever needs one
-runs `samtools sort`, which `binning.sh` does before staging this file for
-metaWRAP. Do not add a reflen ORDER BY back in the belief that it steers @SQ — an
-earlier version of this step did exactly that, called the BAM correct by
-construction, and cost a production ticket (jgi: "ERROR: the bam file 'reads.bam'
-is not sorted!"). `tests/jobs/test_assembly_coverage.py` pins the finding.
+derivable from the REFERENCE_LENGTHS table's row order (probed; filed upstream as
+duckdb-miint#173, which asks for a defined or steerable @SQ order — see
+docs/duckdb-miint.md's "Open upstream gaps" table for the removal ticket). So no
+ORDER BY on either the reflen table or the copied relation can produce a
+coordinate sort, and none is attempted: whoever needs one runs `samtools sort`,
+which `binning.sh` does before staging this file for metaWRAP. Do not add a reflen
+ORDER BY back in the belief that it steers @SQ — an earlier version of this step
+did exactly that, called the BAM correct by construction, and cost a production
+ticket (jgi: "ERROR: the bam file 'reads.bam' is not sorted!").
+`tests/jobs/test_assembly_coverage.py` pins the finding.
 
 WHY `SEQUENCE_DATA` IS NOT OPTIONAL. By default `FORMAT BAM` writes SEQ as `*`,
 and that silently corrupts the depth jgi reports. Coverage ramps DOWN at both

@@ -89,8 +89,11 @@ mkdir -p "${WORK_FILES}"
 # DO NOT "optimise" this back into a copy or a hardlink of coverage_bam. The
 # durable rule: a BAM is coordinate sorted by TID (the @SQ index), and the @SQ
 # order miint's `FORMAT BAM` writer emits is not derivable from the
-# REFERENCE_LENGTHS table it is built from (see docs/duckdb-miint.md), so no
-# ordering assembly_coverage can apply makes its output sorted. Measured on the
+# REFERENCE_LENGTHS table it is built from (duckdb-miint#173; see
+# docs/duckdb-miint.md), so no ordering assembly_coverage can apply makes its
+# output sorted. This sort comes out only when that issue lands and a fresh probe
+# agrees — docs/duckdb-miint.md's "Open upstream gaps" table carries the removal
+# ticket and its exit criteria. Measured on the
 # production BAM that exposed this: 11,390 of 925,483 records step backwards in
 # tid across 20,975 contigs, and jgi_summarize_bam_contig_depths rejects the file
 # outright. After this sort, zero.
