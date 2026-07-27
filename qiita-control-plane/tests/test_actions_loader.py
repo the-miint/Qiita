@@ -1041,4 +1041,4 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     )
     names = [s.name for s in ftp_130.steps]
     assert names[-1] == "finalize-mask-sample"
-    assert "register-files" in names[:-1]  # a register-files precedes the gate flip
+    assert names[-2] == "register-files"  # register-files immediately precedes the gate flip

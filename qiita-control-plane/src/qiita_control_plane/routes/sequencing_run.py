@@ -917,9 +917,6 @@ async def submit_align_plan(
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _run_exists: None = Depends(require_sequencing_run_exists),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
-    signing_key: bytes = Depends(get_flight_signing_key),
-    data_plane_url: str = Depends(get_data_plane_url),
-    staging_root: Path | None = Depends(get_scratch_staging),
 ) -> AlignPlanResponse:
     """Plan + submit the pool's bulk-block sharded alignment in ONE call — the
     align analog of block-mask-plan.

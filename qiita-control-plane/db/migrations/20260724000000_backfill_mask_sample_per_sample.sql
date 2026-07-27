@@ -33,6 +33,18 @@ WHERE wt.action_id IN ('read-mask', 'fastq-to-parquet')
   AND wt.mask_idx IS NOT NULL
 ON CONFLICT (mask_idx, prep_sample_idx) DO NOTHING;
 
+-- Re-state the table COMMENT now that completion is first-class on BOTH masking
+-- paths (the applied 20260701000003 COMMENT described only the block path). Not an
+-- edit to that applied migration — a fresh COMMENT ON TABLE supersedes it in place.
+COMMENT ON TABLE qiita.mask_sample IS
+    'Per-(mask_idx, prep_sample) completion gate for read masking. Written '
+    'first-class by BOTH masking paths: the block path materializes ''pending'' at '
+    'plan time and flips ''completed'' at reconcile; the per-sample mask-model '
+    'workflows (read-mask, fastq-to-parquet) write ''completed'' at their '
+    'finalize-mask-sample terminal step. Consumers (masked-read export, '
+    'long-read-assembly input, alignment) read ONLY ''completed'' — absence of a row '
+    'means "not masked-complete", NEVER "pass".';
+
 -- migrate:down
 -- Irreversible data backfill: a down-migration cannot distinguish rows this
 -- backfill inserted from rows the per-sample finalize-mask-sample action (or the
