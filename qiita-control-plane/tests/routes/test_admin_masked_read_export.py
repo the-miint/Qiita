@@ -244,12 +244,13 @@ async def test_manifest_happy_path(ctx, seeded):
 
 async def test_manifest_surfaces_mask_sample_state(ctx, seeded):
     """The manifest surfaces each sample's per-(mask, prep_sample) completion so
-    the CLI can report skips: a block-masked sample carries its mask_sample state
-    ('pending'/'completed'); a sample with no mask_sample row (the per-sample
-    read-mask path, or unmasked) carries null."""
+    the CLI can report skips: a sample carries its mask_sample state
+    ('pending'/'completed'); a sample with no gate row carries null — under the
+    first-class completion contract that means "not masked-complete under this
+    mask" (the ticket route 409s it), but the manifest still reports it rather than
+    dropping it silently."""
     pool, mask_idx = seeded["pool"], seeded["mask_idx"]
-    # A is block-masked and still pending; B has no mask_sample row (per-sample /
-    # unmasked path).
+    # A carries a still-pending gate; B has no gate row (not masked under this mask).
     await pool.execute(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
         " VALUES ($1, $2, 'pending')",
@@ -321,22 +322,39 @@ async def test_ticket_admin_missing_scope_403(ctx):
 # ---------------------------------------------------------------------------
 
 
-async def test_ticket_signs_mandatory_filter(ctx):
+async def _seed_completed_gate(pool, mask_idx, prep_sample_idx):
+    """Mark the (mask_idx, prep_sample) gate 'completed' so the tightened ticket
+    route reaches the signing path (a masked-complete sample is exportable)."""
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
+async def test_ticket_signs_mandatory_filter(ctx, seeded):
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await _seed_completed_gate(pool, mask_idx, ps)
     resp = await ctx["admin"].post(
-        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": 11, "mask_idx": 4}
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
     )
     assert resp.status_code == 201, resp.text
     payload = _decode_ticket_payload(resp.json()["ticket"])
     assert payload["table"] == "read_masked"
-    assert payload["filter"] == {"prep_sample_idx": [11], "mask_idx": [4]}
+    assert payload["filter"] == {"prep_sample_idx": [ps], "mask_idx": [mask_idx]}
 
 
-async def test_ticket_ttl_is_one_hour(ctx):
+async def test_ticket_ttl_is_one_hour(ctx, seeded):
     """Export tickets mint at the 3600 s max (the data plane's ceiling); expiry
     is checked only at DoGet initiation, so this bounds mint->stream-start, not
     the download."""
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await _seed_completed_gate(pool, mask_idx, ps)
     before = int(time.time())
-    resp = await ctx["admin"].post(URL_ADMIN_MASKED_READ_EXPORT_TICKET, json=_TICKET_BODY)
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
     assert resp.status_code == 201, resp.text
     expiry = _decode_ticket_expiry(resp.json()["ticket"])
     assert before + 3600 - 5 <= expiry <= before + 3600 + 5
@@ -396,12 +414,13 @@ async def test_ticket_allows_completed_mask_sample_201(ctx, seeded):
     assert resp.status_code == 201, resp.text
 
 
-async def test_ticket_allows_no_mask_sample_row_201(ctx, seeded):
-    """A sample with NO mask_sample row (the per-sample read-mask path, or
-    unmasked) is exportable: the per-sample ticket's read_mask is all-or-nothing,
-    so absence of the block gate preserves the old guarantee. 201, not 409."""
+async def test_ticket_refuses_no_mask_sample_row_409(ctx, seeded):
+    """A sample with NO mask_sample row is NOT masked-complete under this mask_idx
+    — no read-mask has completed for the pair. Under the first-class completion
+    contract, absence is refused (409), never minted (both masking paths now write
+    the gate, so absence is 'not masked here', not 'exempt')."""
     mask_idx, ps = seeded["mask_idx"], seeded["ps_b"]
     resp = await ctx["admin"].post(
         URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
     )
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 409, resp.text

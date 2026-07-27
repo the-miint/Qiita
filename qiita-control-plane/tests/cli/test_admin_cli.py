@@ -677,10 +677,16 @@ def _fake_masked_export_http(manifest):
     manifest_suffix = PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT.format(
         sequenced_pool_idx=pool_idx
     )
+    # The real route always populates `mask_state` (MaskedReadExportSample default),
+    # and the CLI now pre-filters on it. Default any sample that omits it to
+    # 'completed' so terse legacy manifests keep exercising the happy path; a test
+    # asserting the not-complete pre-filter sets mask_state explicitly per sample.
+    served = dict(manifest)
+    served["samples"] = [{"mask_state": "completed", **s} for s in manifest["samples"]]
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         if method == "GET" and url.endswith(manifest_suffix):
-            return httpx.Response(200, json=manifest, request=httpx.Request(method, url))
+            return httpx.Response(200, json=served, request=httpx.Request(method, url))
         if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
             tok = _b64.b64encode(
                 _json.dumps({"prep_sample_idx": json["prep_sample_idx"]}).encode()
@@ -1041,6 +1047,66 @@ def test_masked_read_export_aborts_on_unsafe_accession(monkeypatch, tmp_path, ca
     err = capsys.readouterr().err
     assert "99" in err  # names the offending prep_sample_idx
     assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_aborts_on_not_masked_complete(monkeypatch, tmp_path, capsys):
+    """A heterogeneous pool — one 'completed' sample, one 'pending', one with no
+    gate row (None) — fails the WHOLE export up front (before minting any ticket
+    or writing any file). Regression: the ticket route 409s a non-'completed'
+    sample, and minting inside the download loop used to abort mid-run after
+    earlier samples' files were already written — a partial output set. The
+    manifest's mask_state pre-filter now fails loud before the loop."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A", "mask_state": "completed"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B", "mask_state": "pending"},
+            {"prep_sample_idx": 44, "biosample_accession": "SAMN_C", "mask_state": None},
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+
+    class _BoomFlightClient:
+        def __init__(self, url):
+            pass
+
+        def do_get(self, ticket, options=None):
+            raise AssertionError("must not DoGet when a sample is not masked-complete")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _BoomFlightClient)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "masked-complete" in err
+    assert "43" in err and "44" in err  # both non-'completed' preps named
+    assert "42" not in err  # the completed one is not flagged
+    assert list(out_dir.iterdir()) == []  # nothing written — no partial output
 
 
 def test_masked_read_export_creates_missing_output_dir(monkeypatch, tmp_path):

@@ -917,27 +917,26 @@ async def submit_align_plan(
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _run_exists: None = Depends(require_sequencing_run_exists),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
-    signing_key: bytes = Depends(get_flight_signing_key),
-    data_plane_url: str = Depends(get_data_plane_url),
-    staging_root: Path | None = Depends(get_scratch_staging),
 ) -> AlignPlanResponse:
     """Plan + submit the pool's bulk-block sharded alignment in ONE call — the
     align analog of block-mask-plan.
 
-    Looks up each sample's already-minted host-depletion mask (a LOOKUP, never a
-    mint — the reads are the completed read-mask block-mask-plan produced), mints
-    an `alignment_idx` per mask partition over the sharded reference + aligner +
-    shard-set, tiles each partition into fixed ~10M-read blocks, persists the
-    `block`/`block_member` cover-map + a PENDING `alignment_sample` gate per sample,
-    creates one block work_ticket per block, and dispatches each. Returns the plan
-    (blocks + tickets + partition/sample counts) with HTTP 202; a pool with nothing
-    to align returns 202 with zero counts.
+    Selects the pool's samples masked-complete under the caller-supplied `mask_idx`
+    (alignment does NOT re-derive the mask config — the caller names the mask its
+    reads were produced under), mints one `alignment_idx` over the sharded reference
+    + aligner + shard-set + mask, tiles them into fixed ~10M-read blocks, persists
+    the `block`/`block_member` cover-map + a PENDING `alignment_sample` gate per
+    sample, creates one block work_ticket per block, and dispatches each. Returns the
+    plan (blocks + tickets + partition/sample counts) with HTTP 202; a pool with
+    nothing to align (all samples still masking, or none masked under this mask)
+    returns 202 with zero counts.
 
     Same gate as block-mask-plan — a HumanUser with `Scope.PREP_SAMPLE_WRITE` at
     system_role ≥ wet_lab_admin (alignment re-materializes host-depleted,
     human-derived reads, a privileged lab operation).
     `require_sequenced_pool_in_run` fronts 404 (no such pool) / 422 (pool not under
-    this run). Host-ref coherence (minimap2⇒rype) is validated on the model.
+    this run). A nonexistent `mask_idx` is 404; a mask under which no pool sample is
+    masked-complete is 422.
     """
     # Dispatch is fire-and-forget in-process; refuse if the orchestrator hop is
     # unconfigured rather than minting blocks whose tickets can never run.
@@ -974,25 +973,9 @@ async def submit_align_plan(
             ),
         )
 
-    # The mask LOOKUP folds in the same canonical adapter-set hash the per-sample
-    # read-mask mint used, so it resolves to the SAME mask_idx the block-mask plan
-    # minted (else the lookup misses and every sample skips as no_mask). The helper
-    # decides inclusion exactly as the mint path does and materializes it once.
-    try:
-        adapter_set_hash = await block_planner.resolve_block_mask_adapter_hash(
-            pool,
-            default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
-            data_plane_url=data_plane_url,
-            signing_key=signing_key,
-            staging_root=staging_root,
-            sequencing_run_idx=sequencing_run_idx,
-            sequenced_pool_idx=sequenced_pool_idx,
-        )
-    except block_planner.AdapterMaterializationUnavailable as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
-        ) from exc
-
+    # The caller names the mask_idx to align under; the planner selects the pool's
+    # samples whose mask_sample gate is 'completed' under it. Alignment does not
+    # re-derive the mask config, so there is no adapter-set / host resolution here.
     try:
         summary = await align_planner.plan_and_submit_alignments(
             pool,
@@ -1000,27 +983,21 @@ async def submit_align_plan(
             sequencing_run_idx=sequencing_run_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             reference_idx=body.reference_idx,
-            force_decision=block_planner.force_decision_from(
-                force=body.force,
-                host_rype_reference_idx=body.host_rype_reference_idx,
-                host_minimap2_reference_idx=body.host_minimap2_reference_idx,
-            ),
+            mask_idx=body.mask_idx,
             only_missing=body.only_missing,
-            adapter_set_hash=adapter_set_hash,
             originator_principal_idx=user.principal_idx,
             align_action_id=align_planner.ALIGN_ACTION_ID,
             align_action_version=align_planner.ALIGN_ACTION_VERSION,
         )
-    except block_planner.PoolHostFilterRefusal as exc:
-        # Same per-sample resolution as block-mask-plan: an UNRESOLVED / multi-host
-        # pool cannot name each sample's mask to look up.
-        raise _host_filter_refusal_http(exc) from exc
     except align_planner.AlignNoMasksFound as exc:
-        # The whole pool misses the resolved mask (never masked, or a --force
-        # mismatch between block-mask and align) — loud 422, not a silent 202/0.
+        # No pool sample is masked under the named mask_idx — loud 422, not a silent
+        # 202/0 (the caller named a mask this pool was not masked under).
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+    except align_planner.AlignMaskNotFound as exc:
+        # The named mask_idx does not exist (a client-supplied identifier).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except align_planner.AlignReferenceNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except align_planner.AlignUnsupportedPlatform as exc:

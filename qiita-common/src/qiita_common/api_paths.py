@@ -184,6 +184,13 @@ class LibraryPrimitive(StrEnum):
     # caught by the re-resolve. Also fired on every blocklist mutation by the admin
     # route. See qiita_control_plane.actions.library.sync_reference_exclusion.
     SYNC_REFERENCE_EXCLUSION = "sync-reference-exclusion"
+    # Per-sample read-mask completion: the terminal step of the per-sample read-mask
+    # workflow. Records this sample's masking as 'completed' in the qiita.mask_sample
+    # gate — the per-sample twin of reconcile-block's gate flip. Per-sample masking is
+    # atomic per ticket (no PENDING phase), so it upserts straight to 'completed'.
+    # Runs AFTER register-files so the gate never reads 'completed' before the masked
+    # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
+    FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
 
 
 # =============================================================================

@@ -27,9 +27,47 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
-from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample_with_sequenced_prep_sample,
+    seed_user_principal,
+)
 
 pytestmark = pytest.mark.db
+
+
+async def _seed_gate(pool, principal_idx, *, state):
+    """Seed a real (prep_sample, mask_definition) pair, plus a mask_sample gate row
+    in `state` when `state` is not None (no row otherwise). Returns
+    `(prep_sample_idx, mask_idx, biosample_idx)`; caller cleans up via
+    `_cleanup_gate` (FK-reverse)."""
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    async with pool.acquire() as conn:
+        mask = await mint_mask_definition(
+            conn,
+            filter_workflow="read-mask",
+            filter_version="1.0.0",
+            params={"workflow": "read-mask", "s": secrets.token_hex(4)},
+            principal_idx=principal_idx,
+        )
+    mask_idx = mask["mask_idx"]
+    if state is not None:
+        await pool.execute(
+            "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
+            mask_idx,
+            prep_sample_idx,
+            state,
+        )
+    return prep_sample_idx, mask_idx, biosample_idx
+
+
+async def _cleanup_gate(pool, prep_sample_idx, mask_idx, biosample_idx):
+    await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+    await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+    await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
 
 
 # Ed25519 signing seed the test app signs tickets with; the test decodes the
@@ -247,12 +285,42 @@ async def test_doget_sa_without_scope_403(ctx, sa_no_scope_client):
 
 
 async def test_doget_signs_mandatory_filter(ctx):
-    resp = await ctx["sa"].post(URL_READ_MASKED_DOGET, json={"prep_sample_idx": 11, "mask_idx": 4})
-    assert resp.status_code == 201, resp.text
-    payload = _decode_ticket_payload(resp.json()["ticket"])
-    # read_masked table + BOTH identifiers present and non-empty.
-    assert payload["table"] == "read_masked"
-    assert payload["filter"] == {"prep_sample_idx": [11], "mask_idx": [4]}
+    """A 'completed' gate under the mask → a signed ticket carrying BOTH
+    identifiers as a non-empty filter."""
+    pool = ctx["pool"]
+    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state="completed")
+    try:
+        resp = await ctx["sa"].post(
+            URL_READ_MASKED_DOGET, json={"prep_sample_idx": prep, "mask_idx": mask}
+        )
+        assert resp.status_code == 201, resp.text
+        payload = _decode_ticket_payload(resp.json()["ticket"])
+        # read_masked table + BOTH identifiers present and non-empty.
+        assert payload["table"] == "read_masked"
+        assert payload["filter"] == {"prep_sample_idx": [prep], "mask_idx": [mask]}
+    finally:
+        await _cleanup_gate(pool, prep, mask, bs)
+
+
+@pytest.mark.parametrize("state", [None, "pending"])
+async def test_doget_refuses_when_not_masked_complete(ctx, state):
+    """The completion gate: a 'pending' gate (a covering block still in flight) or
+    NO gate row (absence is not exempt) both 409 — an in-flight/absent pass-set
+    would silently truncate. This is the third read_masked-ticket door; it must be
+    gated exactly like the human export ticket route, so the invariant is uniform:
+    every path that mints a read_masked ticket requires 'completed'."""
+    pool = ctx["pool"]
+    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state=state)
+    try:
+        resp = await ctx["sa"].post(
+            URL_READ_MASKED_DOGET, json={"prep_sample_idx": prep, "mask_idx": mask}
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["mask_state"] == state
+        assert detail["prep_sample_idx"] == prep and detail["mask_idx"] == mask
+    finally:
+        await _cleanup_gate(pool, prep, mask, bs)
 
 
 async def test_doget_table_is_in_cp_allowlist(ctx):

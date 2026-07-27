@@ -235,7 +235,8 @@ _STREAM_MASKED = "qiita_control_plane.runner._stream_masked_reads_to_fastq"
 
 class _FakePool:
     """Minimal asyncpg.Pool stand-in: `fetchval` returns a fixed mask_sample
-    gate state (None = no gate row = allowed)."""
+    gate state. Under the first-class completion contract, only 'completed' is
+    allowed; None (no gate row) and any other state are rejected."""
 
     def __init__(self, gate_state: str | None = None):
         self._gate_state = gate_state
@@ -269,8 +270,8 @@ def test_workflow_needs_staged_masked_reads_gate():
 
 
 def test_resolve_staged_masked_reads_streams_fastq_and_binds(tmp_path, monkeypatch):
-    """No gate row + count>0: the runner streams read_masked to a gzip FASTQ (miint
-    COPY FORMAT FASTQ), which `masked_reads_fastq` binds to. No parquet, no
+    """Completed gate + count>0: the runner streams read_masked to a gzip FASTQ
+    (miint COPY FORMAT FASTQ), which `masked_reads_fastq` binds to. No parquet, no
     DoAction."""
     workspace = tmp_path / "ticket" / "804"
     dest = workspace / "masked_reads.fastq.gz"
@@ -282,7 +283,7 @@ def test_resolve_staged_masked_reads_streams_fastq_and_binds(tmp_path, monkeypat
 
     monkeypatch.setattr(_STREAM_MASKED, _fake_stream)
 
-    bound = _run_masked(_FakePool(), 42, workspace)
+    bound = _run_masked(_FakePool("completed"), 42, workspace)
     assert bound[STAGED_MASKED_READS_BINDING] == dest
     assert dest.exists()
 
@@ -294,7 +295,18 @@ def test_resolve_staged_masked_reads_incomplete_mask_is_bad_input(tmp_path, monk
     with pytest.raises(BackendFailure) as exc:
         _run_masked(_FakePool("processing"), 7, tmp_path / "ws")
     assert exc.value.kind == FailureKind.BAD_INPUT
-    assert "not completed" in exc.value.reason
+    assert "not masked-complete" in exc.value.reason
+
+
+def test_resolve_staged_masked_reads_no_gate_row_is_bad_input(tmp_path, monkeypatch):
+    """No gate row (None) means no read-mask has completed for this pair. Under the
+    first-class completion contract that is NOT exempt: reject before any stream,
+    same as a non-completed row (both masking paths now write the gate)."""
+    monkeypatch.setattr(_STREAM_MASKED, lambda _u, _t, _d: pytest.fail("must not stream"))
+    with pytest.raises(BackendFailure) as exc:
+        _run_masked(_FakePool(None), 7, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "not masked-complete" in exc.value.reason
 
 
 def test_resolve_staged_masked_reads_empty_stream_is_no_data(tmp_path, monkeypatch):
@@ -309,7 +321,7 @@ def test_resolve_staged_masked_reads_empty_stream_is_no_data(tmp_path, monkeypat
 
     monkeypatch.setattr(_STREAM_MASKED, _fake_stream)
     with pytest.raises(StepNoData) as exc:
-        _run_masked(_FakePool(), 7, workspace)
+        _run_masked(_FakePool("completed"), 7, workspace)
     assert "nothing to assemble" in exc.value.reason
     assert not (workspace / "masked_reads.fastq.gz").exists()
 
@@ -322,7 +334,7 @@ def test_resolve_staged_masked_reads_stream_failure_is_bad_input(tmp_path, monke
 
     monkeypatch.setattr(_STREAM_MASKED, _boom)
     with pytest.raises(BackendFailure) as exc:
-        _run_masked(_FakePool(), 7, tmp_path / "ws")
+        _run_masked(_FakePool("completed"), 7, tmp_path / "ws")
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "data plane" in exc.value.reason
 
