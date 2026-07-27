@@ -31,6 +31,15 @@ _None yet._
 
 ### 5. Verify
 
+- The rebuilt `long-read-assembly` binning image carries the `samtools sort` staging step, and `_lib.sh` resolves the allocation from `QIITA_CPUS`/`QIITA_MEM_MB` (#370). Both greps are anchored at start-of-line so a comment mentioning the command cannot satisfy them:
+  ```bash
+  cd /tmp && sudo -u qiita-orch apptainer exec --no-home \
+    "${PATH_DERIVED}/images/long-read-assembly-binning-1.0.0.sif" \
+    bash -c "grep -q '^micromamba run -n metawrap samtools sort' /opt/qiita/binning.sh \
+             && grep -q '^THREADS=\"\${QIITA_CPUS:-' /opt/qiita/_lib.sh \
+             && grep -q '^MEM_MB=\"\${QIITA_MEM_MB:-' /opt/qiita/_lib.sh" \
+    && echo BINNING_SORT_OK
+  ```
 - **`read-mask` 1.0.0 and `fastq-to-parquet` 1.3.0 carry the new `finalize-mask-sample` terminal step** — `make verify-deploy` already confirms `qiita.action` is queryable; this additionally confirms both per-sample masking workflows were re-synced, so they now write the `mask_sample` completion gate first-class. Expect `t` for both rows. (#371)
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
@@ -47,8 +56,12 @@ _None yet._
 
 ### Notes (no host action)
 
+- Every workflow SIF **auto-rebuilds** on this deploy — `binning.sh` changed (it is in the binning image's `HASH_INPUTS`), `binning.def` changed (`build-sif.sh` seeds the def into the digest unconditionally), and `workflows/_shared/_lib.sh` changed, which is hashed into *every* image's build-inputs digest. No manual build step (#370).
+- The binning image now pins `samtools=1.10` and `metabat2=2.15` (both were transitive via `metawrap-mg`). These are the versions the currently-deployed image already ships, and a dry-run solve on the def's own base (`mambaorg/micromamba:1.5.8`) resolved exactly those builds — so this is intended as a pin, not a tool upgrade. It is not a guarantee about a future solve against live channel state, which is why `binning-verify.sh` now reads each tool's reported version and **fails the build** on drift; its sentinel line also prints the resolved versions, so the deploy log records what actually shipped (#370).
+- Container steps now receive `QIITA_CPUS` / `QIITA_MEM_MB` (the step's resolved `baseline_resources`) via `apptainer --env`; entrypoints read them through `_lib.sh`. This is internal to the orchestrator — **no host env var to set**. The entrypoints fall back to the old `nproc` chain when the vars are absent, so a SIF that rebuilds before the orchestrator restarts still runs (#370).
+- `workflows/long-read-assembly/1.0.0.yaml` changed in **comments only** — `qiita-admin actions sync` will re-upsert the same `long-read-assembly` `1.0.0` row; no new action version, nothing to re-verify beyond the generic `make verify-deploy` action list (#370).
+- Tickets that already failed at `binning` with `ERROR: the bam file 'reads.bam' is not sorted!` need a resubmit after this deploy; nothing on the host to change (#370).
 - **Breaking API contract — `align-plan` request shape changed (no host action, downstream-client awareness).** `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now **requires** `mask_idx` and **drops** `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx`. A caller sending the old body gets a 422; a caller that omits `mask_idx` cannot submit a plan. Any out-of-repo align-plan client must be updated to name the `mask_idx` its reads were masked under. Rationale: align no longer re-derives the mask config server-side — the reconstruction matched the real per-sample mask only by coincidence and returned `AlignNoMasksFound` for every pool on this deployment; a nonexistent `mask_idx` is now a 404 (`AlignMaskNotFound`). (#371)
-
 - **Soft API contract — `POST /read-masked/ticket/doget` now enforces the completion gate (no host action, downstream-client awareness).** The service-account-only masked-read DoGet ticket route (held by the `compute` SA; no human role) now 409s a `(prep_sample_idx, mask_idx)` whose `qiita.mask_sample` gate is not `completed` — uniform with the human export ticket route, so *every* path that mints a `read_masked` ticket requires `completed`. No in-repo caller today (long-read-assembly signs `read_masked` tickets in-process), so this is latent; a future out-of-repo worker that mints such a ticket must handle the 409 (retry once masking completes). (#371)
 
 ---

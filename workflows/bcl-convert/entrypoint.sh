@@ -35,14 +35,16 @@ BCL_INPUT_DIR=$(jq -er '.inputs.bcl_input_dir' "${PARAMS_JSON}")
 CONVERT_DIR="${QIITA_OUTPUT_PATH}/ConvertJob"
 mkdir -p "${CONVERT_DIR}"
 
-# bcl-convert thread counts track the CPUs SLURM allocated to this step rather
-# than a hardcoded constant, so they can't drift from the resolved A4 profile.
-# SLURM_CPUS_PER_TASK is exactly the cpu the resolved profile asked for
-# (SlurmBackend sets cpus_per_task = baseline_resources.cpu in slurm/payload.py),
-# so a future profile in workflows/bcl-convert/1.0.0.yaml with a different cpu
-# needs no entrypoint change. Fall back to nproc, then 1, when SLURM didn't
-# export it (e.g. local apptainer runs).
-THREADS="${SLURM_CPUS_PER_TASK:-}"
+# bcl-convert thread counts track the CPUs allocated to this step rather than a
+# hardcoded constant, so they can't drift from the resolved A4 profile. QIITA_CPUS
+# is the step's resolved baseline_resources.cpu, forwarded into the container by
+# slurm/payload.py, so a future profile in workflows/bcl-convert/1.0.0.yaml with a
+# different cpu needs no entrypoint change. SLURM_CPUS_PER_TASK is a second choice
+# for non-container use only — `apptainer exec --containall` scrubs every SLURM_*
+# var, so it is ALWAYS unset in here. nproc, then 1, for a local apptainer run.
+# Same chain as workflows/_shared/_lib.sh, which this file deliberately does not
+# source (bcl-convert's image predates it and carries no jq/manifest contract).
+THREADS="${QIITA_CPUS:-${SLURM_CPUS_PER_TASK:-}}"
 if [[ -z "${THREADS}" ]]; then
     THREADS=$(nproc 2>/dev/null || echo 1)
 fi
