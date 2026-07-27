@@ -41,9 +41,10 @@ COMMENT ON TABLE qiita.mask_sample IS
     'first-class by BOTH masking paths: the block path materializes ''pending'' at '
     'plan time and flips ''completed'' at reconcile; the per-sample mask-model '
     'workflows (read-mask, fastq-to-parquet) write ''completed'' at their '
-    'finalize-mask-sample terminal step. Consumers (masked-read export, '
-    'long-read-assembly input, alignment) read ONLY ''completed'' — absence of a row '
-    'means "not masked-complete", NEVER "pass".';
+    'finalize-mask-sample terminal step. Any consumer that must not read an absent '
+    'or partial pass-set reads ONLY ''completed'' — absence of a row means '
+    '"not masked-complete", NEVER "pass". Stated as a contract, not a roster (an '
+    'enumerated consumer list would only go stale); see fetch_mask_sample_state.';
 
 -- migrate:down
 -- Irreversible data backfill: a down-migration cannot distinguish rows this

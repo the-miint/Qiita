@@ -26,6 +26,7 @@ from qiita_control_plane.repositories.block import (
     finalize_mask_sample,
     has_incomplete_covering_block,
     lock_mask_sample,
+    lock_mask_sample_gate_advisory,
     set_block_state,
     set_block_work_ticket,
     upsert_mask_sample_completed,
@@ -282,6 +283,37 @@ async def test_lock_mask_sample_returns_state_and_requires_txn(blk):
     async with pool.acquire() as conn:
         with pytest.raises(RuntimeError):
             await lock_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
+
+
+async def test_lock_mask_sample_gate_advisory_serializes_and_requires_txn(blk):
+    """The advisory gate lock is a real (mask_idx, prep_sample) mutex: while one
+    transaction holds it, a second transaction cannot acquire the SAME key, and a
+    DIFFERENT key is unaffected; once the holder rolls back, the key frees. And it
+    requires a transaction (xact-scoped)."""
+    pool = blk["pool"]
+    mask_idx = blk["mask_idx"]
+    ps1, ps2 = blk["prep_sample_idxs"]
+    key_sql = "SELECT hashtextextended(format('%s:%s', $1::bigint, $2::bigint), 0)"
+    async with pool.acquire() as a, pool.acquire() as b:
+        key1 = await a.fetchval(key_sql, mask_idx, ps1)
+        key2 = await a.fetchval(key_sql, mask_idx, ps2)
+        tx_a = a.transaction()
+        await tx_a.start()
+        try:
+            await lock_mask_sample_gate_advisory(a, mask_idx=mask_idx, prep_sample_idx=ps1)
+            async with b.transaction():
+                # A holds ps1's key → B cannot take it, but ps2's key is free.
+                assert await b.fetchval("SELECT pg_try_advisory_xact_lock($1)", key1) is False
+                assert await b.fetchval("SELECT pg_try_advisory_xact_lock($1)", key2) is True
+        finally:
+            await tx_a.rollback()
+        # A released → B can now take ps1's key.
+        async with b.transaction():
+            assert await b.fetchval("SELECT pg_try_advisory_xact_lock($1)", key1) is True
+    # No transaction → fail loud.
+    async with pool.acquire() as conn:
+        with pytest.raises(RuntimeError):
+            await lock_mask_sample_gate_advisory(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
 
 
 async def test_finalize_mask_sample_flips_once(blk):

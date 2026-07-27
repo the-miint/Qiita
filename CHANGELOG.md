@@ -260,6 +260,34 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`mask_sample` gate hardening — cascade delete, align-block false-positive, export partial-output, and a third ungated ticket door (#371).**
+  Four defects surfaced once the `mask_sample` (and `alignment_sample`) completion
+  gate became live on both masking paths:
+  - `delete-sequenced-pool` 500'd once a gate row existed — `qiita.mask_sample` and
+    `qiita.alignment_sample` both reference `prep_sample` `ON DELETE RESTRICT`, and
+    the cascade did not clear them before deleting `prep_sample`. It now deletes both
+    gate tables' rows first. Same fix for the bulk-block cover-map
+    (`qiita.block_member`, also `ON DELETE RESTRICT` on `prep_sample`): the cascade
+    now tears down the pool's block-scoped work_tickets and blocks (→ `block_member`
+    CASCADEs) too, so a pool that ran block masking/alignment can be deleted. (The
+    `qiita.genome.prep_sample_idx` origin-sample FK is a narrower remaining gap,
+    tracked separately.)
+  - `has_incomplete_covering_block` (the per-sample read-mask finalize gate) matched
+    ALIGN blocks too — align blocks carry both `mask_idx` and `alignment_idx`, so a
+    pending/failed align block would wedge a read-mask re-run for that `(sample, mask)`
+    forever. Added the `alignment_idx IS NULL` read-mask-block discriminator.
+  - The masked-read-export CLI validated accessions up front but minted the export
+    ticket inside the per-sample download loop, so a now-tightened 409 aborted the run
+    AFTER earlier samples' files were written — a partial output set. It now pre-filters
+    on the manifest's `mask_state` and fails the whole export up front.
+  - `POST /read-masked/ticket/doget` (service-account only) signed a `read_masked`
+    ticket with no completion check — the third door that mints such a ticket. It now
+    409s a non-`completed` `(prep_sample, mask_idx)`, uniform with the human export
+    ticket route (every path that mints a `read_masked` ticket requires `completed`).
+  Also closed the cross-path double-mask race: the per-sample `finalize-mask-sample`
+  and the block planner now take a `(mask_idx, prep_sample)` `pg_advisory_xact_lock`
+  held across their check→write, so exactly one wins and the other refuses.
+
 - **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
   mobile element (e.g. a shared plasmid) resolve to the *same* `feature_idx` under

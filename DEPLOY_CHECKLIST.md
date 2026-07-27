@@ -49,6 +49,8 @@ _None yet._
 
 - **Breaking API contract — `align-plan` request shape changed (no host action, downstream-client awareness).** `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now **requires** `mask_idx` and **drops** `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx`. A caller sending the old body gets a 422; a caller that omits `mask_idx` cannot submit a plan. Any out-of-repo align-plan client must be updated to name the `mask_idx` its reads were masked under. Rationale: align no longer re-derives the mask config server-side — the reconstruction matched the real per-sample mask only by coincidence and returned `AlignNoMasksFound` for every pool on this deployment; a nonexistent `mask_idx` is now a 404 (`AlignMaskNotFound`). (#371)
 
+- **Soft API contract — `POST /read-masked/ticket/doget` now enforces the completion gate (no host action, downstream-client awareness).** The service-account-only masked-read DoGet ticket route (held by the `compute` SA; no human role) now 409s a `(prep_sample_idx, mask_idx)` whose `qiita.mask_sample` gate is not `completed` — uniform with the human export ticket route, so *every* path that mints a `read_masked` ticket requires `completed`. No in-repo caller today (long-read-assembly signs `read_masked` tickets in-process), so this is latent; a future out-of-repo worker that mints such a ticket must handle the 409 (retry once masking completes). (#371)
+
 ---
 
 ## Deployed history

@@ -60,6 +60,7 @@ from ..deps import (
     get_flight_signing_key,
     get_tx_conn_factory,
 )
+from ..repositories.block import fetch_mask_sample_state
 from ..repositories.mask_definition import mint_mask_definition
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
@@ -198,6 +199,7 @@ async def delete_mask_definition_route(
 @read_masked_router.post(PATH_READ_MASKED_DOGET, status_code=201)
 async def create_read_masked_doget_ticket(
     body: ReadMaskedDoGetTicketRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
     sa: ServiceAccount = Depends(require_service_with_scope(Scope.READ_MASKED_DOGET)),
 ) -> DoGetTicketResponse:
@@ -212,6 +214,13 @@ async def create_read_masked_doget_ticket(
     (Pydantic gt=0), so the signed filter is always non-empty. The route
     re-asserts this before signing — an unfiltered read_masked ticket is never
     signed, which would otherwise dump every sample's pass reads fleet-wide.
+
+    Completion gate (contract: see `fetch_mask_sample_state`): the sample must be
+    'completed' under this `mask_idx`, else 409 — a 'pending' row (a covering block
+    still in flight) or NO row (absence is not exempt) both mean the read_masked
+    pass-set would be absent or partial, and a pull would silently truncate. This
+    keeps the invariant uniform with the human export ticket route: EVERY path that
+    mints a read_masked ticket requires 'completed'.
     """
     filter_ = {
         "prep_sample_idx": [body.prep_sample_idx],
@@ -223,6 +232,27 @@ async def create_read_masked_doget_ticket(
         raise HTTPException(
             status_code=422,
             detail="read_masked ticket requires a non-empty prep_sample_idx and mask_idx filter",
+        )
+
+    async with pool.acquire() as conn:
+        mask_state = await fetch_mask_sample_state(
+            conn, mask_idx=body.mask_idx, prep_sample_idx=body.prep_sample_idx
+        )
+    if mask_state != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": (
+                    "the sample is not masked-complete under this mask_idx "
+                    f"(mask_sample.state={mask_state!r}). Either no read-mask has "
+                    "completed for this (prep_sample, mask_idx), or a covering block is "
+                    "still in flight — the read_masked pass-set would be absent or "
+                    "partial. Refusing to sign a ticket; retry once masking is completed."
+                ),
+                "prep_sample_idx": body.prep_sample_idx,
+                "mask_idx": body.mask_idx,
+                "mask_state": mask_state,
+            },
         )
 
     ticket_bytes = sign_ticket(

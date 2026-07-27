@@ -949,8 +949,10 @@ class MaskedReadExportSample(BaseModel):
     `'pending'` (a covering block is mid-flight, so the read_mask is partial — NOT
     exportable, the ticket route 409s), or `None` (no gate row). Only `'completed'`
     is exportable: `None` means "not masked-complete under this mask", NOT exempt, so
-    the ticket route 409s it too. The CLI reads it to report which samples it will
-    skip before minting per-sample tickets.
+    the ticket route 409s it too. The CLI reads it to fail the whole export up front
+    (before minting any per-sample ticket) when a sample is not `'completed'`, rather
+    than abort the download loop mid-run on the ticket route's 409 and leave a partial
+    output set.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]

@@ -54,6 +54,7 @@ from ..repositories.block import (
     has_incomplete_covering_block,
     lock_alignment_sample,
     lock_mask_sample,
+    lock_mask_sample_gate_advisory,
     set_block_state,
     upsert_mask_sample_completed,
 )
@@ -2304,8 +2305,21 @@ async def finalize_mask_sample_gate(
     the block's per-sample finalize over a now-double-written read_mask footprint. So
     refuse loudly when a covering block is still masking this footprint — the block
     path owns that gate; the operator must delete the conflicting block-mask (or the
-    per-sample duplicate) rather than let two masking runs race the same footprint."""
+    per-sample duplicate) rather than let two masking runs race the same footprint.
+
+    The check (`has_incomplete_covering_block`) and the write
+    (`upsert_mask_sample_completed`) are made atomic w.r.t. the concurrent block
+    planner by a `(mask_idx, prep_sample)` advisory lock held across both: without
+    it, this path and a block plan could each read "no conflict" before either
+    writes, and both would proceed (the cross-path double-mask). With the lock,
+    whichever runs second sees the other's committed state and refuses here (or the
+    planner raises `BlockMaskResubmitError`)."""
     async with pool.acquire() as conn, conn.transaction():
+        # Serialize against the block planner's create_mask_sample_pending for this
+        # footprint (contract: see lock_mask_sample_gate_advisory). Held to commit.
+        await lock_mask_sample_gate_advisory(
+            conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
+        )
         if await has_incomplete_covering_block(
             conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
         ):
