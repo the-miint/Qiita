@@ -86,7 +86,16 @@ From: mambaorg/micromamba:1.5.8
     # circular contigs as ONE multi-FASTA — no per-contig split tool — so the native
     # assembly_hash step reads them with miint read_fastx.
     #
-    #  - hifiasm_meta: unpinned, as it has been.
+    #  - hifiasm_meta: unpinned, as it has been — but note the exposure has GROWN,
+    #    because myloasm_split.py is now in this image's HASH_INPUTS. An edit to
+    #    the myloasm splitter invalidates the build hash, forcing a full rebuild,
+    #    which re-resolves this unpinned solve against whatever bioconda has that
+    #    day — so hifiasm_meta can move on a change that had nothing to do with it,
+    #    and %test asserts only that it runs, not which version. Pinning it is the
+    #    fix, deliberately NOT done here: nothing in this repo records the version
+    #    the live deploy is running, so a pin would have to be guessed, and getting
+    #    it wrong changes the DEFAULT assembler's behaviour. Read the deployed
+    #    image's version first, then pin to it.
     micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta
     #  - myloasm: PINNED, and the pin is load-bearing in a way hifiasm's absence of
     #    one is not. myloasm's circularity contract is a STRING in its FASTA header,
