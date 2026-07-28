@@ -263,7 +263,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
-  `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#376).**
+  `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#379).**
   CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
   AF_UNIX socket at `$TMPDIR/pymp-XXXXXXXX/listener-XXXXXXXX`. The SLURM payload
   sets `TMPDIR=<workspace>/tmp` (~85 chars, on real disk so temp doesn't fill the
@@ -274,7 +274,7 @@ duplicates further down are historical strata; leave them where they are.
   after `binning` + `bin_refine` were fixed; reproduced on a real ticket and
   cleared by the symlink.
 - **`long-read-assembly` `bin_refine` no longer crashes DAS_Tool on a bad flag —
-  `--write_bins`, not `--write_bins 1` (#376).** `--write_bins` is a boolean flag
+  `--write_bins`, not `--write_bins 1` (#379).** `--write_bins` is a boolean flag
   in DAS_Tool 1.1.x; the spurious `1` is an unexpected positional that r-docopt
   0.7.2 surfaces as `'short' is not a valid field or method name for reference
   class "Argument"`, Execution-halting before DAS_Tool runs. qp-pacbio passes it
@@ -284,7 +284,7 @@ duplicates further down are historical strata; leave them where they are.
   despite the "1.1.x summary-columns" invariant, and the image rebuilds on any
   `bin_refine.sh` change.
 - **`long-read-assembly` `binning` image can finally run concoct — `binning.def`
-  installs `libgfortran=3.0.0` (#376).** concoct's `vbgmm` C-extension links
+  installs `libgfortran=3.0.0` (#379).** concoct's `vbgmm` C-extension links
   `libgfortran.so.3`, but the metawrap solve ships only `libgfortran.so.5`, so
   `import vbgmm` died at runtime (`ImportError: libgfortran.so.3`) and metaWRAP's
   concoct binner failed — taking the whole step down, since metaWRAP exits
@@ -298,7 +298,7 @@ duplicates further down are historical strata; leave them where they are.
   missed this because the failure is a Python `ImportError` (exit 1), not a loader
   verdict (126/127), so a concoct-broken image shipped green.
 - **`long-read-assembly` `binning` no longer aborts on a contig-ORDER mismatch —
-  `binning.sh` reorders the assembly to the BAM's `@SQ` order (#376).** With the
+  `binning.sh` reorders the assembly to the BAM's `@SQ` order (#379).** With the
   unsorted-BAM failure fixed (#370), the same production ticket reached `metabat2`
   and died with `the order of contigs in abundance file is not the same as the
   assembly file: s10.ctg000011l`. Root cause is the *same* miint gap
