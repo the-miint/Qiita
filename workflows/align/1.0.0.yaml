@@ -111,9 +111,19 @@ steps:
     inputs: [router_index_path, shard_directory]
     params: {aligner: aligner, alignment_idx: alignment_idx}
     outputs: [alignment, alignment_staging_dir]
+    # cpu sizes the job's SHARD CONCURRENCY, not just its parallelism: the job hands
+    # its cpu allocation to DuckDB as `SET threads`, and miint derives how many shards
+    # align at once from DuckDB's thread pool (it ignores its own `threads` argument in
+    # sharded mode). mem_gb is what this job's routing + alignment + output pass was
+    # tuned against; the job resolves DuckDB's `memory_limit` from the real cgroup, so
+    # this value (and any per-run `--mem-gb`) is what actually reaches it.
+    #
+    # Both axes sit AT `action_ceiling`, which deliberately forgoes cpu/mem escalation
+    # on retry — the block model bounds the work per ticket instead. walltime keeps its
+    # headroom (PT4H baseline under a PT8H ceiling) so a TIMEOUT still escalates.
     baseline_resources:
-      cpu: 4
-      mem_gb: 32
+      cpu: 8
+      mem_gb: 64
       walltime: PT4H
 
   # Idempotent block replace: delete this block's exact alignment footprint (its

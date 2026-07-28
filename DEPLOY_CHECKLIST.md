@@ -31,7 +31,19 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#perf/align-sharded-sizing) Confirm the synced `align 1.0.0` action carries the
+  raised `align_sharded` baseline. `actions sync` runs inside `activate.sh`, so this
+  only checks it took — if the row still reads `cpu: 4` / `mem_gb: 32`, align blocks
+  keep submitting at the old size and the change is a silent no-op:
+
+  ```bash
+  DATABASE_URL=$(sudo grep '^DATABASE_URL=' /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-api psql "$DATABASE_URL" -Atc \
+    "SELECT s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s
+      WHERE action_id='align' AND version='1.0.0' AND s->>'name'='align_sharded';"
+  ```
+
+  Expect `cpu` 8 and `mem_gb` 64.
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +51,12 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#perf/align-sharded-sizing) Each `align_sharded` step now requests **8 cpu / 64 GB**
+  (was 4 / 32) — unchanged `action_ceiling`, so nothing new is expressible, but this is
+  the first time the ceiling is requested by default. The SLURM partition align tickets
+  land on must be able to satisfy it, or blocks will pend instead of running. Both axes
+  now sit at the ceiling, which deliberately forgoes cpu/mem escalation on retry
+  (walltime still escalates, PT4H → PT8H).
 
 ---
 
