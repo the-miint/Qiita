@@ -23,14 +23,16 @@ def test_batch_import_request_accepts_multiple_accessions():
     assert req.accessions == ["PRJEB1234", "PRJNA5678"]
 
 
-@pytest.mark.parametrize("removed_field", ["backend", "source"])
-def test_batch_import_request_rejects_removed_fields(removed_field):
-    """Dropped with the resolver/archive provenance; extra="forbid" makes a
-    stale client fail loud instead of being silently ignored."""
+@pytest.mark.parametrize("unknown_field", ["backend", "source"])
+def test_batch_import_request_rejects_unknown_fields(unknown_field):
+    """Every *Request model in this repo pins extra="forbid", so a field the
+    model does not declare fails loud rather than being silently dropped.
+    `backend` and `source` are the two this PR removed, so they are the useful
+    cases to pin."""
     from qiita_common.models.ena_import import BatchImportRequest
 
     with pytest.raises(ValidationError):
-        BatchImportRequest(accessions=["PRJEB1234"], **{removed_field: "whatever"})
+        BatchImportRequest(accessions=["PRJEB1234"], **{unknown_field: "whatever"})
 
 
 def test_batch_import_request_rejects_empty_accessions():

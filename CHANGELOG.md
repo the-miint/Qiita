@@ -1206,8 +1206,9 @@ duplicates further down are historical strata; leave them where they are.
   `backend` / `source` fields on `BatchImportRequest`. miint is the only ENA
   resolver and there will not be others, ENA and SRA mirror each other, and the
   transport does not affect the correctness of the sequences — so none of it
-  earned a column. `BatchImportRequest` now pins `extra="forbid"`, so a client
-  still sending `backend` or `source` gets a 422 rather than silent acceptance.
+  earned a column. `BatchImportRequest` now pins `extra="forbid"` like every
+  other `*Request` model here, so an undeclared field 422s rather than being
+  silently dropped.
   This also removes the finalize-time `set_sequenced_pool_transport` write-back
   from the workflow runner.
 
