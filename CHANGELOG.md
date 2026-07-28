@@ -262,6 +262,22 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`long-read-assembly` `binning` no longer aborts on a contig-ORDER mismatch —
+  `binning.sh` reorders the assembly to the BAM's `@SQ` order (#376).** With the
+  unsorted-BAM failure fixed (#370), the same production ticket reached `metabat2`
+  and died with `the order of contigs in abundance file is not the same as the
+  assembly file: s10.ctg000011l`. Root cause is the *same* miint gap
+  (duckdb-miint#173) at a second consumer: `jgi_summarize_bam_contig_depths` writes
+  the depth matrix in the BAM's `@SQ` order (lexicographic, as miint emits it),
+  while the assembly FASTA is in hifiasm's numeric order — and `metabat2` requires
+  the two to agree. `samtools sort` fixes record order but never `@SQ` order, so it
+  surfaced only after #370 landed. `binning.sh` now reorders `noLCG.fa` into the
+  staged BAM's `@SQ` order (via `samtools faidx`) before handing it to metaWRAP, and
+  fails loud if the `@SQ` and assembly contig sets ever diverge. Confirmed by probe
+  on the shipped `samtools 1.10` / `metabat2 2.15`: a numeric-order assembly
+  reproduces the abort, the `@SQ`-reordered one binds. Pinned by
+  `test_binning_coverage_sort_pin.py`; removable together with the `samtools sort`
+  when duckdb-miint#173 lands (tracked in Qiita#374).
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
   `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with

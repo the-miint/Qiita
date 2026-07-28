@@ -166,12 +166,18 @@ def test_only_the_sorted_bam_is_staged_for_metawrap() -> None:
         "written; the staging path or its variable names must have changed."
     )
     for line in writers:
-        assert line.startswith("mv ") and "STAGED_BAM" in line, (
-            f"something other than the staging `mv` writes the path metaWRAP "
-            f"reads: {line!r}. If miint's name-ordered BAM lands there unsorted, "
-            "jgi rejects it with 'the bam file is not sorted!' -- the production "
-            "failure this test exists for. Stage via the sort, or extend this "
-            "test on purpose."
+        is_staging_mv = line.startswith("mv ") and "STAGED_BAM" in line
+        # Deliberately permitted READER (not a writer of this path): the reorder
+        # step reads the staged BAM's @SQ header to derive the assembly order, so
+        # the staged path is an input to `samtools view -H` here and the redirect
+        # target is STAGED_ORDER, not the staged BAM. Anything else still fails.
+        is_sq_header_read = "samtools view -H" in line and "STAGED_ORDER" in line
+        assert is_staging_mv or is_sq_header_read, (
+            f"something other than the staging `mv` (or the @SQ-order read) touches "
+            f"the path metaWRAP reads: {line!r}. If miint's name-ordered BAM lands "
+            "there unsorted, jgi rejects it with 'the bam file is not sorted!' -- the "
+            "production failure this test exists for. Stage via the sort, or extend "
+            "this test on purpose."
         )
 
 
@@ -214,6 +220,82 @@ def test_binning_sort_memory_is_bounded_by_the_allocation() -> None:
     )
     assert re.search(r"-m\s+\"\$\{SORT_MEM_MB\}M\"", code), (
         "`samtools sort -m` no longer uses the derived per-thread value"
+    )
+
+
+def test_binning_reorders_the_assembly_to_sq_order() -> None:
+    """The assembly is reordered to the staged BAM's @SQ order before metaWRAP.
+
+    Second consumer of the same duckdb-miint#173 @SQ-order defect: metaWRAP's
+    jgi_summarize writes the depth matrix in @SQ order, and metabat2 aborts unless
+    the assembly FASTA is in that SAME order ("the order of contigs in abundance
+    file is not the same as the assembly file"). noLCG.fa is in hifiasm's numeric
+    order; the @SQ order is lexicographic; `samtools sort` fixes record order but
+    never @SQ order, so the two disagree and metabat2 rejects. Reproduced and the
+    reorder-fix confirmed on samtools 1.10 / metabat2 2.15 (a numeric-order
+    assembly aborts, the @SQ-reordered one binds).
+
+    Text pin, like the sort pins above: proving the reorder *works* needs the
+    metaWRAP/metabat2 image; this proves it is still WIRED -- the order comes from
+    the staged BAM's @SQ header and metaWRAP is handed the reordered file, not the
+    raw noLCG.
+    """
+    code = _code_lines(_BINNING_SH)
+    joined = "\n".join(code)
+
+    # The @SQ order is extracted from the staged BAM header (what jgi will read),
+    # not from noLCG or the unsorted coverage_bam.
+    order_src = [ln for ln in code if "ORDERED_NOLCG" in ln or "assembly.ordered" in ln]
+    assert any("samtools faidx" in ln for ln in order_src), (
+        "binning.sh no longer builds the reordered assembly with `samtools faidx`. "
+        "Without it the assembly stays in hifiasm's numeric order while jgi's depth "
+        "matrix is in @SQ order, and metabat2 aborts on the mismatch."
+    )
+    assert re.search(r"samtools view -H .*READS_STEM.*\.bam", joined), (
+        "the @SQ order is no longer read from the STAGED BAM header. It must come "
+        "from the file jgi reads (work_files/<sample>.bam), or the assembly order "
+        "and the depth order can diverge again."
+    )
+
+
+def test_metawrap_gets_the_reordered_assembly_not_raw_nolcg() -> None:
+    """metaWRAP's `-a` is the @SQ-reordered assembly, never the raw noLCG.
+
+    Fail-closed: the whole fix is inert if metaWRAP is handed `${NOLCG}` (numeric
+    order) instead of `${ORDERED_NOLCG}`. Assert the single `metawrap binning`
+    invocation carries the reordered file and not the raw one.
+    """
+    binning_call = [ln for ln in _code_lines(_BINNING_SH) if "metawrap binning" in ln]
+    assert len(binning_call) == 1, f"expected one `metawrap binning`, got {binning_call!r}"
+    call = binning_call[0]
+    assert "ORDERED_NOLCG" in call, (
+        f"`metawrap binning` no longer receives the reordered assembly: {call!r}. "
+        "Handing it ${NOLCG} (hifiasm's numeric order) puts the assembly out of "
+        "step with jgi's @SQ-ordered depth matrix and metabat2 aborts."
+    )
+    assert re.search(r'-a\s+"\$\{NOLCG\}"', call) is None, (
+        f"`metawrap binning` is passed the raw ${{NOLCG}} on its `-a`: {call!r}. "
+        "That is the numeric-order assembly the reorder exists to replace."
+    )
+
+
+def test_binning_fails_loud_on_contig_set_drift() -> None:
+    """The reorder asserts the @SQ set equals noLCG's, rather than silently
+    dropping or inventing contigs.
+
+    assembly_coverage maps to noLCG, so the sets are equal by construction; an
+    inequality is a real upstream bug. A silent reorder that dropped contigs would
+    bin an incomplete assembly.
+    """
+    code = "\n".join(_code_lines(_BINNING_SH))
+    assert "n_ordered" in code and "n_nolcg" in code, (
+        "binning.sh no longer compares the reordered contig count against noLCG's. "
+        "A dropped or extra contig from an @SQ/noLCG set mismatch would slip "
+        "through silently."
+    )
+    assert re.search(r'"\$\{n_ordered\}"\s*-ne\s*"\$\{n_nolcg\}"', code), (
+        "the contig-count equality guard changed shape -- it must still fail the "
+        "step when the reordered assembly and noLCG disagree on contig count."
     )
 
 

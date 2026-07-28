@@ -29,8 +29,11 @@
 # then uses — that is also why qp-pacbio's environment carries bwa.
 #
 # The BAM's @SQ names must match the contigs metaWRAP indexes, which they do
-# because both sides are noLCG.fa. samtools is required regardless of this path:
-# metaWRAP's concoct block runs `samtools index` over work_files/*.bam.
+# because both sides are noLCG.fa. Their ORDER must match too — metabat2 aborts if
+# the depth matrix (in @SQ order) and the assembly disagree — which is why the
+# assembly is reordered to @SQ order below before metaWRAP sees it. samtools is
+# required regardless of this path: metaWRAP's concoct block runs `samtools index`
+# over work_files/*.bam.
 source /opt/qiita/_lib.sh
 
 GENOMES_DIR="$(qiita_input genomes_dir)"
@@ -143,6 +146,59 @@ micromamba run -n metawrap samtools sort \
     -o "${STAGED_BAM}" "${COVERAGE_BAM}"
 mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 
+# Reorder the assembly to the BAM's @SQ order before metaWRAP sees it. metaWRAP
+# runs jgi_summarize_bam_contig_depths over the staged BAM, which writes the depth
+# matrix in the BAM's @SQ order; metabat2 then REQUIRES the assembly FASTA to be in
+# that SAME contig order and aborts otherwise ("the order of contigs in abundance
+# file is not the same as the assembly file: <contig>"). noLCG.fa is in hifiasm's
+# NUMERIC order (s0, s1, s2, …, s10), but the @SQ order miint's `FORMAT BAM` writer
+# emits is LEXICOGRAPHIC (s0, s1, s10, …, s2) and is not steerable from SQL — the
+# same duckdb-miint#173 root as the sort above, surfacing at a second consumer. The
+# sort fixes record order but never touches @SQ order, so the two disagree and
+# metabat2 rejects. Verified on the shipped samtools 1.10 / metabat2 2.15: a
+# numeric-order assembly reproduces the abort, the @SQ-reordered one clears it (see
+# test_binning_coverage_sort_pin.py). Removable together with the sort when
+# duckdb-miint#173 lands — docs/duckdb-miint.md's "Open upstream gaps" row carries
+# the exit criteria.
+#
+# samtools faidx writes its .fai next to the FASTA and genomes_dir is a read-only
+# bind, so index a WORK copy rather than noLCG in place. xargs batches the ~21k
+# region names under ARG_MAX; faidx emits regions in argument order and xargs
+# preserves order across batches, so the output follows @SQ order exactly. (samtools
+# 1.10 has no `-r region-file`; xargs is the version-safe equivalent.)
+#
+# Disk: two assembly-sized copies (assembly.fa + assembly.ordered.fa) land in WORK.
+# The assembly is ≪ the read set, so this is small next to READS_FQ and the sort
+# spill above, and WORK is a mktemp -d cleaned on EXIT.
+STAGED_ORDER="${WORK}/sq_order.txt"
+micromamba run -n metawrap samtools view -H "${WORK_FILES}/${READS_STEM}.bam" \
+    | awk '/^@SQ/{sub(/.*SN:/,"");sub(/\t.*/,"");print}' > "${STAGED_ORDER}"
+cp "${NOLCG}" "${WORK}/assembly.fa"
+micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa"
+ORDERED_NOLCG="${WORK}/assembly.ordered.fa"
+xargs -a "${STAGED_ORDER}" micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa" > "${ORDERED_NOLCG}"
+
+# Fail loud on any contig-set drift: the reorder must neither drop nor invent a
+# contig. assembly_coverage maps the reads to noLCG, so the BAM's @SQ set equals
+# noLCG's by construction — an inequality is a real upstream bug, not a data
+# condition. Both directions fail loud, probed on the shipped samtools 1.10: faidx
+# exits non-zero on a region absent from the FASTA, so xargs fails the step under
+# set -e if an @SQ name is not in noLCG; and the count check below catches the
+# reverse (a noLCG contig missing from @SQ is silently dropped from the order list).
+# Count with awk, not `grep -c`: `grep -c` exits 1 on zero matches, and under the
+# `set -euo pipefail` from _lib.sh an assignment from a failing command
+# substitution aborts the script — so an empty reordered FASTA (the very
+# can't-happen case this guard is for) would die with a bare exit 1 instead of the
+# message below. awk always exits 0 here and prints 0 for no matches, while still
+# failing loud on a genuine read error.
+n_ordered=$(awk '/^>/{n++} END{print n+0}' "${ORDERED_NOLCG}")
+n_nolcg=$(awk '/^>/{n++} END{print n+0}' "${NOLCG}")
+if [[ "${n_ordered}" -ne "${n_nolcg}" ]]; then
+    echo "binning: reordered assembly has ${n_ordered} contigs but noLCG.fa has ${n_nolcg}" >&2
+    echo "         — the coverage BAM's @SQ set does not match noLCG.fa. Check assembly_coverage." >&2
+    exit 65
+fi
+
 # A single binner finding nothing is non-fatal — bin_refine consolidates whatever
 # bin dirs exist. Only a hard metaWRAP crash should fail the step, so we let its
 # real exit code through except for the empty-result case metaWRAP signals with a
@@ -151,7 +207,7 @@ mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 # cap metaWRAP below it to leave ~10 GB headroom for its Python/aligner runtime
 # (else it can OOM-kill at the cgroup boundary).
 micromamba run -n metawrap metawrap binning \
-    -a "${NOLCG}" -o "${OUT}" -t "${THREADS}" -m 90 -l 16000 \
+    -a "${ORDERED_NOLCG}" -o "${OUT}" -t "${THREADS}" -m 90 -l 16000 \
     --single-end --metabat2 --maxbin2 --concoct --universal "${READS_FQ}"
 
 qiita_finish bins_dir=bins
