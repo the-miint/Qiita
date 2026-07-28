@@ -47,8 +47,16 @@ _installed = False
 
 
 def _connect() -> duckdb.DuckDBPyConnection:
-    # miint_connect_config() is always non-empty (allow_unsigned is always set,
-    # since miint installs from a mirror), so always pass it.
+    return duckdb.connect(":memory:", config=miint_connect_config())
+
+
+def duckdb_connect() -> duckdb.DuckDBPyConnection:
+    """Bare in-memory DuckDB connection with miint-safe config.
+
+    For CP-service code that does not need miint loaded but must remain safe
+    if a future change adds INSTALL/LOAD (extension_directory is set when
+    MIINT_EXTENSION_DIRECTORY is present, so $HOME never gets resolved).
+    """
     return duckdb.connect(":memory:", config=miint_connect_config())
 
 
