@@ -80,6 +80,21 @@ From: mambaorg/micromamba:1.5.8
     micromamba create -y -n metawrap -c bioconda -c conda-forge \
         metawrap-mg bwa samtools=1.10 metabat2=2.15 "maxbin2>=2.2.6" concoct
 
+    # concoct's `vbgmm` C-extension links libgfortran.so.3, but the metawrap solve
+    # ships only libgfortran.so.5, so `import vbgmm` dies at RUNTIME with
+    # `ImportError: libgfortran.so.3` — metaWRAP's concoct binner then fails and,
+    # because metaWRAP exits non-zero when any binner hard-fails, takes the whole
+    # step down (metabat2 + maxbin2 succeed regardless). The old conda-forge
+    # `libgfortran` (3.0.0) provides .so.3 and COEXISTS with libgfortran5 (a
+    # different package — both .so files remain), so this restores concoct without
+    # perturbing the pinned solve. Probed on a real assembly: `import vbgmm` goes
+    # from ImportError to OK, and metaWRAP runs concoct to completion. Separate
+    # `install` (not on the create line) so it can't reshape the metawrap solve.
+    # binning-verify.sh asserts `import vbgmm` at BUILD time — the plain presence/
+    # runnability check could not, since the failure is a Python ImportError
+    # (exit 1), not a loader verdict (126/127).
+    micromamba install -y -n metawrap -c conda-forge libgfortran=3.0.0
+
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh /opt/qiita/binning-verify.sh
     chmod 0644 /opt/qiita/manifest_writer.py
 
