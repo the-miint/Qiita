@@ -85,6 +85,14 @@ CREATE TABLE qiita.ena_import_batch_item (
     -- that never reached registration.
     study_idx                 BIGINT REFERENCES qiita.study(idx) ON DELETE RESTRICT,
 
+    -- True when THIS item's registration is the one that created study_idx.
+    -- An import may only add to a study some import created: a study Qiita
+    -- created natively and later deposited carries a bioproject_accession too,
+    -- so matching on the accession alone would silently merge foreign ENA
+    -- samples into curated data. The driver refuses when no item records having
+    -- created the matched study.
+    study_created             BOOLEAN NOT NULL DEFAULT false,
+
     -- One work_ticket_idx per sequenced_pool register_ena_study created for
     -- this study (one per distinct platform) -- appended as the batch driver
     -- submits each pool's download-ena-study ticket via submit_work_ticket_core,
@@ -123,6 +131,12 @@ COMMENT ON COLUMN qiita.ena_import_batch_item.download_work_ticket_idxs IS
 
 CREATE INDEX ena_import_batch_item_batch_idx_idx
     ON qiita.ena_import_batch_item (batch_idx);
+
+-- Backs the import-created guard: before registering into a study that already
+-- exists, the driver asks whether any item created it. Partial -- only the
+-- created rows are ever probed.
+CREATE INDEX ena_import_batch_item_study_created_idx
+    ON qiita.ena_import_batch_item (study_idx) WHERE study_created;
 
 -- One item per (batch, study accession): create_ena_import_batch already
 -- de-duplicates accessions in Python before insert, so this makes that a DB

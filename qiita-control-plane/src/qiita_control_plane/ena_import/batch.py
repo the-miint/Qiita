@@ -45,6 +45,7 @@ from qiita_common.models.ena_import import (
 
 from ..auth.principal import HumanUser, _human_user_from_row
 from ..auth.scopes import role_ceiling
+from ..repositories.study import get_or_create_study_by_ena_accessions
 from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
 from .registration import (
@@ -203,8 +204,29 @@ def _preserve_missing_required(
     ]
 
 
+async def _study_created_by_an_import(pool: asyncpg.Pool, study_idx: int) -> bool:
+    """Whether some batch item created *study_idx*.
+
+    An import may only add to a study an import created. A study Qiita created
+    natively and later deposited carries a `bioproject_accession` too, so the
+    accession lookup alone would match it and merge foreign ENA samples into
+    curated data. Note a batch deleted after its import (CASCADE) takes this
+    record with it, and a later re-import of that accession is then refused.
+    """
+    return await pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM qiita.ena_import_batch_item"
+        " WHERE study_idx = $1 AND study_created)",
+        study_idx,
+    )
+
+
 async def _set_item_registered(
-    pool: asyncpg.Pool, item_idx: int, *, study_idx: int, run_outcomes: list[dict[str, Any]]
+    pool: asyncpg.Pool,
+    item_idx: int,
+    *,
+    study_idx: int,
+    study_created: bool,
+    run_outcomes: list[dict[str, Any]],
 ) -> None:
     """Record a study's registration on its batch item.
 
@@ -221,12 +243,14 @@ async def _set_item_registered(
         merged = _preserve_missing_required(run_outcomes, json.loads(stored))
         await conn.execute(
             "UPDATE qiita.ena_import_batch_item"
-            " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb, failure_reason = NULL"
+            " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb,"
+            "     study_created = study_created OR $5, failure_reason = NULL"
             " WHERE idx = $1",
             item_idx,
             BatchItemState.REGISTERED.value,
             study_idx,
             json.dumps(merged),
+            study_created,
         )
 
 
@@ -298,8 +322,36 @@ async def _process_one_study(
             resolver.resolve_sample_attributes, item.ena_study_accession
         )
 
+        # Resolve the study BEFORE registering anything, so an import into a
+        # study we did not create fails with nothing written.
+        async with pool.acquire() as conn:
+            study_row, study_created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=study_header.study_accession,
+                ena_study_accession=study_header.secondary_study_accession,
+                owner_idx=principal.principal_idx,
+                created_by_idx=principal.principal_idx,
+                # study.title is NOT NULL but ENA's study_title is optional; a
+                # title is cosmetic, not identity, so fall back to the accession.
+                title=study_header.study_title or study_header.study_accession,
+            )
+        study_idx = study_row["idx"]
+        if not study_created and not await _study_created_by_an_import(pool, study_idx):
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=(
+                    f"{item.ena_study_accession} maps to existing study {study_idx}, which was"
+                    " not created by an ENA import; importing into it would merge ENA samples"
+                    " into a natively-created study"
+                ),
+            )
+            return
+
         result = await register_ena_study(
             pool,
+            study_idx=study_idx,
             study_header=study_header,
             runs=runs,
             sample_attributes=sample_attributes,
@@ -310,6 +362,7 @@ async def _process_one_study(
             pool,
             item.idx,
             study_idx=result.study_idx,
+            study_created=study_created,
             run_outcomes=_run_outcomes(result),
         )
 

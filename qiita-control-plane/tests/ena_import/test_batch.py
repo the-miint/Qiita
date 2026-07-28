@@ -30,6 +30,7 @@ from qiita_control_plane.ena_import.batch import (
     schedule_ena_import_batch,
 )
 from qiita_control_plane.ena_import.registration import RunRegistrationStatus
+from qiita_control_plane.repositories.study import create_study
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
     retire_principal,
@@ -1509,5 +1510,83 @@ async def test_reconcile_preserves_harmonization_gap_on_redrive(
     assert list(run_after.missing_required) == gap_before
     # The run's status legitimately changes on a re-drive -- the gap does not.
     assert run_after.status == RunRegistrationStatus.SKIPPED_ALREADY_PRESENT.value
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_import_refuses_a_study_no_import_created(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """A study Qiita created natively and later deposited carries a
+    bioproject_accession too, so the accession lookup matches it. Importing must
+    refuse rather than merge ENA samples into curated data -- and refuse before
+    writing anything."""
+    accession = unique_accession("PRJNA")
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        native = await create_study(
+            conn,
+            owner_idx=admin_principal.principal_idx,
+            created_by_idx=admin_principal.principal_idx,
+            title=f"natively created {accession}",
+            bioproject_accession=accession,
+        )
+    native_idx = native["idx"]
+
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason, study_idx FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert row["state"] == BatchItemState.FAILED.value
+    assert "not created by an ENA import" in row["failure_reason"]
+    # Refused before any write: no sample linked, and no download ticket.
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1", native_idx
+        )
+        == 0
+    )
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+            DOWNLOAD_ENA_STUDY_ACTION_ID,
+            DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        )
+        == 0
+    )
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_import_allows_a_study_an_earlier_batch_created(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """The guard must not block the ongoing-bioproject case: an accession a
+    previous batch imported is re-importable, which is how a study that gains
+    runs over time picks them up."""
+    accession = unique_accession("PRJNA")
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+    second_idx, second_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(second_idx)
+
+    rows = await postgres_pool.fetch(
+        "SELECT idx, state, study_idx, study_created FROM qiita.ena_import_batch_item"
+        " WHERE idx = ANY($1::bigint[]) ORDER BY idx",
+        [first_items[0].idx, second_items[0].idx],
+    )
+    first, second = rows
+    assert first["state"] == BatchItemState.DOWNLOADING.value
+    assert second["state"] == BatchItemState.DOWNLOADING.value
+    assert first["study_idx"] == second["study_idx"]
+    # Only the batch that actually created the study records it.
+    assert first["study_created"] is True
+    assert second["study_created"] is False
 
     await _cleanup_study(postgres_pool, accession)

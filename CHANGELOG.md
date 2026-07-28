@@ -22,6 +22,16 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **ENA import refuses a study no import created (#369).** `register_ena_study`
+  resolved the study itself, keyed on `bioproject_accession` — but a study Qiita
+  created natively and later deposited carries that accession too, so importing
+  it silently merged ENA-derived biosamples, runs and pools into curated data.
+  The study resolve moves out to the batch driver, which now refuses unless some
+  batch item records having created that study (new
+  `ena_import_batch_item.study_created` + a partial index), failing the accession
+  before anything is written. Re-importing a study an earlier batch created is
+  unaffected — that is how a bioproject that gains runs over time picks them up.
+
 - **ENA/SRA study metadata resolver (`ena_import`) (#369).** Adds the
   control-plane seam for resolving an ENA/SRA study's metadata ahead of
   ingestion: `qiita_common.models.ena` (`EnaStudyHeader` / `EnaRunRecord` /

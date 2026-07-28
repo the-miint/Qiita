@@ -30,6 +30,20 @@ processed independently, with bounded concurrency, in three phases:
    scoped to that `sequenced_pool`. This is the ticket that actually pulls read bytes;
    registration itself never touches read data.
 
+### Re-importing, and studies we created ourselves
+
+Re-importing an accession is the supported way to pick up runs a bioproject gained
+since the last import: runs already registered come back as `skipped_already_present`
+and only the new ones are added. Nothing schedules this — it is an operator gesture.
+
+An import will only add to a study **an import created**. A study Qiita created
+natively and later deposited to ENA carries a `bioproject_accession` too, so
+importing that accession would otherwise merge ENA-derived samples into curated
+data. That case fails the accession with `not created by an ENA import`, before
+anything is written. Deleting a batch (which cascades its items) discards the record
+that the import created the study, so a later re-import of that accession is refused
+as well.
+
 A failure in any one accession — an unmappable platform, a resolver error, a database
 conflict — is recorded on that accession alone; it never aborts the batch or its
 sibling accessions. Poll the batch's own status endpoint to see each accession's state

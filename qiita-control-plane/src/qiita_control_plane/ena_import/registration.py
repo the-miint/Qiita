@@ -63,7 +63,6 @@ from qiita_control_plane.repositories.sequencing_run import (
     insert_sequenced_pool,
     insert_sequencing_run,
 )
-from qiita_control_plane.repositories.study import get_or_create_study_by_ena_accessions
 
 from .harmonization import HarmonizationResult, harmonize_biosample_attributes
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
@@ -120,7 +119,6 @@ class EnaStudyRegistrationResult:
     """Composite result of one `register_ena_study` call."""
 
     study_idx: int
-    study_created: bool
     runs: list[RunRegistrationOutcome] = field(default_factory=list)
     created_pools: list[CreatedPool] = field(default_factory=list)
 
@@ -128,18 +126,17 @@ class EnaStudyRegistrationResult:
 async def register_ena_study(
     pool: asyncpg.Pool,
     *,
+    study_idx: int,
     study_header: EnaStudyHeader,
     runs: list[EnaRunRecord],
     sample_attributes: list[EnaSampleAttributes],
     owner_idx: int,
     caller_idx: int,
 ) -> EnaStudyRegistrationResult:
-    """Register one resolved ENA study's runs and samples.
+    """Register one resolved ENA study's runs and samples into `study_idx`.
 
-    `sample_attributes` is indexed once by `sample_accession` and harmonized
-    onto each run's biosample (or `{}` if the resolver found none) when that
-    biosample is newly created, inside the run's own transaction.
-    `owner_idx` / `caller_idx` are identity inputs the caller must supply.
+    The caller resolves the study (`get_or_create_study_by_ena_accessions`) and
+    decides whether importing into it is allowed, so this never creates one.
 
     Never raises for a per-run failure (see `RunRegistrationOutcome`); an
     unmappable `instrument_platform` is one such isolated per-run failure.
@@ -151,18 +148,6 @@ async def register_ena_study(
     }
 
     async with pool.acquire() as conn:
-        study_row, study_created = await get_or_create_study_by_ena_accessions(
-            conn,
-            bioproject_accession=study_header.study_accession,
-            ena_study_accession=study_header.secondary_study_accession,
-            owner_idx=owner_idx,
-            created_by_idx=caller_idx,
-            # study.title is NOT NULL but ENA's study_title is optional; a title
-            # is cosmetic, not identity, so fall back to the accession.
-            title=study_header.study_title or study_header.study_accession,
-        )
-        study_idx = study_row["idx"]
-
         metadata_checklist_idx = await fetch_metadata_checklist_idx_by_name(
             conn, _ERC000011_CHECKLIST_NAME
         )
@@ -222,7 +207,6 @@ async def register_ena_study(
 
     return EnaStudyRegistrationResult(
         study_idx=study_idx,
-        study_created=study_created,
         runs=outcomes,
         created_pools=created_pools,
     )

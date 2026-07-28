@@ -22,6 +22,7 @@ from qiita_control_plane.ena_import.registration import (
     RunRegistrationStatus,
     register_ena_study,
 )
+from qiita_control_plane.repositories.study import get_or_create_study_by_ena_accessions
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 from qiita_control_plane.testing.unique_names import unique_accession
 
@@ -172,8 +173,22 @@ async def reg(postgres_pool):
 
 
 async def _register(reg, *, study_header, runs, sample_attributes=()):
+    """Resolve the study then register into it, the same two steps the batch
+    driver does. Records whether this call created the study in
+    `reg["study_created"]` -- the driver's import-created guard keys off it."""
+    async with reg["pool"].acquire() as conn:
+        study_row, study_created = await get_or_create_study_by_ena_accessions(
+            conn,
+            bioproject_accession=study_header.study_accession,
+            ena_study_accession=study_header.secondary_study_accession,
+            owner_idx=reg["owner_idx"],
+            created_by_idx=reg["caller_idx"],
+            title=study_header.study_title or study_header.study_accession,
+        )
+    reg["study_created"] = study_created
     result = await register_ena_study(
         reg["pool"],
+        study_idx=study_row["idx"],
         study_header=study_header,
         runs=runs,
         sample_attributes=list(sample_attributes),
@@ -544,10 +559,9 @@ async def test_reimport_same_study_reuses_study_row(reg):
     )
 
     first = await _register(reg, study_header=header, runs=[run])
+    assert reg["study_created"] is True
     second = await _register(reg, study_header=header, runs=[run])
-
-    assert first.study_created is True
-    assert second.study_created is False
+    assert reg["study_created"] is False
     assert first.study_idx == second.study_idx
 
     count = await reg["pool"].fetchval(
