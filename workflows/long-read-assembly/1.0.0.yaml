@@ -87,6 +87,16 @@ steps:
     container: long-read-assembly-assemble-1.0.0.sif
     entrypoint: /opt/qiita/assemble.sh
     inputs: [masked_reads_fastq, run_config]
+    # The deploy-staged miint extension, bind-mounted read-only. The myloasm
+    # branch's circular/linear split reads with miint's read_fastx and writes with
+    # COPY (FORMAT FASTA), and it LOADs the SAME build the CP/CO/DP run rather
+    # than a copy baked into the image — a fourth miint would be one `make
+    # preflight`'s byte-identity check does not compare, free to drift. Resolved
+    # against PATH_DERIVED, matching where the deploy stages it
+    # (PATH_DERIVED/duckdb-ext). Unused by the hifiasm_meta branch, which is
+    # harmless: a bind the entrypoint never reads costs nothing.
+    derived_inputs:
+      MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]
     baseline_resources:
       cpu: 32

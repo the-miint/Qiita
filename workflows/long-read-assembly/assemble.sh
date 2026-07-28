@@ -57,7 +57,7 @@ init_outputs() {
 
 case "${ASSEMBLER}" in
     hifiasm_meta)
-        micromamba run -n assemble hifiasm_meta -t "${THREADS}" -o "${WORK}/asm" "${READS_FASTQ}"
+        micromamba run -n hifiasm_meta hifiasm_meta -t "${THREADS}" -o "${WORK}/asm" "${READS_FASTQ}"
         GFA="${WORK}/asm.p_ctg.gfa"
 
         # GFA S-line -> FASTA. hifiasm-meta's documented contig-name shape is
@@ -79,24 +79,41 @@ case "${ASSEMBLER}" in
         # Supporting ONT would mean threading a read type through the action
         # context and swapping this for `--nano-r10` / `--nano-r9`; it is a
         # deliberate match to the input, not a default nobody chose.
-        micromamba run -n assemble myloasm "${READS_FASTQ}" -o "${WORK}/myloasm" -t "${THREADS}" --hifi
+        micromamba run -n myloasm myloasm "${READS_FASTQ}" -o "${WORK}/myloasm" -t "${THREADS}" --hifi
         PRIMARY="${WORK}/myloasm/assembly_primary.fa"
 
-        # Circularity comes from the FASTA header, NOT the GFA — myloasm_split.awk
-        # carries the probe that established it, why only `circular-yes` counts,
-        # and why the id is cut at `_len-`. It is a separate file so the unit test
-        # can run the real split against real myloasm headers instead of
-        # text-matching this script.
+        # A MISSING primary FASTA is a contract violation, not an empty assembly.
+        # _lib.sh sets `set -e`, so reaching this line means myloasm exited 0 — and
+        # myloasm was probed to exit NON-zero and write nothing when it cannot
+        # assemble (3 reads: "No k-mers found. Exiting.", exit 1). So a zero exit
+        # with no output file means the path or filename moved under us, e.g. a
+        # release renaming it to `assembly_primary.fasta`. Left fail-open, that
+        # produces an empty genomes_dir, which assembly_hash reports as the
+        # terminal StepNoData "this sample assembled nothing" — every sample in the
+        # run silently discarded, with no error anywhere and no retry. Fail loud
+        # instead.
+        if [[ ! -e "${PRIMARY}" ]]; then
+            echo "myloasm exited 0 but wrote no ${PRIMARY} — the output filename or" >&2
+            echo "layout has moved; re-probe it against the pinned myloasm version" >&2
+            exit 64
+        fi
+
+        # Present-but-empty IS a legitimate empty assembly: leave genomes_dir empty,
+        # exactly as the hifiasm branch does for an empty GFA. It must also not
+        # reach the splitter — miint's `read_fastx` RAISES on a zero-record input
+        # ("Error Empty file: …") rather than returning no rows.
         #
-        # Guarded on the primary FASTA exactly as the hifiasm branch guards on its
-        # GFA: missing-or-empty leaves genomes_dir empty. That guard cannot
-        # distinguish "assembled nothing" from "wrote nothing unexpectedly" —
-        # whether myloasm emits a zero-record assembly_primary.fa on an empty
-        # assembly is NOT established (no probe fixture reproduced that case).
+        # Circularity comes from the FASTA header, NOT the GFA — myloasm_split.py
+        # carries the probe that established it, why only `circular-yes` counts,
+        # and why the id is cut at `_len-`. It reads with miint's read_fastx and
+        # writes with `COPY … (FORMAT FASTA)`, LOADing the SAME deploy-staged
+        # extension the rest of the system runs (bind-mounted read-only via this
+        # step's `derived_inputs: MIINT_EXTENSION_DIRECTORY`). No init_outputs
+        # here: a zero-row COPY still creates its file, so an empty class is an
+        # empty file already.
         if [[ -s "${PRIMARY}" ]]; then
-            init_outputs
-            awk -v circ_out="${OUT}/circular.fa" -v nolcg_out="${OUT}/noLCG.fa" \
-                -f /opt/qiita/myloasm_split.awk "${PRIMARY}"
+            python3 /opt/qiita/myloasm_split.py \
+                "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa"
         fi
         ;;
     *)

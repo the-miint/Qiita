@@ -1,14 +1,16 @@
 Bootstrap: docker
 From: mambaorg/micromamba:1.5.8
 
-# Per-tool image for the long-read-assembly `assemble` step (hifiasm_meta +
-# myloasm — the two `assembler` enum values, sharing one image because the step is
-# one-or-the-other at run time and neither conflicts with the other's solve). One
-# of four single-tool images the workflow ships (assemble / binning / bin_refine /
+# Per-STEP image for the long-read-assembly `assemble` step. It carries the two
+# `assembler` enum values — hifiasm_meta and myloasm — in SEPARATE micromamba envs
+# (see %post): the step runs one or the other per ticket, and separate envs keep
+# an unpinned hifiasm solve from being able to break the pinned myloasm one.
+#
+# One of four per-step images the workflow ships (assemble / binning / bin_refine /
 # checkm), each built from its own def + sif-build.d/ spec so a change to one
-# tool's solve rebuilds ONLY that image — the tools are mutually
+# image's solve rebuilds ONLY that image — the workflow's tools are mutually
 # dependency-incompatible (metawrap is py2.7-era; CheckM is py3; DAS_Tool drags in
-# R), and a single-tool image also makes each reusable on its own. The step is
+# R), and a narrow image also makes each reusable on its own. The step is
 # invoked as `apptainer exec <sif> /opt/qiita/assemble.sh` (per-step entrypoint),
 # so the %runscript is unused.
 #
@@ -34,10 +36,10 @@ From: mambaorg/micromamba:1.5.8
     ../_shared/_lib.sh /opt/qiita/_lib.sh
     # This image's per-step entrypoint.
     assemble.sh /opt/qiita/assemble.sh
-    # The myloasm circular/linear splitter the entrypoint runs with `awk -f`. Its
+    # The myloasm circular/linear splitter (miint read_fastx + FORMAT FASTA). Its
     # own file (not inlined in assemble.sh) so the unit test can execute the real
     # program against real myloasm headers.
-    myloasm_split.awk /opt/qiita/myloasm_split.awk
+    myloasm_split.py /opt/qiita/myloasm_split.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -57,22 +59,46 @@ From: mambaorg/micromamba:1.5.8
     # moves the interpreter major version under manifest_writer.py.
     micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python=3.11
 
-    # One env holding BOTH assemblers this step can dispatch to. Channels bioconda
-    # + conda-forge. The circular/linear split is plain awk in either case and the
-    # circular contigs are emitted as a single multi-FASTA (no per-contig split
-    # tool), so the native assembly_hash step reads them with miint read_fastx.
+    # python-duckdb, for myloasm_split.py's miint read_fastx + FORMAT FASTA split.
+    #
+    # PINNED, and the pin is a LOCKSTEP with the compute orchestrator, not a taste
+    # preference: the split LOADs the extension the deploy staged into
+    # MIINT_EXTENSION_DIRECTORY (bind-mounted read-only via the step's
+    # `derived_inputs`), and DuckDB namespaces that directory by ENGINE VERSION +
+    # PLATFORM — `<dir>/v1.5.4/linux_amd64/miint.duckdb_extension`. The stage step
+    # runs under the orchestrator's venv python, so the staged build carries the
+    # orchestrator's DuckDB version; a container on a different one finds no
+    # extension for its version and the step dies at LOAD. Keep this equal to the
+    # `duckdb` version resolved in qiita-compute-orchestrator/uv.lock —
+    # test_myloasm_split.py asserts the two match, so a lockfile bump fails the
+    # unit suite rather than the next assembly.
+    micromamba install -y -n base -c conda-forge python-duckdb=1.5.4
+
+    # ONE ENV PER ASSEMBLER, deliberately, even though only one runs per step. A
+    # single shared solve couples them: hifiasm_meta is unpinned, so a future
+    # release of it with a conflicting dependency would either make the myloasm pin
+    # unsatisfiable — taking BOTH assemblers down on a routine rebuild — or quietly
+    # move a shared transitive dep underneath myloasm. Separate envs cost only disk
+    # in an image that is already tool-sized.
+    #
+    # The circular/linear split is plain awk in either case and the circular contigs
+    # are emitted as a single multi-FASTA (no per-contig split tool), so the native
+    # assembly_hash step reads them with miint read_fastx.
+    #
     #  - hifiasm_meta: unpinned, as it has been.
+    micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta
     #  - myloasm: PINNED, and the pin is load-bearing in a way hifiasm's absence of
-    #    one is not. myloasm's circularity contract is a STRING in its FASTA
-    #    header, probed on exactly this version (0.6.0); a solve that drifted to a
-    #    release which renamed or reordered those fields would not error — it would
-    #    match nothing and silently route every closed genome to binning. The
-    #    %test below asserts the resolved version so a drifted solve fails the
-    #    BUILD, and myloasm_split.awk fails the STEP on an unrecognised header.
-    micromamba create -y -n assemble -c bioconda -c conda-forge hifiasm_meta myloasm=0.6.0
+    #    one is not. myloasm's circularity contract is a STRING in its FASTA header,
+    #    probed on exactly this version (0.6.0). A drifted solve that RENAMED or
+    #    reordered those fields is caught — myloasm_split.awk fails the step on a
+    #    header it cannot parse. What no runtime check can catch is a release that
+    #    KEEPS the `_len-<N>_circular-<yes|no|possibly>_` shape and changes what the
+    #    values mean; that is what the pin, and the %test asserting it below, are
+    #    for.
+    micromamba create -y -n myloasm -c bioconda -c conda-forge myloasm=0.6.0
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh
-    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/myloasm_split.awk
+    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/myloasm_split.py
 
     micromamba clean -a -y
 
@@ -89,13 +115,15 @@ From: mambaorg/micromamba:1.5.8
     # fresh mktemp dir rather than bare /tmp: private, and it does not leave
     # root-owned litter on the build host.
     export HOME="$(mktemp -d)"
-    micromamba env list | grep -q assemble
-    micromamba run -n assemble hifiasm_meta --version
-    # myloasm's VERSION is asserted, not merely its presence: assemble.sh reads
-    # circularity out of a header string probed against 0.6.0, so a solve that
-    # moved off it must fail the build rather than ship an image that silently
-    # classifies every genome as linear.
-    micromamba run -n assemble myloasm --version | grep -Fxq "myloasm 0.6.0"
+    micromamba env list | grep -q hifiasm_meta
+    micromamba env list | grep -q myloasm
+    micromamba run -n hifiasm_meta hifiasm_meta --version
+    # myloasm's VERSION is asserted, not merely its presence. assemble.sh reads
+    # circularity out of a header string probed against 0.6.0. A release that
+    # renamed those fields would be caught at run time by myloasm_split.awk; one
+    # that KEPT the shape and changed the meaning would not be, and this pin is the
+    # only thing standing in front of it.
+    micromamba run -n myloasm myloasm --version | grep -Fxq "myloasm 0.6.0"
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep
     # rather than at the end of a long job.
@@ -108,22 +136,31 @@ From: mambaorg/micromamba:1.5.8
     # reaching for an interpreter the image lacks — is what killed every step of
     # this workflow at its final line.
     grep -q 'python3 /opt/qiita/manifest_writer\.py' /opt/qiita/_lib.sh
-    # Guard the entrypoint stays wired to its env — one per assembler, since a
-    # branch that lost its `micromamba run -n assemble` prefix would resolve the
-    # binary from the BASE env (where neither exists) and die mid-step.
-    grep -q 'micromamba run -n assemble hifiasm_meta' /opt/qiita/assemble.sh
-    grep -q 'micromamba run -n assemble myloasm' /opt/qiita/assemble.sh
+    # Guard each branch stays wired to ITS OWN env — a branch that lost its
+    # `micromamba run -n <env>` prefix, or kept a stale env name after the split
+    # into two envs, would resolve the binary from the BASE env (where neither
+    # exists) and die mid-step.
+    grep -q 'micromamba run -n hifiasm_meta hifiasm_meta' /opt/qiita/assemble.sh
+    grep -q 'micromamba run -n myloasm myloasm' /opt/qiita/assemble.sh
+    grep -q 'python3 /opt/qiita/myloasm_split\.py' /opt/qiita/assemble.sh
+    # The splitter's DuckDB must be the version the orchestrator staged the miint
+    # extension with — DuckDB namespaces the staged dir by engine version, so a
+    # skew is a LOAD failure at run time. Assert it here so a drifted solve fails
+    # the BUILD instead.
+    python3 -c "import duckdb; assert duckdb.__version__ == '1.5.4', duckdb.__version__"
     # The splitter is %files-copied, so it can go missing independently of the
-    # entrypoint that runs it. Prove it is present AND that this image's awk can
-    # execute it, on the same one-circular/one-linear pair the unit test uses —
-    # `awk -f` on a missing or unparseable program is a runtime failure that would
-    # otherwise surface only after a multi-hour assembly.
-    printf '>a_len-10_circular-yes_depth-9-9-9_duplicated-no mult=1.00\nACGT\n>b_len-20_circular-no_depth-9-9-9_duplicated-no mult=1.00\nTTTT\n' \
-        > "${HOME}/probe.fa"
-    awk -v circ_out="${HOME}/c.fa" -v nolcg_out="${HOME}/n.fa" \
-        -f /opt/qiita/myloasm_split.awk "${HOME}/probe.fa"
-    grep -qx '>a' "${HOME}/c.fa"
-    grep -qx '>b' "${HOME}/n.fa"
+    # entrypoint that runs it. It cannot be RUN here — it LOADs the deploy-staged
+    # miint extension, which does not exist at build time and is bind-mounted only
+    # at submit — so assert it is present and importable-clean. Its behaviour is
+    # covered by test_myloasm_split.py, which runs the real program against real
+    # myloasm headers with a real staged extension.
+    test -s /opt/qiita/myloasm_split.py
+    python3 -m py_compile /opt/qiita/myloasm_split.py
+    # It must stay LOAD-only: an INSTALL would need the team mirror reachable from
+    # every compute node and a writable $HOME, the footgun the staged dir replaced.
+    # Anchored at a string-literal quote so the splitter's own prose explaining why
+    # it does NOT install cannot fail the build.
+    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/myloasm_split.py
 
 %runscript
     echo "long-read-assembly-assemble image: invoke the step entrypoint, e.g." >&2

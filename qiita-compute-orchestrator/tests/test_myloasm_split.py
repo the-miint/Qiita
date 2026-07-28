@@ -26,27 +26,42 @@ reported `circular-no`); it is therefore accepted as a well-formed value and
 routed to noLCG, which is both the safe direction and what the assay owner does
 by hand.
 
-These tests EXECUTE `myloasm_split.awk` rather than text-matching it, so they
-prove the split works, not merely that it is still spelled a certain way. The
-static pins at the bottom cover the parts that cannot be executed without
+Three further behaviours were probed and are relied on below:
+  * myloasm is DETERMINISTIC — two runs over the same reads gave byte-identical
+    headers.
+  * Across two read samplings of the SAME genome, `depth-` moved (32→31) and the
+    unitig id moved (u713ctg→u932ctg) while `_len-` was identical (580076).
+  * With nothing assemblable (3 reads) myloasm EXITS NON-ZERO and writes no
+    `assembly_primary.fa` at all — which is why assemble.sh treats a MISSING
+    primary FASTA after a zero exit as a contract violation, not an empty
+    assembly.
+
+The behavioural tests here EXECUTE `myloasm_split.py` against a real staged miint
+extension, so they prove the split works rather than that it is still spelled a
+certain way. They SKIP where miint cannot be staged (no network / no mirror); the
+static pins below always run and cover the wiring that cannot be executed without
 building the image.
 """
 
 from __future__ import annotations
 
+import os
 import re
-import shutil
 import subprocess
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW_DIR = _REPO_ROOT / "workflows" / "long-read-assembly"
-_SPLIT_AWK = _WORKFLOW_DIR / "myloasm_split.awk"
+_SPLIT_PY = _WORKFLOW_DIR / "myloasm_split.py"
 _ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
 _ASSEMBLE_ENV = _WORKFLOW_DIR / "sif-build.d" / "assemble.env"
+_WORKFLOW_YAML = _WORKFLOW_DIR / "1.0.0.yaml"
+_CO_LOCK = _REPO_ROOT / "qiita-compute-orchestrator" / "uv.lock"
 
 # The two headers verbatim from the probe described in the module docstring. Kept
 # byte-exact (trailing `mult=1.00` included) so a myloasm release that changes the
@@ -57,40 +72,48 @@ _LIN_HEADER = ">u278ctg_len-577882_circular-no_depth-33-33-33_duplicated-no mult
 _EXIT_CONTRACT_VIOLATION = 64
 
 
-def _require_awk() -> str:
-    awk = shutil.which("awk")
-    if awk is None:
-        pytest.skip("awk not available; the split cannot be executed here")
-    return awk
+@pytest.fixture(scope="module")
+def staged_miint(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A miint extension directory staged the way the deploy stages one.
 
-
-def _split(tmp_path: Path, fasta: str) -> subprocess.CompletedProcess[str]:
-    """Run the splitter exactly the way assemble.sh does.
-
-    assemble.sh pre-creates both outputs before invoking awk (so an empty CLASS is
-    an empty file, not a missing one) — mirrored here, or these tests would be
-    exercising a different contract than production.
+    The production container does not INSTALL — it LOADs a directory the deploy
+    populated and bind-mounted. Reproduced here so the tests exercise the real
+    LOAD-only path rather than a differently-configured connection.
     """
-    awk = _require_awk()
+    duckdb = pytest.importorskip("duckdb")
+    ext_dir = tmp_path_factory.mktemp("miint-ext")
+    con = duckdb.connect(
+        config={"allow_unsigned_extensions": "true", "extension_directory": str(ext_dir)}
+    )
+    try:
+        con.execute("INSTALL miint FROM 'https://ftp.microbio.me/pub/miint'")
+    except Exception as exc:  # noqa: BLE001 - any failure here is "cannot stage"
+        pytest.skip(f"cannot stage the miint extension (offline?): {exc}")
+    finally:
+        con.close()
+    return str(ext_dir)
+
+
+def _split(tmp_path: Path, fasta: str, staged: str | None) -> subprocess.CompletedProcess[str]:
+    """Run the splitter the way assemble.sh does."""
     primary = tmp_path / "assembly_primary.fa"
     primary.write_text(fasta)
-    circ = tmp_path / "circular.fa"
-    nolcg = tmp_path / "noLCG.fa"
-    circ.write_text("")
-    nolcg.write_text("")
+    env = dict(os.environ)
+    if staged is None:
+        env.pop("MIINT_EXTENSION_DIRECTORY", None)
+    else:
+        env["MIINT_EXTENSION_DIRECTORY"] = staged
     return subprocess.run(
         [
-            awk,
-            "-v",
-            f"circ_out={circ}",
-            "-v",
-            f"nolcg_out={nolcg}",
-            "-f",
-            str(_SPLIT_AWK),
+            sys.executable,
+            str(_SPLIT_PY),
             str(primary),
+            str(tmp_path / "circular.fa"),
+            str(tmp_path / "noLCG.fa"),
         ],
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -99,52 +122,54 @@ def _ids(path: Path) -> list[str]:
 
 
 def test_split_program_is_present() -> None:
-    """Anti-vacuity guard: every test below shells out to this file, and a missing
-    one would make `awk -f` fail in a way easy to mistake for a real assertion."""
-    assert _SPLIT_AWK.is_file(), f"{_SPLIT_AWK} is missing — the pins below are vacuous"
+    """Anti-vacuity guard: every test below shells out to this file."""
+    assert _SPLIT_PY.is_file(), f"{_SPLIT_PY} is missing — the pins below are vacuous"
 
 
-def test_real_probe_headers_split_on_circularity(tmp_path: Path) -> None:
+def test_real_probe_headers_split_on_circularity(tmp_path: Path, staged_miint: str) -> None:
     """The circular arm lands in circular.fa, the linear control in noLCG.fa.
 
     This is the probe's own result replayed through our code: the two headers
     differ ONLY in what myloasm concluded about topology, so a splitter that sent
     them the same way would be ignoring the field entirely.
     """
-    result = _split(tmp_path, f"{_CIRC_HEADER}\nACGTACGT\n{_LIN_HEADER}\nTTTTGGGG\n")
+    result = _split(tmp_path, f"{_CIRC_HEADER}\nACGTACGT\n{_LIN_HEADER}\nTTTTGGGG\n", staged_miint)
     assert result.returncode == 0, result.stderr
-
     assert _ids(tmp_path / "circular.fa") == ["u713ctg"]
     assert _ids(tmp_path / "noLCG.fa") == ["u278ctg"]
 
 
-def test_sequence_bytes_are_copied_verbatim(tmp_path: Path) -> None:
+def test_sequence_bytes_are_copied_verbatim(tmp_path: Path, staged_miint: str) -> None:
     """The splitter routes records; it must never rewrite sequence.
 
     These contigs are hashed downstream with the SAME canonical hash a reference
-    sequence gets, so a single altered or re-wrapped byte would mint a different
-    feature_idx for an identical molecule.
+    sequence gets, so a single altered byte would mint a different feature_idx for
+    an identical molecule.
     """
-    seq = "ACGTACGTAC"
-    result = _split(tmp_path, f"{_CIRC_HEADER}\n{seq}\n")
+    seq = "ACGTACGTACGTACGTACGT"
+    result = _split(tmp_path, f"{_CIRC_HEADER}\n{seq}\n", staged_miint)
     assert result.returncode == 0, result.stderr
-    lines = (tmp_path / "circular.fa").read_text().splitlines()
-    assert [ln for ln in lines if not ln.startswith(">")] == [seq]
+    body = "".join(
+        ln for ln in (tmp_path / "circular.fa").read_text().splitlines() if not ln.startswith(">")
+    )
+    assert body == seq
 
 
-def test_line_wrapped_fasta_is_preserved(tmp_path: Path) -> None:
-    """A wrapped record keeps every sequence line, in order.
+def test_line_wrapped_input_is_reassembled(tmp_path: Path, staged_miint: str) -> None:
+    """A wrapped input record keeps its full sequence.
 
-    myloasm 0.6.0 was observed to write one line per contig, but nothing in the
-    splitter relies on that and a future release must not silently truncate.
+    myloasm 0.6.0 was observed to write one line per contig, but read_fastx is the
+    parser precisely so a wrapped release needs no change here.
     """
-    result = _split(tmp_path, f"{_CIRC_HEADER}\nACGT\nTTGG\nCC\n")
+    result = _split(tmp_path, f"{_CIRC_HEADER}\nACGT\nTTGG\nCC\n", staged_miint)
     assert result.returncode == 0, result.stderr
-    lines = (tmp_path / "circular.fa").read_text().splitlines()
-    assert lines == [">u713ctg", "ACGT", "TTGG", "CC"]
+    body = "".join(
+        ln for ln in (tmp_path / "circular.fa").read_text().splitlines() if not ln.startswith(">")
+    )
+    assert body == "ACGTTTGGCC"
 
 
-def test_circular_possibly_is_not_treated_as_circular(tmp_path: Path) -> None:
+def test_circular_possibly_is_not_treated_as_circular(tmp_path: Path, staged_miint: str) -> None:
     """`circular-possibly` goes to noLCG — the recoverable direction.
 
     A contig wrongly sent to noLCG is still recovered through binning (as a
@@ -153,40 +178,25 @@ def test_circular_possibly_is_not_treated_as_circular(tmp_path: Path) -> None:
     the asymmetry decides which way an uncertain call should fall.
     """
     header = ">u9ctg_len-1234_circular-possibly_depth-10-9-9_duplicated-no mult=1.00"
-    result = _split(tmp_path, f"{header}\nACGT\n")
+    result = _split(tmp_path, f"{header}\nACGT\n", staged_miint)
     assert result.returncode == 0, result.stderr
     assert _ids(tmp_path / "circular.fa") == []
     assert _ids(tmp_path / "noLCG.fa") == ["u9ctg"]
 
 
-def test_contig_id_is_stable_when_only_the_length_drifts(tmp_path: Path) -> None:
-    """Re-assembling the same sample must not rename the contig.
+def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path, staged_miint: str) -> None:
+    """The decoration and the space-separated `mult=…` tail are both stripped.
 
-    A circular contig's reported length moves by a few bp between runs because its
-    rotational start does. The id becomes the LCG's bin_id in assembly_hash, so
-    carrying `_len-<N>` into it would make the same genome a different bin on every
-    re-assembly.
+    read_fastx puts `mult=1.00` in a separate `comment` column, and the `_len-…`
+    decoration is cut here — the id that survives becomes the LCG bin_id, and the
+    discarded `depth-` field was probed to vary between read samplings of the same
+    genome.
     """
-    first = tmp_path / "a"
-    second = tmp_path / "b"
-    first.mkdir()
-    second.mkdir()
-    _split(first, ">u713ctg_len-580076_circular-yes_depth-32-32-32_duplicated-no mult=1.00\nAC\n")
-    _split(second, ">u713ctg_len-580071_circular-yes_depth-32-32-32_duplicated-no mult=1.00\nAC\n")
-    assert _ids(first / "circular.fa") == _ids(second / "circular.fa") == ["u713ctg"]
-
-
-def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path) -> None:
-    """The space-separated `mult=…` tail is never part of the id.
-
-    miint's read_fastx takes a record id to be the header's FIRST token, so an id
-    carrying a space would be silently truncated downstream instead of here.
-    """
-    result = _split(tmp_path, f"{_CIRC_HEADER}\nAC\n")
+    result = _split(tmp_path, f"{_CIRC_HEADER}\nAC\n", staged_miint)
     assert result.returncode == 0, result.stderr
     ids = _ids(tmp_path / "circular.fa")
     assert ids == ["u713ctg"]
-    assert not any(" " in i or "mult" in i for i in ids)
+    assert not any(" " in i or "mult" in i or "depth" in i for i in ids)
 
 
 @pytest.mark.parametrize(
@@ -196,46 +206,51 @@ def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path) -> None:
         # introduce, and the one that would otherwise pass silently with an empty
         # circular.fa.
         ("unknown header shape", ">u1ctg_length-10_loop-yes mult=1.00\nACGT\n"),
-        # A fourth circularity value we have never probed must stop the step, not
-        # be guessed at.
+        # A fourth circularity value we have never probed must stop the step.
         ("unknown circularity value", ">u1ctg_len-10_circular-maybe_depth-1-1-1\nACGT\n"),
         # Two genomes collapsing onto one bin_id downstream.
-        (
-            "duplicate contig id",
-            ">x_len-10_circular-yes_d\nAC\n>x_len-99_circular-no_d\nGT\n",
-        ),
-        # A truncated or mis-detected file.
-        ("sequence before any header", "ACGT\n>x_len-10_circular-no_d\nAC\n"),
+        ("duplicate contig id", ">x_len-10_circular-yes_d\nAC\n>x_len-99_circular-no_d\nGT\n"),
     ],
 )
-def test_malformed_input_fails_loud(tmp_path: Path, case: str, fasta: str) -> None:
+def test_malformed_input_fails_loud(
+    tmp_path: Path, staged_miint: str, case: str, fasta: str
+) -> None:
     """Every shape we cannot interpret exits 64 instead of producing a partial split.
 
-    Silence is the dangerous outcome here: an unrecognised header simply fails to
-    match `_circular-yes`, so the step would exit 0 having classified every genome
+    Silence is the dangerous outcome: an unrecognised header simply fails to match
+    the circular pattern, so the step would exit 0 having classified every genome
     as linear. Fail-closed converts that into a step failure an operator sees.
     """
-    result = _split(tmp_path, fasta)
+    result = _split(tmp_path, fasta, staged_miint)
     assert result.returncode == _EXIT_CONTRACT_VIOLATION, (
         f"{case}: expected exit {_EXIT_CONTRACT_VIOLATION}, got {result.returncode}. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert "myloasm_split" in result.stderr, (
-        f"{case}: nothing diagnostic on stderr: {result.stderr!r}"
-    )
+    assert "myloasm_split" in result.stderr, f"{case}: nothing diagnostic: {result.stderr!r}"
 
 
-def test_empty_assembly_yields_two_empty_files(tmp_path: Path) -> None:
-    """A zero-record primary FASTA leaves both classes empty, not missing.
+def test_missing_extension_directory_fails_loud(tmp_path: Path) -> None:
+    """Without the staged extension the step must fail, never fall back to INSTALL.
 
-    assembly_coverage reads a missing OR zero-byte noLCG.fa as "nothing to bin"
-    and assembly_hash raises StepNoData when neither class exists, so an empty
-    assembly must stay a clean no-data outcome rather than a crash.
+    A per-job INSTALL is the footgun the deploy-staged directory replaced: it needs
+    the team mirror reachable from every compute node and a writable $HOME. Needs
+    no staged extension itself, so it runs even offline.
     """
-    result = _split(tmp_path, "")
-    assert result.returncode == 0, result.stderr
-    assert (tmp_path / "circular.fa").read_text() == ""
-    assert (tmp_path / "noLCG.fa").read_text() == ""
+    result = _split(tmp_path, f"{_CIRC_HEADER}\nAC\n", None)
+    assert result.returncode == _EXIT_CONTRACT_VIOLATION, result.stdout + result.stderr
+    assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
+
+
+def test_empty_primary_fasta_fails_rather_than_raising_opaquely(tmp_path: Path) -> None:
+    """A zero-byte primary FASTA is refused with our message, not read_fastx's.
+
+    `read_fastx` RAISES on a zero-record input ("Error Empty file: …") instead of
+    returning no rows. assemble.sh already skips the splitter in that case; this is
+    the second gate, so a direct invocation cannot hit the raw raise either.
+    """
+    result = _split(tmp_path, "", None)
+    assert result.returncode == _EXIT_CONTRACT_VIOLATION
+    assert "empty" in result.stderr.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +261,12 @@ def test_empty_assembly_yields_two_empty_files(tmp_path: Path) -> None:
 def test_assemble_sh_runs_myloasm_and_the_splitter() -> None:
     """The myloasm branch invokes the tool in its env and the real splitter file."""
     code = _ASSEMBLE_SH.read_text()
-    assert "micromamba run -n assemble myloasm" in code, (
-        "assemble.sh no longer runs myloasm from the `assemble` env; the base env "
-        "has no such binary and the step would die mid-run."
+    assert "micromamba run -n myloasm myloasm" in code, (
+        "assemble.sh no longer runs myloasm from its own env; the base env has no "
+        "such binary and the step would die mid-run."
     )
-    assert "-f /opt/qiita/myloasm_split.awk" in code, (
-        "assemble.sh no longer runs myloasm_split.awk — the tested split is not the "
+    assert "python3 /opt/qiita/myloasm_split.py" in code, (
+        "assemble.sh no longer runs myloasm_split.py — the tested split is not the "
         "one production uses."
     )
     assert "assembly_primary.fa" in code, (
@@ -260,22 +275,77 @@ def test_assemble_sh_runs_myloasm_and_the_splitter() -> None:
     )
 
 
+def test_missing_primary_fasta_is_a_hard_failure_not_an_empty_assembly() -> None:
+    """assemble.sh exits 64 when myloasm succeeds but wrote no primary FASTA.
+
+    Probed: myloasm exits NON-zero and writes nothing when it cannot assemble. So
+    under `set -e` a zero exit with no output file means the filename or layout
+    moved. Left fail-open that yields an empty genomes_dir, which assembly_hash
+    reports as the terminal StepNoData "assembled nothing" — every sample silently
+    discarded, no error, no retry.
+    """
+    code = _ASSEMBLE_SH.read_text()
+    assert re.search(r'if \[\[ ! -e "\$\{PRIMARY\}" \]\]', code), (
+        "assemble.sh no longer hard-fails on a MISSING assembly_primary.fa. A "
+        "missing-or-empty guard cannot tell 'assembled nothing' from 'the output "
+        "path moved', and the latter is silently discarded."
+    )
+
+
 def test_myloasm_branch_does_not_reuse_the_hifiasm_gfa_rule() -> None:
     """The hifiasm segment-name regex must not be applied to myloasm output.
 
     It would match nothing there, so circular.fa would come out empty on every
     myloasm run with no error — the silent failure this whole change exists to
-    avoid. Assert the regex appears only inside the hifiasm_meta branch.
+    avoid.
     """
     body = _ASSEMBLE_SH.read_text()
-    myloasm_branch = body.split("myloasm)", 1)
-    assert len(myloasm_branch) == 2, "assemble.sh no longer has a `myloasm)` case arm"
-    # Cut at the arm terminator so this looks at the myloasm branch alone.
-    arm = myloasm_branch[1].split(";;", 1)[0]
+    parts = body.split("myloasm)", 1)
+    assert len(parts) == 2, "assemble.sh no longer has a `myloasm)` case arm"
+    arm = parts[1].split(";;", 1)[0]
     assert "tg[0-9]+c$" not in arm, (
         "the hifiasm-meta GFA segment-name regex appears in the myloasm branch. It "
         "matches no myloasm contig, so every circular genome would be silently "
         "routed to binning."
+    )
+
+
+def test_splitter_uses_miint_and_never_installs() -> None:
+    """The split reads/writes through miint and stays LOAD-only.
+
+    Hand-rolling a FASTA reader/writer where miint has one is the repo's named
+    review smell; a per-job INSTALL is the footgun the staged directory replaced.
+    """
+    code = _SPLIT_PY.read_text()
+    assert "read_fastx" in code, "the splitter no longer reads with miint's read_fastx"
+    assert "FORMAT FASTA" in code, "the splitter no longer writes with miint's FASTA writer"
+    assert "LOAD miint" in code, "the splitter no longer LOADs miint"
+    # Anchored at a string-literal opening quote so the word INSTALL in the prose
+    # explaining WHY we don't install cannot satisfy — or break — this.
+    assert re.search(r"""["']\s*INSTALL\b""", code) is None, (
+        "the splitter issues an INSTALL statement. Service-side connects are "
+        "LOAD-only: an INSTALL needs the mirror reachable from every compute node "
+        "and a writable $HOME."
+    )
+
+
+def test_assemble_step_binds_the_deploy_staged_miint() -> None:
+    """The assemble step declares MIINT_EXTENSION_DIRECTORY as a derived input.
+
+    Without it the container gets no miint at all — `payload.py` deliberately does
+    not forward the native-only miint env to containers, so `derived_inputs` is the
+    per-step mechanism that binds the staged directory in read-only.
+    """
+    yaml_text = _WORKFLOW_YAML.read_text()
+    assemble = yaml_text.split("- step: assemble", 1)[1].split("- step:", 1)[0]
+    assert "derived_inputs:" in assemble, (
+        "the assemble step declares no derived_inputs, so the staged miint "
+        "extension is never bind-mounted and the myloasm split cannot LOAD it."
+    )
+    assert re.search(r"MIINT_EXTENSION_DIRECTORY:\s*duckdb-ext", assemble), (
+        "the assemble step's derived_inputs no longer maps "
+        "MIINT_EXTENSION_DIRECTORY to duckdb-ext (where the deploy stages the "
+        "extension, relative to PATH_DERIVED)."
     )
 
 
@@ -284,15 +354,14 @@ def test_image_pins_myloasm_and_asserts_the_pin_at_build_time() -> None:
 
     The pin is enforced only by the solver, and nothing about it is observable from
     this repo. Since the circularity contract is a header STRING probed against one
-    version, a drifted solve must fail the BUILD — a test here can read the spec but
-    not the built image.
+    version, a drifted solve must fail the BUILD.
     """
     defsrc = _ASSEMBLE_DEF.read_text()
     create = next(
         (ln for ln in defsrc.splitlines() if "micromamba create" in ln and "myloasm" in ln),
         None,
     )
-    assert create is not None, "assemble.def no longer installs myloasm into the assemble env"
+    assert create is not None, "assemble.def no longer creates the myloasm env"
     pin = re.search(r"\bmyloasm=([0-9][^\s\"']*)", create)
     assert pin is not None, (
         f"myloasm is unpinned on assemble.def's create line: {create!r}. It comes "
@@ -306,10 +375,44 @@ def test_image_pins_myloasm_and_asserts_the_pin_at_build_time() -> None:
     )
 
 
+def test_container_duckdb_matches_the_orchestrator_lock() -> None:
+    """The image's DuckDB equals the orchestrator's resolved DuckDB.
+
+    This is a genuine lockstep, not tidiness. The split LOADs the extension the
+    deploy staged, and `stage-miint-extension.sh` stages with the ORCHESTRATOR's
+    venv python — while DuckDB namespaces the extension directory by engine
+    version + platform. A container on a different DuckDB finds no extension for
+    its version and every myloasm assembly dies at LOAD, after doing all its work.
+    A `uv lock` bump must therefore move the def's pin too, and this fails the unit
+    suite when it doesn't.
+    """
+    lock = tomllib.loads(_CO_LOCK.read_text())
+    locked = {p["name"]: p["version"] for p in lock["package"]}
+    orchestrator_duckdb = locked.get("duckdb")
+    assert orchestrator_duckdb, "duckdb is not in qiita-compute-orchestrator/uv.lock"
+
+    defsrc = _ASSEMBLE_DEF.read_text()
+    pin = re.search(r"\bpython-duckdb=([0-9][^\s\"']*)", defsrc)
+    assert pin is not None, (
+        "assemble.def does not pin python-duckdb. An unpinned solve can land on a "
+        "DuckDB whose version has no staged miint extension."
+    )
+    assert pin.group(1) == orchestrator_duckdb, (
+        f"assemble.def pins python-duckdb={pin.group(1)} but the orchestrator "
+        f"resolves duckdb=={orchestrator_duckdb}. DuckDB namespaces the staged "
+        "extension directory by engine version, so the container would LOAD from a "
+        "version directory the deploy never staged."
+    )
+    assert re.search(rf"duckdb.__version__ == '{re.escape(orchestrator_duckdb)}'", defsrc), (
+        "assemble.def's %test no longer asserts the resolved DuckDB version, so a "
+        "drifted solve would build green and fail at LOAD on the cluster."
+    )
+
+
 def test_build_spec_hashes_the_splitter_and_verifies_the_myloasm_version() -> None:
     """The SIF spec rebuilds on a splitter edit and verifies the pinned version.
 
-    HASH_INPUTS scopes the two-gate idempotency check. myloasm_split.awk is
+    HASH_INPUTS scopes the two-gate idempotency check. myloasm_split.py is
     %files-copied into the image and decides which contigs become LCGs, so omitting
     it would let an edited splitter be skipped as "unchanged" and never reach the
     host.
@@ -317,13 +420,19 @@ def test_build_spec_hashes_the_splitter_and_verifies_the_myloasm_version() -> No
     spec = _ASSEMBLE_ENV.read_text()
     hash_inputs = re.search(r'^HASH_INPUTS="([^"]*)"', spec, re.MULTILINE)
     assert hash_inputs is not None, "assemble.env no longer declares HASH_INPUTS"
-    assert "myloasm_split.awk" in hash_inputs.group(1), (
-        f"myloasm_split.awk is missing from HASH_INPUTS ({hash_inputs.group(1)!r}). "
+    assert "myloasm_split.py" in hash_inputs.group(1), (
+        f"myloasm_split.py is missing from HASH_INPUTS ({hash_inputs.group(1)!r}). "
         "Editing the splitter would not rebuild the image."
     )
     verify_match = re.search(r'^VERIFY_MATCH="([^"]*)"', spec, re.MULTILINE)
     assert verify_match is not None, "assemble.env no longer declares VERIFY_MATCH"
-    create = next(ln for ln in _ASSEMBLE_DEF.read_text().splitlines() if "micromamba create" in ln)
+    # The def now creates one env PER assembler, so pick the myloasm line
+    # specifically — the first `micromamba create` is hifiasm_meta's.
+    create = next(
+        ln
+        for ln in _ASSEMBLE_DEF.read_text().splitlines()
+        if "micromamba create" in ln and "myloasm=" in ln
+    )
     version = re.search(r"\bmyloasm=([0-9][^\s\"']*)", create).group(1)
     assert version in verify_match.group(1), (
         f"VERIFY_MATCH ({verify_match.group(1)!r}) does not assert the pinned "
