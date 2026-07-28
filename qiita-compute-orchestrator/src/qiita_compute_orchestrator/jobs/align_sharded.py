@@ -138,9 +138,19 @@ YAML_STEP_NAME = "align_sharded"
 # DuckDB threads. NOT merely a parallelism knob: `SET threads` IS the sharded
 # aligners' CROSS-SHARD concurrency. miint derives `max_active_shards` from DuckDB's
 # thread-pool size (`ceil(db_threads / max_threads_per_shard)`, clamped to the shard
-# count) and IGNORES its own `threads` argument in sharded mode, so this value caps
-# how many shards align at once — set below the cgroup's cpu allocation it pins the
-# job to that many cores no matter what SLURM granted.
+# count) and IGNORES its own `threads` argument in sharded mode. We never set
+# `max_threads_per_shard`, so it is miint's default of 1 and the derivation reduces to
+# `max_active_shards = min(threads, shard_count)` — one worker per shard, each aligner
+# single-threaded.
+#
+# **This must equal the align workflow's `baseline_resources.cpu`, and nothing derives
+# it from the cgroup.** Unlike memory, there is no cpu-resolution helper: a literal
+# above the allocation oversubscribes that many concurrent shards onto fewer cores, and
+# a literal below it leaves cores idle. `test_align_cpu_pins_duckdb_threads` fails if
+# the two drift. Deliberately NOT generalized to a repo-wide invariant — most native
+# jobs set threads for DuckDB's own operator memory (per-thread sort/HASH_AGG state)
+# and legitimately differ from their `cpu:`; here the cores are spent by the ALIGNER's
+# shard concurrency, not by DuckDB, which is what makes the two the same number.
 _DUCKDB_THREADS = 8
 
 # DuckDB `memory_limit`, resolved from the REAL cgroup so a per-run `--mem-gb`
@@ -528,9 +538,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # ROW (a block spans many prep_samples). sequence_idx is unique, 1:1.
                 # A TABLE, not a VIEW over the reads relation: two narrow BIGINT
                 # columns (~16 B/read) is small enough to hold outright, and
-                # materializing it keeps the final COPY's join off a Parquet scan and
-                # gives the planner exact stats for the build side — a view's estimate
-                # can put the (far larger) alignment set on the build side instead.
+                # materializing it keeps the COPY's join off a Parquet scan (the bound
+                # reads relation is a lazy `read_parquet` view). NOT for the planner's
+                # benefit — a Parquet footer carries exact row counts, so a view's
+                # cardinality is exact too and the join plan is identical either way.
                 conn.execute(
                     f"CREATE TABLE {_READ_META} AS "
                     f"SELECT sequence_idx, prep_sample_idx FROM {reads_rel}"
