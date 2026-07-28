@@ -171,52 +171,12 @@ def test_resolve_runs_rejects_empty_accession(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-class _FakeConnection:
-    """Records every SQL string passed to `.execute`; nothing else is needed here."""
-
-    def __init__(self) -> None:
-        self.executed: list[str] = []
-
-    def execute(self, sql: str, *args, **kwargs) -> _FakeConnection:
-        self.executed.append(sql)
-        return self
-
-
-def test_open_ena_connection_is_load_only_never_installs(monkeypatch):
-    """`_open_ena_connection` must LOAD httpfs on a staged connection and NEVER
-    INSTALL: a service-side INSTALL resolves `$HOME/.duckdb` and dies on
-    `/dev/null`. Reintroducing INSTALL (or swapping the staged helper for the
-    client one) would fail on the deploy but pass a local dev run, so pin it."""
-    from qiita_control_plane.ena_import import miint_resolver
-
-    connections: list[_FakeConnection] = []
-
-    def _fake_connect_with_miint_staged() -> _FakeConnection:
-        con = _FakeConnection()
-        connections.append(con)
-        return con
-
-    monkeypatch.setattr(
-        miint_resolver, "connect_with_miint_staged", _fake_connect_with_miint_staged
-    )
-
-    miint_resolver._open_ena_connection()
-    miint_resolver._open_ena_connection()
-
-    # A fresh staged connection per call, each LOADing httpfs; never an INSTALL.
-    assert len(connections) == 2
-    all_executed = [sql for con in connections for sql in con.executed]
-    assert all("INSTALL" not in sql.upper() for sql in all_executed)
-    load_calls = [sql for sql in all_executed if "LOAD httpfs" in sql]
-    assert len(load_calls) == 2
-
-
 def test_resolver_binds_the_staged_helper_not_the_client_installer():
-    """Guard the import itself: the resolver must bind `connect_with_miint_staged`
-    (LOAD-only) and not the client-side `connect_with_miint` (INSTALL). An
-    `import connect_with_miint as connect_with_miint_staged` alias would pass the
-    behavior test above, so assert the binding directly (mirrors
-    tests/test_miint_connect.py's `_read_ingest` binding check)."""
+    """The resolver must bind `connect_with_miint_staged` (LOAD-only) and not the
+    client-side `connect_with_miint` (INSTALL): a service-side INSTALL resolves
+    `$HOME/.duckdb` and dies on qiita-api's `/dev/null` home. httpfs rides along
+    via `miint_load_sql` (pinned in qiita-common), so there is nothing extra to
+    load here."""
     from qiita_control_plane import miint as miint_module
     from qiita_control_plane.ena_import import miint_resolver
 

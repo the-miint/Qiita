@@ -11,7 +11,6 @@ DuckDB+miint session (mirrors `runner._stream_masked_reads_to_fastq`)."""
 
 from __future__ import annotations
 
-import duckdb
 from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyHeader
 
 from qiita_control_plane.miint import connect_with_miint_staged
@@ -29,34 +28,9 @@ _RUN_FIELDS = (
 )
 
 
-def _open_ena_connection() -> duckdb.DuckDBPyConnection:
-    """`connect_with_miint_staged()` plus an explicit `LOAD httpfs`.
-
-    Service-side: `MiintEnaResolver` runs inside the CP service (the
-    `POST /ena-import-batch` background task, `batch._process_one_study`), so both
-    extensions are LOAD-only. `qiita-api`'s `$HOME` is `/dev/null`, so any INSTALL
-    dies resolving `~/.duckdb/extensions` — the rule `qiita_control_plane.miint`
-    spells out. Use the staged (LOAD-only) helper, never the client INSTALL one.
-
-    miint AND httpfs are both pre-staged into `MIINT_EXTENSION_DIRECTORY` by the
-    deploy (`stage_miint_extension` INSTALLs httpfs into the same directory), so
-    `LOAD httpfs` resolves from there with no mirror round-trip or writable
-    `$HOME`. This is the CP counterpart to the orchestrator's `open_miint_ena_conn`
-    — the LOAD-only, both-extensions helper the `ingest_ena_reads` job uses.
-
-    The explicit `LOAD httpfs` is required because `read_ena`/`read_ena_attributes`
-    need `httpfs` for their outbound ENA API calls and it does NOT reliably autoload
-    under the miint connect config (`allow_unsigned_extensions` + a private
-    `extension_directory`): the query fails with `'https' scheme is not supported`
-    rather than degrading."""
-    con = connect_with_miint_staged()
-    con.execute("LOAD httpfs;")
-    return con
-
-
 def _query_ena_study_header(accession: str) -> tuple[list[str], list[tuple]]:
     """`read_ena(accession, result='study')` — one row, the study header."""
-    with _open_ena_connection() as con:
+    with connect_with_miint_staged() as con:
         rel = con.execute(
             "SELECT * FROM read_ena($accession, result='study')", {"accession": accession}
         )
@@ -66,7 +40,7 @@ def _query_ena_study_header(accession: str) -> tuple[list[str], list[tuple]]:
 def _query_ena_runs(accession: str) -> tuple[list[str], list[tuple]]:
     """`read_ena(accession)` (default `result='read_run'`) — one row per run
     under the study, restricted to `_RUN_FIELDS`."""
-    with _open_ena_connection() as con:
+    with connect_with_miint_staged() as con:
         rel = con.execute(
             "SELECT * FROM read_ena($accession, fields=$fields)",
             {"accession": accession, "fields": _RUN_FIELDS},
@@ -78,7 +52,7 @@ def _query_ena_sample_attributes(accession: str) -> tuple[list[str], list[tuple]
     """`read_ena_attributes(accession)` — one (sample_accession, tag, value)
     row per submitter-defined attribute, across every sample under the
     study (miint resolves the study accession to its samples internally)."""
-    with _open_ena_connection() as con:
+    with connect_with_miint_staged() as con:
         rel = con.execute("SELECT * FROM read_ena_attributes($accession)", {"accession": accession})
         return [d[0] for d in rel.description], rel.fetchall()
 

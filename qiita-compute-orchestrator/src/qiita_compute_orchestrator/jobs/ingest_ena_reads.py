@@ -45,7 +45,7 @@ from ..miint import (
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
-    open_miint_ena_conn,
+    open_miint_conn,
 )
 from ..read_staging import hardlink, per_slot_caps, read_roster_parquet, write_sorted_reads
 from ..sequence_range_retry import mint_or_reuse_sequence_range
@@ -131,7 +131,7 @@ def _stage_run_reads(
     skip/partial-download — that returns normally with a warning, which is why
     the caller must inspect `warning_messages`."""
     intermediate = validate_parquet_path(intermediate_path)
-    with open_miint_ena_conn() as conn:
+    with open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
         (count,) = conn.execute(
             "COPY ( SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "

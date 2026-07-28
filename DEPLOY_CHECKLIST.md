@@ -51,12 +51,11 @@ _None yet._
   no backfill), so it needs no bucket-3 entry.
 - miint deploy staging (`stage_miint_extension`, run at deploy via
   `scripts/stage-miint-extension.sh`) now also installs DuckDB's own
-  `httpfs` extension into the same `MIINT_EXTENSION_DIRECTORY`. **Both
-  planes** LOAD it on the ENA path — the compute orchestrator's
-  `ingest_ena_reads` job (`open_miint_ena_conn`) and the control plane's
-  ENA resolver (`ena_import/miint_resolver.py`) — so a staged directory
-  without it takes out `POST /ena-import-batch` at resolve as well as the
-  download job. No new operator action, but not because the step is
+  `httpfs` extension into the same `MIINT_EXTENSION_DIRECTORY`. It is
+  LOADed with miint by `miint_load_sql`, so **every** miint connection in
+  both planes needs it staged — a staged directory without it takes out
+  `POST /ena-import-batch` at resolve as well as the download job. No new
+  operator action, but not because the step is
   unconditional: the staging gate (`staging_is_current`) now reports a
   stage missing `httpfs` as stale, so the standing step re-stages a host
   that was already current on miint alone. `make verify-deploy`'s

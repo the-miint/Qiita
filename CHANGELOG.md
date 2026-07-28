@@ -94,8 +94,8 @@ duplicates further down are historical strata; leave them where they are.
   collides with bcl-convert's action-context-embedded `sample_map`, though
   both are `sequenced_pool`-scoped) via a new
   `repositories.sequenced_sample.fetch_sequenced_pool_run_roster`. The job
-  opens a FRESH DuckDB connection per run (`open_miint_ena_conn`, LOAD miint +
-  httpfs) so `miint_warnings()` stays scoped to exactly that run, mints the
+  opens a FRESH DuckDB connection per run (`open_miint_conn`) so
+  `miint_warnings()` stays scoped to exactly that run, mints the
   `sequence_idx` range through the existing CO→CP callback, and fails loud
   (new retriable `FailureKind.EXTERNAL_FETCH_TRANSIENT` for a
   transport/network-shaped raised error; permanent `BAD_INPUT` for a
@@ -869,6 +869,16 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`httpfs` is loaded with miint, not per caller (#369).** `miint_load_sql`
+  now emits `LOAD miint; LOAD httpfs;` and `miint_install_sql` installs httpfs
+  alongside miint, so install and load stay symmetric for every context that
+  stages them (deploy, both test conftests, the client CLI). miint reaches the
+  network through DuckDB's own filesystem layer, which dispatches `https://` to
+  httpfs, so httpfs is part of a working miint rather than a per-caller extra —
+  and it is regrettably not transiently loaded by miint itself. The dedicated
+  `open_miint_ena_conn` helper and the control plane resolver's explicit
+  `LOAD httpfs` are gone; `ingest_ena_reads` uses the shared `open_miint_conn`.
 
 - **ENA ingest classifies an md5-verification failure as an explicit,
   self-documented permanent error (#369).** Once the data plane bundles the miint build
