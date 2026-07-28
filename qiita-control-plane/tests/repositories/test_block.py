@@ -26,8 +26,10 @@ from qiita_control_plane.repositories.block import (
     finalize_mask_sample,
     has_incomplete_covering_block,
     lock_mask_sample,
+    lock_mask_sample_gate_advisory,
     set_block_state,
     set_block_work_ticket,
+    upsert_mask_sample_completed,
 )
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
@@ -283,6 +285,37 @@ async def test_lock_mask_sample_returns_state_and_requires_txn(blk):
             await lock_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
 
 
+async def test_lock_mask_sample_gate_advisory_serializes_and_requires_txn(blk):
+    """The advisory gate lock is a real (mask_idx, prep_sample) mutex: while one
+    transaction holds it, a second transaction cannot acquire the SAME key, and a
+    DIFFERENT key is unaffected; once the holder rolls back, the key frees. And it
+    requires a transaction (xact-scoped)."""
+    pool = blk["pool"]
+    mask_idx = blk["mask_idx"]
+    ps1, ps2 = blk["prep_sample_idxs"]
+    key_sql = "SELECT hashtextextended(format('%s:%s', $1::bigint, $2::bigint), 0)"
+    async with pool.acquire() as a, pool.acquire() as b:
+        key1 = await a.fetchval(key_sql, mask_idx, ps1)
+        key2 = await a.fetchval(key_sql, mask_idx, ps2)
+        tx_a = a.transaction()
+        await tx_a.start()
+        try:
+            await lock_mask_sample_gate_advisory(a, mask_idx=mask_idx, prep_sample_idx=ps1)
+            async with b.transaction():
+                # A holds ps1's key → B cannot take it, but ps2's key is free.
+                assert await b.fetchval("SELECT pg_try_advisory_xact_lock($1)", key1) is False
+                assert await b.fetchval("SELECT pg_try_advisory_xact_lock($1)", key2) is True
+        finally:
+            await tx_a.rollback()
+        # A released → B can now take ps1's key.
+        async with b.transaction():
+            assert await b.fetchval("SELECT pg_try_advisory_xact_lock($1)", key1) is True
+    # No transaction → fail loud.
+    async with pool.acquire() as conn:
+        with pytest.raises(RuntimeError):
+            await lock_mask_sample_gate_advisory(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
+
+
 async def test_finalize_mask_sample_flips_once(blk):
     pool = blk["pool"]
     mask_idx = blk["mask_idx"]
@@ -302,6 +335,61 @@ async def test_finalize_mask_sample_flips_once(blk):
     )
     async with pool.acquire() as conn, conn.transaction():
         assert await finalize_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=ps1) is False
+
+
+# ---------------------------------------------------------------------------
+# upsert_mask_sample_completed (the per-sample read-mask writer)
+# ---------------------------------------------------------------------------
+
+
+async def test_upsert_mask_sample_completed_creates_completed_row(blk):
+    """The per-sample path has no PENDING phase: the upsert materializes the gate
+    straight to 'completed' with no prior row."""
+    pool = blk["pool"]
+    mask_idx = blk["mask_idx"]
+    ps1, _ = blk["prep_sample_idxs"]
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
+    state = await pool.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        ps1,
+    )
+    assert state == "completed"
+
+
+async def test_upsert_mask_sample_completed_is_idempotent_and_moves_pending_forward(blk):
+    """A re-run stays completed; and an existing PENDING row (e.g. a block-path
+    row for the same pair) is moved forward to completed, never backward."""
+    pool = blk["pool"]
+    mask_idx = blk["mask_idx"]
+    ps1, ps2 = blk["prep_sample_idxs"]
+    # ps2 starts PENDING (block-path materialization); ps1 has no row yet.
+    async with pool.acquire() as conn, conn.transaction():
+        await create_mask_sample_pending(conn, mask_idx=mask_idx, prep_sample_idxs=[ps2])
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
+        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=ps2)
+    # Re-run ps1 — still completed (idempotent).
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
+    rows = await pool.fetch(
+        "SELECT prep_sample_idx, state FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx
+    )
+    assert {(r["prep_sample_idx"], r["state"]) for r in rows} == {
+        (ps1, "completed"),
+        (ps2, "completed"),
+    }
+
+
+async def test_upsert_mask_sample_completed_requires_txn(blk):
+    """Guarded like the sibling gate writers — no transaction ⇒ fail loud."""
+    pool = blk["pool"]
+    mask_idx = blk["mask_idx"]
+    ps1, _ = blk["prep_sample_idxs"]
+    async with pool.acquire() as conn:
+        with pytest.raises(RuntimeError):
+            await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=ps1)
 
 
 # ---------------------------------------------------------------------------

@@ -296,6 +296,25 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         )
         return 1
 
+    # Every sample must be masked-complete under this mask before any ticket is
+    # minted. The ticket route 409s a non-'completed' sample; minting inside the
+    # per-sample download loop would then abort mid-run AFTER earlier samples'
+    # files were already written — a partial output set. `mask_state` rides the
+    # manifest (gate contract: see fetch_mask_sample_state), so we can fail the
+    # whole export up front, mirroring the accession check. Only 'completed' is
+    # exportable: a 'pending' row (a covering block in flight) or NO row (absence
+    # is not exempt) both mean the read_masked pass-set would be absent or partial.
+    not_complete = sorted(s["prep_sample_idx"] for s in samples if s["mask_state"] != "completed")
+    if not_complete:
+        print(
+            f"error: {len(not_complete)} sample(s) on sequenced_pool {pool_idx} are not "
+            f"masked-complete under mask_idx {args.mask_idx} (mask_sample.state != 'completed'): "
+            f"prep_sample_idx {not_complete}. The read_masked pass-set would be absent or "
+            "partial — refusing to export. Retry once masking has completed.",
+            file=sys.stderr,
+        )
+        return 1
+
     # fastq output is never overwritten: a gzipped fastq has no cheap footer to
     # count (unlike parquet), and a paired sample's two files make a count-vs-disk
     # compare ambiguous. So for fastq, refuse up front if any target name already

@@ -130,6 +130,17 @@ async def seeded(postgres_pool, human_admin_session):
         )
     mask_idx = mask["mask_idx"]
 
+    # First-class mask_sample completion gate: the tightened export route requires a
+    # 'completed' gate row for (mask_idx, prep_sample) — in the real per-sample
+    # read-mask workflow the finalize-mask-sample terminal step writes it. Seed it
+    # directly so the fully-masked e2e sample is not 409'd as masking-incomplete.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        mask_idx,
+        ps,
+    )
+
     yield {
         "accession": accession,
         "prep_sample_idx": ps,
@@ -138,6 +149,11 @@ async def seeded(postgres_pool, human_admin_session):
         "mask_idx": mask_idx,
     }
 
+    await postgres_pool.execute(
+        "DELETE FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        ps,
+    )
     await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss)
     await postgres_pool.execute(
         "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx

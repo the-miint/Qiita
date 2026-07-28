@@ -310,15 +310,30 @@ async def delete_sequenced_pool_cascade(
     the caller's transaction; the caller must have already gated via
     `assert_sequenced_pool_deletable`.
 
-    The subtree is ON DELETE RESTRICT throughout (with two exceptions that
-    CASCADE: work_ticket_step off work_ticket, and sequence_range off
-    prep_sample), so order is explicit:
+    Every prep_sample-referencing FK in the subtree is ON DELETE RESTRICT (with
+    two exceptions that CASCADE: work_ticket_step off work_ticket, and
+    sequence_range off prep_sample), so each must be cleared before prep_sample.
+    Order:
       work_ticket (pool- and sample-scoped; → work_ticket_step CASCADEs) →
       prep_sample_metadata → prep_sample_field_exception → prep_sample_to_study →
       sequenced_sample (breaks the composite FK to prep_sample) →
+      block cover-map: the block-scoped work_tickets (block tickets carry NULL
+        pool/sample idxs — a CHECK — so the pool-/sample-scoped work_ticket delete
+        above cannot reach them) then the blocks themselves (→ block_member
+        CASCADEs; a block is planned per (pool, mask/alignment), so every block
+        covering one of this pool's samples is this pool's) →
+      mask_sample + alignment_sample (per-(mask/alignment, prep_sample) completion
+        gates) →
       prep_sample (→ sequence_range CASCADEs) → sequenced_pool.
 
-    Returns the per-table delete counts for the caller's response."""
+    NOT cleared here: `qiita.genome.prep_sample_idx` (a qiita-origin genome's
+    source sample, also ON DELETE RESTRICT) — a narrower, separately-tracked gap,
+    so a pool with a derived-genome source sample still cannot be deleted until
+    that is handled.
+
+    Returns the per-table delete counts for the caller's response (the derived
+    gate-row and block-cover-map deletes are not surfaced — internal cleanup, not
+    primary counts)."""
     prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
 
     work_ticket_deleted = _rowcount(
@@ -353,6 +368,43 @@ async def delete_sequenced_pool_cascade(
             "DELETE FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
             sequenced_pool_idx,
         )
+    )
+    # Bulk-block cover-map. block_member.prep_sample_idx is ON DELETE RESTRICT, and
+    # the block-scoped work_tickets that own the blocks carry NULL pool/sample idxs
+    # (work_ticket_scope_target_consistent CHECK), so the pool-/sample-scoped
+    # work_ticket delete above cannot reach them. Tear the blocks down here: their
+    # work_tickets first (work_ticket.block_idx is NO ACTION, so it must precede the
+    # block delete; this CASCADEs work_ticket_step), then the blocks (→ block_member
+    # CASCADEs; block.work_ticket_idx is SET NULL). A block is planned per
+    # (pool, mask/alignment), so every block covering one of this pool's samples is
+    # this pool's — deleting them whole is correct.
+    block_idxs = [
+        r["block_idx"]
+        for r in await conn.fetch(
+            "SELECT DISTINCT block_idx FROM qiita.block_member"
+            " WHERE prep_sample_idx = ANY($1::bigint[])",
+            prep_sample_idxs,
+        )
+    ]
+    if block_idxs:
+        await conn.execute(
+            "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])",
+            block_idxs,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
+            block_idxs,
+        )
+    # Per-(mask/alignment, prep_sample) completion gates. Both prep_sample_idx FKs
+    # are ON DELETE RESTRICT, so any live gate row would block the prep_sample
+    # delete below. Clear them here (after sequenced_sample, before prep_sample).
+    await conn.execute(
+        "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
+    await conn.execute(
+        "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
     )
     prep_sample_deleted = _rowcount(
         await conn.execute(

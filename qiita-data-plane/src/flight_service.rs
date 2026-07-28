@@ -2298,7 +2298,7 @@ fn delete_read_mask_block(
 /// manual unlink would corrupt the catalog; orphan parquets are tolerated until a
 /// future maintenance pass (matches `delete_mask`). Idempotent: deleting an
 /// `alignment_idx` with zero rows is success and returns `rows_deleted: 0`, so the
-/// control plane can safely retry. `alignment_idx` is an HMAC-verified i64.
+/// control plane can safely retry. `alignment_idx` is an Ed25519-verified i64.
 fn delete_alignment(
     catalog_connstr: &str,
     data_path: &str,
@@ -2358,7 +2358,7 @@ fn delete_alignment(
 /// retriable), logical `DELETE` only (no raw parquet unlink — DuckLake owns file
 /// lifecycle). Idempotent: a fresh block (no rows yet) deletes 0. Empty `members`
 /// is a control-plane bug (the DoAction arm rejects it before this); guarded here
-/// too, returning a zero-count noop. All integers are HMAC-verified i64s, safe to
+/// too, returning a zero-count noop. All integers are Ed25519-verified i64s, safe to
 /// inline.
 fn delete_alignment_block(
     catalog_connstr: &str,

@@ -1,16 +1,8 @@
 """Real-miint contract test for `assembly_coverage` (align_minimap2 NOT stubbed).
 
-This step's correctness rests on behaviours of miint's BAM writer that are not in
-its docs, so they are pinned here rather than described in a comment. What each
-case would catch:
+Behaviours of miint's BAM writer this step DEPENDS on, pinned here because they are
+not in its docs:
 
-  - **@SQ is reversed from the REFERENCE_LENGTHS table.** The step builds that
-    table DESC so @SQ lands ASC, which is the only reason `ORDER BY reference,
-    position` is a real coordinate sort — jgi_summarize_bam_contig_depths checks
-    the @SQ index (tid), not the contig name, and rejects the file outright
-    otherwise. `test_reflen_order_is_reversed_in_sq` pins the reversal against
-    miint DIRECTLY, with both orderings, so a version bump that "fixes" it fails
-    here instead of producing a BAM metaWRAP rejects two steps downstream.
   - **Zero-coverage contigs still get an @SQ line.** That is what makes jgi report
     them at depth 0 rather than dropping them, so the fixture deliberately leaves
     one contig unaligned.
@@ -20,13 +12,24 @@ case would catch:
     here still passes while jgi silently under-reports depth — see
     `test_bam_carries_real_sequences`.
 
+And one behaviour this step deliberately does NOT depend on, pinned because a
+previous version of the step DID and it cost a production ticket: **the @SQ order
+is not controlled by the REFERENCE_LENGTHS table.** A BAM's sort order is on tid
+(the @SQ index), so no ORDER BY the step can apply makes its output coordinate
+sorted; `binning.sh` runs `samtools sort` instead.
+`test_sq_order_is_not_derivable_from_reflen` pins the writer's behaviour and
+`test_contig_name_order_is_not_tid_order` pins the consequence. Filed upstream as
+duckdb-miint#173 (a defined or steerable @SQ order); docs/duckdb-miint.md's
+"Open upstream gaps" table tracks it and the removal of the sort.
+
 Not pinned here, because it needs metabat2 which the test env does not have: that
 jgi accepts the BAM and agrees with a samtools-written one. Established by probe
 against jgi_summarize_bam_contig_depths 2.15 — with `SEQUENCE_DATA`, both depth and
 variance from miint's BAM equal those from a real `minimap2 | samtools sort` BAM to
 every printed digit (per contig: depth 6.29783 / 7.99987, variance 14.4156 /
-14.4126) with zero warnings. The sortedness and SEQ assertions below are the
-in-repo proxy for it.
+14.4126) with zero warnings. The SEQ assertions below are the in-repo proxy for it.
+Note that probe compared against a `samtools sort`ed BAM and used a handful of
+contigs, which is why it did not expose the @SQ-order defect above.
 """
 
 from __future__ import annotations
@@ -34,7 +37,9 @@ from __future__ import annotations
 import asyncio
 import gzip
 import random
+import shutil
 import struct
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -50,13 +55,13 @@ from qiita_compute_orchestrator.miint import open_miint_conn
 def _sq_reference_names(path) -> list[str]:
     """The @SQ reference names in header order.
 
-    Lives in the TEST, not the job: the production step is correct BY
-    CONSTRUCTION (it owns the reflen order and the record ORDER BY) and never
-    reads the header back. But miint exposes no @SQ-header reader — `read_sam` /
-    `read_alignments` return per-record columns, and `SELECT DISTINCT reference`
-    drops zero-coverage contigs — so pinning miint's undocumented reflen→@SQ
-    REVERSAL, which the construction relies on, requires reading the header
-    directly here. (If miint ever grows a header reader, replace this.)
+    Lives in the TEST, not the job: the step never reads its own header back
+    (nothing in the job depends on the @SQ order — see the module docstring). But
+    miint exposes no @SQ-header reader — `read_sam` / `read_alignments` return
+    per-record columns, and `SELECT DISTINCT reference` drops zero-coverage
+    contigs — so pinning what the writer does with @SQ requires reading the header
+    directly here. Requested upstream as duckdb-miint#174; replace this helper
+    with the reader when it lands.
 
     BAM is BGZF (gzip-compatible). Layout: magic `BAM\\1`, int32 l_text, l_text
     header bytes, int32 n_ref, then per ref int32 l_name, l_name NUL-terminated
@@ -158,42 +163,105 @@ def _run(assembly, tmp_path: Path) -> Path:
     return outputs["coverage_bam"]
 
 
-def test_sq_header_is_ascending_and_covers_every_contig(assembly, tmp_path):
-    """@SQ carries all three contigs, ascending — including the unaligned one.
+def test_sq_header_covers_every_contig(assembly, tmp_path):
+    """@SQ carries all three contigs — including the unaligned one.
 
-    Ascending order is the load-bearing part: it is what makes the step's
-    `ORDER BY reference, position` a genuine coordinate sort.
+    The SET is what matters and is all this can assert: a contig with an @SQ line
+    is reported by jgi at depth 0 instead of being dropped. The ORDER is
+    deliberately NOT asserted — the writer picks it and we cannot steer it (see
+    `test_sq_order_is_not_derivable_from_reflen`). The old version of this test
+    asserted ascending name order and passed only because this fixture is three
+    `s1.`-prefixed contigs; it would not have held on a real assembly.
     """
     bam = _run(assembly, tmp_path)
-    assert _sq_reference_names(bam) == [_CTG_A, _CTG_B, _CTG_UNCOVERED]
+    assert sorted(_sq_reference_names(bam)) == [_CTG_A, _CTG_B, _CTG_UNCOVERED]
 
 
-def test_records_are_coordinate_sorted(assembly, tmp_path):
-    """Records are non-decreasing in (tid, position) — what jgi checks.
+def _record_tids(bam) -> list[int]:
+    """Each record's tid — its reference's @SQ index — in FILE order.
 
-    Two halves, together the coordinate-sort jgi requires: the RECORD stream
-    (read back through miint's `read_alignments`, in file order) must be sorted by
-    (reference-tid, position), and the tid order is the @SQ order — which
-    `test_sq_header_is_ascending_and_covers_every_contig` pins as ascending name.
-    So map each record's reference to its @SQ index and assert non-decreasing.
-
-    This rests on `read_alignments` returning rows IN FILE ORDER (not re-sorting),
-    else an unsorted BAM could pass silently. Probed against the shipped build: a
-    BAM written deliberately in reverse (reference,position) order reads back
-    reversed, not re-sorted — so the reader preserves file order and this test
-    genuinely exercises the on-disk record order.
+    Rests on `read_alignments` returning rows in file order (not re-sorting), else
+    an unsorted BAM could pass a sortedness check silently. Probed against the
+    shipped build: a BAM written deliberately in reverse (reference, position)
+    order reads back reversed, not re-sorted.
     """
-    bam = _run(assembly, tmp_path)
-    order = {name: i for i, name in enumerate(_sq_reference_names(bam))}
+    tid = {name: i for i, name in enumerate(_sq_reference_names(bam))}
+    with open_miint_conn() as conn:
+        refs = conn.execute("SELECT reference FROM read_alignments(?)", [str(bam)]).fetchall()
+    return [tid[ref] for (ref,) in refs]
+
+
+def test_contig_name_order_is_not_tid_order(tmp_path):
+    """Ordering records by contig NAME does not order them by tid — the defect.
+
+    This is the consequence of `test_sq_order_is_not_derivable_from_reflen`, stated
+    as the thing that actually broke: `jgi_summarize_bam_contig_depths` checks the
+    tid order, so a BAM whose records are grouped by contig name is not
+    "coordinate sorted" and jgi rejects it outright. `assembly_coverage` used to
+    write `ORDER BY reference ASC, position ASC` believing it was a coordinate
+    sort; on the production assembly (20,975 contigs) 11,390 of 925,483 records
+    stepped backwards in tid, and after a `samtools sort` in `binning.sh`, zero.
+
+    Checked from the header alone — walk the contigs in ascending name order, read
+    off each one's tid, and assert that sequence is not non-decreasing. No records
+    are needed and nothing here is a coincidence of one fixture: the @SQ order is
+    deterministic (asserted below) and at this n it is not the name order.
+
+    If this ever fails, miint has given @SQ a name-ordered layout. That would make
+    a name sort a real coordinate sort again — do not act on it without also
+    re-reading `test_sq_order_is_not_derivable_from_reflen`, and do not remove
+    `binning.sh`'s sort merely because one miint build happens to agree.
+    """
+    bam = tmp_path / "nameorder.bam"
+    names = sorted(f"s{i}.ctg{i:06d}l" for i in range(1, _SQ_PROBE_N + 1))
 
     with open_miint_conn() as conn:
-        rows = conn.execute(
-            "SELECT reference, position FROM read_alignments(?)", [str(bam)]
-        ).fetchall()
+        _empty_alignment_table(conn, "aln")
+        sq_order = _write_sq_probe_bam(conn, names, bam)
 
-    assert rows, "fixture produced no alignments — the assertions below are vacuous"
-    keys = [(order[ref], pos) for ref, pos in rows]
-    assert keys == sorted(keys)
+    tid = {name: i for i, name in enumerate(sq_order)}
+    tids_in_name_order = [tid[name] for name in names]
+    assert tids_in_name_order != sorted(tids_in_name_order), (
+        "walking contigs in ascending name order gave ascending tids, so the @SQ "
+        "layout now matches the name order — see the docstring before relying on it"
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("samtools") is None,
+    reason="needs samtools; the fix it pins lives in binning.sh, which runs inside "
+    "the long-read-assembly binning image where samtools is present",
+)
+def test_samtools_sort_makes_the_bam_tid_monotonic(assembly, tmp_path):
+    """`samtools sort` is what actually produces the coordinate sort jgi demands.
+
+    The positive half of `test_contig_name_order_is_not_tid_order`: whatever the
+    writer emitted, the file `binning.sh` hands metaWRAP is tid-monotonic and still
+    carries an @SQ line for every contig (including the zero-coverage one — losing
+    those would silently drop contigs from the depth table).
+
+    SKIPPED wherever samtools is absent, which includes CI and a stock dev box —
+    so on those, this property is NOT covered in-repo. It was established on the
+    deploy host instead, inside the binning image, against the 2.0 GB BAM from the
+    ticket that exposed the bug: 11,390 out-of-order tid transitions over 925,483
+    records before the sort and 0 after, @SQ name sets identical (20,975 either
+    way, `cmp` clean), and jgi then reporting every contig — 20,925 of them at
+    depth 0 on a subset built to have zero-coverage contigs.
+    """
+    bam = _run(assembly, tmp_path)
+    sorted_bam = tmp_path / "sorted.bam"
+    subprocess.run(
+        ["samtools", "sort", "-o", str(sorted_bam), str(bam)],
+        check=True,
+        capture_output=True,
+    )
+
+    tids = _record_tids(sorted_bam)
+    assert tids, "fixture produced no alignments — the assertion below is vacuous"
+    assert tids == sorted(tids), "samtools sort did not leave the records tid-ordered"
+    assert sorted(_sq_reference_names(sorted_bam)) == [_CTG_A, _CTG_B, _CTG_UNCOVERED], (
+        "the sort dropped a contig from @SQ; the zero-coverage one is the point"
+    )
 
 
 def test_bam_carries_real_sequences(assembly, tmp_path):
@@ -302,8 +370,9 @@ def test_chimeric_and_reverse_reads_produce_a_valid_bam(tmp_path):
 def test_uncovered_contig_has_no_alignments(assembly, tmp_path):
     """The zero-coverage contig really is zero-coverage.
 
-    Without this, `test_sq_header_...` could pass on a fixture where every contig
-    happened to be hit, and would no longer be testing the header's provenance.
+    Without this, `test_sq_header_covers_every_contig` could pass on a fixture
+    where every contig happened to be hit, and would no longer be testing that a
+    zero-coverage contig still earns an @SQ line.
     """
     bam = _run(assembly, tmp_path)
     with open_miint_conn() as conn:
@@ -380,32 +449,84 @@ def test_empty_nolcg_yields_an_empty_bam(tmp_path):
     assert outputs["coverage_bam"].read_bytes() == b""
 
 
-def test_reflen_order_is_reversed_in_sq(tmp_path):
-    """miint reverses the REFERENCE_LENGTHS table when writing @SQ.
+# Contig count for the @SQ-order probe. Deliberately well past the handful this
+# file's `assembly` fixture uses: the reflen->@SQ "reversal" this file used to
+# assert is a SMALL-n COINCIDENCE, and how small depends on the names. Measured
+# (miint v1.5.4, 2026-07-24): with `s1.ctg%06dl`-style names a DESC reflen yields
+# ascending @SQ up to n=5 and diverges from n=6; with the `s<i>.ctg%06dl` names
+# used below it already diverges at n=3. A real assembly has thousands.
+_SQ_PROBE_N = 64
 
-    Pinned against miint DIRECTLY, both directions, because the step's entire sort
-    strategy is built on it and it is undocumented. If a miint bump stops
-    reversing, this fails with a clear cause — rather than
-    `test_sq_header_is_ascending...` failing with a confusing one.
+
+def _write_sq_probe_bam(conn, order: list[str], bam) -> list[str]:
+    """Write a record-less BAM whose REFERENCE_LENGTHS rows are in `order`."""
+    values = ", ".join(f"('{n}', 1000)" for n in order)
+    conn.execute(
+        f"CREATE OR REPLACE TABLE reflen AS SELECT * FROM (VALUES {values}) t(reference, length)"
+    )
+    conn.execute(f"COPY (SELECT * FROM aln) TO '{bam}' (FORMAT BAM, REFERENCE_LENGTHS 'reflen')")
+    return _sq_reference_names(bam)
+
+
+def test_sq_order_is_not_derivable_from_reflen(tmp_path):
+    """The @SQ order is NOT the REFERENCE_LENGTHS order, nor its reverse.
+
+    The finding that replaced this file's old `test_reflen_order_is_reversed_in_sq`
+    (qiita-probed 2026-07-24, miint v1.5.4, reproduced standalone on the deploy
+    host). That test asserted miint reverses the reflen table into @SQ, and it
+    passed — on three `s1.`-prefixed contigs. It is false in general: at n=5, 10,
+    64, 300 and 2000, with the table built ASC, DESC or shuffled, the emitted @SQ
+    order matches neither the table's row order, nor its reverse, nor
+    `ORDER BY reference`. The **set** is always preserved; only the order is
+    unpredictable. The rule miint actually uses is UNKNOWN — its source was not
+    read, so do not infer one from this fixture.
+
+    Why it is worth a test rather than a comment: `assembly_coverage` built its
+    reflen table DESC on the strength of the reversal claim and shipped a BAM
+    whose records were name-ordered but tid-scrambled, which
+    `jgi_summarize_bam_contig_depths` rejected outright in production. This is the
+    canary. If a miint bump makes @SQ track the reflen order, this test fails —
+    at which point `binning.sh`'s `samtools sort` could be revisited, but not
+    before. That is the exit condition on duckdb-miint#173; the removal work and
+    its full criteria are tracked from docs/duckdb-miint.md's "Open upstream gaps"
+    table.
     """
     bam = tmp_path / "order.bam"
-    names = [_CTG_A, _CTG_B, _CTG_UNCOVERED]
+    names = sorted(f"s{i}.ctg{i:06d}l" for i in range(1, _SQ_PROBE_N + 1))
+    descending = list(reversed(names))
 
+    first_pass_desc: list[str] = []
     with open_miint_conn() as conn:
         _empty_alignment_table(conn, "aln")
-        for order, expected in ((names, list(reversed(names))), (list(reversed(names)), names)):
-            values = ", ".join(f"('{n}', 1000)" for n in order)
-            conn.execute(
-                f"CREATE OR REPLACE TABLE reflen AS SELECT * FROM (VALUES {values}) "
-                "t(reference, length)"
+        for label, order in (("ASC", names), ("DESC", descending)):
+            got = _write_sq_probe_bam(conn, order, bam)
+            if label == "DESC":
+                first_pass_desc = got
+            assert sorted(got) == names, (
+                f"reflen order {label}: @SQ dropped or invented contigs — "
+                "the SET is the one part of the header that IS guaranteed"
             )
-            conn.execute(
-                f"COPY (SELECT * FROM aln) TO '{bam}' (FORMAT BAM, REFERENCE_LENGTHS 'reflen')"
+            assert got != order, (
+                f"reflen order {label} came back as @SQ verbatim; miint may have "
+                "gained a defined @SQ order — see binning.sh's samtools sort"
             )
-            assert _sq_reference_names(bam) == expected, (
-                f"reflen order {order} produced @SQ {_sq_reference_names(bam)}; "
-                "assembly_coverage assumes miint reverses it"
+            assert got != list(reversed(order)), (
+                f"reflen order {label} came back REVERSED in @SQ, the contract "
+                "assembly_coverage used to assume and that a production ticket "
+                "disproved; recheck before relying on it again"
             )
+
+    # Deterministic, though: the same table gives the same @SQ order on a FRESH
+    # connection, not merely twice within one. That is what makes the assertions
+    # above a statement about miint rather than about run-to-run noise — and the
+    # weaker same-connection form would not have distinguished the two.
+    with open_miint_conn() as conn:
+        _empty_alignment_table(conn, "aln")
+        again = _write_sq_probe_bam(conn, descending, tmp_path / "order2.bam")
+    assert again == first_pass_desc, (
+        "@SQ order changed between connections; the order assertions above would "
+        "then be about noise, not about miint"
+    )
 
 
 def test_format_bam_requires_reference_lengths(tmp_path):

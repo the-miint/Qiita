@@ -332,6 +332,22 @@ def build_job_submit_payload(
         # stages real work through it (an assembly, a decompressed FASTQ) dies
         # partway through, having also charged those bytes to the job's cgroup
         # memory. Point it at the workspace: real disk, already bound via --home.
+        #
+        # QIITA_CPUS / QIITA_MEM_MB are the resolved allocation, forwarded for the
+        # same reason: `--containall` scrubs the SLURM_* vars too, so an entrypoint
+        # inside the container sees NEITHER SLURM_CPUS_PER_TASK NOR
+        # SLURM_MEM_PER_NODE (measured: zero SLURM_* vars survive). Without these,
+        # a tool sized "per the allocation" is really sized off `nproc` and off
+        # nothing at all — and `nproc` only happens to equal the allocation because
+        # SLURM cpuset-binds the step; a site with cpuset binding off would hand a
+        # 16-cpu step the node's full core count. Memory has no such accident:
+        # nothing inside the container reveals the cgroup ceiling (the enforcing
+        # cgroup is a PARENT of the one /proc/self/cgroup names), while the ceiling
+        # is real and fatal — the SLURM cgroup carries memory.max = the step's
+        # --mem, and a per-thread tool budget that overshoots it is an OOM kill.
+        # These are the only channel; treat them as part of the container contract
+        # (`workflows/_shared/_lib.sh` resolves both, with fallbacks for off-SLURM
+        # local runs).
         apptainer_args = [
             "--home",
             f"{workspace}:{workspace}",
@@ -341,6 +357,10 @@ def build_job_submit_payload(
             f"QIITA_OUTPUT_PATH={output_path}",
             "--env",
             f"QIITA_WORK_TICKET_IDX={work_ticket_idx}",
+            "--env",
+            f"QIITA_CPUS={baseline_resources.cpu}",
+            "--env",
+            f"QIITA_MEM_MB={baseline_resources.mem_gb * 1024}",
             "--env",
             f"TMPDIR={workspace}/tmp",
             "--bind",
