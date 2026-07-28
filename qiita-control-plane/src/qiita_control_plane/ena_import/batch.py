@@ -34,7 +34,6 @@ from typing import Any
 
 import asyncpg
 from fastapi import FastAPI
-from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena_import import (
     BatchImportItem,
@@ -43,8 +42,7 @@ from qiita_common.models.ena_import import (
     RunImportOutcome,
 )
 
-from ..auth.principal import HumanUser, _human_user_from_row
-from ..auth.scopes import role_ceiling
+from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
 from ..repositories.study import get_or_create_study_by_ena_accessions
 from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
@@ -84,37 +82,6 @@ class BatchImportItemHandle:
 
     idx: int
     ena_study_accession: str
-
-
-async def _load_principal(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
-    """Reconstruct the submitting `HumanUser` from a principal_idx.
-
-    The background task and startup reconcile have no request-bound `Principal`
-    to reuse, so this locally re-implements `auth.principal._build_human_user`'s
-    query (`role_ceiling` supplies the same scope set an OIDC session would).
-    Same guard: a disabled/retired principal is refused, not just a missing one
-    -- an admin disabled/retired AFTER submission must not be re-driven on their
-    behalf across a CP restart.
-    """
-    row = await pool.fetchrow(
-        "SELECT p.idx, p.system_role, p.disabled, p.retired, u.email, u.profile_complete"
-        " FROM qiita.principal p JOIN qiita.user u ON u.principal_idx = p.idx"
-        " WHERE p.idx = $1",
-        principal_idx,
-    )
-    if row is None:
-        raise RuntimeError(
-            f"principal {principal_idx} not found (or not a human user);"
-            " cannot submit/re-drive ena_import_batch work on its behalf"
-        )
-    if row["disabled"] or row["retired"]:
-        raise RuntimeError(
-            f"principal {principal_idx}: {MSG_PRINCIPAL_DISABLED_OR_RETIRED};"
-            " cannot submit/re-drive ena_import_batch work on its behalf"
-        )
-    # Same construction the OIDC/token loaders use; the guard above is this
-    # loader's addition (a disabled/retired principal must not be re-driven).
-    return _human_user_from_row(row, scopes=role_ceiling(row["system_role"]))
 
 
 async def create_ena_import_batch(
@@ -533,8 +500,8 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
             # batch, not raise out of the lifespan reconcile and keep the whole
             # control plane down -- the same per-accession isolation this module
             # promises everywhere else.
-            principal = await _load_principal(pool, principal_idx)
-        except RuntimeError:
+            principal = await load_human_user(pool, principal_idx)
+        except PrincipalUnusableError:
             _log.exception(
                 "cannot re-drive ena_import_batch %d -- unresolvable submitting principal %d",
                 batch_idx,

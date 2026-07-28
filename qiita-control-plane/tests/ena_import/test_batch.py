@@ -91,13 +91,10 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
     return list(_RUN_COLUMNS), [row]
 
 
-def _fake_attrs(accession: str) -> tuple[list[str], list[tuple]]:
-    # At least one row so most tests exercise the harmonized-metadata path; the
+def _fake_attrs(accession: str) -> list[tuple[str, dict[str, str]]]:
+    # At least one sample so most tests exercise the harmonized-metadata path; the
     # empty-attributes case is covered separately by monkeypatching _QUERY_ATTRS to [].
-    return (
-        ["sample_accession", "tag", "value"],
-        [(f"SAMN-{accession}", "collection date", "2020-01-01")],
-    )
+    return [(f"SAMN-{accession}", {"collection date": "2020-01-01"})]
 
 
 @pytest.fixture(autouse=True)
@@ -517,7 +514,7 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
 ):
     """Real DDBJ finding: a sample can have ZERO ENA attributes (PRJDB40364's
     SAMD01818724). An empty resolve result must register normally, never fail the item."""
-    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: (["sample_accession", "tag", "value"], []))
+    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: [])
 
     accession = unique_accession("PRJDB")
     batch_idx, items = await create_ena_import_batch(
@@ -739,11 +736,8 @@ def _make_shared_sample_fakes(shared_sample_accession: str):
         )
         return list(_RUN_COLUMNS), [row]
 
-    def _fake_attrs_shared(accession: str) -> tuple[list[str], list[tuple]]:
-        return (
-            ["sample_accession", "tag", "value"],
-            [(shared_sample_accession, "collection date", "2020-01-01")],
-        )
+    def _fake_attrs_shared(accession: str) -> list[tuple[str, dict[str, str]]]:
+        return [(shared_sample_accession, {"collection date": "2020-01-01"})]
 
     return _fake_runs_shared, _fake_attrs_shared
 
@@ -1295,11 +1289,7 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     def _bad_latitude_attrs(accession):
         # ILLUMINA maps (pool created), but an unparseable latitude fails the run
         # in harmonization -- the created_pools-non-empty / all-runs-failed case.
-        sample = f"SAMN-{accession}"
-        return (
-            ["sample_accession", "tag", "value"],
-            [(sample, "geographic location (latitude)", "not-a-number")],
-        )
+        return [(f"SAMN-{accession}", {"geographic location (latitude)": "not-a-number"})]
 
     monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
 

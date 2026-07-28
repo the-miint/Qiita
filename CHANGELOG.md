@@ -880,6 +880,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA sample attributes are grouped by DuckDB, not pivoted in Python (#369).**
+  `read_ena_attributes` returns one narrow `(sample_accession, tag, value)` row
+  per attribute; the resolver now groups them into a `MAP` in SQL and DuckDB
+  hands each sample back as a plain `dict`. One row per sample crosses the wire
+  instead of one per attribute, and the hand-rolled `pivot_sample_attributes`
+  is gone. Verified against live ENA (`PRJNA48739`).
+- **One human-user loader instead of two (#369).** `ena_import.batch`
+  re-implemented `auth.principal._build_human_user`'s query, disabled/retired
+  guard, and construction so a background task could load a principal without a
+  request. Both now call a shared `auth.principal.load_human_user`, which raises
+  `PrincipalUnusableError`; the OIDC path maps that to its 401.
+
 - **`httpfs` is loaded with miint, not per caller (#369).** `miint_load_sql`
   now emits `LOAD miint; LOAD httpfs;` and `miint_install_sql` installs httpfs
   alongside miint, so install and load stay symmetric for every context that

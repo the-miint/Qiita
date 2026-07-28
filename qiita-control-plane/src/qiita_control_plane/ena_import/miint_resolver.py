@@ -16,7 +16,7 @@ from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyH
 from qiita_control_plane.miint import connect_with_miint_staged
 
 from .accession import validate_study_accession
-from .resolver import EnaAccessionNotFoundError, pivot_sample_attributes
+from .resolver import EnaAccessionNotFoundError
 
 # Explicit fields for read_run: only the columns EnaRunRecord models, not read_ena's
 # full default set (which also carries sample-descriptive fields out of scope here).
@@ -48,13 +48,21 @@ def _query_ena_runs(accession: str) -> tuple[list[str], list[tuple]]:
         return [d[0] for d in rel.description], rel.fetchall()
 
 
-def _query_ena_sample_attributes(accession: str) -> tuple[list[str], list[tuple]]:
-    """`read_ena_attributes(accession)` — one (sample_accession, tag, value)
-    row per submitter-defined attribute, across every sample under the
-    study (miint resolves the study accession to its samples internally)."""
+def _query_ena_sample_attributes(accession: str) -> list[tuple[str, dict[str, str]]]:
+    """`read_ena_attributes(accession)` — one `(sample_accession, attributes)`
+    row per sample under the study, the narrow `(sample_accession, tag, value)`
+    rows grouped into a MAP by DuckDB rather than in Python. Sends one row per
+    sample instead of one per attribute, and DuckDB hands the MAP back as a
+    plain `dict`."""
     with connect_with_miint_staged() as con:
-        rel = con.execute("SELECT * FROM read_ena_attributes($accession)", {"accession": accession})
-        return [d[0] for d in rel.description], rel.fetchall()
+        return con.execute(
+            "SELECT sample_accession,"
+            "       map_from_entries(list(struct_pack(k := tag, v := value))) AS attributes"
+            " FROM read_ena_attributes($accession)"
+            " GROUP BY sample_accession"
+            " ORDER BY sample_accession",
+            {"accession": accession},
+        ).fetchall()
 
 
 class MiintEnaResolver:
@@ -76,7 +84,7 @@ class MiintEnaResolver:
 
     def resolve_sample_attributes(self, accession: str) -> list[EnaSampleAttributes]:
         accession = validate_study_accession(accession)
-        columns, rows = _query_ena_sample_attributes(accession)
+        rows = _query_ena_sample_attributes(accession)
         if not rows:
             # Unlike resolve_study_header/resolve_runs, 0 rows here is NOT "nothing
             # resolved" -- a real ENA/DDBJ sample can carry zero <SAMPLE_ATTRIBUTE>
@@ -84,4 +92,7 @@ class MiintEnaResolver:
             # already proved these samples real. Return [] rather than raise;
             # registration.register_ena_study treats a missing sample as empty.
             return []
-        return pivot_sample_attributes(columns, rows)
+        return [
+            EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
+            for sample_accession, attributes in rows
+        ]

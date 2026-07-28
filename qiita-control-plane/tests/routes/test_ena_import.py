@@ -75,11 +75,8 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
     return list(_RUN_COLUMNS), [row]
 
 
-def _fake_attrs(accession: str) -> tuple[list[str], list[tuple]]:
-    return (
-        ["sample_accession", "tag", "value"],
-        [(f"SAMN-{accession}", "collection date", "2020-01-01")],
-    )
+def _fake_attrs(accession: str) -> list[tuple[str, dict[str, str]]]:
+    return [(f"SAMN-{accession}", {"collection date": "2020-01-01"})]
 
 
 @pytest.fixture(autouse=True)

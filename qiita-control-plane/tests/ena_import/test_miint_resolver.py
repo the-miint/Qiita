@@ -69,6 +69,17 @@ def assert_prjna48739_runs(runs: list[EnaRunRecord]) -> None:
     assert paired.base_count == 87391853
 
 
+def _group_fixture_rows(columns, rows):
+    """Group the recorded narrow `(sample_accession, tag, value)` fixture the way
+    `_query_ena_sample_attributes`' SQL now does, so the fixture keeps its
+    recorded-from-ENA shape while the fake matches what DuckDB returns."""
+    sample_i, tag_i, value_i = (columns.index(c) for c in ("sample_accession", "tag", "value"))
+    grouped: dict[str, dict[str, str]] = {}
+    for row in rows:
+        grouped.setdefault(row[sample_i], {})[row[tag_i]] = row[value_i]
+    return sorted(grouped.items())
+
+
 def assert_prjna48739_sample_attributes(attrs: list[EnaSampleAttributes]) -> None:
     assert len(attrs) == 1
     sample = attrs[0]
@@ -134,7 +145,7 @@ def test_resolve_sample_attributes_pivots_by_sample(monkeypatch):
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
     columns, rows = _load_fixture("sample_attributes.json")
-    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: (columns, rows))
+    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: _group_fixture_rows(columns, rows))
 
     attrs = MiintEnaResolver().resolve_sample_attributes("PRJNA48739")
 
@@ -146,7 +157,7 @@ def test_resolve_sample_attributes_zero_rows_returns_empty_list(monkeypatch):
     read_ena_attributes result is "no attributes", not "nonexistent" -- must NOT raise."""
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
-    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: (["sample_accession", "tag", "value"], []))
+    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: [])
 
     attrs = MiintEnaResolver().resolve_sample_attributes("PRJDB40364")
 

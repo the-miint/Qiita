@@ -119,11 +119,8 @@ def _make_two_runs_sharing_one_sample(shared_sample_accession: str):
         ]
         return list(_RUN_COLUMNS), rows
 
-    def _fake_attrs(accession: str) -> tuple[list[str], list[tuple]]:
-        return (
-            ["sample_accession", "tag", "value"],
-            [(shared_sample_accession, "collection date", "2020-01-01")],
-        )
+    def _fake_attrs(accession: str) -> list[tuple[str, dict[str, str]]]:
+        return [(shared_sample_accession, {"collection date": "2020-01-01"})]
 
     return _fake_runs, _fake_attrs
 
