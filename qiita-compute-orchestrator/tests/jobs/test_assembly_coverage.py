@@ -264,6 +264,36 @@ def test_samtools_sort_makes_the_bam_tid_monotonic(assembly, tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    shutil.which("samtools") is None,
+    reason="needs samtools; the behaviour it pins is relied on by binning.sh's "
+    "contig-set-drift guard, which runs inside the long-read-assembly binning image",
+)
+def test_faidx_exits_nonzero_on_a_missing_region(tmp_path):
+    """binning.sh's drift guard leans on `samtools faidx` FAILING on an absent name.
+
+    The reorder pipes the BAM's @SQ names into `xargs ... samtools faidx <assembly>`.
+    If an @SQ name is not in the assembly, faidx must exit non-zero so `xargs` (and
+    the entrypoint's `set -e`) fail the step — that is the guard's "@SQ name not in
+    noLCG" direction, which the static count check cannot catch (faidx pads a header
+    for the missing name, so `grep -c '^>'` counts stay equal). Pin that faidx
+    behaviour directly, rather than leaving it a comment. SKIPPED without samtools
+    (CI, dev boxes); it holds inside the binning image where samtools is present.
+    """
+    fa = tmp_path / "asm.fa"
+    fa.write_text(">c1\nACGTACGTACGT\n>c2\nTTTTGGGGCCCC\n")
+    subprocess.run(["samtools", "faidx", str(fa)], check=True, capture_output=True)
+
+    present = subprocess.run(["samtools", "faidx", str(fa), "c1"], capture_output=True)
+    assert present.returncode == 0, "faidx failed on a present region — fixture is wrong"
+
+    missing = subprocess.run(["samtools", "faidx", str(fa), "c1", "cNOPE"], capture_output=True)
+    assert missing.returncode != 0, (
+        "samtools faidx returned 0 for an absent region — binning.sh's drift guard "
+        "would then NOT fail the step when the @SQ set has a name absent from noLCG"
+    )
+
+
 def test_bam_carries_real_sequences(assembly, tmp_path):
     """SEQ is written, not `*`.
 

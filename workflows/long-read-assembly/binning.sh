@@ -156,16 +156,23 @@ mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 # same duckdb-miint#173 root as the sort above, surfacing at a second consumer. The
 # sort fixes record order but never touches @SQ order, so the two disagree and
 # metabat2 rejects. Verified on the shipped samtools 1.10 / metabat2 2.15: a
-# numeric-order assembly reproduces the abort, the @SQ-reordered one clears it (see
-# test_binning_coverage_sort_pin.py). Removable together with the sort when
-# duckdb-miint#173 lands — docs/duckdb-miint.md's "Open upstream gaps" row carries
-# the exit criteria.
+# numeric-order assembly reproduces the abort, the @SQ-reordered one clears it.
+# Removable together with the sort when duckdb-miint#173 lands — docs/duckdb-miint.md's
+# "Open upstream gaps" row carries the exit criteria.
 #
 # samtools faidx writes its .fai next to the FASTA and genomes_dir is a read-only
 # bind, so index a WORK copy rather than noLCG in place. xargs batches the ~21k
 # region names under ARG_MAX; faidx emits regions in argument order and xargs
 # preserves order across batches, so the output follows @SQ order exactly. (samtools
 # 1.10 has no `-r region-file`; xargs is the version-safe equivalent.)
+#
+# `xargs --no-run-if-empty` is load-bearing, not a nicety: without it, an empty
+# order file makes xargs run `faidx` ONCE with no regions, which emits the WHOLE
+# assembly in its original (numeric) order — same contig count as noLCG, so the
+# count guard below would pass and metaWRAP would get the un-reordered assembly,
+# the exact bug. Unreachable today (the @SQ set equals noLCG's, so an empty order
+# file implies an empty noLCG, which exited above), but the flag makes the guard's
+# fail-loud cover that seam instead of silently passing.
 #
 # Disk: two assembly-sized copies (assembly.fa + assembly.ordered.fa) land in WORK.
 # The assembly is ≪ the read set, so this is small next to READS_FQ and the sort
@@ -176,7 +183,8 @@ micromamba run -n metawrap samtools view -H "${WORK_FILES}/${READS_STEM}.bam" \
 cp "${NOLCG}" "${WORK}/assembly.fa"
 micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa"
 ORDERED_NOLCG="${WORK}/assembly.ordered.fa"
-xargs -a "${STAGED_ORDER}" micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa" > "${ORDERED_NOLCG}"
+xargs --no-run-if-empty -a "${STAGED_ORDER}" \
+    micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa" > "${ORDERED_NOLCG}"
 
 # Fail loud on any contig-set drift: the reorder must neither drop nor invent a
 # contig. assembly_coverage maps the reads to noLCG, so the BAM's @SQ set equals
