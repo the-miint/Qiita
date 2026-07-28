@@ -16,8 +16,6 @@ from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
     EnaStudyHeader,
-    ResolverKind,
-    SourceArchive,
 )
 
 from qiita_control_plane.ena_import.registration import (
@@ -181,8 +179,6 @@ async def _register(reg, *, study_header, runs, sample_attributes=()):
         sample_attributes=list(sample_attributes),
         owner_idx=reg["owner_idx"],
         caller_idx=reg["caller_idx"],
-        source_archive=SourceArchive.ENA,
-        resolver_kind=ResolverKind.MIINT,
     )
     reg["tracker"].study_idxs.append(result.study_idx)
     reg["tracker"].study_accessions.append(study_header.study_accession)
@@ -907,29 +903,6 @@ async def test_created_pools_empty_when_every_run_fails(reg):
 # ---------------------------------------------------------------------------
 # Provenance columns persisted
 # ---------------------------------------------------------------------------
-
-
-async def test_provenance_columns_persisted(reg):
-    study_accession = unique_accession("PRJNA")
-    header = _study_header(study_accession=study_accession)
-    run = _run(
-        run_accession=unique_accession("SRR"),
-        experiment_accession=unique_accession("SRX"),
-        sample_accession=unique_accession("SAMN"),
-        study_accession=study_accession,
-    )
-
-    await _register(reg, study_header=header, runs=[run])
-
-    row = await reg["pool"].fetchrow(
-        "SELECT source_archive, resolver_kind, transport"
-        " FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
-        run.run_accession,
-    )
-    assert row["source_archive"] == "ena"
-    assert row["resolver_kind"] == "miint"
-    # transport stays NULL in T02 -- populated by the download workflow.
-    assert row["transport"] is None
 
 
 # ---------------------------------------------------------------------------

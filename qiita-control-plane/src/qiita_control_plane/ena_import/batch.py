@@ -36,7 +36,6 @@ import asyncpg
 from fastapi import FastAPI
 from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED
 from qiita_common.models import WorkTicketState
-from qiita_common.models.ena import ResolverKind, SourceArchive
 from qiita_common.models.ena_import import (
     BatchImportItem,
     BatchImportStatus,
@@ -47,7 +46,7 @@ from qiita_common.models.ena_import import (
 from ..auth.principal import HumanUser, _human_user_from_row
 from ..auth.scopes import role_ceiling
 from .accession import validate_study_accession
-from .miint_resolver import BACKEND_MIINT, MiintEnaResolver
+from .miint_resolver import MiintEnaResolver
 from .registration import (
     EnaStudyRegistrationResult,
     RunRegistrationStatus,
@@ -122,34 +121,25 @@ async def create_ena_import_batch(
     *,
     accessions: list[str],
     principal: HumanUser,
-    resolver_backend: str,
-    source_archive: SourceArchive,
     download_method: str,
 ) -> tuple[int, list[BatchImportItemHandle]]:
     """INSERT the batch row + one `pending` item per accession, synchronously.
 
-    Validates every accession's shape and `resolver_backend` up front (fail-loud,
-    before any write) so a batch with one garbage accession never partially lands
-    -- the resolver instance is discarded here; each item builds its own inside
-    `_process_one_study`. Returns the batch idx and item handles in submitted
-    order; the route fires the background task next.
+    Validates every accession's shape up front (fail-loud, before any write) so
+    a batch with one garbage accession never partially lands. Returns the batch
+    idx and item handles in submitted order; the route fires the background task
+    next.
     """
     # De-duplicate accessions, order-preserving: a repeated accession in one
     # request would otherwise fan out concurrent items registering the same study.
     validated = list(dict.fromkeys(validate_study_accession(a) for a in accessions))
-    if resolver_backend != BACKEND_MIINT:  # fail loud on an unrecognized backend
-        raise ValueError(
-            f"unknown ENA resolver backend={resolver_backend!r}; expected {BACKEND_MIINT!r}"
-        )
 
     async with pool.acquire() as conn, conn.transaction():
         batch_idx = await conn.fetchval(
             "INSERT INTO qiita.ena_import_batch"
-            " (submitted_by_principal_idx, resolver_backend, source_archive, download_method)"
-            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            " (submitted_by_principal_idx, download_method)"
+            " VALUES ($1, $2) RETURNING idx",
             principal.principal_idx,
-            resolver_backend,
-            source_archive.value,
             download_method,
         )
         items: list[BatchImportItemHandle] = []
@@ -289,9 +279,6 @@ async def _process_one_study(
     *,
     item: BatchImportItemHandle,
     principal: HumanUser,
-    resolver_backend: str,
-    source_archive: SourceArchive,
-    resolver_kind: ResolverKind,
     download_method: str,
 ) -> None:
     """Resolve + register ONE study, then submit one download-ena-study ticket
@@ -318,8 +305,6 @@ async def _process_one_study(
             sample_attributes=sample_attributes,
             owner_idx=principal.principal_idx,
             caller_idx=principal.principal_idx,
-            source_archive=source_archive,
-            resolver_kind=resolver_kind,
         )
         await _set_item_registered(
             pool,
@@ -405,9 +390,6 @@ async def _run_batch(
     *,
     items: list[BatchImportItemHandle],
     principal: HumanUser,
-    resolver_backend: str,
-    source_archive: SourceArchive,
-    resolver_kind: ResolverKind,
     download_method: str,
 ) -> None:
     """Process every item with bounded concurrency. Never raises -- each
@@ -421,9 +403,6 @@ async def _run_batch(
                 pool,
                 item=item,
                 principal=principal,
-                resolver_backend=resolver_backend,
-                source_archive=source_archive,
-                resolver_kind=resolver_kind,
                 download_method=download_method,
             )
 
@@ -435,9 +414,6 @@ def schedule_ena_import_batch(
     *,
     items: list[BatchImportItemHandle],
     principal: HumanUser,
-    resolver_backend: str,
-    source_archive: SourceArchive,
-    resolver_kind: ResolverKind,
     download_method: str,
 ) -> asyncio.Task:
     """Fire-and-forget the batch's resolve+register+submit background task on
@@ -452,9 +428,6 @@ def schedule_ena_import_batch(
             app.state.pool,
             items=items,
             principal=principal,
-            resolver_backend=resolver_backend,
-            source_archive=source_archive,
-            resolver_kind=resolver_kind,
             download_method=download_method,
         ),
         name="ena_import_batch",
@@ -480,8 +453,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     pool = app.state.pool
     rows = await pool.fetch(
         "SELECT bi.idx, bi.ena_study_accession, bi.batch_idx,"
-        "       b.submitted_by_principal_idx, b.resolver_backend, b.source_archive,"
-        "       b.download_method"
+        "       b.submitted_by_principal_idx, b.download_method"
         " FROM qiita.ena_import_batch_item bi"
         " JOIN qiita.ena_import_batch b ON b.idx = bi.batch_idx"
         " WHERE bi.state = ANY($1::text[])"
@@ -502,21 +474,16 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     total = 0
     for batch_idx, batch_rows in by_batch.items():
         principal_idx = batch_rows[0]["submitted_by_principal_idx"]
-        resolver_backend = batch_rows[0]["resolver_backend"]
         download_method = batch_rows[0]["download_method"]
         try:
-            # Convert the persisted enum-backed columns INSIDE the guard: a
-            # malformed value (e.g. a hand-written 'http' resolver_backend the
-            # CHECK now forbids) must fail only this batch, not raise out of the
-            # lifespan reconcile and keep the whole control plane down -- the same
-            # per-accession isolation this module promises everywhere else.
-            source_archive = SourceArchive(batch_rows[0]["source_archive"])
-            resolver_kind = ResolverKind(resolver_backend)
+            # Inside the guard: an unresolvable principal must fail only this
+            # batch, not raise out of the lifespan reconcile and keep the whole
+            # control plane down -- the same per-accession isolation this module
+            # promises everywhere else.
             principal = await _load_principal(pool, principal_idx)
-        except RuntimeError, ValueError:
+        except RuntimeError:
             _log.exception(
-                "cannot re-drive ena_import_batch %d -- unresolvable submitting"
-                " principal %d or malformed persisted batch metadata",
+                "cannot re-drive ena_import_batch %d -- unresolvable submitting principal %d",
                 batch_idx,
                 principal_idx,
             )
@@ -534,9 +501,6 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
             app,
             items=items,
             principal=principal,
-            resolver_backend=resolver_backend,
-            source_archive=source_archive,
-            resolver_kind=resolver_kind,
             download_method=download_method,
         )
         total += len(items)

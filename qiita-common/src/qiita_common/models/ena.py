@@ -10,8 +10,6 @@ than silently becoming `None`/`0`.
 
 from __future__ import annotations
 
-from enum import StrEnum
-
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -123,26 +121,3 @@ class EnaSampleAttributes(BaseModel):
             if not isinstance(value, str):
                 raise ValueError(f"attribute value for tag {tag!r} must be a string; got {value!r}")
         return v
-
-
-class SourceArchive(StrEnum):
-    """Public archive an `ena_import`-registered `sequenced_sample` row's
-    metadata and reads were resolved from.
-
-    Mirrored by the `qiita.sequenced_sample.source_archive` TEXT/CHECK constraint
-    — not a Postgres ENUM; same carve-out as `UploadStatus` / `ReferenceStatus`;
-    see CLAUDE.md "Enum parity". Keep both sides in sync by hand."""
-
-    ENA = "ena"
-    SRA = "sra"
-
-
-class ResolverKind(StrEnum):
-    """Which resolver produced a `sequenced_sample` row's imported metadata.
-    Only `miint` (`ena_import.BACKEND_MIINT`) today.
-
-    Mirrored by the `qiita.sequenced_sample.resolver_kind` TEXT/CHECK constraint
-    — not a Postgres ENUM; same carve-out as `UploadStatus` / `ReferenceStatus`;
-    see CLAUDE.md "Enum parity". Keep both sides in sync by hand."""
-
-    MIINT = "miint"

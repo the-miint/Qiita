@@ -1,5 +1,5 @@
 -- Batch multi-study ENA import: a `qiita.ena_import_batch` row is
--- one `POST /api/v1/ena-import-batch` submission (a list of ENA/SRA study
+-- one `POST /api/v1/ena-import-batch` submission (a list of ENA study
 -- accessions); one `qiita.ena_import_batch_item` row per accession tracks
 -- its own resolve/register/download-submit progress independently, so one
 -- accession's failure never affects its siblings -- mirrors the
@@ -7,8 +7,8 @@
 -- guarantees, one level up.
 --
 -- Both tables are additive and reversible; no CREATE TYPE (matches
--- `sequenced_sample.source_archive` / `resolver_kind` and `upload.status` --
--- TEXT/CHECK, not a Postgres ENUM; see CLAUDE.md "Enum parity").
+-- `upload.status` -- TEXT/CHECK, not a Postgres ENUM; see CLAUDE.md
+-- "Enum parity").
 --
 -- State machine (qiita.ena_import_batch_item.state, mirrored by
 -- qiita_common.models.ena_import.BatchItemState):
@@ -43,35 +43,18 @@ CREATE TABLE qiita.ena_import_batch (
 
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    -- Which resolver backend every item in this batch resolves through.
-    -- Mirrors qiita_control_plane.ena_import.miint_resolver.BACKEND_MIINT. A
-    -- single-value CHECK -- the HTTP resolver was removed, leaving miint the sole
-    -- backend -- so a future backend is a deliberate migration, not silent drift.
-    -- It also keeps a hand-written 'http' row from reaching the startup enum
-    -- conversion in reconcile_inflight_batches (ResolverKind has only MIINT).
-    resolver_backend             TEXT NOT NULL DEFAULT 'miint'
-        CHECK (resolver_backend IN ('miint')),
-
-    -- Which public archive this batch's reads/metadata come from. Mirrors
-    -- qiita_common.models.ena.SourceArchive.
-    source_archive               TEXT NOT NULL DEFAULT 'ena'
-        CHECK (source_archive IN ('ena', 'sra')),
-
     -- Transport pinned into every download-ena-study ticket this batch
     -- submits. Only 'http' is supported today -- no Aspera key-staging in
-    -- this compute environment (see docs/architecture.md's ENA Study Import
-    -- download-ticket-granularity decision); a single-value CHECK so a
-    -- future transport addition is a deliberate migration, not a silent
-    -- drift.
+    -- this compute environment; a single-value CHECK so a future transport
+    -- is a deliberate migration, not silent drift.
     download_method               TEXT NOT NULL DEFAULT 'http'
         CHECK (download_method IN ('http'))
 );
 
 COMMENT ON TABLE qiita.ena_import_batch IS
-    'One POST /api/v1/ena-import-batch submission: a list of ENA/SRA study '
+    'One POST /api/v1/ena-import-batch submission: a list of ENA study '
     'accessions fanned out into one qiita.ena_import_batch_item per '
-    'accession. resolver_backend/source_archive/download_method mirror '
-    'qiita_common.models.ena_import.BatchImportRequest.';
+    'accession.';
 
 
 CREATE TABLE qiita.ena_import_batch_item (

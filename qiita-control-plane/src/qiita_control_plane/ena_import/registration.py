@@ -44,8 +44,6 @@ from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
     EnaStudyHeader,
-    ResolverKind,
-    SourceArchive,
 )
 
 from qiita_control_plane.repositories._sample_helpers import (
@@ -135,16 +133,13 @@ async def register_ena_study(
     sample_attributes: list[EnaSampleAttributes],
     owner_idx: int,
     caller_idx: int,
-    source_archive: SourceArchive,
-    resolver_kind: ResolverKind,
 ) -> EnaStudyRegistrationResult:
     """Register one resolved ENA study's runs and samples.
 
     `sample_attributes` is indexed once by `sample_accession` and harmonized
     onto each run's biosample (or `{}` if the resolver found none) when that
     biosample is newly created, inside the run's own transaction.
-    `owner_idx` / `caller_idx` / `source_archive` / `resolver_kind` are identity
-    inputs the caller must supply.
+    `owner_idx` / `caller_idx` are identity inputs the caller must supply.
 
     Never raises for a per-run failure (see `RunRegistrationOutcome`); an
     unmappable `instrument_platform` is one such isolated per-run failure.
@@ -218,8 +213,6 @@ async def register_ena_study(
                     sequenced_pool_idx=sequenced_pool_idx_by_platform[platform],
                     owner_idx=owner_idx,
                     caller_idx=caller_idx,
-                    source_archive=source_archive,
-                    resolver_kind=resolver_kind,
                     metadata_checklist_idx=metadata_checklist_idx,
                     attrs_by_sample_accession=attrs_by_sample_accession,
                 )
@@ -287,8 +280,6 @@ async def _register_one_run(
     sequenced_pool_idx: int,
     owner_idx: int,
     caller_idx: int,
-    source_archive: SourceArchive,
-    resolver_kind: ResolverKind,
     metadata_checklist_idx: int,
     attrs_by_sample_accession: dict[str, EnaSampleAttributes],
 ) -> RunRegistrationOutcome:
@@ -363,8 +354,6 @@ async def _register_one_run(
                 caller_idx=caller_idx,
                 ena_experiment_accession=run.experiment_accession,
                 ena_run_accession=run.run_accession,
-                source_archive=source_archive.value,
-                resolver_kind=resolver_kind.value,
             )
             return RunRegistrationOutcome(
                 run_accession=run.run_accession,

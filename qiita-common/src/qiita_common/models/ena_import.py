@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class BatchItemState(StrEnum):
@@ -37,16 +37,13 @@ class BatchItemState(StrEnum):
 class BatchImportRequest(BaseModel):
     """Body for `POST /api/v1/ena-import-batch`.
 
-    `accessions`: ENA/SRA STUDY accessions, one `qiita.study` per entry.
-    `backend`: metadata resolver backend (`'miint'`, the only value today).
-    `source`: the archive reads come from (`SourceArchive`, `'ena'`
-    default). `download_method`: transport for each spawned ticket (only `'http'`
-    supported today).
+    `accessions`: ENA STUDY accessions, one `qiita.study` per entry.
+    `download_method`: transport for each spawned ticket (only `'http'` today).
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     accessions: list[str] = Field(min_length=1)
-    backend: str = "miint"
-    source: str = "ena"
     download_method: str = "http"
 
 

@@ -104,8 +104,6 @@ from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
     EnaStudyHeader,
-    ResolverKind,
-    SourceArchive,
 )
 from qiita_common.models.ena_import import (
     BatchImportItem,
@@ -405,8 +403,6 @@ __all__ = [
     "EnaRunRecord",
     "EnaSampleAttributes",
     "EnaStudyHeader",
-    "ResolverKind",
-    "SourceArchive",
     # Batch ENA import.
     "BatchImportItem",
     "BatchImportRequest",

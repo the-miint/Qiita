@@ -25,7 +25,6 @@ from qiita_common.models import (
     BatchImportStatus,
     BatchItemState,
 )
-from qiita_common.models.ena import ResolverKind, SourceArchive
 
 from ..auth.guards import require_human_with_role
 from ..auth.principal import HumanUser
@@ -63,9 +62,9 @@ async def submit_ena_import_batch(
     principal: HumanUser = Depends(require_human_with_role(SystemRole.WET_LAB_ADMIN)),
     _: None = Depends(_require_compute_backend_client),
 ) -> BatchImportResponse:
-    """Fail loud (422), before writing anything, on an unrecognized `source`, an
-    unsupported `download_method`, or any malformed accession — one bad accession
-    422s the whole submission.
+    """Fail loud (422), before writing anything, on an unsupported
+    `download_method` or any malformed accession — one bad accession 422s the
+    whole submission.
 
     On success: INSERT the batch + one `pending` item per accession, fire the
     background task, return 202. `principal` (the submitting admin) is threaded
@@ -73,14 +72,6 @@ async def submit_ena_import_batch(
     and the principal `submit_work_ticket_core` enforces each download ticket's
     audience against — never bypassed just because this route is admin-gated.
     """
-    try:
-        source_archive = SourceArchive(body.source)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"unknown source archive: {body.source!r}",
-        ) from exc
-
     if body.download_method != DEFAULT_DOWNLOAD_METHOD:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -95,13 +86,10 @@ async def submit_ena_import_batch(
             pool,
             accessions=body.accessions,
             principal=principal,
-            resolver_backend=body.backend,
-            source_archive=source_archive,
             download_method=body.download_method,
         )
     except ValueError as exc:
-        # InvalidEnaAccessionError or an unrecognized resolver `backend` -- both
-        # raised by create_ena_import_batch before any row is written.
+        # InvalidEnaAccessionError, raised before any row is written.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
@@ -110,9 +98,6 @@ async def submit_ena_import_batch(
         request.app,
         items=items,
         principal=principal,
-        resolver_backend=body.backend,
-        source_archive=source_archive,
-        resolver_kind=ResolverKind(body.backend),
         download_method=body.download_method,
     )
 

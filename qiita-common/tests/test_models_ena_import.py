@@ -13,21 +13,24 @@ def test_batch_import_request_defaults():
 
     req = BatchImportRequest(accessions=["PRJEB1234"])
     assert req.accessions == ["PRJEB1234"]
-    assert req.backend == "miint"
-    assert req.source == "ena"
     assert req.download_method == "http"
 
 
-def test_batch_import_request_accepts_overrides():
+def test_batch_import_request_accepts_multiple_accessions():
     from qiita_common.models.ena_import import BatchImportRequest
 
-    req = BatchImportRequest(
-        accessions=["PRJEB1234", "PRJNA5678"],
-        source="sra",
-        download_method="http",
-    )
+    req = BatchImportRequest(accessions=["PRJEB1234", "PRJNA5678"], download_method="http")
     assert req.accessions == ["PRJEB1234", "PRJNA5678"]
-    assert req.source == "sra"
+
+
+@pytest.mark.parametrize("removed_field", ["backend", "source"])
+def test_batch_import_request_rejects_removed_fields(removed_field):
+    """Dropped with the resolver/archive provenance; extra="forbid" makes a
+    stale client fail loud instead of being silently ignored."""
+    from qiita_common.models.ena_import import BatchImportRequest
+
+    with pytest.raises(ValidationError):
+        BatchImportRequest(accessions=["PRJEB1234"], **{removed_field: "whatever"})
 
 
 def test_batch_import_request_rejects_empty_accessions():

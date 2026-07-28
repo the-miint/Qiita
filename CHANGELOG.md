@@ -1107,6 +1107,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Removed
 
+- **ENA import: the per-sample provenance columns and the resolver/archive
+  request fields (#369).** `sequenced_sample.source_archive` / `resolver_kind` /
+  `transport`, the `ena_import_batch.resolver_backend` / `source_archive`
+  columns, the `ResolverKind` / `SourceArchive` models, `BACKEND_MIINT`, and the
+  `backend` / `source` fields on `BatchImportRequest`. miint is the only ENA
+  resolver and there will not be others, ENA and SRA mirror each other, and the
+  transport does not affect the correctness of the sequences — so none of it
+  earned a column. `BatchImportRequest` now pins `extra="forbid"`, so a client
+  still sending `backend` or `source` gets a 422 rather than silent acceptance.
+  This also removes the finalize-time `set_sequenced_pool_transport` write-back
+  from the workflow runner.
+
 - **The intake `human_filtering` policy flag (#303).** Host filtering no longer reads a
   per-project intent recorded at intake — a sample's host is a property of the sample, not
   of the project it was booked under. The pre-flight readers, the roster field, the

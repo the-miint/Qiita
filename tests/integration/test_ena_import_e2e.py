@@ -23,7 +23,6 @@ from conftest import ducklake_connect
 from qiita_common.actions import ActionDefinition, WorkflowAction
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import SystemRole
-from qiita_common.models.ena import ResolverKind, SourceArchive
 from qiita_common.models.ena_import import BatchItemState
 
 from qiita_control_plane.auth.principal import HumanUser
@@ -451,8 +450,6 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        resolver_backend="miint",
-        source_archive=SourceArchive.ENA,
         download_method="http",
     )
     batch_cleanup.append(batch_idx)
@@ -462,9 +459,6 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         postgres_pool,
         item=items[0],
         principal=admin_principal,
-        resolver_backend="miint",
-        source_archive=SourceArchive.ENA,
-        resolver_kind=ResolverKind.MIINT,
         download_method="http",
     )
 
@@ -587,9 +581,6 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         postgres_pool,
         item=items[0],
         principal=admin_principal,
-        resolver_backend="miint",
-        source_archive=SourceArchive.ENA,
-        resolver_kind=ResolverKind.MIINT,
         download_method="http",
     )
 

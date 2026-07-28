@@ -37,8 +37,7 @@ and, on failure, the reason.
 
 ### REST surface
 
-- `POST /api/v1/ena-import-batch` — body: `{accessions: [...], backend: "miint",
-  source: "ena", download_method: "http"}`. Returns `202` immediately with a batch
+- `POST /api/v1/ena-import-batch` — body: `{accessions: [...], download_method: "http"}`. Returns `202` immediately with a batch
   handle and every accession at its initial `pending` state; the resolve/register/
   submit work for the whole batch runs in the background. **Admin-only**
   (wet_lab_admin or system_admin) — this is an operator gesture, not something an
@@ -117,7 +116,7 @@ gaps expected to close soon (except where noted):
 Metadata resolution and read download both go through `duckdb-miint` table functions,
 not a hand-rolled ENA client:
 
-- `read_ena` — study header + run list (the default resolver backend, `miint`).
+- `read_ena` — study header + run list.
 - `read_ena_attributes` — per-sample attributes, pivoted into the checklist model.
 - `read_ena_sequences` — the actual read download, called by the `ingest_ena_reads`
   compute job once a pool's runs are registered.

@@ -21,7 +21,7 @@ from .batch import (
     schedule_ena_import_batch,
 )
 from .harmonization import HarmonizationResult, harmonize_biosample_attributes
-from .miint_resolver import BACKEND_MIINT, MiintEnaResolver
+from .miint_resolver import MiintEnaResolver
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
 from .protocol_mapping import (
     UnmappableEnaLibraryStrategyError,
@@ -43,7 +43,6 @@ from .submit import (
 )
 
 __all__ = [
-    "BACKEND_MIINT",
     "DEFAULT_DOWNLOAD_METHOD",
     "DOWNLOAD_ENA_STUDY_ACTION_ID",
     "DOWNLOAD_ENA_STUDY_ACTION_VERSION",

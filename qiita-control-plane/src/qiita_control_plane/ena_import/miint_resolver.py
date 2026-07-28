@@ -19,10 +19,6 @@ from qiita_control_plane.miint import connect_with_miint_staged
 from .accession import validate_study_accession
 from .resolver import EnaAccessionNotFoundError, pivot_sample_attributes
 
-# The only ENA metadata resolver backend. Kept as a named constant so the batch
-# route/driver validate the request's `backend` against one source of truth.
-BACKEND_MIINT = "miint"
-
 # Explicit fields for read_run: only the columns EnaRunRecord models, not read_ena's
 # full default set (which also carries sample-descriptive fields out of scope here).
 _RUN_FIELDS = (

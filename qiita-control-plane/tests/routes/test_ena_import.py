@@ -434,11 +434,15 @@ async def test_submit_rejects_unsupported_download_method(eib_client, admin_toke
     assert "download_method" in resp.text
 
 
-async def test_submit_rejects_unknown_source(eib_client, admin_token):
+@pytest.mark.parametrize("removed_field", ["backend", "source"])
+async def test_submit_rejects_removed_request_fields(eib_client, admin_token, removed_field):
+    """`backend` and `source` were dropped with the resolver/archive provenance.
+    A client still sending either gets a 422 rather than having it silently
+    ignored."""
     token, _ = admin_token
     resp = await eib_client.post(
         URL_ENA_IMPORT_BATCH_PREFIX,
-        json={"accessions": [unique_accession("PRJNA")], "source": "not-a-real-archive"},
+        json={"accessions": [unique_accession("PRJNA")], removed_field: "whatever"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 422, resp.text
