@@ -857,6 +857,15 @@ duplicates further down are historical strata; leave them where they are.
   archived block records that this deploy already followed that order. `redeploy.md`
   (source of truth for bucket order), `/deploy-note` and `/deploy-archive` updated
   to match. (#276)
+- **CP library primitives now use `duckdb_connect()` instead of bare
+  `duckdb.connect(":memory:")` (#349).** Ten call sites in `library.py` switched to
+  a new `miint.duckdb_connect()` helper that always passes `miint_connect_config()`
+  (sets `extension_directory` when `MIINT_EXTENSION_DIRECTORY` is present). No
+  behavior change today — none of these paths loads an extension — but the first
+  one that gains INSTALL/LOAD would otherwise resurrect the `/dev/null` `$HOME`
+  failure that took down every `long-read-assembly` ticket. The helper also
+  documents why we defer `SET home_directory=` (prod sets the var; deploy checks
+  enforce it; dev/CI have writable `$HOME`).
 
 
 ### Removed

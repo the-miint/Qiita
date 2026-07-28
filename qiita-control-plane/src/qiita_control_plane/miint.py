@@ -46,18 +46,24 @@ _install_lock = threading.Lock()
 _installed = False
 
 
-def _connect() -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(":memory:", config=miint_connect_config())
-
-
 def duckdb_connect() -> duckdb.DuckDBPyConnection:
     """Bare in-memory DuckDB connection with miint-safe config.
 
     For CP-service code that does not need miint loaded but must remain safe
     if a future change adds INSTALL/LOAD (extension_directory is set when
     MIINT_EXTENSION_DIRECTORY is present, so $HOME never gets resolved).
-    """
+
+    Note: we do not set `home_directory` here. Prod sets
+    MIINT_EXTENSION_DIRECTORY (deploy bucket 1), and `make preflight` +
+    `verify-deploy`'s cp-miint check enforce it, so the only unset
+    environments are dev/CI, which have a writable $HOME and no /dev/null
+    failure."""
     return duckdb.connect(":memory:", config=miint_connect_config())
+
+
+def _connect() -> duckdb.DuckDBPyConnection:
+    # Private alias of duckdb_connect() for the miint-loaded helpers above.
+    return duckdb_connect()
 
 
 def connect_with_miint() -> duckdb.DuckDBPyConnection:
