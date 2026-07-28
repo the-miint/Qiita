@@ -2,10 +2,12 @@
 `read_ena_attributes`.
 
 `read_ena` returns an ALL-VARCHAR relation — every field, including numeric
-ones, arrives as text. These models are the boundary where that becomes typed:
-the numeric fields (`tax_id`, `read_count`, `base_count`, `fastq_bytes`) are
-coerced at construction, and a non-blank value that fails to parse raises rather
-than silently becoming `None`/`0`.
+ones, arrives as text, and the per-file fields arrive as one `;`-delimited
+string rather than a list (duckdb-miint#178). These models are the boundary
+where that becomes typed: the numeric fields (`tax_id`, `read_count`,
+`base_count`, `fastq_bytes`) are coerced at construction, and a non-blank value
+that fails to parse raises rather than silently becoming `None`/`0`. Removing
+the coercion once miint types these is tracked in Qiita#378.
 """
 
 from __future__ import annotations

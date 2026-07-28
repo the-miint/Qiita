@@ -880,6 +880,15 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`read_ena`'s untyped output is now tracked upstream (#369).** miint yields
+  every `read_ena` column as `VARCHAR` — numeric fields as digit strings, and the
+  per-file fields (`fastq_ftp` / `fastq_aspera` / `fastq_md5` / `fastq_bytes`) as
+  one `;`-delimited string rather than a list, with the index alignment between
+  them undocumented. Filed as
+  [duckdb-miint#178](https://github.com/the-miint/duckdb-miint/issues/178); the
+  boundary coercion `qiita_common.models.ena` carries for it is named at the
+  workaround site, rowed in `docs/duckdb-miint.md`'s Open upstream gaps, and its
+  removal tracked at #378.
 - **ENA sample attributes are grouped by DuckDB, not pivoted in Python (#369).**
   `read_ena_attributes` returns one narrow `(sample_accession, tag, value)` row
   per attribute; the resolver now groups them into a `MAP` in SQL and DuckDB
