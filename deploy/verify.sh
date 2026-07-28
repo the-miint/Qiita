@@ -116,6 +116,12 @@ fi
 # workflow dies at submission. Nothing else fails when it is missing — the CP
 # boots and serves every other route — so without this check the gap is
 # invisible until someone submits an assembly.
+#
+# httpfs is checked in the same breath and from the same staged directory: the
+# ENA import path LOADs it (the CP resolver and the CO's download job both do),
+# and LOAD never downloads, so a stage without it verifies green here and then
+# fails every ENA import at runtime. Fail the deploy instead — same reasoning as
+# the miint-gpl-boundary probe.
 if [ -n "${SKIP_CP_MIINT:-}" ]; then
     skip "cp-miint" "SKIP_CP_MIINT=1"
 elif [ -r "$CP_ENV" ]; then
@@ -123,11 +129,16 @@ elif [ -r "$CP_ENV" ]; then
         set -a
         # shellcheck disable=SC1091
         source /etc/qiita/control-plane.env; set +a
-        exec '${CONTROL_PLANE_VENV}/bin/python' -c 'from qiita_control_plane.miint import connect_with_miint_staged; connect_with_miint_staged().close()'
+        exec '${CONTROL_PLANE_VENV}/bin/python' -c 'from qiita_control_plane.miint import connect_with_miint_staged
+conn = connect_with_miint_staged()
+try:
+    conn.execute(\"LOAD httpfs;\")
+finally:
+    conn.close()'
     " 2>&1); then
-        pass "cp-miint" "control plane can LOAD miint (run as $QIITA_API_USER)"
+        pass "cp-miint" "control plane can LOAD miint + httpfs (run as $QIITA_API_USER)"
     else
-        fail "cp-miint" "control plane cannot LOAD miint — long-read-assembly will fail at submission: ${out}"
+        fail "cp-miint" "control plane cannot LOAD miint/httpfs — long-read-assembly fails at submission, ENA import at resolve: ${out}"
     fi
 else
     skip "cp-miint" "$CP_ENV absent (first deploy)"

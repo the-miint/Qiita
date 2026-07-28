@@ -411,6 +411,15 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **miint staging gate now notices a missing `httpfs` (#369).**
+  `staging_is_current` fingerprinted the miint object alone, so on a host whose
+  miint stage was already current the deploy took the skip branch and never ran
+  the `INSTALL httpfs` this PR added to `stage_miint_extension`. `LOAD` does not
+  download, so both consumers — the CO's ENA download job and the CP's ENA
+  resolver — would have failed at runtime with no fallback. The gate now treats
+  a staged directory without `httpfs` as stale (a local check, before the mirror
+  HEAD), and `make verify-deploy`'s `cp-miint` probe LOADs `httpfs` too so the
+  gap fails the deploy rather than every ENA import.
 - **ENA import: an empty ENA sample attribute set no longer fails the whole
   study (#369).** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
   whose sample (`SAMD01818724`) has zero `<SAMPLE_ATTRIBUTE>` elements —
