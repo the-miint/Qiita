@@ -262,6 +262,41 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
+  `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#376).**
+  CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
+  AF_UNIX socket at `$TMPDIR/pymp-XXXXXXXX/listener-XXXXXXXX`. The SLURM payload
+  sets `TMPDIR=<workspace>/tmp` (~85 chars, on real disk so temp doesn't fill the
+  tiny `--containall` `/tmp` tmpfs), and Python's ~32-char suffix pushes the socket
+  path over the ~108-char AF_UNIX `sun_path` limit — crashing `lineage_wf` on every
+  run. `checkm.sh` now points `TMPDIR` at a short `/tmp` symlink into the same
+  workspace temp (socket path short, temp files still on disk). First reached only
+  after `binning` + `bin_refine` were fixed; reproduced on a real ticket and
+  cleared by the symlink.
+- **`long-read-assembly` `bin_refine` no longer crashes DAS_Tool on a bad flag —
+  `--write_bins`, not `--write_bins 1` (#376).** `--write_bins` is a boolean flag
+  in DAS_Tool 1.1.x; the spurious `1` is an unexpected positional that r-docopt
+  0.7.2 surfaces as `'short' is not a valid field or method name for reference
+  class "Argument"`, Execution-halting before DAS_Tool runs. qp-pacbio passes it
+  bare; probed on das_tool 1.1.7 / r-docopt 0.7.2 (bare parses, `1` crashes).
+  First reached only after `binning` was fixed (every prior run died earlier).
+  Also pins `das_tool=1.1.7` in `bin_refine.def` — the create line was unpinned
+  despite the "1.1.x summary-columns" invariant, and the image rebuilds on any
+  `bin_refine.sh` change.
+- **`long-read-assembly` `binning` image can finally run concoct — `binning.def`
+  installs `libgfortran=3.0.0` (#376).** concoct's `vbgmm` C-extension links
+  `libgfortran.so.3`, but the metawrap solve ships only `libgfortran.so.5`, so
+  `import vbgmm` died at runtime (`ImportError: libgfortran.so.3`) and metaWRAP's
+  concoct binner failed — taking the whole step down, since metaWRAP exits
+  non-zero when any binner hard-fails (metabat2 + maxbin2 succeeded regardless).
+  Latent until now: every prior run died at an earlier wall (missing binners →
+  unsorted BAM → metabat2 contig order), so concoct was never reached. The old
+  conda-forge `libgfortran` (3.0.0) provides `.so.3` and coexists with
+  `libgfortran5`, restoring concoct without perturbing the pinned solve; verified
+  by running metaWRAP binning to completion on a real assembly. `binning-verify.sh`
+  now asserts `import vbgmm` at build time — the prior tool-runnability check
+  missed this because the failure is a Python `ImportError` (exit 1), not a loader
+  verdict (126/127), so a concoct-broken image shipped green.
 - **`long-read-assembly` `binning` no longer aborts on a contig-ORDER mismatch —
   `binning.sh` reorders the assembly to the BAM's `@SQ` order (#376).** With the
   unsorted-BAM failure fixed (#370), the same production ticket reached `metabat2`
