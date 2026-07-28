@@ -87,6 +87,21 @@ if (( ${#missing[@]} > 0 || ${#unrunnable[@]} > 0 )); then
     exit 1
 fi
 
+# concoct's `vbgmm` C-extension links libgfortran.so.3. If the env ships only
+# libgfortran.so.5 the import fails at RUNTIME with an ImportError — exit 1, NOT a
+# loader verdict (126/127) — so the runnability loop above PASSES it and concoct
+# still dies inside metaWRAP, failing the whole step (metabat2 + maxbin2 succeed).
+# That is exactly how a broken concoct shipped once. Assert the import directly;
+# binning.def installs libgfortran=3.0.0 (provides .so.3, coexists with
+# libgfortran5) to satisfy it.
+if ! "${ENV_BIN}/python" -c 'import vbgmm' >/dev/null 2>&1; then
+    echo "concoct's vbgmm fails to import — the metawrap env is missing" >&2
+    echo "libgfortran.so.3. binning.def must 'micromamba install libgfortran=3.0.0'" >&2
+    echo "(it provides .so.3 and coexists with libgfortran5). Without it metaWRAP's" >&2
+    echo "concoct binner dies at runtime and fails the whole binning step." >&2
+    exit 1
+fi
+
 # Presence is not enough for the two tools whose BEHAVIOUR the workflow depends
 # on. Both are pinned in binning.def; assert the pins actually took, because the
 # solver is otherwise the only thing enforcing them and a drifted solve would

@@ -286,6 +286,57 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
+  `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#379).**
+  CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
+  AF_UNIX socket at `$TMPDIR/pymp-XXXXXXXX/listener-XXXXXXXX`. The SLURM payload
+  sets `TMPDIR=<workspace>/tmp` (~85 chars, on real disk so temp doesn't fill the
+  tiny `--containall` `/tmp` tmpfs), and Python's ~32-char suffix pushes the socket
+  path over the ~108-char AF_UNIX `sun_path` limit — crashing `lineage_wf` on every
+  run. `checkm.sh` now points `TMPDIR` at a short `/tmp` symlink into the same
+  workspace temp (socket path short, temp files still on disk). First reached only
+  after `binning` + `bin_refine` were fixed; reproduced on a real ticket and
+  cleared by the symlink.
+- **`long-read-assembly` `bin_refine` no longer crashes DAS_Tool on a bad flag —
+  `--write_bins`, not `--write_bins 1` (#379).** `--write_bins` is a boolean flag
+  in DAS_Tool 1.1.x; the spurious `1` is an unexpected positional that r-docopt
+  0.7.2 surfaces as `'short' is not a valid field or method name for reference
+  class "Argument"`, Execution-halting before DAS_Tool runs. qp-pacbio passes it
+  bare; probed on das_tool 1.1.7 / r-docopt 0.7.2 (bare parses, `1` crashes).
+  First reached only after `binning` was fixed (every prior run died earlier).
+  Also pins `das_tool=1.1.7` in `bin_refine.def` — the create line was unpinned
+  despite the "1.1.x summary-columns" invariant, and the image rebuilds on any
+  `bin_refine.sh` change.
+- **`long-read-assembly` `binning` image can finally run concoct — `binning.def`
+  installs `libgfortran=3.0.0` (#379).** concoct's `vbgmm` C-extension links
+  `libgfortran.so.3`, but the metawrap solve ships only `libgfortran.so.5`, so
+  `import vbgmm` died at runtime (`ImportError: libgfortran.so.3`) and metaWRAP's
+  concoct binner failed — taking the whole step down, since metaWRAP exits
+  non-zero when any binner hard-fails (metabat2 + maxbin2 succeeded regardless).
+  Latent until now: every prior run died at an earlier wall (missing binners →
+  unsorted BAM → metabat2 contig order), so concoct was never reached. The old
+  conda-forge `libgfortran` (3.0.0) provides `.so.3` and coexists with
+  `libgfortran5`, restoring concoct without perturbing the pinned solve; verified
+  by running metaWRAP binning to completion on a real assembly. `binning-verify.sh`
+  now asserts `import vbgmm` at build time — the prior tool-runnability check
+  missed this because the failure is a Python `ImportError` (exit 1), not a loader
+  verdict (126/127), so a concoct-broken image shipped green.
+- **`long-read-assembly` `binning` no longer aborts on a contig-ORDER mismatch —
+  `binning.sh` reorders the assembly to the BAM's `@SQ` order (#379).** With the
+  unsorted-BAM failure fixed (#370), the same production ticket reached `metabat2`
+  and died with `the order of contigs in abundance file is not the same as the
+  assembly file: s10.ctg000011l`. Root cause is the *same* miint gap
+  (duckdb-miint#173) at a second consumer: `jgi_summarize_bam_contig_depths` writes
+  the depth matrix in the BAM's `@SQ` order (lexicographic, as miint emits it),
+  while the assembly FASTA is in hifiasm's numeric order — and `metabat2` requires
+  the two to agree. `samtools sort` fixes record order but never `@SQ` order, so it
+  surfaced only after #370 landed. `binning.sh` now reorders `noLCG.fa` into the
+  staged BAM's `@SQ` order (via `samtools faidx`) before handing it to metaWRAP, and
+  fails loud if the `@SQ` and assembly contig sets ever diverge. Confirmed by probe
+  on the shipped `samtools 1.10` / `metabat2 2.15`: a numeric-order assembly
+  reproduces the abort, the `@SQ`-reordered one binds. Pinned by
+  `test_binning_coverage_sort_pin.py`; removable together with the `samtools sort`
+  when duckdb-miint#173 lands (tracked in Qiita#374).
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
   `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
@@ -892,6 +943,15 @@ duplicates further down are historical strata; leave them where they are.
   archived block records that this deploy already followed that order. `redeploy.md`
   (source of truth for bucket order), `/deploy-note` and `/deploy-archive` updated
   to match. (#276)
+- **CP library primitives now use `duckdb_connect()` instead of bare
+  `duckdb.connect(":memory:")` (#349).** Ten call sites in `library.py` switched to
+  a new `miint.duckdb_connect()` helper that always passes `miint_connect_config()`
+  (sets `extension_directory` when `MIINT_EXTENSION_DIRECTORY` is present). No
+  behavior change today — none of these paths loads an extension — but the first
+  one that gains INSTALL/LOAD would otherwise resurrect the `/dev/null` `$HOME`
+  failure that took down every `long-read-assembly` ticket. The helper also
+  documents why we defer `SET home_directory=` (prod sets the var; deploy checks
+  enforce it; dev/CI have writable `$HOME`).
 
 
 ### Removed
