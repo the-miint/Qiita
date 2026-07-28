@@ -133,3 +133,18 @@ def test_read_ingest_uses_the_staged_helper():
 
     assert _read_ingest.connect_with_miint_staged is miint_module.connect_with_miint_staged
     assert not hasattr(_read_ingest, "connect_with_miint")
+
+
+def test_duckdb_connect_carries_config(monkeypatch, tmp_path):
+    """duckdb_connect() passes miint_connect_config() so extension_directory is
+    set even on bare connections — the contract that prevents the /dev/null
+    $HOME failure from recurring in library.py paths."""
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", str(tmp_path))
+    from qiita_control_plane.miint import duckdb_connect
+
+    con = duckdb_connect()
+    try:
+        result = con.execute("SELECT current_setting('extension_directory')").fetchone()
+        assert result[0] == str(tmp_path)
+    finally:
+        con.close()
