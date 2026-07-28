@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- (#perf/align-sharded-sizing) Confirm the synced `align 1.0.0` action carries the
+- (#381) Confirm the synced `align 1.0.0` action carries the
   raised `align_sharded` baseline. `actions sync` runs inside `activate.sh`, so this
   only checks it took — if the row still reads `cpu: 4` / `mem_gb: 32`, align blocks
   keep submitting at the old size and the change is a silent no-op:
@@ -51,7 +51,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#perf/align-sharded-sizing) Each `align_sharded` step now requests **8 cpu / 64 GB**
+- (#381) Each `align_sharded` step now requests **8 cpu / 64 GB**
   (was 4 / 32) — unchanged `action_ceiling`, so nothing new is expressible, but this is
   the first time the ceiling is requested by default. The SLURM partition align tickets
   land on must be able to satisfy it, or blocks will pend instead of running. Both axes

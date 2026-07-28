@@ -689,7 +689,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
-- **`align_sharded` gets the memory and cores it was allocated (#TBD).** The job
+- **`align_sharded` gets the memory and cores it was allocated (#381).** The job
   hardcoded DuckDB to `memory_limit=8GB` / `threads=4` instead of resolving from the
   SLURM cgroup, so a 64 GB allocation reached DuckDB as 8 GB and the alignment output
   spilled gigabytes to shared scratch. `memory_limit` now resolves via
