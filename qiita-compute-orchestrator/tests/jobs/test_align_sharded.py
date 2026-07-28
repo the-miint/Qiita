@@ -163,13 +163,45 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
     per (read in the query, shard_name). `alignments`: {read_id: [align_row, ...]}
     where an `align_row` is the tuple `(flags, reference, position, stop_position,
     mapq, cigar, mate_reference, mate_position, template_length)` the align seam
-    emits for each read present in the query (one row per mate for a PE read). The
-    seam CTAS's a full-schema raw table + inserts those rows, mirroring the real
-    align_*_sharded. `calls` (optional list) records each align call's (aligner,
-    query_columns, preset); `captured` (optional dict) records the routing
-    `threshold`."""
+    emits for each read present in the query (one row per mate for a PE read).
+    `calls` (optional list) records each align call's (aligner, query_columns,
+    preset); `captured` (optional dict) records the routing `threshold`.
+
+    The align seams return `(sql, params)` rather than materializing a relation, so
+    these stubs return a SELECT over a typed VALUES list, semi-joined to the query
+    table so only reads actually present in the query emit rows — the same
+    query-awareness the old CTAS stub got imperatively. Returning SQL (rather than
+    building a table) is what keeps execute()'s real shape under test: the fragment
+    is embedded as a subquery inside the staging COPY, exactly as the real aligner
+    is.
+
+    The seams no longer receive a connection, so `fake_r2s` stashes the one it is
+    given for the align stub's column introspection. That ordering is guaranteed —
+    the read_to_shard build always runs before the align seam."""
+    conn_box: dict = {}
+    # Explicit per-value casts: DuckDB infers a VALUES column's type from the first
+    # row, and mate_reference / mate_position are NULL in the single-end fixtures,
+    # which would otherwise leave those columns untyped and break the `= '='` /
+    # IS NULL decode in execute().
+    col_types = (
+        "BIGINT",  # read_id
+        "INTEGER",  # flags
+        "VARCHAR",  # reference
+        "BIGINT",  # position
+        "BIGINT",  # stop_position
+        "INTEGER",  # mapq
+        "VARCHAR",  # cigar
+        "VARCHAR",  # mate_reference
+        "BIGINT",  # mate_position
+        "BIGINT",  # template_length
+    )
+    col_names = (
+        "read_id, flags, reference, position, stop_position, mapq, cigar, "
+        "mate_reference, mate_position, template_length"
+    )
 
     def fake_r2s(conn, router_index_path, query_table, dest_table, *, threshold):
+        conn_box["conn"] = conn
         if captured is not None:
             captured["threshold"] = threshold
         read_ids = [r[0] for r in conn.execute(f"SELECT read_id FROM {query_table}").fetchall()]
@@ -180,34 +212,58 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
                     [rid, shard_name],
                 )
 
-    def _do_align(conn, query_table, dest_table, *, aligner, preset):
+    def _align_sql(query_table, *, aligner, preset):
         if calls is not None:
+            conn = conn_box["conn"]
             cols = [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
             calls.append({"aligner": aligner, "cols": cols, "preset": preset})
-        # CTAS the raw alignments table with the full align schema, so execute()'s
-        # `a.* EXCLUDE (read_id, reference, mate_reference)` drops exactly those.
-        conn.execute(
-            f"CREATE TABLE {dest_table} ("
-            "read_id BIGINT, flags INTEGER, reference VARCHAR, position BIGINT, "
-            "stop_position BIGINT, mapq INTEGER, cigar VARCHAR, "
-            "mate_reference VARCHAR, mate_position BIGINT, template_length BIGINT)"
-        )
-        read_ids = [r[0] for r in conn.execute(f"SELECT read_id FROM {query_table}").fetchall()]
-        for rid in read_ids:
-            for row in alignments.get(rid, []):
-                conn.execute(
-                    f"INSERT INTO {dest_table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [rid, *row]
+        rows = []
+        for rid, align_rows in alignments.items():
+            for row in align_rows:
+                literals = ", ".join(
+                    f"CAST({_sql_literal(v)} AS {t})"
+                    for v, t in zip((rid, *row), col_types, strict=True)
                 )
+                rows.append(f"({literals})")
+        if not rows:
+            # No fixture rows: an aligner that emitted nothing. Still has to be a
+            # well-typed, empty relation of the right shape.
+            typed = ", ".join(
+                f"CAST(NULL AS {t}) AS {n}"
+                for t, n in zip(col_types, col_names.replace(" ", "").split(","), strict=True)
+            )
+            return f"SELECT {typed} WHERE false", []
+        return (
+            f"SELECT * FROM (VALUES {', '.join(rows)}) AS t({col_names}) "
+            f"WHERE read_id IN (SELECT read_id FROM {query_table})",
+            [],
+        )
 
-    def fake_mm2(conn, query_table, shard_directory, read_to_shard_table, dest_table, *, preset):
-        _do_align(conn, query_table, dest_table, aligner="minimap2", preset=preset)
+    def fake_mm2(query_table, shard_directory, read_to_shard_table, *, preset):
+        return _align_sql(query_table, aligner="minimap2", preset=preset)
 
-    def fake_bt2(conn, query_table, shard_directory, read_to_shard_table, dest_table):
-        _do_align(conn, query_table, dest_table, aligner="bowtie2", preset=None)
+    def fake_bt2(query_table, shard_directory, read_to_shard_table):
+        return _align_sql(query_table, aligner="bowtie2", preset=None)
 
     monkeypatch.setattr(align_sharded, "_build_read_to_shard", fake_r2s)
-    monkeypatch.setattr(align_sharded, "_run_align_minimap2_sharded", fake_mm2)
-    monkeypatch.setattr(align_sharded, "_run_align_bowtie2_sharded", fake_bt2)
+    monkeypatch.setattr(align_sharded, "_align_minimap2_sharded_sql", fake_mm2)
+    monkeypatch.setattr(align_sharded, "_align_bowtie2_sharded_sql", fake_bt2)
+
+
+def _sql_literal(value) -> str:
+    """A Python fixture value as a SQL literal for the VALUES list above. Only the
+    types the align fixtures use (None / int / str); anything else is a fixture bug
+    and should fail loudly rather than be coerced."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        raise TypeError("unexpected bool in an align fixture row")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    raise TypeError(f"unsupported align fixture literal: {value!r}")
 
 
 def _read_alignment(path: Path):
@@ -555,6 +611,100 @@ def test_align_sharded_bowtie2_low_identity_pair_dropped_as_unit(tmp_path, monke
     ]
 
 
+def test_align_sharded_bowtie2_single_end_scored_per_record(tmp_path, monkeypatch):
+    """A SINGLE-END bowtie2 batch is scored PER RECORD at the bowtie2 floor (0.99).
+
+    The pooling is a property of the BATCH, not of the aligner: an SE bowtie2 run has
+    no mate to pool, so each alignment stands on its own CIGAR. This is the shape the
+    live short-read data takes, and it was previously UNTESTED — every bowtie2 case
+    here was paired.
+
+    Note this asserts a contract, not a bug fix: the old aligner-keyed branch
+    produced the SAME rows for SE input (a pooled window over a one-row partition
+    returns that row's own CIGAR), it just paid a full blocking sort of every
+    alignment to do it. The change is cost, not output — which is exactly why this
+    test is worth having, since nothing else pins the SE result."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(
+        tmp_path / "reads.parquet",
+        [(10, 1, "ACGTACGT", None), (10, 2, "GGGGCCCC", None), (20, 3, "TTTTAAAA", None)],
+    )
+    router, shard_dir = _make_indexes(tmp_path)
+    # read 1: 150=          -> identity 1.00 >= 0.99 -> KEPT
+    # read 2: 100=50X       -> identity 0.667        -> DROPPED
+    # read 3: 149=1X        -> identity 0.993        -> KEPT (and a different sample)
+    _install_stubs(
+        align_sharded,
+        monkeypatch,
+        routing={1: ["0"], 2: ["0"], 3: ["0"]},
+        alignments={
+            1: [_se_hit(100, position=1, stop=151, cigar="150=")],
+            2: [_se_hit(200, position=5, stop=155, cigar="100=50X")],
+            3: [_se_hit(300, position=9, stop=159, cigar="149=1X")],
+        },
+    )
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="bowtie2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+    _cols, rows = _read_alignment(Path(out["alignment"]))
+    # Reads 1 and 3 survive on their own identity; read 2 is dropped. No mate columns
+    # are populated (SE), and prep_sample_idx is stamped per row (10 vs 20).
+    assert rows == [
+        (555, 10, 1, 100, None, 0, 1, 151, 60, "150=", None, 0),
+        (555, 20, 3, 300, None, 0, 9, 159, 60, "149=1X", None, 0),
+    ]
+    # The phase-1 staging Parquet must NOT survive in the workspace: that directory
+    # is `alignment_staging_dir`, and register-files loads every `*.parquet` in it
+    # into the DuckLake `alignment` table — a leftover would register the UNSORTED,
+    # (for PE) UNFILTERED rows a second time.
+    assert [p.name for p in (tmp_path / "ws").glob("*.parquet")] == ["alignment.parquet"]
+
+
+def test_align_sharded_rejects_a_mixed_se_pe_batch(tmp_path, monkeypatch):
+    """A batch mixing single- and paired-end reads fails LOUDLY, naming the counts.
+
+    A prep/run is uniformly one or the other by construction, so a mix is invalid
+    input. Previously it was left to surface downstream — bowtie2 rejects it at bind
+    with an opaque `gpl_boundary` error, and minimap2 TOLERATES a mix, which would
+    have silently applied the wrong (mis-pooled) identity filter."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(
+        tmp_path / "reads.parquet",
+        [(10, 1, "ACGTACGT", "TTGGCCAA"), (10, 2, "GGGGCCCC", None)],
+    )
+    router, shard_dir = _make_indexes(tmp_path)
+    _install_stubs(
+        align_sharded,
+        monkeypatch,
+        routing={1: ["0"], 2: ["0"]},
+        alignments={1: [_se_hit(100)], 2: [_se_hit(200)]},
+    )
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    with pytest.raises(ValueError, match="mixes single- and paired-end"):
+        asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+    # And it leaves no partial output behind.
+    assert not (tmp_path / "ws" / "alignment.parquet").exists()
+
+
 def test_align_sharded_empty_alignment_is_valid(tmp_path, monkeypatch):
     """A block whose reads align nowhere yields an EMPTY alignment.parquet — valid,
     not a fail-fast — while keeping the full column schema."""
@@ -596,10 +746,10 @@ def test_align_sharded_partial_output_removed_on_failure(tmp_path, monkeypatch):
     router, shard_dir = _make_indexes(tmp_path)
     _install_stubs(align_sharded, monkeypatch, routing={1: ["0"]}, alignments={})
 
-    def boom(conn, query_table, shard_directory, read_to_shard_table, dest_table, *, preset):
+    def boom(query_table, shard_directory, read_to_shard_table, *, preset):
         raise RuntimeError("align blew up")
 
-    monkeypatch.setattr(align_sharded, "_run_align_minimap2_sharded", boom)
+    monkeypatch.setattr(align_sharded, "_align_minimap2_sharded_sql", boom)
 
     inputs = align_sharded.Inputs(
         # reads stream (see _stub_block_read_stream)
