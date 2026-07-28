@@ -93,8 +93,14 @@ steps:
     # than a copy baked into the image — a fourth miint would be one `make
     # preflight`'s byte-identity check does not compare, free to drift. Resolved
     # against PATH_DERIVED, matching where the deploy stages it
-    # (PATH_DERIVED/duckdb-ext). Unused by the hifiasm_meta branch, which is
-    # harmless: a bind the entrypoint never reads costs nothing.
+    # (PATH_DERIVED/duckdb-ext).
+    #
+    # The bind is UNCONDITIONAL — the backend emits it for every derived_inputs
+    # entry regardless of which assembler the entrypoint then runs — so a missing
+    # or mislocated PATH_DERIVED/duckdb-ext fails apptainer for BOTH branches,
+    # hifiasm_meta included. Only the miint LOAD is myloasm-specific; the mount is
+    # not. That is why the deploy checklist verifies the path exists rather than
+    # treating it as a myloasm-only concern.
     derived_inputs:
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]

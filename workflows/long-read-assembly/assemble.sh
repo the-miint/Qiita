@@ -19,7 +19,8 @@
 # Each branch below therefore writes circular.fa + noLCG.fa itself. Reusing one
 # assembler's rule on the other's output fails SILENTLY — it matches nothing, so
 # every circular genome is quietly demoted to binning input and the LCG class
-# disappears with no error anywhere.
+# disappears with no error anywhere. myloasm_split.py holds the myloasm side of
+# this, including the probe that established it; don't restate it there and here.
 #
 # A linear chromosome is a single contig too, but LCG means a large *circular*
 # genome. A complete but LINEAR chromosome is not circular, so it flows to noLCG
@@ -45,16 +46,14 @@ trap 'rm -rf "$WORK"' EXIT
 OUT="${QIITA_OUTPUT_PATH}/genomes"
 mkdir -p "${OUT}"
 
-# Create both files up front, and ONLY once the assembler produced something, so
-# an empty CLASS is an empty file while an empty ASSEMBLY is an empty
-# genomes_dir. Downstream depends on that distinction: assembly_coverage treats a
-# missing OR zero-byte noLCG.fa as "nothing to bin", and assembly_hash raises
-# StepNoData only when neither an LCG nor a MAG exists.
-init_outputs() {
-    : > "${OUT}/circular.fa"
-    : > "${OUT}/noLCG.fa"
-}
-
+# Both arms create BOTH files whenever the assembler produced anything, and
+# neither when it didn't — so an empty CLASS is an empty file while an empty
+# ASSEMBLY is an empty genomes_dir. Downstream depends on that distinction:
+# assembly_coverage treats a missing OR zero-byte noLCG.fa as "nothing to bin",
+# and assembly_hash raises StepNoData only when neither an LCG nor a MAG exists.
+# Each arm gets this for free from its writer (a shell `>` redirect truncates into
+# existence; a zero-row COPY still writes its file), so there is no pre-creation
+# step to keep in sync.
 case "${ASSEMBLER}" in
     hifiasm_meta)
         micromamba run -n hifiasm_meta hifiasm_meta -t "${THREADS}" -o "${WORK}/asm" "${READS_FASTQ}"
@@ -67,8 +66,15 @@ case "${ASSEMBLER}" in
         # well-formed circular segment name matches (a bare `c$` would also catch any
         # non-canonical name ending in 'c'); a name that doesn't match the circular shape
         # falls through to noLCG (binned), which is the safe default.
+        #
+        # This arm is deliberately left as it was, INCLUDING two behaviours the
+        # myloasm arm below does not share: a missing GFA is treated as an empty
+        # assembly rather than a contract violation, and an unrecognised segment
+        # name is routed to noLCG rather than failing the step. Both are the same
+        # fail-open shape, and both are worth revisiting — but changing the
+        # DEFAULT assembler's behaviour is not this change's business, so it is a
+        # follow-up rather than a silent ride-along.
         if [[ -s "${GFA}" ]]; then
-            init_outputs
             awk '$1=="S" && $2 ~ /tg[0-9]+c$/  {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/circular.fa"
             awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
         fi
@@ -99,18 +105,14 @@ case "${ASSEMBLER}" in
         fi
 
         # Present-but-empty IS a legitimate empty assembly: leave genomes_dir empty,
-        # exactly as the hifiasm branch does for an empty GFA. It must also not
-        # reach the splitter — miint's `read_fastx` RAISES on a zero-record input
-        # ("Error Empty file: …") rather than returning no rows.
+        # exactly as the hifiasm arm does for an empty GFA. It must also not reach
+        # the splitter — miint's `read_fastx` RAISES on a zero-record input ("Error
+        # Empty file: …") rather than returning no rows.
         #
-        # Circularity comes from the FASTA header, NOT the GFA — myloasm_split.py
-        # carries the probe that established it, why only `circular-yes` counts,
-        # and why the id is cut at `_len-`. It reads with miint's read_fastx and
-        # writes with `COPY … (FORMAT FASTA)`, LOADing the SAME deploy-staged
-        # extension the rest of the system runs (bind-mounted read-only via this
-        # step's `derived_inputs: MIINT_EXTENSION_DIRECTORY`). No init_outputs
-        # here: a zero-row COPY still creates its file, so an empty class is an
-        # empty file already.
+        # myloasm_split.py owns the split and carries the probe behind it: why the
+        # header and not the GFA, why only `circular-yes` counts, and why the id is
+        # cut at `_len-`. It LOADs the deploy-staged miint bind-mounted by this
+        # step's `derived_inputs: MIINT_EXTENSION_DIRECTORY`.
         if [[ -s "${PRIMARY}" ]]; then
             python3 /opt/qiita/myloasm_split.py \
                 "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa"

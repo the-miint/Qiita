@@ -36,11 +36,12 @@ Three further behaviours were probed and are relied on below:
     primary FASTA after a zero exit as a contract violation, not an empty
     assembly.
 
-The behavioural tests here EXECUTE `myloasm_split.py` against a real staged miint
-extension, so they prove the split works rather than that it is still spelled a
-certain way. They SKIP where miint cannot be staged (no network / no mirror); the
-static pins below always run and cover the wiring that cannot be executed without
-building the image.
+The behavioural tests here EXECUTE `myloasm_split.py` against the real miint
+extension this component's conftest stages, so they prove the split works rather
+than that it is still spelled a certain way. Like the other real-miint smokes in
+this tree they carry no offline skip — a missing extension fails the session. The
+static pins below cover the wiring that cannot be executed without building the
+image.
 """
 
 from __future__ import annotations
@@ -73,25 +74,26 @@ _EXIT_CONTRACT_VIOLATION = 64
 
 
 @pytest.fixture(scope="module")
-def staged_miint(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """A miint extension directory staged the way the deploy stages one.
+def staged_miint() -> str:
+    """The extension directory this component's conftest already staged.
 
-    The production container does not INSTALL — it LOADs a directory the deploy
-    populated and bind-mounted. Reproduced here so the tests exercise the real
-    LOAD-only path rather than a differently-configured connection.
+    Deliberately NOT a second INSTALL into a fresh tmpdir: `conftest.py`'s
+    session-scoped `_stage_miint_extension` installs once into the stable
+    per-component dir from `setup_miint_test_env("orchestrator")`, cached across
+    runs on purpose. Re-downloading here would undo that for every `make test`,
+    and would pin the mirror URL in a second place instead of honouring
+    `MIINT_EXTENSION_REPO`.
+
+    It is also the right SHAPE for these tests: a directory somebody else staged,
+    which the splitter only ever LOADs — exactly the production posture.
     """
-    duckdb = pytest.importorskip("duckdb")
-    ext_dir = tmp_path_factory.mktemp("miint-ext")
-    con = duckdb.connect(
-        config={"allow_unsigned_extensions": "true", "extension_directory": str(ext_dir)}
+    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+    assert ext_dir, (
+        "MIINT_EXTENSION_DIRECTORY is unset — conftest's setup_miint_test_env() "
+        "should have set it. Without it these tests would silently exercise a "
+        "different extension resolution than production."
     )
-    try:
-        con.execute("INSTALL miint FROM 'https://ftp.microbio.me/pub/miint'")
-    except Exception as exc:  # noqa: BLE001 - any failure here is "cannot stage"
-        pytest.skip(f"cannot stage the miint extension (offline?): {exc}")
-    finally:
-        con.close()
-    return str(ext_dir)
+    return ext_dir
 
 
 def _split(tmp_path: Path, fasta: str, staged: str | None) -> subprocess.CompletedProcess[str]:
@@ -329,23 +331,68 @@ def test_splitter_uses_miint_and_never_installs() -> None:
     )
 
 
-def test_assemble_step_binds_the_deploy_staged_miint() -> None:
-    """The assemble step declares MIINT_EXTENSION_DIRECTORY as a derived input.
+def test_assemble_step_binds_where_the_stager_actually_stages() -> None:
+    """The assemble step's derived_inputs path matches `stage-miint-extension.sh`.
 
-    Without it the container gets no miint at all — `payload.py` deliberately does
-    not forward the native-only miint env to containers, so `derived_inputs` is the
-    per-step mechanism that binds the staged directory in read-only.
+    Without the declaration the container gets no miint at all — `payload.py`
+    deliberately does not forward the native-only miint env to containers, so
+    `derived_inputs` is the per-step mechanism that binds the staged directory in
+    read-only.
+
+    The path is compared against the STAGER rather than a literal: YAML cannot
+    import a constant, so renaming the staged directory in the script would
+    otherwise leave this test and the YAML agreeing with each other and disagreeing
+    with the host, and every assemble ticket would bind a path that does not exist.
     """
+    stager = (_REPO_ROOT / "scripts" / "stage-miint-extension.sh").read_text()
+    staged = re.search(
+        r'MIINT_EXTENSION_DIRECTORY="\$\{PATH_DERIVED%/\}/([A-Za-z0-9._-]+)"', stager
+    )
+    assert staged is not None, (
+        "could not read the staged-extension directory out of "
+        "scripts/stage-miint-extension.sh — this test can no longer verify that "
+        "the workflow binds where the deploy stages."
+    )
+
     yaml_text = _WORKFLOW_YAML.read_text()
     assemble = yaml_text.split("- step: assemble", 1)[1].split("- step:", 1)[0]
     assert "derived_inputs:" in assemble, (
         "the assemble step declares no derived_inputs, so the staged miint "
         "extension is never bind-mounted and the myloasm split cannot LOAD it."
     )
-    assert re.search(r"MIINT_EXTENSION_DIRECTORY:\s*duckdb-ext", assemble), (
-        "the assemble step's derived_inputs no longer maps "
-        "MIINT_EXTENSION_DIRECTORY to duckdb-ext (where the deploy stages the "
-        "extension, relative to PATH_DERIVED)."
+    bound = re.search(r"MIINT_EXTENSION_DIRECTORY:\s*(\S+)", assemble)
+    assert bound is not None, "the assemble step no longer binds MIINT_EXTENSION_DIRECTORY"
+    assert bound.group(1) == staged.group(1), (
+        f"the assemble step binds PATH_DERIVED/{bound.group(1)} but "
+        f"stage-miint-extension.sh stages into PATH_DERIVED/{staged.group(1)}. The "
+        "bind would resolve to a path that does not exist, failing the step for "
+        "BOTH assemblers (the bind is emitted regardless of branch)."
+    )
+
+
+def test_build_spec_verify_cmd_names_an_env_the_def_creates() -> None:
+    """`VERIFY_CMD`'s `-n <env>` must be an env `assemble.def` actually creates.
+
+    This is the one spec field whose staleness aborts a DEPLOY rather than just
+    failing a check: `build-sif.sh` runs `VERIFY_CMD` both for the idempotency skip
+    and for the post-build re-verify, so a stale env name can never be skipped as
+    already-built and then fails the re-verify — and `activate.sh` aborts before any
+    service restarts, taking every component down with it. The env names moved once
+    already (a single `assemble` env became one per assembler).
+    """
+    spec = _ASSEMBLE_ENV.read_text()
+    verify_cmd = re.search(r'^VERIFY_CMD="([^"]*)"', spec, re.MULTILINE)
+    assert verify_cmd is not None, "assemble.env no longer declares VERIFY_CMD"
+    named = re.search(r"-n\s+(\S+)", verify_cmd.group(1))
+    assert named is not None, (
+        f"VERIFY_CMD ({verify_cmd.group(1)!r}) does not run inside a named env; if "
+        "that is deliberate, this test needs updating on purpose."
+    )
+    created = set(re.findall(r"micromamba create\b[^\n]*?-n\s+(\S+)", _ASSEMBLE_DEF.read_text()))
+    assert named.group(1) in created, (
+        f"VERIFY_CMD runs in env {named.group(1)!r}, which assemble.def does not "
+        f"create (it creates {sorted(created)}). The build would fail its verify and "
+        "abort the whole deploy before any service restart."
     )
 
 

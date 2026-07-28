@@ -65,13 +65,13 @@ From: mambaorg/micromamba:1.5.8
     # preference: the split LOADs the extension the deploy staged into
     # MIINT_EXTENSION_DIRECTORY (bind-mounted read-only via the step's
     # `derived_inputs`), and DuckDB namespaces that directory by ENGINE VERSION +
-    # PLATFORM — `<dir>/v1.5.4/linux_amd64/miint.duckdb_extension`. The stage step
-    # runs under the orchestrator's venv python, so the staged build carries the
+    # PLATFORM — `<dir>/v<duckdb-version>/<platform>/miint.duckdb_extension`. The
+    # stage step runs under the orchestrator's venv python, so the staged build carries the
     # orchestrator's DuckDB version; a container on a different one finds no
     # extension for its version and the step dies at LOAD. Keep this equal to the
     # `duckdb` version resolved in qiita-compute-orchestrator/uv.lock —
-    # test_myloasm_split.py asserts the two match, so a lockfile bump fails the
-    # unit suite rather than the next assembly.
+    # a unit test asserts the two match, so a lockfile bump fails the unit suite
+    # rather than the next assembly.
     micromamba install -y -n base -c conda-forge python-duckdb=1.5.4
 
     # ONE ENV PER ASSEMBLER, deliberately, even though only one runs per step. A
@@ -81,8 +81,9 @@ From: mambaorg/micromamba:1.5.8
     # move a shared transitive dep underneath myloasm. Separate envs cost only disk
     # in an image that is already tool-sized.
     #
-    # The circular/linear split is plain awk in either case and the circular contigs
-    # are emitted as a single multi-FASTA (no per-contig split tool), so the native
+    # Each arm splits circular from linear its own way (hifiasm's GFA segment name
+    # in awk; myloasm's FASTA header in myloasm_split.py, via miint). Both emit the
+    # circular contigs as ONE multi-FASTA — no per-contig split tool — so the native
     # assembly_hash step reads them with miint read_fastx.
     #
     #  - hifiasm_meta: unpinned, as it has been.
@@ -90,7 +91,7 @@ From: mambaorg/micromamba:1.5.8
     #  - myloasm: PINNED, and the pin is load-bearing in a way hifiasm's absence of
     #    one is not. myloasm's circularity contract is a STRING in its FASTA header,
     #    probed on exactly this version (0.6.0). A drifted solve that RENAMED or
-    #    reordered those fields is caught — myloasm_split.awk fails the step on a
+    #    reordered those fields is caught — myloasm_split.py fails the step on a
     #    header it cannot parse. What no runtime check can catch is a release that
     #    KEEPS the `_len-<N>_circular-<yes|no|possibly>_` shape and changes what the
     #    values mean; that is what the pin, and the %test asserting it below, are
@@ -118,9 +119,9 @@ From: mambaorg/micromamba:1.5.8
     micromamba env list | grep -q hifiasm_meta
     micromamba env list | grep -q myloasm
     micromamba run -n hifiasm_meta hifiasm_meta --version
-    # myloasm's VERSION is asserted, not merely its presence. assemble.sh reads
-    # circularity out of a header string probed against 0.6.0. A release that
-    # renamed those fields would be caught at run time by myloasm_split.awk; one
+    # myloasm's VERSION is asserted, not merely its presence. myloasm_split.py
+    # reads circularity out of a header string probed against 0.6.0. A release that
+    # renamed those fields would be caught at run time by myloasm_split.py; one
     # that KEPT the shape and changed the meaning would not be, and this pin is the
     # only thing standing in front of it.
     micromamba run -n myloasm myloasm --version | grep -Fxq "myloasm 0.6.0"
@@ -151,11 +152,15 @@ From: mambaorg/micromamba:1.5.8
     # The splitter is %files-copied, so it can go missing independently of the
     # entrypoint that runs it. It cannot be RUN here — it LOADs the deploy-staged
     # miint extension, which does not exist at build time and is bind-mounted only
-    # at submit — so assert it is present and importable-clean. Its behaviour is
-    # covered by test_myloasm_split.py, which runs the real program against real
-    # myloasm headers with a real staged extension.
+    # at submit — so import it instead. Same idiom as manifest_writer.py above (and
+    # bcl-convert's def), for the same two reasons: it catches a def-time failure
+    # that mere byte-compilation would miss, and it EXECUTES the module's top-level
+    # `import duckdb` — the realistic break here, since python-duckdb lands in the
+    # base env by a separate `micromamba install`. `py_compile` would do neither,
+    # and would also write a `__pycache__` into the read-only image filesystem
+    # this %test runs against.
     test -s /opt/qiita/myloasm_split.py
-    python3 -m py_compile /opt/qiita/myloasm_split.py
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('ms','/opt/qiita/myloasm_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
     # It must stay LOAD-only: an INSTALL would need the team mirror reachable from
     # every compute node and a writable $HOME, the footgun the staged dir replaced.
     # Anchored at a string-literal quote so the splitter's own prose explaining why
