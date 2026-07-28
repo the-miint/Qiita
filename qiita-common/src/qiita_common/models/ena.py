@@ -1,4 +1,4 @@
-"""Pydantic models for ENA/SRA study metadata resolved via miint `read_ena` /
+"""Pydantic models for INSDC study metadata resolved via miint `read_ena` /
 `read_ena_attributes`.
 
 `read_ena` returns an ALL-VARCHAR relation — every field, including numeric

@@ -1,4 +1,4 @@
-"""Tests for the ENA/SRA study-metadata Pydantic models (`models.ena`).
+"""Tests for the INSDC study-metadata Pydantic models (`models.ena`).
 
 `read_ena` returns an ALL-VARCHAR relation, so these models are the boundary that
 coerces the numeric fields (tax_id, read_count, base_count, fastq_bytes) and

@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -23,7 +22,6 @@ from qiita_control_plane.ena_import import (
 )
 from qiita_control_plane.ena_import.batch import (
     _preserve_missing_required,
-    _process_one_study,
     create_ena_import_batch,
     fetch_batch_status,
     reconcile_inflight_batches,
@@ -409,19 +407,16 @@ async def test_create_ena_import_batch_seeds_pending_items(
         postgres_pool,
         accessions=accessions,
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
     assert {item.ena_study_accession for item in items} == set(accessions)
 
     batch_row = await postgres_pool.fetchrow(
-        "SELECT submitted_by_principal_idx, download_method"
-        " FROM qiita.ena_import_batch WHERE idx = $1",
+        "SELECT submitted_by_principal_idx FROM qiita.ena_import_batch WHERE idx = $1",
         batch_idx,
     )
     assert batch_row["submitted_by_principal_idx"] == admin_principal.principal_idx
-    assert batch_row["download_method"] == "http"
 
     item_rows = await postgres_pool.fetch(
         "SELECT ena_study_accession, state FROM qiita.ena_import_batch_item"
@@ -446,7 +441,6 @@ async def test_create_ena_import_batch_rejects_invalid_accession_writes_nothing(
             postgres_pool,
             accessions=[good, bad],
             principal=admin_principal,
-            download_method="http",
         )
 
     count = await postgres_pool.fetchval(
@@ -468,7 +462,6 @@ async def test_process_one_study_registers_and_submits_download_ticket(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -476,7 +469,6 @@ async def test_process_one_study_registers_and_submits_download_ticket(
         batch_app,
         items=items,
         principal=admin_principal,
-        download_method="http",
     )
     await task
 
@@ -504,7 +496,6 @@ async def test_process_one_study_registers_and_submits_download_ticket(
     assert ticket_row["originator_principal_idx"] == admin_principal.principal_idx
     context = json.loads(ticket_row["action_context"])
     assert context["ena_study_accession"] == accession
-    assert context["download_method"] == "http"
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -521,7 +512,6 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -529,7 +519,6 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
         batch_app,
         items=items,
         principal=admin_principal,
-        download_method="http",
     )
     await task
 
@@ -588,55 +577,6 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
     await _cleanup_study(postgres_pool, accession)
 
 
-async def test_process_one_study_threads_batch_download_method_not_hardcoded_default(
-    batch_app, postgres_pool, admin_principal, batch_cleanup, monkeypatch
-):
-    """The ticket's `download_method` must come from the caller's argument, not a
-    hardcoded default. Since the real value is 'http' (== the default), drive a
-    deliberately non-default value through a monkeypatched submit and assert it reaches
-    the ticket body verbatim -- an end-to-end test alone couldn't distinguish the two.
-    """
-    accession = unique_accession("PRJNA")
-    batch_idx, items = await create_ena_import_batch(
-        postgres_pool,
-        accessions=[accession],
-        principal=admin_principal,
-        download_method="http",
-    )
-    batch_cleanup.append(batch_idx)
-
-    captured_bodies = []
-
-    async def _fake_submit_work_ticket_core(*, app, principal, body):
-        captured_bodies.append(body)
-        return SimpleNamespace(work_ticket_idx=999_999_999)
-
-    monkeypatch.setattr(
-        "qiita_control_plane.routes.work_ticket.submit_work_ticket_core",
-        _fake_submit_work_ticket_core,
-    )
-
-    distinctive_download_method = "not-the-hardcoded-default"
-    await _process_one_study(
-        batch_app,
-        postgres_pool,
-        item=items[0],
-        principal=admin_principal,
-        download_method=distinctive_download_method,
-    )
-
-    assert len(captured_bodies) == 1
-    assert captured_bodies[0].action_context["download_method"] == distinctive_download_method
-
-    await _cleanup_study(postgres_pool, accession)
-
-
-# ---------------------------------------------------------------------------
-# Audience enforcement -- the action's audience is checked even when the batch
-# route itself is admin-gated
-# ---------------------------------------------------------------------------
-
-
 async def test_process_one_study_rejects_non_audience_principal_no_ticket_created(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
@@ -663,7 +603,6 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
         postgres_pool,
         accessions=[accession],
         principal=non_audience_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -671,7 +610,6 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
         batch_app,
         items=items,
         principal=non_audience_principal,
-        download_method="http",
     )
     # Must not raise -- a rejected submission is a per-item failure, not a batch failure.
     await task
@@ -756,7 +694,6 @@ async def test_batch_dedupes_shared_biosample_across_two_items(
         postgres_pool,
         accessions=[accession_a, accession_b],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -764,7 +701,6 @@ async def test_batch_dedupes_shared_biosample_across_two_items(
         batch_app,
         items=items,
         principal=admin_principal,
-        download_method="http",
     )
     await task
 
@@ -824,7 +760,6 @@ async def test_run_batch_isolates_per_study_failure(
         postgres_pool,
         accessions=[ok_accession, bad_accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -832,7 +767,6 @@ async def test_run_batch_isolates_per_study_failure(
         batch_app,
         items=items,
         principal=admin_principal,
-        download_method="http",
     )
     # Must not raise -- the batch as a whole never fails.
     await task
@@ -868,7 +802,6 @@ async def test_fetch_batch_status_rolls_up_downloading_to_done(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
     item = items[0]
@@ -911,7 +844,6 @@ async def test_fetch_batch_status_rolls_up_in_flight_ticket_to_downloading(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
     item = items[0]
@@ -953,7 +885,6 @@ async def test_fetch_batch_status_rolls_up_failed_ticket_without_failing_batch(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
     item = items[0]
@@ -1016,7 +947,6 @@ async def test_reconcile_inflight_batches_redrives_pending_items(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -1034,17 +964,6 @@ async def test_reconcile_inflight_batches_redrives_pending_items(
         batch_idx,
     )
     assert item_row["state"] == BatchItemState.DOWNLOADING.value
-
-    # The re-driven ticket's download_method comes from the batch's OWN persisted
-    # value (SELECTed by reconcile_inflight_batches), not a hardcoded default.
-    work_ticket_idx = item_row["download_work_ticket_idxs"][0]
-    context = json.loads(
-        await postgres_pool.fetchval(
-            "SELECT action_context FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
-        )
-    )
-    assert context["download_method"] == "http"
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -1071,7 +990,6 @@ async def test_reconcile_inflight_batches_refuses_disabled_principal(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -1112,7 +1030,6 @@ async def test_reconcile_inflight_batches_refuses_retired_principal(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -1146,7 +1063,6 @@ async def test_create_ena_import_batch_dedupes_repeated_accession(
         postgres_pool,
         accessions=[accession, accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -1177,7 +1093,6 @@ async def test_process_one_study_zero_pools_reaches_terminal_failed(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -1185,7 +1100,6 @@ async def test_process_one_study_zero_pools_reaches_terminal_failed(
         batch_app,
         items=items,
         principal=admin_principal,
-        download_method="http",
     )
     await task
 
@@ -1212,7 +1126,6 @@ async def test_fetch_batch_status_missing_ticket_row_stays_downloading(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -1242,13 +1155,11 @@ async def _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     task = schedule_ena_import_batch(
         batch_app,
         items=items,
         principal=admin_principal,
-        download_method="http",
     )
     await task
     return batch_idx, items

@@ -301,7 +301,7 @@ URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 # =============================================================================
 # /ena-import-batch/* — batch multi-study ENA import driver
 # =============================================================================
-# POST accepts a list of ENA/SRA study accessions and returns a batch handle
+# POST accepts a list of INSDC study accessions and returns a batch handle
 # immediately (202); the resolve+register+download-submit work runs in a
 # background task (qiita_control_plane.ena_import.batch). GET polls the
 # per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see

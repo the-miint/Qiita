@@ -1,6 +1,6 @@
 """Batch multi-study ENA import routes.
 
-`POST /api/v1/ena-import-batch` accepts a *list* of ENA/SRA study accessions,
+`POST /api/v1/ena-import-batch` accepts a *list* of INSDC study accessions,
 validates their shape up front (422 on anything malformed), and returns a batch
 handle immediately (202) — the resolve/register/download-submit work runs in a
 background task (`ena_import.batch`). `GET /api/v1/ena-import-batch/{idx}` reads
@@ -34,7 +34,6 @@ from ..ena_import.batch import (
     fetch_batch_status,
     schedule_ena_import_batch,
 )
-from ..ena_import.submit import DEFAULT_DOWNLOAD_METHOD
 
 router = APIRouter(prefix=PATH_ENA_IMPORT_BATCH_PREFIX, tags=["ena-import-batch"])
 
@@ -62,9 +61,8 @@ async def submit_ena_import_batch(
     principal: HumanUser = Depends(require_human_with_role(SystemRole.WET_LAB_ADMIN)),
     _: None = Depends(_require_compute_backend_client),
 ) -> BatchImportResponse:
-    """Fail loud (422), before writing anything, on an unsupported
-    `download_method` or any malformed accession — one bad accession 422s the
-    whole submission.
+    """Fail loud (422), before writing anything, on any malformed accession:
+    one bad accession 422s the whole submission.
 
     On success: INSERT the batch + one `pending` item per accession, fire the
     background task, return 202. `principal` (the submitting admin) is threaded
@@ -72,21 +70,11 @@ async def submit_ena_import_batch(
     and the principal `submit_work_ticket_core` enforces each download ticket's
     audience against — never bypassed just because this route is admin-gated.
     """
-    if body.download_method != DEFAULT_DOWNLOAD_METHOD:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                f"unsupported download_method {body.download_method!r};"
-                f" only {DEFAULT_DOWNLOAD_METHOD!r} is supported in this compute environment"
-            ),
-        )
-
     try:
         batch_idx, items = await create_ena_import_batch(
             pool,
             accessions=body.accessions,
             principal=principal,
-            download_method=body.download_method,
         )
     except ValueError as exc:
         # InvalidEnaAccessionError, raised before any row is written.
@@ -98,7 +86,6 @@ async def submit_ena_import_batch(
         request.app,
         items=items,
         principal=principal,
-        download_method=body.download_method,
     )
 
     return BatchImportResponse(

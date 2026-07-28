@@ -1,4 +1,4 @@
-"""Tests for ENA/SRA accession-type detection and validation (`ena_import.accession`)."""
+"""Tests for INSDC accession-type detection and validation (`ena_import.accession`)."""
 
 import pytest
 

@@ -399,7 +399,7 @@ __all__ = [
     "StudyLookupByAccessionRequest",
     "StudyLookupByAccessionResponse",
     "TerminologyTermRef",
-    # ENA/SRA metadata.
+    # INSDC study metadata.
     "EnaRunRecord",
     "EnaSampleAttributes",
     "EnaStudyHeader",

@@ -420,17 +420,6 @@ async def test_submit_rejects_malformed_accession(eib_client, admin_token, postg
     assert count == 0
 
 
-async def test_submit_rejects_unsupported_download_method(eib_client, admin_token):
-    token, _ = admin_token
-    resp = await eib_client.post(
-        URL_ENA_IMPORT_BATCH_PREFIX,
-        json={"accessions": [unique_accession("PRJNA")], "download_method": "aspera"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp.status_code == 422, resp.text
-    assert "download_method" in resp.text
-
-
 @pytest.mark.parametrize("unknown_field", ["backend", "source"])
 async def test_submit_rejects_unknown_request_fields(eib_client, admin_token, unknown_field):
     """`BatchImportRequest` pins extra="forbid" like every other *Request model

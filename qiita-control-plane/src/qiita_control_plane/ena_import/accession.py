@@ -1,4 +1,7 @@
-"""ENA/SRA accession-type detection and validation.
+"""INSDC accession-type detection and validation.
+
+ENA, SRA and DDBJ mirror each other, and every accession below resolves through
+ENA's API regardless of which archive minted it.
 
 Validate an accession up front so a bad one fails loud here, in Python, with an
 actionable message before any network/DuckDB call. Validation-only mirror of
@@ -21,7 +24,7 @@ class EnaAccessionKind(StrEnum):
 
 
 class InvalidEnaAccessionError(ValueError):
-    """Raised when an accession is empty/blank or matches no known ENA/SRA prefix.
+    """Raised when an accession is empty/blank or matches no known INSDC prefix.
     Never a silent `None`/empty-result fallback."""
 
 
@@ -51,13 +54,13 @@ def detect_accession_kind(accession: str) -> EnaAccessionKind:
         if candidate.startswith(prefixes):
             return kind
     raise InvalidEnaAccessionError(
-        f"'{accession}' does not match a known ENA/SRA accession prefix; "
+        f"'{accession}' does not match a known INSDC accession prefix; "
         f"expected one of: {_accepted_prefixes_message()}"
     )
 
 
 def validate_study_accession(accession: str) -> str:
-    """Validate `accession` is a well-formed ENA/SRA STUDY accession and return it
+    """Validate `accession` is a well-formed INSDC STUDY accession and return it
     stripped. Raises `InvalidEnaAccessionError` on anything else — including a
     well-formed accession of the wrong kind (sample/run/experiment)."""
     kind = detect_accession_kind(accession)

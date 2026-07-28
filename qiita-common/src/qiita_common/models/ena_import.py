@@ -37,14 +37,13 @@ class BatchItemState(StrEnum):
 class BatchImportRequest(BaseModel):
     """Body for `POST /api/v1/ena-import-batch`.
 
-    `accessions`: ENA STUDY accessions, one `qiita.study` per entry.
-    `download_method`: transport for each spawned ticket (only `'http'` today).
+    `accessions`: ENA STUDY accessions, one `qiita.study` per entry. The
+    transport each spawned ticket uses is the download job's to choose.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     accessions: list[str] = Field(min_length=1)
-    download_method: str = "http"
 
 
 class RunImportOutcome(BaseModel):

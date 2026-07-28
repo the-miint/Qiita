@@ -673,7 +673,7 @@ restriction.
 
 ## ENA Study Import
 
-Admin-facing bulk import of public ENA/SRA studies' metadata and reads, distinct
+Admin-facing bulk import of public INSDC studies' metadata and reads, distinct
 from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study
 accessions and returns immediately with a batch handle, while a background task
 (`qiita_control_plane.ena_import.batch`) resolves each accession's metadata (via
@@ -687,7 +687,7 @@ standard `register-files` action into DuckLake. One accession's failure — reso
 error, unmappable platform, a DB conflict — is isolated to that accession; it never
 aborts the batch or its siblings. See
 [`docs/runbooks/ena-import.md`](runbooks/ena-import.md) for the operator-facing
-walkthrough, the REST surface, and this surface's hard scope limits (ENA/SRA only,
+walkthrough, the REST surface, and this surface's hard scope limits (INSDC only,
 `http` transport only, no DDBJ/legacy-platform or ENVO harmonization yet).
 
 ## Compute Orchestrator

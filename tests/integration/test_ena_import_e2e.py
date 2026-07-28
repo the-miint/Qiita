@@ -447,7 +447,6 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         postgres_pool,
         accessions=[accession],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -456,7 +455,6 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         postgres_pool,
         item=items[0],
         principal=admin_principal,
-        download_method="http",
     )
 
     item_row = await postgres_pool.fetchrow(
@@ -578,7 +576,6 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         postgres_pool,
         item=items[0],
         principal=admin_principal,
-        download_method="http",
     )
 
     study_count_after = await postgres_pool.fetchval(

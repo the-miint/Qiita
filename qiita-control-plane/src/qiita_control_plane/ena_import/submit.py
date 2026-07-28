@@ -1,8 +1,9 @@
 """Submit helper for the `download-ena-study` work ticket.
 
 Builds the `WorkTicketCreateRequest` body for ONE `sequenced_pool`-scoped
-`download-ena-study` ticket, `action_context` carrying `{ena_study_accession,
-download_method}`. By the time this is called, the pool and its
+`download-ena-study` ticket, `action_context` carrying `{ena_study_accession}`.
+The transport is the job's to choose, not the ticket's. By the time this is
+called, the pool and its
 `sequenced_sample` rows already exist (from `register_ena_study`).
 
 Deliberately a PURE body-builder -- no DB access, no HTTP. The caller supplies
@@ -20,17 +21,12 @@ from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest
 DOWNLOAD_ENA_STUDY_ACTION_ID = "download-ena-study"
 DOWNLOAD_ENA_STUDY_ACTION_VERSION = "1.0.0"
 
-# The only transport this compute environment supports (no Aspera key-staging);
-# matches the workflow YAML's single-value download_method enum.
-DEFAULT_DOWNLOAD_METHOD = "http"
-
 
 def build_download_ena_study_ticket(
     *,
     sequenced_pool_idx: int,
     sequencing_run_idx: int,
     ena_study_accession: str,
-    download_method: str = DEFAULT_DOWNLOAD_METHOD,
 ) -> WorkTicketCreateRequest:
     """Compose ONE `sequenced_pool`-scoped `download-ena-study`
     `WorkTicketCreateRequest`. `sequenced_pool_idx` / `sequencing_run_idx`
@@ -44,8 +40,5 @@ def build_download_ena_study_ticket(
             "sequenced_pool_idx": sequenced_pool_idx,
             "sequencing_run_idx": sequencing_run_idx,
         },
-        action_context={
-            "ena_study_accession": ena_study_accession,
-            "download_method": download_method,
-        },
+        action_context={"ena_study_accession": ena_study_accession},
     )

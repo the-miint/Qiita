@@ -13,13 +13,12 @@ def test_batch_import_request_defaults():
 
     req = BatchImportRequest(accessions=["PRJEB1234"])
     assert req.accessions == ["PRJEB1234"]
-    assert req.download_method == "http"
 
 
 def test_batch_import_request_accepts_multiple_accessions():
     from qiita_common.models.ena_import import BatchImportRequest
 
-    req = BatchImportRequest(accessions=["PRJEB1234", "PRJNA5678"], download_method="http")
+    req = BatchImportRequest(accessions=["PRJEB1234", "PRJNA5678"])
     assert req.accessions == ["PRJEB1234", "PRJNA5678"]
 
 

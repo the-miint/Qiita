@@ -1,4 +1,4 @@
-"""ENA-study import package — batch, per-study ingestion of ENA/SRA metadata
+"""ENA-study import package — batch, per-study ingestion of INSDC metadata
 and reads into Qiita.
 
 Layers: the metadata resolver (`MiintEnaResolver`, miint `read_ena` /
@@ -36,14 +36,12 @@ from .registration import (
 )
 from .resolver import EnaAccessionNotFoundError
 from .submit import (
-    DEFAULT_DOWNLOAD_METHOD,
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
     build_download_ena_study_ticket,
 )
 
 __all__ = [
-    "DEFAULT_DOWNLOAD_METHOD",
     "DOWNLOAD_ENA_STUDY_ACTION_ID",
     "DOWNLOAD_ENA_STUDY_ACTION_VERSION",
     "BatchImportItemHandle",

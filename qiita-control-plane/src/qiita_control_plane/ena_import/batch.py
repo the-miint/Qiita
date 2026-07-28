@@ -14,8 +14,8 @@ limit and bounding concurrent DB writers. Each item (`_process_one_study`): reso
 (blocking calls under `asyncio.to_thread`) -> `register_ena_study` -> one
 `download-ena-study` ticket per created pool, submitted in-process through
 `submit_work_ticket_core` with the BATCH's submitting principal (so the ticket's
-audience gate is enforced against a real principal) and the batch's own persisted
-`download_method`. One accession's failure marks only that item `failed`.
+audience gate is enforced against a real principal). One accession's failure
+marks only that item `failed`.
 
 `reconcile_inflight_batches` (from `main.py` lifespan startup) re-drives every
 item still `pending`/`resolving`/`registered` after a CP restart --
@@ -89,7 +89,6 @@ async def create_ena_import_batch(
     *,
     accessions: list[str],
     principal: HumanUser,
-    download_method: str,
 ) -> tuple[int, list[BatchImportItemHandle]]:
     """INSERT the batch row + one `pending` item per accession, synchronously.
 
@@ -104,11 +103,9 @@ async def create_ena_import_batch(
 
     async with pool.acquire() as conn, conn.transaction():
         batch_idx = await conn.fetchval(
-            "INSERT INTO qiita.ena_import_batch"
-            " (submitted_by_principal_idx, download_method)"
-            " VALUES ($1, $2) RETURNING idx",
+            "INSERT INTO qiita.ena_import_batch (submitted_by_principal_idx)"
+            " VALUES ($1) RETURNING idx",
             principal.principal_idx,
-            download_method,
         )
         items: list[BatchImportItemHandle] = []
         for accession in validated:
@@ -270,7 +267,6 @@ async def _process_one_study(
     *,
     item: BatchImportItemHandle,
     principal: HumanUser,
-    download_method: str,
 ) -> None:
     """Resolve + register ONE study, then submit one download-ena-study ticket
     per pool it created. Never raises -- every failure mode is caught and
@@ -385,7 +381,6 @@ async def _process_one_study(
                     sequenced_pool_idx=created_pool.sequenced_pool_idx,
                     sequencing_run_idx=created_pool.sequencing_run_idx,
                     ena_study_accession=study_header.study_accession,
-                    download_method=download_method,
                 )
                 response = await submit_work_ticket_core(app=app, principal=principal, body=body)
                 ticket_idx = response.work_ticket_idx
@@ -410,7 +405,6 @@ async def _run_batch(
     *,
     items: list[BatchImportItemHandle],
     principal: HumanUser,
-    download_method: str,
 ) -> None:
     """Process every item with bounded concurrency. Never raises -- each
     item's own try/except in `_process_one_study` absorbs its failure."""
@@ -423,7 +417,6 @@ async def _run_batch(
                 pool,
                 item=item,
                 principal=principal,
-                download_method=download_method,
             )
 
     await asyncio.gather(*[_bounded(item) for item in items])
@@ -434,21 +427,16 @@ def schedule_ena_import_batch(
     *,
     items: list[BatchImportItemHandle],
     principal: HumanUser,
-    download_method: str,
 ) -> asyncio.Task:
     """Fire-and-forget the batch's resolve+register+submit background task on
     this module's own tracked set (see module docstring for why it's separate
-    from `dispatch.py`'s). `download_method` is the batch's own persisted value,
-    threaded verbatim so a future transport value never silently drifts to the
-    wrong one for tickets this batch submits.
-    """
+    from `dispatch.py`'s)."""
     task = asyncio.create_task(
         _run_batch(
             app,
             app.state.pool,
             items=items,
             principal=principal,
-            download_method=download_method,
         ),
         name="ena_import_batch",
     )
@@ -473,7 +461,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     pool = app.state.pool
     rows = await pool.fetch(
         "SELECT bi.idx, bi.ena_study_accession, bi.batch_idx,"
-        "       b.submitted_by_principal_idx, b.download_method"
+        "       b.submitted_by_principal_idx"
         " FROM qiita.ena_import_batch_item bi"
         " JOIN qiita.ena_import_batch b ON b.idx = bi.batch_idx"
         " WHERE bi.state = ANY($1::text[])"
@@ -494,7 +482,6 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     total = 0
     for batch_idx, batch_rows in by_batch.items():
         principal_idx = batch_rows[0]["submitted_by_principal_idx"]
-        download_method = batch_rows[0]["download_method"]
         try:
             # Inside the guard: an unresolvable principal must fail only this
             # batch, not raise out of the lifespan reconcile and keep the whole
@@ -521,7 +508,6 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
             app,
             items=items,
             principal=principal,
-            download_method=download_method,
         )
         total += len(items)
     return total

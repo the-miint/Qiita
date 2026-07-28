@@ -326,7 +326,6 @@ async def test_batch_driver_registers_and_dedupes_a_real_small_study(
         postgres_pool,
         accessions=[_STUDY_ACCESSION],
         principal=admin_principal,
-        download_method="http",
     )
     batch_cleanup.append(batch_idx)
 
@@ -335,7 +334,6 @@ async def test_batch_driver_registers_and_dedupes_a_real_small_study(
         postgres_pool,
         item=items[0],
         principal=admin_principal,
-        download_method="http",
     )
 
     item_row = await postgres_pool.fetchrow(

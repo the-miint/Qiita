@@ -41,14 +41,7 @@ CREATE TABLE qiita.ena_import_batch (
     submitted_by_principal_idx  BIGINT NOT NULL
         REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
 
-    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    -- Transport pinned into every download-ena-study ticket this batch
-    -- submits. Only 'http' is supported today -- no Aspera key-staging in
-    -- this compute environment; a single-value CHECK so a future transport
-    -- is a deliberate migration, not silent drift.
-    download_method               TEXT NOT NULL DEFAULT 'http'
-        CHECK (download_method IN ('http'))
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 COMMENT ON TABLE qiita.ena_import_batch IS
@@ -118,7 +111,7 @@ CREATE TABLE qiita.ena_import_batch_item (
 );
 
 COMMENT ON TABLE qiita.ena_import_batch_item IS
-    'One ENA/SRA study accession within a qiita.ena_import_batch, tracked '
+    'One INSDC study accession within a qiita.ena_import_batch, tracked '
     'independently through resolve -> register -> download-submit so one '
     'accession''s failure never affects its siblings. state mirrors '
     'qiita_common.models.ena_import.BatchItemState.';

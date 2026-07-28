@@ -1,4 +1,4 @@
-"""Shared ENA/SRA metadata-resolver helpers.
+"""Shared INSDC metadata-resolver helpers.
 
 `MiintEnaResolver` (miint `read_ena` / `read_ena_attributes`) is the resolver;
 the error type below is shared with it. Given a validated study accession it

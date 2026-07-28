@@ -931,6 +931,12 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA import: "ENA/SRA" is now "INSDC" (#369).** The accession validator has
+  always accepted ENA, SRA and DDBJ prefixes (`PRJEB` / `PRJNA` / `PRJDB`,
+  `ERP` / `SRP` / `DRP`), and all three resolve through ENA's API, so naming two
+  of the three mirrors was arbitrary and read as though SRA were fetched
+  directly. Docstrings, the accession error message, the table comment and the
+  docs now say INSDC.
 - **`read_ena`'s untyped output is now tracked upstream (#369).** miint yields
   every `read_ena` column as `VARCHAR` — numeric fields as digit strings, and the
   per-file fields (`fastq_ftp` / `fastq_aspera` / `fastq_md5` / `fastq_bytes`) as
@@ -1199,6 +1205,12 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Removed
 
+- **ENA import: the batch's `download_method` (#369).** The batch persisted a
+  transport and threaded it into every ticket it submitted. The download job
+  already owns that choice and defaults it, so a re-drive had no business
+  knowing it: the column, the request field, the route's validation and the
+  ticket's `action_context` entry are gone. The workflow still accepts
+  `download_method` as the job's own parameter.
 - **ENA import: the per-sample provenance columns and the resolver/archive
   request fields (#369).** `sequenced_sample.source_archive` / `resolver_kind` /
   `transport`, the `ena_import_batch.resolver_backend` / `source_archive`

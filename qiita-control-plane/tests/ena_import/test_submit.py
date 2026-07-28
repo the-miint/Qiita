@@ -6,16 +6,16 @@ from __future__ import annotations
 from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest
 
 from qiita_control_plane.ena_import import (
-    DEFAULT_DOWNLOAD_METHOD,
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
     build_download_ena_study_ticket,
 )
 
 
-def test_builds_sequenced_pool_scoped_ticket_with_default_transport():
-    """Default call: pinned action_id/version, both pool scalars, accession + default
-    ('http') transport in action_context."""
+def test_builds_sequenced_pool_scoped_ticket():
+    """Pinned action_id/version, both pool scalars, and the accession in
+    action_context. The transport is the job's to choose, so the ticket does not
+    carry one."""
     req = build_download_ena_study_ticket(
         sequenced_pool_idx=7,
         sequencing_run_idx=3,
@@ -27,26 +27,7 @@ def test_builds_sequenced_pool_scoped_ticket_with_default_transport():
     assert req.scope_target.kind == ScopeTargetKind.SEQUENCED_POOL
     assert req.scope_target.sequenced_pool_idx == 7
     assert req.scope_target.sequencing_run_idx == 3
-    assert req.action_context == {
-        "ena_study_accession": "PRJEB1234",
-        "download_method": DEFAULT_DOWNLOAD_METHOD,
-    }
-
-
-def test_default_download_method_is_http():
-    """Locks the default transport to 'http' -- the only value this compute environment
-    supports (no Aspera key-staging)."""
-    assert DEFAULT_DOWNLOAD_METHOD == "http"
-
-
-def test_explicit_download_method_overrides_default():
-    req = build_download_ena_study_ticket(
-        sequenced_pool_idx=1,
-        sequencing_run_idx=1,
-        ena_study_accession="PRJEB1",
-        download_method="http",
-    )
-    assert req.action_context["download_method"] == "http"
+    assert req.action_context == {"ena_study_accession": "PRJEB1234"}
 
 
 def test_action_id_version_pinned_against_the_synced_workflow():

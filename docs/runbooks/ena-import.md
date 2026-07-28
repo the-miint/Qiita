@@ -1,7 +1,7 @@
 # ENA study import (runbook)
 
 **For:** an operator (wet_lab_admin or system_admin) importing one or more public
-ENA/SRA studies' metadata and reads into Qiita. Read the *Scope and limits* section
+public INSDC studies' metadata and reads into Qiita. Read the *Scope and limits* section
 before the first import on a new deploy — several boundaries here are hard limits,
 not "not implemented yet."
 
@@ -11,7 +11,7 @@ specific to importing from ENA.
 
 ## What an import does
 
-A single admin-facing call kicks off a **batch**: a list of ENA/SRA study accessions
+A single admin-facing call kicks off a **batch**: a list of INSDC study accessions
 (`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`). Each accession in the batch is
 processed independently, with bounded concurrency, in three phases:
 
@@ -51,7 +51,7 @@ and, on failure, the reason.
 
 ### REST surface
 
-- `POST /api/v1/ena-import-batch` — body: `{accessions: [...], download_method: "http"}`. Returns `202` immediately with a batch
+- `POST /api/v1/ena-import-batch` — body: `{accessions: [...]}`. Returns `202` immediately with a batch
   handle and every accession at its initial `pending` state; the resolve/register/
   submit work for the whole batch runs in the background. **Admin-only**
   (wet_lab_admin or system_admin) — this is an operator gesture, not something an
@@ -109,11 +109,13 @@ gaps expected to close soon (except where noted):
 - **Reads and metadata only.** No host-genome handling, no downstream processing
   beyond landing raw reads in DuckLake — an imported study's reads still go through
   the normal read-mask / alignment pipeline like any other ingested data.
-- **ENA/SRA source archives only.** GSA (China National GeneBank / BGI) and CNGB are
-  out of scope; there is no resolver or accession-prefix support for either.
-- **No Aspera.** `download_method` is pinned to `http` — the only transport this
-  compute environment supports (no Aspera key-staging exists). A request for any
-  other transport is rejected (`422`) before anything is written.
+- **INSDC archives only.** ENA, SRA and DDBJ mirror each other and every accession
+  resolves through ENA's API, so the archive that minted it does not change the path.
+  GSA (China National GeneBank / BGI) and CNGB are out of scope; there is no resolver
+  or accession-prefix support for either.
+- **No Aspera.** The download job fetches over `http`: no Aspera key-staging
+  exists in this compute environment. The transport is the job's to choose, so
+  neither the batch nor its tickets pin one.
 - **DDBJ / legacy-platform metadata is a known gap, not yet closed.** The platform
   and library-strategy mapping tables cover the INSDC/ENA-native platform and
   strategy vocabulary; a DDBJ-submitted record with a legacy or DDBJ-specific
