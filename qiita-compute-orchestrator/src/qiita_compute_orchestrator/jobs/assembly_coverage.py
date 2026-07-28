@@ -24,20 +24,13 @@ intermediate-materialisation the repo's streaming rule warns about. It is forced
 by metaWRAP's interface (which *is* "a BAM at work_files/<sample>.bam"), not
 chosen, and is the thing to design away if metaWRAP is ever replaced.
 
-Three behaviours of miint's BAM writer this step depends on. The parameters are
+Behaviours of miint's BAM writer this step depends on. The parameters are
 documented upstream (<https://the-miint.github.io/duckdb-miint/writing/>); the
 notes below are what a probe against the shipped build adds on top:
 
   * `COPY … (FORMAT BAM)` REQUIRES `REFERENCE_LENGTHS`, and emits an @SQ line for
     every contig in that table — including zero-coverage ones, which is what makes
     jgi report them at depth 0 instead of dropping them.
-  * @SQ comes out **reversed** from the reference-lengths table's physical order,
-    and jgi's sortedness check is on the @SQ index (tid), not the contig name. So
-    the table is built DESC to land @SQ ascending, after which `ORDER BY reference,
-    position` is a genuine coordinate sort — the BAM is correct BY CONSTRUCTION,
-    since we control the reflen order and thus the @SQ order. This reversal is not
-    in the upstream docs, so `tests/jobs/test_assembly_coverage.py` pins it
-    directly against miint; a version bump that changes it fails there.
   * `SEQUENCE_DATA` RAISES on a lookup miss (`Invalid Input Error: Read '<id>' not
     found in SEQUENCE_DATA table`) rather than falling back to `*` for that record
     — so a partial lookup cannot silently reintroduce the depth bias below. Probed
@@ -47,6 +40,19 @@ notes below are what a probe against the shipped build adds on top:
     conventional aligner writes them). `samtools quickcheck` clean, zero SEQ/CIGAR
     length mismatches, jgi accepts with no warnings. This is why keeping secondaries
     (no `max_secondary := 0`, unlike syndna/host_filter) is safe here.
+
+THIS BAM IS NOT COORDINATE SORTED, and cannot be made so here. A BAM's sort order
+is on *tid* — the @SQ index — and the @SQ order miint's writer emits is not
+derivable from the REFERENCE_LENGTHS table's row order (probed; filed upstream as
+duckdb-miint#173, which asks for a defined or steerable @SQ order — see
+docs/duckdb-miint.md's "Open upstream gaps" table for the removal ticket). So no
+ORDER BY on either the reflen table or the copied relation can produce a
+coordinate sort, and none is attempted: whoever needs one runs `samtools sort`,
+which `binning.sh` does before staging this file for metaWRAP. Do not add a reflen
+ORDER BY back in the belief that it steers @SQ — an earlier version of this step
+did exactly that, called the BAM correct by construction, and cost a production
+ticket (jgi: "ERROR: the bam file 'reads.bam' is not sorted!").
+`tests/jobs/test_assembly_coverage.py` pins the finding.
 
 WHY `SEQUENCE_DATA` IS NOT OPTIONAL. By default `FORMAT BAM` writes SEQ as `*`,
 and that silently corrupts the depth jgi reports. Coverage ramps DOWN at both
@@ -196,15 +202,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 ),
                 threads=_DUCKDB_THREADS,
             )
-            # apply_duckdb_settings sets preserve_insertion_order=false, which
-            # exists for the chunked-Parquet flush path (it lets the vectorized
-            # engine reorder row groups). This job writes a BAM, not Parquet, and
-            # its correctness depends on the COPY's ORDER BY reaching the writer
-            # intact — so remove the assumption rather than rely on it: with
-            # preservation ON, the explicit ORDER BY is authoritative. (Probed
-            # fine either way at 9600 rows / 4 threads, but "fine when I tested it"
-            # is exactly the assumption worth deleting.)
-            conn.execute("SET preserve_insertion_order=true")
+            # NOTE: no `preserve_insertion_order=true` override. This job used to
+            # set one, to protect an ORDER BY on the COPY that was believed to make
+            # the BAM coordinate sorted. That belief was wrong (see the docstring),
+            # the ORDER BY is gone with it, and nothing downstream reads this file
+            # in record order — `binning.sh` sorts it. So the helper's `false`
+            # stands, and the writer's record order is whatever the engine
+            # produces. If a consumer ever needs a defined order here, sort at the
+            # consumer, not by re-pinning a global setting.
 
             # Persistent relations, not TEMP/CTE: miint's table functions resolve
             # relation names on a SEPARATE connection, which sees neither.
@@ -253,16 +258,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [_READS, _CONTIGS, _MM2_PRESET],
             )
 
-            # DESC on purpose — see the module docstring. miint reverses the
-            # reflen order when writing @SQ, so DESC here lands @SQ ascending,
-            # which is what makes the ORDER BY below a genuine coordinate sort.
-            # The BAM is correct by construction (we own both the reflen order and
-            # the record ORDER BY); the reversal itself is pinned by the contract
-            # test rather than re-read from the header at runtime.
+            # No ORDER BY: the row order of this table does not reach @SQ (see the
+            # docstring), so any ordering here would be decoration that reads like
+            # a contract.
             conn.execute(
                 f"CREATE OR REPLACE TABLE {_REFLEN} AS "
                 "SELECT read_id AS reference, length(sequence1) AS length "
-                f"FROM {_CONTIGS} ORDER BY read_id DESC"
+                f"FROM {_CONTIGS}"
             )
 
             # Contigs exist, so alignments must too. Zero here is NOT the
@@ -284,9 +286,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # SEQUENCE_DATA is REQUIRED for correctness here, not a nicety —
             # see the module docstring. Without it SEQ is written as `*`, and
             # jgi silently reports a length-dependent under-estimate of depth.
+            #
+            # No ORDER BY on the copied relation either, and this one had a price:
+            # it sorted a read-set-sized relation, which the memory split above
+            # says outright can spill to temp_directory. It bought a name order
+            # that is not the tid order, so it was never the coordinate sort it
+            # looked like, and its only consumer (`binning.sh`) re-sorts with
+            # samtools regardless.
             conn.execute(
-                f"COPY (SELECT * FROM {_ALIGNMENT} "
-                "      ORDER BY reference ASC, position ASC) "
+                f"COPY (SELECT * FROM {_ALIGNMENT}) "
                 f"TO '{bam_sql}' (FORMAT BAM, REFERENCE_LENGTHS '{_REFLEN}', "
                 f"SEQUENCE_DATA '{_SEQDATA}')"
             )

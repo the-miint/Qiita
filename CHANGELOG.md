@@ -31,6 +31,17 @@ duplicates further down are historical strata; leave them where they are.
   study access (wet_lab_admin+ role bypass). A field of that name already on the study
   is a 409; the 201 body is the created field, with a linked field's inherited
   `data_type`/`required`/`terminology_idx` resolved on read.
+- **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
+  The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
+  now record masking completion in `qiita.mask_sample` first-class, via a new
+  terminal `finalize-mask-sample` library action that runs after `register-files`
+  (so the gate never reads `completed` before the masked reads are durable in
+  DuckLake). Previously only the block masking path wrote this gate, so downstream
+  consumers carried an unsafe "no gate row ⇒ allowed" carve-out. An idempotent
+  backfill migration populates a `completed` row for every historical completed
+  per-sample mask. The `finalize-mask-sample` writer refuses when a covering block
+  is still masking the same footprint under the shared `mask_idx` (cross-path
+  double-mask), so it cannot stomp a block's in-flight gate.
 - **`qiita reference export` — pull a genome's sequences to FASTA.gz or Parquet (#366).**
   A user CLI (`reference:read`) that exports one or more genomes'
   sequences: for each `--genome-idx` it resolves the genome's members, mints a
@@ -95,16 +106,18 @@ duplicates further down are historical strata; leave them where they are.
 - **`assembly_coverage` — binning coverage from miint's minimap2, not bwa.** New native
   step in `long-read-assembly`, between `assemble` and `binning`: it aligns the masked
   HiFi reads back to the noLCG contigs with miint's embedded minimap2 (`map-hifi`) and
-  writes a coordinate-sorted BAM, which `binning.sh` stages into
+  writes a BAM, which `binning.sh` stages into
   `work_files/<sample>.bam`. metaWRAP guards its own `bwa mem` behind that file's
   existence, so it skips self-alignment and derives depth from the minimap2 alignment —
   the same seam qp-pacbio uses, and the only one available (`metawrap binning` has no
   aligner-selection flag). Native rather than in-container because miint is deliberately
-  not exposed to containers. Three miint BAM-writer behaviours it rests on are pinned by
-  `tests/jobs/test_assembly_coverage.py`: `COPY … (FORMAT BAM)` requires
-  `REFERENCE_LENGTHS`; @SQ is emitted **reversed** from that table (undocumented — so the
-  table is built DESC to land @SQ ascending, which is what makes the coordinate sort valid,
-  since jgi checks tid order, not contig name); and `SEQUENCE_DATA` (documented upstream but
+  not exposed to containers. **SUPERSEDED IN PART — see the `Fixed` entry below on the
+  unsorted coverage BAM.** As shipped, this entry claimed the BAM was coordinate sorted
+  because miint emits `@SQ` **reversed** from the `REFERENCE_LENGTHS` table (so the table
+  was built DESC to land `@SQ` ascending). That reversal claim is false; the BAM was not
+  sorted, and `binning.sh` now runs `samtools sort`. The two behaviours that DID hold, and
+  are still pinned by `tests/jobs/test_assembly_coverage.py`: `COPY … (FORMAT BAM)` requires
+  `REFERENCE_LENGTHS`; and `SEQUENCE_DATA` (documented upstream but
   easy to miss) is required to write real SEQ, without which jgi's contig-end exclusion
   window (`--maxEdgeBases`, default 75)
   collapses — it sizes that window from the read length it reads out of SEQ — averaging the
@@ -257,6 +270,121 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
+  `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
+  ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
+  `ERROR: the bam file 'reads.bam' is not sorted!`. Two causes, both fixed here:
+  metaWRAP's own `samtools sort` sits inside the *same*
+  `if [[ ! -f work_files/<sample>.bam ]]` guard as its `bwa mem`, so pre-placing
+  our minimap2 BAM to skip the aligner silently skipped the sort as well; and the
+  BAM was not sorted to begin with, because `assembly_coverage` relied on a miint
+  contract that turned out to be false. Measured on that ticket's BAM: 11,390 of
+  925,483 records step backwards in tid across 20,975 contigs; after the sort,
+  zero. `binning.sh` now sorts into a `.partial` staging name inside `work_files/`
+  and renames it into place (so a killed sort cannot leave a truncated BAM at the
+  name metaWRAP reads), replacing the old `ln`-else-`cp` staging.
+- **The `binning` image pins `samtools=1.10` and `metabat2=2.15`, and asserts both
+  at build time (#370).** Neither was named in `binning.def` — both arrived through
+  `metawrap-mg`'s solve, so a rebuild could move either with no change to this
+  repo. They are the two tools the sort fix depends on: samtools provides the
+  `samtools sort`, and metabat2 owns `jgi_summarize_bam_contig_depths`, the tool
+  whose `is not sorted!` rejection the sort exists to satisfy — pinning the
+  producer of the sort order while leaving the consumer that adjudicates it free
+  to move would have been half a fix. A solver pin is invisible in the built
+  image, so `binning-verify.sh` now reads each tool's own reported version and
+  fails the build on drift; it runs as both the def's `%test` and the spec's
+  `VERIFY_CMD`. The sort itself is pinned by `test_binning_coverage_sort_pin.py`,
+  which needs no binary: the behavioural test needs the samtools binary (so it is
+  skipped wherever samtools is absent, CI included) and invokes samtools directly,
+  pinning samtools' behaviour rather than ours. The new test asserts the parts
+  that are ours — the entrypoint still sorts `${COVERAGE_BAM}`, the only thing
+  written to the path metaWRAP reads is the sorted BAM, staging stays atomic
+  inside `work_files/`, and the sort budget still derives from `MEM_MB`.
+- **Container steps are told their own allocation: `QIITA_CPUS` / `QIITA_MEM_MB`
+  (#370).** `apptainer exec --containall` scrubs the environment, so no `SLURM_*`
+  var reaches a container entrypoint — measured on the deploy host: zero survive.
+  `SLURM_CPUS_PER_TASK` was therefore always unset in `workflows/_shared/_lib.sh`
+  and in `workflows/bcl-convert/entrypoint.sh`, and `THREADS` came from the `nproc`
+  fallback; it happened to equal the allocation only because SLURM cpuset-binds the
+  step (`nproc` reports the cpuset — 16 under a 16-cpu allocation on a 64-core
+  node). Memory had no equivalent: nothing inside the container exposes the cgroup
+  ceiling, though the ceiling is real (`memory.max` = the step's `--mem`), so a
+  per-thread tool budget could overshoot it. `slurm/payload.py` now forwards both
+  values from the step's resolved `baseline_resources`, and `binning.sh` sizes
+  `samtools sort -m` (which is PER THREAD) so the total is a third of `MEM_MB`
+  regardless of thread count. Measured in the binning image on the 2.0 GB
+  production BAM at 16 cpu: peak RSS 11.1 GiB / 19 s wall, unchanged between a
+  12.75 GiB and a 34 GiB budget.
+- **Corrected the miint `FORMAT BAM` `@SQ`-order claim in `docs/duckdb-miint.md`,
+  `assembly_coverage`'s docstring, and `test_assembly_coverage.py` (#370).** Those
+  three asserted that `@SQ` is emitted in the *reverse* of the `REFERENCE_LENGTHS`
+  table's physical order, so that building the table `ORDER BY … DESC` lands `@SQ`
+  ascending and makes `ORDER BY reference, position` a genuine coordinate sort.
+  Probed 2026-07-24 (miint `v1.5.4`, reproduced standalone on the deploy host):
+  the emitted `@SQ` order matches neither the table's row order, nor its reverse,
+  nor `ORDER BY reference` — at n = 5, 10, 64, 300, 2000, whether the table is
+  built ASC, DESC or shuffled. It is deterministic run to run and preserves the
+  *set* of names, but the rule is unknown (miint's source was not read). The
+  reversal holds only at tiny n and only for some naming schemes, which is why the
+  old `test_reflen_order_is_reversed_in_sq` passed on its three-contig fixture;
+  it is replaced by `test_sq_order_is_not_derivable_from_reflen`, which pins the
+  probe finding and fails loudly if a miint bump gives `@SQ` a defined order.
+  Filed upstream as duckdb-miint#173 (a defined or steerable `@SQ` order) and
+  duckdb-miint#174 (no SQL access to a SAM/BAM header, which is why the contract
+  test hand-parses the BAM binary layout to see `@SQ` at all); the removal of the
+  `samtools sort` the first one forces is tracked at #374.
+- **A miint workaround now has to carry an issue, and `docs/duckdb-miint.md` has
+  an *Open upstream gaps* table to carry it in (#370).** New rule in `CLAUDE.md`'s
+  miint section: when miint's behaviour doesn't match what we expected, the
+  upstream issue is filed **in the PR that lands the workaround**, named by
+  qualified number (`duckdb-miint#173`) at the code comment, the
+  `docs/duckdb-miint.md` entry and the changelog line — and if the workaround is
+  code we mean to delete once upstream fixes it, a Qiita issue with exit criteria
+  plus a row in the new table. The table is the standing list of what qiita
+  carries for miint's sake; a row is deleted by the PR that deletes its
+  workaround. Motivated by this PR: the `@SQ`-order defect was found, documented
+  in three places and worked around, and nothing filed it — so the workaround
+  would have become permanent by default and the next reader could not have told
+  whether it still applied.
+- **`assembly_coverage` drops both now-inert `ORDER BY`s and its
+  `preserve_insertion_order` override (#370).** With the `@SQ` reversal disproven,
+  the reflen table's `ORDER BY read_id DESC` steered nothing, and the COPY's
+  `ORDER BY reference ASC, position ASC` was a name sort — not the tid sort a BAM
+  is sorted by — over a read-set-sized relation that the module's own memory split
+  says can spill to `temp_directory`. Its only consumer, `binning.sh`, now
+  `samtools sort`s regardless. The `SET preserve_insertion_order=true` existed
+  solely to protect that ORDER BY, so it goes with it and the shared helper's
+  `false` stands. `test_records_are_in_reference_name_order` is replaced by
+  `test_writer_output_is_not_tid_sorted`, which pins the property the production
+  failure was actually about.
+- **`mask_sample` gate hardening — cascade delete, align-block false-positive, export partial-output, and a third ungated ticket door (#371).**
+  Four defects surfaced once the `mask_sample` (and `alignment_sample`) completion
+  gate became live on both masking paths:
+  - `delete-sequenced-pool` 500'd once a gate row existed — `qiita.mask_sample` and
+    `qiita.alignment_sample` both reference `prep_sample` `ON DELETE RESTRICT`, and
+    the cascade did not clear them before deleting `prep_sample`. It now deletes both
+    gate tables' rows first. Same fix for the bulk-block cover-map
+    (`qiita.block_member`, also `ON DELETE RESTRICT` on `prep_sample`): the cascade
+    now tears down the pool's block-scoped work_tickets and blocks (→ `block_member`
+    CASCADEs) too, so a pool that ran block masking/alignment can be deleted. (The
+    `qiita.genome.prep_sample_idx` origin-sample FK is a narrower remaining gap,
+    tracked separately.)
+  - `has_incomplete_covering_block` (the per-sample read-mask finalize gate) matched
+    ALIGN blocks too — align blocks carry both `mask_idx` and `alignment_idx`, so a
+    pending/failed align block would wedge a read-mask re-run for that `(sample, mask)`
+    forever. Added the `alignment_idx IS NULL` read-mask-block discriminator.
+  - The masked-read-export CLI validated accessions up front but minted the export
+    ticket inside the per-sample download loop, so a now-tightened 409 aborted the run
+    AFTER earlier samples' files were written — a partial output set. It now pre-filters
+    on the manifest's `mask_state` and fails the whole export up front.
+  - `POST /read-masked/ticket/doget` (service-account only) signed a `read_masked`
+    ticket with no completion check — the third door that mints such a ticket. It now
+    409s a non-`completed` `(prep_sample, mask_idx)`, uniform with the human export
+    ticket route (every path that mints a `read_masked` ticket requires `completed`).
+  Also closed the cross-path double-mask race: the per-sample `finalize-mask-sample`
+  and the block planner now take a `(mask_idx, prep_sample)` `pg_advisory_xact_lock`
+  held across their check→write, so exactly one wins and the other refuses.
 
 - **A feature shared across genomes (a plasmid) no longer causes a lossful load (#366).**
   `feature_idx` is content-hash-global, so two organisms carrying an identical
@@ -519,6 +647,24 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#371).**
+  `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
+  `mask_idx` and aligns the pool's samples whose `mask_sample` gate is `completed`
+  under it. The server-side reconstruction of each sample's mask config (host refs
+  from biosample metadata / `force`, adapter hash, lima/syndna) is removed: it
+  matched the real mask only by coincidence — per-sample masks are minted from the
+  submitter's `action_context`, a different source of truth — so `align-plan`
+  returned `AlignNoMasksFound` for every pool on this deployment. `AlignPlanRequest`
+  drops `force`, `host_rype_reference_idx`, and `host_minimap2_reference_idx` and
+  adds the required `mask_idx`; a nonexistent `mask_idx` is a new 404
+  (`AlignMaskNotFound`), distinct from the repurposed `AlignNoMasksFound` (422 — the
+  mask exists but no pool sample is masked-complete under it).
+- **The masked-read export and long-read-assembly readers now require a `completed` `mask_sample` gate (#371).**
+  Both consumers previously treated the ABSENCE of a `mask_sample` row as "allowed".
+  With completion now written first-class by every masking path, absence means "not
+  masked-complete", so both reject it (export 409; assembly SUBMISSION/BAD_INPUT)
+  rather than stream an absent or partial pass-set. The backfill above keeps
+  historical per-sample masks passing across the deploy.
 - **The reference DoGet ticket route now accepts `reference:read` in addition to
   `ticket:doget` (any-of) (#366).** `POST /reference/{reference_idx}/ticket/doget` mints
   a read ticket for reference sequences / chunks / taxonomy / phylogeny — all

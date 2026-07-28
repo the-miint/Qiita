@@ -947,12 +947,14 @@ class MaskedReadExportSample(BaseModel):
     per row.
 
     `mask_state` is the sample's per-`(mask_idx, prep_sample)` completion gate
-    (`qiita.mask_sample.state`): `'completed'` (fully masked — exportable),
-    `'pending'` (a block-mask is mid-flight; a covering block hasn't finished, so
-    the read_mask is partial — NOT exportable, the ticket route 409s), or `None`
-    (no gate row — the per-sample read-mask path or an unmasked sample; the
-    all-or-nothing per-sample write means it is exportable). The CLI reads it to
-    report which samples it will skip before minting per-sample tickets.
+    (`qiita.mask_sample.state`): `'completed'` (masked and durable — exportable),
+    `'pending'` (a covering block is mid-flight, so the read_mask is partial — NOT
+    exportable, the ticket route 409s), or `None` (no gate row). Only `'completed'`
+    is exportable: `None` means "not masked-complete under this mask", NOT exempt, so
+    the ticket route 409s it too. The CLI reads it to fail the whole export up front
+    (before minting any per-sample ticket) when a sample is not `'completed'`, rather
+    than abort the download loop mid-run on the ticket route's 409 and leave a partial
+    output set.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]

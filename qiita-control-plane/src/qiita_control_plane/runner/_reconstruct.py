@@ -550,6 +550,25 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_MASK_SAMPLE:
+        # Terminal step of the per-sample read-mask workflow: record this sample's
+        # masking as completed in the mask_sample gate (the per-sample twin of
+        # reconcile-block's gate flip). Runs AFTER register-files so the gate never
+        # reads 'completed' before the masked reads are in DuckLake. No file inputs:
+        # prep_sample_idx from the scope target, mask_idx from the ticket (runner-bound
+        # above for the prep_sample branch).
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                "finalize-mask-sample requires a prep_sample-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.FINALIZE_MASK_SAMPLE](
+            pool,
+            mask_idx=bound[MASK_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
         # Persist the two fastqc-equivalent QC reports onto this prep_sample's
         # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json

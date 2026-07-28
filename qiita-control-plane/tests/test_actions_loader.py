@@ -1001,3 +1001,44 @@ def test_load_actions_read_mask_audience_is_admin_only():
         SystemRole.WET_LAB_ADMIN,
         SystemRole.SYSTEM_ADMIN,
     }
+
+
+def test_load_actions_read_mask_finalizes_gate_after_register_files():
+    """`finalize-mask-sample` (the per-sample mask_sample completion writer) must be
+    the LAST step and run strictly AFTER `register-files`: the gate must not read
+    'completed' until the masked reads are durable in DuckLake. Pins the terminal
+    ordering so a reorder that flips the gate before register-files surfaces here."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_id["read-mask"].steps]
+
+    assert names[-1] == "finalize-mask-sample"
+    assert names.index("register-files") < names.index("finalize-mask-sample")
+    # persist-read-metrics still reads the local parquet before register-files moves it.
+    assert names.index("persist-read-metrics") < names.index("register-files")
+
+
+def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
+    """The mask-model fastq-to-parquet (1.3.0) mints a mask_idx and writes read_mask
+    exactly like read-mask, so it owes the SAME first-class completion gate: its last
+    step is `finalize-mask-sample`, after the read_mask `register-files`. The
+    pre-mask-model versions (1.0.0–1.2.0) never mint a mask_idx and carry no such
+    step; they are not checked here. Keyed by (action_id, version) because several
+    fastq-to-parquet versions coexist on disk."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    ftp_130 = next(
+        a
+        for a in load_actions(repo_root / "workflows")
+        if a.action_id == "fastq-to-parquet" and a.version == "1.3.0"
+    )
+    names = [s.name for s in ftp_130.steps]
+    assert names[-1] == "finalize-mask-sample"
+    assert names[-2] == "register-files"  # register-files immediately precedes the gate flip

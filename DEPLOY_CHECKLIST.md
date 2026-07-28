@@ -19,7 +19,7 @@ _None yet._
 
 ### 2. One-time host setup
 
-- **PRE-CHECK before the bucket-3 `20260724000001` migration.** That migration adds `UNIQUE(display_name)` to `biosample_global_field` and `prep_sample_global_field`; the `ALTER TABLE ... ADD CONSTRAINT UNIQUE` **fails** if either table already holds duplicate display_names. Find and resolve any before `make migrate`: (#feat_biosample_metadata_import)
+- **PRE-CHECK before the bucket-3 `20260725000001` migration.** That migration adds `UNIQUE(display_name)` to `biosample_global_field` and `prep_sample_global_field`; the `ALTER TABLE ... ADD CONSTRAINT UNIQUE` **fails** if either table already holds duplicate display_names. Find and resolve any before `make migrate`: (#feat_biosample_metadata_import)
 
   ```bash
   psql "$DATABASE_URL" -tAc "
@@ -33,8 +33,8 @@ _None yet._
 
 ### 3. Migrations
 
-- `20260724000000_metadata_global_field_alias_index_comments.sql` — attaches explanatory COMMENTs to the per-global metadata uniqueness indexes (no schema change). Plain `make migrate`. (#feat_biosample_metadata_import)
-- `20260724000001_global_field_display_name_unique.sql` — adds `UNIQUE(display_name)` to both global-field tables. Plain `make migrate` — **but only after the bucket-2 pre-check passes** (the constraint build aborts on existing duplicate display_names). (#feat_biosample_metadata_import)
+- `20260725000000_metadata_global_field_alias_index_comments.sql` — attaches explanatory COMMENTs to the per-global metadata uniqueness indexes (no schema change). Plain `make migrate`. (#feat_biosample_metadata_import)
+- `20260725000001_global_field_display_name_unique.sql` — adds `UNIQUE(display_name)` to both global-field tables. Plain `make migrate` — **but only after the bucket-2 pre-check passes** (the constraint build aborts on existing duplicate display_names). (#feat_biosample_metadata_import)
 
 ### 4. Deploy
 

@@ -625,9 +625,10 @@ _EXPORT_TICKET_TTL_SECONDS = 3600
 # (the read_masked join key) + biosample_accession (the filename's leading part;
 # NULL until NCBI submission, surfaced so the export fails loudly rather than
 # silently dropping the sample) + the per-(mask_idx, prep_sample) completion gate
-# state (LEFT JOIN mask_sample — NULL when no block-mask gate row exists, i.e. the
-# per-sample read-mask path or an unmasked sample). The pool-wide run/pool idxs
-# live on the manifest. `$2` is the mask_idx the manifest is scoped to.
+# state (LEFT JOIN mask_sample — NULL when no gate row exists for this
+# (mask_idx, prep_sample); NULL means "not masked-complete under this mask", NOT an
+# exempt sample — gate contract in `fetch_mask_sample_state`). The pool-wide
+# run/pool idxs live on the manifest. `$2` is the mask_idx the manifest is scoped to.
 _MASKED_EXPORT_ROSTER_SQL = (
     "SELECT ss.prep_sample_idx, bs.biosample_accession, msamp.state AS mask_state"
     "  FROM qiita.sequenced_sample ss"
@@ -704,13 +705,10 @@ async def create_masked_read_export_ticket(
     the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
     initiation, so it never bounds the download).
 
-    Completion gate (block-masked samples): if a `qiita.mask_sample` row exists
-    for this `(mask_idx, prep_sample)` and is NOT 'completed', the sample's mask
-    is assembled by several blocks and at least one is still in flight — its
-    read_mask is PARTIAL, so a pull would silently truncate. Refuse with 409. A
-    sample with NO mask_sample row (the per-sample read-mask path, or unmasked) is
-    unaffected: that path writes a sample's read_mask all-or-nothing, so absence
-    preserves the old guarantee and the ticket is minted.
+    Completion gate (contract: see `fetch_mask_sample_state`): the sample must be
+    'completed' under this `mask_idx`, else 409 — a 'pending' row (a covering block
+    still in flight) or NO row (absence is not exempt) both mean the read_masked
+    pass-set would be absent or partial, and a pull would silently truncate.
     """
     filter_ = {
         "prep_sample_idx": [body.prep_sample_idx],
@@ -727,15 +725,16 @@ async def create_masked_read_export_ticket(
         body.mask_idx,
         body.prep_sample_idx,
     )
-    if mask_state is not None and mask_state != "completed":
+    if mask_state != "completed":
         raise HTTPException(
             status_code=409,
             detail={
                 "reason": (
-                    "the sample's block-mask is not yet complete "
-                    f"(mask_sample.state={mask_state!r}); a covering block is still in "
-                    "flight, so its read_mask is partial. Refusing to export a "
-                    "partially-masked sample — retry once reconcile marks it completed."
+                    "the sample is not masked-complete under this mask_idx "
+                    f"(mask_sample.state={mask_state!r}). Either no read-mask has "
+                    "completed for this (prep_sample, mask_idx), or a covering block is "
+                    "still in flight — the read_masked pass-set would be absent or "
+                    "partial. Refusing to export; retry once masking is completed."
                 ),
                 "prep_sample_idx": body.prep_sample_idx,
                 "mask_idx": body.mask_idx,

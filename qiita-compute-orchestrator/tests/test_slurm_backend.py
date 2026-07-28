@@ -1457,6 +1457,43 @@ async def test_container_tmpdir_points_at_the_workspace_not_the_tmpfs(jwt_path, 
     assert (tmp_path / "tmp").is_dir(), "workspace tmp/ must exist before the job starts"
 
 
+@pytest.mark.asyncio
+async def test_container_is_told_its_own_allocation(jwt_path, tmp_path):
+    """`QIITA_CPUS` / `QIITA_MEM_MB` reach the container, carrying the step's
+    resolved baseline_resources.
+
+    `--containall` scrubs the environment, so NO `SLURM_*` var survives into a
+    container step — measured on the deploy host: zero of them. Without these two
+    an entrypoint has no way to learn its allocation: cpu degrades to `nproc`
+    (which equals the allocation only because SLURM cpuset-binds the step, an
+    accident of site config), and memory has nothing at all, while the cgroup
+    ceiling is real and fatal. `workflows/_shared/_lib.sh` resolves THREADS/MEM_MB
+    from these, and `binning.sh` sizes `samtools sort -m` — a PER-THREAD budget —
+    off MEM_MB so its total cannot exceed the allocation.
+
+    The values must be the STEP's, not the node's, which is why this asserts a
+    distinctive cpu/mem rather than the shared `baseline` fixture's 1/1."""
+    transport, captured = _capture_submit()
+    backend = _make_backend(transport, jwt_path)
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "binning",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/binning:1.0.0",
+        entrypoint="/opt/qiita/binning.sh",
+        baseline_resources=StepBaselineResources(cpu=16, mem_gb=100, walltime_seconds=60),
+    )
+
+    tokens = shlex.split(captured["payload"]["script"])
+    assert "QIITA_CPUS=16" in tokens
+    assert "QIITA_MEM_MB=102400" in tokens
+
+
 # ============================================================================
 # cancel — scancel every attempt of a ticket by name prefix
 # ============================================================================
