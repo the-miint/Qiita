@@ -22,6 +22,23 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`long-read-assembly`: the `myloasm` assembler option is implemented (#259).**
+  Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
+  image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
+  (noLCG) contigs. The two assemblers **disagree on how circularity is encoded**,
+  so this is a real branch rather than a second tool behind the same tail:
+  hifiasm-meta puts it in the GFA segment name (`…tg……c`), myloasm puts it in the
+  `assembly_primary.fa` header (`_circular-yes`) and marks nothing in its GFA.
+  Reusing the hifiasm regex would have matched nothing and silently demoted every
+  closed genome to binning input, so the split is a separate `myloasm_split.awk`
+  that unit tests execute against real myloasm headers. Only `circular-yes` counts
+  as circular (`circular-possibly` routes to noLCG, the recoverable direction), and
+  the contig id is cut at `_len-` because a circular contig's reported length
+  drifts between re-assemblies as its rotational start moves — carrying it would
+  make the same genome a different LCG bin_id every run. An unrecognised header
+  shape fails the step (exit 64) instead of yielding an empty `circular.fa`.
+  myloasm is pinned to 0.6.0 in `assemble.def` (the version the header format was
+  probed on), asserted in `%test` and by the SIF spec's `VERIFY_MATCH`.
 - **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
   The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
   now record masking completion in `qiita.mask_sample` first-class, via a new

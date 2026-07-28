@@ -15,7 +15,7 @@ description: >
   COPY FORMAT FASTQ — no intermediate Parquet; the native `assembly_run_config`
   step only records the chosen assembler. Four container steps then run the heavy
   tools —
-  `assemble` (hifiasm_meta → circular LCG genomes + noLCG contigs), `binning`
+  `assemble` (hifiasm_meta or myloasm → circular LCG genomes + noLCG contigs), `binning`
   (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
   and `checkm` (per-MAG completeness/contamination). The storage tail REUSES the
   reference-add machinery: `assembly_hash` hashes the LCG + MAG contigs (shared
@@ -53,8 +53,11 @@ context_schema:
     # Step-1 assembler. Threaded (as a scalar param) through the native
     # assembly_run_config step into run_config.json, which the `assemble`
     # container reads — a scalar can't ride a container step's inputs (the runner
-    # would treat it as a bind-mount path). hifiasm_meta is implemented today;
-    # myloasm is a valid enum value that is not implemented yet.
+    # would treat it as a bind-mount path). Both values are implemented; they
+    # differ in HOW circularity is read back (hifiasm_meta: GFA segment name;
+    # myloasm: assembly_primary.fa header), which assemble.sh branches on. The
+    # default stays hifiasm_meta — switching it is an assay decision, not a
+    # mechanical one.
     assembler:
       type: string
       enum: [hifiasm_meta, myloasm]
@@ -76,7 +79,7 @@ steps:
       mem_gb: 2
       walltime: PT10M
 
-  # hifiasm_meta assembly + circular-genome extraction. Reads run_config.json to
+  # hifiasm_meta / myloasm assembly + circular-genome extraction. Reads run_config.json to
   # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
   # terminal no-data outcome inside the container.
   - step: assemble
