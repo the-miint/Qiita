@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **`long-read-assembly`: the `myloasm` assembler option is implemented (#259).**
+- **`long-read-assembly`: the `myloasm` assembler option is implemented (#380).**
   Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
   image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
   (noLCG) contigs. The two assemblers **disagree on how circularity is encoded**,

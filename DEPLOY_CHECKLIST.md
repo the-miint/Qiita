@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- The rebuilt `long-read-assembly` assemble image can actually run a myloasm assembly end to end (#259): myloasm at the pinned 0.6.0 (the circular/linear split reads a header string probed against exactly that version), the splitter itself, a DuckDB matching the one the miint extension was staged with (DuckDB namespaces the staged dir by engine version, so a skew fails every myloasm ticket at LOAD), and `MIINT_EXTENSION_DIRECTORY` sitting where the step's `derived_inputs` bind expects it (`PATH_DERIVED/duckdb-ext` — it resolves RELATIVE to `PATH_DERIVED`, so a host that points it elsewhere binds a non-existent path). **The bind is unconditional, so a wrong path fails the assemble step for BOTH assemblers, `hifiasm_meta` included** — that check is not myloasm-only. The version pins are. Expect `ASSEMBLE_MYLOASM_OK`.
+- The rebuilt `long-read-assembly` assemble image can actually run a myloasm assembly end to end (#380): myloasm at the pinned 0.6.0 (the circular/linear split reads a header string probed against exactly that version), the splitter itself, a DuckDB matching the one the miint extension was staged with (DuckDB namespaces the staged dir by engine version, so a skew fails every myloasm ticket at LOAD), and `MIINT_EXTENSION_DIRECTORY` sitting where the step's `derived_inputs` bind expects it (`PATH_DERIVED/duckdb-ext` — it resolves RELATIVE to `PATH_DERIVED`, so a host that points it elsewhere binds a non-existent path). **The bind is unconditional, so a wrong path fails the assemble step for BOTH assemblers, `hifiasm_meta` included** — that check is not myloasm-only. The version pins are. Expect `ASSEMBLE_MYLOASM_OK`.
   ```bash
   sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
   test "$MIINT_EXTENSION_DIRECTORY" = "${PATH_DERIVED%/}/duckdb-ext" || { echo "MIINT bind path mismatch: $MIINT_EXTENSION_DIRECTORY"; exit 1; }
@@ -48,7 +48,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- `long-read-assembly` 1.0.0 accepts `assembler: myloasm` from this deploy on — previously it exited 64 mid-step. The **default is unchanged** (`hifiasm_meta`), so no existing ticket changes behaviour; picking myloasm is an assay decision made per action context. The assemble SIF auto-rebuilds to add myloasm 0.6.0 (its own conda env) plus `python-duckdb`, so its build is slower than a routine no-op verify; it bind-mounts the **already-staged** miint extension read-only rather than carrying its own copy, so no extra staging step is needed and it stays byte-identical to the CP/CO/DP build. One standing consequence: the image's DuckDB is now in lockstep with the orchestrator's, so a future `uv lock` DuckDB bump must re-pin `assemble.def` — a unit test enforces it (#259).
+- `long-read-assembly` 1.0.0 accepts `assembler: myloasm` from this deploy on — previously it exited 64 mid-step. The **default is unchanged** (`hifiasm_meta`), so no existing ticket changes behaviour; picking myloasm is an assay decision made per action context. The assemble SIF auto-rebuilds to add myloasm 0.6.0 (its own conda env) plus `python-duckdb`, so its build is slower than a routine no-op verify; it bind-mounts the **already-staged** miint extension read-only rather than carrying its own copy, so no extra staging step is needed and it stays byte-identical to the CP/CO/DP build. One standing consequence: the image's DuckDB is now in lockstep with the orchestrator's, so a future `uv lock` DuckDB bump must re-pin `assemble.def` — a unit test enforces it (#380).
 
 ---
 
