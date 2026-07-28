@@ -59,7 +59,10 @@ class RunImportOutcome(BaseModel):
     set only on `failed`. `missing_required` lists the checklist-required fields
     ENA did not supply for a newly-created biosample (the harmonization gap) —
     computed at import and reported here, never silently dropped. It is empty
-    for a reused/re-imported biosample (no harmonization write ran).
+    for a biosample this import reused from an earlier study (no harmonization
+    write ran, so there was no gap to compute). A re-drive of an already-
+    registered item likewise recomputes nothing, and deliberately preserves the
+    gap the original pass recorded rather than reporting an empty one.
     """
 
     run_accession: str

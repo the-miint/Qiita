@@ -23,6 +23,7 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
 from qiita_control_plane.ena_import.batch import (
+    _preserve_missing_required,
     _process_one_study,
     create_ena_import_batch,
     fetch_batch_status,
@@ -1489,5 +1490,106 @@ async def test_reconcile_registered_item_reuses_already_submitted_ticket(
         DOWNLOAD_ENA_STUDY_ACTION_VERSION,
     )
     assert ticket_count == 1
+
+    # The re-drive harmonizes nothing (the biosample already exists), so the gap
+    # the first pass recorded must still be reported.
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    assert status.items[0].runs[0].missing_required
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+def test_preserve_missing_required_merges_per_run():
+    """The carry-forward is per run, not per item: a re-drive that creates some
+    biosamples and reuses others must keep each run's own truth. A freshly
+    computed gap always wins (including a re-harmonization that closed one); an
+    empty fresh gap falls back to what was stored; a run with nothing stored, or
+    new to this pass, keeps its fresh value."""
+    stored = [
+        {"run_accession": "ERR1", "missing_required": ["collection date"]},
+        {"run_accession": "ERR2", "missing_required": ["geographic location (country and/or sea)"]},
+        {"run_accession": "ERR3", "missing_required": []},
+    ]
+    fresh = [
+        # Reused biosample: nothing recomputed, so ERR1's stored gap must survive.
+        {"run_accession": "ERR1", "missing_required": []},
+        # Re-harmonized: the freshly computed value replaces the stored one.
+        {"run_accession": "ERR2", "missing_required": ["depth"]},
+        # Nothing stored and nothing fresh -- stays empty.
+        {"run_accession": "ERR3", "missing_required": []},
+        # New to this pass -- keeps its fresh value.
+        {"run_accession": "ERR4", "missing_required": ["latitude"]},
+    ]
+    assert _preserve_missing_required(fresh, stored) == [
+        {"run_accession": "ERR1", "missing_required": ["collection date"]},
+        {"run_accession": "ERR2", "missing_required": ["depth"]},
+        {"run_accession": "ERR3", "missing_required": []},
+        {"run_accession": "ERR4", "missing_required": ["latitude"]},
+    ]
+
+
+def test_preserve_missing_required_keeps_other_fields():
+    """Only `missing_required` is carried forward -- status and failure_reason
+    are this pass's truth (a re-drive legitimately reports
+    `skipped_already_present` where the first pass said `registered`)."""
+    stored = [
+        {
+            "run_accession": "ERR1",
+            "status": RunRegistrationStatus.REGISTERED.value,
+            "failure_reason": None,
+            "missing_required": ["collection date"],
+        }
+    ]
+    fresh = [
+        {
+            "run_accession": "ERR1",
+            "status": RunRegistrationStatus.SKIPPED_ALREADY_PRESENT.value,
+            "failure_reason": None,
+            "missing_required": [],
+        }
+    ]
+    assert _preserve_missing_required(fresh, stored) == [
+        {
+            "run_accession": "ERR1",
+            "status": RunRegistrationStatus.SKIPPED_ALREADY_PRESENT.value,
+            "failure_reason": None,
+            "missing_required": ["collection date"],
+        }
+    ]
+
+
+async def test_reconcile_preserves_harmonization_gap_on_redrive(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """A re-drive must not erase the harmonization gap it did not recompute.
+
+    `register_ena_study` harmonizes only a biosample it creates, so re-driving an
+    already-registered item recomputes nothing and its fresh outcomes carry an
+    empty `missing_required`. Writing that over the stored list would drop the
+    very gap `GET /ena-import-batch/{idx}` exists to report -- a CP restart would
+    silently close every gap it reported.
+    """
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    before = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    gap_before = list(before.items[0].runs[0].missing_required)
+    # _fake_attrs supplies only 'collection date', so the rest of the checklist's
+    # required fields are the gap this test protects.
+    assert gap_before
+
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item SET state = 'registered' WHERE idx = $1",
+        items[0].idx,
+    )
+    assert await reconcile_inflight_batches(batch_app) == 1
+    await asyncio.gather(*list(batch_app.state.running_ena_import_batches))
+
+    after = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    run_after = after.items[0].runs[0]
+    assert list(run_after.missing_required) == gap_before
+    # The run's status legitimately changes on a re-drive -- the gap does not.
+    assert run_after.status == RunRegistrationStatus.SKIPPED_ALREADY_PRESENT.value
 
     await _cleanup_study(postgres_pool, accession)

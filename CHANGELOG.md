@@ -420,6 +420,15 @@ duplicates further down are historical strata; leave them where they are.
   a staged directory without `httpfs` as stale (a local check, before the mirror
   HEAD), and `make verify-deploy`'s `cp-miint` probe LOADs `httpfs` too so the
   gap fails the deploy rather than every ENA import.
+- **ENA import: a re-drive no longer erases the harmonization gap it did not
+  recompute (#369).** `register_ena_study` harmonizes only a biosample it
+  creates, so re-driving a `registered` item (a CP restart, via
+  `reconcile_inflight_batches`) recomputed nothing and wrote an empty
+  `missing_required` over the stored one — silently closing every gap
+  `GET /ena-import-batch/{idx}` had reported, against the runbook's promise that
+  these are never dropped. The write now carries a stored gap forward per run,
+  so a re-drive that creates some biosamples keeps their freshly computed values
+  and preserves only the runs it skipped.
 - **ENA import: an empty ENA sample attribute set no longer fails the whole
   study (#369).** A live ingestion test surfaced a real DDBJ study (`PRJDB40364`)
   whose sample (`SAMD01818724`) has zero `<SAMPLE_ATTRIBUTE>` elements —

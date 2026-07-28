@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import asyncpg
 from fastapi import FastAPI
@@ -174,38 +175,69 @@ async def _set_item_state(
     )
 
 
-def _serialize_run_outcomes(result: EnaStudyRegistrationResult) -> str:
-    """JSON-encode the per-run outcomes for the item's `run_outcomes` JSONB
-    column (asyncpg has no default jsonb codec, so write a string + `::jsonb`).
-    Carries each run's status, failure reason, and harmonization gap
-    (`missing_required`) so `GET /ena-import-batch/{idx}` can surface them."""
-    return json.dumps(
-        [
-            {
-                "run_accession": o.run_accession,
-                "status": o.status.value,
-                "failure_reason": o.failure_reason,
-                "missing_required": (
-                    list(o.harmonization.missing_required) if o.harmonization else []
-                ),
-            }
-            for o in result.runs
-        ]
-    )
+def _run_outcomes(result: EnaStudyRegistrationResult) -> list[dict[str, Any]]:
+    """Per-run outcomes for the item's `run_outcomes` JSONB column. Carries each
+    run's status, failure reason, and harmonization gap (`missing_required`) so
+    `GET /ena-import-batch/{idx}` can surface them."""
+    return [
+        {
+            "run_accession": o.run_accession,
+            "status": o.status.value,
+            "failure_reason": o.failure_reason,
+            "missing_required": (list(o.harmonization.missing_required) if o.harmonization else []),
+        }
+        for o in result.runs
+    ]
+
+
+def _preserve_missing_required(
+    fresh: list[dict[str, Any]], stored: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Carry a previously recorded harmonization gap forward onto *fresh*.
+
+    A re-drive re-registers an already-imported study, so `register_ena_study`
+    finds every biosample already present and harmonizes none of them
+    (`biosample_created` is False). The fresh outcomes then carry an empty
+    `missing_required` not because the gap closed but because nothing recomputed
+    it -- writing that over the stored list would drop the very gap this surface
+    exists to report, and the runbook promises these are never silently dropped.
+
+    Per run, so a re-drive that *does* create some biosamples keeps their newly
+    computed values and preserves only the runs it skipped. A run absent from
+    the stored outcomes (new to this pass) simply keeps its fresh value.
+    """
+    prior = {o["run_accession"]: o.get("missing_required") or [] for o in stored}
+    return [
+        o if o["missing_required"] else {**o, "missing_required": prior.get(o["run_accession"], [])}
+        for o in fresh
+    ]
 
 
 async def _set_item_registered(
-    pool: asyncpg.Pool, item_idx: int, *, study_idx: int, run_outcomes_json: str
+    pool: asyncpg.Pool, item_idx: int, *, study_idx: int, run_outcomes: list[dict[str, Any]]
 ) -> None:
-    await pool.execute(
-        "UPDATE qiita.ena_import_batch_item"
-        " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb, failure_reason = NULL"
-        " WHERE idx = $1",
-        item_idx,
-        BatchItemState.REGISTERED.value,
-        study_idx,
-        run_outcomes_json,
-    )
+    """Record a study's registration on its batch item.
+
+    Reads the stored outcomes under the same transaction before writing so a
+    re-drive cannot erase a harmonization gap it did not recompute (see
+    `_preserve_missing_required`). asyncpg has no default jsonb codec, so the
+    column is read as a string and written back as one + `::jsonb`.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        stored = await conn.fetchval(
+            "SELECT run_outcomes FROM qiita.ena_import_batch_item WHERE idx = $1 FOR UPDATE",
+            item_idx,
+        )
+        merged = _preserve_missing_required(run_outcomes, json.loads(stored))
+        await conn.execute(
+            "UPDATE qiita.ena_import_batch_item"
+            " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb, failure_reason = NULL"
+            " WHERE idx = $1",
+            item_idx,
+            BatchItemState.REGISTERED.value,
+            study_idx,
+            json.dumps(merged),
+        )
 
 
 async def _append_item_download_ticket(pool: asyncpg.Pool, item_idx: int, ticket_idx: int) -> None:
@@ -293,7 +325,7 @@ async def _process_one_study(
             pool,
             item.idx,
             study_idx=result.study_idx,
-            run_outcomes_json=_serialize_run_outcomes(result),
+            run_outcomes=_run_outcomes(result),
         )
 
         if not result.created_pools:
