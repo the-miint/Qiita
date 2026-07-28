@@ -332,14 +332,15 @@ class MetadataFieldWriteResult(BaseModel):
     value: SampleMetadataValue
 
 
-class BiosampleMetadataWriteRequest(BaseModel):
-    """Body for PATCH /api/v1/study/{study_idx}/biosample/{biosample_idx}/metadata.
+class SampleMetadataWriteRequest(BaseModel):
+    """Body for a study-scoped sample-family metadata write (the
+    PATCH .../{entity}/metadata routes, e.g. biosample and sequenced-sample).
 
-    metadata carries text values keyed on biosample field display_name; the
-    route resolves each against the study's existing global or study-local
-    fields and upserts it. At least one entry is required — an empty write is
-    almost certainly a client error. Unknown field names are rejected by the
-    route rather than created.
+    metadata carries text values keyed on field display_name; the route
+    resolves each against the study's existing global or study-local fields and
+    upserts it. At least one entry is required — an empty write is almost
+    certainly a client error. Unknown field names are rejected by the route
+    rather than created.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -347,8 +348,8 @@ class BiosampleMetadataWriteRequest(BaseModel):
     metadata: dict[str, str] = Field(min_length=1)
 
 
-class BiosampleMetadataWriteResponse(BaseModel):
-    """Returned by PATCH /api/v1/study/{study_idx}/biosample/{biosample_idx}/metadata.
+class SampleMetadataWriteResponse(BaseModel):
+    """Returned by a study-scoped sample-family metadata write route.
 
     results maps each display_name the caller sent to what the write did to
     that field (scope, outcome, resulting value), in the caller's input order.

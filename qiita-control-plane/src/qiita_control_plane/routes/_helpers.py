@@ -4,24 +4,43 @@ Centralizing them keeps response wording consistent across parallel
 endpoints — same input shape, same on-the-wire output.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
+from typing import NoReturn
 
 import asyncpg
 from fastapi import HTTPException
-from qiita_common.models import IdxsListResponse, MissingReasonRef, TerminologyTermRef
+from qiita_common.models import (
+    IdxsListResponse,
+    MetadataEntry,
+    MetadataFieldWriteResult,
+    MissingReasonRef,
+    SampleMetadataWriteResponse,
+    TerminologyTermRef,
+)
 
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
+    DuplicateGlobalFieldTargetError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
+    EntityMetadataSpec,
     MetadataChecklistUnknownError,
+    MetadataParseError,
+    MetadataRow,
+    MetadataUnknownFieldsError,
+    OwnerSampleIdMetadataWriteError,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
+    StudyFieldConflictError,
     TransientWriteRaceError,
+    fetch_entity_is_linked_to_study,
+    fetch_global_metadata,
+    fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
+    write_sample_metadata,
 )
 
 
@@ -42,6 +61,240 @@ def _attempted_label(value: object) -> str:
 # is not in a route's specific message map. Lifted here so the wording
 # stays identical across every route that falls back to it.
 GENERIC_FK_VIOLATION = "references a row that does not exist"
+
+
+def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
+    """Map a metadata-row dict to MetadataEntry, preserving the input keys.
+
+    Each input key is reused unchanged as the output key, so the caller's
+    keying carries through: the global read is keyed by internal_name, the
+    local read by display_name. Only the four MetadataEntry fields are read
+    from each row (a global row's internal_name rides along as the key, not
+    as an entry field), so one builder serves every sample-family entity.
+    """
+    return {
+        key: MetadataEntry(
+            display_name=row.display_name,
+            description=row.description,
+            data_type=row.data_type,
+            value=row.value,
+        )
+        for key, row in rows.items()
+    }
+
+
+async def read_global_and_local_entries(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+) -> tuple[dict[str, MetadataEntry], dict[str, MetadataEntry]]:
+    """Read an entity's globally-linked and study-local metadata and shape both
+    into MetadataEntry dicts.
+
+    Spec-driven, so every sample-family entity's study-scoped read shares this
+    body; the caller owns the connection/snapshot and the link/existence/retired
+    gating (whose 404 wording and idx source differ per entity). Returns
+    (global_metadata keyed by internal_name, local_metadata keyed by
+    display_name).
+    """
+    global_rows = await fetch_global_metadata(conn, spec=spec, entity_idx=entity_idx)
+    local_rows = await fetch_local_metadata(
+        conn, spec=spec, entity_idx=entity_idx, study_idx=study_idx
+    )
+    global_metadata = metadata_entries_from_rows(global_rows)
+    local_metadata = metadata_entries_from_rows(local_rows)
+    return global_metadata, local_metadata
+
+
+async def resolve_linked_study_entity(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
+    entity_idx: int,
+    metadata_idx_column: str,
+    study_idx: int,
+    noun: str,
+    retired_status: int,
+    retired_detail: str,
+) -> tuple[asyncpg.Record, int]:
+    """Fetch a study-scoped entity and gate it on its study link + retirement.
+
+    metadata_idx_column names the row column that keys metadata and the study
+    link -- the entity's own idx for a direct entity, a supertype idx for a
+    subtype (prep_sample_idx on a sequenced_sample). A nonexistent row and an
+    unlinked one share the "not linked" 404 so existence never leaks across the
+    study boundary; retirement is checked only after the link passes and raises
+    retired_status/retired_detail (a read passes 404, a write passes 409).
+    Returns the (non-None) row plus its metadata/link idx.
+    """
+    row = await fetch_row(conn, entity_idx)
+    metadata_entity_idx = None if row is None else row[metadata_idx_column]
+    linked = metadata_entity_idx is not None and await fetch_entity_is_linked_to_study(
+        conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
+    )
+    if not linked:
+        raise HTTPException(
+            status_code=404, detail=f"{noun} {entity_idx} is not linked to study {study_idx}"
+        )
+    if row["retired"]:
+        raise HTTPException(status_code=retired_status, detail=retired_detail)
+    return row, metadata_entity_idx
+
+
+async def read_study_scoped_entity(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
+    entity_idx: int,
+    metadata_idx_column: str,
+    study_idx: int,
+    noun: str,
+) -> tuple[asyncpg.Record, dict[str, MetadataEntry], dict[str, MetadataEntry]]:
+    """Fetch a study-scoped entity for reading and return its metadata.
+
+    Gates via resolve_linked_study_entity with a read's 404-on-retired, then
+    reads the entity's global and study-local metadata. Returns the (non-None)
+    row plus the two MetadataEntry dicts.
+    """
+    row, metadata_entity_idx = await resolve_linked_study_entity(
+        conn,
+        spec=spec,
+        fetch_row=fetch_row,
+        entity_idx=entity_idx,
+        metadata_idx_column=metadata_idx_column,
+        study_idx=study_idx,
+        noun=noun,
+        retired_status=404,
+        retired_detail=f"{noun} {entity_idx} not found",
+    )
+    global_metadata, local_metadata = await read_global_and_local_entries(
+        conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
+    )
+    return row, global_metadata, local_metadata
+
+
+# Sample-family metadata-write exceptions the shared mapper handles. A route
+# writing sample metadata catches these and delegates to
+# raise_http_for_sample_metadata_write_error; entity-specific errors
+# (owner-id-field-collision, required-field, asyncpg) stay on the route.
+SAMPLE_METADATA_WRITE_ERRORS = (
+    MetadataUnknownFieldsError,
+    MetadataParseError,
+    StudyFieldConflictError,
+    DuplicateGlobalFieldTargetError,
+    OwnerSampleIdMetadataWriteError,
+    SlotOccupiedError,
+    TransientWriteRaceError,
+)
+
+
+async def raise_http_for_sample_metadata_write_error(
+    conn: asyncpg.Connection, exc: Exception
+) -> NoReturn:
+    """Map a sample-family metadata-write exception to its HTTPException.
+
+    Shared by every route that writes sample metadata (the study-scoped
+    metadata PATCH routes and the biosample / sequenced-sample import
+    composers) so one exception maps to one response everywhere. Parse,
+    unknown-field, study-field-conflict, duplicate-global-target, and
+    owner-sample-id errors map to 422; a slot collision to 409 (diagnosed
+    against conn); a transient write race to 503. Always raises.
+    """
+    if isinstance(exc, MetadataUnknownFieldsError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown metadata fields: {', '.join(exc.field_keys)}",
+        )
+    if isinstance(exc, MetadataParseError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"could not parse metadata field {exc.field_key!r}"
+                f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
+            ),
+        )
+    if isinstance(exc, StudyFieldConflictError):
+        # found_global_field_idx None means the shadowing study field is
+        # purely-local; otherwise it is bound to a different global field.
+        if exc.found_global_field_idx is None:
+            conflict = "a purely-local field of that name"
+        else:
+            conflict = "a field of that name bound to a different global field"
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} conflicts with"
+                f" {conflict} already on this study"
+            ),
+        )
+    if isinstance(exc, DuplicateGlobalFieldTargetError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"metadata fields {exc.field_keys!r} all resolve to the same global field",
+        )
+    if isinstance(exc, OwnerSampleIdMetadataWriteError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} is an owner-sample-id field"
+                " and cannot be written as ordinary metadata"
+            ),
+        )
+    if isinstance(exc, SlotOccupiedError):
+        detail = await detail_for_slot_collision(conn, exc)
+        raise HTTPException(status_code=409, detail=detail)
+    if isinstance(exc, TransientWriteRaceError):
+        raise_for_transient_write_race(exc)
+    # Not a SAMPLE_METADATA_WRITE_ERRORS member: the caller's except clause and
+    # this dispatch have drifted. Fail loud rather than swallow the exception.
+    raise exc
+
+
+async def write_and_map_sample_metadata(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    metadata: Mapping[str, str],
+    caller_idx: int,
+) -> SampleMetadataWriteResponse:
+    """Upsert a metadata dict for a sample-family entity and shape the result.
+
+    Shared by every study-scoped metadata PATCH: writes each field
+    (allow_local=True), maps the metadata-write exceptions to their HTTP
+    responses, and returns the per-field results keyed by display_name in the
+    caller's input order. A cross-study slot collision still 409s; a same-study,
+    same-field, different-value rewrite is a last-writer-wins overwrite -- there
+    is no If-Match on this path, so the caller accepts lost-update semantics.
+    """
+    try:
+        # on_conflict="upsert" overwrites the caller's own study's value in
+        # place. No If-Match guards this, so a concurrent same-study rewrite of
+        # the same field is last-writer-wins (lost update); a foreign study's
+        # value still raises (409) rather than being overwritten.
+        results = await write_sample_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=study_idx,
+            metadata=metadata,
+            caller_idx=caller_idx,
+            allow_local=True,
+            on_conflict="upsert",
+        )
+    except SAMPLE_METADATA_WRITE_ERRORS as exc:
+        await raise_http_for_sample_metadata_write_error(conn, exc)
+    return SampleMetadataWriteResponse(
+        results={
+            r.field_key: MetadataFieldWriteResult(scope=r.scope, outcome=r.outcome, value=r.value)
+            for r in results
+        }
+    )
 
 
 def raise_for_unique_violation(

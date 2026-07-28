@@ -22,6 +22,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Study-scoped biosample and sequenced-sample metadata read + write —
+  `GET`/`PATCH /study/{study_idx}/{biosample|sequenced-sample}/{idx}[/metadata]` (#TBD).**
+  Four routes expose a study's view of a sample's metadata. The two GETs return the
+  entity's core row plus its globally-linked metadata and this study's purely-local
+  metadata (`StudyScopedBiosampleResponse` / `StudyScopedSequencedSampleResponse`);
+  the two PATCHes upsert text values keyed by field display_name against the study's
+  existing global or study-local fields, reporting per field whether it resolved
+  global or local and the write outcome (inserted / updated / unchanged).
+  Sequenced-sample metadata lives on the supertype prep_sample. All four are clamped
+  to `Tier.ADMIN` study access (wet_lab_admin+ role bypass), an interim stand-in
+  until per-field visibility-tier enforcement lands. A sample not linked to the path
+  study is 404 (indistinguishable from nonexistent); a retired sample is 404 on read
+  and 409 on write. The PATCH carries no If-Match — a cross-study slot collision is a
+  409, but a same-study rewrite is last-writer-wins. The biosample surface also
+  returns the owner-biosample-id row on read while refusing to write it (422).
 - **Create a study-local biosample field — `POST /study/{study_idx}/biosample-field`
   and `qiita biosample create-field` (#TBD).** Mints one
   `biosample_study_field` definition (no metadata value) in either mode: purely-local

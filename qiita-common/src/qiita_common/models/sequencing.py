@@ -778,6 +778,20 @@ class SequencedSampleResponse(BaseModel):
         )
 
 
+class StudyScopedSequencedSampleResponse(SequencedSampleResponse):
+    """Returned by GET /api/v1/study/{study_idx}/sequenced-sample/{sequenced_sample_idx}.
+
+    A study-scoped view: every field of the sequenced-sample-level
+    SequencedSampleResponse (core columns, caller_system_role, and the
+    globally-linked global_metadata keyed by internal_name) plus this study's
+    purely-local prep_sample metadata, keyed by display_name. local_metadata is
+    returned only on a study-scoped response, where the caller is already
+    authorized on the study.
+    """
+
+    local_metadata: dict[str, MetadataEntry]
+
+
 class SequencedSamplePatchRequest(PatchRequestModel):
     """Body for PATCH /api/v1/sequenced-sample/{sequenced_sample_idx}.
 

@@ -2105,6 +2105,34 @@ async def preflight_sample_metadata(
     return [(resolved[name], parsed_values[name]) for name in metadata]
 
 
+async def fetch_entity_is_linked_to_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+) -> bool:
+    """Return True iff entity_idx has a non-retired link to study_idx.
+
+    Checks only spec.link_table's own retirement (retired = false); the
+    entity's own retirement is a separate row the caller checks itself.
+    Accepts either a pool or a connection so the read composes inside an
+    open transaction or stands alone.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    return await pool_or_conn.fetchval(
+        f"SELECT EXISTS ("
+        f"    SELECT 1 FROM {spec.link_table}"
+        f"     WHERE {spec.link_entity_key_column} = $1"
+        f"       AND study_idx = $2"
+        f"       AND retired = false"
+        f")",
+        entity_idx,
+        study_idx,
+    )
+
+
 async def insert_entity_to_study(
     conn: asyncpg.Connection,
     *,

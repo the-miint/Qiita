@@ -32,6 +32,7 @@ from ..repositories._sample_helpers import (
     EntityMetadataSpec,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
+    write_local_metadata_or_diagnose,
 )
 
 # Seeded NCBI Taxonomy fixture data — must match the seed migration at
@@ -437,6 +438,39 @@ async def seed_local_study_field(
             required=required,
         )
     return idx
+
+
+async def seed_local_metadata_value(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    display_name: str,
+    value: str,
+    created_by_idx: int,
+    data_type: FieldDataType = FieldDataType.TEXT,
+) -> tuple[int, int]:
+    """Write one purely-local metadata value for spec's entity and return
+    (metadata_idx, study_field_idx) for cleanup.
+
+    Delegates to the repository local writer so the study-field get-or-create
+    and the value insert stay single-sourced; the caller tracks both returned
+    idxs for FK-reverse teardown. Runs inside an acquired transaction because
+    the underlying writer requires one.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        result = await write_local_metadata_or_diagnose(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=study_idx,
+            display_name=display_name,
+            data_type=data_type,
+            value=value,
+            caller_idx=created_by_idx,
+        )
+    return result.metadata_idx, result.study_field_idx
 
 
 async def seed_globally_linked_study_field(

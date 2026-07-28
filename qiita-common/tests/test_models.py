@@ -902,25 +902,25 @@ def test_read_mask_reason_sql_list_is_sorted_and_quoted():
     assert read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN) == "'spikein_syndna'"
 
 
-def test_biosample_metadata_write_request_rejects_empty_metadata():
+def test_sample_metadata_write_request_rejects_empty_metadata():
     """Tests the case where the metadata dict is empty: an empty write is
     rejected at the wire boundary (min_length=1), matching the core PATCH's
     at-least-one-field rule.
     """
-    from qiita_common.models import BiosampleMetadataWriteRequest
+    from qiita_common.models import SampleMetadataWriteRequest
 
     with pytest.raises(ValidationError):
-        BiosampleMetadataWriteRequest(metadata={})
+        SampleMetadataWriteRequest(metadata={})
 
 
-def test_biosample_metadata_write_request_rejects_extra_field():
+def test_sample_metadata_write_request_rejects_extra_field():
     """Tests the case where an unknown top-level key is supplied: extra="forbid"
     rejects it rather than silently ignoring it.
     """
-    from qiita_common.models import BiosampleMetadataWriteRequest
+    from qiita_common.models import SampleMetadataWriteRequest
 
     with pytest.raises(ValidationError):
-        BiosampleMetadataWriteRequest(metadata={"ph": "7.2"}, typo="x")
+        SampleMetadataWriteRequest(metadata={"ph": "7.2"}, typo="x")
 
 
 def test_metadata_entry_round_trips_ref_values():
