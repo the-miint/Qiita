@@ -739,6 +739,37 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`align_sharded` streams the aligner into its output instead of buffering it three
+  times (#385).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
+  then a pooled-identity `WINDOW`, then a sorted `COPY` — three full buffers of the
+  alignment set, with the selective identity filter running *after* the first two
+  (`EXPLAIN`: `SEQ_SCAN → HASH_JOIN → WINDOW → FILTER → ORDER_BY → BATCH_COPY_TO_FILE`).
+  Both align seams now return `(sql, params)` rather than materializing a table, and
+  `execute()` runs two phases: phase 1 streams align → (single-end) filter →
+  `read_meta` join into a transient staging Parquet inside the DuckDB temp dir, and
+  phase 2 applies the pooled paired-end filter plus the single 6-column identifier
+  sort into `alignment.parquet`. Measured on a 20M-row SAM-shaped fixture at a 2 GB
+  `memory_limit`, with a deliberately non-selective filter so this is pipeline shape
+  alone: 12.0 s and ~4.9 GB spilled → 5.5 s and zero spill. The split is load-bearing
+  rather than cosmetic — `memory_limit` is a ceiling, not a reservation, so sorting in
+  the same statement as the aligner would hold the whole alignment set while the rype
+  router, per-shard indexes and GPL-boundary daemons are still resident. The identity
+  filter now branches on the BATCH SHAPE, not the aligner: the floors stay per-aligner
+  (0.99 bowtie2 / 0.90 minimap2, query coverage minimap2-only) but the pooling is
+  per-shape, and a single-end batch — whose pooled window was a partition of one row,
+  provably equal to a per-row predicate — now filters with a plain `WHERE` in phase 1.
+  A batch that MIXES single- and paired-end reads is rejected with the counts instead
+  of surfacing as bowtie2's opaque `gpl_boundary` bind error or, on minimap2, as a
+  silently mis-pooled filter — and that rejection now runs ahead of the routing pass,
+  so it cannot be skipped by a batch whose reads route nowhere (which previously exited
+  0 with an empty output) and does not pay for a `rype_classify` pass first. Also pins
+  a miint contract the paired-end gate silently depended on: `cigar_sequence_identity`
+  and `cigar_query_coverage` are permutation-invariant over a concatenated CIGAR, which
+  is what lets the pooled `string_agg(cigar, '')` window omit an `ORDER BY`. Upstream
+  documents neither as order-insensitive, so a mirror build changing that would have
+  made the gate nondeterministic; it is now verified over all 120 permutations of a
+  5-fragment CIGAR and recorded in `docs/duckdb-miint.md`.
+
 - **`align_sharded` gets the memory and cores it was allocated (#381).** The job
   hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached
   DuckDB as 8 GB and the alignment output spilled gigabytes to shared scratch.
