@@ -346,6 +346,46 @@ async def test_align_plan_long_read_platform_selects_minimap2(ctx, planned):
     assert resp.json()["aligner"] == "minimap2"
 
 
+@pytest.mark.parametrize(
+    ("platform", "expected_target"),
+    [
+        ("illumina", align_planner._BLOCK_TARGET_READS_BY_PLATFORM["illumina"]),
+        ("pacbio_smrt", align_planner._LONG_READ_BLOCK_TARGET_READS),
+        ("oxford_nanopore", align_planner._LONG_READ_BLOCK_TARGET_READS),
+    ],
+)
+async def test_align_plan_tiles_at_the_platform_block_target(
+    ctx, planned, monkeypatch, platform, expected_target
+):
+    """The platform's block target actually reaches the tiler.
+
+    The map itself is unit-tested (`tests/test_align_planner.py`); what this pins is
+    the WIRING — that the planner resolves the target from the run's platform and
+    hands it to `tile_partition`, rather than tiling at the short-read default. That
+    can't be observed from the response on these fixtures (300 reads fits one block at
+    either target), and seeding >1M reads to make it observable would cost far more
+    than recording the argument, so record the argument."""
+    await _seed_align_action(planned["db"])
+    await planned["db"].execute(
+        "UPDATE qiita.sequencing_run SET platform = $2::qiita.platform WHERE idx = $1",
+        planned["run_idx"],
+        platform,
+    )
+
+    seen: list[int] = []
+    real_tile = align_planner.tile_partition
+
+    def _recording_tile(ranges, *, target_reads):
+        seen.append(target_reads)
+        return real_tile(ranges, target_reads=target_reads)
+
+    monkeypatch.setattr(align_planner, "tile_partition", _recording_tile)
+
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    assert seen == [expected_target]
+
+
 async def test_align_plan_unsupported_platform_422(ctx, planned):
     """A platform with no defined sharded aligner (ls454) is refused 422 — fail
     loud rather than defaulting to an aligner."""

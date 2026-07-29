@@ -769,6 +769,23 @@ duplicates further down are historical strata; leave them where they are.
   documents neither as order-insensitive, so a mirror build changing that would have
   made the gate nondeterministic; it is now verified over all 120 permutations of a
   5-fragment CIGAR and recorded in `docs/duckdb-miint.md`.
+- **Long-read align blocks are tiled at 1M reads, not 10M (#TBD).** The align planner
+  tiled every platform at `block_planner._BLOCK_TARGET_READS` (10M), a target sized on
+  read COUNT because short-read work is count-bound. The sharded aligner's cost is
+  driven by BYTES: each of the reference's ~1000 shards re-reads the block to pull its
+  own routed subset, so a block's re-scan is `n_shards × block_bytes`. At ~15 kb/read a
+  10M-read HiFi block is ~150 GB, whose re-scan alone is ~4.5 h against the align
+  step's PT4H baseline — the ticket could not finish. `pacbio_smrt` and
+  `oxford_nanopore` now tile at 1M reads (~15 GB, ~27 min); `illumina` is unchanged at
+  10M. The target is resolved from the run's platform beside the aligner (also
+  platform-derived, never a caller choice), via a new
+  `_BLOCK_TARGET_READS_BY_PLATFORM` whose keys are pinned equal to
+  `_ALIGNER_BY_PLATFORM`'s, so adding a platform forces an explicit block-size
+  decision rather than inheriting the short-read default. Note the total re-scan across
+  a sample's blocks is `n_shards × total_bytes` and therefore *invariant* to block
+  size — what block size controls is the per-JOB share, i.e. whether one ticket fits
+  its walltime. `block_planner._BLOCK_TARGET_READS` is deliberately untouched: read
+  masking has no 1000-shard fan-out, so 10M stays correct there.
 
 - **`align_sharded` gets the memory and cores it was allocated (#381).** The job
   hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached

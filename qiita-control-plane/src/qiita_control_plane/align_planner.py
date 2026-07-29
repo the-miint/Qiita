@@ -1,8 +1,10 @@
 """Align planner / tiler for bulk-block sharded alignment.
 
-The align analog of `block_planner`: decouples the COMPUTE unit (a fixed
-~10M-read block) from the ACCOUNTING unit (per-sample completion). Given a pool's
-samples + a sharded reference + a caller-named `mask_idx`, the planner:
+The align analog of `block_planner`: decouples the COMPUTE unit (a block, sized per
+PLATFORM — ~10M reads short-read, ~1M long-read; see
+`_BLOCK_TARGET_READS_BY_PLATFORM`) from the ACCOUNTING unit (per-sample completion).
+Given a pool's samples + a sharded reference + a caller-named `mask_idx`, the
+planner:
 
   1. selects the pool's samples whose `mask_sample` gate is `completed` under the
      caller-named `mask_idx`. Alignment does NOT re-derive the mask config — it is
@@ -12,8 +14,8 @@ samples + a sharded reference + a caller-named `mask_idx`, the planner:
      via the resolver, failing 4xx early otherwise;
   3. mints one `alignment_idx` over `{reference_idx, aligner, mask_idx, shard_ids}`
      (the mask-style identity, deduped fleet-wide) for the single mask being aligned;
-  4. tiles the to-align samples into ≤`_BLOCK_TARGET_READS`-read blocks (reusing the
-     PURE `block_planner.tile_partition` over `qiita.sequence_range` bounds),
+  4. tiles the to-align samples into blocks of ≤ the platform's read target (reusing
+     the PURE `block_planner.tile_partition` over `qiita.sequence_range` bounds),
      persists the `block` / `block_member` cover-map + an `alignment_sample`
      PENDING gate per sample, creates one block `work_ticket` per block (carrying
      `mask_idx` AND `alignment_idx` + the align action_context), back-fills
@@ -99,6 +101,39 @@ _ALIGNER_BY_PLATFORM: dict[str, str] = {
     "oxford_nanopore": "minimap2",
 }
 
+# Reads per block for a LONG-READ platform. A block is one work ticket / SLURM job,
+# so this is the per-job input size; the short-read value is `_BLOCK_TARGET_READS`
+# (10M), sized on read COUNT because short-read work is count-bound.
+#
+# Long reads need a smaller block because the sharded aligner's cost is driven by
+# BYTES, not reads. Each of the reference's ~1000 shards re-reads the block's reads to
+# pull its own routed subset, so the total re-scan is `n_shards x block_bytes` per
+# block — and summed over a sample's blocks that is `n_shards x total_bytes`,
+# INVARIANT to block size. What block size does control is the per-JOB share of it,
+# i.e. whether one ticket fits its walltime. At ~15 kb/read a 10M-read HiFi block is
+# ~150 GB, so its re-scan alone is ~4.5 h against the align step's PT4H baseline —
+# the job cannot finish. At 1M reads (~15 GB) the same work is ~27 min.
+#
+# 1M is also what makes the aligner's query relation materializable: ~15-20 GB fits
+# the step's resolved ~57 GB DuckDB limit, where a 10M-read block does not and would
+# spill the whole block to shared scratch.
+#
+# This is deliberately NOT a change to `block_planner._BLOCK_TARGET_READS`, which
+# read masking also uses: masking has no 1000-shard fan-out, so its cost is linear in
+# the block and 10M stays right there. Whether long-read MASK blocks want a different
+# size is a separate question, not settled here.
+_LONG_READ_BLOCK_TARGET_READS = 1_000_000
+
+# Reads per block by platform. Every platform in `_ALIGNER_BY_PLATFORM` MUST appear
+# here — `test_block_target_covers_every_aligned_platform` fails otherwise, so adding
+# a platform forces an explicit decision about its block size instead of inheriting
+# the short-read default silently.
+_BLOCK_TARGET_READS_BY_PLATFORM: dict[str, int] = {
+    "illumina": _BLOCK_TARGET_READS,
+    "pacbio_smrt": _LONG_READ_BLOCK_TARGET_READS,
+    "oxford_nanopore": _LONG_READ_BLOCK_TARGET_READS,
+}
+
 
 def _aligner_for_platform(platform: str) -> str:
     """Map a `qiita.platform` value to its sharded aligner, or raise
@@ -110,6 +145,22 @@ def _aligner_for_platform(platform: str) -> str:
         raise AlignUnsupportedPlatform(
             f"no sharded aligner defined for platform {platform!r}; sharded alignment "
             f"supports only: {supported}"
+        ) from exc
+
+
+def _block_target_for_platform(platform: str) -> int:
+    """Reads per align block for `platform` (see `_BLOCK_TARGET_READS_BY_PLATFORM`).
+
+    Callers reach this only after `_aligner_for_platform` has accepted the platform,
+    so a KeyError here means the two maps have drifted — raise rather than fall back
+    to the short-read default, which would hand a long-read pool 10M-read blocks that
+    cannot finish inside the align step's walltime."""
+    try:
+        return _BLOCK_TARGET_READS_BY_PLATFORM[platform]
+    except KeyError as exc:  # pragma: no cover - the parity test prevents this
+        raise AlignUnsupportedPlatform(
+            f"no align block-read target defined for platform {platform!r}; "
+            "_BLOCK_TARGET_READS_BY_PLATFORM has drifted from _ALIGNER_BY_PLATFORM"
         ) from exc
 
 
@@ -169,7 +220,7 @@ async def plan_and_submit_alignments(
     originator_principal_idx: int,
     align_action_id: str,
     align_action_version: str,
-    target_reads: int = _BLOCK_TARGET_READS,
+    target_reads: int | None = None,
 ) -> dict[str, Any]:
     """Plan + submit a pool's bulk-block sharded-alignment work.
 
@@ -185,6 +236,12 @@ async def plan_and_submit_alignments(
     block `work_ticket` per block (scope `block`, carrying `mask_idx` +
     `alignment_idx` + the align `action_context`), back-filling
     `block.work_ticket_idx`. After commit each ticket is dispatched.
+
+    `target_reads` is the block size; `None` (the normal case) resolves it FROM THE
+    PLATFORM via `_BLOCK_TARGET_READS_BY_PLATFORM` — 10M for short reads, 1M for long
+    reads, whose per-shard re-scan is byte-driven and would otherwise blow the align
+    step's walltime. An explicit value overrides that (tests tile small pools without
+    seeding 10M reads).
 
     `only_missing` drops samples already carrying an `alignment_sample` row for
     their resolved alignment (an interrupted plan re-runs only the gap). On a fresh
@@ -207,6 +264,11 @@ async def plan_and_submit_alignments(
         sequencing_run_idx,
     )
     aligner = _aligner_for_platform(run_row["platform"])
+    # Block size is per-platform too, and for the same reason the aligner is: it
+    # follows the read chemistry, not the caller. Resolved here (rather than at the
+    # tiling call below) so the platform lookup happens once, next to the aligner's.
+    if target_reads is None:
+        target_reads = _block_target_for_platform(run_row["platform"])
 
     # The caller names the mask to align under; it must exist. A pool with no sample
     # masked under an EXISTING mask is AlignNoMasksFound (422, below); a nonexistent

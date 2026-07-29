@@ -69,6 +69,17 @@ _None yet._
   now sit at the ceiling, which deliberately forgoes cpu/mem escalation on retry
   (walltime still escalates, PT4H → PT8H).
 
+- (#perf/align-long-read-block-target) A **long-read** align plan (`pacbio_smrt` /
+  `oxford_nanopore`) now tiles at **1M reads per block instead of 10M**, so it mints
+  roughly **10× as many block tickets**, each ~1/10 the size. A 10M-read HiFi block
+  spent longer than its own PT4H walltime just re-reading itself once per shard, so
+  those tickets could not finish. Illumina is unchanged at 10M. No host action and
+  nothing to re-sync — this is control-plane code, not a workflow YAML. What to expect
+  operationally: many more, much shorter align jobs per pool; concurrency is still
+  capped by `FANOUT_MAX_INFLIGHT` (tickets are minted `dispatch_held` and released by
+  the per-alignment throttle), so this raises queue depth, not the number running at
+  once.
+
 - `long-read-assembly` 1.0.0 accepts `assembler: myloasm` from this deploy on — previously it exited 64 mid-step. The **default is unchanged** (`hifiasm_meta`), so no existing ticket changes behaviour; picking myloasm is an assay decision made per action context. The assemble SIF auto-rebuilds to add myloasm 0.6.0 (its own conda env) plus `python-duckdb`, so its build is slower than a routine no-op verify; it bind-mounts the **already-staged** miint extension read-only rather than carrying its own copy, so no extra staging step is needed and it stays byte-identical to the CP/CO/DP build. One standing consequence: the image's DuckDB is now in lockstep with the orchestrator's, so a future `uv lock` DuckDB bump must re-pin `assemble.def` — a unit test enforces it (#380).
 
 ---
