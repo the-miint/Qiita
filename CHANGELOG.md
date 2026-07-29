@@ -262,6 +262,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Compute-orchestrator no longer floods logs with Acero "poorly aligned buffer" warnings on Flight-sourced DuckDB scans (#333).**
+  pyarrow's Acero engine warns per batch when it receives Arrow buffers whose
+  base address is not 64-byte aligned. The misalignment is introduced by gRPC
+  transport buffers on the receive side — arrow-rs already writes IPC with
+  `alignment=64`, so a producer-side fix is not possible. 8-byte-aligned buffers
+  are valid on all modern x86_64/ARM; the warning is a defensive hint, not a
+  correctness issue. Setting `ACERO_ALIGNMENT_HANDLING=ignore` at module load
+  silences it; `setdefault` preserves operator override.
 - **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
   `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#379).**
   CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
