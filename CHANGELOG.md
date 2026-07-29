@@ -262,6 +262,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`qiita reference load --shard-index` now requires `--genome-map`, failing fast instead of after a full ingest (#324).**
+  Without a genome map, `plan-shards` derives zero genome-bearing features from
+  `qiita.feature_genome` and fails with `N=0` ("reference … has no genome-bearing
+  features to shard") after hash → mint → load → register-files have all run —
+  observed in production on Web-of-Life 3 after an ~18h load. A CLI guard fires
+  before any network call, and an `if/then` conditional in both reference-add
+  workflow schemas catches direct `POST /work-ticket` submissions that bypass
+  the CLI. The existing `plan-shards` `N==0` guard is retained as backstop.
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
   `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
