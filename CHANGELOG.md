@@ -262,6 +262,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Native/CLI venv refresh no longer skips qiita-common reinstall, closing a deploy gap that broke every native SLURM job (#332).**
+  `redeploy.sh` steps 5 and 6 dropped the "prove it's current" skip that could fire
+  incorrectly when an operator `git pull`ed manually first (redeploy's own pull was
+  a no-op → `native_pkgs_changed()` returned "provably unchanged" → skip)
+  or when `local-deploy.sh` ran directly (it only syncs the `/opt/qiita` service
+  venvs, never the checkout native venv). Either way the native venv kept the old
+  `qiita-common` while its editable source moved forward. `uv sync
+  --reinstall-package qiita-common` is a sub-second local copy; the optimization
+  traded negligible time for a real correctness gap. The native-import probe also
+  deepens to import `qiita_compute_orchestrator.config` so a stale venv fails
+  deploy verify as a backstop.
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
   `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
