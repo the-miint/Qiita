@@ -373,6 +373,7 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
     genome_map = tmp_path / "gmap.parquet"
     import pyarrow as pa
     import pyarrow.parquet as pq
+
     pq.write_table(pa.table({"feature_idx": pa.array([1], type=pa.int64())}), genome_map)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
