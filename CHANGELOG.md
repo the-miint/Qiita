@@ -690,7 +690,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Changed
 
 - **`align_sharded` streams the aligner into its output instead of buffering it three
-  times (#TBD).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
+  times (#385).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
   then a pooled-identity `WINDOW`, then a sorted `COPY` — three full buffers of the
   alignment set, with the selective identity filter running *after* the first two
   (`EXPLAIN`: `SEQ_SCAN → HASH_JOIN → WINDOW → FILTER → ORDER_BY → BATCH_COPY_TO_FILE`).
