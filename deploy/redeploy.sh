@@ -241,10 +241,9 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
     deploy_clone=$(cd "$QIITA_CLONE" 2>/dev/null && pwd || true)
     if [ -z "${FORCE_NATIVE_REFRESH:-}" ] \
        && [ -n "$native_clone" ] && [ "$native_clone" = "$deploy_clone" ] \
-       && ! native_pkgs_changed \
-       && sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs' 2>/dev/null; then
-        echo "Native venv already current — neither qiita-common nor"
-        echo "qiita-compute-orchestrator changed in this pull and the venv imports cleanly;"
+       && sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.config, qiita_compute_orchestrator.jobs' 2>/dev/null; then
+        echo "Native venv already current — the venv imports qiita_common,"
+        echo "qiita_compute_orchestrator.config, and qiita_compute_orchestrator.jobs cleanly;"
         echo "skipping the refresh (no work to do)."
     else
         # Reached when the venv is NOT provably current: a code change, a SEPARATE
@@ -269,10 +268,11 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         # broken refresh must abort here, not surface as a stale job at the next
         # genome-scale reference-load. (compute-readiness's probe/native-import covers
         # the compute-node side in step 6; this is the cheap head-node check.)
-        if ! sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs'; then
+        if ! sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.config, qiita_compute_orchestrator.jobs'; then
             echo "ERROR: native venv at $native_checkout cannot import qiita_common /" >&2
-            echo "       qiita_compute_orchestrator.jobs after the refresh. The /opt/qiita" >&2
-            echo "       SERVICE venvs are already deployed and serving (step 4) — only NATIVE" >&2
+            echo "       qiita_compute_orchestrator.config / qiita_compute_orchestrator.jobs" >&2
+            echo "       after the refresh. The /opt/qiita SERVICE venvs are already deployed" >&2
+            echo "       and serving (step 4) — only NATIVE" >&2
             echo "       SLURM jobs are at risk. Fix the checkout and re-run (idempotent)." >&2
             exit 1
         fi
@@ -367,20 +367,17 @@ cli_checkout="$QIITA_CLONE/qiita-control-plane"
 if [ ! -d "$cli_checkout" ]; then
     echo "No $cli_checkout — skipping CLI-venv refresh (unexpected layout)."
 elif [ -z "${FORCE_CLI_REFRESH:-}" ] \
-     && ! cli_pkgs_changed \
      && sudo -u "$QIITA_USER" bash -lc "cd '$cli_checkout' && '$UV' run --no-sync python -c 'import qiita_control_plane.cli.user'" 2>/dev/null; then
-    # Provably current: this pull changed neither qiita-common nor
-    # qiita-control-plane AND the checkout venv already imports the CLI entrypoint
+    # Provably current: the checkout venv already imports the CLI entrypoint
     # module. Nothing to do — don't stop to ask, mirroring the native-venv skip.
     # (Same blind spot as that skip: a prior run that died mid-`uv sync` may still
     # import; FORCE_CLI_REFRESH=1 forces the resync for that recovery path.)
     # Fails SAFE: if the `uv run --no-sync` probe itself errors (missing lockfile,
     # or a uv too old to know --no-sync) the && chain short-circuits to the else
     # below and we do the full reinstall — an extra idempotent refresh, never a
-    # missed one (the same fail-safe-into-refresh reasoning as cli_pkgs_changed's
-    # `return 0`).
-    echo "Checkout CLI venv already current — neither qiita-common nor"
-    echo "qiita-control-plane changed in this pull and it imports cleanly; skipping."
+    # missed one.
+    echo "Checkout CLI venv already current — it imports qiita_control_plane.cli.user"
+    echo "cleanly; skipping."
 else
     echo "Refreshing the operator checkout CLI venv (as $QIITA_USER):"
     echo "    cd $cli_checkout && $UV sync --reinstall-package qiita-common"
