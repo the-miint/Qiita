@@ -710,7 +710,15 @@ duplicates further down are historical strata; leave them where they are.
   provably equal to a per-row predicate — now filters with a plain `WHERE` in phase 1.
   A batch that MIXES single- and paired-end reads is rejected with the counts instead
   of surfacing as bowtie2's opaque `gpl_boundary` bind error or, on minimap2, as a
-  silently mis-pooled filter.
+  silently mis-pooled filter — and that rejection now runs ahead of the routing pass,
+  so it cannot be skipped by a batch whose reads route nowhere (which previously exited
+  0 with an empty output) and does not pay for a `rype_classify` pass first. Also pins
+  a miint contract the paired-end gate silently depended on: `cigar_sequence_identity`
+  and `cigar_query_coverage` are permutation-invariant over a concatenated CIGAR, which
+  is what lets the pooled `string_agg(cigar, '')` window omit an `ORDER BY`. Upstream
+  documents neither as order-insensitive, so a mirror build changing that would have
+  made the gate nondeterministic; it is now verified over all 120 permutations of a
+  5-fragment CIGAR and recorded in `docs/duckdb-miint.md`.
 
 - **`align_sharded` gets the memory and cores it was allocated (#381).** The job
   hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached

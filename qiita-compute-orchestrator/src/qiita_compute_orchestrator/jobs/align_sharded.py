@@ -694,7 +694,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 #
                 # The two dimensions are independent, so all four combinations are
                 # well-defined — but only three are reachable through the control
-                # plane, which picks minimap2 for `pacbio_smrt`/`nanopore` (long reads,
+                # plane, whose `_ALIGNER_BY_PLATFORM` maps `pacbio_smrt` and
+                # `oxford_nanopore` to minimap2 (long reads,
                 # single-end) and bowtie2 for short reads (either shape). PE+minimap2 is
                 # therefore dead today; it is kept coherent (pooled, at the minimap2
                 # floor, with the coverage gate over the pooled CIGAR) rather than
@@ -783,6 +784,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # pooled key uses `feature_idx` rather than the raw `reference` string
                 # it was cast from (same identity, narrower sort key); both mates of a
                 # concordant placement share it.
+                #
+                # The `string_agg` deliberately carries NO `ORDER BY`, which rests on a
+                # miint contract upstream does not document: both CIGAR scorers are
+                # PERMUTATION-INVARIANT, so it does not matter which mate concatenates
+                # first. Verified over all 120 permutations of a 5-fragment CIGAR
+                # including an indel and a soft clip, and pinned by
+                # `test_pooled_cigar_scoring_is_permutation_invariant` — because if a
+                # mirror build ever made either scorer position-dependent, this gate
+                # would go nondeterministic (the same pair kept on one run and dropped
+                # on the next) with nothing to signal it. The fix then is to add the
+                # `ORDER BY`, at the cost of a sort inside every partition. See
+                # docs/duckdb-miint.md.
                 pooled_qualify = ""
                 if is_paired:
                     partition = (
