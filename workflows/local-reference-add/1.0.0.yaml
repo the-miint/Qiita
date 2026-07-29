@@ -58,6 +58,12 @@ context_schema:
     minimap2_preset:
       type: string
       enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
+    # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
+    # is minted its OWN feature_idx so it can key a feature table while reads align to
+    # its parent. Contract + the closed->half-open coordinate conversion:
+    # qiita_compute_orchestrator.jobs.hash_sequences.
+    gff_path: {type: string, pattern: "^/"}
   # A sharded reference must build at least one per-shard index type.
   not:
     required: [shard_index, build_minimap2, build_bowtie2]
@@ -72,12 +78,6 @@ context_schema:
     properties: {shard_index: {const: true}}
   then:
     required: [genome_map_path]
-    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
-    # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
-    # is minted its OWN feature_idx so it can key a feature table while reads align to
-    # its parent. Contract + the closed->half-open coordinate conversion:
-    # qiita_compute_orchestrator.jobs.hash_sequences.
-    gff_path: {type: string, pattern: "^/"}
 
 success_status: active
 failure_status: failed
