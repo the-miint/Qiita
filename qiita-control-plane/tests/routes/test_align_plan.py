@@ -349,7 +349,10 @@ async def test_align_plan_long_read_platform_selects_minimap2(ctx, planned):
 @pytest.mark.parametrize(
     ("platform", "expected_target"),
     [
-        ("illumina", align_planner._BLOCK_TARGET_READS_BY_PLATFORM["illumina"]),
+        # Sourced from the VALUE constants, not from the map under test — reading the
+        # map would make each case tautological. The map's contents are pinned
+        # separately in tests/test_align_planner.py.
+        ("illumina", align_planner._BLOCK_TARGET_READS),
         ("pacbio_smrt", align_planner._LONG_READ_BLOCK_TARGET_READS),
         ("oxford_nanopore", align_planner._LONG_READ_BLOCK_TARGET_READS),
     ],

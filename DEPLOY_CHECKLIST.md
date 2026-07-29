@@ -80,6 +80,32 @@ _None yet._
   the per-alignment throttle), so this raises queue depth, not the number running at
   once.
 
+  **This applies to NEW plans only — it does not rescue an alignment already planned.**
+  Block ranges are persisted in `qiita.block_member`, so a long-read alignment planned
+  before this deploy keeps its 10M-read blocks, and redriving one still runs a ticket
+  that cannot finish. If a long-read alignment is stuck for this reason, DELETE it and
+  re-plan so it re-tiles at 1M; re-running the existing tickets will not help. Check
+  whether any exist before assuming this is moot:
+
+  ```bash
+  DATABASE_URL=$(sudo grep '^DATABASE_URL=' /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-api psql "$DATABASE_URL" -Atc \
+    "SELECT t.alignment_idx, r.platform, t.block_idx,
+            sum(m.max_sequence_idx - m.min_sequence_idx + 1) AS block_reads
+       FROM qiita.work_ticket t
+       JOIN qiita.block_member m ON m.block_idx = t.block_idx
+       JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = m.prep_sample_idx
+       JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx
+       JOIN qiita.sequencing_run r ON r.idx = sp.sequencing_run_idx
+      WHERE t.alignment_idx IS NOT NULL
+        AND r.platform IN ('pacbio_smrt','oxford_nanopore')
+      GROUP BY t.alignment_idx, r.platform, t.block_idx
+      HAVING sum(m.max_sequence_idx - m.min_sequence_idx + 1) > 2000000;"
+  ```
+
+  Any row is a pre-deploy long-read block larger than the new target. Empty output (the
+  expected result today — no long-read alignment has been run) means nothing to do.
+
 - `long-read-assembly` 1.0.0 accepts `assembler: myloasm` from this deploy on — previously it exited 64 mid-step. The **default is unchanged** (`hifiasm_meta`), so no existing ticket changes behaviour; picking myloasm is an assay decision made per action context. The assemble SIF auto-rebuilds to add myloasm 0.6.0 (its own conda env) plus `python-duckdb`, so its build is slower than a routine no-op verify; it bind-mounts the **already-staged** miint extension read-only rather than carrying its own copy, so no extra staging step is needed and it stays byte-identical to the CP/CO/DP build. One standing consequence: the image's DuckDB is now in lockstep with the orchestrator's, so a future `uv lock` DuckDB bump must re-pin `assemble.def` — a unit test enforces it (#380).
 
 ---

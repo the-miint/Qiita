@@ -39,8 +39,10 @@ def test_long_read_platforms_get_the_smaller_block_target():
     Not a cosmetic difference: the sharded aligner re-reads a block's reads once per
     touched shard, so the per-job cost follows BYTES. At ~15 kb/read a 10M-read HiFi
     block is ~150 GB and its re-scan alone exceeds the align step's PT4H baseline, so
-    the ticket cannot finish; ~1M reads (~15 GB) brings it to ~27 min. Illumina reads
-    are ~100x shorter, so 10M stays right there."""
+    the ticket cannot finish; ~1M reads (~15 GB) brings it to ~27 min. Both timings are
+    FLOORS (measured warm, on local disk, with idle cores), so what the choice rests on
+    is the ordering, not the absolute numbers. Illumina reads are ~100x shorter, so 10M
+    stays right there."""
     assert _block_target_for_platform("pacbio_smrt") == _LONG_READ_BLOCK_TARGET_READS
     assert _block_target_for_platform("oxford_nanopore") == _LONG_READ_BLOCK_TARGET_READS
     assert _block_target_for_platform("illumina") == _BLOCK_TARGET_READS
@@ -49,25 +51,31 @@ def test_long_read_platforms_get_the_smaller_block_target():
     assert _LONG_READ_BLOCK_TARGET_READS < _BLOCK_TARGET_READS
 
 
-def test_long_read_platforms_are_exactly_the_minimap2_ones():
-    """The platforms taking the smaller block are exactly the minimap2 ones.
+def test_small_block_platforms_still_coincide_with_minimap2_today():
+    """Tripwire, NOT an invariant: today the small-block platforms happen to be exactly
+    the minimap2 ones.
 
-    These are two independent axes (aligner choice vs block size) and the code keeps
-    them as separate maps deliberately, so this is an assertion about today's
-    platform set rather than a derivation: both distinctions currently track long-vs-
-    short reads. If a future platform breaks the correspondence, this test should be
-    updated to name it, not deleted — the point is that the divergence gets noticed."""
+    Aligner choice and block size are independent axes and the source keeps them as
+    separate maps on purpose — this asserts a coincidence in the current platform set,
+    so that a future platform which breaks it gets NOTICED rather than silently
+    inheriting an assumption. When that happens, update this test to name the exception;
+    do not treat the failure as a bug in the maps."""
     small_block = {p for p, t in _BLOCK_TARGET_READS_BY_PLATFORM.items() if t < _BLOCK_TARGET_READS}
     minimap2 = {p for p, a in _ALIGNER_BY_PLATFORM.items() if a == "minimap2"}
     assert small_block == minimap2
 
 
-def test_block_target_for_unknown_platform_raises():
-    """An unmapped platform fails loud. Callers reach `_block_target_for_platform`
-    only after `_aligner_for_platform` accepted the platform, so this is the
-    map-drift guard — never a silent default to the short-read size."""
-    with pytest.raises(AlignUnsupportedPlatform, match="no align block-read target"):
+def test_block_target_for_unknown_platform_raises_a_server_error():
+    """Map drift fails loud as a bare `RuntimeError`, never a silent short-read default.
+
+    The type matters as much as the raise: `AlignUnsupportedPlatform` is mapped by the
+    route to 422, which would blame the caller for a valid request and echo our private
+    constant names back in the response body. Drift is a server-side config bug, so it
+    must reach the client as a 500 — hence `RuntimeError`, and hence this test asserts
+    it is NOT the typed platform error."""
+    with pytest.raises(RuntimeError, match="no align block-read target") as excinfo:
         _block_target_for_platform("ls454")
+    assert not isinstance(excinfo.value, AlignUnsupportedPlatform)
 
 
 def test_unsupported_platform_has_no_aligner():

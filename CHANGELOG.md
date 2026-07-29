@@ -778,7 +778,13 @@ duplicates further down are historical strata; leave them where they are.
   10M-read HiFi block is ~150 GB, whose re-scan alone is ~4.5 h against the align
   step's PT4H baseline — the ticket could not finish. `pacbio_smrt` and
   `oxford_nanopore` now tile at 1M reads (~15 GB, ~27 min); `illumina` is unchanged at
-  10M. The target is resolved from the run's platform beside the aligner (also
+  10M. Both timings are *floors* — they assume a scan rate measured warm, on local
+  disk, with idle cores, where the real job reads Lustre while aligning — so the
+  decision rests on the ordering (10M cannot fit even ideally; 1M can be several times
+  worse than ideal and still fit), not the absolute numbers. Applies to NEW plans only:
+  block ranges are persisted, so an alignment planned before this lands keeps its
+  10M-read blocks and must be deleted and re-planned to re-tile. The target is resolved
+  from the run's platform beside the aligner (also
   platform-derived, never a caller choice), via a new
   `_BLOCK_TARGET_READS_BY_PLATFORM` whose keys are pinned equal to
   `_ALIGNER_BY_PLATFORM`'s, so adding a platform forces an explicit block-size

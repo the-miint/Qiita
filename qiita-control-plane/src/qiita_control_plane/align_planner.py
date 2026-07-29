@@ -114,9 +114,17 @@ _ALIGNER_BY_PLATFORM: dict[str, str] = {
 # ~150 GB, so its re-scan alone is ~4.5 h against the align step's PT4H baseline —
 # the job cannot finish. At 1M reads (~15 GB) the same work is ~27 min.
 #
-# 1M is also what makes the aligner's query relation materializable: ~15-20 GB fits
-# the step's resolved ~57 GB DuckDB limit, where a 10M-read block does not and would
-# spill the whole block to shared scratch.
+# **Both figures are FLOORS, not estimates.** They come from a ~9.2 GB/s scan rate
+# measured on local disk with a warm page cache and an otherwise idle 8-thread pool;
+# the real job reads from Lustre with its cores busy aligning. Read them as "10M
+# cannot fit PT4H even under ideal conditions" and "1M has room to be several times
+# slower than ideal and still fit" — the ordering is what the choice rests on, not
+# the absolute numbers.
+#
+# A second property of this size, independent of walltime: a 1M-read long-read block's
+# sequences (~15-20 GB) fit inside the step's resolved ~57 GB DuckDB limit, so the
+# block can be held in-heap rather than re-scanned from Parquet. A 10M-read block
+# (~150 GB) does not, and holding it would spill to shared scratch.
 #
 # This is deliberately NOT a change to `block_planner._BLOCK_TARGET_READS`, which
 # read masking also uses: masking has no 1000-shard fan-out, so its cost is linear in
@@ -152,13 +160,20 @@ def _block_target_for_platform(platform: str) -> int:
     """Reads per align block for `platform` (see `_BLOCK_TARGET_READS_BY_PLATFORM`).
 
     Callers reach this only after `_aligner_for_platform` has accepted the platform,
-    so a KeyError here means the two maps have drifted — raise rather than fall back
-    to the short-read default, which would hand a long-read pool 10M-read blocks that
-    cannot finish inside the align step's walltime."""
+    so a miss here means the two maps have drifted. Raise rather than fall back to the
+    short-read default, which would hand a long-read pool 10M-read blocks that cannot
+    finish inside the align step's walltime.
+
+    Deliberately a bare `RuntimeError`, NOT `AlignUnsupportedPlatform`: drift is OUR
+    config bug, and the typed class is mapped by the route to 422, which would blame
+    the caller for a request that is perfectly valid (and publish these private
+    constant names in the response body). Nothing catches `RuntimeError` on the route,
+    so this surfaces as a 500 — the honest classification, and it keeps the diagnostic
+    in the server log where it belongs."""
     try:
         return _BLOCK_TARGET_READS_BY_PLATFORM[platform]
-    except KeyError as exc:  # pragma: no cover - the parity test prevents this
-        raise AlignUnsupportedPlatform(
+    except KeyError as exc:
+        raise RuntimeError(
             f"no align block-read target defined for platform {platform!r}; "
             "_BLOCK_TARGET_READS_BY_PLATFORM has drifted from _ALIGNER_BY_PLATFORM"
         ) from exc
