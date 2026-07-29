@@ -293,6 +293,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Native/CLI venv refresh no longer skips qiita-common reinstall, closing a deploy gap that broke every native SLURM job (#332).**
+  `redeploy.sh` steps 5 and 6 dropped the "prove it's current" skip that could fire
+  incorrectly when an operator `git pull`ed manually first (redeploy's own pull was
+  a no-op → `native_pkgs_changed()` returned "provably unchanged" → skip)
+  or when `local-deploy.sh` ran directly (it only syncs the `/opt/qiita` service
+  venvs, never the checkout native venv). Either way the native venv kept the old
+  `qiita-common` while its editable source moved forward. `uv sync
+  --reinstall-package qiita-common` is a sub-second local copy; the optimization
+  traded negligible time for a real correctness gap. The native-import probe also
+  deepens to import `qiita_compute_orchestrator.config` so a stale venv fails
+  deploy verify as a backstop.
 - **Compute-orchestrator no longer floods logs with Acero "poorly aligned buffer" warnings on Flight-sourced DuckDB scans (#333).**
   pyarrow's Acero engine warns per batch when it receives Arrow buffers whose
   base address is not 64-byte aligned. The misalignment is introduced by gRPC
