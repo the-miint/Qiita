@@ -8,9 +8,7 @@
 -- whose *_to_study link is retired. The check's verdict rests on that link's
 -- retired flag, which lives outside the metadata row and can flip to true long
 -- after the row was inserted, so freezing the row's own key columns does not
--- freeze the verdict. An overwrite is a new write and needs re-checking; before
--- metadata values could be overwritten in place, INSERT was the only way for
--- new data to arrive, and guarding it was sufficient.
+-- freeze the verdict. An overwrite is a new write and needs re-checking.
 --
 -- Re-checking in the DB rather than only before the write is what makes the
 -- guard atomic with the write: a caller that checks the link, then writes,

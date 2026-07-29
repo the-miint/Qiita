@@ -83,8 +83,6 @@ class ResolvedField(NamedTuple):
 
 
 # One resolved metadata column paired with the parsed value to write into it.
-# SampleMetadataValue (the value's type) is defined once in qiita_common.models
-# and imported above so the wire models and this module share one union.
 type ResolvedFieldValue = tuple[ResolvedField, SampleMetadataValue]
 
 
@@ -404,6 +402,10 @@ class EntityMetadataSpec:
     owner_sample_id_flag_column: str | None = None
 
 
+# SQL identifiers are interpolated into the queries below only from frozen
+# constants and closed in-code mappings, never from caller input; values always
+# bind as $N placeholders.
+
 # The columns a global-field lookup may key on. A closed mapping from the
 # public Literal to its SQL column name, so the interpolated identifier is
 # never reached by caller input (the value is unbindable as a placeholder).
@@ -455,10 +457,8 @@ async def fetch_global_fields_by_keys(
     if not lookup_keys:
         return {}
 
-    # f-string interpolation is safe: spec fields are frozen constants and the
-    # key column comes from a closed Literal->column mapping, never from caller
-    # input. A global field is its own reference, so idx doubles as
-    # global_field_idx; internal_name is selected so it can serve as the dict key.
+    # A global field is its own reference, so idx doubles as global_field_idx;
+    # internal_name is selected so it can serve as the dict key.
     key_sql_column = _GLOBAL_FIELD_KEY_COLUMN[key_column]
     rows = await pool_or_conn.fetch(
         f"SELECT idx, internal_name, display_name, data_type, terminology_idx,"
@@ -492,10 +492,8 @@ async def fetch_study_fields_by_display_names(
     if not names:
         return {}
 
-    # f-string interpolation of the identifiers is safe: spec fields are frozen
-    # module-level constants, never reached by caller input. The LEFT JOIN
-    # resolves the inherited data_type / terminology_idx for globally-linked
-    # rows, which store those columns NULL.
+    # The LEFT JOIN resolves the inherited data_type / terminology_idx for
+    # globally-linked rows, which store those columns NULL.
     fk_column = spec.study_field_global_fk_column
     rows = await pool_or_conn.fetch(
         f"SELECT sf.idx, sf.display_name,"
@@ -601,9 +599,8 @@ def _decode_metadata_value(
     data_type-driven decoding; otherwise the value_* column the data_type names
     is read. A data_type absent from GLOBAL_METADATA_VALUE_COLUMN raises
     NotImplementedError (labelled by read_label) so it cannot silently surface
-    a NULL value. The row must carry the six value_* columns plus the
-    missing_reason_name / terminology_term_id / terminology_term_label join
-    payload the two metadata reads select.
+    a NULL value. The row must carry the six value_* columns plus
+    missing_reason_name, terminology_term_id, and terminology_term_label.
     """
     # Ref kinds take precedence over data_type; the typed branch is reached
     # only when neither Ref column is populated.
@@ -698,14 +695,13 @@ async def fetch_local_metadata(
     missing and terminology-term entries surface as MissingReasonRef /
     TerminologyTermRef; other typed rows require data_type in {TEXT, NUMERIC,
     DATE} and raise NotImplementedError otherwise. An owner-sample-id row (where
-    the spec has one) is a study-local value like any other and is included —
-    the caller gates study-member access.
+    the spec has one) is a study-local value like any other and is included;
+    this read applies no visibility gating of its own.
     """
-    # f-string interpolation of the table identifiers is safe: all (including
-    # spec fields) are frozen constants, never reached by caller input. The
-    # study_field join scopes to one study and supplies the field's display_name
-    # + data_type; the LEFT JOINs recover a Ref row's display payload in one
-    # round trip. m.global_field_idx IS NULL selects only purely-local values.
+    # The study_field join scopes to one study and supplies the field's
+    # display_name + data_type; the LEFT JOINs recover a Ref row's display
+    # payload in one round trip. m.global_field_idx IS NULL selects only
+    # purely-local values.
     rows = await pool_or_conn.fetch(
         f"SELECT sf.display_name, sf.description, sf.data_type,"
         f" m.value_text, m.value_numeric, m.value_date,"
@@ -1230,9 +1226,6 @@ async def _update_metadata(
     else:
         set_clause = f"{existing_value_column} = NULL, {new_column} = $1"
 
-    # f-string interpolation of identifiers is safe: spec fields and the
-    # value-column names are frozen module-level constants / closed in-code
-    # choices, never reached by caller input.
     updated_idx = await conn.fetchval(
         f"UPDATE {spec.metadata_table} SET {set_clause} WHERE idx = $2 RETURNING idx",
         bound_value,
@@ -1289,7 +1282,7 @@ async def _insert_metadata_or_diagnose(
         # Re-writing through the *same* study_field (same display_name) instead
         # trips the per-field constraint; under upsert that must also route
         # into diagnosis so the caller's own value is overwritten, but under
-        # raise it stays a raw propagation (the existing non-target behavior).
+        # raise it stays a raw propagation.
         diagnostic_constraint_names = {spec.global_field_unique_index_name}
         if on_conflict == "upsert":
             diagnostic_constraint_names.add(spec.local_unique_per_field_index_name)

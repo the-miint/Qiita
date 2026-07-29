@@ -66,11 +66,10 @@ GENERIC_FK_VIOLATION = "references a row that does not exist"
 def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
     """Map a metadata-row dict to MetadataEntry, preserving the input keys.
 
-    Each input key is reused unchanged as the output key, so the caller's
-    keying carries through: the global read is keyed by internal_name, the
-    local read by display_name. Only the four MetadataEntry fields are read
-    from each row (a global row's internal_name rides along as the key, not
-    as an entry field), so one builder serves every sample-family entity.
+    Each input key is reused unchanged as the output key, so whatever the rows
+    were keyed on carries through. Only the four MetadataEntry fields are read
+    from each row; a row's internal_name, when it has one, rides along as the
+    key rather than as an entry field.
     """
     return {
         key: MetadataEntry(
@@ -93,11 +92,9 @@ async def read_global_and_local_entries(
     """Read an entity's globally-linked and study-local metadata and shape both
     into MetadataEntry dicts.
 
-    Spec-driven, so every sample-family entity's study-scoped read shares this
-    body; the caller owns the connection/snapshot and the link/existence/retired
-    gating (whose 404 wording and idx source differ per entity). Returns
-    (global_metadata keyed by internal_name, local_metadata keyed by
-    display_name).
+    Spec-driven. The caller owns the connection/snapshot and the
+    link/existence/retired gating. Returns (global_metadata keyed by
+    internal_name, local_metadata keyed by display_name).
     """
     global_rows = await fetch_global_metadata(conn, spec=spec, entity_idx=entity_idx)
     local_rows = await fetch_local_metadata(
@@ -263,12 +260,12 @@ async def write_and_map_sample_metadata(
 ) -> SampleMetadataWriteResponse:
     """Upsert a metadata dict for a sample-family entity and shape the result.
 
-    Shared by every study-scoped metadata PATCH: writes each field
-    (allow_local=True), maps the metadata-write exceptions to their HTTP
-    responses, and returns the per-field results keyed by display_name in the
-    caller's input order. A cross-study slot collision still 409s; a same-study,
-    same-field, different-value rewrite is a last-writer-wins overwrite -- there
-    is no If-Match on this path, so the caller accepts lost-update semantics.
+    Writes each field (allow_local=True), maps the metadata-write exceptions to
+    their HTTP responses, and returns the per-field results keyed by
+    display_name in the caller's input order. A cross-study slot collision still
+    409s; a same-study, same-field, different-value rewrite is a
+    last-writer-wins overwrite -- there is no If-Match on this path, so the
+    caller accepts lost-update semantics.
     """
     try:
         # on_conflict="upsert" overwrites the caller's own study's value in

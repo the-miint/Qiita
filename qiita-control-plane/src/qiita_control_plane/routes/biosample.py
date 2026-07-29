@@ -1,26 +1,14 @@
 """Biosample routes.
 
-Two routers live here. The study-scoped router (prefix=/study) carries the
-single-biosample import (POST), the study-scoped bulk-id read
-(GET .../list-idxs), the study-scoped single-biosample read
-(GET .../biosample/{biosample_idx}, returning global + study-local
-metadata), and the study-scoped metadata write
-(PATCH .../biosample/{biosample_idx}/metadata, upserting this study's
-values; no If-Match). The biosample-scoped router (prefix=/biosample) carries the
-single-resource read (GET /{biosample_idx}) and the single-resource
-PATCH (PATCH /{biosample_idx}). Bulk-import, retirement, search, and
-admin metadata-schema endpoints are deferred. The write handler gates on
-caller scope, study existence, and per-study ADMIN access (wet_lab_admin+
-bypass) and delegates the multi-table write to the repositories.biosample
-composer inside one connection-scoped transaction; the study-scoped
-single-biosample read gates on caller scope, study existence, and per-study
-ADMIN access (wet_lab_admin+ bypass) and 404s on a biosample not linked to
-the path study; the single-biosample (biosample-scoped) read gates on caller
-scope, then 404s on missing or retired biosamples and gates non-admin callers
-on owner-or-linked-study-access via the repository predicate; the PATCH gates
-on caller scope and wet_lab_admin (or higher) role and applies its mutation
-inside one connection-scoped transaction with required If-Match
-optimistic-concurrency control.
+Two routers live here: a study-scoped one (prefix=/study) for operations
+authorized on a study, and a biosample-scoped one (prefix=/biosample) for
+operations authorized on the biosample itself. Study-scoped handlers gate on
+caller scope, study existence, and per-study access tier (wet_lab_admin+
+bypass); biosample-scoped handlers gate on caller scope, then on
+owner-or-linked-study access via the repository predicate. Writes apply their
+mutation inside one connection-scoped transaction, delegating multi-table work
+to the repositories.biosample composer. Bulk import, retirement, search, and
+admin metadata-schema endpoints are deferred.
 """
 
 from collections.abc import Awaitable, Callable
@@ -277,9 +265,9 @@ def _biosample_study_field_response_from_row(
     """Shape a biosample_study_field row into BiosampleStudyFieldResponse.
 
     Maps the row's own idx to biosample_study_field_idx; every other column
-    name already matches a response field. The row comes from
-    create_biosample_study_field / fetch_biosample_study_field, which resolve
-    the inherited data_type / required / terminology_idx for a linked field.
+    name already matches a response field. data_type / required /
+    terminology_idx must arrive already resolved to their effective values --
+    for a globally-linked field, inherited from the global-field row.
     """
     return BiosampleStudyFieldResponse.model_validate(
         {
@@ -421,11 +409,10 @@ async def get_biosample_in_study(
 
     Access policy is interim: gated at Tier.ADMIN study access with a
     wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands, at which point this relaxes (the read
-    was originally planned at viewer tier). 401 on Anonymous, 403 on missing
-    scope or sub-ADMIN tier, 404 on a study that does not exist.
-    require_study_exists composes alongside require_study_access so an
-    admin-bypass caller still gets 404 on a non-existent study.
+    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope or
+    sub-ADMIN tier, 404 on a study that does not exist. require_study_exists
+    composes alongside require_study_access so an admin-bypass caller still gets
+    404 on a non-existent study.
 
     The biosample must be linked to this study: a nonexistent biosample_idx and
     one with no non-retired biosample_to_study link to study_idx share the same
@@ -434,8 +421,8 @@ async def get_biosample_in_study(
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
     local_metadata includes the owner-biosample-id row: the ADMIN clamp means
-    any caller who reaches this route is authorized to see it. Changing that
-    value is not offered here -- a future higher-privilege surface owns it.
+    any caller who reaches this route is authorized to see it. This route does
+    not write that value.
 
     The response carries an `ETag` header derived from the row's `updated_at`
     column; the value is a quoted ISO 8601 timestamp and is opaque by contract.
@@ -549,9 +536,7 @@ def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
 
     Centralises the column -> field mapping (the idx -> biosample_idx rename
     aside, every key matches its column). Excludes the metadata dicts and
-    caller_system_role, which each response shaper adds itself, so the
-    biosample-level and study-scoped shapers share one column list. Runs no
-    DB queries.
+    caller_system_role. Runs no DB queries.
     """
     return {
         "biosample_idx": row["idx"],

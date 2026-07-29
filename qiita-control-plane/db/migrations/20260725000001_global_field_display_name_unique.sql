@@ -2,8 +2,8 @@
 
 -- internal_name is already unique; display_name was not. Enforce uniqueness
 -- within each global-field table so a display_name maps to at most one row.
--- See docs/architecture.md (Global vs. study-local fields) for why non-unique
--- global display_names were rejected.
+-- See docs/architecture.md (Global vs. study-local fields and multi-alias
+-- linkage) for why non-unique global display_names were rejected.
 
 ALTER TABLE qiita.biosample_global_field
     ADD CONSTRAINT biosample_global_field_display_name_unique UNIQUE (display_name);

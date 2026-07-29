@@ -224,9 +224,7 @@ class TerminologyTermRef(BaseModel):
 
 
 # One resolved metadata value: a scalar, an intentionally-missing marker, or a
-# terminology term. The two Ref variants form a discriminated union on `kind`.
-# Shared by MetadataEntry and MetadataFieldWriteResult, and imported by the
-# control-plane repositories, so the union has a single definition.
+# terminology term; the two Ref variants discriminate on `kind`.
 SampleMetadataValue = (
     str
     | Decimal

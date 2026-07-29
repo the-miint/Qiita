@@ -1,48 +1,23 @@
 """Sequenced-sample routes.
 
-Three routers live here. The run-scoped router (prefix=/sequencing-run)
-carries the per-item import composer (POST
-/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample) and
-the sequenced-sample list reads scoped to a run or one of its pools —
-bare idxs (GET /sequencing-run/{run_idx}/sequenced-sample/list-idxs) and
-the richer per-sample rows (GET
-/sequencing-run/{run_idx}/sequenced-sample/list and the pool-scoped
-.../sequenced-pool/{pool_idx}/sequenced-sample/list). The study-scoped
-router (prefix=/study) carries the study-scoped bulk-id read (GET
-/study/{study_idx}/sequenced-sample/list-idxs), the study-scoped
-single read (GET /study/{study_idx}/sequenced-sample/{sequenced_sample_idx},
-returning the combined row plus global and study-local metadata), and the
-study-scoped metadata write (PATCH
-/study/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata,
-upserting this study's values on the supertype prep_sample; no If-Match). The
-sequenced-sample-scoped router (prefix=/sequenced-sample) carries the
-single-resource read (GET /{sequenced_sample_idx}) that surfaces the
-combined sequenced_sample + supertype prep_sample row plus its
-globally-linked metadata, and the single-resource PATCH (PATCH
-/{sequenced_sample_idx}) that edits the subtype-table columns (ENA
-accessions and submission tracking).
+Three routers live here: a run-scoped one (prefix=/sequencing-run) for the
+per-item import composer and the list reads scoped to a run or one of its
+pools, a study-scoped one (prefix=/study) for operations authorized on a
+study, and a sequenced-sample-scoped one (prefix=/sequenced-sample) for
+single-resource access to the combined sequenced_sample + supertype
+prep_sample row.
 
 Every write handler gates on caller scope (Scope.PREP_SAMPLE_WRITE) plus
-require_complete_profile (humans-only). The POST composer additionally
-gates on caller-creator semantics on the path's `sequenced_pool` (via
-`require_caller_owns_pool()`, wet_lab_admin+ bypass) and on per-study
-ADMIN access across every listed study in the body (via
-`require_caller_has_admin_on_all_studies`, same bypass). The PATCH
-still composes `require_role_at_least(WET_LAB_ADMIN)` because its
-editable column set (ENA accessions + submission tracking) is operated
-by the submission subsystem, not by sample owners. The run-scoped and
-single-resource reads gate on Scope.PREP_SAMPLE_READ + wet_lab_admin
-role unconditionally; the study-scoped roster read instead gates on
-Scope.STUDY_READ + study existence + study access (viewer tier,
-wet_lab_admin and system_admin bypass tier), mirroring the biosample
-study-roster read. The study-scoped single read gates on
-Scope.PREP_SAMPLE_READ + study existence + ADMIN-tier study access
-(wet_lab_admin+ bypass), an interim clamp mirroring the biosample
-study-scoped read. All handlers delegate their DB work to the sibling
-repository modules. Service accounts are still rejected by the PATCH's
-role gate today; a wider auth-model change (so ServiceAccount carries a
-system_role) is required before submission-subsystem service accounts
-can satisfy require_role_at_least.
+require_complete_profile (humans-only); the import composer adds
+caller-creator semantics on the path's `sequenced_pool` (via
+`require_caller_owns_pool()`) and per-study ADMIN access across every study
+listed in the body (via `require_caller_has_admin_on_all_studies`), both with
+a wet_lab_admin+ bypass. The run-scoped and single-resource reads gate on
+Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the study-scoped
+reads gate on study existence plus a study-access tier — viewer for the roster
+read, an interim ADMIN clamp for the single read — with wet_lab_admin and
+system_admin bypassing, mirroring the biosample reads. All handlers delegate
+their DB work to the sibling repository modules.
 """
 
 import logging
@@ -534,9 +509,7 @@ def _sequenced_sample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
 
     Centralises the column -> field mapping (ss.idx -> sequenced_sample_idx,
     GREATEST(...) -> effective_updated_at). Excludes the metadata dicts and
-    caller_system_role, which each response shaper adds itself, so the
-    sequenced-sample-level and study-scoped shapers share one column list.
-    Runs no DB queries.
+    caller_system_role. Runs no DB queries.
     """
     return {
         "sequenced_sample_idx": row["idx"],
