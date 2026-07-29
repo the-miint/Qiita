@@ -740,7 +740,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Changed
 
 - **`align_sharded` hands minimap2 a materialized query relation instead of the lazy
-  Parquet view (#TBD).** Both sharded aligners re-read the query relation once per
+  Parquet view (#391).** Both sharded aligners re-read the query relation once per
   shard, so a block's sequences are re-read 1000 times at the current shard count.
   Against the Parquet-backed view each of those reads pays for ~100% of the block's
   sequence *bytes* — a Parquet scan must decompress a whole column chunk to yield any
