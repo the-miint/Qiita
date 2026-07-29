@@ -26,8 +26,10 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      across a pair vs per record) — never to split or re-run the aligner. A mixed
      batch is invalid input and is REJECTED here, naming the counts, rather than
      left to surface as bowtie2's opaque bind-time `gpl_boundary` error or — on
-     minimap2, which tolerates a mix — as a silently mis-pooled filter. A
-     `_READ_META` TABLE carries
+     minimap2, which tolerates a mix — as a silently mis-pooled filter. That
+     rejection sits HERE, ahead of step 2, so it is unconditional: the routing pass
+     can legitimately come up empty (step 2), and validating after that would let
+     invalid input exit 0 with an empty output. A `_READ_META` TABLE carries
      `(sequence_idx -> prep_sample_idx)` so each output row is stamped with its true
      owner (a block spans many prep_samples).
   2. `read_to_shard` — one `rype_classify` pass against the whole-reference ROUTER
@@ -158,9 +160,19 @@ YAML_STEP_NAME = "align_sharded"
 # DuckDB threads. NOT merely a parallelism knob: `SET threads` IS the sharded
 # aligners' CROSS-SHARD concurrency. miint derives `max_active_shards` from DuckDB's
 # thread-pool size (`ceil(db_threads / max_threads_per_shard)`, clamped to the shard
-# count) and IGNORES its own `threads` argument in sharded mode, so this value caps
-# how many shards align at once — set below the cgroup's cpu allocation it pins the
-# job to that many cores no matter what SLURM granted.
+# count) and IGNORES its own `threads` argument in sharded mode. We never set
+# `max_threads_per_shard`, so it is miint's default of 1 and the derivation reduces to
+# `max_active_shards = min(threads, shard_count)` — one worker per shard, each aligner
+# single-threaded.
+#
+# **This must equal the align workflow's `baseline_resources.cpu`, and nothing derives
+# it from the cgroup.** Unlike memory, there is no cpu-resolution helper: a literal
+# above the allocation oversubscribes that many concurrent shards onto fewer cores, and
+# a literal below it leaves cores idle. `test_align_cpu_pins_duckdb_threads` fails if
+# the two drift. Deliberately NOT generalized to a repo-wide invariant — most native
+# jobs set threads for DuckDB's own operator memory (per-thread sort/HASH_AGG state)
+# and legitimately differ from their `cpu:`; here the cores are spent by the ALIGNER's
+# shard concurrency, not by DuckDB, which is what makes the two the same number.
 _DUCKDB_THREADS = 8
 
 # DuckDB `memory_limit`, resolved from the REAL cgroup so a per-run `--mem-gb`
@@ -543,9 +555,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # block spans many prep_samples). sequence_idx is unique, 1:1.
                 # A TABLE, not a VIEW over the reads relation: two narrow BIGINT
                 # columns (~16 B/read) is small enough to hold outright, and
-                # materializing it keeps phase 1's join off a Parquet scan and gives
-                # the planner exact stats for the build side — a view's estimate can
-                # put the (far larger) alignment set on the build side instead.
+                # materializing it keeps phase 1's join off a Parquet scan (the bound
+                # reads relation is a lazy `read_parquet` view). NOT for the planner's
+                # benefit — a Parquet footer carries exact row counts, so a view's
+                # cardinality is exact too and the join plan is identical either way.
                 conn.execute(
                     f"CREATE TABLE {_READ_META} AS "
                     f"SELECT sequence_idx, prep_sample_idx FROM {reads_rel}"
@@ -560,6 +573,40 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "SELECT sequence_idx AS read_id, sequence1, sequence2 "
                     f"FROM {reads_rel}"
                 )
+                # Is this batch paired-end? Decides only the FILTER SHAPE below, not
+                # the aligner (the CP picks that from the platform). The read set is
+                # uniformly SE or PE by construction, so this counts rather than
+                # samples: a MIXED batch is invalid input and fails HERE, naming the
+                # counts, instead of surfacing as bowtie2's opaque `gpl_boundary`
+                # rejection or — worse, on minimap2, which tolerates a mix — as a
+                # silently mis-pooled identity filter.
+                #
+                # Probed BEFORE the routing pass, and before the no-routed-reads
+                # early return below, so the rejection is UNCONDITIONAL: a mixed batch
+                # whose reads happen to route nowhere is still invalid input, and
+                # validating after that return would let it exit 0 with an empty
+                # output. It also means a mixed batch fails before paying for
+                # rype_classify. Costs nothing to do here — DuckDB answers both
+                # aggregates from the reads Parquet's row-group statistics (`count(*)`
+                # from the row counts, `count(sequence2)` from the null counts), so
+                # neither reads a byte of the sequence columns; a short-circuiting
+                # `LIMIT 1` probe would be far SLOWER, since that one does scan.
+                #
+                # `total > 0` is load-bearing now that this runs ahead of the empty
+                # check: an empty read batch makes `paired == total == 0`, which is
+                # neither mixed (no raise) nor paired.
+                paired, total = conn.execute(
+                    f"SELECT count(sequence2), count(*) FROM {_QUERY}"
+                ).fetchone()
+                if paired not in (0, total):
+                    raise ValueError(
+                        "read batch mixes single- and paired-end reads "
+                        f"({paired} of {total} rows carry sequence2); a prep/run is "
+                        "uniformly one or the other by construction, so this batch is "
+                        "invalid input"
+                    )
+                is_paired = paired == total and total > 0
+
                 # read_to_shard (non-temp — align resolves it by name on its own
                 # connection). One rype_classify pass fills it; multi-bucket, so a read
                 # spanning K shards gets K rows and aligns against all K.
@@ -609,25 +656,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                         _QUERY, inputs.shard_directory, _READ_TO_SHARD
                     )
 
-                # Is this batch paired-end? Decides only the FILTER SHAPE below, not
-                # the aligner (the CP picks that from the platform). The read set is
-                # uniformly SE or PE by construction, so this counts rather than
-                # samples: a MIXED batch is invalid input and fails HERE, naming the
-                # counts, instead of surfacing as bowtie2's opaque `gpl_boundary`
-                # rejection or — worse, on minimap2, which tolerates a mix — as a
-                # silently mis-pooled identity filter.
-                paired, total = conn.execute(
-                    f"SELECT count(sequence2), count(*) FROM {_QUERY}"
-                ).fetchone()
-                if paired not in (0, total):
-                    raise ValueError(
-                        "read batch mixes single- and paired-end reads "
-                        f"({paired} of {total} rows carry sequence2); a prep/run is "
-                        "uniformly one or the other by construction, so this batch is "
-                        "invalid input"
-                    )
-                is_paired = paired == total and total > 0
-
                 # The high-identity filter. Two INDEPENDENT dimensions, previously
                 # conflated under one aligner test:
                 #   * the FLOORS are per-aligner — identity 0.99 for bowtie2 (a true
@@ -644,11 +672,35 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 #     and including feature_idx keeps a read's distinct placements
                 #     (report_all emits each as its own 2-record pair) judged
                 #     separately. An SE record has no mate to pool, so the pooled
-                #     window would be a partition of ONE row — `string_agg` over it
-                #     returns that row's own CIGAR, making the window provably
-                #     equivalent to a per-row predicate, at the cost of a full
-                #     blocking sort of every alignment. SE therefore filters with a
-                #     plain WHERE.
+                #     window is a partition of ONE row — `string_agg` over it returns
+                #     that row's own CIGAR, which makes the window equivalent to a
+                #     per-row predicate at the cost of a full blocking sort of every
+                #     alignment. SE therefore filters with a plain WHERE.
+                #
+                #     That equivalence rests on one premise worth stating rather than
+                #     glossing: the OLD partition key (`read_id`, `reference`,
+                #     `position` — `LEAST`/`GREATEST` collapse to `position` once
+                #     `mate_position` is NULL, since both ignore NULLs) has to be
+                #     UNIQUE per row for the partition to be a single row. Two SE
+                #     placements of one read on one feature at the same start position
+                #     would previously have been scored on their two CIGARs
+                #     CONCATENATED, and are now scored individually. Neither aligner is
+                #     documented to guarantee that can't happen (`report_all` /
+                #     `max_secondary := 100` both emit multiple placements per read),
+                #     but distinct placements carry distinct start positions in
+                #     practice — and scoring the concatenation of two unrelated
+                #     placements was never the intended semantics anyway, so where the
+                #     two forms could differ, the per-row one is the defensible answer.
+                #
+                # The two dimensions are independent, so all four combinations are
+                # well-defined — but only three are reachable through the control
+                # plane, which picks minimap2 for `pacbio_smrt`/`nanopore` (long reads,
+                # single-end) and bowtie2 for short reads (either shape). PE+minimap2 is
+                # therefore dead today; it is kept coherent (pooled, at the minimap2
+                # floor, with the coverage gate over the pooled CIGAR) rather than
+                # special-cased, so a future paired long-read platform needs no change
+                # here. `test_align_sharded_minimap2_pe_pair_pooled_at_minimap2_floor`
+                # pins it so the quadrant can't rot unnoticed.
                 min_identity = (
                     _MIN_SEQUENCE_IDENTITY_BOWTIE2
                     if inputs.aligner == "bowtie2"

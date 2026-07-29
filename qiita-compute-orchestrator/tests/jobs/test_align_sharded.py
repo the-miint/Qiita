@@ -611,6 +611,79 @@ def test_align_sharded_bowtie2_low_identity_pair_dropped_as_unit(tmp_path, monke
     ]
 
 
+def test_align_sharded_minimap2_pe_pair_pooled_at_minimap2_floor(tmp_path, monkeypatch):
+    """A PAIRED-END minimap2 batch pools its mates, at minimap2's floor — the fourth
+    (aligner x batch-shape) quadrant, and the only one with no live caller.
+
+    The two dimensions are independent by design: the FLOORS come from the aligner,
+    the POOLING from the batch shape. Three quadrants are reachable through the
+    control plane, which picks minimap2 for pacbio/nanopore (single-end) and bowtie2
+    for short reads (either shape); PE+minimap2 is dead today. It is pinned anyway
+    because the alternative to defining it is special-casing it, and an untested
+    combination is how the two dimensions silently re-conflate.
+
+    Both minimap2-specific gates are exercised over the POOLED CIGAR here, which no
+    other test does (the qcov test is single-end, so it scores one row's `cigar`):
+      * pair 6's pooled identity 0.967 is KEPT at 0.90 and would be DROPPED at
+        bowtie2's 0.99 — so the floor really is per-aligner, not per-shape;
+      * pair 7 is high-identity but low pooled COVERAGE, and is dropped by the
+        coverage conjunct applied to `string_agg(cigar)` rather than a single row."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(
+        tmp_path / "reads.parquet",
+        [
+            (10, 5, "ACGTACGT", "TTGGCCAA"),
+            (10, 6, "GGGGCCCC", "AAAATTTT"),
+            (10, 7, "CCCCGGGG", "TTTTAAAA"),
+        ],
+    )
+    router, shard_dir = _make_indexes(tmp_path)
+    # Pair 5 (feature 100): 150= + 150=      -> pooled identity 300/300 = 1.00  -> KEPT
+    # Pair 6 (feature 200): 150= + 140=10X   -> pooled identity 290/300 = 0.967 -> KEPT
+    #                       at the 0.90 minimap2 floor (would FAIL bowtie2's 0.99)
+    # Pair 7 (feature 300): 150= + 20=130S   -> pooled identity 170/170 = 1.00, but
+    #                       pooled qcov 170/300 = 0.567 < 0.90 -> BOTH mates DROPPED
+    _install_stubs(
+        align_sharded,
+        monkeypatch,
+        routing={5: ["0"], 6: ["0"], 7: ["0"]},
+        alignments={
+            5: [
+                (99, "100", 1, 151, 60, "150=", "=", 151, 300),
+                (147, "100", 151, 301, 60, "150=", "=", 1, -300),
+            ],
+            6: [
+                (99, "200", 1, 151, 60, "150=", "=", 151, 300),
+                (147, "200", 151, 301, 60, "140=10X", "=", 1, -300),
+            ],
+            7: [
+                (99, "300", 1, 151, 60, "150=", "=", 151, 300),
+                (147, "300", 151, 301, 60, "20=130S", "=", 1, -300),
+            ],
+        },
+    )
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+    _cols, rows = _read_alignment(Path(out["alignment"]))
+    # Pairs 5 and 6 survive whole; pair 7 is gone entirely (never half a pair).
+    assert rows == [
+        (555, 10, 5, 100, 100, 99, 1, 151, 60, "150=", 151, 300),
+        (555, 10, 5, 100, 100, 147, 151, 301, 60, "150=", 1, -300),
+        (555, 10, 6, 200, 200, 99, 1, 151, 60, "150=", 151, 300),
+        (555, 10, 6, 200, 200, 147, 151, 301, 60, "140=10X", 1, -300),
+    ]
+
+
 def test_align_sharded_bowtie2_single_end_scored_per_record(tmp_path, monkeypatch):
     """A SINGLE-END bowtie2 batch is scored PER RECORD at the bowtie2 floor (0.99).
 
@@ -702,6 +775,39 @@ def test_align_sharded_rejects_a_mixed_se_pe_batch(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="mixes single- and paired-end"):
         asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
     # And it leaves no partial output behind.
+    assert not (tmp_path / "ws" / "alignment.parquet").exists()
+
+
+def test_align_sharded_rejects_a_mixed_batch_that_routes_nowhere(tmp_path, monkeypatch):
+    """The mixed-batch rejection is UNCONDITIONAL — it does not depend on the reads
+    routing somewhere.
+
+    A block whose reads route to no shard is a legitimate empty no-op that returns an
+    empty alignment.parquet, so the shape probe has to run BEFORE that early return.
+    Otherwise invalid input would exit 0 whenever routing happened to come up empty,
+    which is precisely the case where nothing downstream could ever notice."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(
+        tmp_path / "reads.parquet",
+        [(10, 1, "ACGTACGT", "TTGGCCAA"), (10, 2, "GGGGCCCC", None)],
+    )
+    router, shard_dir = _make_indexes(tmp_path)
+    # Nothing routes: absent the ordering above, execute() would take the empty-output
+    # path and never look at the batch shape.
+    _install_stubs(align_sharded, monkeypatch, routing={}, alignments={})
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    with pytest.raises(ValueError, match="mixes single- and paired-end"):
+        asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
     assert not (tmp_path / "ws" / "alignment.parquet").exists()
 
 
