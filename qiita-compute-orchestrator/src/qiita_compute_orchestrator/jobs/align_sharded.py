@@ -43,8 +43,12 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      shard(s), reporting ALL placements (bowtie2 `report_all`, the "modified SHOGUN"
      set in `_BOWTIE2_ALIGN_PARAMS`; minimap2 `max_secondary := 100`, its analogue —
      the historical `-k 16` / `max_secondary := 0` primary-only collapse is gone, and
-     dropping the arg entirely would silently fall back to a finite default). Its
-     output carries all
+     dropping the arg entirely would silently fall back to a finite default). On the
+     minimap2 (long-read) path the aligner is handed a MATERIALIZED copy of the query
+     relation rather than the view, because both aligners re-read the query once per
+     shard and against a Parquet view that cost scales with read LENGTH — see the
+     materialization note in `execute()` for the numbers and why bowtie2 keeps the
+     view. Its output carries all
      standard SAM columns, INCLUDING the mate columns (`mate_reference`,
      `mate_position`, `template_length`) and the SAM `flags` that make a paired-end
      read's two mate rows an explicit pair. We ADD three typed identity columns —
@@ -304,7 +308,13 @@ _BOWTIE2_ALIGN_PARAMS = (
 # TABLEs (read_to_shard has to be one — align's separate connection resolves it by
 # name). There is deliberately NO relation for the aligner's output: it is a SELECT
 # streamed straight into the phase-1 staging COPY, never a materialised table.
+#
+# `_QUERY_MATERIALIZED` is a TABLE copy of `_QUERY` created ONLY on the minimap2
+# (long-read) path, and only as the relation handed to the ALIGNER — see the
+# materialization note in execute(). Every other consumer of the query (the SE/PE
+# probe, the rype routing pass) keeps reading the view.
 _QUERY = "align_sharded_query"
+_QUERY_MATERIALIZED = "align_sharded_query_materialized"
 _READ_META = "align_sharded_read_meta"
 _READ_TO_SHARD = "align_sharded_read_to_shard"
 
@@ -538,12 +548,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # Bind the block's reads. Under `align` this streams from the data
-            # plane (the workflow binds no `reads` path) and materializes to a
-            # real table — which this job needs regardless of source, because it
-            # builds TWO relations over the reads below and a Flight reader is
-            # consumed once. The DuckDB memory_limit + workspace temp_directory
-            # set above bound that materialization (it spills, it does not grow
-            # the heap).
+            # plane (the workflow binds no `reads` path), which the seam drains
+            # once into a Parquet in the DuckDB temp dir and binds as a lazy
+            # `read_parquet` VIEW. The view (not a table) is what this job needs
+            # from the seam: a Flight reader is single-consumption and this job
+            # builds several relations over the reads below, and the drain's peak
+            # memory is flat in row count rather than in block size.
+            #
+            # It being a VIEW over a Parquet is also load-bearing for the
+            # minimap2 materialization further down — a Parquet scan cannot yield
+            # a row without decompressing the whole column chunk it sits in,
+            # which is exactly the per-shard cost that materialization removes.
             async with bind_step_reads(
                 conn,
                 reads=None,
@@ -645,8 +660,55 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # (every routed read failed to align) — only an empty read_to_shard
                 # INPUT is the case handled above.
                 if inputs.aligner == "minimap2":
+                    # MATERIALIZE the query relation for minimap2 (long reads only).
+                    #
+                    # Both sharded aligners read the query relation ONCE PER SHARD (a
+                    # per-shard id fetch; qiita-verified against real miint, see
+                    # docs/duckdb-miint.md), so the block's sequences are re-read
+                    # `n_shards` times — 1000 times at the current shard count. Against
+                    # the Parquet-backed VIEW each of those reads pays for ~100% of the
+                    # block's sequence BYTES, because a Parquet scan must decompress a
+                    # whole column chunk to yield any row from it, while a shard wants
+                    # ~0.1% of the reads. Against a materialized TABLE, DuckDB scans the
+                    # narrow `read_id` column and fetches `sequence1`/`sequence2` only
+                    # for the rows the shard actually asked for, so the per-shard cost
+                    # stops scaling with read LENGTH: measured 93 ms per 1000 bp/read
+                    # per shard for the view vs 0.2 ms for the table. Extrapolated to a
+                    # 1M-read HiFi block at ~15 kb/read that is ~23 min of re-reading
+                    # against the view vs a few seconds against the table. The copy
+                    # itself costs ONE full scan of the reads Parquet — it buys out
+                    # `n_shards` of them.
+                    #
+                    # bowtie2 (short reads) is deliberately NOT materialized: the same
+                    # arithmetic over ~160 bp reads is tens of seconds total, which does
+                    # not pay for a copy of the block.
+                    #
+                    # It is created AFTER the routing pass on purpose: rype makes its own
+                    # internal corpus copy while classifying, and overlapping the two
+                    # would double the sequence footprint for no benefit (rype reads the
+                    # corpus once, so it gains nothing from a table).
+                    #
+                    # **This is only a win while the copy FITS IN MEMORY, and what keeps
+                    # it fitting is the block target, not anything enforced here.** A
+                    # long-read align block is tiled to 1M reads (`align_planner`'s
+                    # long-read target), so the copy is ~15 GB of sequence against the
+                    # resolved `memory_limit` (~57 GB under the 64 GB baseline
+                    # allocation). `memory_limit` is a ceiling rather than a
+                    # reservation, so a copy that did NOT fit degrades instead of
+                    # dying — but degrades badly, and quietly: DuckDB would spill it to
+                    # `temp_directory`, which is the workspace on Lustre, and the
+                    # per-shard fetches would then hit shared-filesystem spill files
+                    # 1000 times over. That is plausibly WORSE than the Parquet view
+                    # this replaces (the Parquet is at least zstd-compressed), so the
+                    # failure mode is a performance regression with no error to notice
+                    # it by. Anything that raises a long-read block's sequence bytes
+                    # much above the current target — an explicit `target_reads`
+                    # override, or a platform with far longer reads (ONT ultra-long at
+                    # ~100 kb would be ~100 GB) — needs this branch reconsidered, not
+                    # just the target.
+                    conn.execute(f"CREATE TABLE {_QUERY_MATERIALIZED} AS SELECT * FROM {_QUERY}")
                     align_sql, align_params = _align_minimap2_sharded_sql(
-                        _QUERY,
+                        _QUERY_MATERIALIZED,
                         inputs.shard_directory,
                         _READ_TO_SHARD,
                         preset=_MINIMAP2_PRESET,
@@ -774,6 +836,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     + f") TO '{staged_sql}' ({PARQUET_OPTS_INTERMEDIATE})",
                     align_params,
                 )
+
+                # The materialized query relation has no reader left the moment phase 1's
+                # COPY returns — the aligner is done with it and phase 2 reads only the
+                # staging Parquet — so holding it through the sort is pure occupancy.
+                # Drop it. This is hygiene, NOT a measured speedup: the sort's input is
+                # SAM rows with no sequence columns, so it may well never have wanted
+                # those bytes. What IS verified is the mechanism — dropping an in-memory
+                # table returns its bytes to the buffer manager rather than deferring
+                # the release to connection close. Unconditional + `IF EXISTS` rather
+                # than re-testing the aligner: the bowtie2 path never created it, and a
+                # DROP that has to agree with a branch 50 lines up is a latent bug.
+                conn.execute(f"DROP TABLE IF EXISTS {_QUERY_MATERIALIZED}")
 
                 # PHASE 2 — sort the staged rows into the final output, applying the
                 # POOLED filter first when the batch is paired-end. Sorted by the

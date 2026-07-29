@@ -739,6 +739,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`align_sharded` hands minimap2 a materialized query relation instead of the lazy
+  Parquet view (#TBD).** Both sharded aligners re-read the query relation once per
+  shard, so a block's sequences are re-read 1000 times at the current shard count.
+  Against the Parquet-backed view each of those reads pays for ~100% of the block's
+  sequence *bytes* — a Parquet scan must decompress a whole column chunk to yield any
+  row from it — while a shard wants ~0.1% of the reads; against a materialized table
+  DuckDB scans the narrow `read_id` column and fetches sequences only for the rows the
+  shard asked for, so the per-shard cost stops scaling with read length. Measured
+  93 ms per 1000 bp/read per shard for the view vs 0.2 ms for the table, i.e. ~23 min
+  of re-reading vs a few seconds on a 1M-read HiFi block at ~15 kb/read. The copy is
+  created only on the minimap2 (long-read) path, only after routing has committed to
+  an align, and is dropped once phase 1 is done with it (it has no reader after that,
+  so holding it through the sort is pure occupancy). bowtie2 keeps the view: the same
+  arithmetic over ~160 bp reads is tens of seconds total, which does not pay for a copy
+  of the block. The win is contingent on the copy fitting in memory — ~15 GB at the 1M
+  long-read block target (#389) against a ~57 GB resolved limit (#381) — and degrades
+  rather than fails if it does not: DuckDB would spill it to the Lustre workspace and
+  the per-shard fetches would read spill files 1000 times, plausibly worse than the
+  view. Raising a long-read block's sequence bytes well above the current target needs
+  this branch reconsidered, not just the target. Also corrects two stale claims
+  that this reasoning rests on — `align_sharded` said `bind_step_reads` "materializes
+  to a real table" (it binds a lazy `read_parquet` view), and `read_source` said a
+  block is tiled to 10M reads "regardless of platform" against a DuckDB "capped at
+  8 GB" (long-read align blocks are 1M since #389, and align resolves its limit from
+  the allocation since #381), plus its "node-local scratch" description of the drain
+  file (it lands under `PATH_SCRATCH`, which is Lustre on the deploy).
 - **`align_sharded` streams the aligner into its output instead of buffering it three
   times (#385).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
   then a pooled-identity `WINDOW`, then a sorted `COPY` — three full buffers of the
