@@ -428,7 +428,9 @@ async def test_do_reference_load_shard_index_requires_taxonomy(fasta_file, tmp_p
     assert calls == []
 
 
-async def test_do_reference_load_shard_index_requires_genome_map(fasta_file, taxonomy_file, tmp_path, cp_transport):
+async def test_do_reference_load_shard_index_requires_genome_map(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
     """`--shard-index` without `--genome-map` is rejected before any network call —
     plan-shards derives the per-shard feature set from qiita.feature_genome, which
     mint-features populates only when a genome map is supplied."""

@@ -19,6 +19,15 @@ _None yet._
 
 ### 2. One-time host setup
 
+- (#324) Workflow schemas `reference-add/1.0.0.yaml` and `local-reference-add/1.0.0.yaml`
+  now require `genome_map_upload_idx` / `genome_map_path` when `shard_index` is true.
+  Existing sharded references that were loaded without a genome map (and therefore have
+  zero shards) are unaffected — the schema gate only fires on new submissions. No
+  operator action needed unless you plan to submit a new `--shard-index` reference
+  without a genome map (which would now fail fast at submit, instead of after hours).
+
+### 3. Migrations
+
 _None yet._
 
 ### 3. Migrations
