@@ -36,7 +36,7 @@ from .biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 
-# Owners' ids for their own samples sometimes inadvertently PII, so the
+# Owners' ids for their own samples sometimes inadvertently contain PII, so the
 # owner-biosample-id field is pinned above the study's default tier:
 # even on a public study, only study members may read the owner-id
 # metadata.

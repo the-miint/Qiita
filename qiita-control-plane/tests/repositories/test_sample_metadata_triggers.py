@@ -1,16 +1,13 @@
-"""Integration tests for the *_study_field_propagate_global_link triggers.
+"""Integration tests for the triggers guarding the *_metadata surface.
 
-Covers the structurally identical
-biosample_study_field_propagate_global_link and
-prep_sample_study_field_propagate_global_link triggers in one suite,
-parameterized over EntityMetadataSpec so every transition branch
-(upgrade, unlink-empty, unlink-with-metadata-raises, rebind-raises) is
-exercised against both the biosample and prep_sample stacks.
+Covers the structurally identical biosample and prep_sample trigger twins
+in one suite, parameterized over EntityMetadataSpec so every branch is
+exercised against both stacks.
 
 The SQL UPDATE/SELECT statements that drive the triggers interpolate
-identifiers from frozen module-level spec fields (study_field_table,
-study_field_global_fk_column, metadata_table); the spec carries every
-identifier that differs between the two stacks.
+identifiers from frozen module-level spec fields (metadata_table,
+study_field_table, study_field_global_fk_column, link_table); the spec
+carries every identifier that differs between the two stacks.
 """
 
 import asyncpg
@@ -246,3 +243,153 @@ async def test_propagate_link_rebind_raises_unconditionally(ctx, spec):
         field_idx,
     )
     assert bound == gf_a.idx
+
+
+async def _retire_link(ctx, spec, entity_idx):
+    """Retire the entity's link to ctx['study_idx'].
+
+    The retirement CHECK requires retired_at and retired_by_idx alongside the
+    flag, so all three are set in one UPDATE.
+    """
+    await ctx["pool"].execute(
+        f"UPDATE {spec.link_table}"
+        f"   SET retired = true, retired_at = now(), retired_by_idx = $1"
+        f" WHERE {spec.link_entity_key_column} = $2 AND study_idx = $3",
+        ctx["principal_idx"],
+        entity_idx,
+        ctx["study_idx"],
+    )
+
+
+async def _seed_global_value(ctx, spec, entity_idx, value):
+    """Write one globally-linked TEXT metadata value while the link is active.
+
+    Returns (metadata_idx, global_field_idx), both tracked for cleanup.
+    """
+    gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            global_field_idx=gf.idx,
+            display_name=unique_field_name("retired_link"),
+            created_by_idx=ctx["principal_idx"],
+        )
+        metadata_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
+    return metadata_idx, gf.idx
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_reject_if_link_retired_blocks_value_update(ctx, spec):
+    """Tests the case where a metadata value is overwritten after the writing
+    study's link to the entity has been retired: the trigger rejects it, so an
+    overwrite cannot slip through a link that no longer permits writes.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    metadata_idx, _ = await _seed_global_value(ctx, spec, entity_idx, "before")
+
+    await _retire_link(ctx, spec, entity_idx)
+
+    # The value UPDATE the upsert path performs is now refused.
+    with pytest.raises(asyncpg.RaiseError, match="is retired"):
+        await ctx["pool"].execute(
+            f"UPDATE {spec.metadata_table} SET value_text = $1 WHERE idx = $2",
+            "after",
+            metadata_idx,
+        )
+
+    # The stored value is unchanged.
+    stored_value = await ctx["pool"].fetchval(
+        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1",
+        metadata_idx,
+    )
+    assert stored_value == "before"
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_reject_if_link_retired_allows_value_update_on_active_link(ctx, spec):
+    """Tests the case where a metadata value is overwritten while the link is
+    still active: the guard does not over-reject the ordinary upsert.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    metadata_idx, _ = await _seed_global_value(ctx, spec, entity_idx, "before")
+
+    await ctx["pool"].execute(
+        f"UPDATE {spec.metadata_table} SET value_text = $1 WHERE idx = $2",
+        "after",
+        metadata_idx,
+    )
+
+    stored_value = await ctx["pool"].fetchval(
+        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1",
+        metadata_idx,
+    )
+    assert stored_value == "after"
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_reject_if_link_retired_allows_global_link_propagation(ctx, spec):
+    """Tests the case where a study_field is upgraded local -> global while an
+    entity holding a value through it has a retired link: the propagated
+    global_field_idx write must still succeed, which is what scoping the guard
+    to the value columns preserves.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
+
+    # A purely-local field carrying one value, written while the link is active.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=unique_field_name("retired_upgrade"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+        )
+        metadata_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="kept",
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
+
+    await _retire_link(ctx, spec, entity_idx)
+
+    # Upgrading the field to global fires the propagate trigger, which writes
+    # global_field_idx onto the existing metadata row — a column outside the
+    # retired-link guard's scope, so the upgrade is unaffected by retirement.
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table}"
+        f"   SET {spec.study_field_global_fk_column} = $1,"
+        f"       data_type = NULL,"
+        f"       required = NULL,"
+        f"       terminology_idx = NULL,"
+        f"       tier_override = NULL"
+        f" WHERE idx = $2",
+        gf.idx,
+        field_idx,
+    )
+
+    row = await ctx["pool"].fetchrow(
+        f"SELECT global_field_idx, value_text FROM {spec.metadata_table} WHERE idx = $1",
+        metadata_idx,
+    )
+    assert dict(row) == {"global_field_idx": gf.idx, "value_text": "kept"}

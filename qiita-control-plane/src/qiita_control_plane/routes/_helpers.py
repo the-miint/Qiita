@@ -177,10 +177,9 @@ async def read_study_scoped_entity(
     return row, global_metadata, local_metadata
 
 
-# Sample-family metadata-write exceptions the shared mapper handles. A route
-# writing sample metadata catches these and delegates to
-# raise_http_for_sample_metadata_write_error; entity-specific errors
-# (owner-id-field-collision, required-field, asyncpg) stay on the route.
+# Sample-family metadata-write exceptions carrying one shared HTTP mapping.
+# Entity-specific errors (owner-id-field-collision, required-field, asyncpg) are
+# excluded — they are mapped per entity, not here.
 SAMPLE_METADATA_WRITE_ERRORS = (
     MetadataUnknownFieldsError,
     MetadataParseError,
@@ -197,10 +196,8 @@ async def raise_http_for_sample_metadata_write_error(
 ) -> NoReturn:
     """Map a sample-family metadata-write exception to its HTTPException.
 
-    Shared by every route that writes sample metadata (the study-scoped
-    metadata PATCH routes and the biosample / sequenced-sample import
-    composers) so one exception maps to one response everywhere. Parse,
-    unknown-field, study-field-conflict, duplicate-global-target, and
+    One exception maps to exactly one response, so the mapping cannot drift.
+    Parse, unknown-field, study-field-conflict, duplicate-global-target, and
     owner-sample-id errors map to 422; a slot collision to 409 (diagnosed
     against conn); a transient write race to 503. Always raises.
     """
@@ -249,8 +246,9 @@ async def raise_http_for_sample_metadata_write_error(
         raise HTTPException(status_code=409, detail=detail)
     if isinstance(exc, TransientWriteRaceError):
         raise_for_transient_write_race(exc)
-    # Not a SAMPLE_METADATA_WRITE_ERRORS member: the caller's except clause and
-    # this dispatch have drifted. Fail loud rather than swallow the exception.
+    # Reached only if SAMPLE_METADATA_WRITE_ERRORS above gained a member with no
+    # branch here; a parity test pins the two together. Fail loud rather than
+    # swallow the exception or answer with a status picked for a different error.
     raise exc
 
 

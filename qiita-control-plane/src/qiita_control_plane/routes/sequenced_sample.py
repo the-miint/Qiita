@@ -124,6 +124,7 @@ from ._helpers import (
     build_idxs_list_response,
     detail_for_biosample_link_rejection,
     etag_for_updated_at,
+    metadata_entries_from_rows,
     parse_kv_detail,
     raise_http_for_sample_metadata_write_error,
     read_study_scoped_entity,
@@ -644,8 +645,6 @@ async def get_sequenced_sample_in_study(
     a quoted ISO 8601 timestamp and is opaque by contract.
     """
     # One REPEATABLE READ snapshot so the row read, the link check, and both
-    # metadata reads cannot disagree about a concurrent writer's commit.
-    # One REPEATABLE READ snapshot so the row read, the link check, and both
     # metadata reads cannot disagree about a concurrent writer's commit. The
     # shared helper fetches the joined row and keys the link + metadata on the
     # supertype prep_sample_idx (nonexistent and unlinked share one 404).
@@ -795,15 +794,7 @@ async def get_sequenced_sample(
             conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
         )
 
-    global_metadata = {
-        internal_name: MetadataEntry(
-            display_name=entry.display_name,
-            description=entry.description,
-            data_type=entry.data_type,
-            value=entry.value,
-        )
-        for internal_name, entry in metadata_rows.items()
-    }
+    global_metadata = metadata_entries_from_rows(metadata_rows)
 
     # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
     response.headers["ETag"] = etag_for_updated_at(row["effective_updated_at"])
@@ -940,15 +931,7 @@ async def patch_sequenced_sample(
 
     # Reuse the GET route's row -> response shaper so PATCH and GET share
     # one source of truth for the response shape.
-    global_metadata = {
-        internal_name: MetadataEntry(
-            display_name=entry.display_name,
-            description=entry.description,
-            data_type=entry.data_type,
-            value=entry.value,
-        )
-        for internal_name, entry in metadata_rows.items()
-    }
+    global_metadata = metadata_entries_from_rows(metadata_rows)
     return _sequenced_sample_response_from_row(
         updated_row,
         global_metadata=global_metadata,

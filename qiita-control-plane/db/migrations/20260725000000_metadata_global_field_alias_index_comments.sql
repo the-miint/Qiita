@@ -3,7 +3,7 @@
 -- Record, in the catalog itself, why the per-global metadata uniqueness is
 -- keyed on (entity, global field) and must stay that way. No actual changes
 -- to indexes; this only attaches an explanatory COMMENT so future work surfaces
--- theintended multi-alias invariant without reading architecture.md first.
+-- the intended multi-alias invariant without reading architecture.md first.
 
 COMMENT ON INDEX qiita.biosample_metadata_one_value_per_global_field IS
     'At most one metadata value per (biosample, global field). Deliberately '

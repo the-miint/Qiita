@@ -24,6 +24,9 @@ from qiita_common.models.reference import FieldDataType, Tier
 # Change one and you must change the other in the same PR.
 MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
+# Defined here so the wire models and the repository layer share one definition.
+type MetadataFieldScope = Literal["global", "local"]
+
 
 class FieldWriteOutcome(StrEnum):
     """What a single metadata upsert did to one field's slot: created a new
@@ -327,7 +330,7 @@ class MetadataFieldWriteResult(BaseModel):
     that now occupies the slot. Reported per field by the metadata write route.
     """
 
-    scope: Literal["global", "local"]
+    scope: MetadataFieldScope
     outcome: FieldWriteOutcome
     value: SampleMetadataValue
 

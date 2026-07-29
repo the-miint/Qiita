@@ -18,6 +18,7 @@ from qiita_common.models import (
     TERMINOLOGY_TERM_VALUE_COLUMN,
     FieldDataType,
     FieldWriteOutcome,
+    MetadataFieldScope,
     MissingReasonRef,
     SampleMetadataValue,
     TerminologyTermRef,
@@ -25,6 +26,9 @@ from qiita_common.models import (
 )
 
 from . import require_transaction
+
+# Whether a colliding metadata write overwrites the existing value or raises.
+type MetadataConflictMode = Literal["raise", "upsert"]
 
 
 class SampleEntityKind(StrEnum):
@@ -70,7 +74,7 @@ class ResolvedField(NamedTuple):
     """
 
     caller_key: str
-    scope: Literal["global", "local"]
+    scope: MetadataFieldScope
     global_field_idx: int | None
     study_field_idx: int | None
     canonical_display: str
@@ -91,9 +95,7 @@ class MetadataRow:
     extracted from the row — either the typed Python value from the matching
     value_* column, a MissingReasonRef carrying an intentionally-missing
     reason's idx + name, or a TerminologyTermRef carrying a terminology-term's
-    idx + term_id + label. fetch_local_metadata returns these keyed by
-    display_name; the globally-linked read returns the GlobalMetadataRow
-    subclass keyed by internal_name.
+    idx + term_id + label.
     """
 
     display_name: str
@@ -352,7 +354,7 @@ class SampleMetadataWriteResult(NamedTuple):
 
 
 class SampleMetadataFieldResult(NamedTuple):
-    """Per-field outcome of one write_sample_metadata call: the key the caller
+    """Per-field outcome of one sample-metadata write: the key the caller
     keyed the value on (its display_name, or a global's internal_name under
     global-internal-name resolution), whether it resolved to a globally-linked
     or a purely-local field, what the write did to the slot, and the value that
@@ -360,7 +362,7 @@ class SampleMetadataFieldResult(NamedTuple):
     """
 
     field_key: str
-    scope: Literal["global", "local"]
+    scope: MetadataFieldScope
     outcome: FieldWriteOutcome
     value: SampleMetadataValue
 
@@ -937,14 +939,14 @@ async def _fetch_slot_occupant(
 ) -> Mapping[str, object]:
     """Read the existing row occupying the metadata slot rejected by the
     unique constraint, joined to its source study_field to recover the
-    contributing study. Exactly one of global_field_idx / study_field_idx
-    must be passed: the non-None one selects the WHERE column (the global
-    partial-unique-index path filters by m.global_field_idx; the
-    per-field unique-constraint path filters by m.{study_field_idx_column})
-    and the slot identifier embedded in any TransientWriteRaceError raised
-    when the occupant has been concurrently deleted. Returns all six value
-    columns; value_boolean is read ahead of BOOLEAN support being wired
-    in coordinated with the value-column map.
+    contributing study and that field's own idx. Exactly one of
+    global_field_idx / study_field_idx must be passed: the non-None one
+    selects the WHERE column (the global partial-unique-index path filters
+    by m.global_field_idx; the per-field unique-constraint path filters by
+    m.{study_field_idx_column}) and the slot identifier embedded in any
+    TransientWriteRaceError raised when the occupant has been concurrently
+    deleted. Returns all six value columns; value_boolean is read ahead of
+    BOOLEAN support being wired in coordinated with the value-column map.
     """
     # XOR check: exactly one of the two idx kwargs must be passed.
     if (global_field_idx is None) == (study_field_idx is None):
@@ -967,7 +969,8 @@ async def _fetch_slot_occupant(
         f" m.value_text, m.value_numeric, m.value_boolean,"
         f" m.value_date, m.value_terminology_term_idx,"
         f" m.{MISSING_REASON_VALUE_COLUMN},"
-        f" f.study_idx AS contributing_study_idx"
+        f" f.study_idx AS contributing_study_idx,"
+        f" f.idx AS contributing_study_field_idx"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.study_field_table} f"
         f" ON f.idx = m.{spec.study_field_idx_column}"
@@ -1248,14 +1251,14 @@ async def _insert_metadata_or_diagnose(
     spec: EntityMetadataSpec,
     entity_idx: int,
     study_idx: int,
-    study_field_idx: int,
-    study_field_created: bool,
+    study_field_idx: int | None = None,
+    study_field_created: bool = False,
     display_name: str,
     data_type: FieldDataType,
     value: SampleMetadataValue,
     caller_idx: int,
     global_field_idx: int | None = None,
-    on_conflict: Literal["raise", "upsert"] = "raise",
+    on_conflict: MetadataConflictMode = "raise",
 ) -> SampleMetadataWriteResult:
     """Insert one metadata row inside a SAVEPOINT. On the collision-diagnostic
     unique violation, diagnose the slot occupant, then either overwrite it
@@ -1265,10 +1268,14 @@ async def _insert_metadata_or_diagnose(
     isolates the INSERT so the caller's outer transaction survives to run the
     diagnostic SELECT and any overwrite. global_field_idx discriminates the two
     write paths: non-None routes the diagnostic constraint and the slot lookup
-    through the cross-study partial index, None through the per-field
-    constraint. Returns SampleMetadataWriteResult carrying the outcome:
-    INSERTED on a clean insert, UPDATED on an upsert overwrite, UNCHANGED when
-    the same-study slot already held exactly this value (no write performed).
+    through the cross-study partial index and mints the globally-linked
+    study_field here; None routes through the per-field constraint and requires
+    study_field_idx, the row the caller already resolved. Returns
+    SampleMetadataWriteResult carrying the outcome: INSERTED on a clean insert,
+    UPDATED on an upsert overwrite, UNCHANGED when the same-study slot already
+    held exactly this value (no write performed). Every collision result names
+    the study_field the value is attached to, which on the global path may be a
+    different alias of that global field than the caller keyed on.
 
     A foreign study's value is never overwritten: its cross-study conflict
     raises even under upsert, so one study cannot claim or clobber another's
@@ -1295,18 +1302,41 @@ async def _insert_metadata_or_diagnose(
     # diagnose and (under upsert) overwrite the occupant below.
     try:
         async with conn.transaction():
+            # The global path mints its study_field here, inside the savepoint:
+            # the mint resolves on display_name while the slot is keyed on the
+            # global field, so a mint that turns out to be unnecessary rolls
+            # back with the rejected INSERT below instead of surviving as a
+            # value-less alias. The purely-local path arrives with the row it
+            # already resolved, which is itself the slot.
+            if global_field_idx is not None:
+                (
+                    target_field_idx,
+                    study_field_created,
+                ) = await _get_or_create_globally_linked_study_field(
+                    conn,
+                    spec=spec,
+                    study_idx=study_idx,
+                    global_field_idx=global_field_idx,
+                    display_name=display_name,
+                    created_by_idx=caller_idx,
+                )
+            elif study_field_idx is None:
+                raise ValueError("study_field_idx is required when global_field_idx is None")
+            else:
+                target_field_idx = study_field_idx
+
             metadata_idx = await _insert_metadata(
                 conn,
                 spec=spec,
                 entity_idx=entity_idx,
-                study_field_idx=study_field_idx,
+                study_field_idx=target_field_idx,
                 data_type=data_type,
                 value=value,
                 created_by_idx=caller_idx,
             )
         return SampleMetadataWriteResult(
             metadata_idx=metadata_idx,
-            study_field_idx=study_field_idx,
+            study_field_idx=target_field_idx,
             study_field_created=study_field_created,
             outcome=FieldWriteOutcome.INSERTED,
         )
@@ -1330,6 +1360,9 @@ async def _insert_metadata_or_diagnose(
     )
     contributing_study_idx = existing_row["contributing_study_idx"]
     existing_metadata_idx = existing_row["existing_metadata_idx"]
+    # The value is attached to the occupant's own study_field, which the global
+    # path's mint has just rolled back past: report that row, never "created".
+    occupant_field_idx = existing_row["contributing_study_field_idx"]
 
     # Upsert overwrites only the caller's own study's value; a foreign study's
     # value falls through to the raised cross-study conflict below.
@@ -1338,8 +1371,8 @@ async def _insert_metadata_or_diagnose(
             # Slot already holds exactly this value — no write; report untouched.
             return SampleMetadataWriteResult(
                 metadata_idx=existing_metadata_idx,
-                study_field_idx=study_field_idx,
-                study_field_created=study_field_created,
+                study_field_idx=occupant_field_idx,
+                study_field_created=False,
                 outcome=FieldWriteOutcome.UNCHANGED,
             )
         # Different value, or a missing↔typed kind change: overwrite in place.
@@ -1360,8 +1393,8 @@ async def _insert_metadata_or_diagnose(
         )
         return SampleMetadataWriteResult(
             metadata_idx=existing_metadata_idx,
-            study_field_idx=study_field_idx,
-            study_field_created=study_field_created,
+            study_field_idx=occupant_field_idx,
+            study_field_created=False,
             outcome=FieldWriteOutcome.UPDATED,
         )
 
@@ -1369,7 +1402,7 @@ async def _insert_metadata_or_diagnose(
         spec=spec,
         entity_idx=entity_idx,
         display_name=display_name,
-        study_field_idx=study_field_idx,
+        study_field_idx=occupant_field_idx,
         attempted_study_idx=study_idx,
         attempted_value=value,
         data_type=data_type,
@@ -1393,41 +1426,33 @@ async def write_global_metadata_or_diagnose(
     data_type: FieldDataType,
     value: SampleMetadataValue,
     caller_idx: int,
-    on_conflict: Literal["raise", "upsert"] = "raise",
+    on_conflict: MetadataConflictMode = "raise",
 ) -> SampleMetadataWriteResult:
     """Write one globally-linked metadata row; on cross-study slot collision,
     diagnose the existing occupant and either overwrite it (on_conflict=
     "upsert", caller's study owns the slot) or raise a typed exception.
 
     Returns SampleMetadataWriteResult (carrying the write outcome) on success.
-    The caller owns the outer transaction: any study_field row created here
-    rolls back with it on a raised exception. UniqueViolations whose
-    constraint_name is NOT spec.global_field_unique_index_name propagate
-    unchanged. StudyFieldConflictError and TransientWriteRaceError also
-    propagate. Under upsert a foreign study's value still raises rather than
-    being overwritten.
+    The caller owns the outer transaction. A study_field minted for this write
+    never outlives a write that does not use it: it is created inside the same
+    savepoint as the INSERT, so it rolls back both on a raised exception and on
+    an upsert that resolves to a value held through another alias of the same
+    global field. UniqueViolations whose constraint_name is NOT
+    spec.global_field_unique_index_name propagate unchanged.
+    StudyFieldConflictError and TransientWriteRaceError also propagate. Under
+    upsert a foreign study's value still raises rather than being overwritten.
     """
-    # Fail-fast: the caller must own the transaction so the typed exception
-    # rolls back any study_field row this function created before raising.
+    # Fail-fast: the caller must own the transaction so the whole write, mint
+    # included, rolls back atomically.
     require_transaction(conn)
 
-    # Resolve the caller's study_field bound to global_field_idx (created here
-    # on first use), then insert-and-diagnose against the cross-study index.
-    study_field_idx, study_field_created = await _get_or_create_globally_linked_study_field(
-        conn,
-        spec=spec,
-        study_idx=study_idx,
-        global_field_idx=global_field_idx,
-        display_name=display_name,
-        created_by_idx=caller_idx,
-    )
+    # The study_field bound to global_field_idx is resolved (and minted on
+    # first use) inside the insert-and-diagnose savepoint.
     return await _insert_metadata_or_diagnose(
         conn,
         spec=spec,
         entity_idx=entity_idx,
         study_idx=study_idx,
-        study_field_idx=study_field_idx,
-        study_field_created=study_field_created,
         display_name=display_name,
         data_type=data_type,
         value=value,
@@ -1645,6 +1670,10 @@ async def create_study_field(
         # defaults to False.
         if data_type is None:
             raise ValueError("data_type is required for a purely-local study field")
+        # A display_name that already names a global field is accepted here on
+        # purpose; metadata writes keyed on that name are then refused as a
+        # shadowed field, an accepted cost for the study that chose it. A delete
+        # surface for study fields is not built yet.
         idx, created, _ = await _get_or_create_local_study_field(
             conn,
             spec=spec,
@@ -1681,7 +1710,7 @@ async def write_local_metadata_or_diagnose(
     required: bool = False,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
-    on_conflict: Literal["raise", "upsert"] = "raise",
+    on_conflict: MetadataConflictMode = "raise",
 ) -> SampleMetadataWriteResult:
     """Write one local (non-globally-linked) metadata row; on collision,
     diagnose the existing occupant and either overwrite it (on_conflict=
@@ -1775,6 +1804,10 @@ def validate_primary_secondary_studies(
 _ENFORCED_REQUIRED_FIELDS = frozenset({"host_taxon_id"})
 
 
+# Slated for removal: the premise behind this gate is a misunderstanding, so it is
+# deliberately not being extended to cover the cases it gets wrong. Notably, a required
+# field whose value is supplied through a study-local alias of that field is not
+# recognized as supplied, and the import is rejected as missing.
 async def assert_required_global_fields_supplied(
     conn: asyncpg.Connection,
     *,
@@ -2202,7 +2235,7 @@ async def write_resolved_metadata_entries(
     study_idx: int,
     caller_idx: int,
     resolved_metadata: Sequence[ResolvedFieldValue],
-    on_conflict: Literal["raise", "upsert"] = "raise",
+    on_conflict: MetadataConflictMode = "raise",
 ) -> list[SampleMetadataFieldResult]:
     """Write each resolved entry against study_idx, dispatched by scope, and
     return one SampleMetadataFieldResult per entry in caller input order.
@@ -2268,7 +2301,7 @@ async def write_sample_metadata(
     caller_idx: int,
     allow_local: bool,
     known_missing_reasons: Mapping[str, int] | None = None,
-    on_conflict: Literal["raise", "upsert"] = "raise",
+    on_conflict: MetadataConflictMode = "raise",
     global_internal_names: bool = False,
 ) -> list[SampleMetadataFieldResult]:
     """Resolve, validate, and write one entity's metadata against study_idx.

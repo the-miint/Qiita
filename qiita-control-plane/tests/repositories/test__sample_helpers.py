@@ -57,6 +57,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     ResolvedField,
     SampleEntityKind,
     SampleMetadataFieldResult,
+    SampleMetadataWriteResult,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     StudyFieldAlreadyExistsError,
@@ -944,9 +945,8 @@ async def test_write_global_metadata_or_diagnose_propagates_non_target_unique_vi
 
 async def test_write_global_metadata_or_diagnose_rolls_back_new_study_field_on_collision(ctx):
     """When the colliding write goes through a brand-new field that
-    get-or-create just created, the typed exception propagating out of
-    the caller's transaction also rolls that new study_field row back —
-    it must not survive.
+    get-or-create just created, the savepoint wrapping the mint and the
+    INSERT rolls that new study_field row back — it must not survive.
     """
     bs_idx = await _create_biosample_with_link(ctx)
     second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
@@ -5318,6 +5318,71 @@ async def test_write_global_metadata_or_diagnose_upsert_real_to_missing_updates(
     row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
     assert row["value_text"] is None
     assert row["value_missing_reason_idx"] == reason_idx
+
+
+async def test_write_global_metadata_or_diagnose_upsert_through_second_alias(ctx):
+    """Tests the case where an upsert resolves to a value the study already
+    holds through a different study-local alias of the same global field. The
+    existing row is overwritten in place, the result names the alias the value
+    is attached to, and the alias minted for the losing INSERT does not
+    survive.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "alias_upsert")
+
+    # Seed the slot through one alias of the global field.
+    first_display_name = unique_field_name("alias_upsert_a")
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=first_display_name,
+        data_type=FieldDataType.TEXT,
+        value="v1",
+    )
+
+    # Upsert the same global field under a second, never-used display_name: the
+    # mint succeeds, the INSERT collides on (biosample, global field), and the
+    # overwrite lands on the row the first alias owns.
+    second_display_name = unique_field_name("alias_upsert_b")
+    second = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=second_display_name,
+        data_type=FieldDataType.TEXT,
+        value="v2",
+        on_conflict="upsert",
+    )
+
+    expected_result = SampleMetadataWriteResult(
+        metadata_idx=first.metadata_idx,
+        study_field_idx=first.study_field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
+    )
+    assert second == expected_result
+    actual_row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
+    expected_row = _expected_metadata_row(
+        bs_idx=bs_idx,
+        study_field_idx=first.study_field_idx,
+        gf_idx=gf_idx,
+        data_type=FieldDataType.TEXT,
+        value="v2",
+        caller_idx=ctx["principal_idx"],
+    )
+    assert actual_row == expected_row
+    assert await _biosample_metadata_count(ctx, bs_idx, gf_idx) == 1
+
+    # The alias minted for the losing INSERT rolled back with it.
+    orphan_row = await ctx["pool"].fetchrow(
+        "SELECT idx FROM qiita.biosample_study_field WHERE study_idx = $1 AND display_name = $2",
+        ctx["study_idx"],
+        second_display_name,
+    )
+    assert orphan_row is None
 
 
 async def test_write_global_metadata_or_diagnose_upsert_foreign_study_still_raises(ctx):
