@@ -58,9 +58,7 @@ context_schema:
     minimap2_preset:
       type: string
       enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
-  # A sharded reference must build at least one per-shard index type (same
-  # backstop as reference-add). Fires only when shard_index is true AND both
-  # build_* are explicitly false. The whole-reference rype_router is always built.
+  # A sharded reference must build at least one per-shard index type.
   not:
     required: [shard_index, build_minimap2, build_bowtie2]
     properties:
@@ -69,8 +67,7 @@ context_schema:
       build_bowtie2: {const: false}
   # A sharded reference requires a genome map — plan-shards derives the per-shard
   # feature set from qiita.feature_genome, which mint-features populates only when
-  # a genome map is supplied. Without it the load runs to completion then fails at
-  # plan-shards with N=0 ("reference … has no genome-bearing features to shard").
+  # a genome map is supplied.
   if:
     properties: {shard_index: {const: true}}
   then:

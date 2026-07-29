@@ -371,12 +371,9 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
     flight_client.queue_response(101)  # taxonomy
     flight_client.queue_response(102)  # genome_map
     genome_map = tmp_path / "gmap.parquet"
-    # Write a minimal valid Parquet file (one row, one column) so the upload
-    # stream can open it. Contents are irrelevant to this test's assertions.
     import pyarrow as pa
     import pyarrow.parquet as pq
-    table = pa.table({"feature_idx": pa.array([1], type=pa.int64())})
-    pq.write_table(table, genome_map)
+    pq.write_table(pa.table({"feature_idx": pa.array([1], type=pa.int64())}), genome_map)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
         result = await do_reference_load(

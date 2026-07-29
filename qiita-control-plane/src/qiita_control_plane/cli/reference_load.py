@@ -567,17 +567,16 @@ async def do_reference_load(
             " host-filter indexes (host-reference-add); --shard-index builds per-shard"
             " analysis indexes on a plain reference"
         )
-    # Both need taxonomy: host uses it as the rype mapping authority, sharding as
-    # the lineage sort key.
+    # Both need taxonomy.
     if (host or shard_index) and taxonomy_path is None:
         raise ValueError(
             "--host / --shard-index require --taxonomy: host uses it as the rype mapping"
             " authority, sharding as the lineage sort key"
         )
-    # Sharding requires a genome map: plan-shards derives the shard set from
-    # qiita.feature_genome, which mint-features populates only when a genome map
-    # is supplied. Without it, the load runs for hours then fails at plan-shards
-    # with N=0 ("reference … has no genome-bearing features to shard").
+    # Sharding requires a genome map — plan-shards derives the per-shard feature
+    # set from qiita.feature_genome, which mint-features populates only when a
+    # genome map is supplied. Without it the load runs to completion then fails
+    # at plan-shards with N=0.
     if shard_index and genome_map_path is None:
         raise ValueError(
             "--shard-index requires --genome-map: plan-shards derives the per-shard"
