@@ -574,6 +574,17 @@ async def do_reference_load(
             "--host / --shard-index require --taxonomy: host uses it as the rype mapping"
             " authority, sharding as the lineage sort key"
         )
+    # Sharding requires a genome map: plan-shards derives the shard set from
+    # qiita.feature_genome, which mint-features populates only when a genome map
+    # is supplied. Without it, the load runs for hours then fails at plan-shards
+    # with N=0 ("reference … has no genome-bearing features to shard").
+    if shard_index and genome_map_path is None:
+        raise ValueError(
+            "--shard-index requires --genome-map: plan-shards derives the per-shard"
+            " feature set from qiita.feature_genome, which mint-features populates only"
+            " when a genome map is supplied. Without it the load runs to completion then"
+            " fails at plan-shards with N=0"
+        )
 
     # Index-selection / build-param knobs are index-type-scoped. Reject them up
     # front (boundary-local message) rather than silently dropping them
