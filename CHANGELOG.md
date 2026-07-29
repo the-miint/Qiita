@@ -262,6 +262,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Compute-orchestrator no longer floods logs with Acero "poorly aligned buffer" warnings on Flight-sourced DuckDB scans (#333).**
+  pyarrow's Acero engine warns per batch when it receives Arrow buffers whose
+  base address is not 64-byte aligned. The misalignment is introduced by gRPC
+  transport buffers on the receive side — arrow-rs already writes IPC with
+  `alignment=64`, so a producer-side fix is not possible. 8-byte-aligned buffers
+  are valid on all modern x86_64/ARM; the warning is a defensive hint, not a
+  correctness issue. Setting `ACERO_ALIGNMENT_HANDLING=ignore` at module load
+  silences it; `setdefault` preserves operator override.
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
   `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
