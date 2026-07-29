@@ -10,7 +10,8 @@ work_files/. This step is our version of that pre-map, done with miint's embedde
 minimap2 instead of a container-local binary.
 
 Why this is its OWN native step. Each command in this workflow is one step —
-`assemble` (hifiasm_meta), `binning` (metawrap), `bin_refine` (dastool), `checkm`
+`assemble` (hifiasm_meta or myloasm), `binning` (metawrap), `bin_refine` (dastool),
+`checkm`
 — and the minimap2 pre-map is a distinct command from metawrap's binners, so it
 gets its own step, exactly as qp-pacbio splits its step 3 (`minimap2`) from step 4
 (`metawrap binning`). It is a `module:` (native) step rather than a container SIF

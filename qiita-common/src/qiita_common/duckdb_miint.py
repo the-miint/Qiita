@@ -31,7 +31,15 @@ Install vs. load — the two halves of the contract:
 
 Cross-language note: the Rust data plane can't import this module, so it honors
 the same env contract (`MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY`)
-independently — keep the two sides in sync (see `qiita-data-plane/src/main.rs`).
+independently — keep the sides in sync (see `qiita-data-plane/src/main.rs`).
+
+There is a THIRD copy for the same reason: `workflows/long-read-assembly/`'s
+myloasm splitter runs inside a container SIF, which installs `python-duckdb` but
+not `qiita-common` (a path dep of the two Python services only). It reaches the
+deploy-staged extension through the step's `derived_inputs` bind and mirrors
+`miint_connect_config()` inline. A change to the connect config or the
+LOAD-vs-INSTALL rule has to reach all three — the container one fails at LOAD on
+the cluster, after the assembler has already done its work.
 """
 
 from __future__ import annotations

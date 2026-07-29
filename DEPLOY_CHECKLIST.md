@@ -49,6 +49,17 @@ _None yet._
 
   Expect `cpu` 8 and `mem_gb` 64.
 
+- The rebuilt `long-read-assembly` assemble image can actually run a myloasm assembly end to end (#380): myloasm at the pinned 0.6.0 (the circular/linear split reads a header string probed against exactly that version), the splitter itself, a DuckDB matching the one the miint extension was staged with (DuckDB namespaces the staged dir by engine version, so a skew fails every myloasm ticket at LOAD), and `MIINT_EXTENSION_DIRECTORY` sitting where the step's `derived_inputs` bind expects it (`PATH_DERIVED/duckdb-ext` — it resolves RELATIVE to `PATH_DERIVED`, so a host that points it elsewhere binds a non-existent path). **The bind is unconditional, so a wrong path fails the assemble step for BOTH assemblers, `hifiasm_meta` included** — that check is not myloasm-only. The version pins are. Expect `ASSEMBLE_MYLOASM_OK`.
+  ```bash
+  sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
+  test "$MIINT_EXTENSION_DIRECTORY" = "${PATH_DERIVED%/}/duckdb-ext" || { echo "MIINT bind path mismatch: $MIINT_EXTENSION_DIRECTORY"; exit 1; }
+  cd /tmp && apptainer exec --no-home "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
+    bash -c "micromamba run -n myloasm myloasm --version | grep -Fxq \"myloasm 0.6.0\" \
+             && test -s /opt/qiita/myloasm_split.py \
+             && python3 -c \"import duckdb; print(duckdb.__version__)\" | grep -Fxq 1.5.4" \
+    && echo ASSEMBLE_MYLOASM_OK'
+  ```
+
 ### 6. After the deploy verifies green
 
 _None yet._
@@ -82,6 +93,8 @@ _None yet._
   land on must be able to satisfy it, or blocks will pend instead of running. Both axes
   now sit at the ceiling, which deliberately forgoes cpu/mem escalation on retry
   (walltime still escalates, PT4H → PT8H).
+
+- `long-read-assembly` 1.0.0 accepts `assembler: myloasm` from this deploy on — previously it exited 64 mid-step. The **default is unchanged** (`hifiasm_meta`), so no existing ticket changes behaviour; picking myloasm is an assay decision made per action context. The assemble SIF auto-rebuilds to add myloasm 0.6.0 (its own conda env) plus `python-duckdb`, so its build is slower than a routine no-op verify; it bind-mounts the **already-staged** miint extension read-only rather than carrying its own copy, so no extra staging step is needed and it stays byte-identical to the CP/CO/DP build. One standing consequence: the image's DuckDB is now in lockstep with the orchestrator's, so a future `uv lock` DuckDB bump must re-pin `assemble.def` — a unit test enforces it (#380).
 
 ---
 
