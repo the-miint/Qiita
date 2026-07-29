@@ -51,6 +51,20 @@ if [[ ! -d "${CHECKM_DATA_PATH}" || -z "$(ls -A "${CHECKM_DATA_PATH}" 2>/dev/nul
     exit 78
 fi
 
+# CheckM's markerGeneFinder runs `multiprocessing.Manager()`, which binds an
+# AF_UNIX socket at $TMPDIR/pymp-XXXXXXXX/listener-XXXXXXXX. The SLURM payload sets
+# TMPDIR=<workspace>/tmp — a ~85-char path on real disk (so temp doesn't land on
+# the tiny --containall /tmp tmpfs) — and Python's ~32-char suffix overflows the
+# ~108-char AF_UNIX sun_path limit: `OSError: AF_UNIX path too long`, which crashes
+# lineage_wf on EVERY run. Point TMPDIR at a SHORT symlink into the same real temp
+# (WORK): the socket path stays short, its files still land on disk. Kept for the
+# rest of the step — the qa call and qiita_finish tolerate it. Symlink lives in the
+# container's tmpfs /tmp (a link is bytes) and is cleaned with WORK on exit.
+CK_TMP_LINK="/tmp/ck.$$"
+ln -sfn "${WORK}" "${CK_TMP_LINK}"
+trap 'rm -rf "$WORK"; rm -f "$CK_TMP_LINK"' EXIT
+export TMPDIR="${CK_TMP_LINK}"
+
 # Emit CheckM's RAW --tab_table output straight into checkm_dir. lineage_wf carries
 # marker lineage + completeness/contamination/strain heterogeneity; qa -o 2 adds
 # genome size / # contigs. assembly_load joins the two by "Bin Id" in DuckDB.

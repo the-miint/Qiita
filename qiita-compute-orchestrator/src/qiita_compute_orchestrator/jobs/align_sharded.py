@@ -23,7 +23,7 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      uniformly-paired-end (all-non-null) batch natively, and a read set is uniformly
      one or the other by construction (a prep/run is SE or PE, never a mix). A mixed
      batch is invalid input — bowtie2 rejects it at bind, minimap2 tolerates it — and
-     we neither split around that nor paper over it. A `_READ_META` VIEW carries
+     we neither split around that nor paper over it. A `_READ_META` TABLE carries
      `(sequence_idx -> prep_sample_idx)` so each output row is stamped with its true
      owner (a block spans many prep_samples).
   2. `read_to_shard` — one `rype_classify` pass against the whole-reference ROUTER
@@ -124,19 +124,56 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import PARQUET_OPTS, apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn
+from ..miint import (
+    PARQUET_OPTS,
+    apply_duckdb_settings,
+    duckdb_tmp_dir,
+    open_miint_conn,
+    resolve_duckdb_memory_gb,
+)
 from ..read_source import bind_step_reads
 
 YAML_STEP_NAME = "align_sharded"
 
-# DuckDB stages the query VIEW, the small read_to_shard table, and the final
-# sorted COPY; the minimap2/bowtie2 shard indexes are held OUT of DuckDB's heap by
-# their runtimes (grown into the cgroup remainder a `--mem-gb` raise provides).
-# Same rationale as host_filter — making DuckDB allocation-aware here would let it
-# starve the out-of-heap indexes, so DuckDB stays modest and the cgroup is the
-# lever for a genome-scale align.
+# DuckDB threads. NOT merely a parallelism knob: `SET threads` IS the sharded
+# aligners' CROSS-SHARD concurrency. miint derives `max_active_shards` from DuckDB's
+# thread-pool size (`ceil(db_threads / max_threads_per_shard)`, clamped to the shard
+# count) and IGNORES its own `threads` argument in sharded mode. We never set
+# `max_threads_per_shard`, so it is miint's default of 1 and the derivation reduces to
+# `max_active_shards = min(threads, shard_count)` — one worker per shard, each aligner
+# single-threaded.
+#
+# **This must equal the align workflow's `baseline_resources.cpu`, and nothing derives
+# it from the cgroup.** Unlike memory, there is no cpu-resolution helper: a literal
+# above the allocation oversubscribes that many concurrent shards onto fewer cores, and
+# a literal below it leaves cores idle. `test_align_cpu_pins_duckdb_threads` fails if
+# the two drift. Deliberately NOT generalized to a repo-wide invariant — most native
+# jobs set threads for DuckDB's own operator memory (per-thread sort/HASH_AGG state)
+# and legitimately differ from their `cpu:`; here the cores are spent by the ALIGNER's
+# shard concurrency, not by DuckDB, which is what makes the two the same number.
+_DUCKDB_THREADS = 8
+
+# DuckDB `memory_limit`, resolved from the REAL cgroup so a per-run `--mem-gb`
+# override reaches DuckDB; `_DUCKDB_MEMORY_GB` is only the OFF-SLURM (local backend /
+# tests) fallback.
+#
+# Deliberately NOT host_filter's "hold DuckDB modest so the out-of-heap indexes
+# aren't starved" posture, which this job inherited by copy. `memory_limit` is a
+# CEILING, not a reservation: raising it does not let DuckDB claim the box, it only
+# lets an operator that genuinely needs the memory use what was granted instead of
+# spilling. Under the old 8 GB literal against a 64 GB allocation the alignment
+# output spilled gigabytes to the workspace — far more expensive than the memory it
+# was protecting.
+#
+# `_DUCKDB_RESERVE_GB` carves the cgroup out for the in-process co-consumers that
+# share the box with DuckDB: the rype router index while routing, then up to
+# `_DUCKDB_THREADS` per-shard aligner indexes (hundreds of MB to a few GB each) plus
+# their GPL-boundary daemons. It is small because it is the only carve-out ON TOP of
+# `duckdb_headroom_gb`, which already reserves DuckDB's own above-limit RSS
+# overshoot; the resulting limit stays under a configuration observed to work on
+# this shard population.
 _DUCKDB_MEMORY_GB = 8
-_DUCKDB_THREADS = 4
+_DUCKDB_RESERVE_GB = 1
 
 # Routing threshold for the read_to_shard classify. Deliberately LOW: over-routing
 # is safe (a read routed to a shard it does not actually align to simply produces
@@ -210,9 +247,18 @@ _MIN_QUERY_COVERAGE_MINIMAP2 = 0.90
 # call; only the table-name / path args are bound as `?`. NOTE: `preset` here is an
 # ALIGN-time bowtie2 preset (sensitivity), distinct from the index-build preset — a
 # bowtie2 INDEX is preset-independent, but the aligner still takes one.
+#
+# `ignore_quals` is EXPLICIT, not incidental. bowtie2's only use of base quality is
+# interpolating the mismatch penalty between `mismatch_penalty` (max) and
+# `mismatch_penalty_min` (min); SHOGUN sets both to 1, so the penalty is a constant
+# regardless of Q and quality cannot affect scoring. miint forwards per-base quality
+# only when the query relation exposes `qual1`/`qual2`, and the align query here
+# projects sequences alone — so quality was already unused, as a side effect of a
+# projection rather than as a decision. Stating it means a later change to that
+# projection cannot silently start scoring reads differently.
 _BOWTIE2_ALIGN_PARAMS = (
     "preset := 'very-sensitive', seed := 42, n_penalty := 1, "
-    "mismatch_penalty := 1, mismatch_penalty_min := 1, "
+    "mismatch_penalty := 1, mismatch_penalty_min := 1, ignore_quals := true, "
     "read_gap_open := 0, read_gap_extend := 1, "
     "ref_gap_open := 0, ref_gap_extend := 1, "
     "score_min := 'L,0,-0.05', report_all := true, quiet := true, "
@@ -232,10 +278,10 @@ _BOWTIE2_ALIGN_PARAMS = (
 # sequence_idx spans), so walltime sizing can come back by threading that count
 # through the workflow `params:`. Left for a follow-up.
 
-# In-DuckDB relation names. The query + read-meta are VIEWs; read_to_shard is a
-# TABLE resolved by align's separate connection; the alignments TABLE is CTAS'd by
-# the aligner seam from the align function's full output, then joined + sorted into
-# the COPY.
+# In-DuckDB relation names. The query is a VIEW; read-meta and read_to_shard are
+# TABLEs (read_to_shard has to be one — align's separate connection resolves it by
+# name); the alignments TABLE is CTAS'd by the aligner seam from the align function's
+# full output, then joined + sorted into the COPY.
 _QUERY = "align_sharded_query"
 _READ_META = "align_sharded_read_meta"
 _READ_TO_SHARD = "align_sharded_read_to_shard"
@@ -355,20 +401,31 @@ def _build_read_to_shard(
     threshold: float,
 ) -> None:
     """Populate the `read_to_shard` table via one `rype_classify` pass against the
-    router. Appends DISTINCT `(read_id BIGINT, shard_name VARCHAR)` pairs — one per
+    router. Appends `(read_id BIGINT, shard_name VARCHAR)` pairs — one per
     (read, shard) the read routes to (multi-bucket: a read spanning K shards yields
-    K rows). DISTINCT because the table-function interface does not guarantee a
-    single row per (read, bucket).
+    K rows).
+
+    **No dedup, and none is needed.** `(read_id, shard_name)` is unique by
+    construction on both axes: every query row is a distinct `sequence_idx` (the
+    globally-unique read identity, minted once per read), and rype emits at most one
+    row per (read, bucket). Note the cost if that ever stopped holding: miint does
+    NOT dedup on its side — it reads a shard's ids straight out of this table and
+    joins the query against it unfiltered — so a duplicated pair would align the read
+    twice against the same shard and emit duplicate output rows, which no consumer
+    could detect because `(sequence_idx, feature_idx)` is legitimately non-unique
+    (cross-shard and paired-end multiplicity). Keep the uniqueness invariant here.
 
     Isolated so unit tests stub the real classify. Factored around `dest_table` so
     a future multi-router build just calls this once per router (each appending its
     shards), UNIONing into one `read_to_shard`. Positional args (index path,
     sequence-table NAME) + `threshold` are bound as `?` (INSERT...SELECT is DML, so
     prepared params are accepted). `read_id` is CAST to BIGINT to match the query's
-    `read_id` type exactly (the type align binds `read_to_shard.read_id` against)."""
+    `read_id` type exactly (the type align binds `read_to_shard.read_id` against) —
+    current miint builds mirror the input id type, but the output type has been
+    build-dependent, so the cast stays."""
     conn.execute(
         f"INSERT INTO {dest_table} "
-        "SELECT DISTINCT CAST(read_id AS BIGINT) AS read_id, bucket_name AS shard_name "
+        "SELECT CAST(read_id AS BIGINT) AS read_id, bucket_name AS shard_name "
         "FROM rype_classify(?, ?, id_column := 'read_id', threshold := ?)",
         [str(router_index_path), query_table, threshold],
     )
@@ -453,7 +510,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     try:
         with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
-                conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
+                conn,
+                duckdb_tmp,
+                memory_gb=resolve_duckdb_memory_gb(
+                    _DUCKDB_MEMORY_GB,
+                    threads=_DUCKDB_THREADS,
+                    reserve_gb=_DUCKDB_RESERVE_GB,
+                ),
+                threads=_DUCKDB_THREADS,
             )
 
             # Bind the block's reads. Under `align` this streams from the data
@@ -472,8 +536,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # Per-read (sequence_idx -> prep_sample_idx) map, projected to the two
                 # key columns so the final COPY stamps each alignment row's owner PER
                 # ROW (a block spans many prep_samples). sequence_idx is unique, 1:1.
+                # A TABLE, not a VIEW over the reads relation: two narrow BIGINT
+                # columns (~16 B/read) is small enough to hold outright, and
+                # materializing it keeps the COPY's join off a Parquet scan (the bound
+                # reads relation is a lazy `read_parquet` view). NOT for the planner's
+                # benefit — a Parquet footer carries exact row counts, so a view's
+                # cardinality is exact too and the join plan is identical either way.
                 conn.execute(
-                    f"CREATE VIEW {_READ_META} AS "
+                    f"CREATE TABLE {_READ_META} AS "
                     f"SELECT sequence_idx, prep_sample_idx FROM {reads_rel}"
                 )
                 # The align query: the WHOLE read set, keyed by sequence_idx AS read_id,

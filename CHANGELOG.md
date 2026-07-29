@@ -22,6 +22,37 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`long-read-assembly`: the `myloasm` assembler option is implemented (#380).**
+  Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
+  image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
+  (noLCG) contigs. The two assemblers **disagree on how circularity is encoded**,
+  so this is a real branch rather than a second tool behind the same tail:
+  hifiasm-meta puts it in the GFA segment name (`…tg……c`), myloasm puts it in the
+  `assembly_primary.fa` header (`_circular-yes`) and marks nothing in its GFA.
+  Reusing the hifiasm regex would have matched nothing and silently demoted every
+  closed genome to binning input, so the split is a separate `myloasm_split.py`
+  that unit tests execute against real myloasm headers. It reads with miint's
+  `read_fastx` and writes with `COPY … (FORMAT FASTA)` — no hand-rolled FASTA
+  parser — and **LOADs the deploy-staged extension** rather than a copy baked into
+  the image, so the assemble container runs the byte-identical miint the CP/CO/DP
+  run. The staged directory reaches the container through the assemble step's new
+  `derived_inputs: {MIINT_EXTENSION_DIRECTORY: duckdb-ext}` (read-only bind), which
+  is the existing per-step mechanism — `slurm/payload.py` still does not forward
+  native-only miint env to containers. Consequence: the image's DuckDB is now in
+  **lockstep** with the orchestrator's, because DuckDB namespaces the staged
+  extension dir by engine version + platform; `assemble.def` pins
+  `python-duckdb=1.5.4` and a unit test fails if it ever diverges from
+  `qiita-compute-orchestrator/uv.lock`. Only `circular-yes` counts as circular
+  (`circular-possibly` routes to noLCG, the recoverable direction), and the contig
+  id is cut at `_len-` so the bin_id carries no per-run coverage statistics (the
+  discarded `depth-` field was probed to vary between read samplings of the same
+  genome). An unrecognised header shape, a duplicate contig id, or a missing
+  `assembly_primary.fa` after a zero exit each fail the step (exit 64) instead of
+  yielding an empty `circular.fa` or a silent no-data ticket. hifiasm_meta and
+  myloasm now live in **separate conda envs** in the image so the unpinned hifiasm
+  solve cannot make the pinned myloasm one unsatisfiable. myloasm is pinned to
+  0.6.0 (the version the header format was probed on), asserted in `%test` and by
+  the SIF spec's `VERIFY_MATCH`.
 - **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
   The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
   now record masking completion in `qiita.mask_sample` first-class, via a new
@@ -273,6 +304,65 @@ duplicates further down are historical strata; leave them where they are.
   traded negligible time for a real correctness gap. The native-import probe also
   deepens to import `qiita_compute_orchestrator.config` so a stale venv fails
   deploy verify as a backstop.
+- **Compute-orchestrator no longer floods logs with Acero "poorly aligned buffer" warnings on Flight-sourced DuckDB scans (#333).**
+  pyarrow's Acero engine warns per batch when it receives Arrow buffers whose
+  base address is not 64-byte aligned. The misalignment is introduced by gRPC
+  transport buffers on the receive side — arrow-rs already writes IPC with
+  `alignment=64`, so a producer-side fix is not possible. 8-byte-aligned buffers
+  are valid on all modern x86_64/ARM; the warning is a defensive hint, not a
+  correctness issue. Setting `ACERO_ALIGNMENT_HANDLING=ignore` at module load
+  silences it; `setdefault` preserves operator override.
+- **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
+  `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#379).**
+  CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
+  AF_UNIX socket at `$TMPDIR/pymp-XXXXXXXX/listener-XXXXXXXX`. The SLURM payload
+  sets `TMPDIR=<workspace>/tmp` (~85 chars, on real disk so temp doesn't fill the
+  tiny `--containall` `/tmp` tmpfs), and Python's ~32-char suffix pushes the socket
+  path over the ~108-char AF_UNIX `sun_path` limit — crashing `lineage_wf` on every
+  run. `checkm.sh` now points `TMPDIR` at a short `/tmp` symlink into the same
+  workspace temp (socket path short, temp files still on disk). First reached only
+  after `binning` + `bin_refine` were fixed; reproduced on a real ticket and
+  cleared by the symlink.
+- **`long-read-assembly` `bin_refine` no longer crashes DAS_Tool on a bad flag —
+  `--write_bins`, not `--write_bins 1` (#379).** `--write_bins` is a boolean flag
+  in DAS_Tool 1.1.x; the spurious `1` is an unexpected positional that r-docopt
+  0.7.2 surfaces as `'short' is not a valid field or method name for reference
+  class "Argument"`, Execution-halting before DAS_Tool runs. qp-pacbio passes it
+  bare; probed on das_tool 1.1.7 / r-docopt 0.7.2 (bare parses, `1` crashes).
+  First reached only after `binning` was fixed (every prior run died earlier).
+  Also pins `das_tool=1.1.7` in `bin_refine.def` — the create line was unpinned
+  despite the "1.1.x summary-columns" invariant, and the image rebuilds on any
+  `bin_refine.sh` change.
+- **`long-read-assembly` `binning` image can finally run concoct — `binning.def`
+  installs `libgfortran=3.0.0` (#379).** concoct's `vbgmm` C-extension links
+  `libgfortran.so.3`, but the metawrap solve ships only `libgfortran.so.5`, so
+  `import vbgmm` died at runtime (`ImportError: libgfortran.so.3`) and metaWRAP's
+  concoct binner failed — taking the whole step down, since metaWRAP exits
+  non-zero when any binner hard-fails (metabat2 + maxbin2 succeeded regardless).
+  Latent until now: every prior run died at an earlier wall (missing binners →
+  unsorted BAM → metabat2 contig order), so concoct was never reached. The old
+  conda-forge `libgfortran` (3.0.0) provides `.so.3` and coexists with
+  `libgfortran5`, restoring concoct without perturbing the pinned solve; verified
+  by running metaWRAP binning to completion on a real assembly. `binning-verify.sh`
+  now asserts `import vbgmm` at build time — the prior tool-runnability check
+  missed this because the failure is a Python `ImportError` (exit 1), not a loader
+  verdict (126/127), so a concoct-broken image shipped green.
+- **`long-read-assembly` `binning` no longer aborts on a contig-ORDER mismatch —
+  `binning.sh` reorders the assembly to the BAM's `@SQ` order (#379).** With the
+  unsorted-BAM failure fixed (#370), the same production ticket reached `metabat2`
+  and died with `the order of contigs in abundance file is not the same as the
+  assembly file: s10.ctg000011l`. Root cause is the *same* miint gap
+  (duckdb-miint#173) at a second consumer: `jgi_summarize_bam_contig_depths` writes
+  the depth matrix in the BAM's `@SQ` order (lexicographic, as miint emits it),
+  while the assembly FASTA is in hifiasm's numeric order — and `metabat2` requires
+  the two to agree. `samtools sort` fixes record order but never `@SQ` order, so it
+  surfaced only after #370 landed. `binning.sh` now reorders `noLCG.fa` into the
+  staged BAM's `@SQ` order (via `samtools faidx`) before handing it to metaWRAP, and
+  fails loud if the `@SQ` and assembly contig sets ever diverge. Confirmed by probe
+  on the shipped `samtools 1.10` / `metabat2 2.15`: a numeric-order assembly
+  reproduces the abort, the `@SQ`-reordered one binds. Pinned by
+  `test_binning_coverage_sort_pin.py`; removable together with the `samtools sort`
+  when duckdb-miint#173 lands (tracked in Qiita#374).
 - **`long-read-assembly` `binning` no longer dies on an unsorted coverage BAM —
   `binning.sh` runs the `samtools sort` metaWRAP skipped (#370).** A production
   ticket failed in `jgi_summarize_bam_contig_depths` 2.15 with
@@ -648,6 +738,28 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`align_sharded` gets the memory and cores it was allocated (#381).** The job
+  hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached
+  DuckDB as 8 GB and the alignment output spilled gigabytes to shared scratch.
+  `memory_limit` now resolves from the SLURM cgroup via `resolve_duckdb_memory_gb()`
+  (a small reserve for the co-resident rype router and per-shard aligner indexes), and
+  the `align` workflow's baseline rises to `cpu: 8, mem_gb: 64` — at the existing
+  `action_ceiling`, so an OOM retry has no memory headroom to grow into. The thread
+  count is load-bearing beyond parallelism: `SET threads` **is** miint's cross-shard
+  concurrency (it ignores its own `threads` argument in sharded mode, and defaults
+  `max_threads_per_shard` to 1), so the old literal capped the job at 4 concurrent
+  shards regardless of allocation. Cores are NOT cgroup-resolved the way memory is —
+  the thread count stays a module literal that must be kept equal to the workflow's
+  `cpu:` by hand, now pinned by `test_align_cpu_pins_duckdb_threads`. Also drops a
+  `DISTINCT` from the `read_to_shard` build
+  that deduplicated a set already unique by construction (distinct `sequence_idx` per
+  query row × one rype row per bucket), materializes the two-column `read_meta`
+  relation instead of re-scanning the reads Parquet through a view, and sets bowtie2
+  `ignore_quals := true` explicitly — quality was already unused (SHOGUN's
+  `mismatch_penalty == mismatch_penalty_min` makes it a constant, and the align query
+  projects sequences only), but as a side effect of a projection rather than a stated
+  decision.
 
 - **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#371).**
   `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
