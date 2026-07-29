@@ -106,20 +106,31 @@ _ALIGNER_BY_PLATFORM: dict[str, str] = {
 # (10M), sized on read COUNT because short-read work is count-bound.
 #
 # Long reads need a smaller block because the sharded aligner's cost is driven by
-# BYTES, not reads. Each of the reference's ~1000 shards re-reads the block's reads to
-# pull its own routed subset, so the total re-scan is `n_shards x block_bytes` per
-# block — and summed over a sample's blocks that is `n_shards x total_bytes`,
-# INVARIANT to block size. What block size does control is the per-JOB share of it,
-# i.e. whether one ticket fits its walltime. At ~15 kb/read a 10M-read HiFi block is
-# ~150 GB, so its re-scan alone is ~4.5 h against the align step's PT4H baseline —
-# the job cannot finish. At 1M reads (~15 GB) the same work is ~27 min.
+# BYTES, not reads. Both sharded aligners read the query relation ONCE PER SHARD —
+# probed against the installed build, exactly `n_shards` reads with the read set held
+# fixed, and confirmed in miint's source on both aligner paths (see
+# docs/duckdb-miint.md, "read `query_table` ONCE PER SHARD"). The per-shard predicate
+# does not prune usefully at our 1000-shard configuration: every Parquet row group
+# holds some of every shard's reads (`S/G ~ 123`, independent of block size — the
+# derivation is in that same entry). So a block's re-read is `n_shards x block_bytes`.
 #
-# **Both figures are FLOORS, not estimates.** They come from a ~9.2 GB/s scan rate
-# measured on local disk with a warm page cache and an otherwise idle 8-thread pool;
-# the real job reads from Lustre with its cores busy aligning. Read them as "10M
-# cannot fit PT4H even under ideal conditions" and "1M has room to be several times
-# slower than ideal and still fit" — the ordering is what the choice rests on, not
-# the absolute numbers.
+# Summed over a sample's blocks that is `n_shards x total_bytes`, INVARIANT to block
+# size. What block size controls is the per-JOB share of it, i.e. whether ONE ticket
+# fits its walltime.
+#
+# The arithmetic, spelled out because the conclusion depends on the constant:
+#   scan rate  ~9.2 GB/s  (1.6 GB of raw sequence scanned in 174 ms, 8 threads)
+#   10M reads x ~15 kb = ~150 GB  ->  1000 x 150 GB = 150 TB  ->  ~4.5 h
+#    1M reads x ~15 kb =  ~15 GB  ->  1000 x  15 GB =  15 TB  ->  ~27 min
+#
+# That rate is a CEILING: it was measured on local disk with a warm page cache and an
+# otherwise idle thread pool, whereas the real job reads Lustre with its 8 cores busy
+# aligning. So real walltimes are HIGHER than both figures, which is the safe
+# direction for this decision but leaves 10M with no margin at all: at the ideal rate
+# a 10M-read block needs ~4.5 h against a PT4H baseline, so it would have to sustain
+# >10.4 GB/s — better than measured-ideal — merely to fit. A 1M-read block needs
+# ~27 min, so it tolerates being ~9x slower than ideal and still fits. **The choice
+# rests on that asymmetry (no margin vs ~9x margin), not on the point estimates.**
 #
 # A second property of this size, independent of walltime: a 1M-read long-read block's
 # sequences (~15-20 GB) fit inside the step's resolved ~57 GB DuckDB limit, so the
@@ -252,11 +263,13 @@ async def plan_and_submit_alignments(
     `alignment_idx` + the align `action_context`), back-filling
     `block.work_ticket_idx`. After commit each ticket is dispatched.
 
-    `target_reads` is the block size; `None` (the normal case) resolves it FROM THE
-    PLATFORM via `_BLOCK_TARGET_READS_BY_PLATFORM` — 10M for short reads, 1M for long
-    reads, whose per-shard re-scan is byte-driven and would otherwise blow the align
-    step's walltime. An explicit value overrides that (tests tile small pools without
-    seeding 10M reads).
+    `target_reads` is the block size; `None` (the normal case, and the only one the
+    route uses) resolves it FROM THE PLATFORM via `_BLOCK_TARGET_READS_BY_PLATFORM` —
+    10M for short reads, 1M for long reads, whose per-shard re-scan is byte-driven and
+    would otherwise blow the align step's walltime. An explicit value overrides that,
+    which exists as a test seam for tiling behaviour at sizes a fixture can reach
+    (`test_align_plan_explicit_target_reads_overrides_the_platform`); no production
+    caller passes it.
 
     `only_missing` drops samples already carrying an `alignment_sample` row for
     their resolved alignment (an interrupted plan re-runs only the gap). On a fresh

@@ -389,6 +389,46 @@ async def test_align_plan_tiles_at_the_platform_block_target(
     assert seen == [expected_target]
 
 
+async def test_align_plan_explicit_target_reads_overrides_the_platform(ctx, planned):
+    """An explicit `target_reads` wins over the platform-resolved default.
+
+    The planner documents this override, and without a test the resolution could be
+    made unconditional by a refactor and the whole suite would still pass — the
+    parameter reaches no production caller (the route never passes it), so nothing
+    else would notice.
+
+    Asserted through the RESULT rather than by recording the argument: a target of 100
+    against the fixture's 300 reads must tile into 3 blocks of exactly 100, which
+    neither the platform default (1M here — the run is long-read) nor the short-read
+    10M could ever produce. So this pins that the value is honoured end to end, not
+    merely passed along."""
+    from qiita_control_plane.main import app
+
+    await _seed_align_action(planned["db"])
+    await planned["db"].execute(
+        "UPDATE qiita.sequencing_run SET platform = 'pacbio_smrt'::qiita.platform WHERE idx = $1",
+        planned["run_idx"],
+    )
+
+    summary = await align_planner.plan_and_submit_alignments(
+        planned["db"],
+        app=app,
+        sequencing_run_idx=planned["run_idx"],
+        sequenced_pool_idx=planned["pool_idx"],
+        reference_idx=planned["reference_idx"],
+        mask_idx=planned["mask_idx"],
+        only_missing=False,
+        originator_principal_idx=ctx["wet_session"]["principal_idx"],
+        align_action_id=align_planner.ALIGN_ACTION_ID,
+        align_action_version=align_planner.ALIGN_ACTION_VERSION,
+        target_reads=100,
+    )
+
+    assert summary["samples_planned"] == 2
+    assert summary["blocks_created"] == 3
+    assert [b["read_count"] for b in summary["blocks"]] == [100, 100, 100]
+
+
 async def test_align_plan_unsupported_platform_422(ctx, planned):
     """A platform with no defined sharded aligner (ls454) is refused 422 — fail
     loud rather than defaulting to an aligner."""
