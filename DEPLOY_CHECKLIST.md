@@ -35,6 +35,19 @@ _None yet._
   row; confirm it includes `download-ena-study 1.0.0` (new `workflows/`
   entry, picked up by the standing `qiita-admin actions sync` inside
   `activate.sh` — no extra operator step).
+- (#381) Confirm the synced `align 1.0.0` action carries the
+  raised `align_sharded` baseline. `actions sync` runs inside `activate.sh`, so this
+  only checks it took — if the row still reads `cpu: 4` / `mem_gb: 32`, align blocks
+  keep submitting at the old size and the change is a silent no-op:
+
+  ```bash
+  DATABASE_URL=$(sudo grep '^DATABASE_URL=' /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-api psql "$DATABASE_URL" -Atc \
+    "SELECT s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s
+      WHERE action_id='align' AND version='1.0.0' AND s->>'name'='align_sharded';"
+  ```
+
+  Expect `cpu` 8 and `mem_gb` 64.
 
 ### 6. After the deploy verifies green
 
@@ -63,6 +76,12 @@ _None yet._
   fails the deploy rather than every ENA import at runtime. The install
   itself is a plain `INSTALL`, not `FORCE` — httpfs is DuckDB's own signed
   extension, not the team mirror, so a warm cache is always current.
+- (#381) Each `align_sharded` step now requests **8 cpu / 64 GB**
+  (was 4 / 32) — unchanged `action_ceiling`, so nothing new is expressible, but this is
+  the first time the ceiling is requested by default. The SLURM partition align tickets
+  land on must be able to satisfy it, or blocks will pend instead of running. Both axes
+  now sit at the ceiling, which deliberately forgoes cpu/mem escalation on retry
+  (walltime still escalates, PT4H → PT8H).
 
 ---
 

@@ -25,6 +25,7 @@ import path for jobs that never stream).
 from __future__ import annotations
 
 import base64
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
@@ -37,6 +38,16 @@ from qiita_common.api_paths import (
 
 from .config import get_settings
 from .cp_client import make_cp_client
+
+# Acero (pyarrow's C++ compute engine) warns on every Flight-sourced Arrow
+# buffer whose base address is not 64-byte aligned. The misalignment is
+# introduced by gRPC transport buffers on the receive side — arrow-rs
+# already writes IPC with alignment=64, so a producer-side fix is not
+# possible. The warning is cosmetic (8-byte-aligned buffers are valid on
+# all modern x86_64/ARM) but floods logs on every batch. Set the alignment
+# handling policy to `ignore` to silence it; operators can override via the
+# env var if they want the paranoid `reallocate` behaviour.
+os.environ.setdefault("ACERO_ALIGNMENT_HANDLING", "ignore")
 
 if TYPE_CHECKING:
     import duckdb

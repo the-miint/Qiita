@@ -45,6 +45,7 @@ from qiita_common.models import (
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action, sign_ticket
+from ..miint import duckdb_connect
 from ..repositories.assembly import insert_assembly_membership_rows
 from ..repositories.block import (
     fetch_block_members,
@@ -273,7 +274,7 @@ async def _associate_genomes(
     The whole map is validated up front (`_validate_genome_map`) — vocabulary
     and the qiita-origin rule — so a bad map fails before any DB write.
     """
-    with duckdb.connect(":memory:") as duck:
+    with duckdb_connect() as duck:
         has_prep = _validate_genome_map(duck, genome_map_path)
         prep_select = "g.prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT) AS prep_sample_idx"
         reader = duck.execute(
@@ -415,8 +416,8 @@ async def mint_features(
     # connection's single in-flight query. `temp_directory` lets write_conn
     # spill the temp table to the (ephemeral) workspace under memory pressure
     # rather than growing unbounded in the CP's RAM.
-    read_conn = duckdb.connect(":memory:")
-    write_conn = duckdb.connect(":memory:")
+    read_conn = duckdb_connect()
+    write_conn = duckdb_connect()
     try:
         # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires
         # preserve_insertion_order=false (DuckDB errors at bind time
@@ -578,8 +579,8 @@ async def _write_annotation_claims(
     plasmid map carries.
     """
     out_path = output_dir / MINT_ANNOTATION_MAP_OUTPUT_BASENAME
-    read_conn = duckdb.connect(":memory:")
-    write_conn = duckdb.connect(":memory:")
+    read_conn = duckdb_connect()
+    write_conn = duckdb_connect()
     try:
         # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires preserve_insertion_order=false —
         # DuckDB errors at BIND time otherwise, so this fires on the zero-annotation
@@ -808,7 +809,7 @@ async def _write_annotation_terms(
 
     Returns the number of (annotation, term) links written or already present.
     """
-    read_conn = duckdb.connect(":memory:")
+    read_conn = duckdb_connect()
     try:
         expected = read_conn.execute(
             "SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest_path)]
@@ -950,7 +951,7 @@ async def write_membership(
     total_linked = 0
     total_seen = 0
     async with pool.acquire() as conn:
-        with duckdb.connect(":memory:") as duck:
+        with duckdb_connect() as duck:
             reader = duck.execute(
                 MEMBERSHIP_ACCESSION_JOIN_SQL,
                 [str(feature_map_path), str(manifest_path)],
@@ -1262,7 +1263,7 @@ async def plan_shards(
     # with every other read_parquet/COPY target in the codebase.
     member_sql = validate_parquet_path(member_parquet)
     taxonomy_sql = validate_parquet_path(taxonomy_parquet)
-    with duckdb.connect(":memory:") as con:
+    with duckdb_connect() as con:
         con.execute(
             "CREATE TABLE member_genome AS"
             f" SELECT feature_idx, genome_idx FROM read_parquet('{member_sql}')"
@@ -1325,7 +1326,7 @@ async def write_assembly_membership(
     total_linked = 0
     total_seen = 0
     async with pool.acquire() as conn:
-        with duckdb.connect(":memory:") as duck:
+        with duckdb_connect() as duck:
             reader = duck.execute(
                 ASSEMBLY_MEMBERSHIP_JOIN_SQL,
                 [str(bin_map_path), str(manifest_path), str(feature_map_path)],
@@ -1541,7 +1542,7 @@ def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int, int]:
     spikein = f"reason IN ({read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN)})"
     quality_filtered = f"reason = '{ReadMaskReason.PASS.value}'"
     path_sql = validate_parquet_path(read_mask_path)
-    with duckdb.connect(":memory:") as duck:
+    with duckdb_connect() as duck:
         raw, bio, qf, spike = duck.execute(
             "SELECT "
             "  count(*) + count(right_trim2), "

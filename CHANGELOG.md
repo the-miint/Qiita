@@ -504,6 +504,14 @@ duplicates further down are historical strata; leave them where they are.
   No behavior change today (`'http'` is the only value the route/DB CHECK
   currently allow), but this closes the latent drift before a second
   transport is ever added.
+- **Compute-orchestrator no longer floods logs with Acero "poorly aligned buffer" warnings on Flight-sourced DuckDB scans (#333).**
+  pyarrow's Acero engine warns per batch when it receives Arrow buffers whose
+  base address is not 64-byte aligned. The misalignment is introduced by gRPC
+  transport buffers on the receive side — arrow-rs already writes IPC with
+  `alignment=64`, so a producer-side fix is not possible. 8-byte-aligned buffers
+  are valid on all modern x86_64/ARM; the warning is a defensive hint, not a
+  correctness issue. Setting `ACERO_ALIGNMENT_HANDLING=ignore` at module load
+  silences it; `setdefault` preserves operator override.
 - **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
   `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#379).**
   CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
@@ -982,6 +990,28 @@ duplicates further down are historical strata; leave them where they are.
   transient marker still classifies retriable) with a reason string that
   names the failure explicitly instead of relying on the generic fallthrough
   message.
+- **`align_sharded` gets the memory and cores it was allocated (#381).** The job
+  hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached
+  DuckDB as 8 GB and the alignment output spilled gigabytes to shared scratch.
+  `memory_limit` now resolves from the SLURM cgroup via `resolve_duckdb_memory_gb()`
+  (a small reserve for the co-resident rype router and per-shard aligner indexes), and
+  the `align` workflow's baseline rises to `cpu: 8, mem_gb: 64` — at the existing
+  `action_ceiling`, so an OOM retry has no memory headroom to grow into. The thread
+  count is load-bearing beyond parallelism: `SET threads` **is** miint's cross-shard
+  concurrency (it ignores its own `threads` argument in sharded mode, and defaults
+  `max_threads_per_shard` to 1), so the old literal capped the job at 4 concurrent
+  shards regardless of allocation. Cores are NOT cgroup-resolved the way memory is —
+  the thread count stays a module literal that must be kept equal to the workflow's
+  `cpu:` by hand, now pinned by `test_align_cpu_pins_duckdb_threads`. Also drops a
+  `DISTINCT` from the `read_to_shard` build
+  that deduplicated a set already unique by construction (distinct `sequence_idx` per
+  query row × one rype row per bucket), materializes the two-column `read_meta`
+  relation instead of re-scanning the reads Parquet through a view, and sets bowtie2
+  `ignore_quals := true` explicitly — quality was already unused (SHOGUN's
+  `mismatch_penalty == mismatch_penalty_min` makes it a constant, and the align query
+  projects sequences only), but as a side effect of a projection rather than a stated
+  decision.
+
 - **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#371).**
   `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
   `mask_idx` and aligns the pool's samples whose `mask_sample` gate is `completed`
@@ -1201,6 +1231,15 @@ duplicates further down are historical strata; leave them where they are.
   archived block records that this deploy already followed that order. `redeploy.md`
   (source of truth for bucket order), `/deploy-note` and `/deploy-archive` updated
   to match. (#276)
+- **CP library primitives now use `duckdb_connect()` instead of bare
+  `duckdb.connect(":memory:")` (#349).** Ten call sites in `library.py` switched to
+  a new `miint.duckdb_connect()` helper that always passes `miint_connect_config()`
+  (sets `extension_directory` when `MIINT_EXTENSION_DIRECTORY` is present). No
+  behavior change today — none of these paths loads an extension — but the first
+  one that gains INSTALL/LOAD would otherwise resurrect the `/dev/null` `$HOME`
+  failure that took down every `long-read-assembly` ticket. The helper also
+  documents why we defer `SET home_directory=` (prod sets the var; deploy checks
+  enforce it; dev/CI have writable `$HOME`).
 
 
 ### Removed
