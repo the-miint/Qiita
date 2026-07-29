@@ -22,6 +22,37 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`long-read-assembly`: the `myloasm` assembler option is implemented (#380).**
+  Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
+  image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
+  (noLCG) contigs. The two assemblers **disagree on how circularity is encoded**,
+  so this is a real branch rather than a second tool behind the same tail:
+  hifiasm-meta puts it in the GFA segment name (`…tg……c`), myloasm puts it in the
+  `assembly_primary.fa` header (`_circular-yes`) and marks nothing in its GFA.
+  Reusing the hifiasm regex would have matched nothing and silently demoted every
+  closed genome to binning input, so the split is a separate `myloasm_split.py`
+  that unit tests execute against real myloasm headers. It reads with miint's
+  `read_fastx` and writes with `COPY … (FORMAT FASTA)` — no hand-rolled FASTA
+  parser — and **LOADs the deploy-staged extension** rather than a copy baked into
+  the image, so the assemble container runs the byte-identical miint the CP/CO/DP
+  run. The staged directory reaches the container through the assemble step's new
+  `derived_inputs: {MIINT_EXTENSION_DIRECTORY: duckdb-ext}` (read-only bind), which
+  is the existing per-step mechanism — `slurm/payload.py` still does not forward
+  native-only miint env to containers. Consequence: the image's DuckDB is now in
+  **lockstep** with the orchestrator's, because DuckDB namespaces the staged
+  extension dir by engine version + platform; `assemble.def` pins
+  `python-duckdb=1.5.4` and a unit test fails if it ever diverges from
+  `qiita-compute-orchestrator/uv.lock`. Only `circular-yes` counts as circular
+  (`circular-possibly` routes to noLCG, the recoverable direction), and the contig
+  id is cut at `_len-` so the bin_id carries no per-run coverage statistics (the
+  discarded `depth-` field was probed to vary between read samplings of the same
+  genome). An unrecognised header shape, a duplicate contig id, or a missing
+  `assembly_primary.fa` after a zero exit each fail the step (exit 64) instead of
+  yielding an empty `circular.fa` or a silent no-data ticket. hifiasm_meta and
+  myloasm now live in **separate conda envs** in the image so the unpinned hifiasm
+  solve cannot make the pinned myloasm one unsatisfiable. myloasm is pinned to
+  0.6.0 (the version the header format was probed on), asserted in `%test` and by
+  the SIF spec's `VERIFY_MATCH`.
 - **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
   The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
   now record masking completion in `qiita.mask_sample` first-class, via a new
