@@ -54,6 +54,9 @@ _WORKFLOW_DIR = _REPO_ROOT / "workflows" / "long-read-assembly"
 _BINNING_SH = _WORKFLOW_DIR / "binning.sh"
 _BINNING_DEF = _WORKFLOW_DIR / "binning.def"
 _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
+_BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
+_BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
+_CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
 
 
 @pytest.mark.parametrize("path", [_BINNING_SH, _BINNING_DEF, _BINNING_VERIFY])
@@ -166,12 +169,18 @@ def test_only_the_sorted_bam_is_staged_for_metawrap() -> None:
         "written; the staging path or its variable names must have changed."
     )
     for line in writers:
-        assert line.startswith("mv ") and "STAGED_BAM" in line, (
-            f"something other than the staging `mv` writes the path metaWRAP "
-            f"reads: {line!r}. If miint's name-ordered BAM lands there unsorted, "
-            "jgi rejects it with 'the bam file is not sorted!' -- the production "
-            "failure this test exists for. Stage via the sort, or extend this "
-            "test on purpose."
+        is_staging_mv = line.startswith("mv ") and "STAGED_BAM" in line
+        # Deliberately permitted READER (not a writer of this path): the reorder
+        # step reads the staged BAM's @SQ header to derive the assembly order, so
+        # the staged path is an input to `samtools view -H` here and the redirect
+        # target is STAGED_ORDER, not the staged BAM. Anything else still fails.
+        is_sq_header_read = "samtools view -H" in line and "STAGED_ORDER" in line
+        assert is_staging_mv or is_sq_header_read, (
+            f"something other than the staging `mv` (or the @SQ-order read) touches "
+            f"the path metaWRAP reads: {line!r}. If miint's name-ordered BAM lands "
+            "there unsorted, jgi rejects it with 'the bam file is not sorted!' -- the "
+            "production failure this test exists for. Stage via the sort, or extend "
+            "this test on purpose."
         )
 
 
@@ -214,6 +223,179 @@ def test_binning_sort_memory_is_bounded_by_the_allocation() -> None:
     )
     assert re.search(r"-m\s+\"\$\{SORT_MEM_MB\}M\"", code), (
         "`samtools sort -m` no longer uses the derived per-thread value"
+    )
+
+
+def test_binning_reorders_the_assembly_to_sq_order() -> None:
+    """The assembly is reordered to the staged BAM's @SQ order before metaWRAP.
+
+    Second consumer of the same duckdb-miint#173 @SQ-order defect: metaWRAP's
+    jgi_summarize writes the depth matrix in @SQ order, and metabat2 aborts unless
+    the assembly FASTA is in that SAME order ("the order of contigs in abundance
+    file is not the same as the assembly file"). noLCG.fa is in hifiasm's numeric
+    order; the @SQ order is lexicographic; `samtools sort` fixes record order but
+    never @SQ order, so the two disagree and metabat2 rejects. Reproduced and the
+    reorder-fix confirmed on samtools 1.10 / metabat2 2.15 (a numeric-order
+    assembly aborts, the @SQ-reordered one binds).
+
+    Text pin, like the sort pins above: proving the reorder *works* needs the
+    metaWRAP/metabat2 image; this proves it is still WIRED -- the order comes from
+    the staged BAM's @SQ header and metaWRAP is handed the reordered file, not the
+    raw noLCG.
+    """
+    code = _code_lines(_BINNING_SH)
+    joined = "\n".join(code)
+
+    # The @SQ order is extracted from the staged BAM header (what jgi will read),
+    # not from noLCG or the unsorted coverage_bam.
+    order_src = [ln for ln in code if "ORDERED_NOLCG" in ln or "assembly.ordered" in ln]
+    assert any("samtools faidx" in ln for ln in order_src), (
+        "binning.sh no longer builds the reordered assembly with `samtools faidx`. "
+        "Without it the assembly stays in hifiasm's numeric order while jgi's depth "
+        "matrix is in @SQ order, and metabat2 aborts on the mismatch."
+    )
+    assert re.search(r"samtools view -H .*READS_STEM.*\.bam", joined), (
+        "the @SQ order is no longer read from the STAGED BAM header. It must come "
+        "from the file jgi reads (work_files/<sample>.bam), or the assembly order "
+        "and the depth order can diverge again."
+    )
+
+
+def test_metawrap_gets_the_reordered_assembly_not_raw_nolcg() -> None:
+    """metaWRAP's `-a` is the @SQ-reordered assembly, never the raw noLCG.
+
+    Fail-closed: the whole fix is inert if metaWRAP is handed `${NOLCG}` (numeric
+    order) instead of `${ORDERED_NOLCG}`. Assert the single `metawrap binning`
+    invocation carries the reordered file and not the raw one.
+    """
+    binning_call = [ln for ln in _code_lines(_BINNING_SH) if "metawrap binning" in ln]
+    assert len(binning_call) == 1, f"expected one `metawrap binning`, got {binning_call!r}"
+    call = binning_call[0]
+    assert "ORDERED_NOLCG" in call, (
+        f"`metawrap binning` no longer receives the reordered assembly: {call!r}. "
+        "Handing it ${NOLCG} (hifiasm's numeric order) puts the assembly out of "
+        "step with jgi's @SQ-ordered depth matrix and metabat2 aborts."
+    )
+    assert re.search(r'-a\s+"\$\{NOLCG\}"', call) is None, (
+        f"`metawrap binning` is passed the raw ${{NOLCG}} on its `-a`: {call!r}. "
+        "That is the numeric-order assembly the reorder exists to replace."
+    )
+
+
+def test_binning_fails_loud_on_contig_set_drift() -> None:
+    """The reorder asserts the @SQ set equals noLCG's, rather than silently
+    dropping or inventing contigs.
+
+    assembly_coverage maps to noLCG, so the sets are equal by construction; an
+    inequality is a real upstream bug. A silent reorder that dropped contigs would
+    bin an incomplete assembly.
+    """
+    code = "\n".join(_code_lines(_BINNING_SH))
+    assert "n_ordered" in code and "n_nolcg" in code, (
+        "binning.sh no longer compares the reordered contig count against noLCG's. "
+        "A dropped or extra contig from an @SQ/noLCG set mismatch would slip "
+        "through silently."
+    )
+    assert re.search(r'"\$\{n_ordered\}"\s*-ne\s*"\$\{n_nolcg\}"', code), (
+        "the contig-count equality guard changed shape -- it must still fail the "
+        "step when the reordered assembly and noLCG disagree on contig count."
+    )
+
+
+def test_binning_image_installs_libgfortran_for_concoct() -> None:
+    """concoct's `vbgmm` links libgfortran.so.3, which the metawrap solve omits.
+
+    The env ships only libgfortran.so.5, so `import vbgmm` fails at runtime with an
+    ImportError and metaWRAP's concoct binner dies — failing the whole step, even
+    though metabat2 + maxbin2 succeed. binning.def must install libgfortran=3.0.0
+    (provides .so.3, coexists with libgfortran5), and binning-verify.sh must assert
+    the import at build time — the plain runnability check can't catch it, because
+    the failure is a Python ImportError (exit 1), not a loader verdict (126/127).
+    Probed on a real assembly: the install takes `import vbgmm` from ImportError to
+    OK and concoct runs to completion.
+    """
+    defsrc = "\n".join(_code_lines(_BINNING_DEF))
+    assert re.search(r"micromamba install\b[^\n]*\blibgfortran=3", defsrc), (
+        "binning.def no longer installs libgfortran=3 into the metawrap env. "
+        "Without libgfortran.so.3, concoct's vbgmm ImportErrors at runtime and "
+        "metaWRAP fails the binning step."
+    )
+    verify = "\n".join(_code_lines(_BINNING_VERIFY))
+    assert "import vbgmm" in verify, (
+        "binning-verify.sh no longer asserts `import vbgmm`. The tool-runnability "
+        "loop cannot catch this failure (it's a Python ImportError, exit 1, not a "
+        "loader 126/127), so without this assertion a concoct-broken image ships "
+        "green — which is exactly how it shipped once."
+    )
+
+
+def test_bin_refine_passes_write_bins_as_a_bare_flag() -> None:
+    """DAS_Tool's `--write_bins` is boolean; a trailing value crashes r-docopt.
+
+    bin_refine.sh once passed `--write_bins 1`; the spurious `1` is an unexpected
+    positional that r-docopt 0.7.2 renders as `'short' is not a valid field or
+    method name for reference class "Argument"` and Execution-halts BEFORE DAS_Tool
+    runs — a real crash the step then fails loud on, having reached bin_refine for
+    the first time only after binning was fixed. qp-pacbio passes it bare; probed
+    on das_tool 1.1.7 / r-docopt 0.7.2, the bare form parses and the `1` form
+    crashes.
+    """
+    call = [ln for ln in _code_lines(_BIN_REFINE_SH) if "DAS_Tool" in ln and "--write_bins" in ln]
+    assert call, "bin_refine.sh no longer invokes DAS_Tool with --write_bins"
+    joined = "\n".join(call)
+    # A redirect / next flag after --write_bins is fine; an alphanumeric token
+    # (the `1`) is the bug.
+    assert not re.search(r"--write_bins\s+[0-9A-Za-z]", joined), (
+        f"bin_refine.sh passes a value to the boolean --write_bins flag: {joined!r}. "
+        "A trailing token (e.g. `--write_bins 1`) is an unexpected positional that "
+        "r-docopt renders as the 'short is not a valid field' crash. Pass it bare."
+    )
+
+
+def test_bin_refine_image_pins_das_tool() -> None:
+    """das_tool is pinned to 1.1.x, matching the summary-columns invariant.
+
+    bin_refine.sh + assembly_load depend on DAS_Tool 1.1.x's summary columns, and
+    the dastool image rebuilds on any bin_refine.sh change — an unpinned create
+    line lets the solve drift off that invariant on a routine rebuild.
+    """
+    create = next(
+        (
+            ln
+            for ln in _code_lines(_BIN_REFINE_DEF)
+            if "micromamba create" in ln and "dastool" in ln
+        ),
+        None,
+    )
+    assert create is not None, "bin_refine.def no longer creates the dastool env"
+    assert re.search(r"\bdas_tool=1\.1", create), (
+        f"das_tool is unpinned or off 1.1.x on bin_refine.def's create line: {create!r}."
+    )
+
+
+def test_checkm_shortens_tmpdir_for_the_afunix_socket() -> None:
+    """CheckM's multiprocessing.Manager binds an AF_UNIX socket under $TMPDIR.
+
+    The SLURM payload sets TMPDIR=<workspace>/tmp (~85 chars, on real disk so temp
+    doesn't fill the tiny --containall /tmp tmpfs), and Python appends
+    `/pymp-XXXXXXXX/listener-XXXXXXXX` — overflowing the ~108-char AF_UNIX sun_path
+    limit, so lineage_wf dies with `OSError: AF_UNIX path too long` on EVERY run.
+    checkm.sh must repoint TMPDIR at a SHORT /tmp path symlinked into WORK before
+    running checkm. Reproduced on the real ticket; the short symlink clears it.
+    """
+    code = _code_lines(_CHECKM_SH)
+    joined = "\n".join(code)
+    assert any(ln.startswith("export TMPDIR=") for ln in code), (
+        "checkm.sh no longer repoints TMPDIR — CheckM's mp.Manager AF_UNIX socket "
+        "path overflows under the payload's long workspace TMPDIR."
+    )
+    assert re.search(r"/tmp/ck", joined), (
+        "checkm.sh's short-TMPDIR target is not a /tmp-rooted path; a long TMPDIR "
+        "overflows the ~108-char AF_UNIX sun_path limit."
+    )
+    assert re.search(r'\bln -s\S*\s+"\$\{WORK\}"', joined), (
+        "the short TMPDIR is not symlinked to WORK — CheckM's temp would land on "
+        "the tiny tmpfs /tmp instead of real disk."
     )
 
 
