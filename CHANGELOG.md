@@ -769,7 +769,8 @@ duplicates further down are historical strata; leave them where they are.
   documents neither as order-insensitive, so a mirror build changing that would have
   made the gate nondeterministic; it is now verified over all 120 permutations of a
   5-fragment CIGAR and recorded in `docs/duckdb-miint.md`.
-- **Long-read align blocks are tiled at 1M reads, not 10M (#TBD).** The align planner
+
+- **Long-read align blocks are tiled at 1M reads, not 10M (#389).** The align planner
   tiled every platform at `block_planner._BLOCK_TARGET_READS` (10M), a target sized on
   read COUNT because short-read work is count-bound. The sharded aligner's cost is
   driven by BYTES: each of the reference's ~1000 shards re-reads the block to pull its

@@ -69,7 +69,7 @@ _None yet._
   now sit at the ceiling, which deliberately forgoes cpu/mem escalation on retry
   (walltime still escalates, PT4H → PT8H).
 
-- (#perf/align-long-read-block-target) A **long-read** align plan (`pacbio_smrt` /
+- (#389) A **long-read** align plan (`pacbio_smrt` /
   `oxford_nanopore`) now tiles at **1M reads per block instead of 10M**, so it mints
   roughly **10× as many block tickets**, each ~1/10 the size. A 10M-read HiFi block
   spent longer than its own PT4H walltime just re-reading itself once per shard, so
