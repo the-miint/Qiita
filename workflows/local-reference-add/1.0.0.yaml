@@ -75,6 +75,7 @@ context_schema:
   # feature set from qiita.feature_genome, which mint-features populates only when
   # a genome map is supplied.
   if:
+    required: [shard_index]
     properties: {shard_index: {const: true}}
   then:
     required: [genome_map_path]
