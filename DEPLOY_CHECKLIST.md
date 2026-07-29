@@ -31,30 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- (#381) Confirm the synced `align 1.0.0` action carries the
-  raised `align_sharded` baseline. `actions sync` runs inside `activate.sh`, so this
-  only checks it took — if the row still reads `cpu: 4` / `mem_gb: 32`, align blocks
-  keep submitting at the old size and the change is a silent no-op:
-
-  ```bash
-  DATABASE_URL=$(sudo grep '^DATABASE_URL=' /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-)
-  sudo -u qiita-api psql "$DATABASE_URL" -Atc \
-    "SELECT s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s
-      WHERE action_id='align' AND version='1.0.0' AND s->>'name'='align_sharded';"
-  ```
-
-  Expect `cpu` 8 and `mem_gb` 64.
-
-- The rebuilt `long-read-assembly` assemble image can actually run a myloasm assembly end to end (#380): myloasm at the pinned 0.6.0 (the circular/linear split reads a header string probed against exactly that version), the splitter itself, a DuckDB matching the one the miint extension was staged with (DuckDB namespaces the staged dir by engine version, so a skew fails every myloasm ticket at LOAD), and `MIINT_EXTENSION_DIRECTORY` sitting where the step's `derived_inputs` bind expects it (`PATH_DERIVED/duckdb-ext` — it resolves RELATIVE to `PATH_DERIVED`, so a host that points it elsewhere binds a non-existent path). **The bind is unconditional, so a wrong path fails the assemble step for BOTH assemblers, `hifiasm_meta` included** — that check is not myloasm-only. The version pins are. Expect `ASSEMBLE_MYLOASM_OK`.
-  ```bash
-  sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
-  test "$MIINT_EXTENSION_DIRECTORY" = "${PATH_DERIVED%/}/duckdb-ext" || { echo "MIINT bind path mismatch: $MIINT_EXTENSION_DIRECTORY"; exit 1; }
-  cd /tmp && apptainer exec --no-home "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
-    bash -c "micromamba run -n myloasm myloasm --version | grep -Fxq \"myloasm 0.6.0\" \
-             && test -s /opt/qiita/myloasm_split.py \
-             && python3 -c \"import duckdb; print(duckdb.__version__)\" | grep -Fxq 1.5.4" \
-    && echo ASSEMBLE_MYLOASM_OK'
-  ```
+_None yet._
 
 ### 6. After the deploy verifies green
 
@@ -62,51 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#381) Each `align_sharded` step now requests **8 cpu / 64 GB**
-  (was 4 / 32) — unchanged `action_ceiling`, so nothing new is expressible, but this is
-  the first time the ceiling is requested by default. The SLURM partition align tickets
-  land on must be able to satisfy it, or blocks will pend instead of running. Both axes
-  now sit at the ceiling, which deliberately forgoes cpu/mem escalation on retry
-  (walltime still escalates, PT4H → PT8H).
-
-- (#389) A **long-read** align plan (`pacbio_smrt` /
-  `oxford_nanopore`) now tiles at **1M reads per block instead of 10M**, so it mints
-  roughly **10× as many block tickets**, each ~1/10 the size. A 10M-read HiFi block
-  spent longer than its own PT4H walltime just re-reading itself once per shard, so
-  those tickets could not finish. Illumina is unchanged at 10M. No host action and
-  nothing to re-sync — this is control-plane code, not a workflow YAML. What to expect
-  operationally: many more, much shorter align jobs per pool; concurrency is still
-  capped by `FANOUT_MAX_INFLIGHT` (tickets are minted `dispatch_held` and released by
-  the per-alignment throttle), so this raises queue depth, not the number running at
-  once.
-
-  **This applies to NEW plans only — it does not rescue an alignment already planned.**
-  Block ranges are persisted in `qiita.block_member`, so a long-read alignment planned
-  before this deploy keeps its 10M-read blocks, and redriving one still runs a ticket
-  that cannot finish. If a long-read alignment is stuck for this reason, DELETE it and
-  re-plan so it re-tiles at 1M; re-running the existing tickets will not help. Check
-  whether any exist before assuming this is moot:
-
-  ```bash
-  DATABASE_URL=$(sudo grep '^DATABASE_URL=' /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-)
-  sudo -u qiita-api psql "$DATABASE_URL" -Atc \
-    "SELECT t.alignment_idx, r.platform, t.block_idx,
-            sum(m.max_sequence_idx - m.min_sequence_idx + 1) AS block_reads
-       FROM qiita.work_ticket t
-       JOIN qiita.block_member m ON m.block_idx = t.block_idx
-       JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = m.prep_sample_idx
-       JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx
-       JOIN qiita.sequencing_run r ON r.idx = sp.sequencing_run_idx
-      WHERE t.alignment_idx IS NOT NULL
-        AND r.platform IN ('pacbio_smrt','oxford_nanopore')
-      GROUP BY t.alignment_idx, r.platform, t.block_idx
-      HAVING sum(m.max_sequence_idx - m.min_sequence_idx + 1) > 2000000;"
-  ```
-
-  Any row is a pre-deploy long-read block larger than the new target. Empty output (the
-  expected result today — no long-read alignment has been run) means nothing to do.
-
-- `long-read-assembly` 1.0.0 accepts `assembler: myloasm` from this deploy on — previously it exited 64 mid-step. The **default is unchanged** (`hifiasm_meta`), so no existing ticket changes behaviour; picking myloasm is an assay decision made per action context. The assemble SIF auto-rebuilds to add myloasm 0.6.0 (its own conda env) plus `python-duckdb`, so its build is slower than a routine no-op verify; it bind-mounts the **already-staged** miint extension read-only rather than carrying its own copy, so no extra staging step is needed and it stays byte-identical to the CP/CO/DP build. One standing consequence: the image's DuckDB is now in lockstep with the orchestrator's, so a future `uv lock` DuckDB bump must re-pin `assemble.def` — a unit test enforces it (#380).
+_None yet._
 
 ---
 
