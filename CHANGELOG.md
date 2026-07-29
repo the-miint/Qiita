@@ -23,7 +23,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **Study-scoped biosample and sequenced-sample metadata read + write —
-  `GET`/`PATCH /study/{study_idx}/{biosample|sequenced-sample}/{idx}[/metadata]` (#N).**
+  `GET`/`PATCH /study/{study_idx}/{biosample|sequenced-sample}/{idx}[/metadata]` (#386).**
   Four routes expose a study's view of a sample's metadata. The two GETs return the
   entity's core row plus its globally-linked metadata and this study's purely-local
   metadata (`StudyScopedBiosampleResponse` / `StudyScopedSequencedSampleResponse`);
@@ -38,7 +38,7 @@ duplicates further down are historical strata; leave them where they are.
   409, but a same-study rewrite is last-writer-wins. The biosample surface also
   returns the owner-biosample-id row on read while refusing to write it (422).
 - **Create a study-local biosample field — `POST /study/{study_idx}/biosample-field`
-  and `qiita biosample create-field` (#N).** Mints one
+  and `qiita biosample create-field` (#386).** Mints one
   `biosample_study_field` definition (no metadata value) in either mode: purely-local
   (supply `--data-type`, optional `--required`/`--terminology-idx`/`--tier-override`)
   or globally-linked (supply `--biosample-global-field-idx`, inheriting the type
@@ -287,7 +287,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **Metadata values can no longer be overwritten through a retired study link
-  (#N).** The non-retired-link invariant on `biosample_metadata` /
+  (#386).** The non-retired-link invariant on `biosample_metadata` /
   `prep_sample_metadata` was enforced only on INSERT, which was equivalent to
   guarding every write while metadata rows were insert-only. The new in-place
   upsert made an overwrite another way for new data to arrive, so a migration
@@ -766,7 +766,7 @@ duplicates further down are historical strata; leave them where they are.
   Defaults off, so existing callers are unaffected. Internally, one resolver
   now emits a single ordered list of resolved fields, and the pre-write
   resolution errors report the caller's field key namespace-neutrally. No env
-  var, migration, scope, route, or wire change. (#N)
+  var, migration, scope, route, or wire change. (#386)
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately
   minted below the ceiling), a scope-gated route 403s even though the role
@@ -1736,7 +1736,7 @@ _None yet._
   `prep_sample_metadata_one_value_per_global_field`, that one study may hold
   several study-local fields linked to the same global field (keyed by
   `display_name`), and that the per-`(entity, global field)` uniqueness must not
-  be tightened to per-study. Documentation and comments only; no behavior change. (#N)
+  be tightened to per-study. Documentation and comments only; no behavior change. (#386)
 - **Email notification on work-ticket terminal transitions.** When a work
   ticket reaches a terminal state (`completed` / `no_data` / `permanent`-failed),
   the control plane emails the originator. A new in-process asyncio sweeper
@@ -2399,14 +2399,14 @@ _None yet._
   upsert that resolves to a value the study already holds through a different
   study-local alias of the same global field no longer leaves behind the alias
   minted for the losing insert, and reports the study-local field the value is
-  attached to. No env var, migration, scope, route, or wire change. (#N)
+  attached to. No env var, migration, scope, route, or wire change. (#386)
 - **Sample-metadata writes extracted into one composer — no behavior change.**
   Factored the resolve-markers → validate → write-global → write-local sequence
   shared by the biosample and sequenced-prep-sample import composers into a
   single spec-parameterized `write_sample_metadata` helper, and routed both
   import composers through it. The self-contained composer is the reuse point
   for the forthcoming update-a-biosample's-metadata surface. No env var,
-  migration, scope, route, or wire change. (#N)
+  migration, scope, route, or wire change. (#386)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
   helper; split the orchestrator's all-nullable `StepHandle` into typed
@@ -2507,7 +2507,7 @@ _None yet._
   column naming a global field shadowed by a conflicting study-local field is
   rejected (`422`); and two columns resolving to the same global field are
   rejected (`422`). Enabled by a migration adding `UNIQUE(display_name)` to both
-  `biosample_global_field` and `prep_sample_global_field`. (#N)
+  `biosample_global_field` and `prep_sample_global_field`. (#386)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only

@@ -5003,10 +5003,12 @@ def test_biosample_create_field_required_boolean_optional(monkeypatch):
     ]
 
 
-def test_biosample_create_field_linked_with_data_type_exits_2(capsys):
+def test_biosample_create_field_linked_with_data_type_exits_2(capsys, monkeypatch):
     """A linked create that also passes an inherited attribute fails the
     model's mode-coupling validator and exits 2 without a POST."""
     from qiita_control_plane.cli.user import main
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
     with pytest.raises(SystemExit) as exc_info:
         main(
