@@ -475,14 +475,20 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
     assert rows == [(555, 10, 1, 100, None, 0, 1, 41, 60, "40=", None, 0)]
 
 
-def test_align_sharded_minimap2_aligner_gets_a_materialized_query(tmp_path, monkeypatch):
-    """minimap2 is handed a real TABLE holding the query, not the lazy Parquet view.
+@pytest.mark.parametrize("aligner", ["minimap2", "bowtie2"])
+def test_align_sharded_aligner_gets_a_materialized_query(tmp_path, monkeypatch, aligner):
+    """BOTH aligners are handed a real TABLE holding the query, not the lazy Parquet view.
 
-    Both sharded aligners re-read the query relation once per shard, and against a
-    Parquet-backed view that cost scales with read LENGTH (a scan decompresses whole
-    column chunks to yield any row) — which is why the long-read path pays for a copy.
-    Asserted on the relation KIND from DuckDB's catalog, not the name, and the copy is
-    checked to be FAITHFUL: same columns, same rows, in the query's own shape."""
+    Each sharded aligner re-reads the query relation once per shard, and against a
+    Parquet-backed view every one of those reads costs the block's whole sequence BYTES
+    (a scan decompresses entire column chunks to yield any row). That is why the copy is
+    unconditional: it pays for itself on the short-read block too, not just the long-read
+    one — an earlier revision materialized for minimap2 only, on a slope measured at 1M
+    reads and then applied to the 10M-read short-read block.
+
+    Asserted on the relation KIND from DuckDB's own catalog rather than the name, since
+    the name alone would not prove materialization, and the copy is checked FAITHFUL:
+    same columns, same rows, in the query's own shape."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     reads = [(10, 1, "ACGT", None), (10, 2, "TTGG", None), (20, 3, "GGCC", None)]
@@ -502,7 +508,7 @@ def test_align_sharded_minimap2_aligner_gets_a_materialized_query(tmp_path, monk
         # reads stream (see _stub_block_read_stream)
         reference_idx=42,
         alignment_idx=555,
-        aligner="minimap2",
+        aligner=aligner,
         router_index_path=router,
         shard_directory=shard_dir,
         work_ticket_idx=1,
@@ -519,22 +525,27 @@ def test_align_sharded_minimap2_aligner_gets_a_materialized_query(tmp_path, monk
     ]
 
 
-def test_align_sharded_bowtie2_aligner_gets_the_query_view(tmp_path, monkeypatch):
-    """bowtie2 (short reads) keeps the lazy VIEW — the per-shard re-read arithmetic over
-    ~160 bp reads does not pay for a copy of the block, so no table is created at all."""
+def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, monkeypatch):
+    """The materialized copy is for the ALIGNER only — the SE/PE probe and the routing
+    pass still read the VIEW, and the copy does not exist yet when they run.
+
+    Both would be actively worse off against a table: the probe is answered from the
+    Parquet's row-group statistics without touching the sequence columns, and rype
+    materializes its own corpus copy internally, so building ours first would hold two
+    copies of the block at once."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", "TTGG")])
     router, shard_dir = _make_indexes(tmp_path)
 
-    calls: list = []
-    _install_stubs(
-        align_sharded,
-        monkeypatch,
-        routing={1: ["0"]},
-        alignments={1: [_se_hit(100)]},
-        calls=calls,
-    )
+    routed_query_tables: list[str] = []
+
+    def _record_routing_relation(conn, router_index_path, query_table, dest_table, *, threshold):
+        routed_query_tables.append(query_table)
+        conn.execute(f"INSERT INTO {dest_table} VALUES (CAST(1 AS BIGINT), CAST('0' AS VARCHAR))")
+
+    _install_stubs(align_sharded, monkeypatch, routing={1: ["0"]}, alignments={1: [_se_hit(100)]})
+    monkeypatch.setattr(align_sharded, "_build_read_to_shard", _record_routing_relation)
     sql_log = _record_sql(align_sharded, monkeypatch)
 
     inputs = align_sharded.Inputs(
@@ -548,11 +559,12 @@ def test_align_sharded_bowtie2_aligner_gets_the_query_view(tmp_path, monkeypatch
     )
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    assert calls[0]["query_table"] == align_sharded._QUERY
-    assert calls[0]["query_kind"] == "VIEW"
-    assert not [
-        sql for sql in sql_log if f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}" in sql
-    ]
+    assert routed_query_tables == [align_sharded._QUERY]
+    probe = _sole_index(sql_log, "count(sequence2), count(*)", what="SE/PE probe")
+    created = _sole_index(
+        sql_log, f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}", what="materialize"
+    )
+    assert probe < created
 
 
 def test_align_sharded_materialized_query_lives_only_across_the_align(tmp_path, monkeypatch):
