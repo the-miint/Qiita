@@ -22,6 +22,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Two DuckDB memory behaviours job code reasons about are now pinned by test
+  (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
+  in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
+  `temp_directory` and succeeds** rather than failing (so a materialized relation that
+  does not fit is a performance problem, not an OOM), and `DROP TABLE` **returns the
+  table's bytes to the buffer manager immediately** rather than deferring the release
+  to connection close (so dropping a large intermediate mid-job does something). Both
+  were prose-only arguments in job comments before this.
 - **`long-read-assembly`: the `myloasm` assembler option is implemented (#380).**
   Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
   image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
@@ -739,6 +747,41 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`align_sharded` hands the aligner a materialized query relation instead of the lazy
+  Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
+  a block's sequences are re-read 1000 times at the current shard count. Against the
+  Parquet-backed view each of those reads pays for the block's whole sequence *bytes* — a
+  Parquet scan must decompress a whole column chunk to yield any row from it — while a
+  shard wants ~0.1% of the reads; against a materialized table DuckDB scans the narrow
+  `read_id` column and fetches sequences only for the rows the shard asked for. Measured
+  per shard (1000 shards, scattered membership, `threads=8`, warm): 20.0 ms view /
+  3.4 ms table at 1M × 160 bp, 169.0 ms / 27.2 ms at 10M × 160 bp, 330.5 ms / 40.0 ms
+  for a 10M paired-end block. Over 1000 shards that is 169 s → 27 s for a single-end
+  short-read block and 331 s → 40 s for the paired-end one; scaling the view along the
+  byte axis puts a 1M-read HiFi block (~15 GB) near 26 min against seconds. Building the
+  copy costs one Parquet scan — 22 ms at 1M reads, 241 ms at 10M.
+  **The two costs scale on different axes:** the view tracks total bytes (so read count
+  *and* read length), the table tracks reads-per-shard and is flat in read length. An
+  earlier revision of this change materialized for minimap2 only, on the strength of a
+  per-1000-bp/read slope measured at 1M reads and then applied to the 10M-read short-read
+  block — understating bowtie2's re-read by 10×. The copy is now unconditional, created
+  after routing has committed to an align (`rype_classify` holds its own resident copy of
+  the corpus while classifying, so building ours first would hold two), and dropped once
+  phase 1 is done with it. The win is contingent on the copy fitting in memory — ~15 GB
+  at the 1M long-read block target (#389), under ~1 GB for a short-read block, against a
+  ~57 GB resolved limit (#381) — and degrades rather than fails if it does not: DuckDB
+  spills it to the Lustre workspace and the per-shard fetches read spill files 1000
+  times, plausibly worse than the view. Raising a block's sequence bytes well above the
+  current targets needs this reconsidered, not just the target. Filed upstream as
+  duckdb-miint#184, with removal tracked at #392 and a row in
+  `docs/duckdb-miint.md` → Open upstream gaps; the overdue duckdb-miint#175 row (sharded
+  aligners pin subject ids to VARCHAR) is added there too. Also corrects three stale
+  claims this reasoning rests on — `align_sharded` said `bind_step_reads` "materializes
+  to a real table" (it binds a lazy `read_parquet` view), and `read_source` said a block
+  is tiled to 10M reads "regardless of platform" against a DuckDB "capped at 8 GB"
+  (long-read align blocks are 1M since #389, and align resolves its limit from the
+  allocation since #381), plus its "node-local scratch" description of the drain file (it
+  lands under `PATH_SCRATCH`, which is Lustre on the deploy).
 - **`align_sharded` streams the aligner into its output instead of buffering it three
   times (#385).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
   then a pooled-identity `WINDOW`, then a sorted `COPY` — three full buffers of the

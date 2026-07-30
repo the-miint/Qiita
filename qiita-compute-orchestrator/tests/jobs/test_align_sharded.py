@@ -11,6 +11,10 @@ assert the orchestration around them:
     construction; the tools handle the mode natively);
   - a SINGLE align call runs (the aligner is dispatched by `Inputs.aligner`, which
     the CP resolves from platform — minimap2 carries the `map-hifi` preset);
+  - minimap2 is handed a MATERIALIZED copy of the query relation and bowtie2 the lazy
+    view, and that copy exists only across the align (created after routing, dropped
+    before the phase-2 sort) — every other minimap2 case here runs through it, so the
+    output assertions double as proof the copy changes nothing but storage;
   - the aligner's SAM output is passed through, EXCEPT the raw VARCHAR
     `reference`/`mate_reference` (dropped — `feature_idx`/`mate_feature_idx`, cast
     from them, carry the identity), with `prep_sample_idx` (stamped PER ROW from the
@@ -35,6 +39,7 @@ returns NULL for a plain `M` CIGAR (it needs the =/X distinction).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 from pathlib import Path
 
@@ -170,8 +175,10 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
     where an `align_row` is the tuple `(flags, reference, position, stop_position,
     mapq, cigar, mate_reference, mate_position, template_length)` the align seam
     emits for each read present in the query (one row per mate for a PE read).
-    `calls` (optional list) records each align call's (aligner, query_columns,
-    preset); `captured` (optional dict) records the routing `threshold`.
+    `calls` (optional list) records each align call's aligner, preset, and — for the
+    relation it was handed — the name, the columns, the relation KIND (`BASE TABLE`
+    vs `VIEW`, so a test can tell the materialized minimap2 copy from the lazy view)
+    and its rows; `captured` (optional dict) records the routing `threshold`.
 
     The align seams return `(sql, params)` rather than materializing a relation, so
     these stubs return a SELECT over a typed VALUES list, semi-joined to the query
@@ -229,7 +236,25 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
         if calls is not None:
             conn = conn_box["conn"]
             cols = [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
-            calls.append({"aligner": aligner, "cols": cols, "preset": preset})
+            # The KIND of the relation the aligner was handed, read from DuckDB's own
+            # catalog rather than inferred from its name: `BASE TABLE` for the
+            # materialized minimap2 copy, `VIEW` for the lazy Parquet-backed query.
+            kind = conn.execute(
+                "SELECT table_type FROM information_schema.tables WHERE table_name = ?",
+                [query_table],
+            ).fetchone()
+            calls.append(
+                {
+                    "aligner": aligner,
+                    "cols": cols,
+                    "preset": preset,
+                    "query_table": query_table,
+                    "query_kind": None if kind is None else kind[0],
+                    "query_rows": conn.execute(
+                        f"SELECT * FROM {query_table} ORDER BY read_id"
+                    ).fetchall(),
+                }
+            )
         rows = []
         for rid, align_rows in alignments.items():
             for row in align_rows:
@@ -261,6 +286,49 @@ def _install_stubs(align_sharded, monkeypatch, *, routing, alignments, calls=Non
     monkeypatch.setattr(align_sharded, "_build_read_to_shard", fake_r2s)
     monkeypatch.setattr(align_sharded, "_align_minimap2_sharded_sql", fake_mm2)
     monkeypatch.setattr(align_sharded, "_align_bowtie2_sharded_sql", fake_bt2)
+
+
+def _record_sql(align_sharded, monkeypatch) -> list[str]:
+    """Record, in order, every SQL statement `execute()` runs on the job's connection.
+
+    For the LIFETIME assertions about the materialized minimap2 query relation — that
+    it is created only after routing has committed to an align, and dropped before the
+    phase-2 sort so the sort gets that memory back. Those are memory-lifetime
+    properties: they leave no trace in the output rows, so statement order is the only
+    thing that can pin them. The recorder WRAPS the real connection (it does not
+    replace it), so every statement still runs and the rest of the assertions in a
+    test hold as usual. Whitespace is normalized so a reflowed SQL string does not
+    break a match."""
+    real_open = align_sharded.open_miint_conn
+    log: list[str] = []
+
+    class _Recorder:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            log.append(" ".join(sql.split()))
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @contextlib.contextmanager
+    def _wrapped(*args, **kwargs):
+        with real_open(*args, **kwargs) as conn:
+            yield _Recorder(conn)
+
+    monkeypatch.setattr(align_sharded, "open_miint_conn", _wrapped)
+    return log
+
+
+def _sole_index(log: list[str], needle: str, *, what: str) -> int:
+    """The index of the ONE recorded statement containing `needle`. Fails loudly on
+    zero or multiple matches, so an ordering assertion can never pass by matching the
+    wrong statement."""
+    hits = [i for i, sql in enumerate(log) if needle in sql]
+    assert len(hits) == 1, f"expected exactly one {what} statement, found {len(hits)}"
+    return hits[0]
 
 
 def _sql_literal(value) -> str:
@@ -405,6 +473,169 @@ def test_align_sharded_dispatch_bowtie2(tmp_path, monkeypatch):
     assert calls[0]["preset"] is None
     _cols, rows = _read_alignment(Path(out["alignment"]))
     assert rows == [(555, 10, 1, 100, None, 0, 1, 41, 60, "40=", None, 0)]
+
+
+@pytest.mark.parametrize("aligner", ["minimap2", "bowtie2"])
+def test_align_sharded_aligner_gets_a_materialized_query(tmp_path, monkeypatch, aligner):
+    """BOTH aligners are handed a real TABLE holding the query, not the lazy Parquet view.
+
+    Each sharded aligner re-reads the query relation once per shard, and against a
+    Parquet-backed view every one of those reads costs the block's whole sequence BYTES
+    (a scan decompresses entire column chunks to yield any row). That is why the copy is
+    unconditional: it pays for itself on the short-read block too, not just the long-read
+    one — an earlier revision materialized for minimap2 only, on a slope measured at 1M
+    reads and then applied to the 10M-read short-read block.
+
+    Asserted on the relation KIND from DuckDB's own catalog rather than the name, since
+    the name alone would not prove materialization, and the copy is checked FAITHFUL:
+    same columns, same rows, in the query's own shape."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    reads = [(10, 1, "ACGT", None), (10, 2, "TTGG", None), (20, 3, "GGCC", None)]
+    _write_reads_parquet(tmp_path / "reads.parquet", reads)
+    router, shard_dir = _make_indexes(tmp_path)
+
+    calls: list = []
+    _install_stubs(
+        align_sharded,
+        monkeypatch,
+        routing={1: ["0"], 2: ["0"], 3: ["1"]},
+        alignments={1: [_se_hit(100)]},
+        calls=calls,
+    )
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner=aligner,
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+
+    assert calls[0]["query_table"] == align_sharded._QUERY_MATERIALIZED
+    assert calls[0]["query_kind"] == "BASE TABLE"
+    # Faithful copy: the query's columns, and every read — the materialization is a
+    # storage change only, it must not filter or reshape the query.
+    assert calls[0]["cols"] == ["read_id", "sequence1", "sequence2"]
+    assert calls[0]["query_rows"] == [
+        (sequence_idx, sequence1, sequence2) for _psi, sequence_idx, sequence1, sequence2 in reads
+    ]
+
+
+def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, monkeypatch):
+    """The materialized copy is for the ALIGNER only — the SE/PE probe and the routing
+    pass still read the VIEW, and the copy does not exist yet when they run.
+
+    Both would be actively worse off against a table: the probe is answered from the
+    Parquet's row-group statistics without touching the sequence columns, and rype
+    materializes its own corpus copy internally, so building ours first would hold two
+    copies of the block at once."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", "TTGG")])
+    router, shard_dir = _make_indexes(tmp_path)
+
+    routed_query_tables: list[str] = []
+
+    def _record_routing_relation(conn, router_index_path, query_table, dest_table, *, threshold):
+        routed_query_tables.append(query_table)
+        conn.execute(f"INSERT INTO {dest_table} VALUES (CAST(1 AS BIGINT), CAST('0' AS VARCHAR))")
+
+    _install_stubs(align_sharded, monkeypatch, routing={1: ["0"]}, alignments={1: [_se_hit(100)]})
+    monkeypatch.setattr(align_sharded, "_build_read_to_shard", _record_routing_relation)
+    sql_log = _record_sql(align_sharded, monkeypatch)
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="bowtie2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+
+    assert routed_query_tables == [align_sharded._QUERY]
+    probe = _sole_index(sql_log, "count(sequence2), count(*)", what="SE/PE probe")
+    created = _sole_index(
+        sql_log, f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}", what="materialize"
+    )
+    assert probe < created
+
+
+def test_align_sharded_materialized_query_lives_only_across_the_align(tmp_path, monkeypatch):
+    """The materialized query is created only once routing has committed to an align,
+    and dropped before the phase-2 sort.
+
+    Both ends are memory-lifetime properties invisible in the output: creating it
+    before the routing pass would hold a copy of the block's sequences while rype makes
+    its own internal one, and holding it past phase 1 would deny the sort that memory.
+    Statement order is the only thing that can pin either."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    router, shard_dir = _make_indexes(tmp_path)
+    _install_stubs(align_sharded, monkeypatch, routing={1: ["0"]}, alignments={1: [_se_hit(100)]})
+    sql_log = _record_sql(align_sharded, monkeypatch)
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+
+    routed_check = _sole_index(
+        sql_log, f"SELECT count(*) FROM {align_sharded._READ_TO_SHARD}", what="routed-count"
+    )
+    created = _sole_index(
+        sql_log, f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}", what="materialize"
+    )
+    # Phase 1 by its own projection, not by the staging filename — phase 2 names that
+    # file too (it reads what phase 1 wrote), and matching both would order nothing.
+    phase1 = _sole_index(sql_log, "AS alignment_idx, rm.prep_sample_idx", what="phase-1 COPY")
+    dropped = _sole_index(
+        sql_log, f"DROP TABLE IF EXISTS {align_sharded._QUERY_MATERIALIZED}", what="drop"
+    )
+    phase2 = _sole_index(sql_log, "ORDER BY alignment_idx", what="phase-2 sort")
+    assert routed_check < created < phase1 < dropped < phase2
+
+
+def test_align_sharded_no_routed_reads_skips_the_materialization(tmp_path, monkeypatch):
+    """A block whose reads route nowhere never pays for the copy: the aligner is not
+    called at all on that path, so materializing would buy nothing."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", None)])
+    router, shard_dir = _make_indexes(tmp_path)
+    _install_stubs(align_sharded, monkeypatch, routing={}, alignments={})
+    sql_log = _record_sql(align_sharded, monkeypatch)
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+
+    assert not [
+        sql for sql in sql_log if align_sharded._QUERY_MATERIALIZED in sql and "CREATE" in sql
+    ]
+    # Still the valid empty output the no-routed-reads path is supposed to write.
+    _cols, rows = _read_alignment(Path(out["alignment"]))
+    assert rows == []
 
 
 def test_align_sharded_cross_shard_multiplicity_no_dedup(tmp_path, monkeypatch):
