@@ -24,13 +24,19 @@ the same either way and the per-sample path can migrate later (or not) without
 touching a job.
 
 **Both branches end at the same lazy VIEW over a Parquet, and that is the point.**
-`qc` streams: its peak memory is flat in row count, and that property is
-load-bearing — materializing a whole block into the heap would reintroduce
-exactly the memory-scales-with-input shape that OOM-killed 24/26 samples on the
-first real PacBio run. A block is tiled to ~10M reads regardless of platform
-(`block_planner._BLOCK_TARGET_READS`) against a job DuckDB capped at 8 GB, so
-"it will fit" is not a safe assumption and "DuckDB will spill a base table" is
-not a behaviour this repo has probed.
+A view keeps a consumer's peak memory flat in row count, and that property is
+load-bearing — binding a whole block into the heap HERE would reintroduce exactly
+the memory-scales-with-input shape that OOM-killed 24/26 samples on the first real
+PacBio run, and it would impose it on every consumer, including the ones that only
+ever stream their reads once. Both the block size and the per-job DuckDB
+`memory_limit` are tuned per workflow (the align planner tiles long-read blocks
+smaller than short-read ones; each job resolves its own limit), so "it will fit"
+is not something this seam can assert on a consumer's behalf.
+
+A job that genuinely needs a MATERIALIZED relation therefore builds its own, off
+this view, narrowed to the columns it is about to use — under its own memory
+budget, and next to the operation whose cost model motivates it. This seam does
+not make that trade for anyone.
 
 So the stream branch does NOT hold the block in DuckDB. It drains the Flight
 reader exactly once with `COPY (SELECT * FROM <stream>) TO <workspace>/…parquet`
@@ -42,7 +48,9 @@ relation names on a SEPARATE connection where a registered stream relation is
 invisible (see docs/duckdb-miint.md) — a `read_parquet` view resolves there
 fine, which is exactly what these jobs did before this change.
 
-The spill file lives in the JOB'S OWN workspace, on node-local scratch, and is
+The spill file lives in the workspace the caller passes — the job's own scratch,
+which on the deploy is under `PATH_SCRATCH` (a SHARED filesystem, Lustre; a
+native step's `/tmp` is node-local but that is not where this lands) — and is
 deleted when the binding closes. It is not a step-to-step filepath handoff and
 does not reintroduce the shared-filesystem coupling this seam exists to remove:
 nothing outside this one job ever learns the path.

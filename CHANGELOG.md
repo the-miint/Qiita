@@ -22,6 +22,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Two DuckDB memory behaviours job code reasons about are now pinned by test
+  (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
+  in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
+  `temp_directory` and succeeds** rather than failing (so a materialized relation that
+  does not fit is a performance problem, not an OOM), and `DROP TABLE` **returns the
+  table's bytes to the buffer manager immediately** rather than deferring the release
+  to connection close (so dropping a large intermediate mid-job does something). Both
+  were prose-only arguments in job comments before this.
 - **`long-read-assembly`: the `myloasm` assembler option is implemented (#380).**
   Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
   image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
@@ -301,6 +309,19 @@ duplicates further down are historical strata; leave them where they are.
   before any network call, and an `if/then` conditional in both reference-add
   workflow schemas catches direct `POST /work-ticket` submissions that bypass
   the CLI. The existing `plan-shards` `N==0` guard is retained as backstop.
+- **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#393).**
+  `action_ceiling` was `32 cpu / 192 GB / PT16H`, byte-identical to the `assemble` step's
+  `baseline_resources` on every axis. A ceiling equal to the baseline silently disables
+  retry on that axis — the runner grows the floor and clamps to the ceiling, so the grown
+  value never exceeds the resolved one, which reads as saturation and fails the ticket
+  **permanently on attempt 0**. A single `assemble` OOM was therefore unrecoverable, dying
+  with `retry_count=0` and "escalation exhausted, not retrying" instead of retrying larger.
+  The ceiling is now `mem_gb: 500` / `walltime: P2D`; every step baseline is unchanged, so
+  ordinary tickets request exactly what they did before and only a *failing* step climbs.
+  Sizing is measured: hifiasm_meta's peak scales with thread count, and the 16-thread
+  reference for this assay peaked at 164.8 GiB across 26 samples with a slowest sample of
+  28h16m, while our 32-thread configuration peaked at 182.3 GiB on the *smallest* input and
+  exceeded 192 GiB on a mid-sized one. `cpu` stays 32 (nothing escalates it).
 - **Native/CLI venv refresh no longer skips qiita-common reinstall, closing a deploy gap that broke every native SLURM job (#332).**
   `redeploy.sh` steps 5 and 6 dropped the "prove it's current" skip that could fire
   incorrectly when an operator `git pull`ed manually first (redeploy's own pull was
@@ -746,6 +767,96 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`align_sharded` hands the aligner a materialized query relation instead of the lazy
+  Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
+  a block's sequences are re-read 1000 times at the current shard count. Against the
+  Parquet-backed view each of those reads pays for the block's whole sequence *bytes* — a
+  Parquet scan must decompress a whole column chunk to yield any row from it — while a
+  shard wants ~0.1% of the reads; against a materialized table DuckDB scans the narrow
+  `read_id` column and fetches sequences only for the rows the shard asked for. Measured
+  per shard (1000 shards, scattered membership, `threads=8`, warm): 20.0 ms view /
+  3.4 ms table at 1M × 160 bp, 169.0 ms / 27.2 ms at 10M × 160 bp, 330.5 ms / 40.0 ms
+  for a 10M paired-end block. Over 1000 shards that is 169 s → 27 s for a single-end
+  short-read block and 331 s → 40 s for the paired-end one; scaling the view along the
+  byte axis puts a 1M-read HiFi block (~15 GB) near 26 min against seconds. Building the
+  copy costs one Parquet scan — 22 ms at 1M reads, 241 ms at 10M.
+  **The two costs scale on different axes:** the view tracks total bytes (so read count
+  *and* read length), the table tracks reads-per-shard and is flat in read length. An
+  earlier revision of this change materialized for minimap2 only, on the strength of a
+  per-1000-bp/read slope measured at 1M reads and then applied to the 10M-read short-read
+  block — understating bowtie2's re-read by 10×. The copy is now unconditional, created
+  after routing has committed to an align (`rype_classify` holds its own resident copy of
+  the corpus while classifying, so building ours first would hold two), and dropped once
+  phase 1 is done with it. The win is contingent on the copy fitting in memory — ~15 GB
+  at the 1M long-read block target (#389), under ~1 GB for a short-read block, against a
+  ~57 GB resolved limit (#381) — and degrades rather than fails if it does not: DuckDB
+  spills it to the Lustre workspace and the per-shard fetches read spill files 1000
+  times, plausibly worse than the view. Raising a block's sequence bytes well above the
+  current targets needs this reconsidered, not just the target. Filed upstream as
+  duckdb-miint#184, with removal tracked at #392 and a row in
+  `docs/duckdb-miint.md` → Open upstream gaps; the overdue duckdb-miint#175 row (sharded
+  aligners pin subject ids to VARCHAR) is added there too. Also corrects three stale
+  claims this reasoning rests on — `align_sharded` said `bind_step_reads` "materializes
+  to a real table" (it binds a lazy `read_parquet` view), and `read_source` said a block
+  is tiled to 10M reads "regardless of platform" against a DuckDB "capped at 8 GB"
+  (long-read align blocks are 1M since #389, and align resolves its limit from the
+  allocation since #381), plus its "node-local scratch" description of the drain file (it
+  lands under `PATH_SCRATCH`, which is Lustre on the deploy).
+- **`align_sharded` streams the aligner into its output instead of buffering it three
+  times (#385).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
+  then a pooled-identity `WINDOW`, then a sorted `COPY` — three full buffers of the
+  alignment set, with the selective identity filter running *after* the first two
+  (`EXPLAIN`: `SEQ_SCAN → HASH_JOIN → WINDOW → FILTER → ORDER_BY → BATCH_COPY_TO_FILE`).
+  Both align seams now return `(sql, params)` rather than materializing a table, and
+  `execute()` runs two phases: phase 1 streams align → (single-end) filter →
+  `read_meta` join into a transient staging Parquet inside the DuckDB temp dir, and
+  phase 2 applies the pooled paired-end filter plus the single 6-column identifier
+  sort into `alignment.parquet`. Measured on a 20M-row SAM-shaped fixture at a 2 GB
+  `memory_limit`, with a deliberately non-selective filter so this is pipeline shape
+  alone: 12.0 s and ~4.9 GB spilled → 5.5 s and zero spill. The split is load-bearing
+  rather than cosmetic — `memory_limit` is a ceiling, not a reservation, so sorting in
+  the same statement as the aligner would hold the whole alignment set while the rype
+  router, per-shard indexes and GPL-boundary daemons are still resident. The identity
+  filter now branches on the BATCH SHAPE, not the aligner: the floors stay per-aligner
+  (0.99 bowtie2 / 0.90 minimap2, query coverage minimap2-only) but the pooling is
+  per-shape, and a single-end batch — whose pooled window was a partition of one row,
+  provably equal to a per-row predicate — now filters with a plain `WHERE` in phase 1.
+  A batch that MIXES single- and paired-end reads is rejected with the counts instead
+  of surfacing as bowtie2's opaque `gpl_boundary` bind error or, on minimap2, as a
+  silently mis-pooled filter — and that rejection now runs ahead of the routing pass,
+  so it cannot be skipped by a batch whose reads route nowhere (which previously exited
+  0 with an empty output) and does not pay for a `rype_classify` pass first. Also pins
+  a miint contract the paired-end gate silently depended on: `cigar_sequence_identity`
+  and `cigar_query_coverage` are permutation-invariant over a concatenated CIGAR, which
+  is what lets the pooled `string_agg(cigar, '')` window omit an `ORDER BY`. Upstream
+  documents neither as order-insensitive, so a mirror build changing that would have
+  made the gate nondeterministic; it is now verified over all 120 permutations of a
+  5-fragment CIGAR and recorded in `docs/duckdb-miint.md`.
+
+- **Long-read align blocks are tiled at 1M reads, not 10M (#389).** The align planner
+  tiled every platform at `block_planner._BLOCK_TARGET_READS` (10M), a target sized on
+  read COUNT because short-read work is count-bound. The sharded aligner's cost is
+  driven by BYTES: each of the reference's ~1000 shards re-reads the block to pull its
+  own routed subset, so a block's re-scan is `n_shards × block_bytes`. At ~15 kb/read a
+  10M-read HiFi block is ~150 GB, whose re-scan alone is ~4.5 h against the align
+  step's PT4H baseline — the ticket could not finish. `pacbio_smrt` and
+  `oxford_nanopore` now tile at 1M reads (~15 GB, ~27 min); `illumina` is unchanged at
+  10M. Both timings are *floors* — they assume a scan rate measured warm, on local
+  disk, with idle cores, where the real job reads Lustre while aligning — so the
+  decision rests on the ordering (10M cannot fit even ideally; 1M can be several times
+  worse than ideal and still fit), not the absolute numbers. Applies to NEW plans only:
+  block ranges are persisted, so an alignment planned before this lands keeps its
+  10M-read blocks and must be deleted and re-planned to re-tile. The target is resolved
+  from the run's platform beside the aligner (also
+  platform-derived, never a caller choice), via a new
+  `_BLOCK_TARGET_READS_BY_PLATFORM` whose keys are pinned equal to
+  `_ALIGNER_BY_PLATFORM`'s, so adding a platform forces an explicit block-size
+  decision rather than inheriting the short-read default. Note the total re-scan across
+  a sample's blocks is `n_shards × total_bytes` and therefore *invariant* to block
+  size — what block size controls is the per-JOB share, i.e. whether one ticket fits
+  its walltime. `block_planner._BLOCK_TARGET_READS` is deliberately untouched: read
+  masking has no 1000-shard fan-out, so 10M stays correct there.
 
 - **`align_sharded` gets the memory and cores it was allocated (#381).** The job
   hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached
