@@ -4840,3 +4840,139 @@ def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
         )
     assert exc.value.code == 1
     assert "no sample in this pool carries SynDNA" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# submit-align-pool
+# ---------------------------------------------------------------------------
+# A THIN client, like submit-block-mask-pool: sample selection, aligner choice,
+# reference readiness and block size are ALL resolved server-side, so the CLI does
+# no roster GET, no reference preflight, and no client-side validation beyond
+# argparse. It POSTs one AlignPlanRequest and renders the plan.
+
+
+def _run_submit_align_pool(*, run=3, pool=5, reference=16, mask=10, only_missing=False):
+    from qiita_control_plane.cli.user import main
+
+    argv = [
+        "submit-align-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+        "--reference-idx",
+        str(reference),
+        "--mask-idx",
+        str(mask),
+    ]
+    if only_missing:
+        argv += ["--only-missing"]
+    return main(argv)
+
+
+def _align_plan_body(**overrides):
+    body = {
+        "sequencing_run_idx": 3,
+        "sequenced_pool_idx": 5,
+        "reference_idx": 16,
+        "aligner": "minimap2",
+        "samples_planned": 26,
+        "samples_skipped_existing": 0,
+        "samples_skipped_no_mask": 0,
+        "samples_skipped_mask_incomplete": 0,
+        "samples_skipped_no_reads": 0,
+        "partitions": [],
+        "blocks": [
+            {"block_idx": 1, "work_ticket_idx": 10, "read_count": 1000000},
+            {"block_idx": 2, "work_ticket_idx": 11, "read_count": 451794},
+        ],
+        "blocks_created": 2,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_submit_align_pool_single_plan_call_passthrough(monkeypatch, capsys):
+    """Exactly ONE POST to the align-plan endpoint, carrying the reference + mask +
+    only_missing. No roster GET and no reference-readiness preflight: the server
+    owns both."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    rc = _run_submit_align_pool()
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("/sequencing-run/3/sequenced-pool/5/align-plan")
+    assert posts[0]["json"] == {"reference_idx": 16, "mask_idx": 10, "only_missing": False}
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+def test_submit_align_pool_only_missing_is_passed_through(monkeypatch, capsys):
+    """--only-missing rides the body (applied server-side), still one POST."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    assert _run_submit_align_pool(only_missing=True) == 0
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["json"] == {"reference_idx": 16, "mask_idx": 10, "only_missing": True}
+
+
+def test_submit_align_pool_summary_reports_the_block_read_count(monkeypatch, capsys):
+    """The stderr summary names the per-block read count.
+
+    This is the line that makes a mis-tiled plan visible at SUBMIT time: block size
+    is resolved server-side from the platform, so the response is the first place it
+    is observable. A short tail block renders as a min-max range, not a per-block
+    list, so a 46-block plan stays one readable line. JSON still goes to stdout.
+    """
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    assert _run_submit_align_pool() == 0
+    out = capsys.readouterr()
+    assert json.loads(out.out)["blocks_created"] == 2
+    assert "451794-1000000 reads" in out.err
+    assert "planned 26 sample(s) into 2 block(s)" in out.err
+    assert "minimap2" in out.err
+
+
+def test_submit_align_pool_summary_reports_skipped_samples(monkeypatch, capsys):
+    """Every skip reason reaches the summary — four separate counts in the body that
+    are easy to miss in raw JSON, and the difference between 'nothing to do' and
+    'named the wrong mask'."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (
+                202,
+                _align_plan_body(
+                    samples_planned=0,
+                    samples_skipped_mask_incomplete=4,
+                    samples_skipped_no_reads=1,
+                    blocks=[],
+                    blocks_created=0,
+                ),
+            )
+        ],
+    )
+    assert _run_submit_align_pool() == 0
+    err = capsys.readouterr().err
+    assert "4 masking-incomplete" in err
+    assert "1 no-reads" in err
+    # No blocks: the size is genuinely unknown rather than a misleading 0.
+    assert "unknown reads" in err
+
+
+def test_submit_align_pool_server_refusal_is_surfaced(monkeypatch, capsys):
+    """A 409 (already-gated pool / unsharded reference) is the server's to raise;
+    the CLI surfaces it as a non-zero exit rather than pre-empting it."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(409, {"detail": "samples already have an alignment gate"})],
+    )
+    assert _run_submit_align_pool() != 0

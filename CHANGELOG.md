@@ -22,6 +22,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita pool submit-align-pool`: a CLI for starting an alignment (closes #396).**
+  `align-plan` was the only pool-scale entrypoint with no client — the sole way to
+  align a pool was a hand-rolled `curl` with a hand-built JSON body, while its
+  sibling `submit-block-mask-pool` has had a CLI all along. Same thin-client shape:
+  sample selection, aligner choice, reference readiness and block size are all
+  resolved server-side, so it validates nothing the server owns and just POSTs.
+  Takes `--sequencing-run-idx`, `--sequenced-pool-idx`, `--reference-idx`,
+  `--mask-idx`, `--only-missing`. The stderr summary names the planned/skipped
+  breakdown **and the per-block read count** — block size is resolved server-side
+  from the platform, so the plan response is the first place it is observable, and a
+  pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
+  per block later.
+
 - **Two DuckDB memory behaviours job code reasons about are now pinned by test
   (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
   in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
@@ -371,6 +384,28 @@ duplicates further down are historical strata; leave them where they are.
   previously accepted without type or range checking; a malformed GFF handle
   (e.g. `gff_upload_idx: 0` or `gff_path: "rel/x"`) slipped through to a
   server-side failure. Both now reject at submission with a 422.
+- **Purging an alignment no longer re-types its block tickets as read-mask blocks (closes #394).**
+  `work_ticket.alignment_idx` is `ON DELETE SET NULL`, and `alignment_idx IS NULL`
+  was also the discriminator for "this block ticket is a read-mask block". So
+  `DELETE /alignment-definition` turned every align block ticket of that alignment
+  into an apparent read-mask block of the `mask_idx` it still carried. A `failed`
+  one then landed in `read_mask_block_cohort(mask_idx)`, where the pump's fail-stop
+  releases nothing — silently halting **all** future block-mask fan-out for that
+  mask, a fleet-wide config hash, in a subsystem the operator was not touching. It
+  also defeated the align-block exclusion in `has_incomplete_covering_block`, whose
+  docstring already named this exact wedge as the thing it was written to prevent.
+  Block kind is now read from `action_id`, which is NOT NULL and which no FK action
+  can clear, at all four sites (`read_mask_block_cohort`, `cohort_for_ticket_row`,
+  `held_cohorts`, `has_incomplete_covering_block`). Same conclusion
+  `block_read.resolve_block_read_scope` already reached from the other direction, for
+  a sharper reason — trusting the nulled column there would stream raw,
+  non-host-depleted reads into an aligner. The two block action ids join
+  `READ_MASK_ACTION_ID` / `BCL_CONVERT_ACTION_ID` in `qiita_common.actions` as bare
+  ids; each submitter still pins its own version. Deliberately version-agnostic: a
+  cohort and a finalize gate must span every in-flight version of an action, so
+  filtering those on version would split one cohort's concurrency accounting across a
+  routine bump. **The fix is retroactive**: existing detached tickets stop
+  contaminating their mask cohort as soon as this deploys, with no cleanup.
 - **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#393).**
   `action_ceiling` was `32 cpu / 192 GB / PT16H`, byte-identical to the `assemble` step's
   `baseline_resources` on every axis. A ceiling equal to the baseline silently disables

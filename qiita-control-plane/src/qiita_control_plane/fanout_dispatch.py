@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
+from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
 
 _log = logging.getLogger(__name__)
 
@@ -108,23 +109,37 @@ def shard_cohort(reference_idx: int) -> FanoutCohort:
 
 def read_mask_block_cohort(mask_idx: int) -> FanoutCohort:
     """The bulk read-mask block children of one mask partition. Discriminated
-    from align blocks by ``alignment_idx IS NULL`` (a read-mask block carries no
-    alignment)."""
+    from align blocks by ``action_id`` — NOT by ``alignment_idx IS NULL``, which a
+    purge of the alignment produces from an align ticket (see
+    `qiita_common.actions`)."""
     return FanoutCohort(
         label=f"read_mask_block(mask_idx={mask_idx})",
-        where_sql="mask_idx = $1 AND block_idx IS NOT NULL AND alignment_idx IS NULL",
-        args=(mask_idx,),
+        where_sql="mask_idx = $1 AND block_idx IS NOT NULL AND action_id = $2",
+        args=(mask_idx, BLOCK_MASK_ACTION_ID),
         lock_class=_LOCK_CLASS_READ_MASK_BLOCK,
         lock_key=mask_idx & _INT4_MASK,
     )
 
 
 def align_block_cohort(alignment_idx: int) -> FanoutCohort:
-    """The bulk sharded-alignment block children of one alignment."""
+    """The bulk sharded-alignment block children of one alignment.
+
+    ``alignment_idx`` is already unambiguous (only an align block sets it, and a
+    purge NULLs it, so a purged ticket drops out either way) — unlike ``mask_idx``,
+    which both block kinds carry. The ``action_id`` test is here because a cohort
+    is a throttle over ONE workflow's fan-out, so scoping it to that workflow is
+    what the cohort means, not because the idx needs disambiguating.
+
+    **If a second action ever sets `alignment_idx`, these two diverge.** This
+    cohort would exclude its tickets from the in-flight cap while
+    `repositories.block.has_incomplete_covering_alignment_block` — deliberately
+    un-filtered, since any covering block counts toward a sample's completion —
+    would still count them. Throttling less than you gate on is the wrong way
+    round: revisit both together, don't add the filter to only one."""
     return FanoutCohort(
         label=f"align_block(alignment_idx={alignment_idx})",
-        where_sql="alignment_idx = $1 AND block_idx IS NOT NULL",
-        args=(alignment_idx,),
+        where_sql="alignment_idx = $1 AND block_idx IS NOT NULL AND action_id = $2",
+        args=(alignment_idx, ALIGN_ACTION_ID),
         lock_class=_LOCK_CLASS_ALIGN_BLOCK,
         lock_key=alignment_idx & _INT4_MASK,
     )
@@ -134,23 +149,30 @@ def cohort_for_ticket_row(row: asyncpg.Record | dict[str, Any]) -> FanoutCohort 
     """Derive the fan-out cohort of a work_ticket from its discriminating
     columns, or None if the ticket is not a fan-out child. The row must carry
     ``reference_idx``, ``shard_id``, ``block_idx``, ``mask_idx``,
-    ``alignment_idx``. The order matches the three fan-out INSERT shapes:
+    ``alignment_idx``, ``action_id``. The order matches the three fan-out INSERT
+    shapes:
 
       * shard build  → reference_idx scope + shard_id set;
-      * align block  → block_idx set + alignment_idx set;
-      * read-mask block → block_idx set + mask_idx set (alignment_idx NULL).
+      * align block  → block_idx set + the align action;
+      * read-mask block → block_idx set + the read-mask-block action.
+
+    A block ticket is routed by its ACTION, not by whether ``alignment_idx`` is
+    set: purging an alignment NULLs that column, which would otherwise route the
+    align ticket into the read-mask cohort of the ``mask_idx`` it still carries
+    (see `block_action`). A block ticket whose action is neither — or which is
+    missing the idx its cohort is keyed by — is not a fan-out child.
     """
     if row["shard_id"] is not None and row["reference_idx"] is not None:
         return shard_cohort(row["reference_idx"])
     if row["block_idx"] is not None:
-        if row["alignment_idx"] is not None:
+        if row["action_id"] == ALIGN_ACTION_ID and row["alignment_idx"] is not None:
             return align_block_cohort(row["alignment_idx"])
-        if row["mask_idx"] is not None:
+        if row["action_id"] == BLOCK_MASK_ACTION_ID and row["mask_idx"] is not None:
             return read_mask_block_cohort(row["mask_idx"])
     return None
 
 
-_TICKET_COHORT_COLUMNS = "reference_idx, shard_id, block_idx, mask_idx, alignment_idx"
+_TICKET_COHORT_COLUMNS = "reference_idx, shard_id, block_idx, mask_idx, alignment_idx, action_id"
 
 
 async def cohort_for_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> FanoutCohort | None:
@@ -254,15 +276,21 @@ async def held_cohorts(pool: asyncpg.Pool) -> list[FanoutCohort]:
         " WHERE dispatch_held AND shard_id IS NOT NULL AND reference_idx IS NOT NULL"
     ):
         cohorts.append(shard_cohort(row["reference_idx"]))
+    # Both block scans key on action_id, not on whether alignment_idx is set — a
+    # purged align ticket keeps its mask_idx and would otherwise be re-pumped here
+    # as a read-mask block (see `block_action`).
     for row in await pool.fetch(
         "SELECT DISTINCT mask_idx FROM qiita.work_ticket"
-        " WHERE dispatch_held AND block_idx IS NOT NULL AND alignment_idx IS NULL"
-        "   AND mask_idx IS NOT NULL"
+        " WHERE dispatch_held AND block_idx IS NOT NULL AND action_id = $1"
+        "   AND mask_idx IS NOT NULL",
+        BLOCK_MASK_ACTION_ID,
     ):
         cohorts.append(read_mask_block_cohort(row["mask_idx"]))
     for row in await pool.fetch(
         "SELECT DISTINCT alignment_idx FROM qiita.work_ticket"
-        " WHERE dispatch_held AND block_idx IS NOT NULL AND alignment_idx IS NOT NULL"
+        " WHERE dispatch_held AND block_idx IS NOT NULL AND action_id = $1"
+        "   AND alignment_idx IS NOT NULL",
+        ALIGN_ACTION_ID,
     ):
         cohorts.append(align_block_cohort(row["alignment_idx"]))
     return cohorts
