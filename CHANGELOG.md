@@ -301,6 +301,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#fix/long-read-assembly-action-ceiling-headroom).**
+  `action_ceiling` was `32 cpu / 192 GB / PT16H`, byte-identical to the `assemble` step's
+  `baseline_resources` on every axis. A ceiling equal to the baseline silently disables
+  retry on that axis — the runner grows the floor and clamps to the ceiling, so the grown
+  value never exceeds the resolved one, which reads as saturation and fails the ticket
+  **permanently on attempt 0**. A single `assemble` OOM was therefore unrecoverable, dying
+  with `retry_count=0` and "escalation exhausted, not retrying" instead of retrying larger.
+  The ceiling is now `mem_gb: 500` / `walltime: P2D`; every step baseline is unchanged, so
+  ordinary tickets request exactly what they did before and only a *failing* step climbs.
+  Sizing is measured: hifiasm_meta's peak scales with thread count, and the 16-thread
+  reference for this assay peaked at 164.8 GiB across 26 samples with a slowest sample of
+  28h16m, while our 32-thread configuration peaked at 182.3 GiB on the *smallest* input and
+  exceeded 192 GiB on a mid-sized one. `cpu` stays 32 (nothing escalates it).
 - **Native/CLI venv refresh no longer skips qiita-common reinstall, closing a deploy gap that broke every native SLURM job (#332).**
   `redeploy.sh` steps 5 and 6 dropped the "prove it's current" skip that could fire
   incorrectly when an operator `git pull`ed manually first (redeploy's own pull was
