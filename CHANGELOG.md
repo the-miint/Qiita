@@ -337,7 +337,25 @@ duplicates further down are historical strata; leave them where they are.
     `TERMINAL_WORK_TICKET_STATES` in `qiita-common`, derived the same
     name-the-terminal-side-and-complement-it way, so a new `StepProgressState`
     becomes adoptable only by an explicit edit.
-
+- **`docs/duckdb-miint.md` audited against a built extension; stale warnings that cost us work are gone (#401).**
+  Every claim re-verified against duckdb-miint `97a3fff`. All 84 functions the file
+  named still exist and nothing had been removed upstream — the damage was mirrored
+  upstream detail going stale, plus warnings for bugs since fixed. Removed advice that
+  was actively wrong: `alignment_slice` does **not** coerce `read_id` to VARCHAR (fixed
+  upstream in `e739376`, so the "cast back" advice would have broken the join it claimed
+  to fix); the GPL boundary hosts **only** bowtie2 + FastTree, so `merge_pairs_vsearch`,
+  `detect_chimera_uchime*`, `cluster_sequences_vsearch`, `search_sequences_vsearch`,
+  `align_mafft` and `align_sortmerna*` need no `install_gpl_boundary()`; and
+  `save_bowtie2_index` **does** require it, where the file said the opposite. Every
+  filename in the upstream docs map was dead after miint's 2026-07 docs reorg, and the
+  documented refresh script `curl -fsSL`'d all of them — silent 404s, exit 0 — which is
+  why the rot went unnoticed. The hand-maintained embedded-tool version table is
+  replaced by `miint_versions()` (it claimed WFA2-lib 2.3.5 against a 2.3.6 build), and
+  the file now leads with a catalog-first recipe: `duckdb_functions()` answers existence,
+  named params, overload arities and macro bodies, with COPY writers called out as the
+  one blind spot. Filed the-miint/duckdb-miint#186 (`read_gff` does not stop at
+  `##FASTA`) and #188 (QC bracket notation implies partial arg lists that don't exist);
+  signposts #196 (make miint's surface self-describing).
 - **`qiita reference load --shard-index` now requires `--genome-map`, failing fast instead of after a full ingest (#324).**
   Without a genome map, `plan-shards` derives zero genome-bearing features from
   `qiita.feature_genome` and fails with `N=0` ("reference … has no genome-bearing
