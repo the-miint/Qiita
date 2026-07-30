@@ -101,6 +101,68 @@ def _inputs(host_filter, **kw):
     return host_filter.Inputs(**base)
 
 
+@pytest.mark.parametrize(
+    ("sequence2", "rype_cols"),
+    [
+        (None, ["read_id", "sequence1"]),
+        ("ACGTACGTAC", ["read_id", "sequence1", "sequence2"]),
+    ],
+    ids=["single-end", "paired-end"],
+)
+def test_host_filter_rype_query_drops_an_all_null_mate(
+    tmp_path, monkeypatch, write_reads, sequence2, rype_cols
+):
+    """rype is handed `sequence1` ALONE when no read in the block carries a mate; minimap2
+    keeps both mates either way.
+
+    A batch-SIZING property with no effect on the mask, so only the COLUMN LIST can pin it.
+    miint reads rype's `is_paired` off the presence of a `sequence2` column and never off
+    its values (duckdb-miint#199), and rype then assumes a query twice as long and halves
+    its Arrow batch — and it reloads the whole index per batch, so an all-NULL mate column
+    doubles the host-index reloads.
+
+    Narrowing minimap2's query instead would be a correctness bug (it aligns pairs
+    natively), hence the second assertion. A MIXED batch keeps the column — see
+    `test_host_filter_marks_rype_union_minimap2`, whose read 40 is single-end among
+    paired ones."""
+    from qiita_compute_orchestrator.jobs import host_filter
+
+    reads = write_reads(tmp_path / "reads.parquet", [(10, "rA", "ACGTACGTAC", sequence2)])
+    qc_mask = _qc_mask(
+        tmp_path / "qc_mask.parquet", [(10, ReadMaskReason.PASS.value, sequence2 is not None)]
+    )
+
+    seen: dict = {}
+
+    def _cols(conn, relation):
+        return [d[0] for d in conn.execute(f"SELECT * FROM {relation} LIMIT 0").description]
+
+    def fake_rype(conn, index_path, sequence_table, dest_table, *, threshold):
+        seen["rype_cols"] = _cols(conn, sequence_table)
+
+    def fake_mm2(conn, index_path, query_table, dest_table, *, preset):
+        seen["mm2_cols"] = _cols(conn, query_table)
+
+    monkeypatch.setattr(host_filter, "_run_rype_classify", fake_rype)
+    monkeypatch.setattr(host_filter, "_run_align_minimap2", fake_mm2)
+
+    asyncio.run(
+        host_filter.execute(
+            _inputs(
+                host_filter,
+                reads=reads,
+                qc_mask=qc_mask,
+                host_rype_path=_ryxdi(tmp_path),
+                host_minimap2_path=_mmi(tmp_path),
+            ),
+            tmp_path / "ws",
+        )
+    )
+
+    assert seen["rype_cols"] == rype_cols
+    assert seen["mm2_cols"] == ["read_id", "sequence1", "sequence2"]
+
+
 def test_host_filter_marks_rype_union_minimap2(tmp_path, monkeypatch, write_reads):
     """host set = rype ∪ minimap2; minimap2 sees ONLY rype's survivors; host
     overrides pass; the mask schema + mask_idx/prep_sample_idx are stamped."""
