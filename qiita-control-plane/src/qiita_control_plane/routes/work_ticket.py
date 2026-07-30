@@ -106,9 +106,13 @@ _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 # not-applicable set is the COMPLEMENT of the applicable set, so a new
 # WorkTicketState defaults to REFUSED — the safe direction; listing the refused
 # states positively would silently make a new state runnable.
-# FAILED and CANCELLED both redrive in place (reset → PENDING + dispatch): they are
-# terminal with no in-flight job (a cancel scancelled it), so the same clean-restart
-# path applies. PENDING just (re)dispatches a lost create-time task.
+# FAILED and CANCELLED both redrive in place (reset → PENDING + dispatch), but they
+# differ in what they leave behind. A CANCELLED ticket has no in-flight job (the
+# cancel scancelled it). A FAILED one MAY still have one: an OOM-killed step
+# escalates and submits attempt N+1, so a ticket that then fails leaves that attempt
+# live with a real slurm_job_id. The redrive's step-row cleanup keys off exactly that
+# difference — see the DELETE in the redrive branch. PENDING just (re)dispatches a
+# lost create-time task.
 _RUN_APPLICABLE_STATES = frozenset(
     {
         WorkTicketState.PENDING.value,
@@ -1342,24 +1346,50 @@ async def run_work_ticket(
                     detail="work_ticket state changed under /run; retry",
                 )
 
-            # Drop every non-`completed` work_ticket_step row. The runner
-            # re-enters each not-yet-completed entry at attempt 0, but a prior
-            # FAILED run left terminal `failed` rows behind; re-using that
-            # attempt would collide (the step_progress writers reject any
-            # transition out of `failed`, and record_failed refuses
-            # failed→failed), wedging the redrive on the dead row. Dropping
-            # them lets the runner re-enter each entry fresh: finding the prior
-            # run's now-orphaned on-disk attempt dir, it advances past it to a
-            # fresh attempt dir (it can neither reuse the stale read-only output
-            # nor delete the SLURM-job-owned dir — see runner `_attempt_is_unowned`).
-            # `completed` rows are KEPT so the runner still fast-forwards
-            # already-finished entries.
-            # Safe because a FAILED ticket has no in-flight job — every step
-            # row is terminal, so this never races the resume-adoption path.
+            # Which prior progress rows survive the redrive. `completed` always
+            # survives, so the runner still fast-forwards finished entries.
+            #
+            # Of the rest, the question is whether the row still names a job
+            # worth adopting — `_adopt_or_submit` re-attaches by the persisted
+            # `slurm_job_id`, and the runner may only adopt a LIVE attempt.
+            #
+            #   * `failed` — always dropped. Re-using that attempt number would
+            #     collide (record_submitted rejects anything but submitting→,
+            #     and record_failed refuses failed→failed), wedging the redrive
+            #     on the dead row. Dropped, the runner re-enters the entry,
+            #     finds the orphaned on-disk attempt dir and advances past it to
+            #     a fresh one (it can neither reuse the stale read-only output
+            #     nor delete the SLURM-job-owned dir — see `_attempt_is_unowned`).
+            #   * in-flight WITH a job id — kept when redriving a FAILED ticket.
+            #     A FAILED ticket CAN have a live job: when a step OOM-kills, the
+            #     runner escalates and submits attempt N+1, so a ticket that then
+            #     fails leaves that attempt live with a real id. Dropping it
+            #     would strand the job outright — the CP forgets the id, nothing
+            #     polls it, and no later redrive can reclaim it.
+            #   * in-flight WITHOUT a job id (a `submitting` write-ahead row) —
+            #     dropped. Its only handle is the deterministic `job_name`, and
+            #     the find-by-name orphan closer that would use it runs solely
+            #     under `resume=True`; /run dispatches with resume=False, so a
+            #     kept row would fall through to a fresh submit writing into the
+            #     same attempt dir a possibly-live orphan is already using.
+            #     Dropping it restores the advance-to-a-fresh-dir guard.
+            #
+            # CANCELLED is the carve-out: cancel is terminal-flip-then-scancel,
+            # and the runner's abort path stops without recording the step row
+            # terminal — so a cancelled ticket keeps an in-flight row naming a
+            # job the reap already killed. Adopting that is the very bug this
+            # commit fixes, reached through a live row instead of a dead one, so
+            # a post-cancel redrive drops every non-completed row.
+            redrive_after_cancel = current_state == WorkTicketState.CANCELLED.value
             await conn.execute(
-                "DELETE FROM qiita.work_ticket_step WHERE work_ticket_idx = $1 AND state <> $2",
+                "DELETE FROM qiita.work_ticket_step"
+                " WHERE work_ticket_idx = $1"
+                "   AND state <> $2"
+                "   AND ($3::boolean OR state = $4 OR slurm_job_id IS NULL)",
                 work_ticket_idx,
                 StepProgressState.COMPLETED.value,
+                redrive_after_cancel,
+                StepProgressState.FAILED.value,
             )
 
             await _reset_failed_reference_scope_for_dispatch(

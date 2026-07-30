@@ -3730,6 +3730,12 @@ class FakeSlurmBackendClient:
         self.submit_calls = 0
         self.status_calls = 0
         self.result_calls = 0
+        # Handles the runner actually polled / verified. Which ATTEMPT a resume
+        # re-attached to is only observable here: the job id and output_path
+        # carried by the handle say whether recovery landed on the live attempt
+        # or on a dead one.
+        self.status_handles: list = []
+        self.result_handles: list = []
 
     async def submit_step(
         self,
@@ -3765,6 +3771,7 @@ class FakeSlurmBackendClient:
 
     async def status_step(self, handle):
         self.status_calls += 1
+        self.status_handles.append(handle)
         item = self.status_script.pop(0) if self.status_script else StepStatus.COMPLETED
         if isinstance(item, BackendFailure):
             raise item
@@ -3772,6 +3779,7 @@ class FakeSlurmBackendClient:
 
     async def result_step(self, handle, status):
         self.result_calls += 1
+        self.result_handles.append(handle)
         item = self.result_script.pop(0) if self.result_script else {}
         if isinstance(item, BackendFailure):
             raise item
@@ -4159,6 +4167,81 @@ async def test_resume_purged_job_without_output_fails(postgres_pool, slurm_ticke
     )
     assert row["state"] == "failed"
     assert row["failure_type"] == "permanent"
+
+
+async def _seed_failed_then_escalated_step(
+    pool, work_ticket_idx, *, step_name, dead_job_id, live_job_id, step_index=0
+):
+    """Seed the shape an OOM escalation leaves behind: attempt 0 terminal
+    (`failed`, OOM-killed) and attempt 1 live (`submitted`) with its own job id.
+
+    Unreachable before the action ceiling was raised above the step baseline —
+    an OOM-killed step used to fail permanently at attempt 0, so no step ever
+    had a second attempt."""
+    for attempt, job_id in ((0, dead_job_id), (1, live_job_id)):
+        await step_progress.record_submitting(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            step_name=step_name,
+            compute_target=ComputeTarget.SLURM,
+            job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+        )
+        await step_progress.record_submitted(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            slurm_job_id=job_id,
+        )
+    await step_progress.record_failed(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=0,
+        failure_kind=FailureKind.OOM_KILLED.value,
+        failure_reason="OUT_OF_MEMORY (simulated)",
+    )
+
+
+async def test_resume_skips_terminal_attempt_and_adopts_the_live_one(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """Restart recovery must resume at the LIVE attempt, not a dead one.
+
+    Regression test for the incident: `assemble` OOM-killed at attempt 0, the
+    runner escalated and submitted attempt 1, and a control-plane restart then
+    re-entered at attempt 0 (the per-invocation counter starts there). Its
+    `failed` row read as "owned", so the runner re-attached to the ENDED job;
+    slurmrestd had purged it, the poll loop's filesystem tiebreaker synthesized
+    COMPLETED, and result_step verified attempt-0's workspace — which has no
+    manifest precisely because that attempt failed. The ticket died with a
+    CONTRACT_VIOLATION while its live attempt-1 job sat queued, never adopted.
+
+    Pins the outcome by the job id and workspace the runner actually touched:
+    against the pre-fix code these assert attempt 0's job and dir."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_failed_then_escalated_step(
+        postgres_pool, slurm_ticket, step_name="compute", dead_job_id=903, live_job_id=904
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # Adopted, not resubmitted — the escalated job is the one already paid for.
+    assert backend.submit_calls == 0
+    # ...and it is attempt 1's job, not the dead attempt 0's.
+    assert [h.slurm_job_id for h in backend.status_handles] == [904]
+    # The workspace verified is attempt-1's; verifying attempt-0's is the bug.
+    assert backend.result_handles[0].output_path.endswith("attempt-1/output")
 
 
 async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):

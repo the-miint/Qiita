@@ -11,6 +11,7 @@ import asyncpg
 from qiita_common.actions import (
     ActionCeiling,
     FlatBaselineResources,
+    WorkflowAction,
     WorkflowStep,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
@@ -364,6 +365,31 @@ def _ceiling_exhausted_failure(
             f"step {event} at the action {axis} ceiling ({ceiling}); {axis} "
             f"escalation exhausted, not retrying. Raise the action {axis} ceiling "
             f"or shrink the input. Original: {cause.reason}"
+        ),
+    )
+
+
+def _terminal_attempts_exhausted_failure(
+    entry: WorkflowStep | WorkflowAction, *, retry_count: int, max_retries: int
+) -> BackendFailure:
+    """Build the permanent failure raised when restart recovery has skipped past
+    one or more already-terminal attempts and the ticket's retry budget is
+    spent.
+
+    The skip path reaches a FRESH submit without passing through the
+    `except BackendFailure` arm that normally enforces `max_retries`, so without
+    this the budget is silently bypassed: a process that recorded an attempt
+    `failed` and died before transitioning the ticket leaves it PROCESSING, and
+    every reconcile would buy another submit. Fail with the budget's own verdict
+    instead."""
+    return BackendFailure(
+        kind=FailureKind.UNKNOWN_PERMANENT,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name=entry.name,
+        reason=(
+            f"every prior attempt of step {entry.name!r} is terminal and the retry "
+            f"budget is spent ({retry_count}/{max_retries}); not submitting a fresh "
+            "attempt. Redrive with /run once the underlying cause is fixed."
         ),
     )
 
@@ -762,6 +788,13 @@ async def _adopt_or_submit(
     purged the job (no match), we fall through to a fresh submit."""
     rows = await step_progress.load_step_progress(pool, work_ticket_idx)
     existing = next((r for r in rows if r.step_index == step_index and r.attempt == attempt), None)
+    # Adoption assumes `attempt` names a LIVE attempt. It is the caller's job to
+    # have skipped any already-terminal one (`_attempt_is_terminal`) — adopting a
+    # terminal attempt re-attaches to a job that already ended, which the purged
+    # -job tiebreaker below then resolves from a workspace whose manifest is
+    # missing precisely because that attempt failed. Deliberately not re-checked
+    # here: this reads the CURRENT rows, and by now this run may have legitimately
+    # written its own terminal row for a prior attempt.
     if existing is not None and existing.slurm_job_id is not None:
         _log.info(
             "work_ticket %d step %r attempt %d already submitted as job %s; adopting",

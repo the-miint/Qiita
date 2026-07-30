@@ -55,6 +55,7 @@ from ._dispatch import (
     _fetch_plan_hint,
     _patch_resource_status,
     _shard_fanout_owns_finalize,
+    _terminal_attempts_exhausted_failure,
 )
 from ._feature_table import (
     GENOME_MAP_PATH_BINDING,
@@ -87,6 +88,7 @@ from ._read_ingest import (
     _workflow_needs_staged_reads,
 )
 from ._reconstruct import (
+    _attempt_is_terminal,
     _attempt_is_unowned,
     _completed_progress_row,
     _dispatch_action,
@@ -822,6 +824,10 @@ async def _run_entry_with_retry(
     # gaps like attempt-0 → attempt-3 for an entry that itself only
     # retried once.
     attempt = 0
+    # How many already-terminal attempts this invocation skipped past. Non-zero
+    # only on a resume/redrive, and it means the fresh submit below was never
+    # authorised by the retry budget — see the guard after the skip branches.
+    skipped_terminal_attempts = 0
     # Escalating memory floor: starts at the ticket's static override and is
     # raised on each OOM-killed retry (see the except arm below). Threaded into
     # every step dispatch in place of the static `mem_gb_override`.
@@ -842,6 +848,25 @@ async def _run_entry_with_retry(
         )
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
+        # Only a LIVE attempt is adoptable. `attempt` restarts at 0 on every
+        # invocation, so a restart-recovery resume of a step that failed at
+        # attempt N and escalated to N+1 lands back on N first — and
+        # `_attempt_is_unowned` (a row-EXISTS check) reports that dead row as
+        # owned. Advancing past it is what keeps `_adopt_or_submit` from
+        # re-attaching to a job that already ended. Checked before the
+        # orphan-dir branch and independently of whether the dir exists: a row
+        # is terminal whether or not its workspace survived.
+        if _attempt_is_terminal(prior_progress, step_index=index, attempt=attempt):
+            _log.info(
+                "work_ticket %d entry %r attempt %d: prior attempt already terminal; "
+                "advancing to the next attempt",
+                work_ticket_idx,
+                entry.name,
+                attempt,
+            )
+            attempt += 1
+            skipped_terminal_attempts += 1
+            continue
         # Skip past a stale attempt dir to a fresh one. This fires only when an
         # attempt dir already exists on disk but NO start-of-run progress row
         # owns this (step_index, attempt) — i.e. a re-run after the row was
@@ -851,10 +876,10 @@ async def _run_entry_with_retry(
         # reuse (it would trip the verifier or block the overwrite) nor delete —
         # a container step's output is owned by the SLURM job user, so the
         # control-plane process here can't unlink or chmod it. So advance to the
-        # next attempt dir, which this process creates fresh. A row PRESENT means
-        # resume-adoption owns the dir (see `_attempt_is_unowned`):
-        # `_adopt_or_submit` must re-attach to its live job and reuse the
-        # workspace, so we leave it and proceed.
+        # next attempt dir, which this process creates fresh. A row PRESENT and
+        # LIVE means resume-adoption owns the dir: `_adopt_or_submit` must
+        # re-attach to its job and reuse the workspace, so we leave it and
+        # proceed. (A present-but-terminal row was already skipped above.)
         if attempt_workspace.exists() and _attempt_is_unowned(
             prior_progress, step_index=index, attempt=attempt
         ):
@@ -867,6 +892,27 @@ async def _run_entry_with_retry(
             )
             attempt += 1
             continue
+        # Skipping dead attempts lands us on a FRESH submit, which the retry
+        # budget has not authorised: `max_retries` is enforced in the
+        # `except BackendFailure` arm below, and we never went through it. The
+        # gap is reachable when a prior process recorded the attempt `failed`
+        # and died before transitioning the ticket — reconcile then re-drives a
+        # still-PROCESSING ticket and would buy a free submit on every restart.
+        if skipped_terminal_attempts:
+            current_retry = await _retry_count(pool, work_ticket_idx)
+            if current_retry >= max_retries:
+                _log.warning(
+                    "work_ticket %d entry %r: %d prior attempt(s) already terminal and "
+                    "retry budget spent (%d/%d); not submitting a fresh attempt",
+                    work_ticket_idx,
+                    entry.name,
+                    skipped_terminal_attempts,
+                    current_retry,
+                    max_retries,
+                )
+                raise _terminal_attempts_exhausted_failure(
+                    entry, retry_count=current_retry, max_retries=max_retries
+                )
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):

@@ -30,11 +30,19 @@ from qiita_common.actions import (
     WorkflowStep,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import StepPlanResponse, StepType, WorkTicketFailureStage
+from qiita_common.models import (
+    LIVE_STEP_PROGRESS_STATES,
+    TERMINAL_STEP_PROGRESS_STATES,
+    StepPlanResponse,
+    StepProgressState,
+    StepType,
+    WorkTicketFailureStage,
+)
 
 from qiita_control_plane.runner import (
     _POLL_DB_READ_MAX_ATTEMPTS,
     WorkflowAborted,
+    _attempt_is_terminal,
     _attempt_is_unowned,
     _bind_step_inputs,
     _escalated_mem_floor_after_oom,
@@ -709,15 +717,20 @@ def test_bind_step_inputs_paths_and_scalar_params():
     assert out["instrument_model"] == "NextSeq 550"
 
 
+def _prow(step_index: int, attempt: int, state: StepProgressState | None = None):
+    """Minimal progress-row stand-in: these predicates read only these fields."""
+    return SimpleNamespace(step_index=step_index, attempt=attempt, state=state)
+
+
 def test_attempt_is_unowned():
     """Guard for the fresh-re-run attempt-dir advance. A pre-existing progress row
-    for this exact (step_index, attempt) means resume-adoption is in play (the
-    runner re-attaches to the live job and reuses its dir) — the attempt is owned,
-    leave it. No row means the attempt is unowned: a fresh re-run (e.g. a redrive
-    whose completed prep row was invalidated, or `/run` having dropped the failed
-    row), so any attempt dir on disk is orphaned and the runner advances past it
-    to a fresh one rather than deleting the SLURM-job-owned output."""
-    rows = [SimpleNamespace(step_index=0, attempt=0)]
+    for this exact (step_index, attempt) means a prior process owns the dir — the
+    attempt is owned, leave it. No row means the attempt is unowned: a fresh
+    re-run (e.g. a redrive whose completed prep row was invalidated, or `/run`
+    having dropped the dead row), so any attempt dir on disk is orphaned and the
+    runner advances past it to a fresh one rather than deleting the
+    SLURM-job-owned output."""
+    rows = [_prow(0, 0, StepProgressState.SUBMITTED)]
     # Pre-existing row for this exact (step_index, attempt) → adoption, owned.
     assert _attempt_is_unowned(rows, step_index=0, attempt=0) is False
     # No rows at all → fresh re-run, unowned.
@@ -726,6 +739,49 @@ def test_attempt_is_unowned():
     assert _attempt_is_unowned(rows, step_index=0, attempt=1) is True
     # A row for a different step → unrelated to this dir, unowned.
     assert _attempt_is_unowned(rows, step_index=1, attempt=0) is True
+
+
+def test_attempt_is_terminal_separates_dead_attempts_from_live_ones():
+    """Only a LIVE attempt is adoptable — the invariant that keeps restart
+    recovery off an ENDED job.
+
+    The end-to-end regression (resume landing on the live attempt) is pinned in
+    `test_runner.py::test_resume_skips_terminal_attempt_and_adopts_the_live_one`;
+    this covers the predicate's own edges."""
+    failed = [_prow(0, 0, StepProgressState.FAILED)]
+    assert _attempt_is_terminal(failed, step_index=0, attempt=0) is True
+    # The distinction that matters: `_attempt_is_unowned` alone reports the same
+    # dead row as OWNED, because it only asks whether a row exists.
+    assert _attempt_is_unowned(failed, step_index=0, attempt=0) is False
+
+    # `completed` is terminal too. Normally consumed by the step-level
+    # fast-forward before the attempt loop runs, so this arm is belt-and-braces
+    # rather than a path exercised in practice.
+    assert (
+        _attempt_is_terminal([_prow(0, 0, StepProgressState.COMPLETED)], step_index=0, attempt=0)
+        is True
+    )
+
+    # Live rows are NOT terminal — skipping one would strand a real SLURM job
+    # and resubmit work already paid for.
+    for live in LIVE_STEP_PROGRESS_STATES:
+        assert _attempt_is_terminal([_prow(0, 0, live)], step_index=0, attempt=0) is False
+
+    # No row at all → nothing terminal here (the orphan-dir path owns that case).
+    assert _attempt_is_terminal([], step_index=0, attempt=0) is False
+    # Scoping: a terminal row for another attempt or another step must not leak.
+    assert _attempt_is_terminal(failed, step_index=0, attempt=1) is False
+    assert _attempt_is_terminal(failed, step_index=1, attempt=0) is False
+
+
+def test_terminal_and_live_step_progress_states_partition_the_enum():
+    """The two sets are complements by construction — a new StepProgressState
+    lands in LIVE (and so becomes adoptable) only via an explicit edit to the
+    terminal tuple."""
+    assert set(TERMINAL_STEP_PROGRESS_STATES) | set(LIVE_STEP_PROGRESS_STATES) == set(
+        StepProgressState
+    )
+    assert not set(TERMINAL_STEP_PROGRESS_STATES) & set(LIVE_STEP_PROGRESS_STATES)
 
 
 # =============================================================================
