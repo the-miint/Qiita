@@ -301,6 +301,42 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
+  Establishes one invariant across the runner and the redrive route: **only a LIVE
+  attempt is adoptable.** Both defects below were latent until a step could have
+  more than one attempt — an OOM-killed step used to fail permanently at attempt 0,
+  so neither path was ever exercised. Together they killed three
+  `long-read-assembly` tickets whose `assemble` had OOM-escalated: each died with
+  `manifest.json missing (…/assemble/attempt-0/output/manifest.json)` while its
+  escalated attempt-1 job sat queued and untouched.
+  - **Resume adopted a terminated attempt.** The per-invocation `attempt` counter
+    restarts at 0, so a control-plane restart re-entered a step at attempt 0 even
+    when attempt 1 was live. `_attempt_is_unowned` only asks whether a row *exists*,
+    so a terminal `failed` row read as "owned" and the runner re-attached to the
+    ENDED job. slurmrestd had purged it, so the poll loop's filesystem tiebreaker
+    synthesized COMPLETED and verified the dead attempt's workspace — which has no
+    manifest precisely because that attempt failed — failing the ticket with a
+    CONTRACT_VIOLATION. A new `_attempt_is_terminal` predicate skips any attempt
+    already terminal, so recovery lands on the live one. Skipping now also consults
+    the retry budget, which the fresh-submit path would otherwise bypass (it never
+    passes through the `except BackendFailure` arm that enforces `max_retries`).
+  - **`/run` deleted in-flight progress rows.** The redrive dropped every
+    non-`completed` row, justified by "a FAILED ticket has no in-flight job" — no
+    longer true, since escalation can leave attempt N+1 `submitted` with a real
+    `slurm_job_id` while the ticket fails. Deleting that row orphaned the job
+    permanently (adoption re-attaches by exactly that persisted id). The redrive now
+    keeps a live row **when it names an adoptable job**: `completed` survives for
+    fast-forward, `failed` is always dropped, an in-flight row with a job id
+    survives a FAILED redrive, and two carve-outs still drop it — after a CANCEL
+    (whose reap already killed the job, so adopting it would reproduce the same
+    failure through a live row) and for a write-ahead `submitting` row with no
+    persisted id (whose find-by-name closer only runs under `resume=True`, so
+    keeping it would let a fresh submit collide with a possibly-live orphan in the
+    same attempt dir).
+  - `TERMINAL_STEP_PROGRESS_STATES` / `LIVE_STEP_PROGRESS_STATES` join
+    `TERMINAL_WORK_TICKET_STATES` in `qiita-common`, derived the same
+    name-the-terminal-side-and-complement-it way, so a new `StepProgressState`
+    becomes adoptable only by an explicit edit.
 - **`docs/duckdb-miint.md` audited against a built extension; stale warnings that cost us work are gone (#401).**
   Every claim re-verified against duckdb-miint `97a3fff`. All 84 functions the file
   named still exist and nothing had been removed upstream — the damage was mirrored

@@ -184,6 +184,7 @@ from ._read_ingest import (
     _write_shard_mapping_parquet,
 )
 from ._reconstruct import (
+    _attempt_is_terminal,
     _attempt_is_unowned,
     _completed_progress_row,
     _dispatch_action,
@@ -289,6 +290,7 @@ __all__: list[str] = [
     "_advance_completed_step_status",
     "_assert_within_ceiling",
     "_atomic_transition",
+    "_attempt_is_terminal",
     "_attempt_is_unowned",
     "_best_effort_record_failed",
     "_bind_step_inputs",

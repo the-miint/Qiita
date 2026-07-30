@@ -196,6 +196,27 @@ class StepProgressState(StrEnum):
     FAILED = "failed"
 
 
+# The terminal/live split of StepProgressState, defined once and imported
+# everywhere — the step-level twin of TERMINAL_WORK_TICKET_STATES above, and
+# derived the same direction (name the terminal side, derive its complement) so
+# a new state defaults to LIVE only by an explicit edit here.
+#
+# The distinction is load-bearing for restart recovery: a terminal attempt's job
+# has already ended, so re-attaching to its persisted `slurm_job_id` reaches a
+# job slurmrestd will eventually purge — which the poll loop's filesystem
+# tiebreaker then reads as "decide from the output manifest", failing the ticket
+# on a workspace that has no manifest precisely because that attempt failed.
+# Only a LIVE attempt is adoptable.
+TERMINAL_STEP_PROGRESS_STATES: tuple[StepProgressState, ...] = (
+    StepProgressState.COMPLETED,
+    StepProgressState.FAILED,
+)
+
+LIVE_STEP_PROGRESS_STATES: tuple[StepProgressState, ...] = tuple(
+    state for state in StepProgressState if state not in TERMINAL_STEP_PROGRESS_STATES
+)
+
+
 class WorkTicket(BaseModel):
     """Control-plane record of an action invocation.
 

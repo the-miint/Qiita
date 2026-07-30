@@ -213,7 +213,9 @@ from qiita_common.models.upload import (
 )
 from qiita_common.models.user import ORCID_PATTERN, UserCreate, UserResponse, UserUpdate
 from qiita_common.models.work_ticket import (
+    LIVE_STEP_PROGRESS_STATES,
     NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_STEP_PROGRESS_STATES,
     TERMINAL_WORK_TICKET_STATES,
     AlignPlanBlock,
     AlignPlanPartition,
@@ -414,7 +416,9 @@ __all__ = [
     "FailureType",
     "ProcessingKind",
     "ResourceOverride",
+    "LIVE_STEP_PROGRESS_STATES",
     "StepProgressState",
+    "TERMINAL_STEP_PROGRESS_STATES",
     "StepType",
     "WorkTicket",
     "WorkTicketCancelRequest",
