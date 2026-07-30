@@ -301,7 +301,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#fix/resume-adopts-stale-attempt).**
+- **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
   Establishes one invariant across the runner and the redrive route: **only a LIVE
   attempt is adoptable.** Both defects below were latent until a step could have
   more than one attempt — an OOM-killed step used to fail permanently at attempt 0,
