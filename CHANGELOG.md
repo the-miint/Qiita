@@ -301,7 +301,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#fix/long-read-assembly-action-ceiling-headroom).**
+- **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#393).**
   `action_ceiling` was `32 cpu / 192 GB / PT16H`, byte-identical to the `assemble` step's
   `baseline_resources` on every axis. A ceiling equal to the baseline silently disables
   retry on that axis — the runner grows the floor and clamps to the ceiling, so the grown

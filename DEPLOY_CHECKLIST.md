@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- (#fix/long-read-assembly-action-ceiling-headroom) Confirm the synced `long-read-assembly 1.0.0`
+- (#393) Confirm the synced `long-read-assembly 1.0.0`
   action carries the raised ceiling. `actions sync` runs inside `activate.sh`, so this only
   checks it took — if the row still reads `192|16:00:00`, an `assemble` OOM or timeout keeps
   failing permanently on attempt 0 (baseline == ceiling disables escalation) and the change is
@@ -56,7 +56,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#fix/long-read-assembly-action-ceiling-headroom) `long-read-assembly`'s `action_ceiling`
+- (#393) `long-read-assembly`'s `action_ceiling`
   rises to **500 GB / P2D** (from 192 GB / PT16H); the `assemble` **baseline is unchanged** at
   32 cpu / 192 GB / PT16H, so an ordinary ticket requests exactly what it does today and
   schedules the same. What changes is failure handling: a ceiling equal to the baseline made
