@@ -732,7 +732,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Build per-shard ANALYSIS aligner indexes (minimap2 + bowtie2) on a plain"
             " reference, plus the ONE whole-reference rype router: after ingest,"
             " plan-shards fans out one build per lineage-sorted shard (loading ->"
-            " indexing -> active). Requires --taxonomy; mutually exclusive with --host."
+            " indexing -> active). Requires --taxonomy and --genome-map; mutually"
+            " exclusive with --host."
         ),
     )
     # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local

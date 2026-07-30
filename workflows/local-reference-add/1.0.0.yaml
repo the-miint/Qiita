@@ -58,21 +58,30 @@ context_schema:
     minimap2_preset:
       type: string
       enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
-  # A sharded reference must build at least one per-shard index type (same
-  # backstop as reference-add). Fires only when shard_index is true AND both
-  # build_* are explicitly false. The whole-reference rype_router is always built.
-  not:
-    required: [shard_index, build_minimap2, build_bowtie2]
-    properties:
-      shard_index: {const: true}
-      build_minimap2: {const: false}
-      build_bowtie2: {const: false}
     # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
     # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
     # is minted its OWN feature_idx so it can key a feature table while reads align to
     # its parent. Contract + the closed->half-open coordinate conversion:
     # qiita_compute_orchestrator.jobs.hash_sequences.
     gff_path: {type: string, pattern: "^/"}
+  # A sharded reference must build at least one per-shard index type.
+  # The `required` list means this `not:` only fires when all three keys are
+  # present — an omitted `build_*` defaults ON via the build-shard-index steps'
+  # `when:`, so a partial selection (e.g. `build_minimap2: false` alone) is valid.
+  not:
+    required: [shard_index, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
+  # A sharded reference requires a genome map — plan-shards derives the per-shard
+  # feature set from qiita.feature_genome, which mint-features populates only when
+  # a genome map is supplied.
+  if:
+    required: [shard_index]
+    properties: {shard_index: {const: true}}
+  then:
+    required: [genome_map_path]
 
 success_status: active
 failure_status: failed

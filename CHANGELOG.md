@@ -301,6 +301,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`qiita reference load --shard-index` now requires `--genome-map`, failing fast instead of after a full ingest (#324).**
+  Without a genome map, `plan-shards` derives zero genome-bearing features from
+  `qiita.feature_genome` and fails with `N=0` ("reference … has no genome-bearing
+  features to shard") after hash → mint → load → register-files have all run —
+  observed in production on Web-of-Life 3 after an ~18h load. A CLI guard fires
+  before any network call, and an `if/then` conditional in both reference-add
+  workflow schemas catches direct `POST /work-ticket` submissions that bypass
+  the CLI. The existing `plan-shards` `N==0` guard is retained as backstop.
+- **`reference-add` / `local-reference-add` schemas now validate `gff_upload_idx` / `gff_path` (#324).**
+  Restructuring the `not:` block into an `if/then` for the `shard_index` guard
+  re-parented `gff_upload_idx` and `gff_path` from inert unknown keywords into
+  declared `properties`. With `additionalProperties` unset, the GFF keys were
+  previously accepted without type or range checking; a malformed GFF handle
+  (e.g. `gff_upload_idx: 0` or `gff_path: "rel/x"`) slipped through to a
+  server-side failure. Both now reject at submission with a 422.
 - **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#393).**
   `action_ceiling` was `32 cpu / 192 GB / PT16H`, byte-identical to the `assemble` step's
   `baseline_resources` on every axis. A ceiling equal to the baseline silently disables
