@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from qiita_control_plane.actions.context_validator import (
     SchemaError,
@@ -151,8 +152,6 @@ def _load_workflow_schema(yaml_relpath):
     Lets tests assert that the YAML `if/then` guards actually reject
     invalid submissions, without spinning up the full route + DB stack.
     """
-    import yaml
-
     workflows_root = Path(__file__).parent.parent.parent / "workflows"
     schema_path = workflows_root / yaml_relpath
     with schema_path.open() as f:
