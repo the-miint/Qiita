@@ -31,24 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- (#393) Confirm the synced `long-read-assembly 1.0.0`
-  action carries the raised ceiling. `actions sync` runs inside `activate.sh`, so this only
-  checks it took — if the row still reads `192|16:00:00`, an `assemble` OOM or timeout keeps
-  failing permanently on attempt 0 (baseline == ceiling disables escalation) and the change is
-  a silent no-op:
-
-  ```bash
-  sudo -u qiita-api bash -c '
-    set -a; source /etc/qiita/control-plane.env; set +a
-    psql "$DATABASE_URL" -Atc "SELECT mem_ceiling_gb, walltime_ceiling FROM qiita.action
-      WHERE action_id = '"'"'long-read-assembly'"'"' AND version = '"'"'1.0.0'"'"';"'
-  ```
-
-  Expect `500|2 days` (was `192|16:00:00`).
-
-  Nothing caps the raised ceiling on the SLURM side: the `qiita` partition is
-  `MaxMemPerNode=UNLIMITED` / `MaxTime=UNLIMITED`, its nodes are `RealMemory=514000` with no
-  `MemSpecLimit`, and the `qiita_norm` QOS carries no limits.
+_None yet._
 
 ### 6. After the deploy verifies green
 
@@ -56,23 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#393) `long-read-assembly`'s `action_ceiling`
-  rises to **500 GB / P2D** (from 192 GB / PT16H); the `assemble` **baseline is unchanged** at
-  32 cpu / 192 GB / PT16H, so an ordinary ticket requests exactly what it does today and
-  schedules the same. What changes is failure handling: a ceiling equal to the baseline made
-  OOM/TIMEOUT escalation a no-op, so a single `assemble` OOM failed the ticket permanently on
-  attempt 0. Retries now climb `192 → 384 → 500` GB and `16h → 32h → 48h`. Consequence for the
-  host: a **retrying** assemble step can now request up to 500 GB and 48 h, so the SLURM
-  partition must be able to satisfy that or the retry pends instead of running — the `qiita`
-  partition's nodes are 514000 MB, which fits 500 GB, but only just, so an escalated job
-  effectively reserves a whole node.
-
-  Second consequence, same cause: the ceiling is also the only bound on a per-ticket
-  `resource_override.mem_gb`, and that override applies to **every** step in the ticket, not
-  just the one that needs it. A `wet_lab_admin`+ submitting with `mem_gb: 500` would now
-  inflate even the 2 GB `assembly_run_config` and 8 GB `assembly_hash` steps to 500 GB on
-  attempt 0, where the old cap was 192. Role-gated, so not an escalation path — but it is a
-  bigger foot-gun than it was, and a ticket submitted that way will pend hard.
+_None yet._
 
 ---
 
