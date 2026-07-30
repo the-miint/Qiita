@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **`qiita pool submit-align-pool`: a CLI for starting an alignment (closes #396).**
+- **`qiita pool submit-align-pool`: a CLI for starting an alignment (#400, closes #396).**
   `align-plan` was the only pool-scale entrypoint with no client — the sole way to
   align a pool was a hand-rolled `curl` with a hand-built JSON body, while its
   sibling `submit-block-mask-pool` has had a CLI all along. Same thin-client shape:
@@ -384,7 +384,7 @@ duplicates further down are historical strata; leave them where they are.
   previously accepted without type or range checking; a malformed GFF handle
   (e.g. `gff_upload_idx: 0` or `gff_path: "rel/x"`) slipped through to a
   server-side failure. Both now reject at submission with a 422.
-- **Purging an alignment no longer re-types its block tickets as read-mask blocks (closes #394).**
+- **Purging an alignment no longer re-types its block tickets as read-mask blocks (#400, closes #394).**
   `work_ticket.alignment_idx` is `ON DELETE SET NULL`, and `alignment_idx IS NULL`
   was also the discriminator for "this block ticket is a read-mask block". So
   `DELETE /alignment-definition` turned every align block ticket of that alignment
