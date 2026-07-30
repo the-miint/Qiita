@@ -22,6 +22,8 @@ from pathlib import Path
 
 import duckdb
 import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from qiita_common.api_paths import (
     URL_REFERENCE_BY_IDX,
@@ -371,9 +373,6 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
     flight_client.queue_response(101)  # taxonomy
     flight_client.queue_response(102)  # genome_map
     genome_map = tmp_path / "gmap.parquet"
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     pq.write_table(pa.table({"feature_idx": pa.array([1], type=pa.int64())}), genome_map)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:

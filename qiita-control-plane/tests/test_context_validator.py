@@ -7,6 +7,8 @@ is exercised by the DB-bound tests in tests/routes/test_work_ticket.py.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from qiita_control_plane.actions.context_validator import (
@@ -136,3 +138,56 @@ def test_check_schema_rejects_bad_property_name():
     """`required` must be an array of strings, not an object."""
     with pytest.raises(SchemaError):
         check_schema({"type": "object", "required": {"x": True}})
+
+
+# ---------------------------------------------------------------------------
+# Real-world schema guards — negative tests
+# ---------------------------------------------------------------------------
+
+
+def _load_workflow_schema(yaml_relpath):
+    """Load a workflow YAML's context_schema for direct validation.
+
+    Lets tests assert that the YAML `if/then` guards actually reject
+    invalid submissions, without spinning up the full route + DB stack.
+    """
+    import yaml
+
+    workflows_root = Path(__file__).parent.parent.parent / "workflows"
+    schema_path = workflows_root / yaml_relpath
+    with schema_path.open() as f:
+        doc = yaml.safe_load(f)
+    return doc["context_schema"]
+
+
+def test_reference_add_shard_index_requires_genome_map_upload_idx():
+    """`shard_index: true` without `genome_map_upload_idx` is rejected by the
+    YAML `if/then` guard — plan-shards derives the per-shard feature set from
+    qiita.feature_genome, which mint-features populates only when a genome map
+    is supplied. Without this guard, a sharded reference runs the full ingest
+    (hours) then fails at plan-shards with N=0."""
+    schema = _load_workflow_schema("reference-add/1.0.0.yaml")
+    context = {
+        "fasta_upload_idx": 1,
+        "taxonomy_upload_idx": 2,
+        "shard_index": True,
+        # genome_map_upload_idx deliberately absent
+    }
+    errs = validate_context(schema, context)
+    assert errs, "expected validation to reject shard_index without genome_map"
+    assert any("genome_map_upload_idx" in e["message"] for e in errs)
+
+
+def test_local_reference_add_shard_index_requires_genome_map_path():
+    """`local-reference-add` carries the same guard: `shard_index: true`
+    without `genome_map_path` is rejected by the YAML `if/then`."""
+    schema = _load_workflow_schema("local-reference-add/1.0.0.yaml")
+    context = {
+        "fasta_manifest_path": "/shared/fastas/manifest.txt",
+        "taxonomy_path": "/shared/tax/tax.parquet",
+        "shard_index": True,
+        # genome_map_path deliberately absent
+    }
+    errs = validate_context(schema, context)
+    assert errs, "expected validation to reject shard_index without genome_map"
+    assert any("genome_map_path" in e["message"] for e in errs)

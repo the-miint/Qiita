@@ -65,6 +65,9 @@ context_schema:
     # qiita_compute_orchestrator.jobs.hash_sequences.
     gff_path: {type: string, pattern: "^/"}
   # A sharded reference must build at least one per-shard index type.
+  # The `required` list means this `not:` only fires when all three keys are
+  # present — an omitted `build_*` defaults ON via the build-shard-index steps'
+  # `when:`, so a partial selection (e.g. `build_minimap2: false` alone) is valid.
   not:
     required: [shard_index, build_minimap2, build_bowtie2]
     properties:
