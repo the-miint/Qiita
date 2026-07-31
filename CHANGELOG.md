@@ -301,6 +301,25 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Single-end blocks no longer pay double the rype index reads: the routing classify
+  gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
+  `rype_classify` a relation with a `sequence2` column that is entirely NULL for
+  single-end (PacBio HiFi) data. miint derives rype's `is_paired` from the column's
+  **presence**, never its values (`ValidateSequenceTable`) — where the RYpe CLI derives
+  it from **content** — so rype assumed a query twice as long and **halved its Arrow
+  batch size**, and it reloads the whole index once per batch. That CLI/miint asymmetry
+  is why the bug survived: a `rype classify run` on the same Parquet reports
+  `is_paired: false` and the un-halved batch, so a CLI reproduction looks healthy. On a 750k-read HiFi block against the 193 GB `w=20` WoL3 router that
+  turned 2 full index reads into 4, at ~54 min each: **~1.8 h of a 4 h walltime budget,
+  spent re-reading the index**. Both jobs now project a narrowed view
+  (`align_sharded._ROUTING_QUERY`, `host_filter._RYPE_QUERY`); the aligners keep both
+  mates, since `is_paired` reaches rype only through batch sizing and never through
+  `rype_classify_arrow`. Filed upstream as
+  [duckdb-miint#199](https://github.com/the-miint/duckdb-miint/issues/199) (derive
+  `is_paired` from content) and
+  [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
+  per invocation — index load is 98.4% of classify wall clock); removal of our
+  workaround tracked at #403.
 - **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
   Establishes one invariant across the runner and the redrive route: **only a LIVE
   attempt is adoptable.** Both defects below were latent until a step could have
