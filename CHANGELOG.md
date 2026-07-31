@@ -313,7 +313,7 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
-- **`docs/duckdb-miint.md`: the GFF `+1` is now flagged as an armed breaking change, not a proposal (#403).**
+- **`docs/duckdb-miint.md`: the GFF `+1` is now flagged as an armed breaking change, not a proposal (#414).**
   duckdb-miint#200 merged into `v1.5-variegata` on 2026-07-31 (`67ec3d48`) and
   **normalizes `read_gff.stop_position` to half-open** — resolving the closed-vs-half-open
   collision by changing the value rather than renaming the column, so it does **not** fail
