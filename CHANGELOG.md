@@ -378,7 +378,7 @@ duplicates further down are historical strata; leave them where they are.
   level from an optional `LOG_LEVEL` (default INFO; an unknown name fails the boot
   rather than silently reverting), called first in both lifespans. It now covers
   everything that propagates to root, including `httpx`; `uvicorn` and
-  `uvicorn.access` keep `propagate=False` and stay outside it.
+  `uvicorn.access` keep `propagate=False` and stay outside it (#408).
 
 - **A fan-out cohort could be stranded with no way to recover it (#406).** Two
   distinct paths. `_pump_ticket_cohort` swallowed pump failures on the theory that
