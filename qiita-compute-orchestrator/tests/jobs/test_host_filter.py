@@ -102,18 +102,19 @@ def _inputs(host_filter, **kw):
 
 
 @pytest.mark.parametrize(
-    ("sequence2", "rype_cols"),
+    ("mates", "rype_cols"),
     [
-        (None, ["read_id", "sequence1"]),
-        ("ACGTACGTAC", ["read_id", "sequence1", "sequence2"]),
+        ([None, None], ["read_id", "sequence1"]),
+        (["ACGTACGTAC", "ACGTACGTAC"], ["read_id", "sequence1", "sequence2"]),
+        ([None, "ACGTACGTAC"], ["read_id", "sequence1", "sequence2"]),
     ],
-    ids=["single-end", "paired-end"],
+    ids=["single-end", "paired-end", "mixed-keeps-the-mate-column"],
 )
 def test_host_filter_rype_query_drops_an_all_null_mate(
-    tmp_path, monkeypatch, write_reads, sequence2, rype_cols
+    tmp_path, monkeypatch, write_reads, mates, rype_cols
 ):
-    """rype is handed `sequence1` ALONE when no read in the block carries a mate; minimap2
-    keeps both mates either way.
+    """rype is handed `sequence1` ALONE when NO read in the block carries a mate; minimap2
+    keeps both mates in every case.
 
     A batch-SIZING property with no effect on the mask, so only the COLUMN LIST can pin it.
     miint reads rype's `is_paired` off the presence of a `sequence2` column and never off
@@ -122,14 +123,27 @@ def test_host_filter_rype_query_drops_an_all_null_mate(
     doubles the host-index reloads.
 
     Narrowing minimap2's query instead would be a correctness bug (it aligns pairs
-    natively), hence the second assertion. A MIXED batch keeps the column — see
-    `test_host_filter_marks_rype_union_minimap2`, whose read 40 is single-end among
-    paired ones."""
+    natively), hence the second assertion.
+
+    The MIXED arm is the one that pins the deliberate divergence from `align_sharded`:
+    this job gates on `paired > 0`, not all-or-none, so one mate-carrying read keeps the
+    column for the whole batch (conservative sizing rather than dropped mates). Nothing
+    else in the suite constrains that — `test_host_filter_marks_rype_union_minimap2` has a
+    mixed fixture but asserts read ids, reasons, threshold and preset, never a column
+    list, so it passes either way and the `> 0` could be flipped to all-or-none with the
+    suite green."""
     from qiita_compute_orchestrator.jobs import host_filter
 
-    reads = write_reads(tmp_path / "reads.parquet", [(10, "rA", "ACGTACGTAC", sequence2)])
+    reads = write_reads(
+        tmp_path / "reads.parquet",
+        [(10 * (i + 1), f"r{i}", "ACGTACGTAC", mate) for i, mate in enumerate(mates)],
+    )
     qc_mask = _qc_mask(
-        tmp_path / "qc_mask.parquet", [(10, ReadMaskReason.PASS.value, sequence2 is not None)]
+        tmp_path / "qc_mask.parquet",
+        [
+            (10 * (i + 1), ReadMaskReason.PASS.value, mate is not None)
+            for i, mate in enumerate(mates)
+        ],
     )
 
     seen: dict = {}

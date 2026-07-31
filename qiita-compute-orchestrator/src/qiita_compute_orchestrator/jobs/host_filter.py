@@ -337,14 +337,24 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     # both mates — minimap2 (below, via `_SURVIVORS`) aligns pairs
                     # natively and needs `sequence2`.
                     #
-                    # Probed on the BOUND READS, not on `_QUERY`: the reads relation is a
-                    # lazy `read_parquet` view, so DuckDB answers both aggregates from
-                    # row-group null/row counts without touching a sequence byte, whereas
-                    # `_QUERY.sequence2` is a trim EXPRESSION that would have to be
-                    # evaluated over every row. `paired > 0` (rather than an all-or-none
-                    # test) keeps the mate column whenever any read has one, so a mixed
-                    # batch degrades to the conservative sizing instead of dropping mates
-                    # — this job has no mixed-batch policy and this fix does not add one.
+                    # Probed on the BOUND READS, not on `_QUERY` — measured 0.0003 s
+                    # against 0.5424 s for the `_QUERY` shape, whose `sequence2` is a
+                    # trim EXPRESSION over a `_QC_MASK` join with a `reason` filter, all
+                    # of which must be evaluated per row. (The join is arguably the
+                    # bigger half of that cost, not the trim.)
+                    #
+                    # Note what does NOT happen: DuckDB does not sum row-group null
+                    # counts. `count(sequence2)` is metadata-served only when statistics
+                    # PROVE zero NULLs; otherwise it scans the column. So the single-end
+                    # case this projection exists for scans — it is cheap because an
+                    # all-NULL column encodes to ~1 KB, not because anything was pruned —
+                    # and a mixed batch pays a real scan. The choice of relation is what
+                    # makes this cheap, and that part is measured.
+                    #
+                    # `paired > 0` (rather than an all-or-none test) keeps the mate column
+                    # whenever any read has one, so a mixed batch degrades to the
+                    # conservative sizing instead of dropping mates — this job has no
+                    # mixed-batch policy and this fix does not add one.
                     paired = conn.execute(f"SELECT count(sequence2) FROM {reads_rel}").fetchone()[0]
                     conn.execute(
                         f"CREATE VIEW {_RYPE_QUERY} AS SELECT read_id, sequence1"

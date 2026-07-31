@@ -602,8 +602,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "SELECT sequence_idx AS read_id, sequence1, sequence2 "
                     f"FROM {reads_rel}"
                 )
-                # Is this batch paired-end? Decides only the FILTER SHAPE below, not
-                # the aligner (the CP picks that from the platform). The read set is
+                # Is this batch paired-end? Decides the FILTER SHAPE below and the
+                # ROUTING PROJECTION handed to rype — never the aligner, which the CP
+                # picks from the platform. (The routing use is the expensive one: it
+                # sets rype's batch size, hence how many times the router index is
+                # reloaded. See its CREATE.) The read set is
                 # uniformly SE or PE by construction, so this counts rather than
                 # samples: a MIXED batch is invalid input and fails HERE, naming the
                 # counts, instead of surfacing as bowtie2's opaque `gpl_boundary`
@@ -615,10 +618,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # whose reads happen to route nowhere is still invalid input, and
                 # validating after that return would let it exit 0 with an empty
                 # output. It also means a mixed batch fails before paying for
-                # rype_classify. Costs nothing to do here — DuckDB answers both
-                # aggregates from the reads Parquet's row-group statistics (`count(*)`
-                # from the row counts, `count(sequence2)` from the null counts), so
-                # neither reads a byte of the sequence columns; a short-circuiting
+                # rype_classify. Cheap here, though NOT by the mechanism this comment
+                # used to claim: DuckDB never sums row-group null counts. `count(*)`
+                # does come from the row counts, but `count(sequence2)` is only
+                # metadata-served when statistics PROVE zero NULLs — then
+                # `statistics_propagation` rewrites it to `count(*)` and constant-folds
+                # it (measured 0.0003 s on a 499 MB zstd column). Otherwise it SCANS:
+                # an all-NULL mate column scans but costs ~nothing because it encodes to
+                # ~1 KB, and a MIXED column pays a real scan (0.147 s at 3M rows, 50/50).
+                # So the single-end case this projection exists for is precisely the one
+                # that does not get the shortcut — it is cheap by encoding, not by
+                # pruning. A short-circuiting
                 # `LIMIT 1` probe would be far SLOWER, since that one does scan.
                 #
                 # `total > 0` is load-bearing now that this runs ahead of the empty

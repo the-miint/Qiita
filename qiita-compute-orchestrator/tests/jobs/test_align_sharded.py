@@ -610,11 +610,22 @@ def test_align_sharded_routing_query_drops_an_all_null_mate(
     # WRAP the installed routing stub rather than replacing it: the stub is what hands
     # the align seam its connection, so a bare replacement would strand `calls`.
     seen_routing_cols: list[list[str]] = []
+    seen_routing_kinds: list[str] = []
     installed_r2s = align_sharded._build_read_to_shard
 
     def _record_routing_cols(conn, router_index_path, query_table, dest_table, *, threshold):
         seen_routing_cols.append(
             [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
+        )
+        # The KIND matters as much as the columns: a TABLE here would hold a second
+        # copy of the block's sequences (~15 GB long-read) concurrently with the
+        # corpus copy rype makes internally — the hazard docs/duckdb-miint.md
+        # documents, and the reason this is a view over a view.
+        seen_routing_kinds.append(
+            conn.execute(
+                "SELECT table_type FROM information_schema.tables WHERE table_name = ?",
+                [query_table],
+            ).fetchone()[0]
         )
         installed_r2s(conn, router_index_path, query_table, dest_table, threshold=threshold)
 
@@ -632,6 +643,7 @@ def test_align_sharded_routing_query_drops_an_all_null_mate(
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
     assert seen_routing_cols == [routing_cols]
+    assert seen_routing_kinds == ["VIEW"]
     assert calls[0]["cols"] == ["read_id", "sequence1", "sequence2"]
 
 

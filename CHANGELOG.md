@@ -305,9 +305,11 @@ duplicates further down are historical strata; leave them where they are.
   gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
   `rype_classify` a relation with a `sequence2` column that is entirely NULL for
   single-end (PacBio HiFi) data. miint derives rype's `is_paired` from the column's
-  **presence**, never its values (`ValidateSequenceTable`), so rype assumed a query
-  twice as long and **halved its Arrow batch size** — and it reloads the whole index
-  once per batch. On a 750k-read HiFi block against the 193 GB `w=20` WoL3 router that
+  **presence**, never its values (`ValidateSequenceTable`) — where the RYpe CLI derives
+  it from **content** — so rype assumed a query twice as long and **halved its Arrow
+  batch size**, and it reloads the whole index once per batch. That CLI/miint asymmetry
+  is why the bug survived: a `rype classify run` on the same Parquet reports
+  `is_paired: false` and the un-halved batch, so a CLI reproduction looks healthy. On a 750k-read HiFi block against the 193 GB `w=20` WoL3 router that
   turned 2 full index reads into 4, at ~54 min each: **~1.8 h of a 4 h walltime budget,
   spent re-reading the index**. Both jobs now project a narrowed view
   (`align_sharded._ROUTING_QUERY`, `host_filter._RYPE_QUERY`); the aligners keep both
