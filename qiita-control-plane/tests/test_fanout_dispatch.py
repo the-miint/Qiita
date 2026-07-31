@@ -16,7 +16,7 @@ The pure-column-routing tests need no DB; the release-semantics tests do.
 import secrets
 
 import pytest
-from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
+from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID, READ_MASK_ACTION_ID
 
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
 from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
@@ -102,8 +102,11 @@ def test_cohort_for_ticket_row_non_fanout_is_none():
     assert cohort_for_ticket_row(_row(reference_idx=7)) is None
     # An entirely unscoped row is not either.
     assert cohort_for_ticket_row(_row()) is None
-    # Nor is a block ticket running some other action.
-    assert cohort_for_ticket_row(_row(block_idx=5, mask_idx=9, action_id="read-mask")) is None
+    # Nor is a block ticket running some other action — the per-sample read-mask
+    # here, which is a real action but not one that fans out into blocks.
+    assert (
+        cohort_for_ticket_row(_row(block_idx=5, mask_idx=9, action_id=READ_MASK_ACTION_ID)) is None
+    )
 
 
 # ---------------------------------------------------------------------------

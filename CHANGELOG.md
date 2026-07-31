@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **`qiita pool submit-align-pool`: a CLI for starting an alignment (#400, closes #396).**
+- **`qiita submit-align-pool`: a CLI for starting an alignment (#400, closes #396).**
   `align-plan` was the only pool-scale entrypoint with no client — the sole way to
   align a pool was a hand-rolled `curl` with a hand-built JSON body, while its
   sibling `submit-block-mask-pool` has had a CLI all along. Same thin-client shape:

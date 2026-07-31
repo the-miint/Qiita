@@ -102,7 +102,7 @@ async def rb(postgres_pool):
     )
 
     # The REAL block action ids, because a block ticket's kind is its action_id
-    # (see block_action) and the read-mask finalize gate keys on it. Insert-if-absent
+    # (see qiita_common.actions) and the read-mask finalize gate keys on it.
     # + delete-only-what-we-made: the (action_id, version) PK is shared with every
     # other test on this worker's database.
     created_actions = {

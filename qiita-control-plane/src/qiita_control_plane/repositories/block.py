@@ -320,7 +320,7 @@ async def has_incomplete_covering_block(
     carry BOTH mask_idx and alignment_idx. The filter is deliberately NOT
     `wt.alignment_idx IS NULL`: purging an alignment NULLs that column
     (`ON DELETE SET NULL`), which would hand this query exactly the align blocks it
-    exists to exclude. See `block_action`."""
+    exists to exclude. See `qiita_common.actions`."""
     incomplete = await conn.fetchval(
         "SELECT 1 FROM qiita.block b"
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"

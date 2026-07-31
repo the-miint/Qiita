@@ -156,10 +156,19 @@ def cohort_for_ticket_row(row: asyncpg.Record | dict[str, Any]) -> FanoutCohort 
       * align block  → block_idx set + the align action;
       * read-mask block → block_idx set + the read-mask-block action.
 
+    A PURGED align ticket (align action, ``alignment_idx`` NULLed by the delete)
+    therefore belongs to NO cohort, and a held one is never released — not by a
+    later top-up, not by startup reconcile. That is the intended end state here:
+    the alternative is releasing a block whose alignment no longer exists, which
+    is what the pre-`action_id` routing did. It leaves a permanently-pending held
+    ticket behind, which is litter rather than a hazard; making the purge flip
+    those to `cancelled` is the abandon primitive tracked separately, not
+    something this routing can do.
+
     A block ticket is routed by its ACTION, not by whether ``alignment_idx`` is
     set: purging an alignment NULLs that column, which would otherwise route the
     align ticket into the read-mask cohort of the ``mask_idx`` it still carries
-    (see `block_action`). A block ticket whose action is neither — or which is
+    (see `qiita_common.actions`). A block ticket whose action is neither — or
     missing the idx its cohort is keyed by — is not a fan-out child.
     """
     if row["shard_id"] is not None and row["reference_idx"] is not None:
@@ -278,7 +287,7 @@ async def held_cohorts(pool: asyncpg.Pool) -> list[FanoutCohort]:
         cohorts.append(shard_cohort(row["reference_idx"]))
     # Both block scans key on action_id, not on whether alignment_idx is set — a
     # purged align ticket keeps its mask_idx and would otherwise be re-pumped here
-    # as a read-mask block (see `block_action`).
+    # as a read-mask block (see `qiita_common.actions`).
     for row in await pool.fetch(
         "SELECT DISTINCT mask_idx FROM qiita.work_ticket"
         " WHERE dispatch_held AND block_idx IS NOT NULL AND action_id = $1"
