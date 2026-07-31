@@ -8,26 +8,37 @@ work_tickets that were INSERTed `dispatch_held` a capped number at a time:
   * one failed ticket in the cohort fail-stops it (releases nothing);
   * `cohort_for_ticket_row` routes a ticket to its cohort by its columns;
   * `held_cohorts` enumerates cohorts that still have held tickets (for the
-    startup reconcile re-pump).
+    startup reconcile re-pump);
+  * a runtime override (`set_override`) retunes one cohort's cap, and lowering
+    it drains rather than recalling work already in flight.
 
 The pure-column-routing tests need no DB; the release-semantics tests do.
 """
 
+import logging
 import secrets
 
 import pytest
 from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID, READ_MASK_ACTION_ID
 
+from qiita_control_plane import fanout_dispatch
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
 from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
 from qiita_control_plane.fanout_dispatch import (
+    MAX_FANOUT_OVERRIDE,
+    active_cohorts,
     align_block_cohort,
+    clear_override,
     cohort_for_ticket_row,
+    cohort_status,
+    get_override,
     held_cohorts,
     read_mask_block_cohort,
+    set_override,
     shard_cohort,
     top_up_dispatch,
 )
+from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.block import create_block
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
@@ -42,6 +53,15 @@ _BLOCK_ACTION_VERSIONS = {
     BLOCK_MASK_ACTION_ID: BLOCK_MASK_ACTION_VERSION,
     ALIGN_ACTION_ID: ALIGN_ACTION_VERSION,
 }
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_overrides():
+    """The override registry is process-global; a leak would silently retune an
+    unrelated test's cohort."""
+    yield
+    fanout_dispatch._OVERRIDES.clear()
+
 
 # ---------------------------------------------------------------------------
 # cohort_for_ticket_row — pure column routing (no DB)
@@ -107,6 +127,70 @@ def test_cohort_for_ticket_row_non_fanout_is_none():
     assert (
         cohort_for_ticket_row(_row(block_idx=5, mask_idx=9, action_id=READ_MASK_ACTION_ID)) is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Cohort identity — the (kind, key) the override registry is keyed by (no DB)
+# ---------------------------------------------------------------------------
+
+
+def test_cohort_kind_and_key_identify_the_cohort():
+    # `lock_key` is masked into int4 and so is lossy; `key` is the exact idx.
+    assert (shard_cohort(7).kind, shard_cohort(7).key) == ("shard", 7)
+    assert (read_mask_block_cohort(9).kind, read_mask_block_cohort(9).key) == (
+        "read_mask_block",
+        9,
+    )
+    assert (align_block_cohort(4).kind, align_block_cohort(4).key) == ("align_block", 4)
+
+
+def test_cohort_kinds_are_distinct():
+    kinds = {shard_cohort(1).kind, read_mask_block_cohort(1).kind, align_block_cohort(1).kind}
+    assert len(kinds) == 3
+
+
+# ---------------------------------------------------------------------------
+# Override registry — in-memory, per cohort (no DB)
+# ---------------------------------------------------------------------------
+
+
+def test_override_round_trips_and_clears():
+    cohort = align_block_cohort(2)
+    assert get_override(cohort) is None
+    set_override(cohort, 16)
+    assert get_override(cohort) == 16
+    clear_override(cohort)
+    assert get_override(cohort) is None
+
+
+def test_clear_override_is_idempotent():
+    clear_override(align_block_cohort(2))  # never set — must not raise
+
+
+@pytest.mark.parametrize("bad", [0, -1, MAX_FANOUT_OVERRIDE + 1])
+def test_set_override_rejects_out_of_range(bad):
+    # Fail at the registry, not only at the route: a typo'd 1000 is the WOL3 incident.
+    with pytest.raises(ValueError):
+        set_override(align_block_cohort(2), bad)
+    assert get_override(align_block_cohort(2)) is None
+
+
+def test_set_override_accepts_the_ceiling():
+    set_override(align_block_cohort(2), MAX_FANOUT_OVERRIDE)
+    assert get_override(align_block_cohort(2)) == MAX_FANOUT_OVERRIDE
+
+
+def test_override_does_not_leak_across_kinds_sharing_a_key():
+    """The registry keys on (kind, key), not key alone.
+
+    The three idx spaces are independent, so reference_idx 5, mask_idx 5 and
+    alignment_idx 5 all coexist. Keying on the bare idx would have one operator
+    override silently retune three unrelated fan-outs.
+    """
+    set_override(shard_cohort(5), 20)
+    assert get_override(shard_cohort(5)) == 20
+    assert get_override(read_mask_block_cohort(5)) is None
+    assert get_override(align_block_cohort(5)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +337,169 @@ async def test_top_up_fail_stops_on_a_failed_ticket(postgres_pool):
 
 
 @pytest.mark.db
+async def test_a_failing_dispatch_does_not_abandon_the_rest_of_the_batch(postgres_pool, caplog):
+    """The release is committed before dispatch, so a mid-batch raise is unrecoverable.
+
+    A ticket that is released but never dispatched is no longer `dispatch_held`, so
+    no pump will pick it up again, yet it still counts as `running` and looks healthy.
+    The remaining tickets must still be dispatched, and the casualty must be named so
+    an operator can `POST /work-ticket/{idx}/run` it.
+    """
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        idxs = await _insert_held_shard_tickets(postgres_pool, sc, 5)
+        dispatched: list[int] = []
+
+        def flaky(idx: int) -> None:
+            if idx == idxs[1]:
+                raise RuntimeError("event loop is shutting down")
+            dispatched.append(idx)
+
+        with caplog.at_level(logging.ERROR):
+            released = await top_up_dispatch(
+                postgres_pool, shard_cohort(ref), max_inflight=5, dispatch_cb=flaky
+            )
+        assert released == idxs
+        # Everything except the casualty still went out.
+        assert dispatched == [i for i in idxs if i != idxs[1]]
+        assert str(idxs[1]) in caplog.text
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_fail_stop_is_logged_at_warning(postgres_pool, caplog):
+    """A frozen fan-out is operator-actionable, so it must clear a WARNING bar.
+
+    At INFO it is indistinguishable from "no free slots" — which is what made the
+    stalled alignment take an afternoon to diagnose.
+    """
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        idxs = await _insert_held_shard_tickets(postgres_pool, sc, 3)
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET state='failed', dispatch_held=false,"
+            " failure_type='permanent', failure_stage='submission', failure_reason='boom'"
+            " WHERE work_ticket_idx=$1",
+            idxs[0],
+        )
+        with caplog.at_level(logging.WARNING):
+            await top_up_dispatch(
+                postgres_pool, shard_cohort(ref), max_inflight=8, dispatch_cb=lambda _idx: None
+            )
+        assert "fail-stop" in caplog.text
+        assert shard_cohort(ref).label in caplog.text
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_override_raises_the_cap_above_the_caller_default(postgres_pool):
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        idxs = await _insert_held_shard_tickets(postgres_pool, sc, 5)
+        set_override(shard_cohort(ref), 4)
+        released = await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=2, dispatch_cb=lambda _idx: None
+        )
+        # The override wins over the caller's global default, not the other way round.
+        assert released == idxs[:4]
+        assert await _held_count(postgres_pool, ref) == 1
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_override_raised_mid_fanout_releases_past_the_original_cap(postgres_pool):
+    """The headline case: retune a fan-out already sitting at its cap, no restart."""
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        idxs = await _insert_held_shard_tickets(postgres_pool, sc, 5)
+        first = await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=2, dispatch_cb=lambda _idx: None
+        )
+        assert first == idxs[:2]  # at the caller's default cap, nothing more would release
+
+        set_override(shard_cohort(ref), 4)
+        # Same caller default as before — only the override changed.
+        released = await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=2, dispatch_cb=lambda _idx: None
+        )
+        assert released == idxs[2:4]
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_override_below_running_releases_nothing_and_kills_nothing(postgres_pool):
+    """Lowering the cap drains; it never recalls work already in flight."""
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc, 5)
+        first = await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=4, dispatch_cb=lambda _idx: None
+        )
+        assert len(first) == 4
+
+        set_override(shard_cohort(ref), 2)
+        assert (
+            await top_up_dispatch(
+                postgres_pool, shard_cohort(ref), max_inflight=4, dispatch_cb=lambda _idx: None
+            )
+            == []
+        )
+        # The 4 already released stay released and non-terminal — drain, not kill.
+        still_running = await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket"
+            " WHERE reference_idx = $1 AND shard_id IS NOT NULL AND NOT dispatch_held"
+            "   AND state IN ('pending', 'queued', 'processing')",
+            ref,
+        )
+        assert still_running == 4
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_cleared_override_reverts_to_the_caller_default(postgres_pool):
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        idxs = await _insert_held_shard_tickets(postgres_pool, sc, 5)
+        set_override(shard_cohort(ref), 4)
+        clear_override(shard_cohort(ref))
+        released = await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=2, dispatch_cb=lambda _idx: None
+        )
+        assert released == idxs[:2]
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_override_does_not_leak_across_cohorts(postgres_pool):
+    sc_a = await _scaffold(postgres_pool)
+    sc_b = await _scaffold(postgres_pool)
+    ref_a, ref_b = sc_a["reference_idx"], sc_b["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc_a, 5)
+        idxs_b = await _insert_held_shard_tickets(postgres_pool, sc_b, 5)
+        set_override(shard_cohort(ref_a), 4)
+        released_b = await top_up_dispatch(
+            postgres_pool, shard_cohort(ref_b), max_inflight=2, dispatch_cb=lambda _idx: None
+        )
+        assert released_b == idxs_b[:2]
+    finally:
+        await _cleanup(postgres_pool, ref_a)
+        await _cleanup(postgres_pool, ref_b)
+
+
+@pytest.mark.db
 async def test_held_cohorts_includes_a_shard_cohort_with_held_tickets(postgres_pool):
     sc = await _scaffold(postgres_pool)
     ref = sc["reference_idx"]
@@ -268,6 +515,135 @@ async def test_held_cohorts_includes_a_shard_cohort_with_held_tickets(postgres_p
         assert shard_cohort(ref).label not in {c.label for c in cohorts_after}
     finally:
         await _cleanup(postgres_pool, ref)
+
+
+# ---------------------------------------------------------------------------
+# cohort_status / active_cohorts — the operator-facing read side (DB)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+async def test_cohort_status_counts_held_running_and_failed(postgres_pool):
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        idxs = await _insert_held_shard_tickets(postgres_pool, sc, 5)
+        await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=2, dispatch_cb=lambda _idx: None
+        )
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET state='failed',"
+            " failure_type='permanent', failure_stage='submission', failure_reason='boom'"
+            " WHERE work_ticket_idx=$1",
+            idxs[0],
+        )
+        status = await cohort_status(postgres_pool, shard_cohort(ref), max_inflight=8)
+        assert (status.held, status.running, status.failed) == (3, 1, 1)
+        assert status.fail_stopped is True
+        assert (status.kind, status.key) == ("shard", ref)
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_cohort_status_is_not_fail_stopped_without_a_failed_child(postgres_pool):
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc, 3)
+        status = await cohort_status(postgres_pool, shard_cohort(ref), max_inflight=8)
+        assert (status.held, status.running, status.failed) == (3, 0, 0)
+        assert status.fail_stopped is False
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_cohort_status_reports_the_effective_cap_and_its_source(postgres_pool):
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc, 3)
+        default = await cohort_status(postgres_pool, shard_cohort(ref), max_inflight=8)
+        assert (default.max_inflight, default.override) == (8, None)
+
+        set_override(shard_cohort(ref), 16)
+        overridden = await cohort_status(postgres_pool, shard_cohort(ref), max_inflight=8)
+        # `max_inflight` is what the pump will actually use; `override` says why.
+        assert (overridden.max_inflight, overridden.override) == (16, 16)
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_active_cohorts_includes_a_fully_released_cohort(postgres_pool):
+    """The difference from `held_cohorts`: a cohort with nothing held but work still
+    running is invisible to reconcile and must still be visible to an operator."""
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc, 3)
+        await top_up_dispatch(
+            postgres_pool, shard_cohort(ref), max_inflight=100, dispatch_cb=lambda _idx: None
+        )
+        assert shard_cohort(ref).label not in {c.label for c in await held_cohorts(postgres_pool)}
+        assert shard_cohort(ref).label in {c.label for c in await active_cohorts(postgres_pool)}
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_active_cohorts_excludes_a_finished_cohort(postgres_pool):
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc, 3)
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET state='completed', dispatch_held=false"
+            " WHERE reference_idx=$1",
+            ref,
+        )
+        assert shard_cohort(ref).label not in {c.label for c in await active_cohorts(postgres_pool)}
+    finally:
+        await _cleanup(postgres_pool, ref)
+
+
+@pytest.mark.db
+async def test_active_cohorts_covers_both_block_kinds(postgres_pool):
+    """All three kinds must be enumerable, not just the shard one the other tests use."""
+    sc = await _seed_block_cohort_scaffold(postgres_pool)
+    async with postgres_pool.acquire() as conn:
+        alignment = await mint_alignment_definition(
+            conn,
+            params={
+                "reference_idx": 1,
+                "aligner": "minimap2",
+                "mask_idx": sc["mask_idx"],
+                "shard_ids": [0],
+            },
+            principal_idx=sc["principal_idx"],
+        )
+    alignment_idx = alignment["alignment_idx"]
+    try:
+        await _insert_block_ticket(
+            postgres_pool, sc, action_id=BLOCK_MASK_ACTION_ID, state="pending", dispatch_held=True
+        )
+        await _insert_block_ticket(
+            postgres_pool,
+            sc,
+            action_id=ALIGN_ACTION_ID,
+            state="processing",
+            dispatch_held=False,
+            alignment_idx=alignment_idx,
+        )
+        labels = {c.label for c in await active_cohorts(postgres_pool)}
+        assert read_mask_block_cohort(sc["mask_idx"]).label in labels
+        assert align_block_cohort(alignment_idx).label in labels
+    finally:
+        await _teardown_block_cohort_scaffold(postgres_pool, sc)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
 
 
 # ---------------------------------------------------------------------------

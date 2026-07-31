@@ -13,7 +13,7 @@ from fastapi.openapi.docs import (
 )
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from qiita_common.log import install_authorization_scrub
+from qiita_common.log import configure_logging, install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
 
 from .auth.cli_login_code_sweeper import run_cli_login_code_sweeper
@@ -42,6 +42,9 @@ _DISPATCH_DRAIN_TIMEOUT_SECONDS = 60.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before the scrubber, which attaches to the handlers this installs, and before
+    # Settings.from_env() below so a fail-fast boot error is itself logged.
+    configure_logging()
     install_authorization_scrub()
 
     settings = Settings.from_env()

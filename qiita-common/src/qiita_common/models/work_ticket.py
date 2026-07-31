@@ -661,3 +661,89 @@ class WorkTicketCancelResponse(BaseModel):
     requested: int
     cancelled: int
     results: list[WorkTicketCancelResult]
+
+
+# =============================================================================
+# Fan-out throttle control — /api/v1/work-ticket/fanout
+# =============================================================================
+# The control plane releases a fan-out's child tickets a capped number at a time
+# (`qiita_control_plane.fanout_dispatch`). These types are the operator-facing
+# surface over that throttle: read a cohort's state, retune its cap at runtime,
+# re-trigger a pump.
+
+
+class FanoutCohortKind(StrEnum):
+    """The three fan-out shapes, and the wire vocabulary addressing one.
+
+    A cohort is `(kind, key)`; the key is whichever idx the fan-out hangs off —
+    reference_idx for a shard build, mask_idx for read-mask blocks, alignment_idx
+    for align blocks. Mirrored by the cohort constructors in
+    `qiita_control_plane.fanout_dispatch`, which build their `kind` from this enum
+    so the wire value and the override-registry key cannot drift apart.
+
+    Not a Postgres ENUM: no column stores it. It names an in-memory cohort derived
+    from work_ticket columns, so the TEXT/CHECK carve-out does not apply either —
+    there is nothing persisted to mirror.
+    """
+
+    SHARD = "shard"
+    READ_MASK_BLOCK = "read_mask_block"
+    ALIGN_BLOCK = "align_block"
+
+
+# Ceiling on a runtime cap override. The throttle exists because ~1000 concurrent
+# data-plane streams exhausted the data plane's file descriptors; a typo'd 1000
+# would walk straight back into that. Lives here, beside the request model that
+# bounds on it, so the API's 422 and the registry's ValueError share one number.
+MAX_FANOUT_OVERRIDE = 100
+
+
+class FanoutCohortStatus(BaseModel):
+    """One cohort's throttle state.
+
+    `max_inflight` is the cap the next pump will apply; `override` says whether an
+    operator set it or it came from the FANOUT_MAX_INFLIGHT default. Both are
+    reported because the two reasons a pump releases nothing — no free slots, and
+    fail-stop — are otherwise indistinguishable from outside.
+    """
+
+    kind: FanoutCohortKind
+    key: int
+    label: str
+    total: int
+    held: int
+    running: int
+    failed: int
+    fail_stopped: bool
+    max_inflight: int
+    override: int | None
+
+
+class FanoutOverrideRequest(BaseModel):
+    """Body for PATCH /api/v1/work-ticket/fanout/{kind}/{key}.
+
+    `max_inflight` null clears the override, reverting the cohort to the
+    FANOUT_MAX_INFLIGHT default. The field is required so that clearing is an
+    explicit null rather than an omitted key — an empty body would otherwise read
+    as "leave it alone", which this route has no way to express.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_inflight: Annotated[int, Field(ge=1, le=MAX_FANOUT_OVERRIDE)] | None
+
+
+class FanoutPumpResponse(BaseModel):
+    """Returned by both PATCH and POST .../pump: what this call released, and the
+    cohort's state afterwards. An empty `released` is never ambiguous — read
+    `status.fail_stopped` and `status.held` to see which reason applied."""
+
+    released: list[int]
+    status: FanoutCohortStatus
+
+
+class FanoutListResponse(BaseModel):
+    """Returned by GET /api/v1/work-ticket/fanout — every cohort with held or
+    in-flight children. A cohort whose tickets are all terminal drops out."""
+
+    cohorts: list[FanoutCohortStatus]

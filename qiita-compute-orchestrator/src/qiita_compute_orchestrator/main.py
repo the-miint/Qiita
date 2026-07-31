@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from qiita_common.auth_constants import API_PREFIX
-from qiita_common.log import install_authorization_scrub
+from qiita_common.log import configure_logging, install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
 
 from .backend import ComputeBackend
@@ -65,6 +65,10 @@ def _build_backend(settings: Settings) -> ComputeBackend:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Must precede the scrubber, which attaches to root's handlers: uvicorn puts its
+    # handlers on its own loggers, so without this root has none and the scrubber is
+    # inert — bearer tokens in httpx logs would go out unscrubbed.
+    configure_logging()
     install_authorization_scrub()
     settings = Settings.from_env()
     # Install once so make_cp_client / get_settings hit the cached
