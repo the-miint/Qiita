@@ -33,6 +33,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
+from qiita_common.actions import ALIGN_ACTION_ID as _ALIGN_ACTION_ID
 
 from .actions.reference import ReferenceNotFound
 from .block_planner import (
@@ -58,10 +59,12 @@ from .runner import (
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
-# The action a block work_ticket is submitted against — the sharded `align`
-# workflow (`workflows/align/1.0.0.yaml`, synced out-of-tree via `qiita-admin
-# actions sync`).
-ALIGN_ACTION_ID = "align"
+# The version this submitter pins. The bare id lives in `qiita_common.actions`
+# (it is also the block-KIND discriminator the dispatch pump and the read-mask
+# finalize gate read, both of which must span every in-flight version); the
+# version is the submitter's own, per that module's contract. Re-exported here so
+# callers keep reading both off the planner that mints these tickets.
+ALIGN_ACTION_ID = _ALIGN_ACTION_ID
 ALIGN_ACTION_VERSION = "1.0.0"
 
 

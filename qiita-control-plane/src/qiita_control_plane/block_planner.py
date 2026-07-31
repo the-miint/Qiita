@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import asyncpg
+from qiita_common.actions import BLOCK_MASK_ACTION_ID as _BLOCK_MASK_ACTION_ID
 from qiita_common.host_filter_plan import (
     PoolPlanRefusal,
     SampleHostFilter,
@@ -161,12 +162,14 @@ def tile_partition(
 _MASK_FILTER_WORKFLOW = "read-mask"
 _MASK_FILTER_VERSION = "1.0.0"
 
-# The action a block work_ticket is submitted against — the bulk-block masking
-# workflow (`workflows/read-mask-block/1.0.0.yaml`, synced out-of-tree via
-# `qiita-admin actions sync`). Distinct from the mask filter identity above: the
-# ticket runs under "read-mask-block", but the mask it produces is minted under
-# the shared "read-mask" filter identity so it collapses with the per-sample path.
-BLOCK_MASK_ACTION_ID = "read-mask-block"
+# The action a block work_ticket is submitted against. Distinct from the mask
+# FILTER identity above: the ticket runs under "read-mask-block", but the mask it
+# produces is minted under the shared "read-mask" filter identity so it collapses
+# with the per-sample path. The bare id lives in `qiita_common.actions` (it is also
+# the block-KIND discriminator the dispatch pump and the read-mask finalize gate
+# read, both of which must span every in-flight version); the version is this
+# submitter's own, per that module's contract.
+BLOCK_MASK_ACTION_ID = _BLOCK_MASK_ACTION_ID
 BLOCK_MASK_ACTION_VERSION = "1.0.0"
 
 

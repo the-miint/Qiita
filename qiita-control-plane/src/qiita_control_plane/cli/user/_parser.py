@@ -40,6 +40,7 @@ from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
     _handle_pool_completion,
+    _handle_submit_align_pool,
     _handle_submit_bcl_convert,
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
@@ -1303,6 +1304,70 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_block.set_defaults(handler=_handle_submit_block_mask_pool)
+
+    p_submit_align = sub.add_parser(
+        "submit-align-pool",
+        help=(
+            "Align a whole pool against a sharded reference as bulk blocks (one"
+            " work-ticket per block), in a single server call."
+        ),
+        description=(
+            "Plan + submit a pool's bulk-block sharded alignment. Aligns the samples"
+            " whose reads are masked-complete under --mask-idx against the sharded"
+            " --reference-idx, tiling them into blocks and dispatching one"
+            " work-ticket per block under the per-alignment fan-out throttle."
+            " Alignment does NOT re-derive the mask config: you name the mask the"
+            " reads were produced under, so a pool masked any way (per-sample or"
+            " block; any host / adapter / lima / syndna config) aligns by pointing at"
+            " its mask_idx. The ALIGNER is not a caller choice either — the server"
+            " derives it from the run's sequencing platform (Illumina bowtie2,"
+            " PacBio HiFi / Nanopore minimap2) and reports it back, as it does the"
+            " block size. Samples that cannot be planned are reported, not fatal."
+        ),
+    )
+    p_submit_align.add_argument(
+        "--sequencing-run-idx",
+        type=int,
+        required=True,
+        help="sequencing_run_idx the pool belongs to (the route checks pool↔run).",
+    )
+    p_submit_align.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        required=True,
+        help="sequenced_pool_idx whose masked samples to align.",
+    )
+    p_submit_align.add_argument(
+        "--reference-idx",
+        type=int,
+        required=True,
+        help=(
+            "ACTIVE reference_idx to align against. Must be sharded (router +"
+            " per-aligner shard indexes built); the server refuses with 409"
+            " otherwise."
+        ),
+    )
+    p_submit_align.add_argument(
+        "--mask-idx",
+        type=int,
+        required=True,
+        help=(
+            "mask_idx the pool's reads were masked under. Only samples whose"
+            " mask_sample gate is 'completed' under it are aligned; the rest are"
+            " reported skipped."
+        ),
+    )
+    p_submit_align.add_argument(
+        "--only-missing",
+        action="store_true",
+        help=(
+            "Skip samples already carrying an alignment gate for the resolved"
+            " alignment (applied server-side), so an interrupted plan re-runs only"
+            " the gap. Off by default, which makes an already-gated pool a 409"
+            " rather than a silent partial re-plan."
+        ),
+    )
+    p_submit_align.set_defaults(handler=_handle_submit_align_pool)
 
     p_pool_completion = sub.add_parser(
         "pool-completion",

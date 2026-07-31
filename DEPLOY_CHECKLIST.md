@@ -39,7 +39,8 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#400) **A past `DELETE /alignment-definition` could silently wedge read-mask block fan-out; this deploy un-wedges it, retroactively.** The purge NULLs `work_ticket.alignment_idx`, which used to make an align block ticket look like a read-mask block of the `mask_idx` it still carries — so a `failed` one fail-stopped `read_mask_block_cohort(mask_idx)` and every later block-mask plan under that mask (a fleet-wide config hash) minted its tickets held and released none, returning a 202 that looked fine. Block kind now reads from `action_id`, so any already-detached tickets stop contaminating their cohort the moment the CP restarts. No cleanup, no query to run.
+- (#400) **Starting an alignment no longer needs hand-rolled `curl`:** `qiita submit-align-pool --sequencing-run-idx N --sequenced-pool-idx N --reference-idx N --mask-idx N [--only-missing]`. Client-side only. Its summary line reports the per-block read count, which is the cheapest way to catch a pool tiled by a stale planner at submit time rather than one walltime ceiling per block later.
 
 ---
 

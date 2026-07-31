@@ -88,6 +88,30 @@ READ_MASK_ACTION_ID = "read-mask"
 # which bcl-convert version produced it.
 BCL_CONVERT_ACTION_ID = "bcl-convert"
 
+# The two BLOCK-scoped actions' bare ids (their YAML lives at
+# workflows/read-mask-block/<version>.yaml and workflows/align/<version>.yaml).
+# Bare ids for the same reason as the two above — and here the version-agnosticism
+# is load-bearing rather than incidental: these tag a block ticket's KIND, and both
+# the fan-out throttle and the read-mask finalize gate must span every in-flight
+# version of an action at once. Filtering those on version would split one cohort's
+# concurrency accounting across a routine version bump. Each submitter still pins
+# its own version separately (`block_planner.BLOCK_MASK_ACTION_VERSION`,
+# `align_planner.ALIGN_ACTION_VERSION`).
+#
+# **Kind is read from action_id, never from `alignment_idx IS NULL`.** An align
+# block ticket carries BOTH `mask_idx` and `alignment_idx`, so the absence of an
+# alignment reads like "this is a read-mask block" — and
+# `work_ticket.alignment_idx` is `ON DELETE SET NULL`, so purging an alignment
+# produces exactly that shape from a ticket that is not a read-mask block at all.
+# Consumers that got this wrong dropped purged align tickets into the read-mask
+# cohort of the mask_idx they still carried, where one `failed` member fail-stops
+# the whole fan-out. `action_id` is NOT NULL and no FK action can clear it.
+# `block_read.resolve_block_read_scope` reaches the same conclusion from the other
+# direction, for a sharper reason: trusting the nulled column there would stream
+# raw, non-host-depleted reads into an aligner.
+BLOCK_MASK_ACTION_ID = "read-mask-block"
+ALIGN_ACTION_ID = "align"
+
 
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
