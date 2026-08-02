@@ -314,6 +314,25 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **An escalated memory/walltime floor now survives a restart or a redrive, instead
+  of restarting the ladder from the YAML baseline (#415, closes #413).** The floor
+  `_run_entry_with_retry` climbs on an OOM/TIMEOUT retry lived only in a local
+  variable, so a control-plane restart or a `/run` redrive discarded it and the
+  ticket re-burned a failing attempt getting back to a size it had already reached.
+  Observed on `long-read-assembly` tickets 6978 / 6980 / 6989: each auto-escalated
+  `assemble` from 192 GB to 384 GB, then came back at 192 GB after the redrive and
+  had to OOM again (~40 min apiece) before re-climbing. Deriving the floor from
+  `work_ticket_step` history would not have covered it — the redrive DELETEs every
+  `failed` row in the same transaction as the state reset — so the floor is now
+  persisted on the ticket itself, in a new `qiita.work_ticket.escalated_resource_floor`
+  JSONB column keyed **per step**, so a ticket that learned `assemble` needs 384 GB
+  doesn't also hand 384 GB to `bin_refine` (YAML: 32) the way the ticket-wide
+  `resource_override` would. Both escalating axes are covered, written independently
+  and merged, so raising the memory floor never drops a walltime floor the same step
+  learned earlier. On a CP restart the saving is more than wall-clock: `retry_count`
+  survives a resume while the floor did not, so the re-climb also spent a rung of a
+  3-rung budget. The column's own `COMMENT ON` carries the semantics, including how
+  to clear it.
 - **Single-end blocks no longer pay double the rype index reads: the routing classify
   gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
   `rype_classify` a relation with a `sequence2` column that is entirely NULL for
