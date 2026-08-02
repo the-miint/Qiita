@@ -334,10 +334,11 @@ def _write_annotation(
     GFF3 `ID`: the spec lets a discontinuous feature repeat one ID across N lines, so it
     is carried as provenance and joined on by nothing.
 
-    Coordinates pass through VERBATIM. They were converted from GFF3's closed
-    `[start, end]` to half-open `[position, stop_position)` exactly once, at ingest, in
-    `hash_sequences._write_annotation_manifest`. Re-deriving or "correcting" them here
-    would be a second conversion.
+    Coordinates pass through VERBATIM. They are 1-based half-open
+    `[position, stop_position)`, settled once at ingest in
+    `hash_sequences._write_annotation_manifest` — which is the single place that
+    reconciles whatever convention `read_gff` currently emits with the one we store.
+    Re-deriving or "correcting" them here would be a second conversion.
 
     Unlike taxonomy's coverage checks (which warn), an unresolved row here is fatal: it
     would emit a lake row whose `annotation_idx` or `feature_idx` is NULL, and a feature

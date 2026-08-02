@@ -3,20 +3,23 @@
 miint's `read_gff` is NOT stubbed here. The whole point of this file is to pin what
 the extension actually does, because the two things it gets wrong fail SILENTLY:
 
-  1. `read_gff`'s `stop_position` is GFF3's 1-based CLOSED end; `alignment_slice` /
-     `read_alignments` / `qiita_lake.alignment` all speak 1-based HALF-OPEN. Both
-     spell the column `stop_position`. Feeding one to the other type-checks, runs,
-     raises nothing — and quietly drops the interval's last base from every
-     coverage number computed downstream forever.
+  1. `read_gff`'s `stop_position` is 1-based HALF-OPEN, matching `alignment_slice` /
+     `read_alignments` / `qiita_lake.alignment`, so the ingest stores it verbatim.
+     It has NOT always been: it emitted GFF3's own CLOSED end until upstream
+     normalized it, changing the value by one without changing the column's name or
+     type. Nothing raises either way — a mismatch just adds or drops the interval's
+     last base in every coverage number computed downstream forever, which is why
+     the assertions below are written against the GFF3 TEXT rather than against
+     whatever the reader currently returns.
   2. The extracted sub-sequence's canonical hash IS the annotated feature's
      identity. An off-by-one in the `substr` mints a DIFFERENT feature_idx that
      still looks perfectly well-formed.
 
-So the assertions are: the conversion happens (stop = gff_stop + 1), the window
-round-trips to the exact insert bytes, and — the one that actually matters — the
-STORED window drives `alignment_slice` with no further adjustment and recovers the
-insert exactly. That last one is what a future reader needs, because it is the
-claim every consumer depends on.
+So the assertions are: the stored window is one past the GFF3 text's closed stop,
+the window round-trips to the exact insert bytes, and — the one that actually
+matters — the STORED window drives `alignment_slice` with no further adjustment and
+recovers the insert exactly. That last one is what a future reader needs, because it
+is the claim every consumer depends on.
 """
 
 from __future__ import annotations
@@ -142,15 +145,23 @@ def _standard_gff(tmp_path: Path) -> Path:
 
 
 def test_annotation_window_is_half_open(tmp_path):
-    """THE off-by-one. GFF3 says the insert ends at 3000, inclusive. We must store
-    3001, exclusive — and the length must come out as stop - position, no +1."""
+    """THE off-by-one. The GFF3 text says the insert ends at 3000, inclusive. We
+    must store 3001, exclusive — and the length must come out as stop - position,
+    no +1.
+
+    Stated against the GFF3 TEXT, not against what `read_gff` returns, so it holds
+    whichever convention the reader uses. It is the tripwire on both directions of
+    that: `read_gff` is half-open today and the ingest stores its `stop_position`
+    verbatim, so a reader that went back to closed would land 3000 here, and an
+    ingest that re-added the old `+ 1` would land 3002."""
     out = _run(tmp_path, gff=_standard_gff(tmp_path))
     (ann,) = _annotations(out["annotation_manifest"])
 
     assert ann["position"] == _GFF_START
     assert ann["stop_position"] == _EXPECTED_STOP_HALFOPEN, (
-        "stored stop_position must be the GFF3 CLOSED stop + 1 (half-open), or every "
-        "downstream coverage number silently loses the interval's last base"
+        "stored stop_position must be one PAST the GFF3 text's closed stop "
+        "(half-open), or every downstream coverage number silently loses the "
+        "interval's last base"
     )
     assert ann["stop_position"] - ann["position"] == _INSERT_LEN
     # The interval's length is NOT a stored column: it is stop - position, and a stored
@@ -418,15 +429,20 @@ def test_two_annotations_with_identical_bases_are_KEPT(tmp_path):
 
 def test_embedded_fasta_section_is_not_parsed_as_annotations(tmp_path):
     """prokka and bakta ALWAYS append the genome to their GFF3 as a `##FASTA` section,
-    and `read_gff` does not stop there — it returns one row per line of the embedded
-    FASTA, with the nucleotide line itself sitting in `seqid` and NULL in every other
-    column. On a real prokka file that is 1539 junk rows behind 99 real features.
+    so `--gff` is unusable on the output of the two most common bacterial annotators
+    unless that section stays out of the annotation rows. On a real prokka file it is
+    1539 embedded-FASTA lines behind 99 real features.
 
-    Un-filtered, those rows reach the parent check and the ingest dies claiming a line
-    of nucleotides is not a sequence in the FASTA. So `--gff` would be unusable on the
-    output of the two most common bacterial annotators there are.
+    Asserted at TWO levels, because the ingest-level assertion alone cannot fail.
+    `read_gff` used to return one row per FASTA line — the nucleotide line in `seqid`,
+    NULL everywhere else — which the ingest filtered with `WHERE type IS NOT NULL`.
+    Upstream now stops at the directive, so that filter came out. But NULL-`type` rows
+    would still be dropped even if they came back, because the surviving landmark
+    predicate is `lower(type) NOT IN (…)` and SQL's three-valued logic excludes a NULL
+    from it. So the ingest-level check below passes on either reader, and only the
+    reader-level one is a real tripwire on upstream.
 
-    The CONTROL is the second half: the byte-identical GFF3 WITHOUT the `##FASTA`
+    The CONTROL is the third part: the byte-identical GFF3 WITHOUT the `##FASTA`
     section must give the same answer. If it didn't, this test would be pinning the
     wrong thing.
     """
@@ -435,6 +451,20 @@ def test_embedded_fasta_section_is_not_parsed_as_annotations(tmp_path):
         [(_PLASMID_READ_ID, _GFF_START, _GFF_STOP_CLOSED, "ID=insert_01")],
         fasta_section=_PLASMID,
     )
+
+    # Reader level: the tripwire. `read_gff` must yield ONE row — the single feature
+    # line — and not the FASTA lines behind it. This is what fails if the reader
+    # regresses; the manifest-level assertion below would not.
+    with open_miint_conn() as conn:
+        raw = conn.execute(
+            "SELECT count(*), count(type) FROM read_gff(?)", [str(with_fasta)]
+        ).fetchone()
+    assert raw == (1, 1), (
+        f"read_gff returned {raw[0]} row(s) ({raw[1]} with a type) for a 1-feature GFF3 "
+        "with an embedded ##FASTA section; it has stopped stopping at the directive, "
+        "and the ingest's landmark filter is now the only thing dropping those rows"
+    )
+
     anns = _annotations(_run(tmp_path, gff=with_fasta)["annotation_manifest"])
     assert [a["annotation_id"] for a in anns] == ["insert_01"], (
         "the ##FASTA section must not become annotation rows"

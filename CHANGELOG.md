@@ -314,6 +314,55 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Annotation intervals are no longer one base too long after the miint mirror bump
+  (#417, closes #410).** The mirror moved from `6ae77c7` to `2b2841e`, which
+  normalized `read_gff.stop_position` to 1-based HALF-OPEN — matching every other
+  reader, and matching what the annotation ingest stores. The column's name and type
+  did not change, only its value, by one, so nothing failed at bind: the ingest's
+  `+ 1` closed→half-open conversion silently became a DOUBLE conversion. Verified by
+  probe on both builds — a feature written `2001\t2400` in the GFF3 text comes back
+  `stop_position = 2401` on the new build and `2400` on the old. The `+ 1` and the
+  `gff_stop_closed` alias are gone; `stop_position` is stored verbatim.
+  `test_annotation_window_is_half_open` now states its expectation against the GFF3
+  **text** rather than against what `read_gff` returns, so it is a tripwire in both
+  directions.
+
+- **`read_gff`'s `##FASTA` workaround is retired (duckdb-miint#186 fixed).** The
+  reader now stops at the directive — verified: a 2-feature file with an embedded
+  FASTA section returns 2 rows on `2b2841e`, and 5 (three of them nucleotide lines in
+  `seqid`) on `6ae77c7`. The ingest's `WHERE type IS NOT NULL` filter is removed and
+  the row is gone from the [Open upstream gaps](docs/duckdb-miint.md) table.
+  `test_embedded_fasta_section_is_not_parsed_as_annotations` gains a **reader-level**
+  assertion (`read_gff` yields exactly one row for a one-feature file with an embedded
+  section) — its existing manifest-level assertion passes on BOTH builds, because
+  NULL-`type` rows are still excluded implicitly by the surviving landmark predicate's
+  three-valued logic, so only the new assertion is a real tripwire on upstream.
+  Verified to fail on `6ae77c7` (69 rows) and pass on `2b2841e`.
+
+- **`_sq_reference_names` no longer hand-parses the BGZF header (duckdb-miint#174
+  fixed).** Re-probing the mirror for the two behaviours CI caught surfaced a third:
+  **`read_alignment_header(path)` now exists**, returning `(tid, name, length)` per
+  reference in header order. The test helper that hand-decoded the BAM container
+  (magic → `l_text` → `n_ref` → per-reference records) is replaced by it, and that row
+  is gone from the gaps table too. Nothing could have caught this drift — an absent
+  function cannot fail a test, unlike the three claims that did fire.
+
+- **The `@SQ`-order contract is re-probed and re-stated: it is name-sorted (#417).**
+  Two canary tests in `test_assembly_coverage.py` fired on the mirror bump, exactly as
+  designed. Re-probing across n = 3/5/10/64/300 with the `REFERENCE_LENGTHS` table
+  built ASC, DESC **and shuffled** shows all three inputs now yield the *same*,
+  lexicographically name-sorted `@SQ`; the old build yields three different orders,
+  none derivable. The shuffled arm is what distinguishes name-sorting from
+  input-echoing — an ASC-only check would have concluded "tracks the input", which is
+  what the old failure message guessed. A follow-up probe with per-contig lengths
+  shuffled independently of the names rules out a `(length, name)` key, which every
+  earlier fixture had held constant at 1000 and so could not have detected; the test
+  fixture now varies length too, and asserts that it does. Both tests now pin the new
+  contract.
+  **`binning.sh`'s `samtools sort` is deliberately NOT retired here**: a name-sorted
+  `@SQ` does make a record-side name order tid-monotonic, but that has to be checked
+  against jgi on real records rather than inferred from the header — still #374.
+
 - **Single-end blocks no longer pay double the rype index reads: the routing classify
   gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
   `rype_classify` a relation with a `sequence2` column that is entirely NULL for

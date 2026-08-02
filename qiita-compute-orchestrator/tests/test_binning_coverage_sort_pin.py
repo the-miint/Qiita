@@ -4,11 +4,11 @@ metaWRAP guards its own `bwa mem` AND its own `samtools sort` behind one
 `if [[ ! -f <out>/work_files/<sample>.bam ]]`. The workflow pre-places that BAM
 to skip bwa (a short-read aligner) in favour of a minimap2 pre-map -- which
 silently skips the sort along with it. And the writer's output was not sorted to
-begin with: a BAM is coordinate-sorted by tid, i.e. by `@SQ` index, and miint's
-`@SQ` order is not derivable from the REFERENCE_LENGTHS table it is built from
-(duckdb-miint#173), so the reference-NAME `ORDER BY` the step used to apply was
-never the sort it looked like. `jgi_summarize_bam_contig_depths` refuses such a
-file outright:
+begin with: a BAM is coordinate-sorted by tid, i.e. by `@SQ` index, and at the time
+miint's `@SQ` order was not derivable from the REFERENCE_LENGTHS table it is built
+from (duckdb-miint#173), so the reference-NAME `ORDER BY` the step used to apply
+was never the sort it looked like. `jgi_summarize_bam_contig_depths` refuses such
+a file outright:
 
     ERROR: the bam file 'reads.bam' is not sorted!
 
@@ -31,15 +31,25 @@ it therefore cannot prove the command *works*, only that it is still there and
 still shaped correctly. Correct-operation evidence lives in the skipped test
 above and in the deploy-checklist verify step.
 
-The sort stays until duckdb-miint#173 lands -- a request for a defined or
-steerable `@SQ` order -- and its removal is tracked (see the "Open upstream gaps"
-table in docs/duckdb-miint.md, which carries the exit criteria). Until then it is
-load-bearing, and nothing HERE pins that miint's order is still undefined: the
-canary is `test_sq_order_is_not_derivable_from_reflen` in
-`jobs/test_assembly_coverage.py`, which fails the moment `@SQ` gains a defined
-order. If that test starts failing, this sort has become pure cost (~19 s and a
-second reads-sized artifact per ticket) -- but removing it still needs a fresh
-probe of miint's writer, not an inference from its changelog.
+**duckdb-miint#173 has partly landed, and the sort stays.** That issue asked for a
+defined or steerable `@SQ` order; upstream delivered the defined half -- `@SQ` is
+now the reference-NAME order, re-probed on mirror build 2b2841e and pinned by
+`test_sq_order_is_name_sorted_regardless_of_reflen` in
+`jobs/test_assembly_coverage.py`. An earlier version of this docstring named
+exactly that event as the point where this sort "has become pure cost". **That was
+wrong, and acting on it would reintroduce the production failure above.**
+
+A defined `@SQ` order makes tid order and NAME order agree. It does not order the
+step's RECORDS, and `assembly_coverage` still applies no `ORDER BY` -- so the file
+this sort receives is still not coordinate sorted, and the sort is still
+load-bearing.
+
+Retiring it needs BOTH halves, in this order: `assembly_coverage` ordering its
+records by (reference, position), AND a probe showing `jgi_summarize_bam_contig_depths`
+accepts the result on real records -- not inferred from the header, and not from
+miint's changelog. The "Open upstream gaps" table in docs/duckdb-miint.md carries
+the removal ticket and those exit criteria. Cost until then: ~19 s and a second
+reads-sized artifact per ticket.
 """
 
 from __future__ import annotations

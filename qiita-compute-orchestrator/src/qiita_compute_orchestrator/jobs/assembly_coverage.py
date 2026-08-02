@@ -42,18 +42,26 @@ notes below are what a probe against the shipped build adds on top:
     length mismatches, jgi accepts with no warnings. This is why keeping secondaries
     (no `max_secondary := 0`, unlike syndna/host_filter) is safe here.
 
-THIS BAM IS NOT COORDINATE SORTED, and cannot be made so here. A BAM's sort order
-is on *tid* — the @SQ index — and the @SQ order miint's writer emits is not
-derivable from the REFERENCE_LENGTHS table's row order (probed; filed upstream as
-duckdb-miint#173, which asks for a defined or steerable @SQ order — see
-docs/duckdb-miint.md's "Open upstream gaps" table for the removal ticket). So no
-ORDER BY on either the reflen table or the copied relation can produce a
-coordinate sort, and none is attempted: whoever needs one runs `samtools sort`,
-which `binning.sh` does before staging this file for metaWRAP. Do not add a reflen
-ORDER BY back in the belief that it steers @SQ — an earlier version of this step
-did exactly that, called the BAM correct by construction, and cost a production
-ticket (jgi: "ERROR: the bam file 'reads.bam' is not sorted!").
-`tests/jobs/test_assembly_coverage.py` pins the finding.
+THIS BAM IS NOT WRITTEN COORDINATE SORTED, and this step does not try to make it
+so. A BAM's sort order is on *tid* — the @SQ index — and @SQ is emitted sorted by
+contig NAME, independent of the REFERENCE_LENGTHS table's row order (re-probed
+2026-08-02 on mirror build 2b2841e across several contig counts, input orders and
+non-uniform lengths; upstream gave @SQ a defined order in response to
+duckdb-miint#173). The reflen table's row
+order therefore steers nothing, and no ORDER BY is attempted on it.
+
+That @SQ is name-sorted does mean a record-side `ORDER BY reference, position`
+would now be tid-monotonic — which is the premise for retiring `binning.sh`'s
+`samtools sort`. That retirement is NOT taken here: it needs the record side
+checked against jgi itself rather than inferred from the header, and it is tracked
+separately with its own exit criteria. Until then `binning.sh` keeps sorting, and
+this step keeps writing unsorted.
+
+Do not add a reflen ORDER BY back in the belief that it steers @SQ — an earlier
+version of this step did exactly that, called the BAM correct by construction, and
+cost a production ticket (jgi: "ERROR: the bam file 'reads.bam' is not sorted!").
+`tests/jobs/test_assembly_coverage.py` pins the current @SQ contract in both
+directions.
 
 WHY `SEQUENCE_DATA` IS NOT OPTIONAL. By default `FORMAT BAM` writes SEQ as `*`,
 and that silently corrupts the depth jgi reports. Coverage ramps DOWN at both
@@ -288,12 +296,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # see the module docstring. Without it SEQ is written as `*`, and
             # jgi silently reports a length-dependent under-estimate of depth.
             #
-            # No ORDER BY on the copied relation either, and this one had a price:
-            # it sorted a read-set-sized relation, which the memory split above
-            # says outright can spill to temp_directory. It bought a name order
-            # that is not the tid order, so it was never the coordinate sort it
-            # looked like, and its only consumer (`binning.sh`) re-sorts with
-            # samtools regardless.
+            # No ORDER BY on the copied relation either, and this one would have a
+            # price: it would sort a read-set-sized relation, which the memory split
+            # above says outright can spill to temp_directory. Now that @SQ is name-sorted a
+            # name ORDER BY here WOULD be tid-monotonic — but its only consumer
+            # (`binning.sh`) re-sorts with samtools regardless, so adding it back
+            # buys nothing until that sort is retired, which is tracked separately.
             conn.execute(
                 f"COPY (SELECT * FROM {_ALIGNMENT}) "
                 f"TO '{bam_sql}' (FORMAT BAM, REFERENCE_LENGTHS '{_REFLEN}', "

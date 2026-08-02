@@ -176,8 +176,8 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- full: qiita-control-plane/db/migrations/20260713020000_reference_annotation.sql
         --
         -- Coordinates are 1-based HALF-OPEN [position, stop_position) — matching
-        -- read_alignments / alignment_slice / qiita_lake.alignment, NOT the closed
-        -- convention GFF3 arrives in. Converted once, at ingest, in hash_sequences.
+        -- read_alignments / alignment_slice / qiita_lake.alignment. Settled once, at
+        -- ingest, in hash_sequences; never re-derived downstream.
         --
         -- `attributes` is kept RAW and lossless (it is what the GFF3 said). The
         -- normalized cross-references parsed out of it live in Postgres as
