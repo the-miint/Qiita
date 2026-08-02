@@ -255,6 +255,18 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **Arrow IPC and gRPC compression codecs are compiled into the data plane, and
+  a harness measures them.** `arrow-ipc` is now a direct dependency with
+  `lz4`/`zstd` on (`arrow-flight` pulled it featureless, so
+  `IpcWriteOptions::batch_compression_type` was a runtime error, not a
+  fallback), and `tonic` carries `gzip`/`zstd`. Both are **inert** — nothing
+  sets a codec or calls `send_compressed`, so every DoGet stream is byte-identical
+  to before. `qiita-data-plane/tests/harness/` reports encoded bytes, encode and
+  decode time for a given (codec, dictionary handling, batch geometry) setting,
+  plus real socket bytes for a gRPC round trip; `tests/compression.rs` calibrates
+  it against inputs whose answer is known in advance. The harness refuses to
+  report a measurement whose record-batch messages do not carry the codec that
+  was asked for — a silent fallback would make every number derived from it a lie.
 - **Two DuckDB memory behaviours job code reasons about are now pinned by test
   (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
   in-memory `CREATE TABLE` far larger than `memory_limit` **spills to

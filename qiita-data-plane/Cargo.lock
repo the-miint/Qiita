@@ -216,6 +216,8 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "lz4_flex",
+ "zstd",
 ]
 
 [[package]]
@@ -1803,12 +1805,14 @@ version = "2026.3.0"
 dependencies = [
  "arrow-array",
  "arrow-flight",
+ "arrow-ipc",
  "arrow-schema",
  "base64",
  "duckdb",
  "ed25519-dalek",
  "futures",
  "parquet",
+ "prost",
  "serde",
  "serde_json",
  "serial_test",
@@ -2679,6 +2683,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "flate2",
  "h2",
  "http",
  "http-body",
@@ -2696,6 +2701,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
