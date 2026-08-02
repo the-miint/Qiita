@@ -22,6 +22,39 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A dead escalation ladder is now caught at build time, not in production
+  (#416, closes #412).** A workflow whose `action_ceiling` equals its heaviest
+  step's `baseline_resources` silently disables OOM/TIMEOUT retry for it: the
+  runner grows the escalation floor by a fixed factor and clamps it to the
+  ceiling, so an equal pair leaves the grown value unchanged, which the retry
+  loop reads as saturation and fails the ticket **permanently at
+  `retry_count=0`** with `RESOURCE_CEILING_EXHAUSTED`. Nothing caught that — not
+  the model, not the loader, not `qiita-admin actions sync` — so it surfaced only
+  as a live incident. `ActionDefinition.steps_without_escalation_headroom()`
+  reports every step whose `mem_gb`/`walltime` is not strictly below the ceiling
+  (checking each lookup profile independently, so bcl-convert's NovaSeq X is
+  distinguishable from its iSeq), and a new test enumerates every shipped YAML
+  against it. `cpu`/`gpu` are exempt — nothing escalates them, so
+  long-read-assembly's deliberate `cpu: 32` pin is not a finding. The list is
+  matched for **exact** equality in both directions, so an entry whose workflow
+  was since re-sized fails as stale rather than quietly outliving its reason.
+  The six action versions carrying the defect today — across four workflow
+  directories, `fastq-to-parquet` contributing three (#411) — are listed as
+  known-pending in a separate dict rather than fixed here, so re-sizing each one
+  (which needs measured peak-RSS data per workflow, not a blanket multiplier)
+  must delete its entry to go green. `align/1.0.0` is the one genuine accept,
+  documented at the step itself.
+  This closes the **YAML-authored** half of the defect; a
+  `resource_override.mem_gb` submitted equal to the ceiling still reproduces it
+  at runtime, on a workflow this guard passes.
+
+- **A baseline above its ceiling is now caught at build time too (#416).**
+  `ActionDefinition.steps_over_ceiling()` plus an unconditional test — no accept
+  list, since a workflow whose every ticket fails at dispatch is never intended.
+  Split from the headroom guard deliberately: an accept meaning "this step
+  knowingly forgoes retry" would otherwise silently also cover "this step can
+  never run" if the accepted baseline later drifted past the ceiling.
+
 - **`qiita submit-align-pool`: a CLI for starting an alignment (#400, closes #396).**
   `align-plan` was the only pool-scale entrypoint with no client — the sole way to
   align a pool was a hand-rolled `curl` with a hand-built JSON body, while its
@@ -883,6 +916,12 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`BaselineResources.as_flat()` is now the single narrowing of the flat
+  population (#416).** The runner's dispatch path and the new headroom queries
+  both resolve through it instead of each re-asserting the three Optional fields
+  and rebuilding a `FlatBaselineResources` by hand, so what actually runs and what
+  the guard checks cannot drift.
 
 - **`align_sharded` hands the aligner a materialized query relation instead of the lazy
   Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
