@@ -286,15 +286,9 @@ def _resolve_baseline_for_step(
             )
         resolved = br.profiles[key]
     else:
-        # Flat population. model_validator guarantees all three required
-        # fields are populated; the asserts narrow the Optional types
-        # without runtime cost on the happy path.
-        assert br.cpu is not None
-        assert br.mem_gb is not None
-        assert br.walltime is not None
-        resolved = FlatBaselineResources(
-            cpu=br.cpu, mem_gb=br.mem_gb, walltime=br.walltime, gpu=br.gpu
-        )
+        # Flat population, taken verbatim. The model owns the narrowing from the
+        # Optional flat fields its validator already guaranteed.
+        resolved = br.as_flat()
 
     # plan() down-size (raise-NEVER), applied BEFORE the raise-only floors so an
     # OOM/TIMEOUT retry (whose floor is seeded from the YAML baseline) always
