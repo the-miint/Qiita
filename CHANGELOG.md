@@ -446,17 +446,13 @@ duplicates further down are historical strata; leave them where they are.
   future re-enable restoring a dead ladder, not a fix for traffic. Retiring them outright
   is the better answer and is deliberately not attempted here — `actions sync` has no
   prune path, so it needs a DB call as well as a YAML deletion.
-- **A test now enforces the invariant across every shipped workflow (#420, closes #411).**
-  `test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis` loads all action
-  YAML and fails on any step whose `mem_gb` or `walltime` baseline is not strictly below its
-  `action_ceiling`, including each profile of a `from_step_output` lookup population — so it
-  also catches the strictly-worse `baseline > ceiling`, which until now was caught only at
-  dispatch, after a ticket had been submitted. `cpu`/`gpu` are deliberately exempt.
-  `align/1.0.0`'s deliberate accept is the sole `_CEILING_HEADROOM_ACCEPTS` entry, keyed
-  narrowly by `(action_id, version, step, axis)` so its walltime axis is still checked, and
-  the test fails if an accept outlives the equality it documents.
-  `test_load_actions_loads_on_disk_bcl_convert_yaml` asserted the defect — that the ceiling
-  *equals* the NovaSeq X profile — and now asserts headroom above it instead.
+- **The six workflows tracked in `_ESCALATION_PENDING_RESIZE` are re-sized, so that dict
+  is now empty (#420, closes #411).** #421 landed the build-time guard and listed the six
+  defective versions there rather than fixing them, because re-sizing each needs measured
+  peak-RSS data per workflow. Raising their ceilings deletes their entries — the guard's
+  exact-equality check fails while a suppression outlives its reason, so the two changes
+  interlock rather than merely coexisting. The dict itself stays, empty: the guard's
+  failure message points a future tracked-but-unfixed defect at it.
 - **Single-end blocks no longer pay double the rype index reads: the routing classify
   gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
   `rype_classify` a relation with a `sequence2` column that is entirely NULL for
