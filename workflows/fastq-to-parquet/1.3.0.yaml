@@ -213,9 +213,10 @@ steps:
 # shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
 # are unchanged here; cpu/gpu never escalate.
 #
-# host_filter peaks at 25.8 GB against its 32 GB baseline — real demand, since it
+# host_filter peaks at 25.8 GB against a 32 GB baseline — real demand, since it
 # deliberately does not size DuckDB from the cgroup (jobs/host_filter.py). ~6 GB
-# of margin is what the ladder has to absorb.
+# of margin is what the ladder has to absorb. Measured on the read-mask family,
+# which carries the host_filter traffic; same module, so the sizing carries.
 action_ceiling:
   cpu: 8
   mem_gb: 64

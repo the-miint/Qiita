@@ -439,7 +439,11 @@ duplicates further down are historical strata; leave them where they are.
   Step *baseline* sizing is deliberately out of scope — `fastq-to-parquet/1.1.0` and
   `1.2.0` keep a 16 GB `host_filter` baseline and so still pay an OOM plus a retry to
   reach 32; raising a baseline changes what every healthy ticket requests, which is a
-  separate call from giving a failing one somewhere to climb.
+  separate call from giving a failing one somewhere to climb. Note `1.0.0`/`1.1.0`/`1.2.0`
+  are disabled in `qiita.action` with no live tickets: their raise is insurance against a
+  future re-enable restoring a dead ladder, not a fix for traffic. Retiring them outright
+  is the better answer and is deliberately not attempted here — `actions sync` has no
+  prune path, so it needs a DB call as well as a YAML deletion.
 - **A test now enforces the invariant across every shipped workflow (#420, closes #411).**
   `test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis` loads all action
   YAML and fails on any step whose `mem_gb` or `walltime` baseline is not strictly below its
