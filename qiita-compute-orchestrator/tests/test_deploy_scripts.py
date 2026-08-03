@@ -25,6 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
 _BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
+_LAKE_SHELL = _REPO_ROOT / "scripts" / "lake-shell.sh"
 
 # The scripts introduced/maintained for the deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
@@ -620,3 +621,131 @@ def test_missing_sources_some_missing_returns_one_and_lists_them(tmp_path: Path)
     missing = set(result.stdout.split())
     assert missing == {"gone.rpm", "also-gone.rpm"}
     assert "present.rpm" not in missing
+
+
+# --- scripts/lake-shell.sh: the read-only DuckLake/CP shell. Sources
+# deploy/_common.sh for read_env_var + qiita_split_conn_password, so it gets the
+# same bash -n + shellcheck gate as the deploy scripts. ------------------------
+
+
+def test_lake_shell_exists_and_executable() -> None:
+    assert _LAKE_SHELL.is_file(), f"{_LAKE_SHELL} missing"
+    assert _LAKE_SHELL.stat().st_mode & 0o111, f"{_LAKE_SHELL} is not executable"
+
+
+def test_lake_shell_is_valid_bash() -> None:
+    result = subprocess.run(["bash", "-n", str(_LAKE_SHELL)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for lake-shell.sh:\n{result.stderr}"
+
+
+def test_lake_shell_passes_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
+    result = subprocess.run(
+        ["shellcheck", "-S", "warning", str(_LAKE_SHELL)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"shellcheck flagged lake-shell.sh:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_lake_shell_derives_data_path_exactly_like_the_data_plane() -> None:
+    """DuckLake pins DATA_PATH into the catalog at creation and rejects an attach
+    whose DATA_PATH differs by even a slash, so the script must reproduce
+    config.rs's bare `format!("{path_persistent_raw}/ducklake")` — no trailing-slash
+    normalization. A `${PERSISTENT%/}` here breaks every host whose
+    PATH_PERSISTENT ends in `/`."""
+    body = _LAKE_SHELL.read_text()
+    assert 'DATA_PATH="${PERSISTENT}/ducklake"' in body
+    assert "PERSISTENT%/" not in body
+
+
+def _call_split_conn_password(connstr: str) -> list[str]:
+    """Returns [sanitized, user, password] as the helper echoes them."""
+    result = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_split_conn_password "$1"', "_", connstr],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.rstrip("\n").split("\t")
+
+
+@pytest.mark.parametrize(
+    ("connstr", "expected"),
+    [
+        # libpq key=value: password lifted out, remaining whitespace collapsed.
+        (
+            "dbname=lake host=db port=5432 user=lake_rw password=s3cr3t sslmode=prefer",
+            ["dbname=lake host=db port=5432 user=lake_rw sslmode=prefer", "lake_rw", "s3cr3t"],
+        ),
+        # libpq with no password at all (peer auth): untouched.
+        (
+            "dbname=lake host=db user=lake_rw",
+            ["dbname=lake host=db user=lake_rw", "lake_rw", ""],
+        ),
+        # postgres:// URI: credentials come out of the authority section.
+        (
+            "postgresql://cp_rw:pw@db:5432/qiita",
+            ["postgresql://cp_rw@db:5432/qiita", "cp_rw", "pw"],
+        ),
+        # URI with a user but no password.
+        (
+            "postgresql://cp_rw@db:5432/qiita",
+            ["postgresql://cp_rw@db:5432/qiita", "cp_rw", ""],
+        ),
+        # A ':' inside the password is legal unencoded and must not truncate it.
+        (
+            "postgresql://cp_rw:pa:ss@db/qiita",
+            ["postgresql://cp_rw@db/qiita", "cp_rw", "pa:ss"],
+        ),
+    ],
+)
+def test_split_conn_password_extracts(connstr: str, expected: list[str]) -> None:
+    assert _call_split_conn_password(connstr) == expected
+
+
+@pytest.mark.parametrize(
+    "connstr",
+    [
+        # Percent-encoded URI password: pgpass wants the DECODED value, so the
+        # helper must decline rather than hand libpq the still-encoded string.
+        "postgresql://cp_rw:pa%40ss@db/qiita",
+        # No username to key a pgpass entry on.
+        "dbname=lake host=db password=s3cr3t",
+    ],
+)
+def test_split_conn_password_declines_when_it_cannot_key_a_pgpass_entry(connstr: str) -> None:
+    sanitized, _user, password = _call_split_conn_password(connstr)
+    assert password == "", "password must not be lifted out when it cannot be keyed"
+    assert sanitized == connstr, "connstr must be left intact for the caller to use as-is"
+
+
+def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path: Path) -> None:
+    """miint is a core dependency, so the shell must fail LOUD rather than open a
+    session whose bioinformatics functions differ from production's. Everything
+    else it needs is present here — only MIINT_EXTENSION_DIRECTORY is missing."""
+    persistent = tmp_path / "persistent"
+    (persistent / "ducklake").mkdir(parents=True)
+    dp_env = tmp_path / "data-plane.env"
+    dp_env.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=localhost user=lake_rw'\n"
+        f"PATH_PERSISTENT={persistent}\n"
+    )
+    cp_env = tmp_path / "control-plane.env"
+    cp_env.write_text("DATABASE_URL='postgresql://cp_rw@localhost:5432/qiita'\n")
+
+    env = {
+        **os.environ,
+        "DP_ENV": str(dp_env),
+        "CP_ENV": str(cp_env),
+        "CO_ENV": str(tmp_path / "absent.env"),
+        "QIITA_DUCKDB_BIN": "/bin/true",
+    }
+    env.pop("MIINT_EXTENSION_DIRECTORY", None)
+
+    result = subprocess.run(
+        ["bash", str(_LAKE_SHELL), "-c", "SELECT 1"], capture_output=True, text=True, env=env
+    )
+    assert result.returncode == 1, f"expected a hard failure, got:\n{result.stdout}"
+    assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
