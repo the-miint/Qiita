@@ -37,7 +37,25 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#420, closes #411) Confirm the six re-sized actions carry their raised ceilings.
+  `actions sync` runs inside `activate.sh`, so this only checks it took — if a row still
+  reads its old value, an OOM or TIMEOUT on that workflow's heaviest step keeps failing
+  permanently on attempt 0 (a baseline at its ceiling has no rung to climb to) and the
+  change is a silent no-op:
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, mem_ceiling_gb, walltime_ceiling
+    FROM qiita.action
+    WHERE (action_id, version) IN
+      (('bcl-convert','1.0.0'),('fastq-to-parquet','1.1.0'),('fastq-to-parquet','1.2.0'),
+       ('fastq-to-parquet','1.3.0'),('read-mask','1.0.0'),('read-mask-block','1.0.0'))
+    ORDER BY action_id, version"
+  ```
+
+  Expect (was → is): `bcl-convert|1.0.0|500|1 day` (was `480|12:00:00`),
+  `fastq-to-parquet|1.1.0|32|08:00:00` and `|1.2.0|32|08:00:00` (both were `16|04:00:00`),
+  `fastq-to-parquet|1.3.0|64|08:00:00`, `read-mask|1.0.0|64|08:00:00` and
+  `read-mask-block|1.0.0|64|08:00:00` (all three were `32|08:00:00`).
 
 ### 6. After the deploy verifies green
 
@@ -53,6 +71,19 @@ _None yet._
   first: `UPDATE qiita.work_ticket SET escalated_resource_floor = NULL WHERE
   work_ticket_idx = <idx>;` — SQL `NULL`, not `'null'::jsonb`, which the CHECK rejects
   precisely because the runner would read it as "nothing escalated yet". (#415)
+- (#420, closes #411) **Six workflows' `action_ceiling` was raised so an OOM/TIMEOUT can
+  actually retry; no step baseline changed, so nothing schedules differently.**
+  `bcl-convert/1.0.0`, `fastq-to-parquet/1.1.0`, `1.2.0`, `1.3.0`, `read-mask/1.0.0` and
+  `read-mask-block/1.0.0` each had a ceiling equal to their heaviest step's baseline, which
+  makes escalation clamp on the first failure and fail the ticket permanently at
+  `retry_count=0` — the shape behind the `long-read-assembly` incident (#393). Only a
+  *failing* step now climbs; a healthy ticket requests exactly what it did before. Reaches
+  `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no host action, just
+  the bucket-5 checks that it took.
+- (#420, closes #411) **The admin `resource_override` envelope widens with these ceilings**
+  (`POST /work-ticket` 422s when `resource_override.mem_gb` exceeds `mem_ceiling_gb`). A
+  per-ticket nudge that used to be rejected at 17 GB on `fastq-to-parquet/1.1.0` is now
+  accepted up to 32. Nothing to do — noted so the wider envelope isn't a surprise.
 
 ---
 

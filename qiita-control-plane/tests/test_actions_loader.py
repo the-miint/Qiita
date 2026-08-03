@@ -634,28 +634,16 @@ _ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
     "align:1.0.0": {"align_sharded": ("mem_gb",)},
 }
 
-# NOT accepts — defects that predate the guard, each genuinely dying permanently
-# on its first OOM (and, where walltime is listed, its first timeout). Listed so
-# the guard can land ahead of the re-sizing, which needs measured peak-RSS data
-# per workflow rather than a blanket multiplier. Six entries across four workflow
-# directories (fastq-to-parquet contributes three versions).
+# NOT accepts — a defect being tracked rather than fixed right now, listed so the
+# guard can land ahead of the re-sizing (which needs measured peak-RSS data per
+# workflow rather than a blanket multiplier). Empty today: the six entries this
+# started with, across four workflow directories, were re-sized and so deleted.
 #
 # Raising a ceiling above its step baseline DELETES that entry from here — the
 # exact-equality check below then fails until it is gone, so a re-size cannot
 # silently leave its suppression behind. Nothing is added here except alongside
-# the work to remove it; when the last one goes, so does this dict.
-_ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {
-    "bcl-convert:1.0.0": {"bcl_convert[Illumina NovaSeq X]": ("mem_gb", "walltime")},
-    "fastq-to-parquet:1.1.0": {"host_filter": ("mem_gb", "walltime")},
-    "fastq-to-parquet:1.2.0": {"host_filter": ("mem_gb", "walltime")},
-    "fastq-to-parquet:1.3.0": {"host_filter": ("mem_gb",)},
-    "read-mask:1.0.0": {
-        "syndna": ("mem_gb",),
-        "lima_mask": ("mem_gb",),
-        "host_filter": ("mem_gb",),
-    },
-    "read-mask-block:1.0.0": {"host_filter": ("mem_gb",)},
-}
+# the work to remove it.
+_ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
 
 
 def test_every_shipped_step_can_escalate_on_both_retry_axes():
@@ -875,7 +863,8 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     step is a container with the SIF filename Settings.path_derived_images
     resolves against; baseline_resources for bcl_convert uses the lookup
     population (from_step_output + profiles with the three supported
-    Illumina families); and action_ceiling matches the largest profile.
+    Illumina families); and action_ceiling leaves escalation headroom
+    above the largest profile.
 
     Locks the YAML shape so the runner's A4 resolution branch (the
     lookup vs flat split in qiita_control_plane.runner._dispatch_step)
@@ -938,13 +927,21 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # Flat-side fields are unset when the lookup population is used.
     assert br.cpu is None and br.mem_gb is None and br.walltime is None
 
-    # action_ceiling matches the largest profile (NovaSeq X). A future
-    # profile bump that exceeds this must update both axes in the same PR
-    # because the runner enforces resolved <= ceiling at dispatch.
+    # The largest profile (NovaSeq X) sits UNDER action_ceiling on both
+    # escalating axes. Equality here — which is what this asserted before —
+    # is the dead-ladder shape: escalation clamps to the ceiling, so an
+    # OOM/TIMEOUT on the NovaSeq X profile failed the ticket permanently at
+    # retry_count=0 instead of retrying larger. cpu is exempt (nothing
+    # escalates it) and stays equal. A future profile bump that exceeds the
+    # ceiling must raise it in the same PR, because the runner enforces
+    # resolved <= ceiling at dispatch; the escalating axes must clear it.
     novaseqx = br.profiles["Illumina NovaSeq X"]
-    assert bcl.action_ceiling.cpu == novaseqx.cpu == 16
-    assert bcl.action_ceiling.mem_gb == novaseqx.mem_gb == 480
-    assert bcl.action_ceiling.walltime == novaseqx.walltime == timedelta(hours=12)
+    assert novaseqx.cpu == 16
+    assert novaseqx.mem_gb == 480
+    assert novaseqx.walltime == timedelta(hours=12)
+    assert bcl.action_ceiling.cpu == novaseqx.cpu
+    assert bcl.action_ceiling.mem_gb > novaseqx.mem_gb
+    assert bcl.action_ceiling.walltime > novaseqx.walltime
 
     # context_schema gates on the operator-supplied BCL folder path; the
     # absolute-path pattern keeps the launcher from resolving against a
