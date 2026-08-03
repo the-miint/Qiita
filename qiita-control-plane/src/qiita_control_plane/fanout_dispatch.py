@@ -85,16 +85,39 @@ _LOCK_CLASS_ALIGN_BLOCK = 0x0FA0_0003
 # for a moment — harmless (see module docstring).
 _INT4_MASK = 0x7FFF_FFFF
 
+# The only two ticket predicates `_cohorts_matching` will interpolate. Constants, not
+# literals at the call sites, so the "module-internal SQL only" constraint is checkable
+# by identity where the fragment is built — see the assert in `_cohorts_matching`.
+_PRED_HELD = "dispatch_held"
+_PRED_ACTIVE = "(dispatch_held OR state IN ('pending', 'queued', 'processing'))"
+
 # Operator-set per-cohort caps, keyed (kind, key). Deliberately in-memory and
 # process-local; a table buys durability we do not want for an incident-time knob.
 # The CP runs a single uvicorn process (no --workers), so a plain dict is the whole
 # mechanism — under `--workers` a set on one worker would be invisible to the next,
 # silently, which is why that stays a single process.
 #
-# A restart drops every override, reverting to the default — the conservative
-# direction for the raise-the-cap case this exists to serve. Nothing expires one
-# either, so an override left set outlives its incident and reapplies if its
-# (kind, key) is ever re-run.
+# A restart drops every override, reverting to the default. **That revert is only
+# conservative in one direction, and the asymmetry is the trap:**
+#
+#   * RAISED above the default (the case this exists to serve) — the restart
+#     reverts DOWN. Fewer tickets in flight than the operator asked for; the
+#     cohort simply drains at the default rate. Safe.
+#   * LOWERED below the default — the restart reverts UP. `reconcile_inflight_tickets`
+#     pumps every held cohort with `settings.fanout_max_inflight`, and this dict is
+#     already empty by then, so the cohort re-pumps at the DEFAULT and lands over
+#     what the operator set (8 in flight after a 2 was asked for, measured). The
+#     lowering has to be re-applied by hand after any restart — `set_override`
+#     WARNs when it records one, so the journal says so at the moment it happens.
+#
+# The restart is not necessarily operator-initiated: both units are
+# `Restart=on-failure`, so the plausible case is a crash during the very incident
+# the operator was throttling.
+#
+# Nothing expires an override either, so one left set outlives its incident and
+# reapplies if its (kind, key) is ever re-run. `overridden_cohorts()` keeps that
+# enumerable — `GET /fanout` unions it in, so an override whose cohort has fully
+# drained still shows up instead of vanishing from the only surface that lists them.
 _OVERRIDES: dict[tuple[str, int], int] = {}
 
 
@@ -173,11 +196,40 @@ def align_block_cohort(alignment_idx: int) -> FanoutCohort:
     )
 
 
-def set_override(cohort: FanoutCohort, max_inflight: int) -> None:
-    """Set `cohort`'s runtime cap. Raises ValueError outside 1..MAX_FANOUT_OVERRIDE."""
+# Kind → builder, so a (kind, key) pair off the wire or out of `_OVERRIDES` can be
+# turned back into its cohort. Lives here with the builders rather than in the routes:
+# `overridden_cohorts` needs it too, and one registry cannot drift from itself.
+COHORT_BUILDERS: dict[FanoutCohortKind, Callable[[int], FanoutCohort]] = {
+    FanoutCohortKind.SHARD: shard_cohort,
+    FanoutCohortKind.READ_MASK_BLOCK: read_mask_block_cohort,
+    FanoutCohortKind.ALIGN_BLOCK: align_block_cohort,
+}
+
+
+def set_override(cohort: FanoutCohort, max_inflight: int, *, default: int | None = None) -> None:
+    """Set `cohort`'s runtime cap. Raises ValueError outside 1..MAX_FANOUT_OVERRIDE.
+
+    Pass `default` (the boot-time `FANOUT_MAX_INFLIGHT` this override displaces) to
+    get the restart warning: a cap set BELOW the default is silently undone by a
+    restart, which reverts the cohort UP to the default rather than down, so it
+    re-pumps to more in flight than was asked for. The WARNING is the only thing
+    that puts "re-apply this" in the journal — see the `_OVERRIDES` comment for the
+    full asymmetry. Omitting `default` skips the check, never the set.
+    """
     if not 1 <= max_inflight <= MAX_FANOUT_OVERRIDE:
         raise ValueError(
             f"max_inflight must be between 1 and {MAX_FANOUT_OVERRIDE}, got {max_inflight}"
+        )
+    if default is not None and max_inflight < default:
+        _log.warning(
+            "fan-out cohort %s capped at %d, BELOW the FANOUT_MAX_INFLIGHT default of %d. "
+            "Overrides are in-memory: a control-plane restart drops this and the cohort "
+            "re-pumps at %d, i.e. MORE in flight than you asked for. Re-apply after any "
+            "restart (the unit is Restart=on-failure, so a crash counts).",
+            cohort.label,
+            max_inflight,
+            default,
+            default,
         )
     _OVERRIDES[(cohort.kind, cohort.key)] = max_inflight
 
@@ -190,6 +242,20 @@ def clear_override(cohort: FanoutCohort) -> None:
 def get_override(cohort: FanoutCohort) -> int | None:
     """`cohort`'s runtime cap, or None when it has none."""
     return _OVERRIDES.get((cohort.kind, cohort.key))
+
+
+def overridden_cohorts() -> list[FanoutCohort]:
+    """Every cohort carrying a runtime override, whether or not it still has tickets.
+
+    Exists because nothing evicts from `_OVERRIDES` except an explicit clear, while
+    `active_cohorts` drops a cohort the moment its last child goes terminal — so an
+    override could outlive its cohort with no surface left to show it, and an operator
+    who set three during an incident could not ask "what have I set?". `GET /fanout`
+    unions this in for exactly that.
+
+    Rebuilt from the (kind, key) identity rather than stored, so a cohort listed here
+    carries the same predicate and lock identity it would anywhere else."""
+    return [COHORT_BUILDERS[FanoutCohortKind(kind)](key) for kind, key in _OVERRIDES]
 
 
 def cohort_for_ticket_row(row: asyncpg.Record | dict[str, Any]) -> FanoutCohort | None:
@@ -402,10 +468,7 @@ async def active_cohorts(pool: asyncpg.Pool) -> list[FanoutCohort]:
     Wider than `held_cohorts`, which reconcile uses: a cohort that has released
     everything still has work running and must stay visible to an operator. A cohort
     whose tickets are all terminal drops out of both."""
-    return await _cohorts_matching(
-        pool,
-        "(dispatch_held OR state IN ('pending', 'queued', 'processing'))",
-    )
+    return await _cohorts_matching(pool, _PRED_ACTIVE)
 
 
 async def held_cohorts(pool: asyncpg.Pool) -> list[FanoutCohort]:
@@ -413,18 +476,25 @@ async def held_cohorts(pool: asyncpg.Pool) -> list[FanoutCohort]:
     all three fan-out types. Used by startup reconcile to re-pump held fan-outs
     that a CP restart left un-topped-up. Cheap: the ``work_ticket_dispatch_held``
     partial index covers the held set."""
-    return await _cohorts_matching(pool, "dispatch_held")
+    return await _cohorts_matching(pool, _PRED_HELD)
 
 
 async def _cohorts_matching(pool: asyncpg.Pool, ticket_predicate: str) -> list[FanoutCohort]:
     """Distinct cohorts of all three kinds whose tickets satisfy `ticket_predicate`.
 
-    `ticket_predicate` is a trusted SQL fragment from this module only — never
-    caller input.
+    `ticket_predicate` is interpolated into SQL, so it must be one of this module's
+    own constants — never caller input. The assert is the guard rather than the
+    docstring being the guard: with exactly two legal values, pinning them by identity
+    means a later refactor that threads a caller-supplied predicate here fails at once
+    instead of opening an injection.
 
     Both block scans key on action_id, not on whether alignment_idx is set: a purged
     align ticket keeps its mask_idx and would otherwise be reported here as a
     read-mask block (see `qiita_common.actions`)."""
+    assert ticket_predicate in (_PRED_HELD, _PRED_ACTIVE), (
+        f"ticket_predicate is interpolated into SQL and must be a module constant, "
+        f"got {ticket_predicate!r}"
+    )
     cohorts: list[FanoutCohort] = []
     for row in await pool.fetch(
         f"SELECT DISTINCT reference_idx FROM qiita.work_ticket"

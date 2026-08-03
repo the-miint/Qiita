@@ -748,6 +748,11 @@ class FanoutPumpResponse(BaseModel):
 
 class FanoutListResponse(BaseModel):
     """Returned by GET /api/v1/work-ticket/fanout — every cohort with held or
-    in-flight children. A cohort whose tickets are all terminal drops out."""
+    in-flight children, plus every cohort carrying a runtime override.
+
+    A cohort whose tickets are all terminal drops out UNLESS it still has an override
+    set: nothing expires an override, so one outlives its cohort and reapplies if that
+    (kind, key) is re-run. Such a cohort appears with zero counts and a non-null
+    `override` — the shape that says "set, with nothing to apply it to"."""
 
     cohorts: list[FanoutCohortStatus]

@@ -49,6 +49,13 @@ def _summarise(status: dict) -> str:
     )
     if status.get("fail_stopped"):
         line += "  [FAIL-STOPPED: redrive the failed child(ren), nothing will release]"
+    # A cohort with nothing held or running is only listed because it still carries an
+    # override. Say so: it is the one entry here that is pure leftover, and it will
+    # reapply if this (kind, key) is ever re-run.
+    elif (
+        status.get("override") is not None and not status.get("held") and not status.get("running")
+    ):
+        line += "  [override set on a drained cohort: clear it with --clear]"
     return line
 
 
@@ -58,9 +65,11 @@ def _render_list(body: dict | list) -> None:
         return
     cohorts = body.get("cohorts", [])
     if not cohorts:
-        print("no active fan-out cohorts.", file=sys.stderr)
+        print("no fan-out cohorts in flight, and no overrides set.", file=sys.stderr)
         return
-    print(f"{len(cohorts)} active fan-out cohort(s):", file=sys.stderr)
+    # Not "active": the response also carries cohorts that have fully drained but still
+    # have an override set, which is the whole point of listing them.
+    print(f"{len(cohorts)} fan-out cohort(s):", file=sys.stderr)
     for status in cohorts:
         print(_summarise(status), file=sys.stderr)
 
@@ -125,7 +134,9 @@ def add_fanout_parser(subparsers) -> None:
     )
     sub = p.add_subparsers(dest="fanout_cmd", required=True)
 
-    p_list = sub.add_parser("list", help="every cohort with held or in-flight children")
+    p_list = sub.add_parser(
+        "list", help="cohorts with held or in-flight children, plus any with an override set"
+    )
     p_list.set_defaults(handler=_handle_fanout_list)
 
     kinds = [k.value for k in FanoutCohortKind]

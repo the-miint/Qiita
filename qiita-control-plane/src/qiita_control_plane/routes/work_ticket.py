@@ -97,14 +97,13 @@ from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, ge
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
 from ..fanout_dispatch import (
+    COHORT_BUILDERS,
     FanoutCohort,
     active_cohorts,
-    align_block_cohort,
     clear_override,
     cohort_status,
-    read_mask_block_cohort,
+    overridden_cohorts,
     set_override,
-    shard_cohort,
     top_up_dispatch,
 )
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
@@ -995,12 +994,6 @@ def _row_to_work_ticket_summary(row: asyncpg.Record) -> WorkTicketSummary:
 # 422s on "fanout". `POST /cancel` has no such problem only because nothing else
 # claims POST on a one-segment path. Keep this block above that route.
 
-_COHORT_BUILDERS = {
-    FanoutCohortKind.SHARD: shard_cohort,
-    FanoutCohortKind.READ_MASK_BLOCK: read_mask_block_cohort,
-    FanoutCohortKind.ALIGN_BLOCK: align_block_cohort,
-}
-
 
 async def _resolve_cohort(request: Request, kind: FanoutCohortKind, key: int) -> FanoutCohort:
     """Build the cohort and 404 when nothing matches it.
@@ -1009,7 +1002,7 @@ async def _resolve_cohort(request: Request, kind: FanoutCohortKind, key: int) ->
     key with no tickets is a 404 rather than an empty success so a typo cannot
     silently record an override against a cohort that does not exist.
     """
-    cohort = _COHORT_BUILDERS[kind](key)
+    cohort = COHORT_BUILDERS[kind](key)
     status_ = await cohort_status(
         request.app.state.pool, cohort, max_inflight=request.app.state.settings.fanout_max_inflight
     )
@@ -1053,18 +1046,26 @@ async def list_fanout_cohorts(
     request: Request,
     _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
 ) -> FanoutListResponse:
-    """Every fan-out cohort with held or in-flight children, with its throttle state.
+    """Every fan-out cohort with held or in-flight children, plus every cohort
+    carrying a runtime override, with its throttle state.
 
     The first call an operator makes when a fan-out looks stuck: it distinguishes
     "fail-stopped", "at its cap", and "nothing held" without a DB session.
+
+    Overrides are unioned in because nothing evicts one — a cohort that has fully
+    drained drops out of `active_cohorts` while its override stays set and reapplies
+    if that (kind, key) is ever re-run. Listing only active cohorts made a set
+    override unenumerable at exactly the moment it became a surprise, so an operator
+    could not ask "what have I set?". A drained cohort appears with zero counts and a
+    non-null `override`, which reads as "set, nothing to apply it to".
     """
     pool = request.app.state.pool
     default = request.app.state.settings.fanout_max_inflight
+    cohorts = await active_cohorts(pool)
+    seen = {(c.kind, c.key) for c in cohorts}
+    cohorts.extend(c for c in overridden_cohorts() if (c.kind, c.key) not in seen)
     return FanoutListResponse(
-        cohorts=[
-            await cohort_status(pool, cohort, max_inflight=default)
-            for cohort in await active_cohorts(pool)
-        ]
+        cohorts=[await cohort_status(pool, cohort, max_inflight=default) for cohort in cohorts]
     )
 
 
@@ -1094,14 +1095,23 @@ async def set_fanout_cohort_override(
     moves tickets held → released and never recalls one.
 
     The override is in-memory and process-local, so a CP restart reverts the cohort
-    to the FANOUT_MAX_INFLIGHT default.
+    to the FANOUT_MAX_INFLIGHT default. That revert is conservative for a RAISED cap
+    and not for a LOWERED one, which reverts upward to more in flight than was asked
+    for — `set_override` WARNs on the lowering case, and the `_OVERRIDES` comment
+    carries the full asymmetry.
     """
     cohort = await _resolve_cohort(request, kind, key)
     if body.max_inflight is None:
         clear_override(cohort)
     else:
         # Bounded by the request model; the registry re-checks (fail fast at both).
-        set_override(cohort, body.max_inflight)
+        # `default` is what a restart would revert to, and is what makes a lowering
+        # WARN rather than being recorded silently.
+        set_override(
+            cohort,
+            body.max_inflight,
+            default=request.app.state.settings.fanout_max_inflight,
+        )
     return await _pump_and_report(request, cohort)
 
 

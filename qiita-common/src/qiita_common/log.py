@@ -54,15 +54,28 @@ import re
 # passes — is all _log.info, and Python's default (no root handler, lastResort at
 # WARNING) silently drops every line of it.
 _DEFAULT_LOG_LEVEL = "INFO"
+
+# `<LEVEL> <logger.name>: <message>`. The leading level followed by a SPACE and the
+# dotted logger name is load-bearing, not cosmetic: it is what distinguishes a record
+# that went through this configuration from uvicorn's own `INFO:` + padding, which
+# reaches the journal whether or not the root logger was ever configured. Anything
+# checking "did app logging actually come up" can only tell the two apart by this
+# shape, so keep the level first and keep `%(name)s`.
 _LOG_FORMAT = "%(levelname)s %(name)s: %(message)s"
 
 
-def configure_logging(level: str | None = None) -> None:
-    """Install a root handler and set the root level.
+def configure_logging(level: str | None = None) -> str:
+    """Install a root handler and set the root level. Returns the resolved level name.
 
     `level` defaults to the LOG_LEVEL env var, then INFO. Raises ValueError on an
     unknown name rather than falling back, so a typo is a boot failure instead of
-    silently-missing logs.
+    silently-missing logs. `NOTSET` is rejected with them: it is a real entry in
+    `getLevelNamesMapping()` but resolves to 0, which is a DEBUG-and-below firehose
+    rather than the "unset, use the default" it reads as.
+
+    The return value exists so a caller can narrate the level it actually got — the
+    services log it at boot, which is the only way an operator can tell a quiet
+    journal (`LOG_LEVEL=WARNING`) from a broken one.
 
     Idempotent: re-running replaces the handler rather than stacking a second one
     (which would double every line). Call **before**
@@ -73,11 +86,12 @@ def configure_logging(level: str | None = None) -> None:
     systemd, and the journal already stamps every line.
     """
     name = (level or os.environ.get("LOG_LEVEL") or _DEFAULT_LOG_LEVEL).upper()
-    resolved = logging.getLevelNamesMapping().get(name)
+    resolved = None if name == "NOTSET" else logging.getLevelNamesMapping().get(name)
     if resolved is None:
-        valid = ", ".join(sorted(logging.getLevelNamesMapping()))
+        valid = ", ".join(sorted(n for n in logging.getLevelNamesMapping() if n != "NOTSET"))
         raise ValueError(f"LOG_LEVEL must be one of: {valid}; got {name!r}")
     logging.basicConfig(level=resolved, format=_LOG_FORMAT, force=True)
+    return name
 
 
 # Match an Authorization header value in any reasonable string serialisation

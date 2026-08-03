@@ -20,6 +20,7 @@ import secrets
 
 import pytest
 from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID, READ_MASK_ACTION_ID
+from qiita_common.models import FanoutCohortKind
 
 from qiita_control_plane import fanout_dispatch
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
@@ -193,6 +194,83 @@ def test_override_does_not_leak_across_kinds_sharing_a_key():
     assert get_override(align_block_cohort(5)) is None
 
 
+def test_set_override_warns_when_lowering_below_the_default(caplog):
+    """A LOWERED override is the one a restart undoes in the dangerous direction —
+    reconcile re-pumps at the default, i.e. MORE in flight than was asked for. The
+    WARNING is the only thing that puts "re-apply this" in the journal."""
+    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.fanout_dispatch"):
+        set_override(shard_cohort(7), 2, default=8)
+
+    assert get_override(shard_cohort(7)) == 2, "the warning must not replace the set"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "lowering below the default must WARN"
+    # Names the cohort and both numbers: a journal line that says only "an override was
+    # lowered" doesn't tell an operator which fan-out to re-apply, or to what.
+    assert "shard" in warnings[0] and "2" in warnings[0] and "8" in warnings[0]
+
+
+def test_set_override_does_not_warn_when_raising_above_the_default(caplog):
+    """The raise case is what the surface exists for, and a restart reverts it DOWN —
+    conservative. Warning on it would train the operator to ignore the warning."""
+    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.fanout_dispatch"):
+        set_override(shard_cohort(7), 40, default=8)
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_set_override_at_the_default_does_not_warn(caplog):
+    """Equal is not lower: a restart reverting to the same number changes nothing."""
+    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.fanout_dispatch"):
+        set_override(shard_cohort(7), 8, default=8)
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_set_override_without_a_default_skips_the_check_not_the_set(caplog):
+    """`default` is optional so non-route callers need not thread settings through;
+    omitting it must still record the override."""
+    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.fanout_dispatch"):
+        set_override(shard_cohort(7), 2)
+
+    assert get_override(shard_cohort(7)) == 2
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_overridden_cohorts_enumerates_every_set_override():
+    """The enumerability fix: `active_cohorts` drops a cohort once its last child goes
+    terminal, so without this an override outlives the only surface that lists it and an
+    operator cannot ask "what have I set?"."""
+    set_override(shard_cohort(5), 4)
+    set_override(align_block_cohort(9), 16)
+
+    got = {(c.kind, c.key) for c in fanout_dispatch.overridden_cohorts()}
+    assert got == {
+        (FanoutCohortKind.SHARD, 5),
+        (FanoutCohortKind.ALIGN_BLOCK, 9),
+    }
+
+
+def test_overridden_cohorts_rebuilds_the_real_cohort_identity():
+    """Rebuilt through the shared builders, so a listed cohort carries the same
+    predicate and lock identity it would anywhere else — not a stub."""
+    set_override(shard_cohort(5), 4)
+    (got,) = fanout_dispatch.overridden_cohorts()
+    expected = shard_cohort(5)
+    assert got == expected
+
+
+def test_overridden_cohorts_is_empty_with_no_overrides():
+    assert fanout_dispatch.overridden_cohorts() == []
+
+
+async def test_cohorts_matching_refuses_a_predicate_that_is_not_a_module_constant():
+    """The fragment is interpolated into SQL. The docstring said "module-internal only";
+    the assert makes a later refactor that threads caller input here fail at once
+    instead of opening an injection."""
+    with pytest.raises(AssertionError, match="module constant"):
+        await fanout_dispatch._cohorts_matching(None, "1=1 OR true")
+
+
 # ---------------------------------------------------------------------------
 # top_up_dispatch — release semantics (DB)
 # ---------------------------------------------------------------------------
@@ -258,6 +336,86 @@ async def _held_count(pool, reference_idx):
         " WHERE reference_idx = $1 AND shard_id IS NOT NULL AND dispatch_held",
         reference_idx,
     )
+
+
+async def _running_count(pool, reference_idx):
+    """Released and genuinely in flight — the thing the cap bounds."""
+    return await pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket"
+        " WHERE reference_idx = $1 AND shard_id IS NOT NULL AND NOT dispatch_held"
+        "   AND state IN ('pending', 'queued', 'processing')",
+        reference_idx,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Restart semantics of an override — the asymmetry the design rests on
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("override", "after_restart"),
+    [
+        # LOWERED: the restart reverts UP to the default and the cohort re-pumps to 8 —
+        # 4x what the operator asked for. This is the direction that bites, and the
+        # reason `set_override` WARNs and the docs say "re-apply after a restart".
+        (2, 8),
+        # RAISED: the control arm, and what makes the above a finding rather than an
+        # observation. Reverting DOWN releases nothing new (the pump never recalls), so
+        # the cohort simply stays where it was. Genuinely conservative.
+        (40, 12),
+    ],
+    ids=["lowered-reverts-up-over-the-operators-cap", "raised-reverts-down-conservatively"],
+)
+async def test_a_restart_drops_overrides_asymmetrically(
+    postgres_pool, monkeypatch, override, after_restart
+):
+    """A CP restart drops `_OVERRIDES`, and what that costs depends on the direction.
+
+    "Restart" here is exactly what the process does: clear the registry, then run the
+    real `reconcile_inflight_tickets`, which pumps every held cohort with
+    `settings.fanout_max_inflight`. Both arms run the same code with only the override's
+    direction differing, which is what isolates the asymmetry.
+
+    Pinning current behaviour, not asserting an ideal: the overrides are deliberately
+    in-memory (an incident knob, not durable state). This test exists so that stays a
+    decision rather than a surprise — the whole design rests on these semantics.
+    """
+    from types import SimpleNamespace
+
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    sc = await _scaffold(postgres_pool)
+    ref = sc["reference_idx"]
+    try:
+        await _insert_held_shard_tickets(postgres_pool, sc, 12)
+        cohort = shard_cohort(ref)
+        default = 8
+
+        set_override(cohort, override, default=default)
+        await top_up_dispatch(
+            postgres_pool, cohort, max_inflight=override, dispatch_cb=lambda _idx: None
+        )
+        before = await _running_count(postgres_pool, ref)
+        assert before == min(override, 12)
+
+        # --- the restart ---
+        fanout_dispatch._OVERRIDES.clear()
+        monkeypatch.setattr(dispatch_mod, "schedule_dispatch", lambda *_a, **_kw: None)
+        app = SimpleNamespace(
+            state=SimpleNamespace(
+                pool=postgres_pool,
+                compute_backend_client=object(),
+                settings=SimpleNamespace(fanout_max_inflight=default),
+                running_dispatches=set(),
+            )
+        )
+        await dispatch_mod.reconcile_inflight_tickets(app)
+
+        assert await _running_count(postgres_pool, ref) == after_restart
+    finally:
+        await _cleanup(postgres_pool, ref)
 
 
 @pytest.mark.db

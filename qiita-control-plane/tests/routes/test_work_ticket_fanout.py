@@ -14,15 +14,33 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_WORK_TICKET_FANOUT, URL_WORK_TICKET_FANOUT_COHORT
+from qiita_common.api_paths import (
+    URL_WORK_TICKET_FANOUT,
+    URL_WORK_TICKET_FANOUT_COHORT,
+    URL_WORK_TICKET_FANOUT_COHORT_PUMP,
+)
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import MAX_FANOUT_OVERRIDE, FanoutCohortKind
 
 pytestmark = pytest.mark.db
 
 
+@pytest.fixture(autouse=True)
+def _clear_fanout_overrides():
+    """`_OVERRIDES` is a process-global dict, and these tests set overrides through
+    PATCH. Without this, one test's override leaks into the next through the module
+    registry and the failure lands in whichever test happens to run second — an
+    ordering-dependent break that says nothing about the code. Mirrors the fixture in
+    `test_fanout_dispatch.py`, which reaches the same registry directly."""
+    from qiita_control_plane.fanout_dispatch import _OVERRIDES
+
+    _OVERRIDES.clear()
+    yield
+    _OVERRIDES.clear()
+
+
 def _pump_url(kind: str, key: int) -> str:
-    return f"{URL_WORK_TICKET_FANOUT_COHORT.format(kind=kind, key=key)}/pump"
+    return URL_WORK_TICKET_FANOUT_COHORT_PUMP.format(kind=kind, key=key)
 
 
 def _cohort_url(kind: str, key: int) -> str:
@@ -288,6 +306,90 @@ async def test_patch_succeeds_on_a_finished_cohort(ctx):
     assert body["status"]["total"] == 3
     assert (body["status"]["held"], body["status"]["running"]) == (0, 0)
     assert body["released"] == []
+
+
+async def test_get_still_lists_a_drained_cohort_that_kept_its_override(ctx):
+    """An override outlives its cohort, so the list must too.
+
+    Nothing evicts from the registry except an explicit clear, and `active_cohorts`
+    drops a cohort the moment its last child goes terminal. Listing only active cohorts
+    made a set override unenumerable at exactly the point it became a surprise — it
+    still reapplies if that (kind, key) is ever re-run, and an operator who set three
+    during an incident had no way to ask "what have I set?".
+    """
+    await ctx["seed_shards"](3)
+    async with _client() as c:
+        patch = await c.patch(
+            _cohort_url(FanoutCohortKind.SHARD, ctx["reference_idx"]),
+            json={"max_inflight": 2},
+            headers=_auth(ctx["admin_tok"]),
+        )
+        assert patch.status_code == 200
+
+        # Drain it completely: every child terminal, nothing held or in flight.
+        await ctx["pool"].execute(
+            "UPDATE qiita.work_ticket SET state='completed', dispatch_held=false"
+            " WHERE reference_idx=$1",
+            ctx["reference_idx"],
+        )
+
+        resp = await c.get(URL_WORK_TICKET_FANOUT, headers=_auth(ctx["admin_tok"]))
+
+    assert resp.status_code == 200
+    mine = [
+        row
+        for row in resp.json()["cohorts"]
+        if row["kind"] == FanoutCohortKind.SHARD and row["key"] == ctx["reference_idx"]
+    ]
+    assert len(mine) == 1, "a drained cohort with an override set must still be listed"
+    # Zero counts with a non-null override is the shape that reads as "set, with nothing
+    # left to apply it to" — which is the state an operator needs to see to clear it.
+    assert (mine[0]["held"], mine[0]["running"]) == (0, 0)
+    assert mine[0]["override"] == 2
+    assert mine[0]["max_inflight"] == 2
+
+
+async def test_get_does_not_list_a_drained_cohort_with_no_override(ctx):
+    """The union is overrides only — a finished cohort with nothing set still drops out,
+    so the list doesn't accumulate every fan-out the deploy has ever run."""
+    await ctx["seed_shards"](3)
+    await ctx["pool"].execute(
+        "UPDATE qiita.work_ticket SET state='completed', dispatch_held=false"
+        " WHERE reference_idx=$1",
+        ctx["reference_idx"],
+    )
+    async with _client() as c:
+        resp = await c.get(URL_WORK_TICKET_FANOUT, headers=_auth(ctx["admin_tok"]))
+
+    assert resp.status_code == 200
+    mine = [
+        row
+        for row in resp.json()["cohorts"]
+        if row["kind"] == FanoutCohortKind.SHARD and row["key"] == ctx["reference_idx"]
+    ]
+    assert mine == []
+
+
+async def test_get_lists_an_active_cohort_once_even_with_an_override(ctx):
+    """The union dedupes on (kind, key): a cohort that is both active and overridden
+    must appear once, not twice."""
+    await ctx["seed_shards"](5)
+    async with _client() as c:
+        patch = await c.patch(
+            _cohort_url(FanoutCohortKind.SHARD, ctx["reference_idx"]),
+            json={"max_inflight": 2},
+            headers=_auth(ctx["admin_tok"]),
+        )
+        assert patch.status_code == 200
+        resp = await c.get(URL_WORK_TICKET_FANOUT, headers=_auth(ctx["admin_tok"]))
+
+    mine = [
+        row
+        for row in resp.json()["cohorts"]
+        if row["kind"] == FanoutCohortKind.SHARD and row["key"] == ctx["reference_idx"]
+    ]
+    assert len(mine) == 1
+    assert mine[0]["override"] == 2
 
 
 async def test_fanout_list_is_not_shadowed_by_the_int_path_param(ctx):

@@ -396,6 +396,51 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Both services now narrate one unconditional line at boot, and the deploy check for
+  it can actually fail (#406).** Review found the CO half of that check passing on
+  nothing: it grepped the journal for a bare `INFO ` and got the same result — no match
+  — on a healthy CO and on one with `configure_logging()` stubbed out, so an operator on
+  a correct deploy would conclude the fix had not landed. Two independent causes, both
+  reproduced. uvicorn's formatter emits `INFO:` plus padding, which a trailing-space
+  pattern excludes; and the CO had no unconditional boot INFO at all, its only two
+  `.info()` sites being work-triggered (a SLURM JWT inside its refresh margin, a miint
+  re-stage), so an idle CO narrated nothing. Both lifespans now log one line naming the
+  resolved log level — the CO's also names its compute backend, the CP's its fan-out
+  default — and `configure_logging()` returns the level it resolved so they can. The
+  check greps the **dotted logger name**, which only a configured root logger produces:
+  verified against a real uvicorn boot in both arms (as-shipped matches, pre-fix does
+  not). Dropping the space instead would have been the worse fix — it matches uvicorn's
+  own lines and would pass on a service still carrying the bug.
+
+- **A fan-out override lowered below the default was silently undone by a restart
+  (#406).** The revert-to-default on restart was documented as "the conservative
+  direction", which holds for the raise case the surface exists to serve and not for the
+  other one: a cohort capped at 2 came back at 8 after a restart — 4× what the operator
+  set — because `reconcile_inflight_tickets` re-pumps every held cohort with
+  `settings.fanout_max_inflight` and the registry is already empty by then. Still
+  deliberately in-memory (an incident knob, not durable state), but no longer silent:
+  `set_override` now WARNs when it records a cap below the default, naming the cohort and
+  both numbers, and the asymmetry is spelled out where someone hits it rather than read
+  as true in both directions. The restart is not necessarily operator-initiated — both
+  units are `Restart=on-failure`, so the plausible case is a crash during the very
+  incident being throttled. Both directions are pinned by a two-arm test, since the whole
+  design rests on these semantics.
+
+- **`GET /work-ticket/fanout` hid an override the moment its cohort drained (#406).**
+  Nothing evicts from the override registry except an explicit clear, while the listing
+  showed only cohorts with held or in-flight children — so an override became
+  unenumerable at exactly the point it turned into a surprise, still set and still
+  reapplying if that `(kind, key)` were ever re-run, with no surface left to show it. An
+  operator who set three during an incident could not ask "what have I set?". The listing
+  now unions in every overridden cohort, deduped by identity; a drained one appears with
+  zero counts and a non-null `override`, and `qiita-admin fanout list` flags it as
+  clearable. Also hardened `_cohorts_matching`'s trust boundary from a docstring into an
+  assert over the two module-constant predicates, so a later refactor that threads
+  caller input into that interpolated SQL fails at once instead of opening an injection.
+  Two remaining review findings are deferred rather than silently dropped: the hand-typed
+  work-ticket state literals in this module (#424) and the multi-acquisition read behind
+  this listing (#425).
+
 - **Neither Python service configured logging, so every `_log.info` was silently
   dropped in production — and the Authorization scrubber was inert (#406).** The CP
   and CO both called `install_authorization_scrub()` but nothing ever configured the

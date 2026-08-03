@@ -147,6 +147,18 @@ def test_install_authorization_scrub_targets_passed_logger():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _log_level_unset(monkeypatch):
+    """Unset LOG_LEVEL for every test in this module.
+
+    These tests exercise the env-reading path, so an exported LOG_LEVEL decides what
+    they assert: `test_configure_logging_defaults_to_info` asserts INFO while calling
+    the very code that would honour a `LOG_LEVEL=DEBUG` in the developer's shell, and
+    failed there for a reason that has nothing to do with the code under test. The
+    tests that want the env path set it themselves — this only pins the baseline."""
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+
+
 def _restore_root(saved_handlers, saved_level):
     root = logging.getLogger()
     root.handlers = saved_handlers
@@ -218,6 +230,103 @@ def test_configure_logging_is_idempotent():
         configure_logging()
         configure_logging()
         assert len(root.handlers) == 1
+    finally:
+        _restore_root(saved_handlers, saved_level)
+
+
+def test_configure_logging_reads_the_log_level_env_var(monkeypatch):
+    """The LOG_LEVEL path is the one production takes — both units set it or inherit
+    the default through it, and nothing else exercises it."""
+    from qiita_common.log import configure_logging
+
+    monkeypatch.setenv("LOG_LEVEL", "WARNING")
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        assert configure_logging() == "WARNING"
+        assert root.level == logging.WARNING
+    finally:
+        _restore_root(saved_handlers, saved_level)
+
+
+def test_configure_logging_env_var_is_case_insensitive(monkeypatch):
+    """An operator writing `LOG_LEVEL=debug` in an env file must not fail the boot."""
+    from qiita_common.log import configure_logging
+
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        assert configure_logging() == "DEBUG"
+        assert root.level == logging.DEBUG
+    finally:
+        _restore_root(saved_handlers, saved_level)
+
+
+def test_configure_logging_rejects_an_unknown_env_level(monkeypatch):
+    """A typo in the env file must keep the unit DOWN, not silently log at the default
+    — the whole point of raising rather than falling back."""
+    from qiita_common.log import configure_logging
+
+    monkeypatch.setenv("LOG_LEVEL", "CHATTY")
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        with pytest.raises(ValueError, match="LOG_LEVEL"):
+            configure_logging()
+    finally:
+        _restore_root(saved_handlers, saved_level)
+
+
+def test_configure_logging_explicit_level_beats_the_env(monkeypatch):
+    """The argument is the override, not a second default."""
+    from qiita_common.log import configure_logging
+
+    monkeypatch.setenv("LOG_LEVEL", "ERROR")
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        assert configure_logging("DEBUG") == "DEBUG"
+        assert root.level == logging.DEBUG
+    finally:
+        _restore_root(saved_handlers, saved_level)
+
+
+@pytest.mark.parametrize("source", ["arg", "env"])
+def test_configure_logging_rejects_notset(monkeypatch, source):
+    """NOTSET is in getLevelNamesMapping() but resolves to 0 — a DEBUG-and-below
+    firehose, not the "leave it at the default" it reads as. Rejected from both the
+    argument and the env var, since production only ever reaches it via the env."""
+    from qiita_common.log import configure_logging
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        with pytest.raises(ValueError, match="LOG_LEVEL"):
+            if source == "arg":
+                configure_logging("NOTSET")
+            else:
+                monkeypatch.setenv("LOG_LEVEL", "NOTSET")
+                configure_logging()
+    finally:
+        _restore_root(saved_handlers, saved_level)
+
+
+def test_configure_logging_returns_the_default_level_name():
+    """The return value is what the services narrate at boot, so it must be the
+    resolved name rather than whatever was passed in (here: nothing)."""
+    from qiita_common.log import configure_logging
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        assert configure_logging() == "INFO"
     finally:
         _restore_root(saved_handlers, saved_level)
 
