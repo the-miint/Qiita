@@ -31,15 +31,13 @@ it therefore cannot prove the command *works*, only that it is still there and
 still shaped correctly. Correct-operation evidence lives in the skipped test
 above and in the deploy-checklist verify step.
 
-The sort stays until duckdb-miint#173 lands -- a request for a defined or
-steerable `@SQ` order -- and its removal is tracked (see the "Open upstream gaps"
-table in docs/duckdb-miint.md, which carries the exit criteria). Until then it is
-load-bearing, and nothing HERE pins that miint's order is still undefined: the
-canary is `test_sq_order_is_not_derivable_from_reflen` in
-`jobs/test_assembly_coverage.py`, which fails the moment `@SQ` gains a defined
-order. If that test starts failing, this sort has become pure cost (~19 s and a
-second reads-sized artifact per ticket) -- but removing it still needs a fresh
-probe of miint's writer, not an inference from its changelog.
+duckdb-miint#173 has landed: `@SQ` is now sorted by reference name, pinned by
+`test_sq_order_is_reference_name_sorted` in `jobs/test_assembly_coverage.py`. That
+removes the *reason* the sort was added but does not by itself make it safe to
+drop -- the step applies no ORDER BY, and metabat2 needs the depth matrix and the
+assembly in the same order. Removal is tracked at Qiita#374 (see the "Open upstream
+gaps" table in docs/duckdb-miint.md for the exit criteria) and needs measuring
+against metabat2, not inferring from a changelog. Until then it is load-bearing.
 """
 
 from __future__ import annotations
