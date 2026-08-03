@@ -412,7 +412,45 @@ duplicates further down are historical strata; leave them where they are.
   retiring them needs measuring against metabat2 (#374). The test helper that hand-parsed the BAM
   binary header is replaced by `read_alignment_header`
   ([duckdb-miint#174](https://github.com/the-miint/duckdb-miint/issues/174)).
-
+- **Six workflows had `action_ceiling` equal to their heaviest step's baseline,
+  silently disabling OOM/TIMEOUT retry (#420, closes #411).** With `baseline == ceiling`
+  the escalation helpers (`_escalated_mem_floor_after_oom` /
+  `_escalated_walltime_after_timeout`) grow the floor and clamp it to the ceiling, so the
+  grown value never exceeds the resolved one; the runner reads that as saturation and
+  raises `RESOURCE_CEILING_EXHAUSTED` **permanently, at `retry_count=0`, without ever
+  retrying** — the same shape that made a single `assemble` OOM unrecoverable in
+  `long-read-assembly` (#393). Each ceiling now sits above its heaviest step on the
+  escalating axes: `bcl-convert/1.0.0` 480→500 GB and PT12H→P1D (dead on *both* axes for
+  the NovaSeq X profile), `fastq-to-parquet/1.1.0` and `1.2.0` 16→32 GB and PT4H→PT8H,
+  `fastq-to-parquet/1.3.0`, `read-mask/1.0.0` and `read-mask-block/1.0.0` 32→64 GB.
+  **Every step baseline is unchanged**, so ordinary tickets request exactly what they did
+  before and schedule identically — only a *failing* step climbs. `cpu`/`gpu` are
+  untouched: nothing escalates them, so a step whose cpu equals the ceiling gives nothing
+  up. `align/1.0.0` keeps its documented accept. Also raises the admin
+  `resource_override` envelope, which is bounded by the same ceiling.
+  Sized from `sacct` on the `qiita` partition rather than a blanket multiplier: NovaSeq X
+  demuxes peak at 364.7/282.2 GB against a 480 GB request; `host_filter` OOM-kills at
+  16 GB and completes at 32 GB peaking at 22.0/22.6/25.8 GB — real demand, since
+  `host_filter` deliberately does not size DuckDB from the cgroup. `bcl-convert`'s 500 is
+  the node bound (`RealMemory=514000` MB, no `MemSpecLimit`; a 500 GB request is confirmed
+  schedulable on the partition), so its rung is +4%, not a doubling: strictly better than
+  a terminal first OOM, but not a guaranteed save. `cpu` stays 16 there deliberately —
+  more threads would raise memory demand, and memory is the axis already at the node bound.
+  Step *baseline* sizing is deliberately out of scope — `fastq-to-parquet/1.1.0` and
+  `1.2.0` keep a 16 GB `host_filter` baseline and so still pay an OOM plus a retry to
+  reach 32; raising a baseline changes what every healthy ticket requests, which is a
+  separate call from giving a failing one somewhere to climb.
+- **A test now enforces the invariant across every shipped workflow (#420, closes #411).**
+  `test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis` loads all action
+  YAML and fails on any step whose `mem_gb` or `walltime` baseline is not strictly below its
+  `action_ceiling`, including each profile of a `from_step_output` lookup population — so it
+  also catches the strictly-worse `baseline > ceiling`, which until now was caught only at
+  dispatch, after a ticket had been submitted. `cpu`/`gpu` are deliberately exempt.
+  `align/1.0.0`'s deliberate accept is the sole `_CEILING_HEADROOM_ACCEPTS` entry, keyed
+  narrowly by `(action_id, version, step, axis)` so its walltime axis is still checked, and
+  the test fails if an accept outlives the equality it documents.
+  `test_load_actions_loads_on_disk_bcl_convert_yaml` asserted the defect — that the ceiling
+  *equals* the NovaSeq X profile — and now asserts headroom above it instead.
 - **Single-end blocks no longer pay double the rype index reads: the routing classify
   gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
   `rype_classify` a relation with a `sequence2` column that is entirely NULL for

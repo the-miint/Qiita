@@ -207,7 +207,29 @@ steps:
     inputs: []
     outputs: []
 
+# The ceiling must stay ABOVE every step's baseline on the escalating axes
+# (mem_gb, walltime): escalation grows the floor and clamps here, so a baseline
+# that has reached the ceiling has no rung to climb to and the runner fails the
+# ticket permanently at retry_count=0 instead of retrying larger. Mechanism in
+# runner/_dispatch.py; enforced for every shipped workflow by
+# test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis.
+# Step baselines are untouched, so an ordinary ticket requests exactly what it
+# did before and schedules identically — only a *failing* step climbs. (That
+# holds while no at-ceiling step exposes a plan() hint: the down-size gate in
+# _resolve_baseline_for_step is `hint < resolved < ceiling`, so raising a
+# ceiling can newly enable a down-size for a step that has one. None here do.)
+# cpu and gpu are exempt: nothing escalates them.
+#
+# 64 is one rung above a baseline measurement shows is tight rather than
+# generous: completed host_filter jobs at a 32 GB request peak at 25.8 GB. That
+# is real demand — host_filter deliberately does NOT size DuckDB from the cgroup
+# (see the comment on _DUCKDB_MEMORY_GB in jobs/host_filter.py), so its RSS does
+# not expand to fill the allocation. ~6 GB of margin is what the ladder has to be
+# able to absorb.
+#
+# walltime already had headroom (host_filter / qc baseline PT4H under PT8H), so a
+# TIMEOUT still escalates and PT8H is unchanged.
 action_ceiling:
   cpu: 8
-  mem_gb: 32
+  mem_gb: 64
   walltime: PT8H

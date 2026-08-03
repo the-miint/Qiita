@@ -150,11 +150,39 @@ steps:
     inputs: [read_staging_dir]
     outputs: []
 
-# Cap matches the largest profile in `bcl_convert.baseline_resources.profiles`
-# above. Any future profile expansion (or per-instrument tuning that exceeds
-# these numbers) must bump this ceiling in the same PR — the runner enforces
-# `resolved <= ceiling` on every axis at dispatch.
+# The ceiling must stay ABOVE every step's baseline on the escalating axes
+# (mem_gb, walltime): escalation grows the floor and clamps here, so a baseline
+# that has reached the ceiling has no rung to climb to and the runner fails the
+# ticket permanently at retry_count=0 instead of retrying larger. Mechanism in
+# runner/_dispatch.py; enforced for every shipped workflow by
+# test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis.
+# Step baselines are untouched, so an ordinary ticket requests exactly what it
+# did before and schedules identically — only a *failing* step climbs. (That
+# holds while no at-ceiling step exposes a plan() hint: the down-size gate in
+# _resolve_baseline_for_step is `hint < resolved < ceiling`, so raising a
+# ceiling can newly enable a down-size for a step that has one. None here do.)
+# cpu and gpu are exempt: nothing escalates them.
+#
+# mem_gb 500 is the node bound, not a doubling: the `qiita` partition's nodes are
+# RealMemory=514000 MB with no MemSpecLimit (~502 GiB), and a 500 GB request is
+# confirmed schedulable there. So the NovaSeq X profile gets one short rung,
+# 480 -> 500 (+4%). Be honest about what that buys — a demux that OOM-kills at
+# 480 GB has demanded more than 480 and may well die again at 500, having burned
+# a second full demux. It is still strictly better than the old ceiling, which
+# made the FIRST OOM terminal, and there is no larger rung to choose. Sizing
+# reference: the two completed NovaSeq X demuxes peaked at 364.7 and 282.2 GB,
+# so 480 is not routinely tight — this ladder is for the tail.
+#
+# cpu stays 16, and NOT because nothing escalates it: raising the thread count
+# would raise memory demand (hifiasm_meta showed the same coupling in #393), and
+# memory is the axis already pinned against the node bound. More CPUs would make
+# the binding constraint worse, so widening that axis is the wrong trade here.
+#
+# walltime P1D doubles PT12H against ~45 min observed runtimes: pure headroom.
+#
+# Any future profile expansion that exceeds these numbers must bump this ceiling
+# in the same PR — the runner enforces `resolved <= ceiling` at dispatch.
 action_ceiling:
   cpu: 16
-  mem_gb: 480
-  walltime: PT12H
+  mem_gb: 500
+  walltime: P1D
