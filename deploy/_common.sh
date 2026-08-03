@@ -239,6 +239,57 @@ read_env_var() {
     ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
 }
 
+# Split the password out of a libpq connection string — key=value form
+# ("host=… user=… password=…") or postgres:// URI form — so a caller can hand it
+# to libpq through PGPASSFILE instead of leaving it in a SQL file or, worse, on a
+# command line (argv is world-readable via /proc).
+#
+# $1 = the connection string. Echoes three TAB-separated fields, newline-terminated:
+#   <connstr with the password removed>\t<username>\t<password>
+#
+# The password field comes back EMPTY, with the connstr unchanged, when it cannot
+# be lifted out safely: no username to key a pgpass entry on, or a percent-encoded
+# URI password that would have to be decoded first. The caller must then use the
+# string as-is rather than authenticate with a wrong value — silently sending the
+# still-encoded password would fail as an auth error far from its cause.
+#
+# Pure (echo + return only) so scripts/lake-shell.sh and the unit tests in
+# test_deploy_scripts.py can both call it.
+qiita_split_conn_password() {
+    local connstr="$1" sanitized="$1" user="" password=""
+    if [[ "$connstr" =~ ^postgres(ql)?:// ]]; then
+        # postgres[ql]://user[:password]@host…  — a literal ':' '@' or '/' inside
+        # either credential has to be percent-encoded, so the character classes
+        # below cannot run past the credential they are matching.
+        if [[ "$connstr" =~ ^(postgres(ql)?://)([^:@/]+):([^@/]+)@(.*)$ ]]; then
+            user="${BASH_REMATCH[3]}"
+            password="${BASH_REMATCH[4]}"
+            sanitized="${BASH_REMATCH[1]}${user}@${BASH_REMATCH[5]}"
+        elif [[ "$connstr" =~ ^(postgres(ql)?://)([^:@/]+)@ ]]; then
+            user="${BASH_REMATCH[3]}"
+        fi
+        if [[ "$password" == *%* ]]; then
+            sanitized="$connstr"
+            password=""
+        fi
+    else
+        if [[ "$connstr" =~ (^|[[:space:]])user=([^[:space:]]+) ]]; then
+            user="${BASH_REMATCH[2]}"
+        fi
+        if [[ "$connstr" =~ (^|[[:space:]])password=([^[:space:]]+) ]]; then
+            password="${BASH_REMATCH[2]}"
+            sanitized="$(printf '%s' "$connstr" \
+                | sed -E 's/(^|[[:space:]])password=[^[:space:]]+/\1/g' \
+                | tr -s '[:space:]' ' ' | sed -E 's/^ +| +$//g')"
+        fi
+    fi
+    if [[ -n "$password" && -z "$user" ]]; then
+        sanitized="$connstr"
+        password=""
+    fi
+    printf '%s\t%s\t%s\n' "$sanitized" "$user" "$password"
+}
+
 # Extract the Env-vars + one-time-host-setup buckets (buckets 1 & 2) from a
 # DEPLOY_CHECKLIST.md and judge whether they are EMPTY. redeploy.sh uses this to
 # skip the "have buckets 1 & 2 been applied?" acknowledgement when there is

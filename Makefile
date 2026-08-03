@@ -1,4 +1,4 @@
-.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy dev-setup install-hooks
+.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy lake-shell dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-integration build-workflows
 .PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -294,6 +294,15 @@ verify-deploy:
 # local-deploy.sh -> stage -> verify); migrations stay out-of-band.
 redeploy:
 	QIITA_HOSTNAME="$(QIITA_HOSTNAME)" bash deploy/redeploy.sh
+
+# ADMIN DEBUGGING ONLY. Read-only DuckDB shell over the lake (qiita_lake) and the
+# control-plane database (qiita_cp), for an operator diagnosing the live system.
+# It bypasses every authorization check the API enforces — it sees all studies —
+# so read-only is not permission: handle what you see as confidential. Not an
+# export path and not a user-facing query interface. Needs no root, only the
+# group-reads the operator already grants. `bash scripts/lake-shell.sh --help`.
+lake-shell:
+	@bash scripts/lake-shell.sh
 
 # Check developer tool prerequisites and print install instructions only for missing ones
 dev-setup:
