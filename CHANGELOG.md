@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
+  system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
+  an `ATTACH` from the service env files — risking a writable attach against the live
+  lake — or borrowing a service account. This attaches both catalogs `READ_ONLY`:
+  `qiita_lake` (DuckLake) and `qiita_cp` (Postgres, tables under `qiita_cp.qiita.*`),
+  so one query can join lake data to control-plane metadata while DuckDB rejects every
+  write. **It is a debugging tool, not a data-access path**: it bypasses every
+  authorization check the API enforces and therefore sees all studies, so read-only is
+  not permission — treat what it shows as confidential. Not an export path, not a
+  user-facing query interface.
+
+  Needs no root: the group-reads the operator already grants on
+  `/etc/qiita/data-plane.env` (`root:qiita-data`) and `PATH_PERSISTENT/ducklake`
+  (`qiita-data:qiita-data`) suffice, and a `READ_ONLY` attach performs no catalog
+  writes at all. miint is loaded from the deploy-staged `MIINT_EXTENSION_DIRECTORY`
+  (read from `control-plane.env`, else `compute-orchestrator.env`) so queries behave as
+  they do in a job — it is a core dependency, so failing to load it is a hard error and
+  the shell refuses to open; core `httpfs` is loaded too. Passwords are split into a
+  0600 `PGPASSFILE` and never reach the generated SQL or `argv`
+  (`qiita_split_conn_password` in `deploy/_common.sh`, unit-tested). Starts at 4 threads
+  / 32GB rather than DuckDB's all-cores/80%-of-RAM defaults, since it shares a host with
+  the services. `qiita_cp` is reachability-probed before attaching — the duckdb CLI
+  aborts its whole init file on the first error, so a control-plane outage would
+  otherwise cost the lake shell too — and is skipped by `--no-cp` or an unreadable
+  `control-plane.env`.
+
 - **A dead escalation ladder is now caught at build time, not in production
   (#416, closes #412).** A workflow whose `action_ceiling` equals its heaviest
   step's `baseline_resources` silently disables OOM/TIMEOUT retry for it: the
