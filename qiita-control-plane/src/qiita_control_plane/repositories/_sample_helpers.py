@@ -30,6 +30,51 @@ from . import require_transaction
 # Whether a colliding metadata write overwrites the existing value or raises.
 type MetadataConflictMode = Literal["raise", "upsert"]
 
+# The only two texts a BOOLEAN-typed metadata value accepts, compared after
+# outer-whitespace stripping and case folding. Anything else is a parse error:
+# the stored value is a real boolean, so admitting a wider vocabulary would
+# rewrite the caller's token into one of these two on read.
+BOOLEAN_TRUE_TEXT = "true"
+BOOLEAN_FALSE_TEXT = "false"
+
+# Maps each data_type to the qiita.*_metadata.value_* column carrying its typed
+# value. Every member of FieldDataType must appear: a data_type absent here has
+# no column to read or write, so it reaches the closed-set guards as a
+# NotImplementedError instead of silently writing or reading NULL.
+GLOBAL_METADATA_VALUE_COLUMN: dict[FieldDataType, str] = {
+    FieldDataType.TEXT: "value_text",
+    FieldDataType.NUMERIC: "value_numeric",
+    FieldDataType.DATE: "value_date",
+    FieldDataType.BOOLEAN: "value_boolean",
+    FieldDataType.TERMINOLOGY: TERMINOLOGY_TERM_VALUE_COLUMN,
+}
+
+# SELECT fragment naming every value_* column a metadata row may populate,
+# aliased to `m`. Derived from the column map so a data_type added there reaches
+# every read that decodes a row; a hand-listed copy is how a column goes
+# missing from one read and not another.
+METADATA_VALUE_COLUMNS_SELECT = ", ".join(
+    f"m.{column}"
+    for column in (*GLOBAL_METADATA_VALUE_COLUMN.values(), MISSING_REASON_VALUE_COLUMN)
+)
+
+# The display payload for a row whose value is a missing-reason or a terminology
+# term (the reason name; the term's term_id and label), and the two LEFT JOINs
+# that supply it. Split because the two halves sit in different clauses of the
+# statement; both are consumed together by every read that decodes values for a
+# caller.
+METADATA_REF_PAYLOAD_SELECT = (
+    "mvr.name AS missing_reason_name,"
+    " tt.term_id AS terminology_term_id,"
+    " tt.label AS terminology_term_label"
+)
+METADATA_REF_JOIN_CLAUSES = (
+    f" LEFT JOIN qiita.missing_value_reason mvr"
+    f"   ON mvr.idx = m.{MISSING_REASON_VALUE_COLUMN}"
+    f" LEFT JOIN qiita.terminology_term tt"
+    f"   ON tt.idx = m.{TERMINOLOGY_TERM_VALUE_COLUMN}"
+)
+
 
 class SampleEntityKind(StrEnum):
     """Discriminator for the entity domain a sample-family operation targets.
@@ -112,17 +157,6 @@ class GlobalMetadataRow(MetadataRow):
     """
 
     internal_name: str
-
-
-# Closed set of data_types currently decoded. BOOLEAN is intentionally
-# absent so adding it requires updating both the value_* column mapping
-# and any sibling write-side parsers together.
-GLOBAL_METADATA_VALUE_COLUMN: dict[FieldDataType, str] = {
-    FieldDataType.TEXT: "value_text",
-    FieldDataType.NUMERIC: "value_numeric",
-    FieldDataType.DATE: "value_date",
-    FieldDataType.TERMINOLOGY: TERMINOLOGY_TERM_VALUE_COLUMN,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -292,14 +326,15 @@ def parse_text_for_data_type(
     field_key: str,
     data_type: FieldDataType,
     text_value: str,
-) -> str | Decimal | date:
+) -> str | Decimal | date | bool:
     """Coerce a text input into the Python type matching data_type.
 
     Outer whitespace is stripped before parsing. TEXT returns the stripped
-    string; NUMERIC returns Decimal; DATE returns datetime.date. BOOLEAN
-    and TERMINOLOGY raise NotImplementedError. Conversion failures raise
-    MetadataParseError carrying field_key, data_type, raw text, and
-    reason.
+    string; NUMERIC returns Decimal; DATE returns datetime.date; BOOLEAN
+    accepts only the two boolean texts, case-insensitively. TERMINOLOGY has no
+    text coercion — its value is a terminology-term lookup — and raises
+    NotImplementedError. Conversion failures raise MetadataParseError carrying
+    field_key, data_type, raw text, and reason.
     """
     # Normalize once; all parse arms see the stripped value.
     stripped = text_value.strip()
@@ -325,10 +360,22 @@ def parse_text_for_data_type(
                 text_value=text_value,
                 reason="not a valid ISO date (YYYY-MM-DD)",
             ) from exc
-    # Closed-set fallback: BOOLEAN and TERMINOLOGY land here and raise.
-    raise NotImplementedError(
-        f"text-to-typed parsing for data_type={data_type} is not yet implemented"
-    )
+    if data_type is FieldDataType.BOOLEAN:
+        folded = stripped.casefold()
+        if folded == BOOLEAN_TRUE_TEXT:
+            return True
+        if folded == BOOLEAN_FALSE_TEXT:
+            return False
+        raise MetadataParseError(
+            field_key=field_key,
+            data_type=data_type,
+            text_value=text_value,
+            reason=f"not {BOOLEAN_TRUE_TEXT!r} or {BOOLEAN_FALSE_TEXT!r} (case-insensitive)",
+        )
+    # Closed-set fallback: no arm above matched. TERMINOLOGY is the one member
+    # that never will — its value is a term lookup, not a coercion — and a
+    # member added without an arm lands here too, loudly.
+    raise NotImplementedError(f"no text coercion for data_type={data_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -599,8 +646,8 @@ def _decode_metadata_value(
     data_type-driven decoding; otherwise the value_* column the data_type names
     is read. A data_type absent from GLOBAL_METADATA_VALUE_COLUMN raises
     NotImplementedError (labelled by read_label) so it cannot silently surface
-    a NULL value. The row must carry the six value_* columns plus
-    missing_reason_name, terminology_term_id, and terminology_term_label.
+    a NULL value. The row must carry the METADATA_VALUE_COLUMNS_SELECT columns
+    plus the METADATA_REF_PAYLOAD_SELECT aliases.
     """
     # Ref kinds take precedence over data_type; the typed branch is reached
     # only when neither Ref column is populated.
@@ -634,29 +681,21 @@ async def fetch_global_metadata(
     populated) surface as MissingReasonRef in the row's `value`;
     terminology-term entries (value_terminology_term_idx populated)
     surface as TerminologyTermRef. Both Ref kinds supersede
-    data_type-driven decoding. Other typed rows require data_type in
-    {TEXT, NUMERIC, DATE}; unsupported data_types raise
-    NotImplementedError. Not study-scoped: the canonical global value
-    persists across link retirement.
+    data_type-driven decoding. Any other row is decoded from the value
+    column its data_type maps to. Not study-scoped: the canonical global
+    value persists across link retirement.
     """
     # f-string interpolation of the table identifiers is safe: all
     # (including spec fields) are frozen constants, never reached by caller input.
-    # LEFT JOINs on qiita.missing_value_reason and qiita.terminology_term so
-    # a Ref-surfaced row's display payload comes back in one round trip; typed
-    # rows have both join keys NULL.
+    # LEFT JOINs on qiita.missing_value_reason and qiita.terminology_term so a
+    # missing-reason or terminology-term row's display payload comes back in one
+    # round trip; rows carrying a scalar value have both join keys NULL.
     rows = await pool_or_conn.fetch(
         f"SELECT gf.internal_name, gf.display_name, gf.description, gf.data_type,"
-        f" m.value_text, m.value_numeric, m.value_date,"
-        f" m.{MISSING_REASON_VALUE_COLUMN}, mvr.name AS missing_reason_name,"
-        f" m.{TERMINOLOGY_TERM_VALUE_COLUMN},"
-        f" tt.term_id AS terminology_term_id,"
-        f" tt.label AS terminology_term_label"
+        f" {METADATA_VALUE_COLUMNS_SELECT}, {METADATA_REF_PAYLOAD_SELECT}"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
-        f" LEFT JOIN qiita.missing_value_reason mvr"
-        f"   ON mvr.idx = m.{MISSING_REASON_VALUE_COLUMN}"
-        f" LEFT JOIN qiita.terminology_term tt"
-        f"   ON tt.idx = m.{TERMINOLOGY_TERM_VALUE_COLUMN}"
+        f"{METADATA_REF_JOIN_CLAUSES}"
         f" WHERE m.{spec.entity_key_column} = $1"
         f"   AND m.global_field_idx IS NOT NULL",
         entity_idx,
@@ -693,28 +732,21 @@ async def fetch_local_metadata(
     one study's local fields; display_name, description, and data_type come from
     that study_field (a purely-local field owns its own type). Intentionally-
     missing and terminology-term entries surface as MissingReasonRef /
-    TerminologyTermRef; other typed rows require data_type in {TEXT, NUMERIC,
-    DATE} and raise NotImplementedError otherwise. An owner-sample-id row (where
-    the spec has one) is a study-local value like any other and is included;
-    this read applies no visibility gating of its own.
+    TerminologyTermRef; any other row is decoded from the value column its
+    data_type maps to. An owner-sample-id row (where the spec has one) is a
+    study-local value like any other and is included; this read applies no
+    visibility gating of its own.
     """
     # The study_field join scopes to one study and supplies the field's
-    # display_name + data_type; the LEFT JOINs recover a Ref row's display
-    # payload in one round trip. m.global_field_idx IS NULL selects only
-    # purely-local values.
+    # display_name + data_type; the LEFT JOINs recover a missing-reason or
+    # terminology-term row's display payload in one round trip.
+    # m.global_field_idx IS NULL selects only purely-local values.
     rows = await pool_or_conn.fetch(
         f"SELECT sf.display_name, sf.description, sf.data_type,"
-        f" m.value_text, m.value_numeric, m.value_date,"
-        f" m.{MISSING_REASON_VALUE_COLUMN}, mvr.name AS missing_reason_name,"
-        f" m.{TERMINOLOGY_TERM_VALUE_COLUMN},"
-        f" tt.term_id AS terminology_term_id,"
-        f" tt.label AS terminology_term_label"
+        f" {METADATA_VALUE_COLUMNS_SELECT}, {METADATA_REF_PAYLOAD_SELECT}"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.study_field_table} sf ON sf.idx = m.{spec.study_field_idx_column}"
-        f" LEFT JOIN qiita.missing_value_reason mvr"
-        f"   ON mvr.idx = m.{MISSING_REASON_VALUE_COLUMN}"
-        f" LEFT JOIN qiita.terminology_term tt"
-        f"   ON tt.idx = m.{TERMINOLOGY_TERM_VALUE_COLUMN}"
+        f"{METADATA_REF_JOIN_CLAUSES}"
         f" WHERE m.{spec.entity_key_column} = $1"
         f"   AND m.global_field_idx IS NULL"
         f"   AND sf.study_idx = $2",
@@ -775,8 +807,9 @@ class SlotOccupiedError(Exception):
         data_type: FieldDataType,
         existing_metadata_idx: int,
         # int arm is the terminology_term.idx FK (read from the typed value
-        # column of a TERMINOLOGY-typed row); the scalar arms cover str/Decimal/date.
-        existing_value: str | Decimal | date | int | None,
+        # column of a TERMINOLOGY-typed row); the scalar arms cover
+        # str/Decimal/date/bool.
+        existing_value: str | Decimal | date | bool | int | None,
         existing_missing_reason_idx: int | None,
         global_field_idx: int | None = None,
     ) -> None:
@@ -855,8 +888,8 @@ class SlotOccupiedByTypedValueError(SlotOccupiedError):
 
 def _resolve_typed_value_column(data_type: FieldDataType) -> str:
     """Map data_type to the qiita.*_metadata.value_* column holding its typed
-    value, via GLOBAL_METADATA_VALUE_COLUMN. Raises NotImplementedError for
-    data_types absent from the mapping (BOOLEAN).
+    value, via GLOBAL_METADATA_VALUE_COLUMN. Raises NotImplementedError for a
+    data_type absent from the mapping, which has no column to read or write.
     """
     column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
     if column is None:
@@ -868,12 +901,12 @@ def _resolve_typed_value_column(data_type: FieldDataType) -> str:
 
 def _resolve_value_column_and_bind(
     value: SampleMetadataValue, data_type: FieldDataType
-) -> tuple[str, int | str | Decimal | date]:
+) -> tuple[str, int | str | Decimal | date | bool]:
     """Resolve the value_* column and the parameter to bind for one metadata
     value. A resolved Ref (missing-reason or terminology-term) names its own
     target column and binds its idx; a bare typed value takes the column its
-    data_type maps to and binds the value itself. BOOLEAN (and any data_type
-    absent from the map) raises NotImplementedError via _resolve_typed_value_column.
+    data_type maps to and binds the value itself. A data_type absent from the
+    map raises NotImplementedError via _resolve_typed_value_column.
     """
     if isinstance(value, (MissingReasonRef, TerminologyTermRef)):
         return value.value_column, value.idx
@@ -941,8 +974,8 @@ async def _fetch_slot_occupant(
     by m.global_field_idx; the per-field unique-constraint path filters by
     m.{study_field_idx_column}) and the slot identifier embedded in any
     TransientWriteRaceError raised when the occupant has been concurrently
-    deleted. Returns all six value columns; value_boolean is read ahead of
-    BOOLEAN support being wired in coordinated with the value-column map.
+    deleted. Returns every value column, so the caller can diagnose the
+    occupant whatever its data_type.
     """
     # XOR check: exactly one of the two idx kwargs must be passed.
     if (global_field_idx is None) == (study_field_idx is None):
@@ -962,9 +995,7 @@ async def _fetch_slot_occupant(
     # never reached by caller input.
     sql = (
         f"SELECT m.idx AS existing_metadata_idx,"
-        f" m.value_text, m.value_numeric, m.value_boolean,"
-        f" m.value_date, m.value_terminology_term_idx,"
-        f" m.{MISSING_REASON_VALUE_COLUMN},"
+        f" {METADATA_VALUE_COLUMNS_SELECT},"
         f" f.study_idx AS contributing_study_idx,"
         f" f.idx AS contributing_study_field_idx"
         f" FROM {spec.metadata_table} m"
@@ -1175,7 +1206,7 @@ async def _insert_metadata(
     typed value (via GLOBAL_METADATA_VALUE_COLUMN), value_missing_reason_idx
     for a MissingReasonRef, or value_terminology_term_idx for a
     TerminologyTermRef. global_field_idx is populated by trigger from the
-    source field row. BOOLEAN typed values raise NotImplementedError.
+    source field row.
     """
     # Resolve which value column to populate and what to bind into it; the
     # shared resolver handles the Ref-vs-typed dispatch and the closed-set guard.

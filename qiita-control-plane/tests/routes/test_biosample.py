@@ -1198,6 +1198,7 @@ async def test_post_biosample_metadata_unknown_field_422(ctx):
     [
         (FieldDataType.NUMERIC, "not-a-number"),
         (FieldDataType.DATE, "not-a-date"),
+        (FieldDataType.BOOLEAN, "yes"),
     ],
 )
 async def test_post_biosample_metadata_unparseable_value_422(ctx, data_type, bad_value):

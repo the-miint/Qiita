@@ -224,11 +224,14 @@ class TerminologyTermRef(BaseModel):
 
 
 # One resolved metadata value: a scalar, an intentionally-missing marker, or a
-# terminology term; the two Ref variants discriminate on `kind`.
+# terminology term; the two Ref variants discriminate on `kind`. bool sits after
+# Decimal so an int-shaped value still resolves to Decimal; a genuine bool wins
+# on exact type either way.
 SampleMetadataValue = (
     str
     | Decimal
     | date
+    | bool
     | Annotated[MissingReasonRef | TerminologyTermRef, Field(discriminator="kind")]
 )
 
@@ -260,7 +263,8 @@ class MetadataEntry(BaseModel):
     display_name / description are the canonical *_global_field values; on a
     study-scoped local read the dict is keyed on `display_name` and both come
     from the study-local field. data_type identifies which Python type carries
-    the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date; a MissingReasonRef
+    the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date,
+    BOOLEAN -> bool; a MissingReasonRef
     carries an intentionally-missing entry's reason idx + name; a
     TerminologyTermRef carries a terminology-term entry's idx + term_id + label.
     Both Ref variants supersede data_type-driven decoding.

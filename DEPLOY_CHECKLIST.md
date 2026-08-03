@@ -51,7 +51,7 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- Metadata values for a `boolean`-typed biosample/prep_sample field now write and read back (`true`/`false`, case-insensitive; anything else 422s). (#386)
 
 ---
 

@@ -1,6 +1,7 @@
 """Tests for shared Pydantic models."""
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -950,6 +951,33 @@ def test_metadata_entry_round_trips_ref_values():
 
     assert MetadataEntry.model_validate(missing.model_dump()) == missing
     assert MetadataEntry.model_validate(term.model_dump()) == term
+
+
+def test_metadata_entry_boolean_value_stays_bool():
+    """Tests the case where a BOOLEAN-typed entry carries a Python bool: the
+    value union keeps it a bool on the wire (JSON true/false, not "True"), and
+    an int still resolves to Decimal so a numeric value cannot be captured by
+    the bool arm.
+    """
+    from qiita_common.models import FieldDataType, MetadataEntry
+
+    is_control = MetadataEntry(
+        display_name="Is Control",
+        description=None,
+        data_type=FieldDataType.BOOLEAN,
+        value=False,
+    )
+    numeric = MetadataEntry(
+        display_name="pH",
+        description=None,
+        data_type=FieldDataType.NUMERIC,
+        value=1,
+    )
+
+    assert is_control.value is False
+    assert '"value":false' in is_control.model_dump_json()
+    assert numeric.value == Decimal("1")
+    assert isinstance(numeric.value, Decimal)
 
 
 def test_biosample_study_field_create_request_local_valid():

@@ -34,6 +34,7 @@ import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import (
+    MISSING_REASON_VALUE_COLUMN,
     FieldDataType,
     FieldWriteOutcome,
     MissingReasonRef,
@@ -42,6 +43,8 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.repositories._sample_helpers import (
+    GLOBAL_METADATA_VALUE_COLUMN,
+    METADATA_VALUE_COLUMNS_SELECT,
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
     DuplicateGlobalFieldTargetError,
@@ -1681,11 +1684,16 @@ async def test_write_local_metadata_or_diagnose_prep_sample_spec(postgres_pool):
         (FieldDataType.NUMERIC, " 42 ", Decimal("42")),
         (FieldDataType.DATE, "2026-05-06", date(2026, 5, 6)),
         (FieldDataType.DATE, " 2026-01-01 ", date(2026, 1, 1)),
+        (FieldDataType.BOOLEAN, "true", True),
+        (FieldDataType.BOOLEAN, "false", False),
+        (FieldDataType.BOOLEAN, "True", True),
+        (FieldDataType.BOOLEAN, "FALSE", False),
+        (FieldDataType.BOOLEAN, "  true  ", True),
     ],
 )
 def test_parse_text_for_data_type_returns_expected(data_type, text_value, expected):
-    """Valid text coerces to the typed Python value (str / Decimal /
-    date) with surrounding whitespace stripped.
+    """Valid text coerces to the typed Python value (str / Decimal / date /
+    bool) with surrounding whitespace stripped.
     """
     assert parse_text_for_data_type("field_x", data_type, text_value) == expected
 
@@ -1697,6 +1705,11 @@ def test_parse_text_for_data_type_returns_expected(data_type, text_value, expect
         (FieldDataType.NUMERIC, ""),
         (FieldDataType.DATE, "not-a-date"),
         (FieldDataType.DATE, "2026/05/06"),
+        (FieldDataType.BOOLEAN, "yes"),
+        (FieldDataType.BOOLEAN, "1"),
+        (FieldDataType.BOOLEAN, "t"),
+        (FieldDataType.BOOLEAN, ""),
+        (FieldDataType.BOOLEAN, "true false"),
     ],
 )
 def test_parse_text_for_data_type_raises_parse_error(data_type, text_value):
@@ -1710,16 +1723,35 @@ def test_parse_text_for_data_type_raises_parse_error(data_type, text_value):
     assert excinfo.value.text_value == text_value
 
 
-@pytest.mark.parametrize(
-    "data_type",
-    [FieldDataType.BOOLEAN, FieldDataType.TERMINOLOGY],
-)
-def test_parse_text_for_data_type_raises_not_implemented(data_type):
-    """BOOLEAN and TERMINOLOGY are deliberately unsupported and raise
-    NotImplementedError.
+def test_parse_text_for_data_type_raises_not_implemented():
+    """Tests the case where the data_type is TERMINOLOGY, which the caller
+    resolves against its terminology before dispatching here — reaching the
+    parser with it is a bug, so the closed-set guard raises rather than
+    coercing the term id to text.
     """
     with pytest.raises(NotImplementedError):
-        parse_text_for_data_type("field_x", data_type, "x")
+        parse_text_for_data_type("field_x", FieldDataType.TERMINOLOGY, "x")
+
+
+def test_global_metadata_value_column_covers_every_data_type():
+    """Tests the case where a FieldDataType member has no value_* column
+    mapped: every member must appear, since an unmapped one is mintable as a
+    field but unwritable as a value.
+    """
+    assert set(GLOBAL_METADATA_VALUE_COLUMN) == set(FieldDataType)
+
+
+def test_metadata_value_columns_select_names_every_mapped_column():
+    """Tests the case where a mapped value column is missing from the shared
+    SELECT fragment — the read would decode a row whose column was never
+    fetched.
+    """
+    selected = {fragment.strip() for fragment in METADATA_VALUE_COLUMNS_SELECT.split(",")}
+    expected = {
+        f"m.{column}"
+        for column in (*GLOBAL_METADATA_VALUE_COLUMN.values(), MISSING_REASON_VALUE_COLUMN)
+    }
+    assert selected == expected
 
 
 # ---------------------------------------------------------------------------
@@ -2601,12 +2633,15 @@ async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test__insert_metadata_unsupported_data_type_raises(ctx, spec):
-    """Closed-set guard: BOOLEAN is absent from GLOBAL_METADATA_VALUE_COLUMN,
-    so the shared inserter raises NotImplementedError rather than silently
-    writing NULL into every value column. Exercised without touching the DB
+async def test__insert_metadata_unsupported_data_type_raises(ctx, spec, monkeypatch):
+    """Tests the case where a data_type has no value_* column mapped: the
+    shared inserter raises NotImplementedError rather than silently writing
+    NULL into every value column. Every real FieldDataType member is mapped,
+    so the gap is staged by removing one. Exercised without touching the DB
     because the guard fires before any INSERT.
     """
+    monkeypatch.delitem(GLOBAL_METADATA_VALUE_COLUMN, FieldDataType.TEXT)
+
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(NotImplementedError):
             await _insert_metadata(
@@ -2614,7 +2649,7 @@ async def test__insert_metadata_unsupported_data_type_raises(ctx, spec):
                 spec=spec,
                 entity_idx=1,
                 study_field_idx=1,
-                data_type=FieldDataType.BOOLEAN,
+                data_type=FieldDataType.TEXT,
                 value="ignored",
                 created_by_idx=ctx["principal_idx"],
             )
@@ -2698,7 +2733,7 @@ async def _seed_globally_linked_metadata(
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test_fetch_global_metadata_text_numeric_date(ctx, spec):
+async def test_fetch_global_metadata_typed_values(ctx, spec):
     entity_idx = await (
         _create_biosample_with_link(ctx)
         if spec.entity_kind is SampleEntityKind.BIOSAMPLE
@@ -2706,8 +2741,9 @@ async def test_fetch_global_metadata_text_numeric_date(ctx, spec):
     )
     suffix = secrets.token_hex(4)
 
-    # Three globally-linked rows, one per supported data_type, on the same
-    # entity. Names are tagged with a suffix to dodge UNIQUE collisions.
+    # One globally-linked row per typed data_type on the same entity, with
+    # both boolean polarities so a false value cannot be mistaken for an
+    # absent one. Names are tagged with a suffix to dodge UNIQUE collisions.
     await _seed_globally_linked_metadata(
         ctx,
         spec=spec,
@@ -2738,6 +2774,26 @@ async def test_fetch_global_metadata_text_numeric_date(ctx, spec):
         data_type=FieldDataType.DATE,
         value=date(2026, 5, 6),
     )
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=spec,
+        entity_idx=entity_idx,
+        internal_name=f"is_control_{suffix}",
+        display_name=f"Is Control {suffix}",
+        description="Whether the sample is a control",
+        data_type=FieldDataType.BOOLEAN,
+        value=True,
+    )
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=spec,
+        entity_idx=entity_idx,
+        internal_name=f"is_pooled_{suffix}",
+        display_name=f"Is Pooled {suffix}",
+        description=None,
+        data_type=FieldDataType.BOOLEAN,
+        value=False,
+    )
 
     result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
 
@@ -2762,6 +2818,20 @@ async def test_fetch_global_metadata_text_numeric_date(ctx, spec):
             description="Date the sample was collected",
             data_type=FieldDataType.DATE,
             value=date(2026, 5, 6),
+        ),
+        f"is_control_{suffix}": GlobalMetadataRow(
+            internal_name=f"is_control_{suffix}",
+            display_name=f"Is Control {suffix}",
+            description="Whether the sample is a control",
+            data_type=FieldDataType.BOOLEAN,
+            value=True,
+        ),
+        f"is_pooled_{suffix}": GlobalMetadataRow(
+            internal_name=f"is_pooled_{suffix}",
+            display_name=f"Is Pooled {suffix}",
+            description=None,
+            data_type=FieldDataType.BOOLEAN,
+            value=False,
         ),
     }
     assert result == expected
@@ -5567,7 +5637,19 @@ async def test_write_local_metadata_or_diagnose_upsert_same_value_unchanged(ctx)
     assert row["global_field_idx"] is None
 
 
-async def test_write_local_metadata_or_diagnose_upsert_different_value_updates(ctx):
+@pytest.mark.parametrize(
+    "data_type, first_value, second_value",
+    [
+        (FieldDataType.TEXT, "v1", "v2"),
+        # False first: the falsy value is the one INSERTed and compared, where a
+        # value mistaken for absent would trip the exactly-one-value CHECK.
+        (FieldDataType.BOOLEAN, False, True),
+    ],
+    ids=["text", "boolean"],
+)
+async def test_write_local_metadata_or_diagnose_upsert_different_value_updates(
+    ctx, data_type, first_value, second_value
+):
     """A same-study re-write of a different local value overwrites the row in
     place and reports UPDATED; the field stays purely-local."""
     bs_idx = await _create_biosample_with_link(ctx)
@@ -5578,23 +5660,23 @@ async def test_write_local_metadata_or_diagnose_upsert_different_value_updates(c
         bs_idx=bs_idx,
         study_idx=ctx["study_idx"],
         display_name=display_name,
-        data_type=FieldDataType.TEXT,
-        value="v1",
+        data_type=data_type,
+        value=first_value,
     )
     second = await _commit_local_write(
         ctx,
         bs_idx=bs_idx,
         study_idx=ctx["study_idx"],
         display_name=display_name,
-        data_type=FieldDataType.TEXT,
-        value="v2",
+        data_type=data_type,
+        value=second_value,
         on_conflict="upsert",
     )
 
     assert second.outcome == FieldWriteOutcome.UPDATED
     assert second.metadata_idx == first.metadata_idx
     row = await _fetch_metadata_row(ctx["pool"], first.metadata_idx)
-    assert row["value_text"] == "v2"
+    assert row[GLOBAL_METADATA_VALUE_COLUMN[data_type]] == second_value
     assert row["global_field_idx"] is None
 
 

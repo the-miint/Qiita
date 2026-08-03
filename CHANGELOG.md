@@ -22,6 +22,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **BOOLEAN-typed sample metadata values (#386).** A biosample or prep_sample
+  field declared `data_type=boolean` now accepts values: the text `true` or
+  `false` (case-insensitive, surrounding whitespace ignored) is stored in
+  `value_boolean` and read back as a JSON boolean. Any other text is a 422
+  naming the two accepted forms. The per-data_type value-column map is now the one
+  source for every read's column list, so a data_type can no longer be
+  writable but absent from a read.
+
 - **Study-scoped biosample and sequenced-sample metadata read + write —
   `GET`/`PATCH /study/{study_idx}/{biosample|sequenced-sample}/{idx}[/metadata]` (#386).**
   Four routes expose a study's view of a sample's metadata. The two GETs return the
