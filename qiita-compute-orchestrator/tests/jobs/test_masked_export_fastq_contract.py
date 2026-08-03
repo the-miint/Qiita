@@ -1,6 +1,6 @@
 """Real-miint contract pins for the `COPY ... TO ... (FORMAT FASTQ)` writer the
 admin masked-read export builds on (the `qiita-admin masked-read-export` CLI
-streams the data plane's `read_masked` view and writes per-sample FASTQ locally
+streams the data plane's `read_masked` macro and writes per-sample FASTQ locally
 via this COPY).
 
 These run against the team-mirror miint build (staged by the session-autouse
@@ -11,7 +11,7 @@ the build, not paraphrased:
 
   * The writer requires the **verbatim** `read_id`, `sequence1`, `qual1`
     columns (and `sequence2`, `qual2` for paired) — the exact column names the
-    `read_masked` view emits. Aliasing `read_id` away raises a BinderException,
+    `read_masked` macro emits. Aliasing `read_id` away raises a BinderException,
     so the CLI must select the view's columns by name, not rename them.
   * `qual1`/`qual2` are `UTINYINT[]` (phred-decoded, as `read_fastx` emits) and
     are written back as ASCII phred+33 (Q40 -> 'I', Q30 -> '?').

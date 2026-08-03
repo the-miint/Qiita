@@ -229,9 +229,11 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 ///
 /// PRIVACY: the bare `read` and `read_mask` tables are deliberately absent, and
 /// must stay absent. A whole-table name here would make an unscoped raw-read
-/// SELECT representable; `read_masked` is the only *unrestricted* read surface,
-/// and it excludes host/human and QC-failed rows by construction (`WHERE
-/// m.reason = 'pass'`).
+/// SELECT representable. `read_masked` is the only broadly-reachable read
+/// surface, and it excludes host/human and QC-failed rows by construction (an
+/// unconditional `reason = 'pass'`). It is no longer unrestricted: it is a table
+/// MACRO whose required (mask, samples) arguments make an unscoped fleet-wide
+/// read unrepresentable rather than merely refused (see `build_read_masked_query`).
 ///
 /// `read_block` is the one path to raw `read` rows over Flight, and it is
 /// admissible only because it CANNOT express an unscoped read: it is not a table
@@ -1307,7 +1309,7 @@ const EXPORT_READ_PARQUET_OPTS: &str =
 /// The read projection, in `read` / `read_masked` table order. Shared by the
 /// per-sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
 /// block-read DoGet selectors (`read_block` from `qiita_lake.read`,
-/// `read_masked_block` from the `read_masked` VIEW), so every read payload the
+/// `read_masked_block` from the `read_masked` MACRO), so every read payload the
 /// data plane hands a compute job has the identical column shape — the shape
 /// `align_sharded.reads` / the read-mask jobs bind. `read_masked` exposes exactly
 /// these columns (plus `mask_idx`), already trimmed and `pass`-filtered.
@@ -1601,7 +1603,18 @@ fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
 /// scope as arguments so the sample predicate reaches BOTH sides of its internal
 /// `read`/`read_mask` join, which is what lets DuckLake prune to the samples'
 /// files. There is deliberately no unscoped form to construct.
+///
+/// `preps` must be non-empty, and that is the CALLER's guarantee, not this
+/// function's: `build_read_masked_query` gets it from `i64_list_filter` (which
+/// rejects an empty list) and `build_block_read_query` refuses empty `members`
+/// first. An empty list here would emit `read_masked(m, [])`, which the macro
+/// reads as "match nothing" — safe, but a silent zero-row answer rather than a
+/// loud error, so the guarantee is asserted rather than assumed.
 fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
+    debug_assert!(
+        !preps.is_empty(),
+        "read_masked scope must name at least one sample; callers guard this"
+    );
     let csv = preps
         .iter()
         .map(|v| v.to_string())
@@ -1629,7 +1642,7 @@ fn count_masked_reads(
     let conn = open_ducklake(catalog_connstr, data_path)?;
     // `prep_sample_idx`/`mask_idx` are signature-verified i64s, safe to inline (same
     // rationale as build_query: parsed integers reach SQL, no string data); the
-    // 'pass' filter mirrors the read_masked view's privacy filter.
+    // 'pass' filter mirrors the read_masked macro's privacy filter.
     let sql = format!(
         "SELECT count(*) FROM qiita_lake.read_mask \
          WHERE mask_idx = {mask_idx} AND prep_sample_idx = {prep_sample_idx} \
@@ -4424,8 +4437,8 @@ mod tests {
     }
 
     /// The `read_masked_block` DoGet selector streams the block's members from the
-    /// `read_masked` VIEW scoped to `mask_idx`: it excludes non-`pass` reads (the
-    /// view's privacy filter), a different mask's rows, and non-member samples —
+    /// `read_masked` MACRO scoped to `mask_idx`: it excludes non-`pass` reads (the
+    /// macro's privacy filter), a different mask's rows, and non-member samples —
     /// in the same `EXPORT_READ_COLUMNS` shape the raw `read_block` selector
     /// yields. Because masked-out reads drop, a masked block can be a proper
     /// subset of the raw range.
@@ -4455,7 +4468,7 @@ mod tests {
                  ({prep_a}, 102, 'a2', 'GGGGG', [30,30,30,30,30]::UTINYINT[], NULL, NULL), \
                  ({prep_b}, 200, 'b0', 'TTTTT', [30,30,30,30,30]::UTINYINT[], NULL, NULL);
              -- mask_a: seq 100 & 102 pass, seq 101 is a host hit (excluded by the
-             -- read_masked view). prep_b's 200 passes but is not a block member.
+             -- read_masked macro). prep_b's 200 passes but is not a block member.
              -- Trims 0 so bytes pass through unchanged.
              INSERT INTO qiita_lake.read_mask \
                  (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
@@ -4806,6 +4819,19 @@ mod tests {
         assert!(
             build_query("read_masked", &bad, &[]).is_err(),
             "sequence_idx is not an allowed filter column"
+        );
+
+        // An explicitly EMPTY sample list. This is the one shape that would
+        // otherwise reach `read_masked_relation` and emit `read_masked(7, [])` —
+        // which the macro reads as "match nothing", so it would answer zero rows
+        // instead of failing. Reject it at the boundary, loudly.
+        let empty_preps = filter_of(&[
+            ("mask_idx", vec![serde_json::json!(7)]),
+            ("prep_sample_idx", vec![]),
+        ]);
+        assert!(
+            build_query("read_masked", &empty_preps, &[]).is_err(),
+            "an empty prep_sample_idx list must be refused, not answered with zero rows"
         );
     }
 

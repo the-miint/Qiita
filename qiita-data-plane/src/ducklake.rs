@@ -208,7 +208,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Create the read + read_mask tables and the read_masked view in DuckLake.
+/// Create the read + read_mask tables and the read_masked macro in DuckLake.
 ///
 /// These hold per-sample sequencing reads and the downstream masks that record,
 /// per read, whether it survives QC/host filtering and how it should be trimmed.
@@ -222,10 +222,12 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 ///
 /// PRIVACY: `read` and `read_mask` are deliberately NOT exposed via Flight
 /// (they are absent from `flight_service::ALLOWED_TABLES`). The only
-/// Flight-reachable read surface is the `read_masked` view, which joins read to
+/// Flight-reachable read surface is the `read_masked` MACRO, which joins read to
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
-/// (host/human hits + QC failures) via `WHERE m.reason = 'pass'`. Human reads
-/// are therefore unreachable by construction, not by a scope check.
+/// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
+/// reads are therefore unreachable by construction, not by a scope check. The
+/// macro's required (mask, samples) parameters additionally make an unscoped
+/// fleet-wide read unrepresentable — see the comment on the macro below.
 pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- Full reads, written ONCE per sequenced sample. Independent of any mask.
@@ -274,6 +276,19 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- pruned nothing, and every file in the lake was read. Taking the scope as
         -- a parameter puts it on BOTH inputs explicitly instead of hoping the
         -- optimizer propagates it.
+        --
+        -- Upstream cause, traced 2026-08-03 and NOT reported as of that date (no
+        -- issue number to cite yet — file it against duckdb/duckdb, not ducklake:
+        -- the reproducer needs no DuckLake). DuckDB's filter pull-up
+        -- (`src/optimizer/filter_combiner.cpp`) mirrors only comparison
+        -- expressions: `FilterCombiner::AddFilter` returns UNSUPPORTED for
+        -- anything that is not a comparison/BETWEEN, and `SupportedFilterComparison`
+        -- omits COMPARE_IN, so an IN or an OR-of-equalities lands in
+        -- `remaining_filters` and is emitted verbatim, never entering the
+        -- equivalence-set maps that do the mirroring. Still present on main after
+        -- the join-filter-mirroring work (duckdb PR #23009), so this is not a
+        -- version we can wait out. Note a CONTIGUOUS integer IN list is rewritten
+        -- to a range and DOES mirror — any reproducer must use a SPARSE list.
         --
         -- Measured on DuckDB 1.5.4 against a local DuckLake of 1,000,000 `read`
         -- rows over 200 samples, one file per sample (the layout fastq_to_parquet
@@ -453,7 +468,8 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// `shear_tree`; there is no production tree consumer today, so no phylogeny view
 /// is built.
 ///
-/// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), like `read_masked`: the
+/// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), for the same reason the
+/// `read_masked` macro is `CREATE OR REPLACE`: the
 /// anti-join predicate IS the enforcement surface, so a definition change must
 /// reconcile on every DP startup rather than silently keep a stale view on an
 /// already-attached catalog. Must run AFTER `ensure_reference_tables` +
@@ -878,7 +894,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(views, 0, "the superseded read_masked view must be dropped");
+        assert_eq!(views, 0, "the superseded read_masked macro must be dropped");
     }
 
     /// ensure_alignment_tables is idempotent (CREATE TABLE IF NOT EXISTS, run on
@@ -1065,7 +1081,7 @@ mod tests {
     /// The `_visible` views are catalog-stored, not session-local: a fresh ATTACH
     /// (a real DP restart) sees them WITHOUT re-running ensure_exclusion_tables and
     /// they still anti-join the mirror. Parity with
-    /// read_masked_view_persists_across_reattach.
+    /// read_masked_macro_persists_across_reattach.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
@@ -1391,14 +1407,15 @@ mod tests {
         assert_eq!(qlen_zero, 4, "zero-trim keeps all quals");
     }
 
-    /// The read_masked view is stored in the Postgres catalog, not the session: a
+    /// The read_masked MACRO is stored in the Postgres catalog, not the session: a
     /// fresh ATTACH (a real DP restart) sees it WITHOUT re-running
-    /// ensure_read_tables. Asserts that catalog-stored view persistence holds on
+    /// ensure_read_tables. That is what makes a macro a drop-in for the view it
+    /// replaced — same lifecycle, created once at boot — so it is worth pinning on
     /// the Postgres catalog the data plane actually uses.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
-    fn read_masked_view_persists_across_reattach() {
+    fn read_masked_macro_persists_across_reattach() {
         let prep = next_test_id();
         let mask = next_test_id();
         let seq = next_test_id();
@@ -1446,7 +1463,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             s, "ACGT",
-            "view persisted across re-attach (zero-trim identity)"
+            "macro persisted across re-attach (zero-trim identity)"
         );
     }
 

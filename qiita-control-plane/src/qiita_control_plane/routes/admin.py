@@ -694,7 +694,7 @@ async def create_masked_read_export_ticket(
     _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
 ) -> DoGetTicketResponse:
     """Mint a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on
-    the data plane's read_masked view — the human (system_admin) counterpart to
+    the data plane's read_masked macro — the human (system_admin) counterpart to
     the service-account POST /read-masked/ticket/doget. The export CLI mints one
     just-in-time per sample.
 
