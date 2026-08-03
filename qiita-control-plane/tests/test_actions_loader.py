@@ -634,28 +634,16 @@ _ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
     "align:1.0.0": {"align_sharded": ("mem_gb",)},
 }
 
-# NOT accepts — defects that predate the guard, each genuinely dying permanently
-# on its first OOM (and, where walltime is listed, its first timeout). Listed so
-# the guard can land ahead of the re-sizing, which needs measured peak-RSS data
-# per workflow rather than a blanket multiplier. Six entries across four workflow
-# directories (fastq-to-parquet contributes three versions).
+# NOT accepts — a defect being tracked rather than fixed right now, listed so the
+# guard can land ahead of the re-sizing (which needs measured peak-RSS data per
+# workflow rather than a blanket multiplier). Empty today: the six entries this
+# started with, across four workflow directories, were re-sized and so deleted.
 #
 # Raising a ceiling above its step baseline DELETES that entry from here — the
 # exact-equality check below then fails until it is gone, so a re-size cannot
 # silently leave its suppression behind. Nothing is added here except alongside
-# the work to remove it; when the last one goes, so does this dict.
-_ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {
-    "bcl-convert:1.0.0": {"bcl_convert[Illumina NovaSeq X]": ("mem_gb", "walltime")},
-    "fastq-to-parquet:1.1.0": {"host_filter": ("mem_gb", "walltime")},
-    "fastq-to-parquet:1.2.0": {"host_filter": ("mem_gb", "walltime")},
-    "fastq-to-parquet:1.3.0": {"host_filter": ("mem_gb",)},
-    "read-mask:1.0.0": {
-        "syndna": ("mem_gb",),
-        "lima_mask": ("mem_gb",),
-        "host_filter": ("mem_gb",),
-    },
-    "read-mask-block:1.0.0": {"host_filter": ("mem_gb",)},
-}
+# the work to remove it.
+_ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
 
 
 def test_every_shipped_step_can_escalate_on_both_retry_axes():
@@ -1183,106 +1171,3 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     names = [s.name for s in ftp_130.steps]
     assert names[-1] == "finalize-mask-sample"
     assert names[-2] == "register-files"  # register-files immediately precedes the gate flip
-
-
-# `align/1.0.0` deliberately accepts a dead memory ladder: its YAML documents
-# that `align_sharded` sits AT the ceiling on mem_gb and that the first OOM is
-# therefore terminal. Keyed by (action_id, version, step, axis) so the accept is
-# as narrow as possible — align's walltime axis is NOT allowlisted and still has
-# to keep its headroom.
-_CEILING_HEADROOM_ACCEPTS = {("align", "1.0.0", "align_sharded", "mem_gb")}
-
-# The axes the runner escalates on a retry. `cpu` and `gpu` are deliberately
-# absent: no mechanism grows either, so a step whose cpu (or gpu) equals the
-# ceiling gives nothing up — long-read-assembly pins cpu: 32 at its ceiling on
-# purpose. Both are still bounded at dispatch by `_assert_within_ceiling`.
-_ESCALATING_AXES = ("mem_gb", "walltime")
-
-
-def test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis():
-    """Every shipped step must leave escalation headroom under its action's
-    `action_ceiling` on both escalating axes.
-
-    `_escalated_mem_floor_after_oom` / `_escalated_walltime_after_timeout` grow
-    the resolved allocation by a fixed factor and clamp to the ceiling. A
-    baseline that has reached the ceiling therefore grows to a value that does
-    not exceed the resolved one, the runner reads that as saturation, and the
-    ticket fails PERMANENTLY at `retry_count=0` with RESOURCE_CEILING_EXHAUSTED
-    — never having retried. `long-read-assembly` shipped that shape and a single
-    `assemble` OOM became unrecoverable in production.
-
-    Nothing else catches it: `ActionDefinition` has no validator comparing the
-    two, the loader only `model_validate`s, and `actions sync` checks module
-    prefixes and `context_schema` — so it is invisible at author, load and sync
-    time and surfaces only as a dead ticket. Hence enumerating the real YAML.
-
-    Checks `>=`, not `==`: a baseline *above* its ceiling is the strictly worse
-    case (`_assert_within_ceiling` rejects it, but only once a ticket has been
-    submitted and dispatched), and catching it here is free.
-    """
-    from pathlib import Path
-
-    from qiita_common.actions import WorkflowStep
-
-    from qiita_control_plane.actions import load_actions
-
-    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
-
-    offenders: list[str] = []
-    live_accepts: set[tuple[str, str, str, str]] = set()
-    checked = 0
-    for action in actions:
-        # `action_ceiling` is a required field on ActionDefinition, so this is a
-        # plain attribute read, not a defensive `getattr` — a missing ceiling
-        # must blow up here, never be silently skipped by a guard test.
-        ceiling = action.action_ceiling
-        for step in action.steps:
-            # `steps` is a WorkflowEntry union: only WorkflowStep dispatches to a
-            # backend and carries resources. Discriminate on the type, not on
-            # whether an attribute happens to exist — a `getattr(..., None)`
-            # probe would also swallow the field being renamed out from under
-            # this sweep, leaving it vacuously green.
-            if not isinstance(step, WorkflowStep):
-                continue
-            # Required field on WorkflowStep, so a plain attribute read: a step
-            # without a baseline must blow up here, never be skipped.
-            baseline_resources = step.baseline_resources
-            # A lookup population resolves to one of `profiles` at dispatch, so
-            # every profile is a baseline the runner can land on — check each.
-            resolved = (
-                [(f"{step.name}[{key}]", p) for key, p in baseline_resources.profiles.items()]
-                if baseline_resources.from_step_output is not None
-                else [(step.name, baseline_resources)]
-            )
-            for label, baseline in resolved:
-                for axis in _ESCALATING_AXES:
-                    checked += 1
-                    if getattr(baseline, axis) < getattr(ceiling, axis):
-                        continue
-                    key = (action.action_id, action.version, step.name, axis)
-                    if key in _CEILING_HEADROOM_ACCEPTS:
-                        live_accepts.add(key)
-                        continue
-                    offenders.append(
-                        f"{action.action_id}/{action.version}:{label} "
-                        f"{axis}={getattr(baseline, axis)} is not below "
-                        f"action_ceiling.{axis}={getattr(ceiling, axis)}"
-                    )
-
-    assert not offenders, (
-        "these steps have no escalation headroom on an escalating axis, so an "
-        "OOM/TIMEOUT fails the ticket permanently at retry_count=0 instead of "
-        "retrying larger. Raise the action_ceiling above the step baseline "
-        "(leave the baseline alone so ordinary tickets schedule unchanged), or "
-        "add a documented _CEILING_HEADROOM_ACCEPTS entry: " + "; ".join(offenders)
-    )
-    # A sweep that silently examined nothing would pass the assert above. These
-    # two pin that it did the work: `checked` guards against the walk breaking
-    # (a renamed field, a shape change), and the accept-list comparison keeps
-    # the allowlist from outliving the equality it documents.
-    assert checked > 0, "the sweep examined no (step, axis) pairs at all"
-    assert live_accepts == _CEILING_HEADROOM_ACCEPTS, (
-        "_CEILING_HEADROOM_ACCEPTS entries that no longer correspond to a step "
-        "at its ceiling — the accept outlived the thing it documents, delete "
-        f"it: {sorted(_CEILING_HEADROOM_ACCEPTS - live_accepts)}"
-    )
