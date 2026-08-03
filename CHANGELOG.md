@@ -314,6 +314,26 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Drop the GFF `+ 1` now that miint normalizes `read_gff` to half-open (closes #410).**
+  `read_gff` / `read_ncbi_annotation` used to emit GFF3's closed `end` under the same
+  `stop_position` column every other miint reader uses for a half-open one;
+  [duckdb-miint#200](https://github.com/the-miint/duckdb-miint/pull/200) normalized them.
+  `hash_sequences._write_annotation_manifest` compensated with its own `+ 1`, which became a
+  silent double-conversion once the mirror picked that up — every annotation interval one base
+  too long, no error. Stored values are unchanged from before the upstream fix, so nothing
+  already ingested is affected, and the capability is not in production use yet. Its
+  `WHERE type IS NOT NULL` guard goes too: `read_gff` now honours `##FASTA`
+  ([duckdb-miint#186](https://github.com/the-miint/duckdb-miint/issues/186)).
+
+- **Re-pin the `@SQ` contract tests: miint now sorts `@SQ` by reference name
+  ([duckdb-miint#173](https://github.com/the-miint/duckdb-miint/issues/173)).** The two canaries
+  in `test_assembly_coverage.py` exist to fail when `@SQ` gains a defined order, and did; they
+  now pin the order rather than its absence. `binning.sh`'s `samtools sort` and FASTA reordering
+  **stay** — `assembly_coverage` applies no `ORDER BY`, so its output is unsorted regardless, and
+  retiring them needs measuring against metabat2 (#374). The test helper that hand-parsed the BAM
+  binary header is replaced by `read_alignment_header`
+  ([duckdb-miint#174](https://github.com/the-miint/duckdb-miint/issues/174)).
+
 - **Single-end blocks no longer pay double the rype index reads: the routing classify
   gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
   `rype_classify` a relation with a `sequence2` column that is entirely NULL for

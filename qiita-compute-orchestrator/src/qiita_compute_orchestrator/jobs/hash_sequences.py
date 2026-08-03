@@ -406,13 +406,11 @@ def _write_annotation_manifest(
     and the manifest is deduplicated on it here so that a GFF3 repeating a line
     verbatim cannot produce two lake rows sharing one minted `annotation_idx`.
 
-    **The closed → half-open conversion happens HERE and nowhere else.** `read_gff`
-    emits GFF3's 1-based CLOSED `[start, end]`; every alignment-side consumer
-    (`alignment_slice`, `read_alignments`, `qiita_lake.alignment`) speaks 1-based
-    HALF-OPEN `[start, stop)`. Both call the column `stop_position`, so nothing
-    type-checks the difference and nothing raises — the only symptom of getting it
-    wrong is that the interval's last base silently stops being counted. Converting
-    once, at ingest, means no downstream consumer ever has to remember.
+    Intervals are 1-based HALF-OPEN `[position, stop_position)` throughout. miint
+    normalizes GFF3's closed `end` to half-open on read (duckdb-miint#200), so
+    `read_gff`'s value is stored as-is. **Do not add a `+ 1` back**: it reads as a
+    fix for GFF3's closed convention, but it double-converts and silently makes
+    every interval one base too long.
 
     Extraction is strand-agnostic ON PURPOSE. A `-` strand annotation is NOT
     reverse-complemented before hashing, because `canonical_sequence_hash_expr`
@@ -426,16 +424,8 @@ def _write_annotation_manifest(
     table, is a second schema declaration that drifts the moment `read_gff`'s column
     types change.
 
-    **Two classes of row are dropped before anything else looks at them**, and both
-    are the common case rather than a corner one:
-
-    `read_gff` does not stop at a `##FASTA` directive — it keeps going and returns
-    one row per line of the embedded FASTA, with the sequence line itself in `seqid`
-    and NULL in every other column. prokka and bakta both ALWAYS append the genome
-    that way, so on a real prokka GFF3 `read_gff` returns 1638 rows for 99 features.
-    Those rows are identified by a NULL `type` (a GFF3 feature line cannot have one)
-    and dropped. Without the filter they reach the parent check and the ingest dies
-    complaining that a line of nucleotides is not a sequence in the FASTA.
+    `read_gff` honours the `##FASTA` directive (duckdb-miint#186), so the embedded
+    genome prokka and bakta always append never reaches us and needs no filtering.
 
     GFF3 LANDMARK rows (`region`, `chromosome`, `contig`, ...) declare the extent of
     the sequence itself rather than annotating an interval of it, and NCBI ships one
@@ -468,24 +458,21 @@ def _write_annotation_manifest(
         "  g.annotation_type, "
         "  coalesce(g.strand, '.') AS strand, "
         "  CAST(g.gff_start AS BIGINT) AS position, "
-        # THE conversion. GFF3's stop is INCLUSIVE; we store EXCLUSIVE.
-        "  CAST(g.gff_stop_closed AS BIGINT) + 1 AS stop_position, "
+        # Already half-open — miint normalizes GFF3's closed end on read.
+        "  CAST(g.gff_stop AS BIGINT) AS stop_position, "
         "  g.score, "
         "  CAST(g.phase AS SMALLINT) AS phase, "
         "  g.attributes "
         "FROM ("
         "  SELECT seqid, source, type AS annotation_type, strand, score, phase, attributes,"
-        "         position AS gff_start, stop_position AS gff_stop_closed"
+        "         position AS gff_start, stop_position AS gff_stop"
         "  FROM read_gff(?)"
-        # The ##FASTA rows. A GFF3 feature line always has a type; read_gff's
-        # embedded-FASTA rows never do. See the docstring.
-        "  WHERE type IS NOT NULL"
         # The landmark rows (NCBI ships one per record). Not annotations.
         #
         # The literals are quoted for SQL, not via Python's repr() — repr switches to
         # double quotes the moment a value contains an apostrophe, and a double-quoted
         # string is an IDENTIFIER in SQL, not a literal.
-        "    AND lower(type) NOT IN "
+        "  WHERE lower(type) NOT IN "
         f"        ({', '.join(_sql_string(t) for t in sorted(_GFF_LANDMARK_TYPES))})"
         ") g",
         [str(gff_path)],
