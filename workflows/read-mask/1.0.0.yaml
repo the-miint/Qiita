@@ -312,34 +312,17 @@ steps:
     inputs: []
     outputs: []
 
-# The ceiling must stay ABOVE every step's baseline on the escalating axes
-# (mem_gb, walltime): escalation grows the floor and clamps here, so a baseline
-# that has reached the ceiling has no rung to climb to and the runner fails the
-# ticket permanently at retry_count=0 instead of retrying larger. Mechanism in
-# runner/_dispatch.py; enforced for every shipped workflow by
-# test_no_step_baseline_sits_at_the_action_ceiling_on_an_escalating_axis.
-# Step baselines are untouched, so an ordinary ticket requests exactly what it
-# did before and schedules identically — only a *failing* step climbs. (That
-# holds while no at-ceiling step exposes a plan() hint: the down-size gate in
-# _resolve_baseline_for_step is `hint < resolved < ceiling`, so raising a
-# ceiling can newly enable a down-size for a step that has one. None here do.)
-# cpu and gpu are exempt: nothing escalates them.
+# Ceiling must stay strictly ABOVE every step baseline on the escalating axes
+# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
+# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
+# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
+# are unchanged here; cpu/gpu never escalate.
 #
-# 64 is one rung above the 32 GB baseline shared by syndna, lima_mask and
-# host_filter. The load-bearing evidence is host_filter's: at a 32 GB request it
-# peaks at 25.8 GB, and that is real demand because host_filter deliberately does
-# NOT size DuckDB from the cgroup (see the comment on _DUCKDB_MEMORY_GB in
-# jobs/host_filter.py).
-#
-# Do NOT read lima_mask's ~32 GB peaks the same way. lima_mask calls
-# resolve_duckdb_memory_gb() with no cap_gb, so DuckDB's memory_limit IS the
-# allocation minus headroom — its RSS tracks whatever cgroup it is handed and
-# would read ~64 at a 64 GB request. That number cannot distinguish "needs 32"
-# from "uses what it's given", so it is not evidence of tightness and must not be
-# used to size this ceiling. syndna peaks at 7.3 GB and is unaffected either way.
-#
-# walltime already had headroom (every step's baseline is PT4H or less under
-# PT8H; longest observed lima_mask run is ~9 min), so a TIMEOUT still escalates.
+# Sized on host_filter: 25.8 GB against a 32 GB baseline, real demand because it
+# deliberately does not size DuckDB from the cgroup (jobs/host_filter.py).
+# Do NOT size off lima_mask's ~32 GB peaks — it calls resolve_duckdb_memory_gb()
+# with no cap_gb, so its RSS tracks whatever cgroup it is handed and would read
+# ~64 at 64 GB. syndna peaks at 7.3 GB and is unaffected.
 action_ceiling:
   cpu: 8
   mem_gb: 64
