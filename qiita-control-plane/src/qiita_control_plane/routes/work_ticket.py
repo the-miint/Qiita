@@ -813,7 +813,7 @@ _WORK_TICKET_COLUMNS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx,"
     " wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx,"
     " wt.prep_sample_idx, wt.sequenced_pool_idx, wt.block_idx,"
-    " sp.sequencing_run_idx, wt.shard_id,"
+    " sp.sequencing_run_idx, wt.shard_id, wt.mask_idx,"
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
     " wt.transient_reason, wt.transient_since,"

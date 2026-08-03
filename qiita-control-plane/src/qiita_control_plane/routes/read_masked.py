@@ -1,4 +1,4 @@
-"""Masked-read routes: mask_idx minting + the masked-read DoGet ticket.
+"""Masked-read routes: mask_idx minting + reads + the masked-read DoGet ticket.
 
 Two routers live here because they are the two halves of one feature:
 
@@ -14,6 +14,21 @@ Both are service-account-only, gated on ``Scope.READ_MASKED_DOGET``. Humans
 never mint masks or pull masked reads — the masked-read consumer path is
 service-driven, and the lake retains privacy-sensitive (human/host) reads that
 the ``read_masked`` view excludes only via ``WHERE reason='pass'``.
+
+**The three GETs are the human read surface, and are gated differently.** They
+answer which masks exist, what config a mask encodes, and which samples are
+masked under it — a ``mask_idx`` is required to submit ``long-read-assembly``,
+whose audience includes a plain ``user``, so an admin-only discovery path would
+put the workflow out of reach of its own audience. They carry filter metadata and
+per-sample completion state, never read data, so they sit at
+``Scope.PREP_SAMPLE_READ`` (held by every human role) at ``require_human``.
+
+A caller below ``wet_lab_admin`` sees only samples they could submit against:
+the same per-study policy the submission gate applies
+(``_check_prep_sample_study_access`` — Tier.ADMIN on every non-retired linked
+study), pushed into the query as a predicate so the narrowing happens in one
+round trip. Narrowing also restricts *which masks* the list returns, so a
+zero-tally row never reveals a mask whose samples were all filtered out.
 
 **Mandatory-filter invariant.** The data plane's ``build_query`` returns an
 unfiltered ``SELECT * FROM read_masked`` for an empty filter — i.e. every
@@ -31,27 +46,32 @@ from typing import Annotated
 
 import asyncpg
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_BY_IDX,
     PATH_MASK_DEFINITION_PREFIX,
+    PATH_MASK_DEFINITION_PREP_SAMPLE,
     PATH_MASK_DEFINITION_ROOT,
     PATH_READ_MASKED_DOGET,
     PATH_READ_MASKED_PREFIX,
 )
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     DoGetTicketResponse,
     MaskDefinition,
     MaskDefinitionDeleteResponse,
+    MaskDefinitionListResponse,
     MaskDefinitionMintRequest,
+    MaskDefinitionSummary,
+    MaskPrepSample,
+    MaskPrepSampleListResponse,
     ReadMaskedDoGetTicketRequest,
 )
 
 from ..actions.library import delete_mask_data
-from ..auth.guards import require_scope, require_service_with_scope
-from ..auth.principal import Principal, ServiceAccount
+from ..auth.guards import require_human, require_scope, require_service_with_scope
+from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import (
     TxConnFactory,
@@ -61,9 +81,21 @@ from ..deps import (
     get_tx_conn_factory,
 )
 from ..repositories.block import fetch_mask_sample_state
-from ..repositories.mask_definition import mint_mask_definition
+from ..repositories.mask_definition import (
+    fetch_mask_definition_by_idx,
+    fetch_mask_prep_samples,
+    list_mask_definitions,
+    mint_mask_definition,
+)
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
+
+# Hard caps on the two mask reads. The mask list is bounded by how many distinct
+# read-filtering configs the fleet has minted; the roster by a pool's sample
+# count. Both return `truncated` rather than paginating — a caller that hits
+# either cap should narrow with a filter.
+_MASK_LIST_HARD_CAP = 1_000
+_MASK_PREP_SAMPLE_HARD_CAP = 100_000
 
 # The masked-read view table this route is allowed to sign tickets for. Must
 # match the CP-side _DOGET_ALLOWED_TABLES (routes/reference.py) and the data
@@ -76,8 +108,9 @@ mask_definition_router = APIRouter(prefix=PATH_MASK_DEFINITION_PREFIX, tags=["ma
 read_masked_router = APIRouter(prefix=PATH_READ_MASKED_PREFIX, tags=["read-masked"])
 
 
-def _mask_record_to_response(row: asyncpg.Record) -> MaskDefinition:
-    """Project a qiita.mask_definition asyncpg.Record onto the response model.
+def _mask_record_fields(row: asyncpg.Record) -> dict:
+    """Project a qiita.mask_definition asyncpg.Record onto the MaskDefinition
+    fields, as a dict the list view extends with its tally.
 
     `params` is JSONB — asyncpg returns it as a JSON string by default, so
     parse it back to a dict for the wire model. Field access is by name so a
@@ -86,13 +119,28 @@ def _mask_record_to_response(row: asyncpg.Record) -> MaskDefinition:
     params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)
-    return MaskDefinition(
-        mask_idx=row["mask_idx"],
-        filter_workflow=row["filter_workflow"],
-        filter_version=row["filter_version"],
-        params=params,
-        created_at=row["created_at"],
-    )
+    return {
+        "mask_idx": row["mask_idx"],
+        "filter_workflow": row["filter_workflow"],
+        "filter_version": row["filter_version"],
+        "params": params,
+        "created_at": row["created_at"],
+    }
+
+
+def _mask_record_to_response(row: asyncpg.Record) -> MaskDefinition:
+    """The single-mask response: mint, and the by-idx read."""
+    return MaskDefinition(**_mask_record_fields(row))
+
+
+def _cap(rows: list, hard_cap: int) -> tuple[list, bool]:
+    """Split a `hard_cap + 1` fetch into (rows, truncated).
+
+    The reads over-fetch by one so a length above the cap distinguishes "the set
+    is exactly cap long" from "the set is larger and was cut"."""
+    if len(rows) > hard_cap:
+        return rows[:hard_cap], True
+    return rows, False
 
 
 @mask_definition_router.post(PATH_MASK_DEFINITION_ROOT, status_code=201)
@@ -131,6 +179,147 @@ async def mint_mask_definition_route(
             raise HTTPException(status_code=500, detail="database error")
 
     return _mask_record_to_response(row)
+
+
+def _narrowing_principal_idx(caller: HumanUser) -> int | None:
+    """The principal_idx the mask reads narrow their sample set to, or None for a
+    caller who sees every sample.
+
+    wet_lab_admin and above bypass the per-study check on the submission side
+    (`_check_prep_sample_study_access`), and bypass it here on the same threshold,
+    so a caller who can submit against a sample can also discover its mask."""
+    if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        return None
+    return caller.principal_idx
+
+
+@mask_definition_router.get(PATH_MASK_DEFINITION_ROOT)
+async def list_mask_definitions_route(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    sequenced_pool_idx: int | None = Query(
+        default=None,
+        gt=0,
+        description="Only masks with at least one sample on this sequenced_pool.",
+    ),
+    prep_sample_idx: int | None = Query(
+        default=None,
+        gt=0,
+        description="Only masks this prep_sample is masked under.",
+    ),
+) -> MaskDefinitionListResponse:
+    """List read-filtering masks, newest first, each with its sample tally.
+
+    The tally (`samples_completed` / `samples_pending`) is scoped to the same
+    filters as the list and counts the same rows the roster read returns. A pool
+    carrying several masks is separable from this one call: `params` distinguishes
+    them by config (a non-null `host_rype_reference_idx` is the human-filtered
+    one) and the tally says which is usable.
+
+    Caller must be a HumanUser with `Scope.PREP_SAMPLE_READ`. Below
+    wet_lab_admin the result narrows to masks over samples the caller has
+    study-admin on.
+    """
+    rows, truncated = _cap(
+        await list_mask_definitions(
+            pool,
+            sequenced_pool_idx=sequenced_pool_idx,
+            prep_sample_idx=prep_sample_idx,
+            visible_to_principal_idx=_narrowing_principal_idx(caller),
+            limit=_MASK_LIST_HARD_CAP + 1,
+        ),
+        _MASK_LIST_HARD_CAP,
+    )
+    masks = [
+        MaskDefinitionSummary(
+            **_mask_record_fields(row),
+            samples_completed=row["samples_completed"],
+            samples_pending=row["samples_pending"],
+        )
+        for row in rows
+    ]
+    return MaskDefinitionListResponse(
+        masks=masks,
+        count=len(masks),
+        truncated=truncated,
+        sequenced_pool_idx=sequenced_pool_idx,
+        prep_sample_idx=prep_sample_idx,
+    )
+
+
+@mask_definition_router.get(PATH_MASK_DEFINITION_BY_IDX)
+async def get_mask_definition_route(
+    mask_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+) -> MaskDefinition:
+    """Read one mask's config. 404 if it does not exist.
+
+    `params` is the config the mask was minted from — its host/spike-in reference
+    idxs and resolved QC constants — so this is how a caller states what a mask
+    filtered on without reading the orchestrator source. See the model docstring
+    for what `params` does and does not cover.
+
+    Unnarrowed: the row is one config blob with no sample in it, so there is no
+    per-study set to narrow. The samples masked under it are the roster read,
+    which does narrow.
+    """
+    row = await fetch_mask_definition_by_idx(pool, mask_idx)
+    if row is None:
+        raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    return _mask_record_to_response(row)
+
+
+@mask_definition_router.get(PATH_MASK_DEFINITION_PREP_SAMPLE)
+async def list_mask_prep_samples_route(
+    mask_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    sequenced_pool_idx: int | None = Query(
+        default=None,
+        gt=0,
+        description="Only samples on this sequenced_pool.",
+    ),
+) -> MaskPrepSampleListResponse:
+    """The samples masked under one mask, ascending by prep_sample_idx, each with
+    its masking state. 404 if the mask does not exist.
+
+    Reads the `mask_sample` gate row where one exists, and the sample's own
+    per-sample masking ticket where it does not — which on that path means the
+    ticket has not completed, a state the gate table cannot represent. `source`
+    says which answered; `work_ticket_state` separates a running ticket from a
+    failed one.
+
+    Existence is checked before the roster read, so a typo'd mask_idx 404s rather
+    than returning an empty roster. An empty roster on a real mask means no
+    sample the caller may see is masked under it.
+
+    Caller must be a HumanUser with `Scope.PREP_SAMPLE_READ`. Below
+    wet_lab_admin the roster narrows to samples the caller has study-admin on.
+    """
+    if await fetch_mask_definition_by_idx(pool, mask_idx) is None:
+        raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    rows, truncated = _cap(
+        await fetch_mask_prep_samples(
+            pool,
+            mask_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+            visible_to_principal_idx=_narrowing_principal_idx(caller),
+            limit=_MASK_PREP_SAMPLE_HARD_CAP + 1,
+        ),
+        _MASK_PREP_SAMPLE_HARD_CAP,
+    )
+    samples = [MaskPrepSample.model_validate(dict(row)) for row in rows]
+    return MaskPrepSampleListResponse(
+        mask_idx=mask_idx,
+        samples=samples,
+        count=len(samples),
+        truncated=truncated,
+        sequenced_pool_idx=sequenced_pool_idx,
+    )
 
 
 @mask_definition_router.delete(PATH_MASK_DEFINITION_BY_IDX)

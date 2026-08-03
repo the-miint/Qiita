@@ -22,6 +22,45 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
+  `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could
+  produce one: `mask-definition` had only `POST` (mint) and `DELETE`, and the admin
+  masked-read-export roster takes `mask_idx` as an *input*. Four reads close it:
+
+  - `GET /api/v1/mask-definition` — masks newest-first, each with its config `params`
+    and a per-mask `samples_completed` / `samples_pending` tally under the same
+    optional `sequenced_pool_idx` / `prep_sample_idx` filters. A pool carrying several
+    masks is separable in one call: `params` distinguishes them by config, the tally
+    says which is usable.
+  - `GET /api/v1/mask-definition/{mask_idx}` — one mask's config, so what a filter ran
+    with is quotable rather than read out of the orchestrator source.
+  - `GET /api/v1/mask-definition/{mask_idx}/prep-sample` — the per-sample roster.
+    Reads the `qiita.mask_sample` gate row where one exists, and the sample's own
+    per-sample masking ticket (`read-mask` or `fastq-to-parquet`) where it does not.
+    The per-sample path writes its gate row `'completed'` in one upsert at the
+    terminal step, so a ticket that ran and did not complete leaves no gate row —
+    indistinguishable, in the gate alone, from a sample nobody tried to mask. The
+    admin export roster LEFT JOINs the gate table and so reports NULL for exactly
+    those; this one names them, with `source` saying which source answered and
+    `work_ticket_state` separating a running ticket from a failed one. A ticket the
+    runner has not started carries no `mask_idx` yet and so appears under no mask.
+  - `mask_idx` on `WorkTicket` / `WorkTicketSummary` (nullable). The column existed and
+    the runner wrote it; the API dropped it, so `qiita ticket status` on a read-mask
+    ticket could not name the mask it produced.
+
+  Gated `Scope.PREP_SAMPLE_READ` at `require_human` — no new scope, so no deploy note.
+  `long-read-assembly`'s audience includes a plain `user`, so an admin-only discovery
+  path would put the workflow out of reach of its own audience. Below `wet_lab_admin`
+  the reads narrow to samples the caller has study-admin on, the same per-study policy
+  `POST /work-ticket` applies at submission; the narrowing also decides which masks the
+  list returns, so a zero-tally row never reveals a mask whose samples were filtered
+  out. The privacy-sensitive pulls (`read_masked:doget`, `admin:masked_read_export`)
+  are unchanged.
+
+- **`qiita mask list` / `show` / `samples` (#423).** The user-CLI front end for the
+  reads above — read-only, in the regular CLI rather than `qiita-admin`, which keeps
+  the destructive `mask delete` / `purge-failed`.
+
 - **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
   system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
   an `ATTACH` from the service env files — risking a writable attach against the live

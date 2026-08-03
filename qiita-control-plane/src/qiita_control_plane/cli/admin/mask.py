@@ -24,9 +24,14 @@ from .. import _common
 
 # The two affected workflows. The move-then-read ordering bug lived in both
 # read-mask/1.0.0 and fastq-to-parquet/1.3.0 (same register→persist shape), so
-# the recovery covers both. The selector keys on failure_reason, not workflow,
-# but we still scope the candidate set to these action_ids so an unrelated
-# action that happens to log the same string is never swept up.
+# the recovery covers both. The selector keys on failure_reason, not workflow, but
+# we still scope the candidate set to these action_ids so an unrelated action that
+# happens to log the same string is never swept up.
+#
+# Equal to PER_SAMPLE_MASK_ACTION_IDS today, and deliberately not that constant:
+# this set is the incident's blast radius, which does not grow when a third
+# per-sample masking action is added. Widening a destructive purge-and-resubmit
+# sweep is a decision to make, not to inherit.
 _PURGE_FAILED_ACTION_IDS = ("read-mask", "fastq-to-parquet")
 
 # The failure_reason substring the move-then-read bug leaves behind: host_filter
