@@ -1514,10 +1514,7 @@ fn export_read_to_parquet(
 /// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
 /// all integers are signature-verified i64s, safe to inline.
 fn block_read_where_clause(members: &[auth::BlockReadMember]) -> String {
-    let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
-    preps.sort_unstable();
-    preps.dedup();
-    let in_list = preps
+    let in_list = block_member_preps(members)
         .iter()
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
@@ -1562,10 +1559,55 @@ fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Stat
             ))
         }),
         _ => Err(Status::invalid_argument(format!(
-            "count_masked requires exactly one value for {col:?}, got {}",
+            "expected exactly one value for {col:?}, got {}",
             values.len()
         ))),
     }
+}
+
+/// A non-empty integer set from a ticket filter column.
+fn i64_list_filter(filter: &auth::TicketFilter, col: &str) -> Result<Vec<i64>, Status> {
+    let values = filter
+        .get(col)
+        .ok_or_else(|| Status::invalid_argument(format!("ticket missing filter column {col:?}")))?;
+    if values.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "filter column {col:?} has empty values list"
+        )));
+    }
+    values
+        .iter()
+        .map(|v| {
+            v.as_i64().ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "filter values for {col:?} must be integers, got {v}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The sorted, deduplicated sample set a block's members cover.
+fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
+    let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
+    preps.sort_unstable();
+    preps.dedup();
+    preps
+}
+
+/// The `read_masked` table-macro call for one (mask, samples) scope.
+///
+/// `read_masked` is a MACRO, not a relation (see `ducklake.rs`): it takes its
+/// scope as arguments so the sample predicate reaches BOTH sides of its internal
+/// `read`/`read_mask` join, which is what lets DuckLake prune to the samples'
+/// files. There is deliberately no unscoped form to construct.
+fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
+    let csv = preps
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("qiita_lake.read_masked({mask_idx}, [{csv}])")
 }
 
 /// Count the masked reads a `read_masked` ticket selects, without streaming them.
@@ -2528,24 +2570,27 @@ fn build_query(
 
     let full_table = format!("qiita_lake.{table}");
 
+    // `read_masked` is a table macro whose (mask, samples) scope IS its argument
+    // list, so it cannot be assembled by the generic WHERE-clause path below.
+    if table == "read_masked" {
+        return build_read_masked_query(filter);
+    }
+
     if filter.is_empty() {
-        // Defense-in-depth against a full-table read leak. `read_masked`
-        // exposes per-sample human read data; the control plane scopes each
-        // ticket to an explicit (prep_sample_idx, mask_idx) before signing, so
-        // an empty filter should never reach here. If the CP ever mis-signed,
-        // an empty filter would `SELECT *` every sample's pass-reads across all
-        // studies — refuse it. This rejects only the *empty* case, not every
-        // under-scoped one: a non-empty but non-scoping filter (e.g. feature_idx
-        // alone) still passes today. Making an unfiltered read opt-in via an
-        // allowlist, and requiring prep_sample_idx for read_masked, is a tracked
-        // durability follow-up.
+        // Defense-in-depth against a full-table read leak. The human-read surface
+        // no longer reaches here at all — `read_masked` is a macro that cannot be
+        // called without a scope (above), which retires the "requiring
+        // prep_sample_idx for read_masked" half of the follow-up this comment used
+        // to track. `alignment_visible` is still guarded here: the CP always
+        // scopes it to (alignment_idx, prep_sample_idx), and an empty filter would
+        // dump the whole sink (and bypass the projection). This rejects only the
+        // *empty* case, not every under-scoped one: a non-empty but non-scoping
+        // filter (e.g. feature_idx alone) still passes today. Making an unfiltered
+        // read opt-in via an allowlist is still a tracked durability follow-up.
         // The reference_* tables are broadly readable by design (this mirrors
         // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
-        // legitimate there — reject empty filters only for the read surface.
-        // `alignment_visible` is likewise never read unscoped — the CP always
-        // scopes it to (alignment_idx, prep_sample_idx). An empty filter would
-        // dump the whole sink (and bypass the projection), so refuse it here too.
-        if table == "read_masked" || is_alignment_doget_surface(table) {
+        // legitimate there — reject empty filters only for the alignment surface.
+        if is_alignment_doget_surface(table) {
             return Err(Status::invalid_argument(format!(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
@@ -2643,6 +2688,32 @@ fn build_query(
     Ok((sql, full_table))
 }
 
+/// Build the `read_masked` DoGet: a call to the table macro, not a filtered SELECT.
+///
+/// The ticket must name exactly the macro's scope — one `mask_idx` and a non-empty
+/// `prep_sample_idx` set — which is precisely what both control-plane signing sites
+/// already produce (`routes/read_masked.py`, `runner/_read_ingest.py`). Any other
+/// column is refused rather than appended as an outer filter: on the human-read
+/// surface an unrecognised scope column is a control-plane bug, and quietly reading
+/// "the macro's scope, plus whatever else" is how an under-scoped read would pass.
+///
+/// This is where the CP's mandatory-filter invariant stops being advisory: an empty
+/// or absent scope has no representation here, it is not merely rejected.
+fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+    let mask_idx = single_i64_filter(filter, "mask_idx")?;
+    let preps = i64_list_filter(filter, "prep_sample_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "read_masked accepts only mask_idx and prep_sample_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    Ok((
+        format!("SELECT * FROM {}", read_masked_relation(mask_idx, &preps)),
+        "qiita_lake.read_masked".to_string(),
+    ))
+}
+
 /// Build the SELECT for a block-read DoGet (`read_block` / `read_masked_block`).
 ///
 /// Source relation, `block_read_where_clause` selector and `EXPORT_READ_COLUMNS`
@@ -2674,7 +2745,12 @@ fn build_block_read_query(
     let full_table = format!("qiita_lake.{source}");
     let member_clause = block_read_where_clause(members);
 
-    let where_str = if table == "read_masked_block" {
+    // `read_masked` is a macro (scope-as-arguments); `read` is a plain relation.
+    // The member clause stays an outer filter either way — it carries the
+    // per-sample sequence sub-ranges the macro's sample scope does not express,
+    // and it is the SAME selector the block DELETE path uses, so a block's read
+    // footprint and its delete footprint cannot drift.
+    let (relation, where_str) = if table == "read_masked_block" {
         let mask_idx = single_i64_filter(filter, "mask_idx")?;
         if filter.len() != 1 {
             return Err(Status::invalid_argument(format!(
@@ -2682,7 +2758,11 @@ fn build_block_read_query(
                 filter.len()
             )));
         }
-        format!("mask_idx = {mask_idx} AND ({member_clause})")
+        // `mask_idx` moves into the macro call; the members' samples scope its
+        // `read`/`read_mask` inputs so DuckLake prunes to their files rather than
+        // scanning the lake (see the measurements on the macro in ducklake.rs).
+        let relation = read_masked_relation(mask_idx, &block_member_preps(members));
+        (relation, member_clause)
     } else {
         if !filter.is_empty() {
             return Err(Status::invalid_argument(format!(
@@ -2690,11 +2770,11 @@ fn build_block_read_query(
                 filter.len()
             )));
         }
-        member_clause
+        (full_table.clone(), member_clause)
     };
 
     Ok((
-        format!("SELECT {EXPORT_READ_COLUMNS} FROM {full_table} WHERE {where_str}"),
+        format!("SELECT {EXPORT_READ_COLUMNS} FROM {relation} WHERE {where_str}"),
         full_table,
     ))
 }
@@ -4662,10 +4742,15 @@ mod tests {
         );
     }
 
+    /// THE pruning regression guard. `read_masked` must be reached as a scoped
+    /// MACRO CALL, never as a relation with a `WHERE`: a filtered select puts the
+    /// sample scope on only one side of the macro's internal join, DuckLake prunes
+    /// nothing, and the DoGet reads every file in the lake (see the measurements on
+    /// the macro in ducklake.rs). That failure is invisible in results — the rows
+    /// are correct, only the cost explodes — so nothing but this shape assertion
+    /// catches a regression to it.
     #[test]
-    fn build_query_read_masked_both_filters() {
-        // read_masked is a plain view: both mask_idx and prep_sample_idx are
-        // integer columns filtered directly via IN clauses (no membership join).
+    fn build_query_read_masked_calls_the_scoped_macro() {
         let mut filter = auth::TicketFilter::new();
         filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
         filter.insert(
@@ -4674,41 +4759,53 @@ mod tests {
         );
         let (sql, table) = build_query("read_masked", &filter, &[]).unwrap();
         assert_eq!(table, "qiita_lake.read_masked");
+        assert_eq!(sql, "SELECT * FROM qiita_lake.read_masked(7, [11,12])");
         assert!(
-            sql.starts_with("SELECT * FROM qiita_lake.read_masked WHERE"),
-            "expected a plain view select, got: {sql}"
-        );
-        assert!(sql.contains("mask_idx IN (7)"), "got: {sql}");
-        assert!(sql.contains("prep_sample_idx IN (11,12)"), "got: {sql}");
-        assert!(
-            !sql.contains("JOIN"),
-            "read_masked is a plain view, no membership JOIN, got: {sql}"
+            !sql.contains("WHERE"),
+            "the scope must be macro arguments, not a WHERE — a WHERE reaches only \
+             one side of the join and defeats file pruning. got: {sql}"
         );
     }
 
     #[test]
-    fn build_query_read_masked_rejects_bad_column() {
-        // sequence_idx is a column of the view but is NOT an allowed filter
-        // column, so a ticket filtering on it must be rejected.
-        let mut filter = auth::TicketFilter::new();
-        filter.insert("sequence_idx".to_string(), vec![serde_json::Value::from(1)]);
-        let result = build_query("read_masked", &filter, &[]);
+    fn build_query_read_masked_requires_its_full_scope() {
+        let mask_only = filter_of(&[("mask_idx", vec![serde_json::json!(7)])]);
         assert!(
-            result.is_err(),
-            "sequence_idx is not an allowed filter column"
+            build_query("read_masked", &mask_only, &[]).is_err(),
+            "a mask with no samples has no macro call — refuse it"
         );
-    }
 
-    #[test]
-    fn build_query_read_masked_rejects_empty_filter() {
-        // An empty filter on the human-read surface would SELECT * every
-        // sample's pass-reads across all studies — refuse it (the CP always
-        // scopes read_masked tickets, this is defense-in-depth).
-        let empty = auth::TicketFilter::new();
-        let result = build_query("read_masked", &empty, &[]);
+        let preps_only = filter_of(&[("prep_sample_idx", vec![serde_json::json!(11)])]);
         assert!(
-            result.is_err(),
+            build_query("read_masked", &preps_only, &[]).is_err(),
+            "samples with no mask would blend pass-sets from different masks"
+        );
+
+        // An empty filter on the human-read surface must never degrade to a
+        // fleet-wide read. With required parameters that is unrepresentable
+        // rather than merely refused, but pin the behaviour anyway.
+        assert!(
+            build_query("read_masked", &auth::TicketFilter::new(), &[]).is_err(),
             "empty filter on read_masked must be rejected"
+        );
+
+        // Extra columns are refused rather than silently appended as an outer
+        // filter: on this surface an unrecognised scope column is a CP bug.
+        let extra = filter_of(&[
+            ("mask_idx", vec![serde_json::json!(7)]),
+            ("prep_sample_idx", vec![serde_json::json!(11)]),
+            ("feature_idx", vec![serde_json::json!(1)]),
+        ]);
+        assert!(
+            build_query("read_masked", &extra, &[]).is_err(),
+            "read_masked takes exactly its scope, nothing else"
+        );
+
+        // sequence_idx is a column of the result but not an allowed scope.
+        let bad = filter_of(&[("sequence_idx", vec![serde_json::json!(1)])]);
+        assert!(
+            build_query("read_masked", &bad, &[]).is_err(),
+            "sequence_idx is not an allowed filter column"
         );
     }
 
@@ -4760,14 +4857,39 @@ mod tests {
         filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
         let (sql, table) = build_query("read_masked_block", &filter, &members).unwrap();
         assert_eq!(table, "qiita_lake.read_masked");
+        // The mask AND the block's samples move into the macro call, so both of
+        // the macro's inputs are pruned; the member clause stays outside because
+        // it carries the per-sample sequence sub-ranges the scope cannot express.
+        let preps = block_member_preps(&members);
         assert!(
-            sql.contains("mask_idx = 7 AND ("),
-            "the mask scope must conjoin the member selector, got: {sql}"
+            sql.starts_with(&format!(
+                "SELECT {EXPORT_READ_COLUMNS} FROM {} WHERE ",
+                read_masked_relation(7, &preps)
+            )),
+            "expected a scoped macro call carrying the block's samples, got: {sql}"
         );
         assert!(
             sql.contains(&block_read_where_clause(&members)),
             "got: {sql}"
         );
+    }
+
+    /// The block path must not regress to scanning the lake either: every member's
+    /// sample has to reach the macro's argument list, not just the outer clause.
+    #[test]
+    fn build_query_read_masked_block_passes_every_block_sample_into_the_macro() {
+        let members = block_members();
+        let filter = filter_of(&[("mask_idx", vec![serde_json::json!(7)])]);
+        let (sql, _) = build_query("read_masked_block", &filter, &members).unwrap();
+        let scope = read_masked_relation(7, &block_member_preps(&members));
+        assert!(sql.contains(&scope), "expected {scope} in: {sql}");
+        for m in &members {
+            assert!(
+                scope.contains(&m.prep_sample_idx.to_string()),
+                "member {} missing from the macro scope {scope}",
+                m.prep_sample_idx
+            );
+        }
     }
 
     #[test]

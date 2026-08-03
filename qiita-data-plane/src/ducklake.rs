@@ -265,26 +265,75 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 
         -- The masking + access boundary: join read to read_mask, apply trims,
         -- and exclude every non-'pass' row. This is the ONLY Flight-reachable
-        -- read surface. substr() takes a 1-based start and a LENGTH; list slicing
-        -- is 1-based and inclusive on both ends. The qual arrays are guarded for
-        -- NULL (FASTA / single-end) symmetrically with their sequence columns.
+        -- read surface.
+        --
+        -- A MACRO, not a view, and the parameters are the point. DuckDB derives a
+        -- transitive predicate across a join equality for `col = const` but NOT for
+        -- `col IN (list)`, so a view can only ever receive a multi-sample scope on
+        -- ONE side of this join: the `read` scan got no filter at all, DuckLake
+        -- pruned nothing, and every file in the lake was read. Taking the scope as
+        -- a parameter puts it on BOTH inputs explicitly instead of hoping the
+        -- optimizer propagates it.
+        --
+        -- Measured on DuckDB 1.5.4 against a local DuckLake of 1,000,000 `read`
+        -- rows over 200 samples, one file per sample (the layout fastq_to_parquet
+        -- writes), 10% of rows non-'pass'. Query is a realistic block — one partial
+        -- head sample, 18 complete, one partial tail — selecting 84,600 rows.
+        -- Figures are rows the scans actually produced (EXPLAIN ANALYZE):
+        --
+        --     view    948,999 read +  84,600 read_mask = 1,033,599
+        --     macro    93,999 read +  84,600 read_mask =   178,599
+        --     floor    84,600 read +  84,600 read_mask =   169,200
+        --
+        -- The macro's `read` figure is 84,600/0.9 to the row, i.e. its entire
+        -- residual is the non-'pass' rate and the two partial end samples cost
+        -- nothing. In production this shape fully scanned a ~20.7-billion-row
+        -- `read`; a single-sample equality scoped the same query to 5,356 rows in
+        -- 0.147 s — which is why this went unnoticed. A one-element IN is rewritten
+        -- to `=`, so single-sample blocks (every long-read tile) were always fine.
+        --
+        -- Two rejected alternatives, both measured, so they are not re-proposed:
+        -- passing the block's sequence_idx range as further parameters is identical
+        -- to the row (once the sample scope prunes to the right per-sample files the
+        -- block's global range spans them anyway), and pushing per-member
+        -- (sample, range) pairs down as an EXISTS is far WORSE than the view —
+        -- 1,900,000 rows, because it defeats file pruning entirely. Hence ONE macro,
+        -- with `read_masked_block` reusing it and leaving its member terms an outer
+        -- filter.
+        --
+        -- Replaces the view deleted at qiita-data-plane/src/ducklake.rs#L266-L306,
+        -- https://github.com/the-miint/Qiita/blob/78a794c7ca1ecf220dcfe19bf51e389bfe392b00/qiita-data-plane/src/ducklake.rs#L266-L306
+        --
+        -- Required parameters also make an unscoped fleet-wide masked read
+        -- UNREPRESENTABLE rather than merely refused — no argument list means
+        -- `every sample`. The control plane's mandatory-filter invariant
+        -- (routes/read_masked.py) stays as defence in depth but is no longer the
+        -- only thing between a mis-signed ticket and every study's reads.
+        --
+        -- substr() takes a 1-based start and a LENGTH; list slicing is 1-based and
+        -- inclusive on both ends. The qual arrays are guarded for NULL (FASTA /
+        -- single-end) symmetrically with their sequence columns.
         --
         -- Trim arithmetic: length() is signed BIGINT, so `length - left - right`
         -- promotes the UINTEGER trims to signed — no unsigned underflow even when
         -- the result is negative. At the exact full-trim boundary
         -- (left+right == length) substr length is 0 -> '' and the slice end < start
-        -- -> [], consistently. The view ASSUMES the upstream invariant
+        -- -> [], consistently. This ASSUMES the upstream invariant
         -- left_trim+right_trim <= length (enforced upstream at mask-emit time: a
         -- read trimmed below min_length is reason='qc_too_short', never 'pass').
         -- An out-of-contract over-trim row would yield inconsistent bytes; it is
         -- a producer bug, not handled here.
         --
-        -- CREATE OR REPLACE (not IF NOT EXISTS): the view is pure metadata, so a
+        -- CREATE OR REPLACE (not IF NOT EXISTS): the macro is pure metadata, so a
         -- definition change here is reconciled on every DP startup. IF NOT EXISTS
         -- would silently keep a stale definition on an already-attached catalog —
-        -- a privacy-surface footgun (the WHERE reason='pass' predicate lives
-        -- here). Tables stay IF NOT EXISTS — they hold data.
-        CREATE OR REPLACE VIEW qiita_lake.read_masked AS
+        -- a privacy-surface footgun (the reason='pass' predicate lives here).
+        -- Tables stay IF NOT EXISTS — they hold data. The DROP VIEW is what
+        -- migrates an already-deployed catalog off the old view: a macro and a
+        -- view cannot share a name, so without it every DP boot would fail.
+        DROP VIEW IF EXISTS qiita_lake.read_masked;
+
+        CREATE OR REPLACE MACRO qiita_lake.read_masked(p_mask_idx, p_preps) AS TABLE
         SELECT
             m.mask_idx,
             m.prep_sample_idx,
@@ -299,11 +348,14 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
                        length(r.sequence2) - m.left_trim2 - m.right_trim2) END AS sequence2,
             CASE WHEN r.qual2 IS NULL THEN NULL ELSE
                 r.qual2[m.left_trim2 + 1 : len(r.qual2) - m.right_trim2] END AS qual2
-        FROM qiita_lake.read r
-        JOIN qiita_lake.read_mask m
+        FROM (SELECT * FROM qiita_lake.read
+              WHERE prep_sample_idx IN (SELECT unnest(p_preps))) r
+        JOIN (SELECT * FROM qiita_lake.read_mask
+              WHERE mask_idx = p_mask_idx
+                AND reason = 'pass'
+                AND prep_sample_idx IN (SELECT unnest(p_preps))) m
           ON r.prep_sample_idx = m.prep_sample_idx
-         AND r.sequence_idx = m.sequence_idx
-        WHERE m.reason = 'pass';",
+         AND r.sequence_idx = m.sequence_idx;",
     )?;
     Ok(())
 }
@@ -803,15 +855,30 @@ mod tests {
         ensure_read_tables(&conn).expect("first ensure_read_tables");
         ensure_read_tables(&conn).expect("second ensure_read_tables (idempotent)");
 
-        // The view exists and is queryable.
-        let mut stmt = conn
-            .prepare(
-                "SELECT count(*) FROM information_schema.tables \
-                 WHERE table_name = 'read_masked'",
+        // The macro exists, and — the migration half — no view of that name is
+        // left behind. A catalog that still carried the view would mean the DROP
+        // silently no-op'd, and the next boot would fail on the name collision.
+        let macros: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_functions() \
+                 WHERE function_name = 'read_masked' AND function_type = 'table_macro'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
-        assert_eq!(n, 1, "read_masked view should exist exactly once");
+        assert_eq!(
+            macros, 1,
+            "read_masked table macro should exist exactly once"
+        );
+        let views: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'read_masked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(views, 0, "the superseded read_masked view must be dropped");
     }
 
     /// ensure_alignment_tables is idempotent (CREATE TABLE IF NOT EXISTS, run on
@@ -1155,10 +1222,7 @@ mod tests {
         // (b) non-'pass' rows excluded: exactly 2 rows for this (mask, prep).
         let total: i64 = conn
             .query_row(
-                &format!(
-                    "SELECT count(*) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND prep_sample_idx = {prep}"
-                ),
+                &format!("SELECT count(*) FROM qiita_lake.read_masked({mask}, [{prep}])"),
                 [],
                 |r| r.get(0),
             )
@@ -1179,8 +1243,8 @@ mod tests {
             .prepare(&format!(
                 "SELECT sequence1, array_to_string(qual1, ','), sequence2, \
                         array_to_string(qual2, ',') \
-                 FROM qiita_lake.read_masked \
-                 WHERE mask_idx = {mask} AND sequence_idx = {seq_se}"
+                 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                 WHERE sequence_idx = {seq_se}"
             ))
             .unwrap();
         let (seq1, qual1, seq2, qual2): (String, String, Option<String>, Option<String>) = stmt
@@ -1201,8 +1265,8 @@ mod tests {
             .prepare(&format!(
                 "SELECT sequence1, array_to_string(qual1, ','), sequence2, \
                         array_to_string(qual2, ',') \
-                 FROM qiita_lake.read_masked \
-                 WHERE mask_idx = {mask} AND sequence_idx = {seq_pe}"
+                 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                 WHERE sequence_idx = {seq_pe}"
             ))
             .unwrap();
         let (pseq1, pqual1, pseq2, pqual2): (String, String, Option<String>, Option<String>) =
@@ -1282,8 +1346,8 @@ mod tests {
         let (s_full, qlen_full): (String, i64) = conn
             .query_row(
                 &format!(
-                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_full}"
+                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_full}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1300,8 +1364,8 @@ mod tests {
             .query_row(
                 &format!(
                     "SELECT sequence1, len(qual1), sequence2, len(qual2) \
-                     FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_full_pe}"
+                     FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_full_pe}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -1316,8 +1380,8 @@ mod tests {
         let (s_zero, qlen_zero): (String, i64) = conn
             .query_row(
                 &format!(
-                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_zero}"
+                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_zero}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1373,8 +1437,8 @@ mod tests {
         let s: String = conn2
             .query_row(
                 &format!(
-                    "SELECT sequence1 FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq}"
+                    "SELECT sequence1 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq}"
                 ),
                 [],
                 |r| r.get(0),

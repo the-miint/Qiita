@@ -822,6 +822,28 @@ duplicates further down are historical strata; leave them where they are.
   [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
   per invocation — index load is 98.4% of classify wall clock); removal of our
   workaround tracked at #403.
+- **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
+  is now a scoped table macro instead of a view.** DuckDB derives a transitive
+  predicate across a join equality for `col = const` but **not** for
+  `col IN (list)`, so a view could only ever receive a multi-sample scope on one
+  side of the `read`/`read_mask` join: the `read` scan got no filter, DuckLake
+  pruned nothing, and every file in the lake was read. Production `EXPLAIN`
+  confirms it — a single-sample equality returns 5,356 rows in 0.147 s, while a
+  ~100-sample `IN` list fully scans a ~20.7-billion-row table (32 GB RAM and
+  >250 GB swap before being killed). `read_masked(p_mask_idx, p_preps)` takes the
+  scope as arguments so it lands on **both** inputs. On a local DuckLake of
+  1,000,000 rows over 200 samples, a realistic block (one partial head sample, 18
+  complete, one partial tail) selecting 84,600 rows went from 1,033,599 rows
+  scanned to 178,599, against a floor of 169,200. Affects `read_masked` and
+  `read_masked_block` — production's main read path — but **not** single-sample
+  blocks (a one-element `IN` is rewritten to `=`), which is why it went unnoticed.
+  Rejected after measuring: passing the block's `sequence_idx` range as further
+  parameters (identical row counts) and pushing per-member `(sample, range)` pairs
+  down as an `EXISTS` (1,900,000 rows — worse than the view, it defeats file
+  pruning). Result rows, column set and column order are unchanged. Side effect:
+  an unscoped fleet-wide masked read is now **unrepresentable** rather than
+  refused, so the control plane's mandatory-filter invariant is defence in depth
+  instead of the only guard.
 - **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
   Establishes one invariant across the runner and the redrive route: **only a LIVE
   attempt is adoptable.** Both defects below were latent until a step could have
