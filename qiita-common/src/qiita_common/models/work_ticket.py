@@ -282,6 +282,10 @@ class ResourceOverride(BaseModel):
     YAML baseline untouched. Carried on `qiita.work_ticket` so a control-plane
     restart re-attaches in-flight work with the same override.
 
+    Not the only floor a step's dispatch resolves against — see the sibling
+    column `qiita.work_ticket.escalated_resource_floor` (control-plane-internal,
+    so it has no model here) and its `COMMENT ON COLUMN`.
+
     INVARIANT — enforcement is NOT on this model: any route that accepts a
     `resource_override` MUST itself gate it to wet_lab_admin+ (else a regular
     caller could inflate their job's footprint) and clamp it to the action

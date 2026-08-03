@@ -23,7 +23,13 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `make migrate` applies `20260802000000_work_ticket_escalated_resource_floor.sql`, no
+  out-of-band setup: an additive `ALTER TABLE qiita.work_ticket ADD COLUMN
+  escalated_resource_floor JSONB`, plus a shape CHECK (`NULL` or a JSON object) and the
+  column's `COMMENT ON`. Nullable, backfill-free — every existing row reads NULL, which
+  the runner treats as "nothing escalated yet". Carries the per-step memory/walltime floor
+  the OOM/TIMEOUT retry ladder climbs to, so a CP restart or a `/run` redrive continues
+  the ladder instead of restarting at the YAML baseline. (#415)
 
 ### 4. Deploy
 
@@ -39,7 +45,14 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- After this deploy, a ticket whose step OOM-kills or times out keeps its escalated size
+  across a CP restart and a `/run` redrive — the previous behaviour re-burned one failing
+  attempt per affected step climbing back (observed on `long-read-assembly` 6978 / 6980 /
+  6989: `assemble` back at 192 GB after redriving from 384 GB). To put a redriven ticket
+  back on its YAML baseline (e.g. after correcting an oversized input), NULL the column
+  first: `UPDATE qiita.work_ticket SET escalated_resource_floor = NULL WHERE
+  work_ticket_idx = <idx>;` — SQL `NULL`, not `'null'::jsonb`, which the CHECK rejects
+  precisely because the runner would read it as "nothing escalated yet". (#415)
 
 ---
 

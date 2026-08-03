@@ -209,10 +209,11 @@ def _resolve_baseline_for_step(
     step below its YAML baseline (a small input needs less); a hint above the
     baseline is a no-op, and an axis with ``baseline == ceiling`` is left alone
     (no headroom to recover — see the inline comment). Applied BEFORE the
-    raise-only override floors below so escalation always wins on a retry: the
-    escalated floor is seeded from the YAML baseline (>= any down-sized value),
-    so a retry after an OOM/TIMEOUT restores at least the baseline regardless of
-    the hint.
+    raise-only override floors below so escalation always wins on a retry: an
+    escalated floor is grown from the YAML baseline and so is always >= any
+    down-sized value, whether it was computed in this run or seeded from the
+    ticket's persisted `escalated_resource_floor`. Either way a step that has
+    ever OOM'd/timed out runs at >= its baseline, regardless of the hint.
 
     ``mem_gb_override`` (the ticket's optional per-run resource bump) raises the
     resolved memory *floor*: ``mem_gb = max(resolved.mem_gb, mem_gb_override)``.
@@ -221,10 +222,11 @@ def _resolve_baseline_for_step(
     below, so an override above ``action_ceiling.mem_gb`` is rejected here too
     (defense in depth; the submission route already 422s it).
 
-    ``walltime_override`` is the symmetric raise-only *walltime* floor — the
-    escalating override raised on each TIMEOUT retry by
-    ``_escalated_walltime_after_timeout`` — applied the same way and bounded by
-    the same ceiling assertion.
+    ``walltime_override`` is the symmetric raise-only *walltime* floor — raised
+    on each TIMEOUT retry by ``_escalated_walltime_after_timeout``, or seeded
+    from the ticket's persisted floor on a run that resumes a ladder an earlier
+    run started — applied the same way and bounded by the same ceiling
+    assertion.
 
     Two paths, picked by which population the YAML declared:
 
@@ -466,8 +468,11 @@ def _escalated_walltime_after_timeout(
     the headroom guard in ``_resolve_baseline_for_step`` guarantees exceeds the
     baseline. The exact mirror of ``_escalated_mem_floor_after_oom`` for
     walltime, minus the static per-run seed (there is no
-    ``resource_override.walltime``): escalation always starts from the YAML
-    baseline.
+    ``resource_override.walltime``): on a step's FIRST timeout, escalation
+    starts from the YAML baseline. On a later run it starts wherever this
+    ticket already escalated this step to — the runner seeds
+    ``current_override`` from the persisted
+    ``work_ticket.escalated_resource_floor``, exactly as it does for memory.
     """
     resolved = _resolve_baseline_for_step(
         entry=entry,
