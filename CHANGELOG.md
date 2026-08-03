@@ -23,7 +23,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
-  system (`scripts/lake-shell.sh`).** Inspecting DuckLake ad-hoc meant hand-assembling
+  system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
   an `ATTACH` from the service env files — risking a writable attach against the live
   lake — or borrowing a service account. This attaches both catalogs `READ_ONLY`:
   `qiita_lake` (DuckLake) and `qiita_cp` (Postgres, tables under `qiita_cp.qiita.*`),
