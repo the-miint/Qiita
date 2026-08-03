@@ -23,7 +23,13 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `make migrate` applies `20260802000000_work_ticket_escalated_resource_floor.sql`, no
+  out-of-band setup: an additive `ALTER TABLE qiita.work_ticket ADD COLUMN
+  escalated_resource_floor JSONB`, plus a shape CHECK (`NULL` or a JSON object) and the
+  column's `COMMENT ON`. Nullable, backfill-free — every existing row reads NULL, which
+  the runner treats as "nothing escalated yet". Carries the per-step memory/walltime floor
+  the OOM/TIMEOUT retry ladder climbs to, so a CP restart or a `/run` redrive continues
+  the ladder instead of restarting at the YAML baseline. (#415)
 
 ### 4. Deploy
 
@@ -31,6 +37,25 @@ _None yet._
 
 ### 5. Verify
 
+- (#420, closes #411) Confirm the six re-sized actions carry their raised ceilings.
+  `actions sync` runs inside `activate.sh`, so this only checks it took — if a row still
+  reads its old value, an OOM or TIMEOUT on that workflow's heaviest step keeps failing
+  permanently on attempt 0 (a baseline at its ceiling has no rung to climb to) and the
+  change is a silent no-op:
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, mem_ceiling_gb, walltime_ceiling
+    FROM qiita.action
+    WHERE (action_id, version) IN
+      (('bcl-convert','1.0.0'),('fastq-to-parquet','1.1.0'),('fastq-to-parquet','1.2.0'),
+       ('fastq-to-parquet','1.3.0'),('read-mask','1.0.0'),('read-mask-block','1.0.0'))
+    ORDER BY action_id, version"
+  ```
+
+  Expect (was → is): `bcl-convert|1.0.0|500|1 day` (was `480|12:00:00`),
+  `fastq-to-parquet|1.1.0|32|08:00:00` and `|1.2.0|32|08:00:00` (both were `16|04:00:00`),
+  `fastq-to-parquet|1.3.0|64|08:00:00`, `read-mask|1.0.0|64|08:00:00` and
+  `read-mask-block|1.0.0|64|08:00:00` (all three were `32|08:00:00`).
 - (#406) The CP now actually emits INFO to the journal — it was silently dropped before,
   so this is the fix's own smoke test (any INFO line will do):
   ```bash
@@ -53,6 +78,27 @@ _None yet._
 - (#406) **`LOG_LEVEL` is new on both CP and CO but needs no action — and expect more journal volume.** It is optional and defaults to `INFO`, so both units boot without it; it is documented in `.env.control-plane.example` / `.env.compute-orchestrator.example` if you ever want to quiet or widen it (an unknown value fails the boot rather than silently reverting). The reason it matters: neither service configured the root logger at all, so every `_log.info` fell through to Python's WARNING-only fallback and never reached the journal. From this deploy the services narrate normally — pump decisions, dispatch lifecycle, sweeper passes — which is a real increase in journal writes on a busy day. Set `LOG_LEVEL=WARNING` on either service to get the old volume back.
 - (#406) **The Authorization-header scrubber was inert in both services and now works.** `install_authorization_scrub()` attaches to the root logger's handlers, and with none configured (above) the loop body never ran — so the filter that rewrites `Bearer <token>` to `Bearer <redacted>` was attached to nothing. It now covers everything propagating to root, including `httpx`. `uvicorn` / `uvicorn.access` keep `propagate=False` and remain outside it, so a bearer token appearing in a uvicorn *access* line would still be unscrubbed; that gap is pre-existing and tracked in #408.
 - (#406) **New operator surface for the fan-out throttle: `qiita-admin fanout {list,set,pump}`** (system_admin, reuses the existing `work_ticket:cancel` scope — no new grant to make). `list` shows every cohort's held/running/failed counts, effective cap, and whether it is fail-stopped; `set <kind> <key> --max-inflight N` retunes one cohort at runtime and pumps it immediately, `--clear` reverts it to `FANOUT_MAX_INFLIGHT`; `pump <kind> <key>` re-triggers a stalled cohort without changing its cap. Caps are bounded at 100. **Overrides are in-memory** — a CP restart reverts every cohort to the `FANOUT_MAX_INFLIGHT` default, so re-apply after a restart if a run still needs it. This replaces the old procedure of editing `control-plane.env` and restarting to retune a fan-out, which also triggered an unthrottled resume of every in-flight ticket.
+- After this deploy, a ticket whose step OOM-kills or times out keeps its escalated size
+  across a CP restart and a `/run` redrive — the previous behaviour re-burned one failing
+  attempt per affected step climbing back (observed on `long-read-assembly` 6978 / 6980 /
+  6989: `assemble` back at 192 GB after redriving from 384 GB). To put a redriven ticket
+  back on its YAML baseline (e.g. after correcting an oversized input), NULL the column
+  first: `UPDATE qiita.work_ticket SET escalated_resource_floor = NULL WHERE
+  work_ticket_idx = <idx>;` — SQL `NULL`, not `'null'::jsonb`, which the CHECK rejects
+  precisely because the runner would read it as "nothing escalated yet". (#415)
+- (#420, closes #411) **Six workflows' `action_ceiling` was raised so an OOM/TIMEOUT can
+  actually retry; no step baseline changed, so nothing schedules differently.**
+  `bcl-convert/1.0.0`, `fastq-to-parquet/1.1.0`, `1.2.0`, `1.3.0`, `read-mask/1.0.0` and
+  `read-mask-block/1.0.0` each had a ceiling equal to their heaviest step's baseline, which
+  makes escalation clamp on the first failure and fail the ticket permanently at
+  `retry_count=0` — the shape behind the `long-read-assembly` incident (#393). Only a
+  *failing* step now climbs; a healthy ticket requests exactly what it did before. Reaches
+  `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no host action, just
+  the bucket-5 checks that it took.
+- (#420, closes #411) **The admin `resource_override` envelope widens with these ceilings**
+  (`POST /work-ticket` 422s when `resource_override.mem_gb` exceeds `mem_ceiling_gb`). A
+  per-ticket nudge that used to be rejected at 17 GB on `fastq-to-parquet/1.1.0` is now
+  accepted up to 32. Nothing to do — noted so the wider envelope isn't a surprise.
 
 ---
 

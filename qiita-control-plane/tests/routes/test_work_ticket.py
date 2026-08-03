@@ -14,6 +14,7 @@ import json
 import logging
 import uuid
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
@@ -2305,6 +2306,126 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
     # which is the whole point — that id is the only handle on the running job.
     assert surviving == [(0, 1, StepProgressState.SUBMITTED.value)]
     assert rows[0]["slurm_job_id"] == 605029
+
+
+async def test_run_preserves_the_escalated_resource_floor(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A redrive must NOT reset the ladder a ticket already climbed.
+
+    The redrive drops the `failed` step rows, so the escalation history they
+    carry is gone by the time the runner re-enters — which is exactly why the
+    learned floor lives on the work_ticket row instead of being reconstructed
+    from that history. Nothing in the reset UPDATE touches it today; this pins
+    that, because adding the column to that reset (or "clearing the ticket
+    cleanly") would silently reintroduce the re-climb: the ticket would come
+    back at its YAML baseline and burn a failing attempt getting back to a size
+    it had already reached."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason,"
+        "  escalated_resource_floor)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'retriable'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'OOM',"
+        "  $6::jsonb)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+        json.dumps({"load": {"mem_gb": 384, "walltime_seconds": 115200}}),
+    )
+    wt_client._created_tickets.append(idx)
+    # The attempt that taught the ticket it needs 384 GB. The redrive deletes
+    # this row — the floor must outlive it.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        "  'oom_killed', 'OUT_OF_MEMORY')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.FAILED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, escalated_resource_floor"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    # The redrive did its usual reset...
+    assert row["state"] == WorkTicketState.PENDING.value
+    assert row["retry_count"] == 0
+    # ... and the escalation history it drops is indeed gone ...
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", idx
+        )
+        == 0
+    )
+    # ... but the learned floor survived, so the next run resumes the ladder.
+    # asyncpg hands JSONB back as a string — no codec is registered on this pool.
+    floor = row["escalated_resource_floor"]
+    decoded = json.loads(floor) if isinstance(floor, str) else floor
+    assert decoded == {"load": {"mem_gb": 384, "walltime_seconds": 115200}}
+
+
+async def test_escalated_resource_floor_rejects_a_jsonb_null(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """The read side can't distinguish jsonb `null` from SQL NULL — both decode
+    to Python None, which the runner reads as "nothing escalated yet". Clearing
+    this column by hand is a documented operator step, so the CHECK makes the
+    near-miss (`'null'::jsonb` instead of NULL) fail loudly at the DB instead of
+    silently resetting a ticket's ladder. The write path needs no such guard:
+    `jsonb_set` errors on a non-object target."""
+    _token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx)"
+        " VALUES ($1, $2, $3, 'reference', $4) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+    )
+    wt_client._created_tickets.append(idx)
+
+    for bad in ("null", "[]", "42"):
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await postgres_pool.execute(
+                "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+                " WHERE work_ticket_idx = $1",
+                idx,
+                bad,
+            )
+    # The control: SQL NULL (the documented way to clear it) and a real object
+    # both pass, so the CHECK isn't just rejecting everything.
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = NULL WHERE work_ticket_idx = $1",
+        idx,
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        idx,
+        json.dumps({"load": {"mem_gb": 384}}),
+    )
 
 
 async def test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped(

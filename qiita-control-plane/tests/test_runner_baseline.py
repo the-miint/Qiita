@@ -41,6 +41,7 @@ from qiita_common.models import (
 
 from qiita_control_plane.runner import (
     _POLL_DB_READ_MAX_ATTEMPTS,
+    StepResourceFloor,
     WorkflowAborted,
     _attempt_is_terminal,
     _attempt_is_unowned,
@@ -49,6 +50,7 @@ from qiita_control_plane.runner import (
     _escalated_walltime_after_timeout,
     _fetch_plan_hint,
     _is_transient_db_error,
+    _parse_escalated_floor,
     _raise_if_ticket_terminal,
     _resolve_baseline_for_step,
 )
@@ -371,6 +373,94 @@ def test_escalation_full_sequence_to_ceiling():
 
 
 # =============================================================================
+# Persisted escalated floor — decoding work_ticket.escalated_resource_floor
+# =============================================================================
+#
+# The column is what carries a step's learned floor across a CP restart or a
+# `/run` redrive, so the decoder is the seam where a wrong shape would silently
+# reset the ladder to the YAML baseline. It raises instead: an unreadable floor
+# is indistinguishable from "never escalated", and quietly picking the latter is
+# exactly the re-climb the column exists to prevent.
+
+
+def test_parse_escalated_floor_null_is_empty():
+    """A ticket that has never escalated reads NULL → no floors, which leaves
+    every step sized exactly as it is today."""
+    assert _parse_escalated_floor(None, work_ticket_idx=1) == {}
+
+
+def test_parse_escalated_floor_decodes_both_axes():
+    parsed = _parse_escalated_floor(
+        {"assemble": {"mem_gb": 384, "walltime_seconds": 115200}}, work_ticket_idx=1
+    )
+    assert parsed == {"assemble": StepResourceFloor(mem_gb=384, walltime=timedelta(hours=32))}
+
+
+def test_parse_escalated_floor_axes_are_independent():
+    """A step that has only ever OOM-killed carries memory alone (and vice
+    versa) — the two arms of the retry loop escalate independently."""
+    parsed = _parse_escalated_floor(
+        {"assemble": {"mem_gb": 384}, "qc": {"walltime_seconds": 28800}}, work_ticket_idx=1
+    )
+    assert parsed["assemble"] == StepResourceFloor(mem_gb=384, walltime=None)
+    assert parsed["qc"] == StepResourceFloor(mem_gb=None, walltime=timedelta(hours=8))
+
+
+def test_parse_escalated_floor_multiple_steps_stay_separate():
+    """Per-step keying is the whole point: a floor learned for one step must
+    not leak onto another (the reason this is not folded into the ticket-wide
+    `resource_override`)."""
+    parsed = _parse_escalated_floor(
+        {"assemble": {"mem_gb": 384}, "bin_refine": {"mem_gb": 64}}, work_ticket_idx=1
+    )
+    assert parsed["assemble"].mem_gb == 384
+    assert parsed["bin_refine"].mem_gb == 64
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        [{"mem_gb": 8}],  # top level must be an object, not an array
+        "mem_gb=8",  # ... nor a scalar
+    ],
+)
+def test_parse_escalated_floor_rejects_non_object_top_level(raw):
+    with pytest.raises(RuntimeError, match="expected a JSON object"):
+        _parse_escalated_floor(raw, work_ticket_idx=7)
+
+
+def test_parse_escalated_floor_rejects_non_object_step_value():
+    with pytest.raises(RuntimeError, match="expected a JSON object"):
+        _parse_escalated_floor({"assemble": 384}, work_ticket_idx=7)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,  # a zero floor would resolve to "no floor" at dispatch
+        -8,
+        "384",  # a JSON string would compare wrong against an int baseline
+        384.5,
+        True,  # bool is an int subclass — must not read as a 1 GB floor
+    ],
+)
+def test_parse_escalated_floor_rejects_bad_axis_value(value):
+    with pytest.raises(RuntimeError, match="expected a positive integer"):
+        _parse_escalated_floor({"assemble": {"mem_gb": value}}, work_ticket_idx=7)
+
+
+def test_parse_escalated_floor_error_names_ticket_and_step():
+    """A 2am post-mortem needs to know WHICH ticket and step carry the bad
+    value — the column holds one object per step."""
+    with pytest.raises(RuntimeError) as exc_info:
+        _parse_escalated_floor({"assemble": {"walltime_seconds": -1}}, work_ticket_idx=6978)
+    message = str(exc_info.value)
+    assert "6978" in message
+    assert "assemble" in message
+    assert "walltime_seconds" in message
+
+
+# =============================================================================
 # Per-run walltime override — raise-only floor, ceiling-bounded
 # =============================================================================
 
@@ -579,10 +669,10 @@ def test_plan_hint_partial_only_touches_named_axis():
 
 def test_escalation_override_beats_plan_hint_on_retry():
     """The correctness invariant: plan() down-size is applied BEFORE the
-    raise-only escalation floors, so a retry (whose floor is seeded from the
-    YAML baseline, >= any down-sized value) always restores at least the
-    baseline. A 12 GB baseline down-sized to 4 GB by plan, with a 24 GB OOM
-    escalation floor, resolves to 24 GB — the hint does not strand the retry
+    raise-only escalation floors, so a retry always restores at least the
+    baseline — an escalated floor is grown from the baseline and so is >= any
+    down-sized value. A 12 GB baseline down-sized to 4 GB by plan, with a 24 GB
+    OOM escalation floor, resolves to 24 GB — the hint does not strand the retry
     below the size it needs."""
     step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)))
     resolved = _resolve_baseline_for_step(
@@ -595,6 +685,29 @@ def test_escalation_override_beats_plan_hint_on_retry():
     )
     assert resolved.mem_gb == 24
     assert resolved.walltime == timedelta(hours=4)
+
+
+def test_plan_hint_cannot_undercut_a_persisted_floor_on_attempt_zero():
+    """Same invariant, on the path the persisted floor newly opens: a resumed
+    run seeds its floors from `escalated_resource_floor`, so attempt 0 can carry
+    an override with no OOM/TIMEOUT in THIS run. The hint must not claw that
+    back — a step that has ever needed 24 GB does not get re-run at plan()'s
+    optimistic 4 GB just because the process restarted."""
+    step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)))
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={},
+        action_ceiling=_CEILING,
+        # As seeded from a persisted StepResourceFloor(mem_gb=24, walltime=4h).
+        mem_gb_override=24,
+        walltime_override=timedelta(hours=4),
+        plan_hint=StepPlanResponse(cpu=2, mem_gb=4, walltime_seconds=600),
+    )
+    assert resolved.mem_gb == 24
+    assert resolved.walltime == timedelta(hours=4)
+    # cpu is not an escalating axis, so the hint still lowers it — the floors
+    # protect only the two axes that escalate.
+    assert resolved.cpu == 2
 
 
 def test_plan_hint_not_applied_without_escalation_headroom():
@@ -883,3 +996,41 @@ async def test_raise_if_ticket_terminal_propagates_non_transient_db_error():
     with pytest.raises(asyncpg.exceptions.UniqueViolationError):
         await _raise_if_ticket_terminal(pool, 1)
     assert pool.calls == 1
+
+
+def test_every_escalating_axis_has_exactly_one_escalation_helper():
+    """`ESCALATING_RESOURCE_AXES` (qiita-common) and the runner's escalation
+    helpers must name the same set of axes, checked in both directions.
+
+    The constant is what the shipped-workflow headroom guard checks against, so
+    the two drifting apart breaks that guard silently and in either direction: a
+    new axis added to the constant with no helper makes the guard demand headroom
+    for a retry that never happens, while a new helper with no entry in the
+    constant means the guard stops covering an axis that now really does
+    escalate. Neither shows up as a failure anywhere else — the constant lives in
+    a package that cannot import the runner, so this test is the only place the
+    two can be compared.
+
+    The second direction is only as good as the `_escalated_*` naming: a helper
+    that escalates an axis under some other name is invisible to the scan below.
+    That is a convention, not a guarantee, and it is the reason the map is
+    written out by hand here rather than derived.
+    """
+    from qiita_common.actions import ESCALATING_RESOURCE_AXES
+
+    import qiita_control_plane.runner._dispatch as dispatch
+
+    helper_by_axis = {
+        "mem_gb": "_escalated_mem_floor_after_oom",
+        "walltime": "_escalated_walltime_after_timeout",
+    }
+
+    assert tuple(helper_by_axis) == ESCALATING_RESOURCE_AXES, (
+        "an axis escalates but is not declared in ESCALATING_RESOURCE_AXES (or "
+        "vice versa) — the shipped-workflow headroom guard reads that constant"
+    )
+    defined = {name for name in vars(dispatch) if name.startswith("_escalated_")}
+    assert defined == set(helper_by_axis.values()), (
+        "the runner's escalation helpers no longer match the axis map above; add "
+        f"the new axis to ESCALATING_RESOURCE_AXES too. Found: {sorted(defined)}"
+    )
