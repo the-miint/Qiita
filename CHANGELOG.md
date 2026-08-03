@@ -395,6 +395,18 @@ duplicates further down are historical strata; leave them where they are.
   INFO → WARNING: a frozen fan-out is operator-actionable and at INFO was
   indistinguishable from an ordinary "no free slots".
 
+- **`make lake-shell` could not start under bash 3.2, which left CI red on macOS (#406,
+  fixing #418).** `add_pgpass_entry`'s seen-set was an associative array. bash 3.2 — what
+  macOS ships as `/bin/bash`, and what `test_deploy_scripts.py` runs the script under on
+  the mac runner — has none, so the shell died at `declare: -A: invalid option` before
+  reaching any of its own error paths, and the test asserting a *specific* hard failure
+  saw exit 2 instead of 1. It is now two parallel indexed arrays with a linear scan,
+  bounded by an explicit count rather than `${#array[@]}`, because bash 3.2 under `set -u`
+  treats an empty array as unset; a single delimited-string map would have needed escaping
+  the scan does not, since a password may hold any byte. Verified against bash 3.2.57 —
+  both the seen-set semantics and the end-to-end refusal path. No live behaviour changes:
+  the deploy host is Linux. Carried in this PR because it also blocked its CI.
+
 - **Drop the GFF `+ 1` now that miint normalizes `read_gff` to half-open (closes #410).**
   `read_gff` / `read_ncbi_annotation` used to emit GFF3's closed `end` under the same
   `stop_position` column every other miint reader uses for a half-open one;

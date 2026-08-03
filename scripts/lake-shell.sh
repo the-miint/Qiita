@@ -153,17 +153,31 @@ PGPASS_FILE="${TMPROOT}/pgpass"
 # Both connections are keyed on the username alone (wildcard host/port/db),
 # which is unambiguous as long as they do not share one — and if they do share a
 # username with different passwords, error rather than let the first line win.
-declare -A PGPASS_SEEN=()
+#
+# The seen-set is two parallel indexed arrays and a linear scan rather than an
+# associative array, because macOS ships bash 3.2 — which has none, and which
+# `make test` exercises this script under on the mac CI runner. The `_COUNT`
+# scalar bounds the scan instead of `${#array[@]}`: under `set -u`, bash 3.2
+# treats an empty array as unset. Passwords may hold any byte, so a single
+# delimited-string map would need escaping that a scan does not.
+PGPASS_SEEN_COUNT=0
+PGPASS_SEEN_USERS=()
+PGPASS_SEEN_PASSWORDS=()
 add_pgpass_entry() {
-    local user="$1" password="$2" escaped_user escaped_password
-    if [[ -n "${PGPASS_SEEN[${user}]:-}" && "${PGPASS_SEEN[${user}]}" != "${password}" ]]; then
-        echo "ERROR: the lake catalog and the control-plane database both connect as '${user}'" >&2
-        echo "  with different passwords, so they cannot be keyed apart in a pgpass file." >&2
-        echo "  Re-run with --no-cp, or give one of them its own role." >&2
-        exit 1
-    fi
-    [[ -z "${PGPASS_SEEN[${user}]:-}" ]] || return 0
-    PGPASS_SEEN["${user}"]="${password}"
+    local user="$1" password="$2" escaped_user escaped_password i
+    for ((i = 0; i < PGPASS_SEEN_COUNT; i++)); do
+        [[ "${PGPASS_SEEN_USERS[i]}" == "${user}" ]] || continue
+        if [[ "${PGPASS_SEEN_PASSWORDS[i]}" != "${password}" ]]; then
+            echo "ERROR: the lake catalog and the control-plane database both connect as '${user}'" >&2
+            echo "  with different passwords, so they cannot be keyed apart in a pgpass file." >&2
+            echo "  Re-run with --no-cp, or give one of them its own role." >&2
+            exit 1
+        fi
+        return 0
+    done
+    PGPASS_SEEN_USERS[PGPASS_SEEN_COUNT]="${user}"
+    PGPASS_SEEN_PASSWORDS[PGPASS_SEEN_COUNT]="${password}"
+    PGPASS_SEEN_COUNT=$((PGPASS_SEEN_COUNT + 1))
     escaped_user="${user//\\/\\\\}"; escaped_user="${escaped_user//:/\\:}"
     escaped_password="${password//\\/\\\\}"; escaped_password="${escaped_password//:/\\:}"
     printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
