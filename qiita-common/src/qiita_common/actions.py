@@ -25,7 +25,6 @@ union keyed on `kind` for the WorkflowStep / WorkflowAction Pydantic arms.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from datetime import timedelta
 from typing import Annotated, Any, Literal
 
@@ -152,13 +151,6 @@ class FlatBaselineResources(BaseModel):
         return v
 
 
-# Every axis a ceiling bounds, in declaration order. DERIVED from the model
-# rather than re-typed, so a resource field added above is covered by the
-# over-ceiling check the day it is added — a hand-copied list would go on
-# silently passing the new axis while claiming to mirror the runner.
-CEILING_RESOURCE_AXES: tuple[str, ...] = tuple(FlatBaselineResources.model_fields)
-
-
 class BaselineResources(BaseModel):
     """Per-step resource declaration. Two valid populations, never both:
 
@@ -219,23 +211,6 @@ class BaselineResources(BaseModel):
             raise ValueError("baseline_resources: profiles must be non-empty")
         return self
 
-    def as_flat(self) -> FlatBaselineResources:
-        """The flat population as a `FlatBaselineResources`.
-
-        Only valid on the flat population — the lookup one resolves to a
-        different profile per run, so there is no single answer and callers must
-        pick from `profiles` themselves. The asserts narrow the Optional types
-        that `_exactly_one_population` has already guaranteed; they cost nothing
-        on the happy path and are unreachable through validated construction.
-        """
-        assert self.profiles is None, "as_flat() is meaningless on the lookup population"
-        assert self.cpu is not None
-        assert self.mem_gb is not None
-        assert self.walltime is not None
-        return FlatBaselineResources(
-            cpu=self.cpu, mem_gb=self.mem_gb, walltime=self.walltime, gpu=self.gpu
-        )
-
 
 class ActionCeiling(FlatBaselineResources):
     """Action-wide resource caps. Always flat — a single upper bound the
@@ -243,15 +218,6 @@ class ActionCeiling(FlatBaselineResources):
     whether the step's `baseline_resources` declares a flat or lookup
     population.
     """
-
-
-# The resource axes the runner GROWS on a retry: `mem_gb` after an OOM,
-# `walltime` after a timeout. `cpu` and `gpu` are deliberately absent — nothing
-# escalates them, so a step whose cpu equals the ceiling forfeits no retry (one
-# shipped workflow pins cpu that way on purpose). A third escalating axis means
-# adding it here AND writing the retry-side growth for it; the control plane
-# pins the two lists against each other.
-ESCALATING_RESOURCE_AXES: tuple[str, ...] = ("mem_gb", "walltime")
 
 
 class WorkflowStep(BaseModel):
@@ -518,87 +484,3 @@ class ActionDefinition(BaseModel):
                 "name. (`action:` entries run in-process and may repeat.)"
             )
         return self
-
-    def _labelled_baselines(self) -> list[tuple[str, FlatBaselineResources]]:
-        """Every step's baseline flattened to (label, resources) pairs.
-
-        A flat population contributes one pair under the step's own name; a
-        lookup population contributes one per profile, labelled
-        ``name[profile]``, because a lookup step can be correctly sized on one
-        instrument profile and mis-sized on another — collapsing them would hide
-        exactly the case that matters. `action:` entries declare no resources and
-        contribute nothing.
-        """
-        pairs: list[tuple[str, FlatBaselineResources]] = []
-        for entry in self.steps:
-            if not isinstance(entry, WorkflowStep):
-                continue
-            br = entry.baseline_resources
-            if br.profiles is not None:
-                pairs.extend((f"{entry.name}[{k}]", v) for k, v in sorted(br.profiles.items()))
-            else:
-                pairs.append((entry.name, br.as_flat()))
-        return pairs
-
-    def _steps_failing(
-        self,
-        axes: tuple[str, ...],
-        holds: Callable[[Any, Any], bool],
-    ) -> dict[str, tuple[str, ...]]:
-        """Label → the subset of ``axes`` where ``holds(baseline, ceiling)`` is
-        False, dropping labels with no failing axis.
-
-        Shared by the two public queries below so the labelling and the
-        drop-the-empties rule stay identical between them; they differ only in
-        which axes they inspect and what they require of each.
-        """
-        return {
-            label: failed
-            for label, flat in self._labelled_baselines()
-            if (
-                failed := tuple(
-                    axis
-                    for axis in axes
-                    if not holds(getattr(flat, axis), getattr(self.action_ceiling, axis))
-                )
-            )
-        }
-
-    def steps_without_escalation_headroom(self) -> dict[str, tuple[str, ...]]:
-        """Steps whose baseline leaves an escalating axis nowhere to grow.
-
-        Returns label → the pinned subset of `ESCALATING_RESOURCE_AXES`, empty
-        when every step can escalate on every axis. An axis is pinned when the
-        baseline is NOT strictly below the ceiling: the retry-side growth
-        multiplies the axis and clamps the product to the ceiling, so an equal
-        pair yields a grown value that does not exceed the current one, which
-        reads as a spent ladder and fails the ticket permanently on its first OOM
-        or timeout.
-
-        Reports only what escalation gives up. A baseline that *exceeds* its
-        ceiling is a strictly worse and separate defect — see
-        `steps_over_ceiling`.
-
-        A query rather than a validator, deliberately: loading the shipped YAML
-        is part of the deploy, so raising here would take the deploy down the
-        moment one workflow drifted. Callers pair this with an explicit list of
-        accepted exceptions, which a validator has nowhere to read from until the
-        accept becomes expressible in the YAML itself.
-        """
-        return self._steps_failing(ESCALATING_RESOURCE_AXES, lambda base, ceil: base < ceil)
-
-    def steps_over_ceiling(self) -> dict[str, tuple[str, ...]]:
-        """Steps whose baseline EXCEEDS the ceiling on any axis — a workflow that
-        cannot run at all.
-
-        Returns label → the offending axes, across every axis the ceiling bounds,
-        mirroring what the runner rejects at dispatch. The runner catches this per
-        ticket; nothing catches it at load, so a workflow can ship in a state
-        where every ticket it accepts fails.
-
-        Kept separate from `steps_without_escalation_headroom` so the two are not
-        interchangeable to a caller. Forgoing escalation is a decision a workflow
-        may legitimately make; exceeding the ceiling never is, so this one admits
-        no accepts.
-        """
-        return self._steps_failing(CEILING_RESOURCE_AXES, lambda base, ceil: base <= ceil)
