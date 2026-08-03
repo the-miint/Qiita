@@ -45,8 +45,8 @@ from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason
 from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
 from qiita_control_plane.testing.db_seeds import (
-    delete_block_action_if_created,
-    seed_block_action_if_absent,
+    delete_action_if_created,
+    seed_action_if_absent,
 )
 
 from conftest import ducklake_connect
@@ -259,7 +259,7 @@ async def block_pool(postgres_pool, human_admin_session):
     # block, which the count assertion then rejects.
     action_id = BLOCK_MASK_ACTION_ID
     version = BLOCK_MASK_ACTION_VERSION
-    created_action = await seed_block_action_if_absent(
+    created_action = await seed_action_if_absent(
         postgres_pool, action_id=action_id, version=version
     )
 
@@ -311,7 +311,7 @@ async def block_pool(postgres_pool, human_admin_session):
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
             created_blocks,
         )
-    await delete_block_action_if_created(
+    await delete_action_if_created(
         postgres_pool, action_id=action_id, version=version, created=created_action
     )
     await postgres_pool.execute(
