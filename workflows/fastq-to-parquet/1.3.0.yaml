@@ -215,8 +215,8 @@ steps:
 #
 # host_filter peaks at 25.8 GB against a 32 GB baseline — real demand, since it
 # deliberately does not size DuckDB from the cgroup (jobs/host_filter.py). ~6 GB
-# of margin is what the ladder has to absorb. Measured on the read-mask family,
-# which carries the host_filter traffic; same module, so the sizing carries.
+# of margin is what the ladder has to absorb. Measured on read-mask/1.0.0, which
+# carries essentially all host_filter traffic; same module, so it carries.
 action_ceiling:
   cpu: 8
   mem_gb: 64

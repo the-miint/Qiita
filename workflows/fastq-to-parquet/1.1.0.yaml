@@ -105,8 +105,8 @@ steps:
 # This version is DISABLED in qiita.action with no tickets — the raise is
 # insurance so re-enabling it does not restore a dead ladder, not active sizing.
 # host_filter OOM-kills at 16 GB and completes at 32, so the rung lands on the
-# size that works. Measured on the read-mask family (the workflows carrying
-# host_filter traffic); same jobs.host_filter module, so the sizing carries.
+# size that works. Measured on read-mask/1.0.0, which carries essentially all
+# host_filter traffic; same jobs.host_filter module, so the sizing carries.
 action_ceiling:
   cpu: 8
   mem_gb: 32

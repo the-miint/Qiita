@@ -431,7 +431,9 @@ duplicates further down are historical strata; leave them where they are.
   Sized from `sacct` on the `qiita` partition rather than a blanket multiplier: NovaSeq X
   demuxes peak at 364.7/282.2 GB against a 480 GB request; `host_filter` OOM-kills at
   16 GB and completes at 32 GB peaking at 22.0/22.6/25.8 GB — real demand, since
-  `host_filter` deliberately does not size DuckDB from the cgroup. `bcl-convert`'s 500 is
+  `host_filter` deliberately does not size DuckDB from the cgroup. All of it measured on
+  `read-mask/1.0.0` (4558 tickets), which carries essentially all `host_filter` traffic;
+  the module is shared, so the sizing carries to the other workflows that run it. `bcl-convert`'s 500 is
   the node bound (`RealMemory=514000` MB, no `MemSpecLimit`; a 500 GB request is confirmed
   schedulable on the partition), so its rung is +4%, not a doubling: strictly better than
   a terminal first OOM, but not a guaranteed save. `cpu` stays 16 there deliberately —
