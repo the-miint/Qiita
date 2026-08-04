@@ -265,7 +265,7 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
 # Study-local field create: per-entity bindings and shared matrix drivers
 # ---------------------------------------------------------------------------
 # Every study-local field create route carries the same gate — require_scope,
-# require_study_exists, and require_study_access at MEMBER with a wet_lab_admin
+# require_study_exists, and require_study_access at ADMIN with a wet_lab_admin
 # bypass — and the same conflict semantics, so each entity supplies its
 # bindings once and drives both matrices through the shared helpers below.
 
@@ -336,10 +336,10 @@ async def _seed_field_global(ctx, *, surface: StudyFieldCreateSurface, label: st
 # names a study that does not exist.
 _STUDY_FIELD_CREATE_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = {
     "owner": ("user", None, "user", 201),
-    "member_grant": ("wet", "member", "user", 201),
+    "admin_grant": ("wet", "admin", "user", 201),
     "wet_lab_admin_bypass": ("user", None, "wet", 201),
     "no_access": ("wet", None, "user", 403),
-    "below_member": ("wet", "viewer", "user", 403),
+    "below_admin": ("wet", "member", "user", 403),
     "missing_scope": ("user", None, "no_scope", 403),
     "nonexistent_study": (None, None, "wet", 404),
 }

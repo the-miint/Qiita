@@ -264,18 +264,24 @@ async def create_biosample_field(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.MEMBER, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
     ),
 ) -> BiosampleStudyFieldResponse:
     """Create a study-local biosample field definition (no metadata value).
 
     The caller must be a HumanUser with profile_complete=True, hold the
-    biosample:write scope, and have `Tier.MEMBER` access (or higher) to the
-    path's study — study owner, a MEMBER-or-higher study_access row, or
-    wet_lab_admin / system_admin (role bypass). `require_study_exists` composes
-    alongside `require_study_access` so role-bypass callers still get 404 on a
+    biosample:write scope, and have `Tier.ADMIN` access (or higher) to the
+    path's study — study owner, an ADMIN study_access row, or wet_lab_admin /
+    system_admin (role bypass). `require_study_exists` composes alongside
+    `require_study_access` so role-bypass callers still get 404 on a
     non-existent study_idx. A field of that name already on the study is a 409;
     the response body is the created field.
+
+    Access policy is interim: the ADMIN gate is a coarse stand-in matching the
+    study-scoped biosample metadata routes, held until per-field
+    visibility-tier enforcement lands. When that clamp comes off, this route
+    goes back to `Tier.MEMBER` — minting a study-local field is work a study
+    member is meant to do.
 
     biosample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /

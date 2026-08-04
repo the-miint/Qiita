@@ -3121,18 +3121,18 @@ async def _post_biosample_field(client, ctx, study_idx: int, **body):
     )
 
 
-async def test_create_biosample_field_member_local(ctx):
-    """Tests the case where a MEMBER-grant user creates a purely-local field:
+async def test_create_biosample_field_admin_local(ctx):
+    """Tests the case where an ADMIN-grant user creates a purely-local field:
     the 201 body is the created resource.
     """
     study_idx = await _seed_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="cf-mem"
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="cf-adm"
     )
     await _grant_study_access(
         ctx,
         study_idx=study_idx,
         principal_idx=ctx["user_session"]["principal_idx"],
-        tier="member",
+        tier="admin",
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
     display_name = unique_field_name("Local")
@@ -3158,8 +3158,8 @@ async def test_create_biosample_field_member_local(ctx):
     assert body == expected
 
 
-async def test_create_biosample_field_member_linked_inherits(ctx):
-    """Tests the case where a MEMBER-tier user links a field to a global field:
+async def test_create_biosample_field_admin_linked_inherits(ctx):
+    """Tests the case where an ADMIN-tier user links a field to a global field:
     the response resolves the inherited data_type from the global row.
     """
     study_idx = await _seed_study(
@@ -3169,7 +3169,7 @@ async def test_create_biosample_field_member_linked_inherits(ctx):
         ctx,
         study_idx=study_idx,
         principal_idx=ctx["user_session"]["principal_idx"],
-        tier="member",
+        tier="admin",
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
     suffix = secrets.token_hex(4)
@@ -3212,8 +3212,8 @@ async def test_create_biosample_field_member_linked_inherits(ctx):
 @pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
 async def test_create_biosample_field_authz(ctx, case, no_biosample_write_client):
     """Tests the case where each row of the shared access matrix calls the
-    create-field route: owner, member grant, and wet_lab_admin bypass are
-    admitted; no access, sub-MEMBER tier, and a missing scope are refused; a
+    create-field route: owner, admin grant, and wet_lab_admin bypass are
+    admitted; no access, sub-ADMIN tier, and a missing scope are refused; a
     nonexistent study is 404 even for a role-bypass caller.
     """
     await assert_study_field_create_authz(

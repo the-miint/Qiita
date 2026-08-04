@@ -39,11 +39,12 @@ duplicates further down are historical strata; leave them where they are.
   (the caller states `data_type` and its options) or linked to a
   `prep_sample_global_field` whose `data_type` / `required` / terminology / tier are
   then inherited and resolved on read. Not an upsert: a name already on the study is
-  a 409. Gated at `Tier.MEMBER` study access (wet_lab_admin+ role bypass) with the
-  `prep_sample:write` scope, matching its biosample counterpart. Closes the gap that
-  left study-local prep_sample fields readable and writable but impossible to create.
-  Reachable from the CLI as `qiita prep-sample create-field`, whose flags mirror
-  `qiita biosample create-field`.
+  a 409. Gated at `Tier.ADMIN` study access (wet_lab_admin+ role bypass) with the
+  `prep_sample:write` scope, matching its biosample counterpart; the ADMIN bar is an
+  interim stand-in until per-field visibility-tier enforcement lands, after which the
+  route returns to `Tier.MEMBER`. Closes the gap that left study-local prep_sample
+  fields readable and writable but impossible to create. Reachable from the CLI as
+  `qiita prep-sample create-field`, whose flags mirror `qiita biosample create-field`.
 
 - **BOOLEAN-typed sample metadata values (#386).** A biosample or prep_sample
   field declared `data_type=boolean` now accepts values: the text `true` or
@@ -81,10 +82,12 @@ duplicates further down are historical strata; leave them where they are.
   `biosample_study_field` definition (no metadata value) in either mode: purely-local
   (supply `--data-type`, optional `--required`/`--terminology-idx`/`--tier-override`)
   or globally-linked (supply `--biosample-global-field-idx`, inheriting the type
-  columns from the global field). Requires `biosample:write` scope and `Tier.MEMBER`
-  study access (wet_lab_admin+ role bypass). A field of that name already on the study
-  is a 409; the 201 body is the created field, with a linked field's inherited
-  `data_type`/`required`/`terminology_idx` resolved on read.
+  columns from the global field). Requires `biosample:write` scope and `Tier.ADMIN`
+  study access (wet_lab_admin+ role bypass) — an interim stand-in until per-field
+  visibility-tier enforcement lands, after which the route returns to `Tier.MEMBER`.
+  A field of that name already on the study is a 409; the 201 body is the created
+  field, with a linked field's inherited `data_type`/`required`/`terminology_idx`
+  resolved on read.
 - **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
   The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
   now record masking completion in `qiita.mask_sample` first-class, via a new

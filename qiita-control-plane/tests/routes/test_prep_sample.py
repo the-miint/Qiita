@@ -435,19 +435,19 @@ async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.NUMERIC) -> tu
     return global_idx, display_name
 
 
-async def test_create_prep_sample_field_member_local(ctx):
-    """Tests the case where a MEMBER-grant user creates a purely-local field:
+async def test_create_prep_sample_field_admin_local(ctx):
+    """Tests the case where an ADMIN-grant user creates a purely-local field:
     the 201 body is the created resource, with the local data_type and a
     defaulted-False required.
     """
     study_idx = await _seed_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pf-mem"
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pf-adm"
     )
     await _grant_study_access(
         ctx,
         study_idx=study_idx,
         principal_idx=ctx["user_session"]["principal_idx"],
-        tier="member",
+        tier="admin",
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
     display_name = unique_field_name("Local")
@@ -563,8 +563,8 @@ async def test_create_prep_sample_field_terminology_coupling_422(ctx):
 @pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
 async def test_create_prep_sample_field_authz(ctx, case, no_prep_sample_write_client):
     """Tests the case where each row of the shared access matrix calls the
-    create-field route: owner, member grant, and wet_lab_admin bypass are
-    admitted; no access, sub-MEMBER tier, and a missing scope are refused; a
+    create-field route: owner, admin grant, and wet_lab_admin bypass are
+    admitted; no access, sub-ADMIN tier, and a missing scope are refused; a
     nonexistent study is 404 even for a role-bypass caller.
     """
     await assert_study_field_create_authz(
