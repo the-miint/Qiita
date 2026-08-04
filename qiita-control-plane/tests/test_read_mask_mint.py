@@ -18,10 +18,22 @@ import secrets
 import pytest
 import pytest_asyncio
 from qiita_common.actions import WorkflowAction, WorkflowStep
+from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane import runner
+from qiita_control_plane.repositories.mask_definition import (
+    ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
+    fetch_mask_definition_by_idx,
+)
+from qiita_control_plane.repositories.reference_membership import (
+    reference_sequence_hashes,
+    reference_sequence_set_hash,
+)
 from qiita_control_plane.testing.db_seeds import (
+    delete_reference_with_sequences,
     seed_biosample_with_sequenced_prep_sample,
+    seed_legacy_mask_definition,
+    seed_reference_with_sequences,
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
@@ -63,7 +75,10 @@ def test_workflow_needs_mask_false_without_mask_param():
 @pytest_asyncio.fixture
 async def seeded(postgres_pool):
     """Seed principal + biosample + sequenced prep_sample + sequenced_sample
-    subtype; yield the ids and clean up FK-reverse."""
+    subtype; yield the ids plus `adapter_reference(sequences)`, and clean up
+    FK-reverse. Adapter references go through the tracker so the principal
+    cleanup below is not blocked by reference.created_by_idx (ON DELETE
+    RESTRICT)."""
     principal_idx = await seed_user_principal(postgres_pool, prefix="mask-mint", suffix="owner")
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
@@ -74,11 +89,26 @@ async def seeded(postgres_pool):
         owner_idx=principal_idx,
         sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
     )
+    references: list[int] = []
+
+    async def adapter_reference(sequences: list[str]) -> int:
+        reference_idx = await seed_reference_with_sequences(
+            postgres_pool,
+            name=f"adapters-{secrets.token_hex(6)}",
+            created_by_idx=principal_idx,
+            sequences=sequences,
+        )
+        references.append(reference_idx)
+        return reference_idx
+
     yield {
         "pool": postgres_pool,
         "principal_idx": principal_idx,
         "prep_sample_idx": prep_sample_idx,
+        "adapter_reference": adapter_reference,
     }
+    for reference_idx in references:
+        await delete_reference_with_sequences(postgres_pool, reference_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
@@ -99,6 +129,7 @@ async def test_mint_read_mask_binds_and_dedups(seeded):
         prep_sample_idx=seeded["prep_sample_idx"],
         originator_principal_idx=seeded["principal_idx"],
         adapter_parquet=None,
+        default_adapter_reference_idx=None,
         host_rype_reference_idx=None,
         host_minimap2_reference_idx=None,
         resolved_lima=None,
@@ -132,6 +163,7 @@ async def test_mint_read_mask_host_ref_drives_identity(seeded):
         originator_principal_idx=seeded["principal_idx"],
         instrument_model="NextSeq 550",
         adapter_parquet=None,
+        default_adapter_reference_idx=None,
         host_minimap2_reference_idx=None,
         resolved_lima=None,
         resolved_syndna=None,
@@ -149,15 +181,67 @@ async def test_mint_read_mask_host_ref_drives_identity(seeded):
 
 
 @pytest.mark.db
-async def test_mint_read_mask_adapter_bytes_drive_identity(seeded, tmp_path):
-    """Different adapter-set bytes -> different mask_idx (the adapter_set_hash is
-    folded into the config). Exercises `_adapter_set_hash` with real differing
-    bytes (callers in other tests pass adapter_parquet=None)."""
+async def test_adapter_set_hash_is_keyed_on_sequences_not_storage(seeded):
+    """`reference_sequence_set_hash` is a function of the reference's SEQUENCES. Two
+    references holding the same sequences hash identically even though they are
+    different reference_idx values loaded separately; changing one sequence
+    changes the digest; member order does not."""
     pool = seeded["pool"]
-    adapters_a = tmp_path / "adapters_a.parquet"
-    adapters_b = tmp_path / "adapters_b.parquet"
-    adapters_a.write_bytes(b"adapter-set-A-bytes")
-    adapters_b.write_bytes(b"adapter-set-B-bytes")
+    same_a = await seeded["adapter_reference"](["ACGTACGT", "TTTTGGGG"])
+    same_b = await seeded["adapter_reference"](["TTTTGGGG", "ACGTACGT"])
+    different = await seeded["adapter_reference"](["ACGTACGT", "GATTACAG"])
+
+    hash_a = await reference_sequence_set_hash(pool, same_a)
+    assert hash_a == await reference_sequence_set_hash(pool, same_b)
+    assert hash_a != await reference_sequence_set_hash(pool, different)
+
+
+@pytest.mark.db
+async def test_adapter_set_hash_is_strand_canonical(seeded):
+    """An adapter and its reverse complement are ONE feature — `qiita.feature`
+    dedups on `canonical_sequence_hash_expr`, which keeps the lex-smaller of the
+    two strands' md5. So a reference holding a sequence and one holding its
+    reverse complement resolve to the same adapter identity, and a reference
+    holding both has one member, not two.
+
+    Pinned because the identity's whole premise is "a function of the sequences",
+    and this says which function: strand-collapsed, not literal."""
+    pool = seeded["pool"]
+    forward = await seeded["adapter_reference"](["TTTTGGGG"])
+    revcomp = await seeded["adapter_reference"](["CCCCAAAA"])
+    both = await seeded["adapter_reference"](["TTTTGGGG", "CCCCAAAA"])
+
+    forward_hash = await reference_sequence_set_hash(pool, forward)
+    assert forward_hash == await reference_sequence_set_hash(pool, revcomp)
+    assert forward_hash == await reference_sequence_set_hash(pool, both)
+    assert len(await reference_sequence_hashes(pool, both)) == 1
+
+
+@pytest.mark.db
+async def test_adapter_set_hash_is_none_for_a_memberless_reference(seeded):
+    """A reference naming no sequences yields None, not the digest of an empty
+    input — every memberless reference would otherwise share one identity."""
+    pool = seeded["pool"]
+    empty = await seeded["adapter_reference"]([])
+    assert await reference_sequence_set_hash(pool, empty) is None
+
+
+@pytest.mark.db
+async def test_mint_read_mask_adapter_set_drives_identity(seeded, tmp_path):
+    """Different adapter SEQUENCES -> different mask_idx (the adapter_set_hash is
+    folded into the config); the same sequences collapse to one mask.
+
+    The adapter Parquet's bytes differ between the two mints of the same adapter
+    set — the thing the original digest keyed on. Identity follows the sequences,
+    so those two mints share a mask.
+    """
+    pool = seeded["pool"]
+    ref_a = await seeded["adapter_reference"](["ACGTACGT", "TTTTGGGG"])
+    ref_b = await seeded["adapter_reference"](["ACGTACGT", "GATTACAG"])
+    parquet_1 = tmp_path / "adapters_1.parquet"
+    parquet_2 = tmp_path / "adapters_2.parquet"
+    parquet_1.write_bytes(b"serialized-by-one-writer")
+    parquet_2.write_bytes(b"serialized-by-another-writer")
 
     common = dict(
         action_id="fastq-to-parquet",
@@ -170,16 +254,89 @@ async def test_mint_read_mask_adapter_bytes_drive_identity(seeded, tmp_path):
         resolved_lima=None,
         resolved_syndna=None,
     )
-    a = await runner._mint_read_mask(pool, adapter_parquet=adapters_a, **common)
-    a_again = await runner._mint_read_mask(pool, adapter_parquet=adapters_a, **common)
-    b = await runner._mint_read_mask(pool, adapter_parquet=adapters_b, **common)
+    a = await runner._mint_read_mask(
+        pool, adapter_parquet=parquet_1, default_adapter_reference_idx=ref_a, **common
+    )
+    a_again = await runner._mint_read_mask(
+        pool, adapter_parquet=parquet_2, default_adapter_reference_idx=ref_a, **common
+    )
+    b = await runner._mint_read_mask(
+        pool, adapter_parquet=parquet_1, default_adapter_reference_idx=ref_b, **common
+    )
 
-    assert a["mask_idx"] == a_again["mask_idx"]  # same adapter bytes -> same mask
-    assert b["mask_idx"] != a["mask_idx"]  # different adapter bytes -> different mask
+    assert a["mask_idx"] == a_again["mask_idx"]
+    assert b["mask_idx"] != a["mask_idx"]
     await pool.execute(
         "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])",
         [a["mask_idx"], b["mask_idx"]],
     )
+
+
+@pytest.mark.db
+async def test_mint_read_mask_rekeys_a_mask_minted_on_the_byte_hash(seeded, tmp_path):
+    """A mask minted under the legacy byte digest is found and re-keyed in place:
+    same mask_idx, current params_hash, scheme stamped.
+
+    The fallback matches on the byte digest, so it finds the row only while the
+    writer bytes are unchanged — this fixture holds them fixed. Once the row is
+    re-keyed its identity no longer involves those bytes, which is the point: a
+    later pyarrow bump cannot move it."""
+    pool = seeded["pool"]
+    ref_idx = await seeded["adapter_reference"](["ACGTACGT", "TTTTGGGG"])
+    adapter_parquet = tmp_path / "adapters.parquet"
+    adapter_parquet.write_bytes(b"bytes-an-older-pyarrow-wrote")
+
+    # The mint reads prep_protocol_idx off the seeded sample, so the legacy row
+    # must be built with the same value or the two configs are not one config.
+    prep_protocol_idx = await pool.fetchval(
+        "SELECT prep_protocol_idx FROM qiita.prep_sample WHERE idx = $1",
+        seeded["prep_sample_idx"],
+    )
+    params_common = dict(
+        action_id="fastq-to-parquet",
+        action_version="1.3.0",
+        prep_protocol_idx=prep_protocol_idx,
+        instrument_model="NextSeq 550",
+        host_rype_reference_idx=None,
+        host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+    legacy_mask_idx = await seed_legacy_mask_definition(
+        pool,
+        params=runner._build_mask_params(
+            adapter_set_hash=runner._adapter_set_hash_legacy(adapter_parquet), **params_common
+        ),
+        created_by_idx=seeded["principal_idx"],
+    )
+    assert (await fetch_mask_definition_by_idx(pool, legacy_mask_idx))[
+        "adapter_hash_scheme"
+    ] is None
+
+    minted = await runner._mint_read_mask(
+        pool,
+        action_id="fastq-to-parquet",
+        action_version="1.3.0",
+        prep_sample_idx=seeded["prep_sample_idx"],
+        originator_principal_idx=seeded["principal_idx"],
+        instrument_model="NextSeq 550",
+        adapter_parquet=adapter_parquet,
+        default_adapter_reference_idx=ref_idx,
+        host_rype_reference_idx=None,
+        host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+
+    assert minted["mask_idx"] == legacy_mask_idx
+    row = await fetch_mask_definition_by_idx(pool, legacy_mask_idx)
+    assert row["adapter_hash_scheme"] == ADAPTER_HASH_SCHEME_SEQUENCE_HASH
+    current_hash = await reference_sequence_set_hash(pool, ref_idx)
+    assert json.loads(row["params"])["resolved_qc"]["adapter_set_hash"] == current_hash
+    assert bytes(row["params_hash"]) == canonical_params_hash(
+        runner._build_mask_params(adapter_set_hash=current_hash, **params_common)
+    )
+    await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", legacy_mask_idx)
 
 
 @pytest.mark.db
@@ -232,6 +389,7 @@ async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
             originator_principal_idx=principal_idx,
             instrument_model="NextSeq 550",
             adapter_parquet=None,
+            default_adapter_reference_idx=None,
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
             resolved_lima=None,
@@ -296,6 +454,7 @@ async def test_mint_read_mask_requires_sequenced_sample(seeded):
             originator_principal_idx=seeded["principal_idx"],
             instrument_model=None,
             adapter_parquet=None,
+            default_adapter_reference_idx=None,
             host_rype_reference_idx=None,
             host_minimap2_reference_idx=None,
             resolved_lima=None,

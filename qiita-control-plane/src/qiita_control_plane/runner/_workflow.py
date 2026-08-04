@@ -460,6 +460,7 @@ async def run_workflow(
                         originator_principal_idx=work_ticket["originator_principal_idx"],
                         instrument_model=bound.get("instrument_model"),
                         adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
+                        default_adapter_reference_idx=default_adapter_reference_idx,
                         host_rype_reference_idx=bound.get("host_rype_reference_idx"),
                         host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
                         # What actually distinguishes the five PacBio protocols:
