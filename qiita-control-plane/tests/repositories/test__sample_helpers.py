@@ -5004,6 +5004,11 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
 
 
 @pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+@pytest.mark.parametrize(
     "first_text, second_text, expected_outcome, expected_stored_text",
     [
         ("5", "5.0", FieldWriteOutcome.UPDATED, "5.0"),
@@ -5015,7 +5020,7 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
     ],
 )
 async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
-    ctx, first_text, second_text, expected_outcome, expected_stored_text
+    ctx, spec, first_text, second_text, expected_outcome, expected_stored_text
 ):
     """Tests the case where a NUMERIC field is rewritten with a value that is
     numerically equal to the one already in the slot but written differently.
@@ -5025,8 +5030,8 @@ async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
     and leaves the row untouched. Every case reports the stored form, and a
     repeat of the same request converges rather than rewriting forever.
     """
-    entity_idx = await _create_biosample_with_link(ctx)
-    gf_row = await _seed_global_field_for_spec(ctx, BIOSAMPLE_METADATA_SPEC, FieldDataType.NUMERIC)
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.NUMERIC)
 
     # Each write commits in its own transaction so the second collides with
     # the persisted slot rather than joining the first write's transaction.
@@ -5034,7 +5039,7 @@ async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
         async with ctx["pool"].acquire() as conn, conn.transaction():
             return await write_sample_metadata(
                 conn,
-                spec=BIOSAMPLE_METADATA_SPEC,
+                spec=spec,
                 entity_idx=entity_idx,
                 study_idx=ctx["study_idx"],
                 metadata={gf_row.display_name: value},
@@ -5045,7 +5050,7 @@ async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
 
     await _upsert(first_text)
     second = await _upsert(second_text)
-    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
+    await _track_entity_metadata_and_fields(ctx, spec, entity_idx)
 
     # The result is compared with its value rendered rather than as a Decimal:
     # Decimal equality cannot see scale, and NaN is not even equal to itself,
@@ -5055,7 +5060,8 @@ async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
     assert rendered == [(gf_row.display_name, "global", expected_outcome, expected_stored_text)]
 
     stored_text = await ctx["pool"].fetchval(
-        "SELECT value_numeric::text FROM qiita.biosample_metadata WHERE biosample_idx = $1",
+        f"SELECT value_numeric::text FROM {spec.metadata_table}"
+        f" WHERE {spec.entity_key_column} = $1",
         entity_idx,
     )
     assert stored_text == expected_stored_text

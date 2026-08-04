@@ -52,6 +52,7 @@ _None yet._
 ### Notes (no host action)
 
 - Metadata values for a `boolean`-typed biosample/prep_sample field now write and read back (`true`/`false`, case-insensitive; anything else 422s). (#386)
+- A metadata write returns a `numeric` value in the form it is stored, so exponent notation comes back resolved (`1e3` → `1000`). A rewrite differing only in scale now reports `updated` and overwrites — `5` then `5.0` stores `5.0` — where it previously reported `unchanged` and wrote nothing. (#386)
 
 ---
 
