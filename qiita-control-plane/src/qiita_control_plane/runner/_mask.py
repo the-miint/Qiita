@@ -17,11 +17,11 @@ from ._upload import _submission_bad_input
 # Read-mask identity (mask_idx) minting
 # =============================================================================
 #
-# A read mask's identity is its filtering CONFIG: the filter workflow + version,
-# the host reference(s) it depletes against, and the resolved QC config. The
-# control plane mints a `mask_idx` deduplicated on the SHA-256 of that config so
-# the same config resolves to the same mask_idx fleet-wide; the host_filter step
-# stamps it onto every read_mask row. The host references are read from the
+# A read mask's identity is its filtering CONFIG: the filter workflow + version, the
+# host reference(s) it depletes against and the params it depletes with, and the
+# resolved QC config. The control plane mints a `mask_idx` deduplicated on the SHA-256
+# of that config so the same config resolves to the same mask_idx fleet-wide; the
+# host_filter step stamps it onto every read_mask row. The host references are read from the
 # sequenced_sample row (where they are pinned at pool fan-out); the resolved QC
 # values mirror the qc job's fastp-equivalent constants so a metadata edit to a
 # protocol row that doesn't change the effective filter yields the same mask.
@@ -51,6 +51,24 @@ LIMA_ARGS_BINDING = "lima_args"
 # faithful to the filter actually applied.
 _QC_RESOLVED_MIN_LENGTH = 100
 _QC_RESOLVED_FILTER_TAIL = "0, 15, 40, 5, 0"
+
+# rype's host-call threshold, the resolved host-filter param the mask hash covers.
+# Mirrors `qiita_compute_orchestrator.jobs.host_filter._RYPE_THRESHOLD` for the same
+# reason as the QC and syndna values (kept here, not imported: the control plane does
+# not depend on the orchestrator package); `test_host_filter_pins` reads it out of that
+# source by AST so the mirror cannot drift silently.
+#
+# It CHANGES which reads are called host, which is what makes it identity and not
+# detail: rype emits a row per bucket scoring at or above the threshold, and the job
+# calls host on ANY emitted row, so the threshold IS the rype host call.
+#
+# The minimap2 stage's `preset` is deliberately NOT here. It is pinned in the job to
+# the preset its `.mmi` was built with ('sr') rather than chosen per mask, and the
+# index is already named by `host_minimap2_reference_idx` below — so it is invariant,
+# and hashing it would re-mint every mask fleet-wide to discriminate nothing. Should a
+# minimap2 param ever become a per-mask choice (a caller-supplied preset, or one that
+# varies by platform), it belongs in `_resolved_host_filter` alongside the threshold.
+_HOST_FILTER_RYPE_THRESHOLD = 0.05
 
 # Canonical lima argument string per preset. The CLIENT chooses only the preset
 # (`lima_preset` in action_context); the control plane resolves the arguments.
@@ -198,6 +216,31 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _resolved_host_filter(host_rype_reference_idx: int | None) -> dict[str, Any] | None:
+    """The effective host-filter params for the mask hash, or None when the identity
+    records no rype reference to apply them to.
+
+    Keyed off that reference rather than a separate gate, so the block can never claim
+    a stage the identity does not also name a reference for. Under the two-reference
+    layout that is exactly "no rype stage ran" — the job skips the stage whose index
+    path is unbound, and the path comes from the reference. A LEGACY
+    `host_reference_idx` ticket is the one case where rype can run with this None: that
+    key is not threaded into the mint at all, so such a mask's params already describe
+    no host filtering whatsoever. Pre-existing and not widened here — flagged so the
+    None is not read as a claim that nothing depleted.
+
+    NESTED and None-when-absent, mirroring `resolved_lima` / `resolved_syndna`: the
+    reference names WHAT we deplete against, never HOW aggressively. A read is host
+    when rype scores it at or above `rype_threshold` against that reference, so two
+    masks built at different thresholds describe different filters and must not share
+    a mask_idx. Nesting is what keeps a future threshold change from re-minting a mask
+    that never ran rype at all.
+    """
+    if host_rype_reference_idx is None:
+        return None
+    return {"rype_threshold": _HOST_FILTER_RYPE_THRESHOLD}
+
+
 def _build_mask_params(
     *,
     action_id: str,
@@ -216,12 +259,12 @@ def _build_mask_params(
     This is the SINGLE source of truth for the mask's identity shape — the mint
     path (`_mint_read_mask`) and the block planner both call it so they derive the
     SAME hash for the SAME effective config. Every value is the EFFECTIVE filter (the host refs
-    the filter applies + adapter bytes hash + thresholds), so two callers with the
-    same effective config collapse to one mask even if descriptive metadata
-    differs. `adapter_set_hash` is passed in already computed (the SHA-256 hex of
-    the materialized adapter Parquet, via `_adapter_set_hash`) rather than a file
-    path, so the backfill can supply it from a re-materialized adapter set without
-    this helper touching the filesystem.
+    the filter applies + the params it applies on top of them + adapter bytes hash +
+    thresholds), so two callers with the same effective config collapse to one mask even
+    if descriptive metadata differs. `adapter_set_hash` is passed in already computed
+    (the SHA-256 hex of the materialized adapter Parquet, via `_adapter_set_hash`)
+    rather than a file path, so the backfill can supply it from a re-materialized
+    adapter set without this helper touching the filesystem.
 
     `resolved_lima` and `resolved_syndna` are what distinguish the five PacBio
     protocols. `prep_protocol_idx` cannot: it is the operator's `--prep-protocol-idx`
@@ -242,6 +285,7 @@ def _build_mask_params(
         "filter_version": action_version,
         "host_rype_reference_idx": host_rype_reference_idx,
         "host_minimap2_reference_idx": host_minimap2_reference_idx,
+        "resolved_host_filter": _resolved_host_filter(host_rype_reference_idx),
         "prep_protocol_idx": prep_protocol_idx,
         "resolved_qc": {
             "instrument_model": instrument_model,
@@ -276,7 +320,10 @@ async def _mint_read_mask(
         from the same action_context values `_resolve_host_filter_indexes`
         consumes (`host_rype_reference_idx` / `host_minimap2_reference_idx`) — so
         the minted mask_idx's params describe the filter that ran. Absent host
-        refs mean no host filtering, a faithful part of the config (None), and
+        refs mean no host filtering, a faithful part of the config (None),
+      * the params those host stages APPLY to those references (`resolved_host_filter`
+        — rype's host-call threshold), because the reference says what we deplete
+        against and never how aggressively, and
       * the resolved QC config (instrument model gating polyG, the fastp-`-l 100`
         thresholds, and a hash of the materialized adapter set).
     `mint_mask_definition` hashes `params` (canonical JSON) and upserts on it, so
