@@ -29,6 +29,7 @@ from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     ComputeTarget,
     ReferenceStatus,
+    ScopeTargetKind,
     StepProgressState,
     WorkTicketState,
 )
@@ -286,6 +287,7 @@ async def _seed_action(
     *,
     context_schema: dict,
     target_kind: str = "reference",
+    action_id: str = "wt-test-action",
     scopes: list[str] | None = None,
     target_processing_kinds: list[str] | None = None,
     human_roles: list[str] | None = None,
@@ -302,8 +304,10 @@ async def _seed_action(
     DB CHECK action_processing_kinds_only_for_prep_sample enforces
     that pairing). `human_roles` overrides the default audience
     ([system_admin]) — pass [user, wet_lab_admin, system_admin] to
-    exercise the wider audience the fastq-to-parquet YAML declares."""
-    action_id = "wt-test-action"
+    exercise the wider audience the fastq-to-parquet YAML declares.
+
+    Every action here shares one `action_id` and varies only by `version`;
+    `action_id` overrides that for a test that needs two distinct ids."""
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
         "INSERT INTO qiita.action ("
@@ -2837,9 +2841,9 @@ async def ticket_seeder(postgres_pool):
         )
 
 
-def _summary_by_idx(payload: list[dict], idx: int) -> dict | None:
-    """Find the summary dict for `idx` in a list response, or None."""
-    return next((row for row in payload if row["work_ticket_idx"] == idx), None)
+def _summary_by_idx(body: dict, idx: int) -> dict | None:
+    """Find the summary dict for `idx` in a WorkTicketListResponse body, or None."""
+    return next((row for row in body["tickets"] if row["work_ticket_idx"] == idx), None)
 
 
 async def test_list_work_ticket_401_on_anonymous(wt_client):
@@ -3072,7 +3076,7 @@ async def test_list_work_ticket_state_filter(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    returned = {row["work_ticket_idx"] for row in resp.json()}
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
     assert processing_idx in returned
     assert pending_idx not in returned
     assert completed_idx not in returned
@@ -3103,7 +3107,7 @@ async def test_list_work_ticket_active_filter(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    returned = {row["work_ticket_idx"] for row in resp.json()}
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
     assert {pending_idx, processing_idx} <= returned
     assert completed_idx not in returned
     assert failed_idx not in returned
@@ -3144,14 +3148,17 @@ async def test_list_work_ticket_orders_newest_first(
         URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
     )
     assert resp.status_code == 200, resp.text
-    returned = [row["work_ticket_idx"] for row in resp.json()]
+    returned = [row["work_ticket_idx"] for row in resp.json()["tickets"]]
     assert returned == sorted(seeded, reverse=True)
 
 
 async def test_list_work_ticket_limit_caps_results(
     wt_client, admin_token, reference_action, ticket_seeder
 ):
-    """`?limit=N` caps the page size (own-scoped, so the count is exact)."""
+    """`?limit=N` caps the page size and says so: a capped page reports
+    `truncated` true with `count` at the cap, an uncapped one false — the
+    caller never has to infer a cut from the row count. Own-scoped, so both
+    counts are exact."""
     admin_tok, admin_idx = admin_token
     for _ in range(3):
         await ticket_seeder.ticket(
@@ -3163,7 +3170,379 @@ async def test_list_work_ticket_limit_caps_results(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    assert len(resp.json()) == 2
+    body = resp.json()
+    assert len(body["tickets"]) == 2
+    assert body["count"] == 2
+    assert body["truncated"] is True
+
+    # limit == the exact row count: the limit+1 fetch finds no extra row, so
+    # this is a complete page, not a truncated one.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"limit": "3"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 3
+    assert body["truncated"] is False
+
+
+# The tagged-union idx column each scope kind fills in (mirrors the DB CHECK on
+# qiita.work_ticket). Keyed on the enum, so the column name interpolated into
+# the INSERT is always one of these three literals.
+_SCOPE_IDX_COLUMN = {
+    ScopeTargetKind.PREP_SAMPLE: "prep_sample_idx",
+    ScopeTargetKind.SEQUENCED_POOL: "sequenced_pool_idx",
+    ScopeTargetKind.BLOCK: "block_idx",
+}
+
+
+async def _seed_scoped_ticket(
+    wt_client,
+    postgres_pool,
+    *,
+    action,
+    originator_idx,
+    kind: ScopeTargetKind,
+    idx,
+    state: WorkTicketState = WorkTicketState.PROCESSING,
+):
+    """Insert one work_ticket of `kind` pointing at `idx` (the tagged-union
+    column that kind uses), register it for wt_client teardown, and return its
+    work_ticket_idx. Only the column NAME is interpolated — both closed-set
+    labels bind through their enum twin."""
+    action_id, version = action
+    column = _SCOPE_IDX_COLUMN[kind]
+    work_ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        f"  scope_target_kind, {column}, state)"
+        " VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5,"
+        "         $6::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        originator_idx,
+        kind.value,
+        idx,
+        state.value,
+    )
+    wt_client._created_tickets.append(work_ticket_idx)
+    return work_ticket_idx
+
+
+@pytest.fixture
+async def pool_of_prep_sample(postgres_pool, prep_sample_with_pool_item):
+    """The sequenced_pool_idx behind `prep_sample_with_pool_item` — the pool a
+    `?sequenced_pool_idx=` filter names when the ticket is sample-scoped."""
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    return await postgres_pool.fetchval(
+        "SELECT sequenced_pool_idx FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+
+
+async def test_list_work_ticket_pool_filter_matches_all_three_scope_kinds(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    reference_action,
+    ticket_seeder,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+    sequenced_pool_action,
+    block_action,
+    block_for_wt,
+):
+    """`?sequenced_pool_idx=P` returns every ticket that touches P by any of the
+    three routes a ticket reaches a pool — the pool itself, one of its samples,
+    or a block covering one of its samples — and nothing else."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    await postgres_pool.execute(
+        "INSERT INTO qiita.block_member"
+        " (block_idx, prep_sample_idx, min_sequence_idx, max_sequence_idx)"
+        " VALUES ($1, $2, 1, 10)",
+        block_for_wt,
+        prep_sample_idx,
+    )
+    sample_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    pool_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=sequenced_pool_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.SEQUENCED_POOL,
+        idx=pool_of_prep_sample,
+    )
+    block_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=block_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.BLOCK,
+        idx=block_for_wt,
+    )
+    # Control: same originator, touches no pool at all.
+    unrelated = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = [row["work_ticket_idx"] for row in resp.json()["tickets"]]
+    assert set(returned) == {sample_scoped, pool_scoped, block_scoped}
+    assert unrelated not in returned
+    # One row per ticket: the block arm covers many samples and the sample arm
+    # rides a UNIQUE join, so neither can fan a ticket into duplicate rows.
+    assert len(returned) == len(set(returned))
+    # The sample-scoped ticket carries read_outcome; the block ticket spans many
+    # samples and carries none.
+    assert _summary_by_idx(resp.json(), sample_scoped)["read_outcome"] is not None
+    assert _summary_by_idx(resp.json(), block_scoped)["read_outcome"] is None
+
+    # AND-composes with the state filters: all three are PROCESSING, so
+    # ?state=completed intersects to empty and ?active=true keeps all three.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={
+            "sequenced_pool_idx": str(pool_of_prep_sample),
+            "state": WorkTicketState.COMPLETED.value,
+        },
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tickets"] == []
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample), "active": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["work_ticket_idx"] for row in resp.json()["tickets"]} == {
+        sample_scoped,
+        pool_scoped,
+        block_scoped,
+    }
+
+
+async def test_list_work_ticket_pool_filter_excludes_other_pools(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+    sequenced_pool_action,
+    sequenced_pool_for_wt,
+):
+    """A ticket on a DIFFERENT pool is excluded — the filter narrows to the
+    named pool rather than to "has a pool"."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    _run_idx, other_pool_idx = sequenced_pool_for_wt
+    mine = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    theirs = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=sequenced_pool_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.SEQUENCED_POOL,
+        idx=other_pool_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert mine in returned
+    assert theirs not in returned
+
+
+async def test_list_work_ticket_pool_filter_keeps_originator_scoping(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    regular_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+):
+    """The pool filter composes with the originator scoping instead of
+    replacing it: another principal's ticket on the pool stays invisible
+    without `?all=true`."""
+    user_tok, user_idx = regular_token
+    admin_tok, _admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    theirs = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is None
+
+    # The originator sees it under the same filter.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {user_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is not None
+
+    # ...and so does the operator view: ?all=true widens across originators
+    # with the pool filter still applied, rather than the two cancelling out.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample), "all": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is not None
+
+
+@pytest.fixture
+async def other_id_reference_action(postgres_pool):
+    """A reference-targeting action under a DIFFERENT action_id. The module's
+    other action fixtures all share `wt-test-action`, so an action_id filter
+    needs this one to have anything to exclude."""
+    action_id, version = await _seed_action(
+        postgres_pool, context_schema={}, action_id="wt-test-other-action"
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+async def test_list_work_ticket_prep_sample_and_action_id_filters(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    other_id_reference_action,
+    ticket_seeder,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+):
+    """`?prep_sample_idx=` narrows to one sample's tickets and `?action_id=`
+    to one action; both AND-compose with the rest of the filters."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    sample_ticket = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    other_action_ticket = await ticket_seeder.ticket(
+        action=other_id_reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"prep_sample_idx": str(prep_sample_idx)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["work_ticket_idx"] for row in resp.json()["tickets"]} == {sample_ticket}
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"action_id": other_id_reference_action[0]},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert other_action_ticket in returned
+    assert sample_ticket not in returned
+
+    # The other direction: the sample's own action_id excludes the other action.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"action_id": prep_sample_action[0]},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert sample_ticket in returned
+    assert other_action_ticket not in returned
+
+    # AND-composed: this sample has no ticket for the other action.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={
+            "prep_sample_idx": str(prep_sample_idx),
+            "action_id": other_id_reference_action[0],
+        },
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tickets"] == []
+
+
+async def test_list_work_ticket_unknown_filter_idx_is_empty_not_404(wt_client, admin_token):
+    """An idx that matches nothing returns an empty list — these are filters on
+    a list, and the route does not confirm which pools or samples exist."""
+    admin_tok, _ = admin_token
+    for params in (
+        {"sequenced_pool_idx": "999999999"},
+        {"prep_sample_idx": "999999999"},
+        {"action_id": "no-such-action"},
+    ):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params=params,
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 200, (params, resp.text)
+        assert resp.json()["tickets"] == []
+
+
+async def test_list_work_ticket_filter_idx_out_of_range_422(wt_client, admin_token):
+    """The two idx filters are positive integers (gt=0), like every other idx
+    on this surface."""
+    admin_tok, _ = admin_token
+    for params in ({"sequenced_pool_idx": "0"}, {"prep_sample_idx": "0"}, {"action_id": ""}):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params=params,
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 422, (params, resp.text)
 
 
 async def test_list_work_ticket_limit_out_of_range_422(wt_client, admin_token):

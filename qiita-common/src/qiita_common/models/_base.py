@@ -11,7 +11,7 @@ import re
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 # A `derived_inputs` key becomes an env var forwarded into the container, so it
 # must look like one. Anchored: a stray `=` or space would corrupt the
@@ -34,6 +34,36 @@ def _fraction_passing_quality_filter(
     if raw_read_count_r1r2 == 0:
         return None
     return quality_filtered_read_count_r1r2 / raw_read_count_r1r2
+
+
+class ReadCounts(BaseModel):
+    """The four per-stage read counts plus the fraction derived from them —
+    one definition of the column names, their invariants, and the fraction, for
+    every surface that reports read outcome. Each subclass documents what its
+    own four counts cover (one sample, one ticket's sample, a pool's sums).
+
+    Both-mates (R1+R2) totals. Per sample they stay NULL until the sample is
+    processed by fastq-to-parquet/1.2.0 (the persist-read-metrics action writes
+    them). By the DB CHECK: quality_filtered <= biological and biological +
+    spikein <= raw. `spikein` (SynDNA) is DISJOINT from biological — a spike-in
+    is added in the lab, not a molecule from the sample — and is 0 for protocols
+    that carry none. `qc_*` and `twist_no_adaptor` reads count toward raw only.
+    """
+
+    raw_read_count_r1r2: int | None
+    biological_read_count_r1r2: int | None
+    quality_filtered_read_count_r1r2: int | None
+    spikein_read_count_r1r2: int | None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fraction_passing_quality_filter(self) -> float | None:
+        """quality_filtered / raw for whatever this instance counts — see
+        `_fraction_passing_quality_filter`. Computed on read, never stored, so it
+        can't drift from the counts."""
+        return _fraction_passing_quality_filter(
+            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
+        )
 
 
 def check_exactly_one_runtime(

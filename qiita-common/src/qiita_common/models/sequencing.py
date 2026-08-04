@@ -21,7 +21,7 @@ from pydantic import (
 from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel, _fraction_passing_quality_filter
+from qiita_common.models._base import PatchRequestModel, ReadCounts
 from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
@@ -150,17 +150,16 @@ class SequencedPoolCreateResponse(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
 
 
-class PoolReadMetrics(BaseModel):
+class PoolReadMetrics(ReadCounts):
     """Compute-on-read read-metric rollup for a sequenced_pool.
 
-    The four counts are SUMS over the pool's NON-retired sequenced_samples
-    (each NULL until at least one sample in the pool has been processed);
-    `fraction_passing_quality_filter` is recomputed from the summed counts via
-    `_fraction_passing_quality_filter` — NOT a mean of per-sample fractions — and
-    is None when raw is absent or 0. `sample_count` is the pool's non-retired
-    sequenced_sample total; `samples_with_metrics` is how many of those carry
-    read counts, so a partial rollup (some samples still unprocessed) is
-    interpretable rather than looking complete.
+    The four `ReadCounts` fields are SUMS over the pool's NON-retired
+    sequenced_samples (each NULL until at least one sample in the pool has been
+    processed); `fraction_passing_quality_filter` is therefore recomputed from
+    the summed counts — NOT a mean of per-sample fractions. `sample_count` is
+    the pool's non-retired sequenced_sample total; `samples_with_metrics` is how
+    many of those carry read counts, so a partial rollup (some samples still
+    unprocessed) is interpretable rather than looking complete.
 
     The read-outcome breakdown splits `samples_with_metrics`'s implicit
     "processed" set so an operator can tell "no metrics yet" from "processed but
@@ -178,12 +177,6 @@ class PoolReadMetrics(BaseModel):
     experiment + run on the sequenced_sample subtype); `samples_fully_submitted_to_ena`
     requires all four. All are compute-on-read, like the read-count sums."""
 
-    raw_read_count_r1r2: int | None
-    biological_read_count_r1r2: int | None
-    quality_filtered_read_count_r1r2: int | None
-    # SynDNA spike-ins, disjoint from biological (added in the lab, not a molecule
-    # from the sample). Always 0/NULL for protocols that carry no spike-in.
-    spikein_read_count_r1r2: int | None
     sample_count: int
     samples_with_metrics: int
     # Read-outcome breakdown (partition of sample_count).
@@ -196,15 +189,6 @@ class PoolReadMetrics(BaseModel):
     samples_with_ena_experiment_accession: int
     samples_with_ena_run_accession: int
     samples_fully_submitted_to_ena: int
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def fraction_passing_quality_filter(self) -> float | None:
-        """Pool quality_filtered / raw, recomputed from the SUMMED counts (see
-        `_fraction_passing_quality_filter`)."""
-        return _fraction_passing_quality_filter(
-            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
-        )
 
 
 # SequencingRunResponse.read_metrics is a forward ref to PoolReadMetrics (defined
@@ -711,7 +695,7 @@ class SequencedSampleCreateResponse(BaseModel):
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
 
 
-class SequencedSampleResponse(BaseModel):
+class SequencedSampleResponse(ReadCounts):
     """Returned by GET /api/v1/sequenced-sample/{sequenced_sample_idx}.
 
     Carries every caller-visible column from the sequenced_sample subtype
@@ -743,17 +727,6 @@ class SequencedSampleResponse(BaseModel):
     ena_run_accession: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None
-    # Per-stage read counts, both-mates (R1+R2) totals. NULL until the
-    # sample is processed by fastq-to-parquet/1.2.0 (the persist-read-metrics
-    # action writes them). By the DB CHECK: quality_filtered <= biological and
-    # biological + spikein <= raw. `spikein` (SynDNA) is DISJOINT from biological —
-    # a spike-in is added in the lab, not a molecule from the sample — and is 0 for
-    # protocols that carry none. `qc_*` and `twist_no_adaptor` reads count toward
-    # raw only.
-    raw_read_count_r1r2: int | None
-    biological_read_count_r1r2: int | None
-    quality_filtered_read_count_r1r2: int | None
-    spikein_read_count_r1r2: int | None
     last_metadata_change_at: AwareDatetime | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
@@ -764,16 +737,6 @@ class SequencedSampleResponse(BaseModel):
     retire_reason: str | None
     global_metadata: dict[str, GlobalMetadataEntry]
     caller_system_role: SystemRole
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def fraction_passing_quality_filter(self) -> float | None:
-        """quality_filtered / raw for this sample — see
-        `_fraction_passing_quality_filter`. Computed on read, never stored, so it
-        can't drift from the counts."""
-        return _fraction_passing_quality_filter(
-            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
-        )
 
 
 class SequencedSamplePatchRequest(PatchRequestModel):

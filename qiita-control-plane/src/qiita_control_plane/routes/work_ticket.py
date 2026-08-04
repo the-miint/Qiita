@@ -79,6 +79,7 @@ from qiita_common.models import (
     WorkTicketCancelResponse,
     WorkTicketCancelResult,
     WorkTicketCreateRequest,
+    WorkTicketListResponse,
     WorkTicketReadOutcome,
     WorkTicketResponse,
     WorkTicketState,
@@ -1178,7 +1179,7 @@ async def get_work_ticket(
 
 @router.get(
     PATH_WORK_TICKET_ROOT,
-    response_model=list[WorkTicketSummary],
+    response_model=WorkTicketListResponse,
 )
 async def list_work_tickets(
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -1198,10 +1199,27 @@ async def list_work_tickets(
             "wet_lab_admin or higher). Default is the caller's own tickets."
         ),
     ),
+    sequenced_pool_idx: int | None = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Filter to tickets that touch this sequenced_pool: pool-scoped tickets, "
+            "tickets on one of the pool's samples, and block tickets whose block "
+            "covers one of them."
+        ),
+    ),
+    prep_sample_idx: int | None = Query(
+        default=None, gt=0, description="Filter to tickets scoped to this prep_sample."
+    ),
+    action_id: str | None = Query(
+        default=None,
+        min_length=1,
+        description="Filter to one action_id (e.g. read-mask), across every action_version.",
+    ),
     limit: int = Query(
         default=_WORK_TICKET_LIST_DEFAULT_LIMIT, ge=1, le=_WORK_TICKET_LIST_MAX_LIMIT
     ),
-) -> list[WorkTicketSummary]:
+) -> WorkTicketListResponse:
     """List work tickets, each with a snapshot of its *current* compute
     placement (target, SLURM job id, step state) from a single LATERAL join
     against work_ticket_step — no live SLURM hop, so the read is at most one
@@ -1211,11 +1229,38 @@ async def list_work_tickets(
     widens to every originator and is gated to wet_lab_admin+ (mirrors the
     single-ticket GET's role bypass); a non-admin requesting it gets 403.
     Anonymous → 401. Ordered newest-first (work_ticket_idx DESC), capped by
-    `limit`.
+    `limit`, with `truncated` True when the underlying set exceeded it — a
+    pool's ticket set can run to hundreds of rows, so a caller assembling one
+    can tell a complete answer from a prefix instead of inferring it from the
+    row count.
 
-    `state` and `active` AND-compose (`?state=completed&active=true` is a
-    valid — empty — intersection), so a caller can scope to "my active
-    tickets" or "all failed tickets" in one query."""
+    Every filter AND-composes (`?state=completed&active=true` is a valid —
+    empty — intersection), so a caller can scope to "my active tickets" or
+    "this pool's read-mask tickets" in one query. `sequenced_pool_idx`
+    composes with the originator scoping rather than replacing it: a caller
+    without `?all=true` still sees only the tickets they originated, so the
+    pool filter is not a way around that.
+
+    `sequenced_pool_idx` matches a ticket by any of the three ways a ticket
+    reaches a pool, so a pool's work is visible whichever submit path
+    produced it:
+      • pool-scoped   — wt.sequenced_pool_idx (bcl-convert)
+      • sample-scoped — the ticket's prep_sample is one of the pool's
+        sequenced_samples (read-mask; the join that also feeds read_outcome)
+      • block-scoped  — the ticket's block covers one of those samples
+        (read-mask-block, whose own prep_sample_idx is NULL)
+    A block ticket spans many samples, so it carries no read_outcome; the
+    per-sample counts for a block-masked pool come from the pool's
+    sequenced-sample roster instead.
+
+    The pool arms read the sample's CURRENT sequenced_pool_idx and do not
+    exclude retired prep_samples, so this list keeps a retired sample's
+    tickets while the pool roster drops the sample itself — a ticket is a
+    record of work that ran, the roster is the pool's live membership.
+
+    An idx that matches nothing (including one that does not exist) returns
+    an empty list rather than 404 — these are filters on a list, and the
+    route stays enumeration-safe like the single-ticket GET above."""
     if isinstance(principal, Anonymous):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
@@ -1239,14 +1284,45 @@ async def list_work_tickets(
     if active:
         args.append(list(NON_TERMINAL_WORK_TICKET_STATES))
         conditions.append(f"wt.state = ANY(${len(args)}::qiita.work_ticket_state[])")
+    if prep_sample_idx is not None:
+        args.append(prep_sample_idx)
+        conditions.append(f"wt.prep_sample_idx = ${len(args)}")
+    if action_id is not None:
+        args.append(action_id)
+        conditions.append(f"wt.action_id = ${len(args)}")
+    if sequenced_pool_idx is not None:
+        args.append(sequenced_pool_idx)
+        n = len(args)
+        # The three arms of "touches this pool" (see the docstring). The
+        # sample arm reads the already-joined `ss` — sequenced_sample is
+        # UNIQUE on prep_sample_idx, so it cannot fan a ticket into several
+        # rows. The block arm is an EXISTS because a block covers many
+        # samples; a join there would.
+        conditions.append(
+            f"(wt.sequenced_pool_idx = ${n} OR ss.sequenced_pool_idx = ${n}"
+            " OR EXISTS (SELECT 1 FROM qiita.block_member bm"
+            "            JOIN qiita.sequenced_sample bss"
+            "              ON bss.prep_sample_idx = bm.prep_sample_idx"
+            f"            WHERE bm.block_idx = wt.block_idx AND bss.sequenced_pool_idx = ${n}))"
+        )
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-    args.append(limit)
+    # Fetch limit+1 so a row count strictly greater than the cap signals
+    # truncation; slice back to the cap before returning. Same mechanism the
+    # sequenced-sample rosters use.
+    args.append(limit + 1)
     rows = await pool.fetch(
         f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME}{where}"
         f" ORDER BY wt.work_ticket_idx DESC LIMIT ${len(args)}",
         *args,
     )
-    return [_row_to_work_ticket_summary(row) for row in rows]
+    truncated = len(rows) > limit
+    if truncated:
+        rows = rows[:limit]
+    return WorkTicketListResponse(
+        tickets=[_row_to_work_ticket_summary(row) for row in rows],
+        count=len(rows),
+        truncated=truncated,
+    )
 
 
 @router.get(

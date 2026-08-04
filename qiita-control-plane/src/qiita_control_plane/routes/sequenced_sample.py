@@ -423,6 +423,11 @@ async def list_sequenced_samples_in_pool(
     Each sample carries `host_filter` — what host filtering it WOULD get, resolved
     from its own `host_taxon_id` metadata plus the run's platform. This is what the
     submit path reads (there is no intake host-filter flag any more).
+
+    Each sample also carries its four per-stage read counts and the fraction
+    surviving quality filtering, making one call the pool's per-sample read
+    table; `SequencedSampleListItem` records which samples that covers and the
+    work-ticket list does not.
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
     # truncation; the route slices back to the cap before returning.
@@ -499,6 +504,9 @@ async def list_sequenced_samples_in_run(
     run instead of one pool. require_sequencing_run_exists fires a 404 for an
     unknown run. Excludes rows whose supertype prep_sample is retired; the
     `truncated` flag indicates the underlying set exceeded the hard cap.
+
+    Carries the same per-sample read counts as the pool-scoped list; `host_filter`
+    stays None here (it needs the run's platform and is resolved per pool).
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
     # truncation; the route slices back to the cap before returning.

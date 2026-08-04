@@ -9,7 +9,7 @@ from typing import Annotated, ClassVar, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel
+from qiita_common.models._base import PatchRequestModel, ReadCounts
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
 
@@ -422,13 +422,14 @@ class IdxsListResponse(BaseModel):
     caller_system_role: SystemRole
 
 
-class SequencedSampleListItem(BaseModel):
+class SequencedSampleListItem(ReadCounts):
     """One active sequenced_sample in a pool- or run-scoped sample list.
 
     Carries the subtype idx, its supertype prep_sample_idx and biosample_idx,
     the sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
-    basename prefix), and the ENA experiment/run plus biosample/ena-sample
-    accessions. Lets a caller fan out per-sample work — the pool host-filter
+    basename prefix), the ENA experiment/run plus biosample/ena-sample
+    accessions, and the sample's four per-stage read counts (`ReadCounts`).
+    Lets a caller fan out per-sample work — the pool host-filter
     fan-out matches each sample's FASTQs by sequenced_pool_item_id, and ENA
     experiment submission needs the biosample's BioSample accession as the
     sample_descriptor — without an N+1 of per-idx GETs. The accession columns
@@ -436,6 +437,10 @@ class SequencedSampleListItem(BaseModel):
     sample property: they parameterize the read mask and are supplied at
     human-filter submission, not carried here.
 
+    The read counts are columns of the SAMPLE, so the list carries them for a
+    sample with no work ticket, and for one masked through the block path whose
+    tickets are block-scoped and span many samples. One pool-scoped call is
+    therefore the pool's whole per-sample read table.
 
     `has_read_mask_ticket` is True when at least one `read-mask` work ticket
     (any state) already exists for the sample's prep_sample_idx. Both list

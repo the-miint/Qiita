@@ -1945,30 +1945,34 @@ def test_ticket_logs_requires_step_index(capsys):
 # ---------------------------------------------------------------------------
 
 
-_TICKET_LIST_RESPONSE = [
-    {
-        "work_ticket_idx": 12,
-        "action_id": "fastq-to-parquet",
-        "action_version": "1.0.0",
-        "originator_principal_idx": 7,
-        "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
-        "action_context": {},
-        "state": "processing",
-        "retry_count": 0,
-        "max_retries": 3,
-        "failure_type": None,
-        "failure_stage": None,
-        "failure_step_name": None,
-        "failure_reason": None,
-        "created_at": "2026-05-20T00:00:00+00:00",
-        "updated_at": "2026-05-20T00:00:01+00:00",
-        "current_step_index": 0,
-        "current_step_name": "convert",
-        "compute_target": "slurm",
-        "slurm_job_id": 4242,
-        "step_state": "running",
-    }
-]
+_TICKET_LIST_RESPONSE = {
+    "tickets": [
+        {
+            "work_ticket_idx": 12,
+            "action_id": "fastq-to-parquet",
+            "action_version": "1.0.0",
+            "originator_principal_idx": 7,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+            "action_context": {},
+            "state": "processing",
+            "retry_count": 0,
+            "max_retries": 3,
+            "failure_type": None,
+            "failure_stage": None,
+            "failure_step_name": None,
+            "failure_reason": None,
+            "created_at": "2026-05-20T00:00:00+00:00",
+            "updated_at": "2026-05-20T00:00:01+00:00",
+            "current_step_index": 0,
+            "current_step_name": "convert",
+            "compute_target": "slurm",
+            "slurm_job_id": 4242,
+            "step_state": "running",
+        }
+    ],
+    "count": 1,
+    "truncated": False,
+}
 
 
 def test_ticket_list_issues_get_with_no_filter_params(monkeypatch):
@@ -2015,6 +2019,36 @@ def test_ticket_list_passes_filter_params(monkeypatch):
         "active": "true",
         "all": "true",
         "limit": "10",
+    }
+
+
+def test_ticket_list_passes_scope_filter_params(monkeypatch):
+    """--sequenced-pool-idx / --prep-sample-idx / --action-id map onto the
+    query params the route reads, under their snake_case names."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LIST_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "list",
+            "--sequenced-pool-idx",
+            "9",
+            "--prep-sample-idx",
+            "55",
+            "--action-id",
+            "read-mask",
+        ]
+    )
+    assert rc == 0
+    assert captured["params"] == {
+        "sequenced_pool_idx": "9",
+        "prep_sample_idx": "55",
+        "action_id": "read-mask",
     }
 
 
