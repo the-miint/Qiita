@@ -367,9 +367,11 @@ async def get_biosample_in_study(
     retirement is evaluated only after the link passes, and a retired biosample
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
-    local_metadata includes the owner-biosample-id row: the ADMIN clamp means
-    any caller who reaches this route is authorized to see it. This route does
-    not write that value.
+    local_metadata includes the owner-biosample-id row, and every caller the
+    gate above admits sees it: an ADMIN-tier study_access row, the study's
+    owner, or a wet_lab_admin+ role, which returns before the tier check runs.
+    The field is pinned to member tier in the schema, but nothing enforces that
+    pin yet, so the gate is what restricts the value. This route does not write it.
 
     The response carries an `ETag` header derived from the row's `updated_at`
     column; the value is a quoted ISO 8601 timestamp and is opaque by contract.

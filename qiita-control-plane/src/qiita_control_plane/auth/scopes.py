@@ -93,8 +93,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
             # Owner-id re-identification export is system_admin-only —
-            # owner-submitted names are member-restricted and can carry
-            # incautiously-entered PII.
+            # owner-submitted names can carry incautiously-entered PII. The
+            # field is pinned to member tier, but nothing enforces that pin
+            # yet, and wet_lab_admin and system_admin reach owner-ids
+            # regardless of tier.
             Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             # Per-pool masked-read export is system_admin-only — the first human
             # masked-read pull, admin-gated until there's a model for picking the

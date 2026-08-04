@@ -2130,13 +2130,16 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
 # ===========================================================================
 
 
-async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx):
+@pytest.mark.parametrize("owns_study", [True, False])
+async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx, owns_study):
     """Tests the case where a study-linked biosample carries both a globally-
     linked metadata value and a purely-local row (the owner-biosample-id): the
     study-scoped GET returns the core row, global_metadata keyed by
     internal_name, and local_metadata keyed by display_name including the
-    owner-id row, with an ETag header. The caller is wet_lab_admin, whose role
-    bypasses the ADMIN tier clamp.
+    owner-id row, with an ETag header. The caller is wet_lab_admin; with
+    owns_study False they hold neither ownership of nor a study_access row on
+    the study, so the role bypass alone admits them and the owner-id row comes
+    back regardless.
     """
     suffix = secrets.token_hex(4)
     internal_name = f"host_subject_id_{suffix}"
@@ -2159,14 +2162,19 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx):
     )
 
     wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="get-in-study")
+    # One knob: who owns the study and the biosample. When that is not the
+    # caller, the wet_lab_admin has no relationship to the study at all.
+    study_owner_idx = wet_idx if owns_study else ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(
+        ctx, owner_idx=study_owner_idx, suffix=f"get-in-study-{owns_study}"
+    )
     owner_field_name = unique_field_name()
 
     post_resp = await _post_biosample(
         ctx["wet"],
         ctx,
         study_idx,
-        owner_idx=wet_idx,
+        owner_idx=study_owner_idx,
         owner_biosample_id_field_name=owner_field_name,
         owner_biosample_id_value="OWNER-ID-1",
         metadata={display_name: "HOST-99"},
@@ -2189,7 +2197,7 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx):
     rj["global_metadata"].pop("host_taxon_id", None)
     expected = {
         "biosample_idx": bs_idx,
-        "owner_idx": wet_idx,
+        "owner_idx": study_owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
@@ -3348,6 +3356,35 @@ async def test_patch_biosample_metadata_unchanged_on_identical_value(ctx):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "results": {name: {"scope": "global", "outcome": "unchanged", "value": "SAME"}}
+    }
+
+
+async def test_patch_biosample_metadata_numeric_reports_stored_form(ctx):
+    """Tests the case where a NUMERIC field is rewritten with a value that is
+    numerically equal to the one already stored. A differing scale carries
+    measurement precision, so it overwrites; a differing notation for the same
+    stored digits does not. Either way the response reports the value in the
+    form it is stored with, not the text the caller sent.
+    """
+    study_idx, bs_idx, global_idx, name = await _seed_linked_biosample_and_global_field(
+        ctx, suffix="patch-scale", data_type=FieldDataType.NUMERIC
+    )
+    first = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "5"})
+    assert first.status_code == 200, first.text
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
+
+    scaled = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "5.0"})
+    assert scaled.status_code == 200, scaled.text
+    assert scaled.json() == {
+        "results": {name: {"scope": "global", "outcome": "updated", "value": "5.0"}}
+    }
+
+    exponent = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "50e-1"})
+    assert exponent.status_code == 200, exponent.text
+    assert exponent.json() == {
+        "results": {name: {"scope": "global", "outcome": "unchanged", "value": "5.0"}}
     }
 
 

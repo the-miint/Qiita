@@ -35,9 +35,11 @@ from .biosample_metadata import (
 )
 
 # Owners' ids for their own samples sometimes inadvertently contain PII, so the
-# owner-biosample-id field is pinned above the study's default tier:
-# even on a public study, only study members may read the owner-id
-# metadata.
+# owner-biosample-id field is pinned above the study's default tier: the intent
+# is that even on a public study, only study members -- plus wet_lab_admin and
+# system_admin callers, who are admitted regardless of tier -- may read the
+# owner-id metadata. That intent is unenforced: no code reads tier_override, and
+# route-level access gates are what actually restrict owner-id reads today.
 OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 
 
@@ -410,8 +412,9 @@ async def import_biosample_from_owner_biosample_id(
 
     # tier_override pins the field to member tier: the owner's sample name
     # is theirs to see, but restricted to study members because sample
-    # names sometimes carry incautiously-entered PII. (Tier enforcement is
-    # not yet built — see docs/architecture.md.)
+    # names sometimes carry incautiously-entered PII. wet_lab_admin and
+    # system_admin callers are admitted regardless of tier. (Tier
+    # enforcement is not yet built — see docs/architecture.md.)
     (
         field_idx,
         field_created,

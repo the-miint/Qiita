@@ -322,6 +322,25 @@ class TransientWriteRaceError(Exception):
         )
 
 
+def _pg_numeric_text(value: Decimal) -> str:
+    """Render a Decimal in the exact text form an unconstrained Postgres
+    NUMERIC column stores it as.
+
+    Postgres expands exponent notation into plain digits and keeps whatever
+    scale those digits carry, so fixed-point formatting matches it — except
+    that every NaN flavour collapses to one, and a negative zero loses its
+    sign while keeping its scale.
+    """
+    # Quiet, signalling, and signed NaN all store as the one unsigned form.
+    if value.is_nan():
+        return "NaN"
+    text = format(value, "f")
+    # is_zero rather than == 0: a signalling NaN raises on comparison.
+    if value.is_signed() and value.is_zero():
+        return text.lstrip("-")
+    return text
+
+
 def parse_text_for_data_type(
     field_key: str,
     data_type: FieldDataType,
@@ -330,11 +349,13 @@ def parse_text_for_data_type(
     """Coerce a text input into the Python type matching data_type.
 
     Outer whitespace is stripped before parsing. TEXT returns the stripped
-    string; NUMERIC returns Decimal; DATE returns datetime.date; BOOLEAN
-    accepts only the two boolean texts, case-insensitively. TERMINOLOGY has no
-    text coercion — its value is a terminology-term lookup — and raises
-    NotImplementedError. Conversion failures raise MetadataParseError carrying
-    field_key, data_type, raw text, and reason.
+    string; NUMERIC returns a Decimal in the representation Postgres stores,
+    so the value written, compared, and reported back are one and the same
+    form; DATE returns datetime.date; BOOLEAN accepts only the two boolean
+    texts, case-insensitively. TERMINOLOGY has no text coercion — its value is
+    a terminology-term lookup — and raises NotImplementedError. Conversion
+    failures raise MetadataParseError carrying field_key, data_type, raw text,
+    and reason.
     """
     # Normalize once; all parse arms see the stripped value.
     stripped = text_value.strip()
@@ -342,7 +363,7 @@ def parse_text_for_data_type(
         return stripped
     if data_type is FieldDataType.NUMERIC:
         try:
-            return Decimal(stripped)
+            parsed_decimal = Decimal(stripped)
         except InvalidOperation as exc:
             raise MetadataParseError(
                 field_key=field_key,
@@ -350,6 +371,10 @@ def parse_text_for_data_type(
                 text_value=text_value,
                 reason="not a valid decimal number",
             ) from exc
+        # Adopt the stored representation here, so no later step has to know
+        # which of the two forms it is holding.
+        stored_form = _pg_numeric_text(parsed_decimal)
+        return Decimal(stored_form)
     if data_type is FieldDataType.DATE:
         try:
             return date.fromisoformat(stripped)
@@ -923,7 +948,9 @@ def _compare_slot_occupant(
     - "same" / "different" — both sides typed (incl. terminology-term-idx
       equality), or both missing-reason; discriminator is value equality
       (scalar equality, terminology-term idx equality, or missing-reason
-      idx equality).
+      idx equality). A NUMERIC slot is the exception: it discriminates on
+      the stored representation, so a rewrite differing only in scale is
+      "different".
     - "occupied_by_missing" — slot holds missing-reason; attempted is typed
       or terminology-term.
     - "occupied_by_typed" — slot holds typed (incl. terminology-term);
@@ -953,9 +980,20 @@ def _compare_slot_occupant(
     if attempted_is_missing:
         return "occupied_by_typed"
 
-    # Both sides typed (or both terminology-term-idx); equality is
-    # well-defined on the comparable scalar.
-    return "same" if existing_row[value_column] == attempted_comparable else "different"
+    # Both sides typed (or both terminology-term-idx). A NUMERIC slot
+    # discriminates on the stored representation: scale carries measurement
+    # precision, so a 5.0-over-5 rewrite is a real change that numeric equality
+    # would call identical. Both sides already hold the stored form, which also
+    # makes NaN compare equal to NaN as the database does. Every other type has
+    # one representation per value, so equality is the whole story.
+    existing_comparable = existing_row[value_column]
+    if isinstance(attempted_comparable, Decimal):
+        stored_matches = _pg_numeric_text(existing_comparable) == _pg_numeric_text(
+            attempted_comparable
+        )
+    else:
+        stored_matches = existing_comparable == attempted_comparable
+    return "same" if stored_matches else "different"
 
 
 async def _fetch_slot_occupant(

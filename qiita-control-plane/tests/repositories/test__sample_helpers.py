@@ -1700,6 +1700,36 @@ def test_parse_text_for_data_type_returns_expected(data_type, text_value, expect
 
 
 @pytest.mark.parametrize(
+    "text_value, expected_stored_text",
+    [
+        ("5", "5"),
+        ("5.0", "5.0"),
+        ("5.000", "5.000"),
+        ("1e3", "1000"),
+        ("1.5E+1", "15"),
+        ("1.5E-1", "0.15"),
+        ("-0", "0"),
+        ("-0.00", "0.00"),
+        ("NaN", "NaN"),
+        ("-NaN", "NaN"),
+        ("sNaN", "NaN"),
+        ("Infinity", "Infinity"),
+        ("-Infinity", "-Infinity"),
+    ],
+)
+def test_parse_text_for_data_type_numeric_canonicalizes(text_value, expected_stored_text):
+    """Tests the case where NUMERIC text arrives in a form the database
+    normalizes on input: the parsed Decimal already carries the stored
+    representation, so exponent notation resolves to plain digits, every NaN
+    flavour collapses to one, and a negative zero drops its sign while keeping
+    its scale. Asserted on the rendered text because Decimal equality ignores
+    scale and reports two representations of one number as equal.
+    """
+    parsed = parse_text_for_data_type("field_x", FieldDataType.NUMERIC, text_value)
+    assert format(parsed, "f") == expected_stored_text
+
+
+@pytest.mark.parametrize(
     "data_type, text_value",
     [
         (FieldDataType.NUMERIC, "abc"),
@@ -4971,6 +5001,64 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
             value="v2",
         )
     ]
+
+
+@pytest.mark.parametrize(
+    "first_text, second_text, expected_outcome, expected_stored_text",
+    [
+        ("5", "5.0", FieldWriteOutcome.UPDATED, "5.0"),
+        ("5", "5.000", FieldWriteOutcome.UPDATED, "5.000"),
+        ("5.0", "5.0", FieldWriteOutcome.UNCHANGED, "5.0"),
+        ("1000", "1e3", FieldWriteOutcome.UNCHANGED, "1000"),
+        ("0", "-0", FieldWriteOutcome.UNCHANGED, "0"),
+        ("NaN", "NaN", FieldWriteOutcome.UNCHANGED, "NaN"),
+    ],
+)
+async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
+    ctx, first_text, second_text, expected_outcome, expected_stored_text
+):
+    """Tests the case where a NUMERIC field is rewritten with a value that is
+    numerically equal to the one already in the slot but written differently.
+    A differing scale carries measurement precision, so it counts as a change
+    and overwrites; a form the database normalizes to what is already stored
+    (exponent notation, a negative zero, a repeated NaN) counts as no change
+    and leaves the row untouched. Every case reports the stored form, and a
+    repeat of the same request converges rather than rewriting forever.
+    """
+    entity_idx = await _create_biosample_with_link(ctx)
+    gf_row = await _seed_global_field_for_spec(ctx, BIOSAMPLE_METADATA_SPEC, FieldDataType.NUMERIC)
+
+    # Each write commits in its own transaction so the second collides with
+    # the persisted slot rather than joining the first write's transaction.
+    async def _upsert(value):
+        async with ctx["pool"].acquire() as conn, conn.transaction():
+            return await write_sample_metadata(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=entity_idx,
+                study_idx=ctx["study_idx"],
+                metadata={gf_row.display_name: value},
+                caller_idx=ctx["principal_idx"],
+                allow_local=False,
+                on_conflict="upsert",
+            )
+
+    await _upsert(first_text)
+    second = await _upsert(second_text)
+    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
+
+    # The result is compared with its value rendered rather than as a Decimal:
+    # Decimal equality cannot see scale, and NaN is not even equal to itself,
+    # so a direct comparison would pass the scale cases and fail the NaN one
+    # for reasons unrelated to what is being tested.
+    rendered = [(r.field_key, r.scope, r.outcome, format(r.value, "f")) for r in second]
+    assert rendered == [(gf_row.display_name, "global", expected_outcome, expected_stored_text)]
+
+    stored_text = await ctx["pool"].fetchval(
+        "SELECT value_numeric::text FROM qiita.biosample_metadata WHERE biosample_idx = $1",
+        entity_idx,
+    )
+    assert stored_text == expected_stored_text
 
 
 async def test_write_sample_metadata_global_internal_names_echoes_caller_key(ctx):

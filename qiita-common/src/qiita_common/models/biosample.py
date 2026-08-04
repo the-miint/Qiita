@@ -333,7 +333,9 @@ class StudyScopedBiosampleResponse(BiosampleResponse):
 class MetadataFieldWriteResult(BaseModel):
     """What a metadata write did to one field's slot: whether the field
     resolved globally-linked or purely-local, the write outcome, and the value
-    that now occupies the slot. Reported per field by the metadata write route.
+    that now occupies the slot. A numeric value comes back in the form it is
+    stored as, which keeps the caller's scale but resolves exponent notation
+    into plain digits. Reported per field by the metadata write route.
     """
 
     scope: MetadataFieldScope

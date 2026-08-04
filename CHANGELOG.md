@@ -305,6 +305,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A numeric metadata write reports the value as it is stored, and a change of
+  scale counts as a change (#386).** A NUMERIC value is now parsed into the
+  representation the database stores, so the value written, the value compared
+  against an occupied slot, and the value reported back are one and the same
+  form — a caller sending `1e3` gets `1000` back rather than a form the row does
+  not hold. Occupied-slot comparison for NUMERIC follows the stored
+  representation rather than numeric equality, so rewriting `5` as `5.0`
+  preserves the added precision instead of being reported as an unchanged no-op,
+  while a notation that resolves to what is already stored still reports
+  unchanged and writes nothing. Repeated `NaN` writes now report unchanged too,
+  matching how the database compares them.
 - **Metadata values can no longer be overwritten through a retired study link
   (#386).** The non-retired-link invariant on `biosample_metadata` /
   `prep_sample_metadata` was enforced only on INSERT, which was equivalent to
