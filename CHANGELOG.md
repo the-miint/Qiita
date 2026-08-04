@@ -1135,6 +1135,16 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **The `host_filter` rype threshold is 0.05, up from 0.0.** rype emits a row per
+  bucket scoring at or above the threshold and `host_filter` calls host on any
+  emitted row, so this value *is* the host call. At 0.0 a single incidental
+  minimizer match masked a read; 0.05 still sits below rype's own 0.1 default, so
+  host depletion stays deliberately aggressive relative to upstream. Applies to
+  every read set — the threshold has no per-platform or per-mask variant — and
+  shifts reads scoring in [0.0, 0.05) from `host_rype` to their `qc_mask` reason
+  (`pass` for a QC-pass read), which makes them visible through `read_masked`. The
+  second host stage (minimap2 on rype's survivors) is unchanged.
+
 - **`BaselineResources.as_flat()` is now the single narrowing of the flat
   population (#416).** The runner's dispatch path and the new headroom queries
   both resolve through it instead of each re-asserting the three Optional fields
