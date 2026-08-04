@@ -457,6 +457,7 @@ async def _seed_global_field_for_spec(
         data_type=data_type,
         terminology_idx=terminology_idx,
         global_field_idx=gf_idx,
+        internal_name=internal_name,
     )
 
 

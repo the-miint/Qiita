@@ -109,6 +109,7 @@ from qiita_common.models.biosample import (
     StudyLookupByAccessionResponse,
     StudyScopedBiosampleResponse,
     TerminologyTermRef,
+    derive_metadata_field_scope,
 )
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
@@ -355,6 +356,7 @@ __all__ = [
     # Step wire contract.
     "AlignmentDoGetTicketRequest",
     "ReadDoGetTicketRequest",
+    "derive_metadata_field_scope",
     "DoGetTicketRequest",
     "DoGetTicketResponse",
     "FoundJobWire",

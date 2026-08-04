@@ -1928,6 +1928,7 @@ async def test_fetch_global_fields_by_keys_returns_matching(
             data_type=FieldDataType.TEXT,
             terminology_idx=None,
             global_field_idx=idx_a,
+            internal_name=f"tfa_{suffix}",
         ),
         name_b: FieldRow(
             idx=idx_b,
@@ -1935,6 +1936,7 @@ async def test_fetch_global_fields_by_keys_returns_matching(
             data_type=FieldDataType.NUMERIC,
             terminology_idx=None,
             global_field_idx=idx_b,
+            internal_name=f"tfb_{suffix}",
         ),
     }
     assert result == expected
@@ -1973,6 +1975,7 @@ async def test_fetch_global_fields_by_keys_omits_unknown(ctx, spec, seed_global_
             data_type=FieldDataType.TEXT,
             terminology_idx=None,
             global_field_idx=idx,
+            internal_name=f"kf_{suffix}",
         ),
     }
     assert result == expected
@@ -2032,9 +2035,10 @@ async def test_global_field_display_name_unique(ctx, seed_global_field, created_
 async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx, spec):
     """Tests the case where a study carries both a purely-local study field
     and a globally-linked one: the fetch returns each as a FieldRow, with
-    global_field_idx None for the local field and the FK for the linked one,
-    the linked row's inherited data_type resolved via the global field, and
-    unknown names omitted.
+    global_field_idx and internal_name None for the local field and the FK plus
+    the linked global's internal_name for the linked one, the linked row's
+    inherited data_type resolved via the global field, and unknown names
+    omitted.
     """
     study_idx = ctx["study_idx"]
     created_by = ctx["principal_idx"]
@@ -2082,6 +2086,7 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
             data_type=FieldDataType.NUMERIC,
             terminology_idx=None,
             global_field_idx=None,
+            internal_name=None,
         ),
         linked_name: FieldRow(
             idx=linked_idx,
@@ -2089,6 +2094,7 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
             data_type=FieldDataType.DATE,
             terminology_idx=None,
             global_field_idx=global_field.idx,
+            internal_name=global_field.internal_name,
         ),
     }
     assert result == expected
@@ -3458,12 +3464,12 @@ def _global_resolved(field_row, *, caller_key=None, study_field_idx=None):
     """
     return ResolvedField(
         caller_key=caller_key if caller_key is not None else field_row.display_name,
-        scope="global",
         global_field_idx=field_row.global_field_idx,
         study_field_idx=study_field_idx,
         canonical_display=field_row.display_name,
         data_type=field_row.data_type,
         terminology_idx=field_row.terminology_idx,
+        internal_name=field_row.internal_name,
     )
 
 
@@ -3474,12 +3480,12 @@ def _local_resolved(field_row, *, caller_key=None):
     """
     return ResolvedField(
         caller_key=caller_key if caller_key is not None else field_row.display_name,
-        scope="local",
         global_field_idx=None,
         study_field_idx=field_row.idx,
         canonical_display=field_row.display_name,
         data_type=field_row.data_type,
         terminology_idx=field_row.terminology_idx,
+        internal_name=None,
     )
 
 
@@ -3685,15 +3691,15 @@ async def test_write_resolved_metadata_entries_writes_each_entry(ctx, spec):
     assert results == [
         SampleMetadataFieldResult(
             field_key=gf_first.display_name,
-            scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="alpha",
+            internal_name=gf_first.internal_name,
         ),
         SampleMetadataFieldResult(
             field_key=gf_second.display_name,
-            scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="beta",
+            internal_name=gf_second.internal_name,
         ),
     ]
 
@@ -3939,6 +3945,7 @@ async def test_preflight_sample_metadata_allow_local_partitions_global_and_local
         data_type=FieldDataType.NUMERIC,
         terminology_idx=None,
         global_field_idx=None,
+        internal_name=None,
     )
     assert resolved == [
         (_global_resolved(gf_row), "hi"),
@@ -4014,6 +4021,7 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
         data_type=FieldDataType.TEXT,
         terminology_idx=None,
         global_field_idx=gf_row.idx,
+        internal_name=gf_row.internal_name,
     )
     assert resolved == [(_global_resolved(alias_row, study_field_idx=alias_idx), "hello")]
 
@@ -4148,6 +4156,7 @@ async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, 
         data_type=FieldDataType.NUMERIC,
         terminology_idx=None,
         global_field_idx=None,
+        internal_name=None,
     )
     assert resolved == [
         (_local_resolved(local_field_row), MissingReasonRef(idx=reason_idx, name=reason_name))
@@ -4348,6 +4357,7 @@ async def test_preflight_sample_metadata_global_internal_names_falls_through_to_
         data_type=FieldDataType.NUMERIC,
         terminology_idx=None,
         global_field_idx=None,
+        internal_name=None,
     )
     assert resolved == [
         (_global_resolved(gf_row, caller_key=internal_name), "hi"),
@@ -4433,6 +4443,7 @@ async def test_preflight_sample_metadata_global_internal_names_suppresses_shadow
         data_type=FieldDataType.TEXT,
         terminology_idx=None,
         global_field_idx=gf_other.idx,
+        internal_name=gf_other.internal_name,
     )
     async with ctx["pool"].acquire() as conn:
         resolved_display = await preflight_sample_metadata(
@@ -4519,6 +4530,7 @@ async def test_write_resolved_metadata_entries_persists_local(ctx):
         data_type=FieldDataType.TEXT,
         terminology_idx=None,
         global_field_idx=None,
+        internal_name=None,
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
         results = await write_resolved_metadata_entries(
@@ -4534,9 +4546,9 @@ async def test_write_resolved_metadata_entries_persists_local(ctx):
     assert results == [
         SampleMetadataFieldResult(
             field_key=local_name,
-            scope="local",
             outcome=FieldWriteOutcome.INSERTED,
             value="hello",
+            internal_name=None,
         )
     ]
 
@@ -4964,15 +4976,15 @@ async def test_write_sample_metadata_writes_global_and_local(ctx):
     assert results == [
         SampleMetadataFieldResult(
             field_key=gf_row.display_name,
-            scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="g",
+            internal_name=gf_row.internal_name,
         ),
         SampleMetadataFieldResult(
             field_key=local_name,
-            scope="local",
             outcome=FieldWriteOutcome.INSERTED,
             value="l",
+            internal_name=None,
         ),
     ]
 
@@ -5021,25 +5033,25 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
     assert inserted == [
         SampleMetadataFieldResult(
             field_key=gf_row.display_name,
-            scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="v1",
+            internal_name=gf_row.internal_name,
         )
     ]
     assert updated == [
         SampleMetadataFieldResult(
             field_key=gf_row.display_name,
-            scope="global",
             outcome=FieldWriteOutcome.UPDATED,
             value="v2",
+            internal_name=gf_row.internal_name,
         )
     ]
     assert unchanged == [
         SampleMetadataFieldResult(
             field_key=gf_row.display_name,
-            scope="global",
             outcome=FieldWriteOutcome.UNCHANGED,
             value="v2",
+            internal_name=gf_row.internal_name,
         )
     ]
 
@@ -5137,9 +5149,9 @@ async def test_write_sample_metadata_global_internal_names_echoes_caller_key(ctx
     assert results == [
         SampleMetadataFieldResult(
             field_key=internal_name,
-            scope="global",
             outcome=FieldWriteOutcome.INSERTED,
             value="hello",
+            internal_name=internal_name,
         )
     ]
 

@@ -673,12 +673,15 @@ async def patch_sequenced_sample_metadata(
     is a 409 (its metadata cannot be written), checked only after the link
     passes.
 
-    The body maps field display_name -> text value against the study's existing
-    global or study-local prep_sample fields and upserts each (unknown fields
+    The body maps field display_name -> text value -- or global internal_name ->
+    text value when it sets global_internal_names, which leaves study-local
+    fields display-name-keyed. Each key resolves against the study's existing
+    global or study-local prep_sample fields and is upserted (unknown fields
     -> 422, an empty body -> 422 at the wire boundary, a cross-study global slot
     collision -> 409). The response reports per field, in input order, whether it
     resolved global or local, the write outcome (inserted / updated / unchanged),
-    and the value now in the slot.
+    the value now in the slot, and the internal_name a globally linked value
+    reads back under.
 
     There is NO If-Match on this route: a concurrent same-study, same-field
     write is last-writer-wins (a silent lost update). The per-slot upsert is
@@ -710,6 +713,7 @@ async def patch_sequenced_sample_metadata(
             study_idx=study_idx,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
+            global_internal_names=body.global_internal_names,
         )
     return response
 

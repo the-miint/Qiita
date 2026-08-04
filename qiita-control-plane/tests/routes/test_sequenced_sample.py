@@ -3706,13 +3706,22 @@ async def test_get_sequenced_sample_in_study_retired_404(ctx):
 # ===========================================================================
 
 
-async def _patch_sequenced_metadata(client, study_idx, sequenced_sample_idx, metadata):
-    """PATCH the study-scoped sequenced-sample metadata route with a metadata dict."""
+async def _patch_sequenced_metadata(
+    client, study_idx, sequenced_sample_idx, metadata, *, global_internal_names=None
+):
+    """PATCH the study-scoped sequenced-sample metadata route with a metadata dict.
+
+    global_internal_names None omits the flag from the body, exercising the
+    route's own default rather than restating it.
+    """
+    body = {"metadata": metadata}
+    if global_internal_names is not None:
+        body["global_internal_names"] = global_internal_names
     return await client.patch(
         URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY.format(
             study_idx=study_idx, sequenced_sample_idx=sequenced_sample_idx
         ),
-        json={"metadata": metadata},
+        json=body,
     )
 
 
@@ -3727,27 +3736,35 @@ async def _track_prep_sample_metadata(ctx, prep_sample_idx):
 
 
 async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.TEXT):
-    """Seed one prep_sample global field; track it. Returns (global_field_idx, display_name)."""
+    """Seed one prep_sample global field; track it.
+
+    Returns (global_field_idx, display_name, internal_name). The two names are
+    deliberately distinct spellings, matching every global field the migrations
+    seed.
+    """
     token = secrets.token_hex(4)
     display_name = f"Field {token}"
+    internal_name = f"field_{token}"
     global_idx = await seed_prep_sample_global_field(
         ctx["pool"],
-        internal_name=f"field_{token}",
+        internal_name=internal_name,
         display_name=display_name,
         data_type=data_type,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
     ctx["created"]["prep_sample_global_field"].append(global_idx)
-    return global_idx, display_name
+    return global_idx, display_name, internal_name
 
 
 async def test_patch_sequenced_sample_metadata_inserts_global_and_local(ctx):
     """Tests the case where a wet_lab_admin upserts one globally-linked value and
     one purely-local value on a sequenced_sample's prep_sample: both are
-    INSERTED, reported per field in input order with scope and stored value.
+    INSERTED, reported per field in input order with scope, stored value, and the
+    internal_name each reads back under -- populated for the global field, None
+    for the local one.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-ins")
-    _global_idx, global_name = await _seed_prep_global_field(ctx)
+    _global_idx, global_name, global_internal = await _seed_prep_global_field(ctx)
     local_name = f"Local {secrets.token_hex(4)}"
     await seed_local_study_field(
         ctx["pool"],
@@ -3769,8 +3786,18 @@ async def test_patch_sequenced_sample_metadata_inserts_global_and_local(ctx):
     rj = resp.json()
     expected = {
         "results": {
-            global_name: {"scope": "global", "outcome": "inserted", "value": "GVAL"},
-            local_name: {"scope": "local", "outcome": "inserted", "value": "LVAL"},
+            global_name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "GVAL",
+                "internal_name": global_internal,
+            },
+            local_name: {
+                "scope": "local",
+                "outcome": "inserted",
+                "value": "LVAL",
+                "internal_name": None,
+            },
         }
     }
     assert rj == expected
@@ -3783,7 +3810,7 @@ async def test_patch_sequenced_sample_metadata_updates_existing_value(ctx):
     overwrites in place: the outcome is UPDATED and the new value is stored.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-upd")
-    _global_idx, name = await _seed_prep_global_field(ctx)
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
     first = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V1"}
     )
@@ -3795,7 +3822,14 @@ async def test_patch_sequenced_sample_metadata_updates_existing_value(ctx):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
-        "results": {name: {"scope": "global", "outcome": "updated", "value": "V2"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "updated",
+                "value": "V2",
+                "internal_name": internal_name,
+            }
+        }
     }
 
 
@@ -3804,7 +3838,7 @@ async def test_patch_sequenced_sample_metadata_unchanged_on_identical_value(ctx)
     outcome is UNCHANGED and nothing is modified.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-unch")
-    _global_idx, name = await _seed_prep_global_field(ctx)
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
     first = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
     )
@@ -3816,8 +3850,86 @@ async def test_patch_sequenced_sample_metadata_unchanged_on_identical_value(ctx)
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
-        "results": {name: {"scope": "global", "outcome": "unchanged", "value": "SAME"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "unchanged",
+                "value": "SAME",
+                "internal_name": internal_name,
+            }
+        }
     }
+
+
+async def test_patch_sequenced_sample_metadata_internal_name_is_the_read_key(ctx):
+    """Tests the case where a caller writes a global field by display_name and
+    then reads the sequenced_sample back: the reported internal_name is the key
+    global_metadata carries, while the display_name the caller sent appears in
+    neither metadata map.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-roundtrip")
+    _global_idx, global_name, global_internal = await _seed_prep_global_field(ctx)
+
+    written = await _patch_sequenced_metadata(
+        ctx["wet"],
+        seeded["study_idx"],
+        seeded["sequenced_sample_idx"],
+        {global_name: "GVAL"},
+    )
+    assert written.status_code == 200, written.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+
+    read = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert read.status_code == 200, read.text
+
+    read_body = read.json()
+    assert written.json()["results"][global_name]["internal_name"] == global_internal
+    assert read_body["global_metadata"][global_internal]["value"] == "GVAL"
+    assert global_name not in read_body["global_metadata"]
+    assert global_name not in read_body["local_metadata"]
+
+
+async def test_patch_sequenced_sample_metadata_internal_name_keying_round_trips(ctx):
+    """Tests the case where the body sets global_internal_names and keys a global
+    prep_sample field on its internal_name: the key the caller sent is the key
+    global_metadata carries, so the sent and read keys match.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-intname")
+    _global_idx, global_name, global_internal = await _seed_prep_global_field(ctx)
+
+    written = await _patch_sequenced_metadata(
+        ctx["wet"],
+        seeded["study_idx"],
+        seeded["sequenced_sample_idx"],
+        {global_internal: "IVAL"},
+        global_internal_names=True,
+    )
+    assert written.status_code == 200, written.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+    assert written.json() == {
+        "results": {
+            global_internal: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "IVAL",
+                "internal_name": global_internal,
+            }
+        }
+    }
+
+    read = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert read.status_code == 200, read.text
+    read_body = read.json()
+    assert read_body["global_metadata"][global_internal]["value"] == "IVAL"
+    assert global_name not in read_body["global_metadata"]
 
 
 async def test_patch_sequenced_sample_metadata_unknown_field_422(ctx):
@@ -3837,7 +3949,9 @@ async def test_patch_sequenced_sample_metadata_parse_422(ctx):
     a non-numeric text for a NUMERIC field is a 422.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-parse")
-    _global_idx, name = await _seed_prep_global_field(ctx, data_type=FieldDataType.NUMERIC)
+    _global_idx, name, _internal_name = await _seed_prep_global_field(
+        ctx, data_type=FieldDataType.NUMERIC
+    )
     resp = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "not-a-number"}
     )
@@ -3875,7 +3989,7 @@ async def test_patch_sequenced_sample_metadata_foreign_study_409(ctx):
     assert post.status_code == 201, post.text
     ss_idx = post.json()["sequenced_sample_idx"]
     prep_idx = post.json()["prep_sample_idx"]
-    _global_idx, name = await _seed_prep_global_field(ctx)
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
 
     # Study A writes the global value first (contributing study = A).
     first = await _patch_sequenced_metadata(ctx["wet"], study_a, ss_idx, {name: "VAL-A"})
@@ -4012,7 +4126,7 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
     INSERTED.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-admin")
-    _global_idx, name = await _seed_prep_global_field(ctx)
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
     await _grant_study_access(
         ctx,
         study_idx=seeded["study_idx"],
@@ -4026,5 +4140,12 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
     assert resp.status_code == 200, resp.text
     await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     assert resp.json() == {
-        "results": {name: {"scope": "global", "outcome": "inserted", "value": "AVAL"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "AVAL",
+                "internal_name": internal_name,
+            }
+        }
     }

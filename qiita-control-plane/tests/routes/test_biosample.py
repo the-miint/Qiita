@@ -3271,43 +3271,60 @@ async def test_create_biosample_field_linked_with_data_type_422(ctx):
 # ===========================================================================
 
 
-async def _patch_biosample_metadata(client, study_idx, biosample_idx, metadata):
-    """PATCH the study-scoped biosample metadata route with a metadata dict."""
+async def _patch_biosample_metadata(
+    client, study_idx, biosample_idx, metadata, *, global_internal_names=None
+):
+    """PATCH the study-scoped biosample metadata route with a metadata dict.
+
+    global_internal_names None omits the flag from the body, exercising the
+    route's own default rather than restating it.
+    """
+    body = {"metadata": metadata}
+    if global_internal_names is not None:
+        body["global_internal_names"] = global_internal_names
     return await client.patch(
         URL_BIOSAMPLE_METADATA_BY_STUDY.format(study_idx=study_idx, biosample_idx=biosample_idx),
-        json={"metadata": metadata},
+        json=body,
     )
 
 
 async def _seed_linked_biosample_and_global_field(ctx, *, suffix, data_type=FieldDataType.TEXT):
     """Seed a wet-owned study, a biosample linked to it, and one global field.
 
-    Returns (study_idx, biosample_idx, global_field_idx, display_name).
+    Returns (study_idx, biosample_idx, global_field_idx, display_name,
+    internal_name). The two names are deliberately distinct spellings, matching
+    every global field the migrations seed.
     """
     wet_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=suffix)
     bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
     token = secrets.token_hex(4)
     display_name = f"Field {token}"
+    internal_name = f"field_{token}"
     global_idx = await seed_biosample_global_field(
         ctx["pool"],
-        internal_name=f"field_{token}",
+        internal_name=internal_name,
         display_name=display_name,
         data_type=data_type,
         created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
-    return study_idx, bs_idx, global_idx, display_name
+    return study_idx, bs_idx, global_idx, display_name, internal_name
 
 
 async def test_patch_biosample_metadata_inserts_global_and_local(ctx):
     """Tests the case where a wet_lab_admin upserts one globally-linked value and
     one purely-local value: both are INSERTED, reported per field in input order
-    with their resolved scope and stored value.
+    with their resolved scope, stored value, and the internal_name each reads
+    back under -- populated for the global field, None for the local one.
     """
-    study_idx, bs_idx, global_idx, global_name = await _seed_linked_biosample_and_global_field(
-        ctx, suffix="patch-ins"
-    )
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        global_name,
+        global_internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-ins")
     local_name = f"Local {secrets.token_hex(4)}"
     local_field_idx = await seed_local_study_field(
         ctx["pool"],
@@ -3329,8 +3346,18 @@ async def test_patch_biosample_metadata_inserts_global_and_local(ctx):
     rj = resp.json()
     expected = {
         "results": {
-            global_name: {"scope": "global", "outcome": "inserted", "value": "GVAL"},
-            local_name: {"scope": "local", "outcome": "inserted", "value": "LVAL"},
+            global_name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "GVAL",
+                "internal_name": global_internal,
+            },
+            local_name: {
+                "scope": "local",
+                "outcome": "inserted",
+                "value": "LVAL",
+                "internal_name": None,
+            },
         }
     }
     assert rj == expected
@@ -3342,9 +3369,13 @@ async def test_patch_biosample_metadata_updates_existing_value(ctx):
     """Tests the case where a second write to the same field with a new value
     overwrites in place: the outcome is UPDATED and the new value is stored.
     """
-    study_idx, bs_idx, global_idx, name = await _seed_linked_biosample_and_global_field(
-        ctx, suffix="patch-upd"
-    )
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        name,
+        internal_name,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-upd")
     first = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "V1"})
     assert first.status_code == 200, first.text
     await track_biosample_metadata_outputs(
@@ -3354,7 +3385,14 @@ async def test_patch_biosample_metadata_updates_existing_value(ctx):
     resp = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "V2"})
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
-        "results": {name: {"scope": "global", "outcome": "updated", "value": "V2"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "updated",
+                "value": "V2",
+                "internal_name": internal_name,
+            }
+        }
     }
 
 
@@ -3362,9 +3400,13 @@ async def test_patch_biosample_metadata_unchanged_on_identical_value(ctx):
     """Tests the case where a field is rewritten with its current value: the
     outcome is UNCHANGED and nothing is modified.
     """
-    study_idx, bs_idx, global_idx, name = await _seed_linked_biosample_and_global_field(
-        ctx, suffix="patch-unch"
-    )
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        name,
+        internal_name,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-unch")
     first = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "SAME"})
     assert first.status_code == 200, first.text
     await track_biosample_metadata_outputs(
@@ -3374,7 +3416,14 @@ async def test_patch_biosample_metadata_unchanged_on_identical_value(ctx):
     resp = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "SAME"})
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
-        "results": {name: {"scope": "global", "outcome": "unchanged", "value": "SAME"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "unchanged",
+                "value": "SAME",
+                "internal_name": internal_name,
+            }
+        }
     }
 
 
@@ -3385,7 +3434,13 @@ async def test_patch_biosample_metadata_numeric_reports_stored_form(ctx):
     stored digits does not. Either way the response reports the value in the
     form it is stored with, not the text the caller sent.
     """
-    study_idx, bs_idx, global_idx, name = await _seed_linked_biosample_and_global_field(
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        name,
+        internal_name,
+    ) = await _seed_linked_biosample_and_global_field(
         ctx, suffix="patch-scale", data_type=FieldDataType.NUMERIC
     )
     first = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "5"})
@@ -3397,14 +3452,240 @@ async def test_patch_biosample_metadata_numeric_reports_stored_form(ctx):
     scaled = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "5.0"})
     assert scaled.status_code == 200, scaled.text
     assert scaled.json() == {
-        "results": {name: {"scope": "global", "outcome": "updated", "value": "5.0"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "updated",
+                "value": "5.0",
+                "internal_name": internal_name,
+            }
+        }
     }
 
     exponent = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "50e-1"})
     assert exponent.status_code == 200, exponent.text
     assert exponent.json() == {
-        "results": {name: {"scope": "global", "outcome": "unchanged", "value": "5.0"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "unchanged",
+                "value": "5.0",
+                "internal_name": internal_name,
+            }
+        }
     }
+
+
+async def test_patch_biosample_metadata_internal_name_is_the_read_key(ctx):
+    """Tests the case where a caller writes a global field by display_name and
+    then reads the biosample back: the reported internal_name is the key
+    global_metadata carries, while the display_name the caller sent appears in
+    neither metadata map. A purely-local value reports no internal_name and does
+    read back under the key it was sent with.
+    """
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        global_name,
+        global_internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-roundtrip")
+    local_name = f"Local {secrets.token_hex(4)}"
+    local_field_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=local_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(local_field_idx)
+
+    written = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {global_name: "GVAL", local_name: "LVAL"}
+    )
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
+
+    read = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert read.status_code == 200, read.text
+
+    # Each result's internal_name (or the sent key, when it is None) names the
+    # map entry the value came back under.
+    results = written.json()["results"]
+    read_body = read.json()
+    assert results[global_name]["internal_name"] == global_internal
+    assert read_body["global_metadata"][global_internal]["value"] == "GVAL"
+    assert global_name not in read_body["global_metadata"]
+    assert global_name not in read_body["local_metadata"]
+    assert results[local_name]["internal_name"] is None
+    assert read_body["local_metadata"][local_name]["value"] == "LVAL"
+
+
+async def test_patch_biosample_metadata_alias_reports_global_internal_name(ctx):
+    """Tests the case where the written key resolves through a study-local alias
+    of a global field: the write lands in the global slot, so the result reports
+    the alias's target global internal_name rather than the alias display_name,
+    and the value reads back under that internal_name.
+    """
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        global_name,
+        global_internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-alias")
+    alias_name = f"Alias {secrets.token_hex(4)}"
+    created_field = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": alias_name, "biosample_global_field_idx": global_idx},
+    )
+    assert created_field.status_code == 201, created_field.text
+    ctx["created"]["biosample_study_field"].append(
+        created_field.json()["biosample_study_field_idx"]
+    )
+
+    written = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {alias_name: "AVAL"})
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
+    assert written.json() == {
+        "results": {
+            alias_name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "AVAL",
+                "internal_name": global_internal,
+            }
+        }
+    }
+
+    read = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert read.status_code == 200, read.text
+    read_body = read.json()
+    assert read_body["global_metadata"][global_internal]["value"] == "AVAL"
+    assert alias_name not in read_body["local_metadata"]
+    # The global field's own display_name was never written, so it is not a key
+    # either -- the alias spelling and the canonical label are both absent.
+    assert global_name not in read_body["global_metadata"]
+
+
+async def test_patch_biosample_metadata_internal_name_keying_round_trips(ctx):
+    """Tests the case where the body sets global_internal_names and keys a global
+    field on its internal_name: the write resolves global, and the key the caller
+    sent is the key global_metadata carries, so the sent and read keys match.
+    """
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        global_name,
+        global_internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-intname")
+
+    written = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {global_internal: "IVAL"}, global_internal_names=True
+    )
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
+    assert written.json() == {
+        "results": {
+            global_internal: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "IVAL",
+                "internal_name": global_internal,
+            }
+        }
+    }
+
+    read = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert read.status_code == 200, read.text
+    read_body = read.json()
+    assert read_body["global_metadata"][global_internal]["value"] == "IVAL"
+    # The display_name was never the write key and is not a read key either.
+    assert global_name not in read_body["global_metadata"]
+
+
+async def test_patch_biosample_metadata_display_name_422_under_internal_name_keying(ctx):
+    """Tests the case where the body sets global_internal_names but keys a global
+    field on its display_name: the key matches no global internal_name and no
+    study-local field, so it is rejected rather than silently resolving.
+    """
+    (
+        study_idx,
+        bs_idx,
+        _global_idx,
+        global_name,
+        _internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-intname-wrong")
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {global_name: "x"}, global_internal_names=True
+    )
+    assert resp.status_code == 422, resp.text
+    assert "unknown metadata fields" in resp.json()["detail"]
+
+
+async def test_patch_biosample_metadata_alias_not_covered_by_internal_name_keying(ctx):
+    """Tests the case where the body sets global_internal_names but the key names
+    a study-local alias of a global field: the alias still resolves, writing the
+    global slot, so the value reads back under the global's internal_name rather
+    than the key sent. The flag narrows the mismatch, it does not remove it.
+    """
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        _global_name,
+        global_internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-intname-alias")
+    alias_name = f"Alias {secrets.token_hex(4)}"
+    created_field = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": alias_name, "biosample_global_field_idx": global_idx},
+    )
+    assert created_field.status_code == 201, created_field.text
+    ctx["created"]["biosample_study_field"].append(
+        created_field.json()["biosample_study_field_idx"]
+    )
+
+    written = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {alias_name: "AVAL"}, global_internal_names=True
+    )
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+    )
+    assert written.json() == {
+        "results": {
+            alias_name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "AVAL",
+                "internal_name": global_internal,
+            }
+        }
+    }
+
+    read = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert read.status_code == 200, read.text
+    read_body = read.json()
+    assert read_body["global_metadata"][global_internal]["value"] == "AVAL"
+    assert alias_name not in read_body["global_metadata"]
+    assert alias_name not in read_body["local_metadata"]
 
 
 async def test_patch_biosample_metadata_unknown_field_422(ctx):
@@ -3424,7 +3705,13 @@ async def test_patch_biosample_metadata_parse_422(ctx):
     """Tests the case where a value cannot be parsed as the field's data_type:
     a non-numeric text for a NUMERIC field is a 422.
     """
-    study_idx, bs_idx, _global_idx, name = await _seed_linked_biosample_and_global_field(
+    (
+        study_idx,
+        bs_idx,
+        _global_idx,
+        name,
+        _internal_name,
+    ) = await _seed_linked_biosample_and_global_field(
         ctx, suffix="patch-parse", data_type=FieldDataType.NUMERIC
     )
     resp = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {name: "not-a-number"})
@@ -3614,9 +3901,13 @@ async def test_patch_biosample_metadata_admin_tier_writes(ctx):
     bypass) writes metadata: the ADMIN clamp is satisfied and the value is
     INSERTED.
     """
-    study_idx, bs_idx, global_idx, name = await _seed_linked_biosample_and_global_field(
-        ctx, suffix="patch-admin"
-    )
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        name,
+        internal_name,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix="patch-admin")
     await _grant_study_access(
         ctx,
         study_idx=study_idx,
@@ -3631,5 +3922,12 @@ async def test_patch_biosample_metadata_admin_tier_writes(ctx):
         ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
     )
     assert resp.json() == {
-        "results": {name: {"scope": "global", "outcome": "inserted", "value": "AVAL"}}
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "AVAL",
+                "internal_name": internal_name,
+            }
+        }
     }

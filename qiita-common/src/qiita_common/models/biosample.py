@@ -7,7 +7,15 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, ClassVar, Literal
 
-from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    model_validator,
+)
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, SystemRole
 from qiita_common.models._base import PatchRequestModel
@@ -30,6 +38,18 @@ MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see
 
 # Defined here so the wire models and the repository layer share one definition.
 type MetadataFieldScope = Literal["global", "local"]
+
+
+def derive_metadata_field_scope(global_link: object) -> MetadataFieldScope:
+    """Map a nullable global-linkage marker to the scope it implies.
+
+    A global-linkage marker is a value that is populated when the field is
+    globally linked and null when it is purely local: a row's FK to a global
+    field, or the linked global field's internal_name carried alongside it.
+    Callers pass whichever one their own type holds. A global field's own idx is
+    not such a marker -- it is never null, so it distinguishes nothing.
+    """
+    return "global" if global_link is not None else "local"
 
 
 def _reject_blank_metadata_text(value: str) -> str:
@@ -349,39 +369,90 @@ class StudyScopedBiosampleResponse(BiosampleResponse):
 
 
 class MetadataFieldWriteResult(BaseModel):
-    """What a metadata write did to one field's slot: whether the field
-    resolved globally-linked or purely-local, the write outcome, and the value
-    that now occupies the slot. A numeric value comes back in the form it is
-    stored as, which keeps the caller's scale but resolves exponent notation
-    into plain digits. Reported per field by the metadata write route.
+    """What a metadata write did to one field's slot: the key the value reads
+    back under, the write outcome, and the value that now occupies the slot.
+
+    internal_name is the field's globally unique identifier when the write
+    resolved to a globally-linked field, and None when it resolved to a
+    purely-local one. It is what a subsequent read is keyed on: a global value
+    appears in a response's global_metadata under internal_name, a local value
+    in local_metadata under the key the caller sent. The two differ for a
+    global field, so a caller verifying its own write needs this rather than
+    the key it supplied. A numeric value comes back in the form it is stored
+    as, which keeps the caller's scale but resolves exponent notation into
+    plain digits.
     """
 
-    scope: MetadataFieldScope
+    model_config = ConfigDict(extra="forbid")
+
+    internal_name: str | None
     outcome: FieldWriteOutcome
     value: SampleMetadataValue
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_contradicting_scope(cls, data: object) -> object:
+        """Accept a supplied scope only when it matches the derived value.
+
+        Permitting the matching case keeps a serialized result parseable by this
+        model; a contradiction raises rather than letting either side win
+        silently. The key is dropped from the returned copy so extra="forbid"
+        does not then reject the derived field as an unknown input.
+        """
+        if not isinstance(data, dict) or "scope" not in data:
+            return data
+        derived = derive_metadata_field_scope(data.get("internal_name"))
+        if data["scope"] != derived:
+            raise ValueError(
+                f"scope {data['scope']!r} contradicts internal_name; scope is derived"
+                f" and must be omitted or {derived!r}"
+            )
+        return {key: value for key, value in data.items() if key != "scope"}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def scope(self) -> MetadataFieldScope:
+        """Whether the write went through a globally-linked or a purely-local
+        field. Computed on read from internal_name, never stored, so the two
+        can't drift."""
+        return derive_metadata_field_scope(self.internal_name)
 
 
 class SampleMetadataWriteRequest(BaseModel):
     """Body for a study-scoped sample-family metadata write (the
     PATCH .../{entity}/metadata routes, e.g. biosample and sequenced-sample).
 
-    metadata carries text values keyed on field display_name; the route
-    resolves each against the study's existing global or study-local fields and
-    upserts it. At least one entry is required — an empty write is almost
-    certainly a client error — and every value must carry content. Unknown
-    field names are rejected by the route rather than created.
+    metadata carries text values keyed on field display_name — or, when
+    global_internal_names is set, on a global field's internal_name (study-local
+    fields stay display-name-keyed either way). The route resolves each key
+    against the study's existing global or study-local fields and upserts it. At
+    least one entry is required — an empty write is almost certainly a client
+    error — and every value must carry content. Unknown field names are rejected
+    by the route rather than created.
+
+    Under global_internal_names, a key matching a global field's internal_name
+    reads back under that same key, because the globally-linked read is
+    internal-name-keyed. A key matching no global internal_name is still resolved
+    against the study's local fields by display_name; if that field is an alias
+    of a global one, the value goes to the global slot and reads back under the
+    global's internal_name rather than the key sent. So the flag aligns the two
+    keys for a direct global match, not for every key. Each result's
+    internal_name reports the read key in both cases.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     metadata: dict[str, NonBlankMetadataText] = Field(min_length=1)
+    global_internal_names: bool = False
 
 
 class SampleMetadataWriteResponse(BaseModel):
     """Returned by a study-scoped sample-family metadata write route.
 
-    results maps each display_name the caller sent to what the write did to
-    that field (scope, outcome, resulting value), in the caller's input order.
+    results maps each key the caller sent to what the write did to that field,
+    in the caller's input order. The keys are the caller's own, which for a
+    globally-linked field is not the key the value reads back under; each
+    result's internal_name carries that.
     """
 
     results: dict[str, MetadataFieldWriteResult]

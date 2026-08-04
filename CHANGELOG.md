@@ -59,8 +59,16 @@ duplicates further down are historical strata; leave them where they are.
   entity's core row plus its globally-linked metadata and this study's purely-local
   metadata (`StudyScopedBiosampleResponse` / `StudyScopedSequencedSampleResponse`);
   the two PATCHes upsert text values keyed by field display_name against the study's
-  existing global or study-local fields, reporting per field whether it resolved
-  global or local and the write outcome (inserted / updated / unchanged).
+  existing global or study-local fields, reporting per field the write outcome
+  (inserted / updated / unchanged) and the `internal_name` the value reads back
+  under — populated for a globally-linked field, null for a purely-local one, since
+  a global value comes back in `global_metadata` keyed on `internal_name` rather
+  than on the display_name the caller wrote. `scope` is derived from that field
+  rather than stored, so the two cannot disagree. A PATCH body may set
+  `global_internal_names` to key global fields on `internal_name` instead, matching
+  the import path's flag, which makes the write key and the read key the same for a
+  direct global match; a key naming a study-local alias of a global field still
+  resolves through the alias, so `internal_name` remains the reliable read key.
   Sequenced-sample metadata lives on the supertype prep_sample. All four are clamped
   to `Tier.ADMIN` study access (wet_lab_admin+ role bypass), an interim stand-in
   until per-field visibility-tier enforcement lands. A sample not linked to the path

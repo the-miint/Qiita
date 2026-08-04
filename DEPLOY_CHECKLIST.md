@@ -54,6 +54,7 @@ _None yet._
 - Metadata values for a `boolean`-typed biosample/prep_sample field now write and read back (`true`/`false`, case-insensitive; anything else 422s). (#386)
 - A metadata write returns a `numeric` value in the form it is stored, so exponent notation comes back resolved (`1e3` → `1000`). A rewrite differing only in scale now reports `updated` and overwrites — `5` then `5.0` stores `5.0` — where it previously reported `unchanged` and wrote nothing. (#386)
 - A sample-family metadata write rejects a blank or whitespace-only value with 422; previously a `text`-typed field stored it as `''`. Supplying no value is still expressed with a missing-value marker. (#386)
+- Each per-field result from a sample-family metadata write carries `internal_name`, the key that value reads back under: a globally-linked value returns in `global_metadata` keyed on `internal_name`, never on the display_name the caller wrote, so a client verifying its own write reads this rather than reusing its key. Null for a purely-local field, which does read back under the key sent. `scope` is still on the wire but is derived from `internal_name`. A metadata PATCH body may also set `global_internal_names` to key global fields on `internal_name` instead of display_name, matching the import path's flag; that makes the write and read keys identical for a direct global match, but a key naming a study-local alias of a global field still resolves through the alias, so `internal_name` stays the reliable read key either way. (#386)
 
 ---
 

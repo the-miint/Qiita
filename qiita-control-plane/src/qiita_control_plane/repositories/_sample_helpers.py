@@ -23,6 +23,7 @@ from qiita_common.models import (
     SampleMetadataValue,
     TerminologyTermRef,
     Tier,
+    derive_metadata_field_scope,
 )
 
 from . import require_transaction
@@ -86,7 +87,23 @@ class SampleEntityKind(StrEnum):
     PREP_SAMPLE = "prep_sample"
 
 
-class FieldRow(NamedTuple):
+def _assert_global_link_consistent(global_field_idx: int | None, internal_name: str | None) -> None:
+    """Reject a field row whose two global-linkage markers disagree.
+
+    A globally-linked field carries both the FK to its global field and that
+    field's internal_name; a purely-local field carries neither. One populated
+    without the other means the row was assembled from mismatched sources, and
+    every scope derived from it downstream would be arbitrary.
+    """
+    if (global_field_idx is None) != (internal_name is None):
+        raise ValueError(
+            "global_field_idx and internal_name must both be set or both be None;"
+            f" got global_field_idx={global_field_idx!r}, internal_name={internal_name!r}"
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class FieldRow:
     """Subset of field columns used by metadata pre-flight reads, for both a
     *_global_field row and a study-local *_study_field row.
 
@@ -95,17 +112,27 @@ class FieldRow(NamedTuple):
     data_type is TERMINOLOGY and scopes any term-id lookup. global_field_idx is
     the global field this row represents or links to: its own idx for a
     *_global_field row, the FK for a *_study_field row (None on a purely-local
-    field).
+    field). internal_name is that global field's stable identifier — its own for
+    a *_global_field row, the linked global's for a globally-linked *_study_field
+    row, and None on a purely-local field.
     """
 
     idx: int
     display_name: str
     data_type: FieldDataType
     terminology_idx: int | None
+    # Nullness decides globally-linked vs purely-local. Never test that with
+    # idx == global_field_idx: the two tables number independently, so a study
+    # field can equal its own FK by coincidence.
     global_field_idx: int | None
+    internal_name: str | None
+
+    def __post_init__(self) -> None:
+        _assert_global_link_consistent(self.global_field_idx, self.internal_name)
 
 
-class ResolvedField(NamedTuple):
+@dataclass(frozen=True, kw_only=True)
+class ResolvedField:
     """One metadata column resolved to the field it will be written against.
 
     caller_key is the key the caller keyed the column on: a display_name, or a
@@ -115,16 +142,28 @@ class ResolvedField(NamedTuple):
     matched, None on a direct global match (the row is minted at write under
     canonical_display). canonical_display is that study-local field's
     display_name, equal to caller_key except when a global was keyed by
-    internal_name. data_type / terminology_idx are the field's effective type.
+    internal_name. internal_name is the resolved global field's stable
+    identifier, None for a purely-local field, and is the key a globally-linked
+    value reads back under. data_type / terminology_idx are the field's
+    effective type.
     """
 
     caller_key: str
-    scope: MetadataFieldScope
     global_field_idx: int | None
     study_field_idx: int | None
     canonical_display: str
     data_type: FieldDataType
     terminology_idx: int | None
+    internal_name: str | None
+
+    def __post_init__(self) -> None:
+        _assert_global_link_consistent(self.global_field_idx, self.internal_name)
+
+    @property
+    def scope(self) -> MetadataFieldScope:
+        """Which write path this column takes. Derived from global_field_idx —
+        the value the global path writes through — so it can't disagree with it."""
+        return derive_metadata_field_scope(self.global_field_idx)
 
 
 # One resolved metadata column paired with the parsed value to write into it.
@@ -429,12 +468,23 @@ class SampleMetadataFieldResult(NamedTuple):
     global-internal-name resolution), whether it resolved to a globally-linked
     or a purely-local field, what the write did to the slot, and the value that
     now occupies it. Emitted one per input field in the caller's input order.
+
+    internal_name is the resolved global field's stable identifier, None for a
+    purely-local field. It is the key a globally-linked value reads back under,
+    which differs from field_key unless the caller keyed on it.
     """
 
     field_key: str
-    scope: MetadataFieldScope
     outcome: FieldWriteOutcome
     value: SampleMetadataValue
+    internal_name: str | None
+
+    @property
+    def scope(self) -> MetadataFieldScope:
+        """Whether the value landed in a globally-linked or a purely-local slot.
+        Derived from internal_name, the only global-linkage marker this type
+        carries, so it can't disagree with it."""
+        return derive_metadata_field_scope(self.internal_name)
 
 
 @dataclass(frozen=True)
@@ -493,7 +543,7 @@ def _field_rows_by_key(
 ) -> dict[str, FieldRow]:
     """Key field-lookup rows by the named column, wrapping each in FieldRow.
     Each row must carry key_column plus idx, display_name, data_type,
-    terminology_idx, and global_field_idx columns.
+    terminology_idx, global_field_idx, and internal_name columns.
     """
     return {
         r[key_column]: FieldRow(
@@ -502,6 +552,7 @@ def _field_rows_by_key(
             data_type=FieldDataType(r["data_type"]),
             terminology_idx=r["terminology_idx"],
             global_field_idx=r["global_field_idx"],
+            internal_name=r["internal_name"],
         )
         for r in rows
     }
@@ -556,7 +607,8 @@ async def fetch_study_fields_by_display_names(
     (study_idx, display_name)). data_type / terminology_idx are the effective
     values: a globally-linked row stores them NULL and inherits from its global
     field, so the query COALESCEs against *_global_field. global_field_idx is
-    the row's FK, None on a purely-local field. Names with no matching row are
+    the row's FK, None on a purely-local field, and internal_name comes from the
+    linked global field, None for the same reason. Names with no matching row are
     absent from the returned dict; empty input short-circuits with no DB call.
     """
     # Materialize so emptiness is detectable and the param can be passed as ANY.
@@ -565,13 +617,14 @@ async def fetch_study_fields_by_display_names(
         return {}
 
     # The LEFT JOIN resolves the inherited data_type / terminology_idx for
-    # globally-linked rows, which store those columns NULL.
+    # globally-linked rows, which store those columns NULL, and carries the
+    # linked global's internal_name (NULL for a purely-local row).
     fk_column = spec.study_field_global_fk_column
     rows = await pool_or_conn.fetch(
         f"SELECT sf.idx, sf.display_name,"
         f" COALESCE(sf.data_type, gf.data_type) AS data_type,"
         f" COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
-        f" sf.{fk_column} AS global_field_idx"
+        f" sf.{fk_column} AS global_field_idx, gf.internal_name"
         f" FROM {spec.study_field_table} sf"
         f" LEFT JOIN {spec.global_field_table} gf ON gf.idx = sf.{fk_column}"
         f" WHERE sf.study_idx = $1 AND sf.display_name = ANY($2::text[])",
@@ -2184,24 +2237,25 @@ async def preflight_sample_metadata(
                 )
             resolved[curr_name] = ResolvedField(
                 caller_key=curr_name,
-                scope="global",
                 global_field_idx=curr_global_field.global_field_idx,
                 study_field_idx=None,
                 canonical_display=curr_global_field.display_name,
                 data_type=curr_global_field.data_type,
                 terminology_idx=curr_global_field.terminology_idx,
+                internal_name=curr_global_field.internal_name,
             )
         elif curr_study_field is not None:
             resolved[curr_name] = ResolvedField(
                 caller_key=curr_name,
                 # A globally-linked alias writes through its global field; a
-                # purely-local field (global_field_idx None) writes locally.
-                scope="global" if curr_study_field.global_field_idx is not None else "local",
+                # purely-local field (global_field_idx None) writes locally, and
+                # the derived scope follows that same nullness.
                 global_field_idx=curr_study_field.global_field_idx,
                 study_field_idx=curr_study_field.idx,
                 canonical_display=curr_study_field.display_name,
                 data_type=curr_study_field.data_type,
                 terminology_idx=curr_study_field.terminology_idx,
+                internal_name=curr_study_field.internal_name,
             )
         else:
             unknown.append(curr_name)
@@ -2396,7 +2450,7 @@ async def write_resolved_metadata_entries(
         results.append(
             SampleMetadataFieldResult(
                 field_key=resolved_field.caller_key,
-                scope=resolved_field.scope,
+                internal_name=resolved_field.internal_name,
                 outcome=write_result.outcome,
                 value=parsed_value,
             )

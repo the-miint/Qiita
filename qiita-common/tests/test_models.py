@@ -986,6 +986,125 @@ def test_sample_metadata_write_request_rejects_extra_field():
         SampleMetadataWriteRequest(metadata={"ph": "7.2"}, typo="x")
 
 
+def test_sample_metadata_write_request_defaults_to_display_names():
+    """Tests the case where the body omits global_internal_names: global fields
+    resolve on display_name, matching every caller written before the flag
+    existed.
+    """
+    from qiita_common.models import SampleMetadataWriteRequest
+
+    built = SampleMetadataWriteRequest(metadata={"collection date": "2026-03-01"})
+
+    assert built.global_internal_names is False
+
+
+def test_sample_metadata_write_request_accepts_global_internal_names():
+    """Tests the case where the body opts into internal-name keying: the flag is
+    carried through so the route can resolve global fields on internal_name.
+    """
+    from qiita_common.models import SampleMetadataWriteRequest
+
+    built = SampleMetadataWriteRequest(
+        metadata={"collection_date": "2026-03-01"}, global_internal_names=True
+    )
+
+    assert built.global_internal_names is True
+
+
+def test_metadata_field_write_result_derives_global_scope():
+    """Tests the case where a write resolved to a globally-linked field: the
+    result carries the internal_name the value reads back under and reports
+    scope "global" without that scope being supplied.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    result = MetadataFieldWriteResult(
+        internal_name="collection_date",
+        outcome=FieldWriteOutcome.INSERTED,
+        value="2026-03-01",
+    )
+
+    assert result.model_dump() == {
+        "internal_name": "collection_date",
+        "outcome": FieldWriteOutcome.INSERTED,
+        "value": "2026-03-01",
+        "scope": "global",
+    }
+
+
+def test_metadata_field_write_result_derives_local_scope():
+    """Tests the case where a write resolved to a purely-local field: there is
+    no internal_name, so the value reads back under the key the caller sent and
+    scope is reported "local".
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    result = MetadataFieldWriteResult(
+        internal_name=None,
+        outcome=FieldWriteOutcome.UPDATED,
+        value="batch 7",
+    )
+
+    assert result.model_dump() == {
+        "internal_name": None,
+        "outcome": FieldWriteOutcome.UPDATED,
+        "value": "batch 7",
+        "scope": "local",
+    }
+
+
+def test_metadata_field_write_result_round_trips_own_serialization():
+    """Tests the case where a serialized result is validated back into the
+    model: the derived scope present in the payload is accepted, so the shared
+    model can parse a response it produced.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    original = MetadataFieldWriteResult(
+        internal_name="host_taxon_id",
+        outcome=FieldWriteOutcome.UNCHANGED,
+        value="9606",
+    )
+
+    reparsed = MetadataFieldWriteResult.model_validate(original.model_dump())
+
+    assert reparsed.model_dump() == original.model_dump()
+
+
+def test_metadata_field_write_result_rejects_contradicting_scope():
+    """Tests the case where a supplied scope disagrees with internal_name:
+    validation fails rather than one of the two silently winning.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    with pytest.raises(ValidationError):
+        MetadataFieldWriteResult.model_validate(
+            {
+                "internal_name": None,
+                "outcome": FieldWriteOutcome.INSERTED,
+                "value": "x",
+                "scope": "global",
+            }
+        )
+
+
+def test_metadata_field_write_result_rejects_unknown_key():
+    """Tests the case where a misspelled key is supplied: extra="forbid" rejects
+    it, so stripping the derived scope does not open the model to typos.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    with pytest.raises(ValidationError):
+        MetadataFieldWriteResult.model_validate(
+            {
+                "internal_name": None,
+                "outcome": FieldWriteOutcome.INSERTED,
+                "value": "x",
+                "scoep": "local",
+            }
+        )
+
+
 def test_metadata_entry_round_trips_ref_values():
     """Tests the case where a MetadataEntry carries the discriminated-union Ref
     variants: both a MissingReasonRef and a TerminologyTermRef validate and

@@ -261,15 +261,22 @@ async def write_and_map_sample_metadata(
     study_idx: int,
     metadata: Mapping[str, str],
     caller_idx: int,
+    global_internal_names: bool = False,
 ) -> SampleMetadataWriteResponse:
     """Upsert a metadata dict for a sample-family entity and shape the result.
 
     Writes each field (allow_local=True), maps the metadata-write exceptions to
-    their HTTP responses, and returns the per-field results keyed by
-    display_name in the caller's input order. A cross-study slot collision still
-    409s; a same-study, same-field, different-value rewrite is a
-    last-writer-wins overwrite -- there is no If-Match on this path, so the
-    caller accepts lost-update semantics.
+    their HTTP responses, and returns the per-field results keyed by the key the
+    caller sent, in its input order. global_internal_names keys global fields on
+    internal_name rather than display_name; study-local fields are display-name-
+    keyed either way. Each result carries the resolved field's internal_name,
+    which is the key a globally-linked value reads back under; it equals the key
+    the caller sent only when that key was the global's own internal_name, so a
+    value resolved through a study-local alias reads back under a different key
+    whatever the flag says. A cross-study slot collision still 409s; a
+    same-study, same-field, different-value rewrite is a last-writer-wins
+    overwrite -- there is no If-Match on this path, so the caller accepts
+    lost-update semantics.
     """
     try:
         # on_conflict="upsert" overwrites the caller's own study's value in
@@ -285,12 +292,17 @@ async def write_and_map_sample_metadata(
             caller_idx=caller_idx,
             allow_local=True,
             on_conflict="upsert",
+            global_internal_names=global_internal_names,
         )
     except SAMPLE_METADATA_WRITE_ERRORS as exc:
         await raise_http_for_sample_metadata_write_error(conn, exc)
     return SampleMetadataWriteResponse(
         results={
-            r.field_key: MetadataFieldWriteResult(scope=r.scope, outcome=r.outcome, value=r.value)
+            # scope is derived from internal_name on the wire model, so it is
+            # not passed here (extra="forbid" would reject it).
+            r.field_key: MetadataFieldWriteResult(
+                internal_name=r.internal_name, outcome=r.outcome, value=r.value
+            )
             for r in results
         }
     )
