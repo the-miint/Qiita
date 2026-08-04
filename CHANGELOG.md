@@ -22,6 +22,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Create a study-local prep_sample field — `POST /study/{study_idx}/prep-sample-field`
+  (#386).** Mints a prep_sample field definition on one study, either purely-local
+  (the caller states `data_type` and its options) or linked to a
+  `prep_sample_global_field` whose `data_type` / `required` / terminology / tier are
+  then inherited and resolved on read. Not an upsert: a name already on the study is
+  a 409. Gated at `Tier.MEMBER` study access (wet_lab_admin+ role bypass) with the
+  `prep_sample:write` scope, matching its biosample counterpart. Closes the gap that
+  left study-local prep_sample fields readable and writable but impossible to create.
+  Reachable from the CLI as `qiita prep-sample create-field`, whose flags mirror
+  `qiita biosample create-field`.
+
 - **BOOLEAN-typed sample metadata values (#386).** A biosample or prep_sample
   field declared `data_type=boolean` now accepts values: the text `true` or
   `false` (case-insensitive, surrounding whitespace ignored) is stored in
@@ -731,6 +742,11 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **Sequenced-sample import accepts study-local prep_sample fields (#386).** The
+  `metadata` dict on `POST /sequencing-run/{idx}/sequenced-pool/{idx}/sequenced-sample`
+  now resolves a name against the study's existing purely-local prep_sample fields as
+  well as the global fields, writing the value through the local field row — matching
+  what biosample import already does. A name matching neither is still a 422.
 - **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#371).**
   `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
   `mask_idx` and aligns the pool's samples whose `mask_sample` gate is `completed`

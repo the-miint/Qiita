@@ -52,13 +52,19 @@ from qiita_control_plane.testing.unique_names import (
 )
 
 from .conftest import (
+    BIOSAMPLE_FIELD_SURFACE,
     OWNER_INELIGIBILITY_KINDS,
+    STUDY_FIELD_CREATE_AUTHZ_CASES,
+    STUDY_FIELD_CREATE_CONFLICT_CASES,
     IneligibilityKind,
     _grant_study_access,
     _seed_study,
     assert_owner_ineligibility_422,
+    assert_study_field_create_authz,
+    assert_study_field_create_conflict,
     delete_idxs,
     etag_for_row,
+    post_study_field,
     resolve_ineligible_owner_idx,
 )
 
@@ -3079,12 +3085,13 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
 
 async def _post_biosample_field(client, ctx, study_idx: int, **body):
     """POST the create-field route and, on 201, track the created row."""
-    resp = await client.post(
-        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx), json=body
+    return await post_study_field(
+        ctx,
+        surface=BIOSAMPLE_FIELD_SURFACE,
+        client=client,
+        study_idx=study_idx,
+        **body,
     )
-    if resp.status_code == 201:
-        ctx["created"]["biosample_study_field"].append(resp.json()["biosample_study_field_idx"])
-    return resp
 
 
 async def test_create_biosample_field_member_local(ctx):
@@ -3175,145 +3182,29 @@ async def test_create_biosample_field_member_linked_inherits(ctx):
     assert body == expected
 
 
-async def test_create_biosample_field_owner_passes(ctx):
-    """Tests the case where the study owner creates a field with no study_access
-    row: the owner bypass in require_study_access admits them at every tier.
+@pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
+async def test_create_biosample_field_authz(ctx, case, no_biosample_write_client):
+    """Tests the case where each row of the shared access matrix calls the
+    create-field route: owner, member grant, and wet_lab_admin bypass are
+    admitted; no access, sub-MEMBER tier, and a missing scope are refused; a
+    nonexistent study is 404 even for a role-bypass caller.
     """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="cf-own"
-    )
-    resp = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=unique_field_name("Own"), data_type="text"
-    )
-    assert resp.status_code == 201, resp.text
-
-
-async def test_create_biosample_field_wet_lab_admin_bypass(ctx):
-    """Tests the case where wet_lab_admin creates a field on a study they
-    neither own nor hold a study_access row for: the role bypass admits them.
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="cf-wet"
-    )
-    resp = await _post_biosample_field(
-        ctx["wet"], ctx, study_idx, display_name=unique_field_name("Wet"), data_type="text"
-    )
-    assert resp.status_code == 201, resp.text
-
-
-async def test_create_biosample_field_duplicate_409(ctx):
-    """Tests the case where a second create at the same display_name is a
-    strict-create conflict (409).
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="cf-dup"
-    )
-    display_name = unique_field_name("Dup")
-    first = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=display_name, data_type="text"
-    )
-    assert first.status_code == 201, first.text
-
-    second = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=display_name, data_type="text"
-    )
-    assert second.status_code == 409
-    assert "already" in second.json()["detail"]
-
-
-async def test_create_biosample_field_linked_different_global_409(ctx):
-    """Tests the case where a create links an already-linked name to a
-    different global field: a 409 conflict.
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="cf-dg"
-    )
-    suffix = secrets.token_hex(4)
-    global_a = await seed_biosample_global_field(
-        ctx["pool"],
-        internal_name=f"cfa_{suffix}",
-        display_name=f"Global A {suffix}",
-        data_type=FieldDataType.TEXT,
-        created_by_idx=SYSTEM_PRINCIPAL_IDX,
-    )
-    global_b = await seed_biosample_global_field(
-        ctx["pool"],
-        internal_name=f"cfb_{suffix}",
-        display_name=f"Global B {suffix}",
-        data_type=FieldDataType.TEXT,
-        created_by_idx=SYSTEM_PRINCIPAL_IDX,
-    )
-    ctx["created"]["biosample_global_field"].extend([global_a, global_b])
-    display_name = unique_field_name("DiffGlobal")
-
-    first = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=display_name, biosample_global_field_idx=global_a
-    )
-    assert first.status_code == 201, first.text
-
-    second = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=display_name, biosample_global_field_idx=global_b
-    )
-    assert second.status_code == 409
-
-
-async def test_create_biosample_field_no_access_403(ctx):
-    """Tests the case where a user with no owner/grant on a wet_lab_admin-owned
-    study is below MEMBER: require_study_access raises 403.
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="cf-noacc"
-    )
-    resp = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=unique_field_name("X"), data_type="text"
-    )
-    assert resp.status_code == 403
-
-
-async def test_create_biosample_field_below_member_403(ctx):
-    """Tests the case where a viewer-tier grant is below the route's MEMBER
-    floor: 403.
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="cf-view"
-    )
-    await _grant_study_access(
+    await assert_study_field_create_authz(
         ctx,
-        study_idx=study_idx,
-        principal_idx=ctx["user_session"]["principal_idx"],
-        tier="viewer",
-        granted_by_idx=ctx["wet_session"]["principal_idx"],
+        case=case,
+        surface=BIOSAMPLE_FIELD_SURFACE,
+        no_scope_client=no_biosample_write_client,
     )
-    resp = await _post_biosample_field(
-        ctx["user"], ctx, study_idx, display_name=unique_field_name("X"), data_type="text"
-    )
-    assert resp.status_code == 403
 
 
-async def test_create_biosample_field_nonexistent_study_404(ctx):
-    """Tests the case where a role-bypass caller targets a missing study:
-    require_study_exists composes alongside the access gate and yields 404.
+@pytest.mark.parametrize("case", STUDY_FIELD_CREATE_CONFLICT_CASES)
+async def test_create_biosample_field_conflict(ctx, case):
+    """Tests the case where each row of the shared conflict matrix calls the
+    create-field route: a name already on the study is a 409, rebinding that
+    name to a different global field is a 409, and a global-field link naming
+    no row is a 422.
     """
-    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    resp = await ctx["wet"].post(
-        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=max_idx + 100_000),
-        json={"display_name": unique_field_name("X"), "data_type": "text"},
-    )
-    assert resp.status_code == 404
-
-
-async def test_create_biosample_field_missing_scope_403(ctx, no_biosample_write_client):
-    """Tests the case where a PAT without biosample:write is rejected by
-    require_scope before the access check runs (403).
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="cf-noscope"
-    )
-    resp = await no_biosample_write_client.post(
-        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
-        json={"display_name": unique_field_name("X"), "data_type": "text"},
-    )
-    assert resp.status_code == 403
+    await assert_study_field_create_conflict(ctx, case=case, surface=BIOSAMPLE_FIELD_SURFACE)
 
 
 async def test_create_biosample_field_terminology_coupling_422(ctx):
@@ -3344,26 +3235,6 @@ async def test_create_biosample_field_linked_with_data_type_422(ctx):
             "biosample_global_field_idx": 1,
             "data_type": "text",
         },
-    )
-    assert resp.status_code == 422
-
-
-async def test_create_biosample_field_bad_global_field_fk_422(ctx):
-    """Tests the case where a biosample_global_field_idx referencing no row
-    trips the FK at the DB and maps to 422.
-    """
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="cf-fk"
-    )
-    max_idx = await ctx["pool"].fetchval(
-        "SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample_global_field"
-    )
-    resp = await _post_biosample_field(
-        ctx["user"],
-        ctx,
-        study_idx,
-        display_name=unique_field_name("X"),
-        biosample_global_field_idx=max_idx + 100_000,
     )
     assert resp.status_code == 422
 

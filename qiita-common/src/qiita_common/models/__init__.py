@@ -115,6 +115,10 @@ from qiita_common.models.host_filter_profile import (
     HostFilterProfile,
     HostFilterResolution,
 )
+from qiita_common.models.prep_sample import (
+    PrepSampleStudyFieldCreateRequest,
+    PrepSampleStudyFieldResponse,
+)
 from qiita_common.models.reference import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -149,6 +153,10 @@ from qiita_common.models.reference import (
     TerminologyTermObsoletionKind,
     Tier,
     read_mask_reason_sql_list,
+)
+from qiita_common.models.sample_field import (
+    SampleStudyFieldCreateRequest,
+    SampleStudyFieldResponse,
 )
 from qiita_common.models.sequencing import (
     AlignmentDefinitionDeleteResponse,
@@ -397,6 +405,8 @@ __all__ = [
     "SampleMetadataValue",
     "SampleMetadataWriteRequest",
     "SampleMetadataWriteResponse",
+    "SampleStudyFieldCreateRequest",
+    "SampleStudyFieldResponse",
     "SequencedSampleListItem",
     "SequencedSampleListResponse",
     "StudyAccessionField",
@@ -473,6 +483,8 @@ __all__ = [
     "PoolReadMaskCoverage",
     "PoolReadMetrics",
     "PoolWorkTicketSummary",
+    "PrepSampleStudyFieldCreateRequest",
+    "PrepSampleStudyFieldResponse",
     "ReadMaskedDoGetTicketRequest",
     "SampleQCReport",
     "SequenceRange",

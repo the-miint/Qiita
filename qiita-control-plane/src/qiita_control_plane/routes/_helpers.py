@@ -16,6 +16,8 @@ from qiita_common.models import (
     MetadataFieldWriteResult,
     MissingReasonRef,
     SampleMetadataWriteResponse,
+    SampleStudyFieldCreateRequest,
+    SampleStudyFieldResponse,
     TerminologyTermRef,
 )
 
@@ -34,8 +36,10 @@ from ..repositories._sample_helpers import (
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
+    StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
     TransientWriteRaceError,
+    create_study_field_and_read_back,
     fetch_entity_is_linked_to_study,
     fetch_global_metadata,
     fetch_local_metadata,
@@ -290,6 +294,79 @@ async def write_and_map_sample_metadata(
             for r in results
         }
     )
+
+
+async def create_and_map_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    body: SampleStudyFieldCreateRequest,
+    caller_idx: int,
+    response_model: type[SampleStudyFieldResponse],
+) -> SampleStudyFieldResponse:
+    """Create one study-local field for a sample-family entity and shape the
+    stored row into response_model.
+
+    Create-side conflicts map to 409 and DB-level violations to 422 (the
+    Pydantic body should preempt the CHECK, but it is the last defense). The
+    caller owns the transaction. Response keys come from response_model's own
+    aliases, so each entity's wire spelling of the two idx fields follows its
+    model rather than being rebuilt here.
+    """
+    noun = spec.entity_kind
+    try:
+        row = await create_study_field_and_read_back(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=body.display_name,
+            created_by_idx=caller_idx,
+            description=body.description,
+            global_field_idx=body.global_field_idx,
+            data_type=body.data_type,
+            required=body.required,
+            terminology_idx=body.terminology_idx,
+            tier_override=body.tier_override,
+        )
+    except StudyFieldAlreadyExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"a {noun} field named {body.display_name!r} already exists on this study",
+        )
+    except StudyFieldConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"a {noun} field named {body.display_name!r} already exists"
+                " on this study bound to a different global field"
+            ),
+        )
+    except TransientWriteRaceError as exc:
+        raise_for_transient_write_race(exc)
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)
+    except asyncpg.CheckViolationError:
+        raise HTTPException(status_code=422, detail=f"violates a database constraint on {noun}")
+
+    # The row names the global link by its SQL column; the response names both
+    # idx fields by the subclass's alias.
+    payload = {
+        response_model.model_fields["study_field_idx"].alias: row["idx"],
+        "study_idx": row["study_idx"],
+        response_model.model_fields["global_field_idx"].alias: row[
+            spec.study_field_global_fk_column
+        ],
+        "display_name": row["display_name"],
+        "description": row["description"],
+        "data_type": row["data_type"],
+        "required": row["required"],
+        "terminology_idx": row["terminology_idx"],
+        "tier_override": row["tier_override"],
+        "created_by_idx": row["created_by_idx"],
+        "created_at": row["created_at"],
+    }
+    return response_model.model_validate(payload)
 
 
 def raise_for_unique_violation(

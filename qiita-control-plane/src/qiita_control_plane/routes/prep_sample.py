@@ -1,13 +1,15 @@
 """Prep-sample routes.
 
-Covers the prep-sample reads. Today: the study list
-(GET /prep-sample/{idx}/study/list). The prep_sample create path runs through
-the sequenced-sample composer (the only subtype today), so there is no
-prep-sample POST here.
+Two routers live here: a prep-sample-scoped one (prefix=/prep-sample) for the
+study-membership read and the operator retirement PATCH, and a study-scoped one
+(prefix=/study) for minting a study-local prep_sample field, which is
+authorized on the study rather than on any one prep_sample. A prep_sample row
+itself is created by the sequenced-sample composer (its only subtype today),
+never by a POST here.
 
-The read gates on caller scope (Scope.PREP_SAMPLE_READ) plus
+The prep-sample-scoped handlers gate on caller scope plus
 require_role_at_least(WET_LAB_ADMIN), matching the sibling sequenced_sample
-reads; prep_sample is that subtype's supertype.
+routes; prep_sample is that subtype's supertype.
 """
 
 from typing import Annotated
@@ -18,20 +20,28 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_PREP_SAMPLE_PREFIX,
     PATH_PREP_SAMPLE_RETIRED,
+    PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
+    PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     PrepSampleRetiredUpdate,
+    PrepSampleStudyFieldCreateRequest,
+    PrepSampleStudyFieldResponse,
     StudyListItem,
     StudyListResponse,
+    Tier,
 )
 
 from ..auth.guards import (
+    require_complete_profile,
     require_human,
     require_prep_sample_exists,
     require_role_at_least,
     require_scope,
+    require_study_access,
+    require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
@@ -39,8 +49,11 @@ from ..repositories.prep_sample import (
     fetch_active_studies_for_prep_sample,
     set_prep_sample_retired,
 )
+from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from ._helpers import create_and_map_study_field
 
 router = APIRouter(prefix=PATH_PREP_SAMPLE_PREFIX, tags=["prep-sample"])
+study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["prep-sample"])
 
 # Hard cap on the study-roster read. Sized to comfortably cover any single
 # prep_sample's linked-study roster while bounding per-response payload size.
@@ -126,3 +139,48 @@ async def set_prep_sample_retired_route(
             ) from exc
         if not exists:
             raise HTTPException(status_code=404, detail=f"prep_sample {prep_sample_idx} not found")
+
+
+# same-pattern-ok: FastAPI registers each route explicitly, so the decorator,
+# path constant, scope, tier, spec, and model pair are the per-entity
+# declaration; the shared body lives in create_and_map_study_field.
+@study_scoped_router.post(PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY, status_code=201)
+async def create_prep_sample_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: PrepSampleStudyFieldCreateRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> PrepSampleStudyFieldResponse:
+    """Create a study-local prep_sample field definition (no metadata value).
+
+    The caller must be a HumanUser with profile_complete=True, hold the
+    prep_sample:write scope, and have `Tier.MEMBER` access (or higher) to the
+    path's study — study owner, a MEMBER-or-higher study_access row, or
+    wet_lab_admin / system_admin (role bypass). `require_study_exists` composes
+    alongside `require_study_access` so role-bypass callers still get 404 on a
+    non-existent study_idx. A field of that name already on the study is a 409;
+    the response body is the created field.
+
+    prep_sample_global_field_idx discriminates two mutually-exclusive modes.
+    Purely-local (omitted): data_type is required, plus optional required /
+    terminology_idx / tier_override. Globally-linked (set): only display_name
+    (+ optional description); data_type / required / terminology_idx /
+    tier_override are inherited from the global field and must be omitted here,
+    and come back on the response resolved to the global field's values.
+    """
+    async with tx() as conn:
+        response = await create_and_map_study_field(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            body=body,
+            caller_idx=user.principal_idx,
+            response_model=PrepSampleStudyFieldResponse,
+        )
+
+    return response

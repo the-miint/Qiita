@@ -72,6 +72,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     _insert_metadata,
     _update_metadata,
     create_study_field,
+    create_study_field_and_read_back,
     fetch_global_fields_by_keys,
     fetch_global_metadata,
     fetch_local_metadata,
@@ -6125,3 +6126,58 @@ async def test_fetch_study_field_returns_none_when_missing(ctx, spec):
     """Tests the case where the idx matches no row: fetch returns None."""
     result = await fetch_study_field(ctx["pool"], spec=spec, idx=987654321)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# create_study_field_and_read_back (spec-parameterized over both entities)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
+    """Tests the case where the create is globally linked: the returned Record
+    carries the resolved column values, with data_type / required COALESCEd
+    from the global-field row that the stored study-field columns leave NULL.
+    """
+    suffix = secrets.token_hex(4)
+    display_name = f"Created Linked {suffix}"
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"cl_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.NUMERIC,
+    )
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        record = await create_study_field_and_read_back(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_idx,
+            description="linked",
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(record["idx"])
+
+    expected = {
+        # Auto-generated; copy actual into expected so the equality confirms
+        # presence without pinning the minted idx or the DB-assigned timestamp.
+        "idx": record["idx"],
+        "created_at": record["created_at"],
+        "study_idx": ctx["study_idx"],
+        spec.study_field_global_fk_column: global_idx,
+        "display_name": display_name,
+        "description": "linked",
+        "data_type": FieldDataType.NUMERIC,
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["principal_idx"],
+    }
+    assert dict(record) == expected

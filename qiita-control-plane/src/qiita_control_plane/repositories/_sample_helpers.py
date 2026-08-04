@@ -1721,6 +1721,57 @@ async def create_study_field(
     return idx
 
 
+async def create_study_field_and_read_back(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    global_field_idx: int | None = None,
+    data_type: FieldDataType | None = None,
+    required: bool | None = None,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+) -> asyncpg.Record:
+    """Create one {entity}_study_field and return the stored row, failing if
+    the name is already used on the study.
+
+    Mints the row via create_study_field (which rejects a name already in use
+    and enforces the local/linked mode rules), then re-reads it through
+    fetch_study_field so the returned Record carries the resolved,
+    inheritance-aware column values. Returns a Record. The caller owns the
+    transaction; StudyFieldAlreadyExistsError / StudyFieldConflictError /
+    TransientWriteRaceError propagate from the create primitive.
+    """
+    # The mint and the read-back span two statements against the same row;
+    # require a wrapping transaction so the read sees the just-minted row.
+    require_transaction(conn)
+    created_idx = await create_study_field(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        display_name=display_name,
+        created_by_idx=created_by_idx,
+        description=description,
+        global_field_idx=global_field_idx,
+        data_type=data_type,
+        required=required,
+        terminology_idx=terminology_idx,
+        tier_override=tier_override,
+    )
+    created_row = await fetch_study_field(conn, spec=spec, idx=created_idx)
+    # The row was just inserted inside this transaction, so a miss here means
+    # corruption, not an ordinary absence; fail loud rather than returning None
+    # up a Record-typed contract.
+    if created_row is None:
+        raise RuntimeError(
+            f"{spec.study_field_table} idx={created_idx} vanished immediately after insert"
+        )
+    return created_row
+
+
 async def write_local_metadata_or_diagnose(
     conn: asyncpg.Connection,
     *,

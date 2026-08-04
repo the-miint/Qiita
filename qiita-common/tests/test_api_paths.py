@@ -306,6 +306,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_PREP_SAMPLE_PREFIX",
         "PATH_PREP_SAMPLE_RETIRED",
     ),
+    (
+        "URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
+        "PATH_STUDY_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
+    ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)

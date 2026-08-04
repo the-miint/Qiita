@@ -440,6 +440,65 @@ async def test_import_sequenced_sample_from_run_with_metadata(ctx):
     ]
 
 
+async def test_import_sequenced_sample_from_run_writes_existing_local_field(ctx):
+    """Tests the case where the metadata names a purely-local prep_sample field
+    the study already has: the composer writes the value through that existing
+    field row instead of refusing the name.
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-local")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="local"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    # The field exists on the study before the import, and is purely local:
+    # nothing in the import request can create one.
+    local_display_name = f"Lab note {secrets.token_hex(4)}"
+    local_field_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=local_display_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("WET-LOCAL"),
+        primary_study_idx=study_idx,
+        metadata={local_display_name: "LOCAL-1"},
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+
+    # The row must hang off the pre-seeded field with no global link; a write
+    # through a global slot, or a newly minted field, would change both columns.
+    rows = await ctx["pool"].fetch(
+        "SELECT prep_sample_study_field_idx, global_field_idx, value_text"
+        " FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1",
+        rj["prep_sample_idx"],
+    )
+    expected_rows = [
+        {
+            "prep_sample_study_field_idx": local_field_idx,
+            "global_field_idx": None,
+            "value_text": "LOCAL-1",
+        }
+    ]
+    assert [dict(r) for r in rows] == expected_rows
+
+
 async def test_import_sequenced_prep_sample_metadata_missing_value_persists(ctx):
     """Tests the case where a metadata text value matches a known
     missing_value_reason name: the composer routes the value to

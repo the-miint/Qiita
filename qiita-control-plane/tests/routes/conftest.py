@@ -10,20 +10,28 @@ tracked table set differs per route.
 import secrets
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from typing import get_args
+from typing import NamedTuple, get_args
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+)
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
+from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories import UpdatableTable
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
     retire_principal,
+    seed_biosample_global_field,
+    seed_prep_sample_global_field,
     seed_service_principal,
     seed_user_principal,
 )
+from qiita_control_plane.testing.unique_names import unique_field_name
 
 
 @pytest.fixture(autouse=True)
@@ -251,6 +259,208 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
     )
     ctx["created"]["study"].append(study_idx)
     return study_idx
+
+
+# ---------------------------------------------------------------------------
+# Study-local field create: per-entity bindings and shared matrix drivers
+# ---------------------------------------------------------------------------
+# Every study-local field create route carries the same gate — require_scope,
+# require_study_exists, and require_study_access at MEMBER with a wet_lab_admin
+# bypass — and the same conflict semantics, so each entity supplies its
+# bindings once and drives both matrices through the shared helpers below.
+
+
+class StudyFieldCreateSurface(NamedTuple):
+    """One entity's bindings for its study-local field create route.
+
+    `global_fk_key` is the request/response key naming the global-field link,
+    `idx_key` the response key naming the created row, and the two
+    `*_created_key` names the ctx cleanup buckets the created rows belong in.
+    """
+
+    url_template: str
+    idx_key: str
+    created_key: str
+    global_fk_key: str
+    seed_global_field: Callable[..., Awaitable[int]]
+    global_created_key: str
+    global_field_table: str
+
+
+BIOSAMPLE_FIELD_SURFACE = StudyFieldCreateSurface(
+    url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    idx_key="biosample_study_field_idx",
+    created_key="biosample_study_field",
+    global_fk_key="biosample_global_field_idx",
+    seed_global_field=seed_biosample_global_field,
+    global_created_key="biosample_global_field",
+    global_field_table="qiita.biosample_global_field",
+)
+PREP_SAMPLE_FIELD_SURFACE = StudyFieldCreateSurface(
+    url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+    idx_key="prep_sample_study_field_idx",
+    created_key="prep_sample_study_field",
+    global_fk_key="prep_sample_global_field_idx",
+    seed_global_field=seed_prep_sample_global_field,
+    global_created_key="prep_sample_global_field",
+    global_field_table="qiita.prep_sample_global_field",
+)
+
+
+async def post_study_field(
+    ctx, *, surface: StudyFieldCreateSurface, client, study_idx: int, **body
+):
+    """POST one entity's create-field route and, on 201, track the created row."""
+    resp = await client.post(surface.url_template.format(study_idx=study_idx), json=body)
+    if resp.status_code == 201:
+        ctx["created"][surface.created_key].append(resp.json()[surface.idx_key])
+    return resp
+
+
+async def _seed_field_global(ctx, *, surface: StudyFieldCreateSurface, label: str) -> int:
+    """Seed one global field for `surface`'s entity and track it for cleanup."""
+    suffix = secrets.token_hex(4)
+    global_idx = await surface.seed_global_field(
+        ctx["pool"],
+        internal_name=f"{label}_{suffix}",
+        display_name=f"Global {label} {suffix}",
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"][surface.global_created_key].append(global_idx)
+    return global_idx
+
+
+# case -> (study owner, tier granted to the regular user, calling client,
+# expected status). A None owner means no study is seeded, so the path idx
+# names a study that does not exist.
+_STUDY_FIELD_CREATE_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = {
+    "owner": ("user", None, "user", 201),
+    "member_grant": ("wet", "member", "user", 201),
+    "wet_lab_admin_bypass": ("user", None, "wet", 201),
+    "no_access": ("wet", None, "user", 403),
+    "below_member": ("wet", "viewer", "user", 403),
+    "missing_scope": ("user", None, "no_scope", 403),
+    "nonexistent_study": (None, None, "wet", 404),
+}
+STUDY_FIELD_CREATE_AUTHZ_CASES = tuple(_STUDY_FIELD_CREATE_AUTHZ)
+
+
+async def assert_study_field_create_authz(
+    ctx,
+    *,
+    case: str,
+    surface: StudyFieldCreateSurface,
+    no_scope_client,
+) -> None:
+    """Drive one access case of a study-local field create and assert its status.
+
+    `case` names a row of the access matrix, which fixes the study's ownership,
+    any grant to the regular user, the calling client, and the expected status.
+    `no_scope_client` is a PAT client lacking the route's write scope.
+    """
+    owner_key, grant_tier, client_key, expected_status = _STUDY_FIELD_CREATE_AUTHZ[case]
+    client = {"user": ctx["user"], "wet": ctx["wet"], "no_scope": no_scope_client}[client_key]
+
+    # A None owner exercises the missing-study 404, so no study is seeded and
+    # the path carries an idx above every existing one.
+    if owner_key is None:
+        max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+        study_idx = max_idx + 100_000
+    else:
+        study_idx = await _seed_study(
+            ctx,
+            owner_idx=ctx[f"{owner_key}_session"]["principal_idx"],
+            suffix=f"authz-{case}",
+        )
+        if grant_tier is not None:
+            await _grant_study_access(
+                ctx,
+                study_idx=study_idx,
+                principal_idx=ctx["user_session"]["principal_idx"],
+                tier=grant_tier,
+                granted_by_idx=ctx["wet_session"]["principal_idx"],
+            )
+
+    resp = await post_study_field(
+        ctx,
+        surface=surface,
+        client=client,
+        study_idx=study_idx,
+        display_name=unique_field_name("Authz"),
+        data_type="text",
+    )
+    assert resp.status_code == expected_status, resp.text
+
+
+# case -> expected status for the create's conflict / bad-reference surface.
+_STUDY_FIELD_CREATE_CONFLICT: dict[str, int] = {
+    "duplicate_name": 409,
+    "different_global": 409,
+    "unknown_global_fk": 422,
+}
+STUDY_FIELD_CREATE_CONFLICT_CASES = tuple(_STUDY_FIELD_CREATE_CONFLICT)
+
+
+async def assert_study_field_create_conflict(
+    ctx,
+    *,
+    case: str,
+    surface: StudyFieldCreateSurface,
+) -> None:
+    """Drive one conflict case of a study-local field create and assert its status.
+
+    Each case builds its own precondition on a caller-owned study: a name
+    already minted on the study, that name already bound to a different global
+    field, or a global-field link naming no row at all.
+    """
+    expected_status = _STUDY_FIELD_CREATE_CONFLICT[case]
+    study_idx = await _seed_study(
+        ctx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        suffix=f"conflict-{case}",
+    )
+    display_name = unique_field_name("Conflict")
+
+    if case == "unknown_global_fk":
+        # Table name comes from the frozen surface constant, never from input.
+        max_idx = await ctx["pool"].fetchval(
+            f"SELECT COALESCE(MAX(idx), 0) FROM {surface.global_field_table}"
+        )
+        body = {"display_name": display_name, surface.global_fk_key: max_idx + 100_000}
+    elif case == "different_global":
+        # The first create binds the name to global A; the retry aims the same
+        # name at global B, which the propagate guard refuses.
+        global_a = await _seed_field_global(ctx, surface=surface, label="cfa")
+        global_b = await _seed_field_global(ctx, surface=surface, label="cfb")
+        first = await post_study_field(
+            ctx,
+            surface=surface,
+            client=ctx["user"],
+            study_idx=study_idx,
+            display_name=display_name,
+            **{surface.global_fk_key: global_a},
+        )
+        assert first.status_code == 201, first.text
+        body = {"display_name": display_name, surface.global_fk_key: global_b}
+    else:
+        first = await post_study_field(
+            ctx,
+            surface=surface,
+            client=ctx["user"],
+            study_idx=study_idx,
+            display_name=display_name,
+            data_type="text",
+        )
+        assert first.status_code == 201, first.text
+        body = {"display_name": display_name, "data_type": "text"}
+
+    resp = await post_study_field(
+        ctx, surface=surface, client=ctx["user"], study_idx=study_idx, **body
+    )
+    assert resp.status_code == expected_status, resp.text
+    if case == "duplicate_name":
+        assert "already" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

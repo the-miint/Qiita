@@ -269,12 +269,14 @@ async def import_sequenced_prep_sample(
       6. Validate and write the supplied metadata against primary_study_idx
          (the field-owning study): resolve every key against
          prep_sample_global_field — on display_name, or on internal_name when
-         global_internal_names is set — parse each value into its typed Python
-         value (or a MissingReasonRef / TerminologyTermRef marker), then INSERT
-         one prep_sample_metadata row per entry through a globally-linked
-         prep_sample_study_field. Only global fields are accepted; an
-         unknown name raises. This must follow step 5 because the
-         reject_if_link_retired trigger fires on each metadata insert.
+         global_internal_names is set — or against the study's existing
+         study-local fields, parse each value into its typed Python value (or a
+         MissingReasonRef / TerminologyTermRef marker), then INSERT one
+         prep_sample_metadata row per entry, through a globally-linked
+         prep_sample_study_field for a global field and through the existing
+         local field row otherwise. A name matching neither raises. This must
+         follow step 5 because the reject_if_link_retired trigger fires on each
+         metadata insert.
 
     Unknown-name, parse-failure, and unresolved-terminology cases raise
     typed exceptions. The caller must wrap the call in `async with
@@ -335,9 +337,9 @@ async def import_sequenced_prep_sample(
     )
 
     # Step d: validate and write the supplied metadata against
-    # primary_study_idx, the field-owning study. allow_local is False so an
-    # unrecognised name raises rather than minting a study-local field. Must
-    # follow the link above — reject_if_link_retired fires on each insert.
+    # primary_study_idx, the field-owning study: a global field writes through
+    # its slot, an existing study-local field writes locally. Must follow the
+    # link above — reject_if_link_retired fires on each insert.
     await write_sample_metadata(
         conn,
         spec=PREP_SAMPLE_METADATA_SPEC,
@@ -345,7 +347,7 @@ async def import_sequenced_prep_sample(
         study_idx=primary_study_idx,
         metadata=metadata,
         caller_idx=caller_idx,
-        allow_local=False,
+        allow_local=True,
         global_internal_names=global_internal_names,
     )
 

@@ -989,7 +989,7 @@ def test_biosample_study_field_create_request_local_valid():
     req = BiosampleStudyFieldCreateRequest(display_name="pH", data_type=FieldDataType.NUMERIC)
 
     assert req.data_type is FieldDataType.NUMERIC
-    assert req.biosample_global_field_idx is None
+    assert req.global_field_idx is None
     assert req.required is None
 
 
@@ -1014,11 +1014,24 @@ def test_biosample_study_field_create_request_linked_valid():
         display_name="Sample pH", biosample_global_field_idx=7, description="acidity"
     )
 
-    assert req.biosample_global_field_idx == 7
+    assert req.global_field_idx == 7
     assert req.data_type is None
     assert req.required is None
     assert req.terminology_idx is None
     assert req.tier_override is None
+
+
+def test_biosample_study_field_create_request_rejects_unaliased_global_fk():
+    """Tests the case where the caller sends the entity-agnostic attribute name
+    instead of the entity-qualified wire name: only the alias is accepted, so
+    the unaliased spelling is rejected as an unknown field.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="pH", data_type=FieldDataType.NUMERIC, global_field_idx=7
+        )
 
 
 def test_biosample_study_field_create_request_linked_rejects_inherited():

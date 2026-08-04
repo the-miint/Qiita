@@ -64,14 +64,10 @@ from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
-    StudyFieldAlreadyExistsError,
-    StudyFieldConflictError,
-    TransientWriteRaceError,
     fetch_global_metadata,
 )
 from ..repositories.biosample import (
     BiosampleLookupKey,
-    create_biosample_study_field,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
@@ -88,9 +84,9 @@ from ._helpers import (
     GENERIC_FK_VIOLATION,
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
+    create_and_map_study_field,
     etag_for_updated_at,
     metadata_entries_from_rows,
-    raise_for_transient_write_race,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
     read_study_scoped_entity,
@@ -259,33 +255,6 @@ async def import_biosample(
     )
 
 
-def _biosample_study_field_response_from_row(
-    row: asyncpg.Record,
-) -> BiosampleStudyFieldResponse:
-    """Shape a biosample_study_field row into BiosampleStudyFieldResponse.
-
-    Maps the row's own idx to biosample_study_field_idx; every other column
-    name already matches a response field. data_type / required /
-    terminology_idx must arrive already resolved to their effective values --
-    for a globally-linked field, inherited from the global-field row.
-    """
-    return BiosampleStudyFieldResponse.model_validate(
-        {
-            "biosample_study_field_idx": row["idx"],
-            "study_idx": row["study_idx"],
-            "biosample_global_field_idx": row["biosample_global_field_idx"],
-            "display_name": row["display_name"],
-            "description": row["description"],
-            "data_type": row["data_type"],
-            "required": row["required"],
-            "terminology_idx": row["terminology_idx"],
-            "tier_override": row["tier_override"],
-            "created_by_idx": row["created_by_idx"],
-            "created_at": row["created_at"],
-        }
-    )
-
-
 @router.post(PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY, status_code=201)
 async def create_biosample_field(
     study_idx: Annotated[int, Field(gt=0)],
@@ -307,47 +276,25 @@ async def create_biosample_field(
     alongside `require_study_access` so role-bypass callers still get 404 on a
     non-existent study_idx. A field of that name already on the study is a 409;
     the response body is the created field.
+
+    biosample_global_field_idx discriminates two mutually-exclusive modes.
+    Purely-local (omitted): data_type is required, plus optional required /
+    terminology_idx / tier_override. Globally-linked (set): only display_name
+    (+ optional description); data_type / required / terminology_idx /
+    tier_override are inherited from the global field and must be omitted here,
+    and come back on the response resolved to the global field's values.
     """
     async with tx() as conn:
-        # Map create-side conflicts to 409 and DB-level violations to 422 (the
-        # Pydantic body should preempt the CHECK, but it is the last defense).
-        try:
-            row = await create_biosample_study_field(
-                conn,
-                study_idx=study_idx,
-                display_name=body.display_name,
-                created_by_idx=user.principal_idx,
-                description=body.description,
-                global_field_idx=body.biosample_global_field_idx,
-                data_type=body.data_type,
-                required=body.required,
-                terminology_idx=body.terminology_idx,
-                tier_override=body.tier_override,
-            )
-        except StudyFieldAlreadyExistsError:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"a biosample field named {body.display_name!r} already exists on this study"
-                ),
-            )
-        except StudyFieldConflictError:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"a biosample field named {body.display_name!r} already exists"
-                    " on this study bound to a different global field"
-                ),
-            )
-        except TransientWriteRaceError as exc:
-            raise_for_transient_write_race(exc)
-        except asyncpg.ForeignKeyViolationError as exc:
-            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
-            raise HTTPException(status_code=422, detail=detail)
-        except asyncpg.CheckViolationError:
-            raise HTTPException(status_code=422, detail=_GENERIC_CHECK_VIOLATION)
+        response = await create_and_map_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            body=body,
+            caller_idx=user.principal_idx,
+            response_model=BiosampleStudyFieldResponse,
+        )
 
-    return _biosample_study_field_response_from_row(row)
+    return response
 
 
 # Hard cap on the bulk-id read. Sized to comfortably cover any single

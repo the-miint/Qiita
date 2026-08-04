@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from qiita_common.api_paths import (
@@ -20,6 +21,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
+    URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     URL_SEQUENCED_SAMPLE_BY_IDX,
@@ -4882,9 +4884,43 @@ def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_biosample_create_field_local_sends_expected_body(monkeypatch):
-    """`biosample create-field` for a purely-local field POSTs display_name +
-    data_type to /study/{S}/biosample-field, omitting unset optionals."""
+class _FieldCliSurface(NamedTuple):
+    """One entity's create-field CLI bindings: subcommand, its global-link flag,
+    the URL the POST must reach, and the request model argparse validates
+    against (its name appears in the exit-2 stderr line)."""
+
+    subcommand: str
+    global_fk_flag: str
+    url_template: str
+    model_name: str
+
+
+_FIELD_CLI_SURFACES = [
+    pytest.param(
+        _FieldCliSurface(
+            "biosample",
+            "--biosample-global-field-idx",
+            URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+            "BiosampleStudyFieldCreateRequest",
+        ),
+        id="biosample",
+    ),
+    pytest.param(
+        _FieldCliSurface(
+            "prep-sample",
+            "--prep-sample-global-field-idx",
+            URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+            "PrepSampleStudyFieldCreateRequest",
+        ),
+        id="prep_sample",
+    ),
+]
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_local_sends_expected_body(surface, monkeypatch):
+    """`<entity> create-field` for a purely-local field POSTs display_name +
+    data_type to that entity's field route, omitting unset optionals."""
     import httpx as _httpx
 
     from qiita_control_plane.cli import _common
@@ -4895,9 +4931,7 @@ def test_biosample_create_field_local_sends_expected_body(monkeypatch):
         captured["method"] = method
         captured["url"] = url
         captured["json"] = json
-        return _httpx.Response(
-            201, json={"biosample_study_field_idx": 9}, request=_httpx.Request(method, url)
-        )
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
@@ -4908,7 +4942,7 @@ def test_biosample_create_field_local_sends_expected_body(monkeypatch):
         [
             "--base-url",
             "https://q.example.test",
-            "biosample",
+            surface.subcommand,
             "create-field",
             "--study-idx",
             "5",
@@ -4920,15 +4954,14 @@ def test_biosample_create_field_local_sends_expected_body(monkeypatch):
     )
     assert rc == 0
     assert captured["method"] == "POST"
-    assert captured["url"] == (
-        f"https://q.example.test{URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=5)}"
-    )
+    assert captured["url"] == (f"https://q.example.test{surface.url_template.format(study_idx=5)}")
     assert captured["json"] == {"display_name": "pH", "data_type": "numeric"}
 
 
-def test_biosample_create_field_linked_omits_type_columns(monkeypatch):
-    """Linked mode sends only display_name + biosample_global_field_idx; the
-    inherited type columns stay absent from the body."""
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_linked_omits_type_columns(surface, monkeypatch):
+    """Linked mode sends only display_name + the entity-qualified global-field
+    link; the inherited type columns stay absent from the body."""
     import httpx as _httpx
 
     from qiita_control_plane.cli import _common
@@ -4937,9 +4970,7 @@ def test_biosample_create_field_linked_omits_type_columns(monkeypatch):
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["json"] = json
-        return _httpx.Response(
-            201, json={"biosample_study_field_idx": 9}, request=_httpx.Request(method, url)
-        )
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
@@ -4948,23 +4979,54 @@ def test_biosample_create_field_linked_omits_type_columns(monkeypatch):
 
     rc = main(
         [
-            "biosample",
+            surface.subcommand,
             "create-field",
             "--study-idx",
             "5",
             "--display-name",
             "Sample pH",
-            "--biosample-global-field-idx",
+            surface.global_fk_flag,
             "7",
         ]
     )
     assert rc == 0
-    assert captured["json"] == {"display_name": "Sample pH", "biosample_global_field_idx": 7}
+    assert captured["json"] == {
+        "display_name": "Sample pH",
+        surface.global_fk_flag.removeprefix("--").replace("-", "_"): 7,
+    }
 
 
-def test_biosample_create_field_required_boolean_optional(monkeypatch):
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_linked_with_data_type_exits_2(surface, capsys, monkeypatch):
+    """A linked create that also passes an inherited attribute fails the
+    model's mode-coupling validator and exits 2 without a POST."""
+    from qiita_control_plane.cli.user import main
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                surface.subcommand,
+                "create-field",
+                "--study-idx",
+                "5",
+                "--display-name",
+                "X",
+                surface.global_fk_flag,
+                "7",
+                "--data-type",
+                "text",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert surface.model_name in capsys.readouterr().err
+
+
+def test_create_field_required_boolean_optional(monkeypatch):
     """--required sends True, --no-required sends False, neither omits the
-    field entirely (three-state, so a local field defaults required server-side)."""
+    field entirely (three-state, so a local field defaults required
+    server-side). The flag is entity-agnostic, so one entity covers it."""
     import httpx as _httpx
 
     from qiita_control_plane.cli import _common
@@ -4973,9 +5035,7 @@ def test_biosample_create_field_required_boolean_optional(monkeypatch):
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         bodies.append(json)
-        return _httpx.Response(
-            201, json={"biosample_study_field_idx": 9}, request=_httpx.Request(method, url)
-        )
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
@@ -5001,29 +5061,3 @@ def test_biosample_create_field_required_boolean_optional(monkeypatch):
         {"display_name": "pH", "data_type": "text", "required": False},
         {"display_name": "pH", "data_type": "text"},
     ]
-
-
-def test_biosample_create_field_linked_with_data_type_exits_2(capsys, monkeypatch):
-    """A linked create that also passes an inherited attribute fails the
-    model's mode-coupling validator and exits 2 without a POST."""
-    from qiita_control_plane.cli.user import main
-
-    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
-
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "biosample",
-                "create-field",
-                "--study-idx",
-                "5",
-                "--display-name",
-                "X",
-                "--biosample-global-field-idx",
-                "7",
-                "--data-type",
-                "text",
-            ]
-        )
-    assert exc_info.value.code == 2
-    assert "BiosampleStudyFieldCreateRequest" in capsys.readouterr().err
