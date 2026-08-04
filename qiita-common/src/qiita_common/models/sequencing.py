@@ -22,7 +22,11 @@ from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
 from qiita_common.models._base import PatchRequestModel, _fraction_passing_quality_filter
-from qiita_common.models.biosample import MetadataChecklistRef, MetadataEntry
+from qiita_common.models.biosample import (
+    MetadataChecklistRef,
+    MetadataEntry,
+    NonBlankMetadataText,
+)
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
 
@@ -667,7 +671,9 @@ class SequencedSampleCreateRequest(BaseModel):
 
     `metadata` keys must match seeded prep_sample_global_field display_name
     values — or, when global_internal_names is set, their internal_name
-    values; unknown names surface as a single 422 listing every bad key.
+    values; unknown names surface as a single 422 listing every bad key. A
+    blank value is rejected — a field left unanswered instead takes a
+    missing-value marker, and a field with nothing to say is simply omitted.
     The two ENA accession fields are nullable: a sample may already carry
     ENA accessions when it is created (e.g. ingesting already-submitted
     data), or have them written back later after an ENA submission.
@@ -681,7 +687,7 @@ class SequencedSampleCreateRequest(BaseModel):
     sequenced_pool_item_id: str = Field(min_length=1)
     primary_study_idx: Annotated[int, Field(gt=0)]
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
-    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata: dict[str, NonBlankMetadataText] = Field(default_factory=dict)
     global_internal_names: bool = False
     metadata_checklist_name: str | None = Field(default=None, min_length=1)
     ena_experiment_accession: str | None = Field(default=None, max_length=50)

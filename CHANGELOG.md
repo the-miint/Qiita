@@ -305,6 +305,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A blank sample metadata value is rejected at the wire boundary (#386).** An
+  empty or whitespace-only value is a 422 naming the field it was sent for,
+  across every request body carrying a metadata dict (biosample import,
+  sequenced-sample create, and the study-scoped metadata write). Values are
+  outer-stripped before being parsed into their field's data type, so a blank
+  one reached storage as `''` on a `text`-typed field — occupying the field's
+  slot while carrying no information, and satisfying a presence check without
+  answering it. Declining to answer remains expressible with a missing-value
+  marker (`not applicable`, `missing: control sample`, …); a field with nothing
+  to say is omitted.
+
 - **A numeric metadata write reports the value as it is stored, and a change of
   scale counts as a change (#386).** A NUMERIC value is now parsed into the
   representation the database stores, so the value written, the value compared

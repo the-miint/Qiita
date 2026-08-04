@@ -914,6 +914,68 @@ def test_sample_metadata_write_request_rejects_empty_metadata():
         SampleMetadataWriteRequest(metadata={})
 
 
+# Every request model carrying a wire-side metadata dict, with the other
+# required fields it needs to reach validation of that dict.
+_METADATA_REQUEST_MODEL_KWARGS = [
+    ("SampleMetadataWriteRequest", {}),
+    (
+        "BiosampleImportRequest",
+        {
+            "owner_idx": 1,
+            "owner_biosample_id_field_name": "owner sample id",
+            "owner_biosample_id_value": "S1",
+        },
+    ),
+    (
+        "SequencedSampleCreateRequest",
+        {
+            "biosample_idx": 1,
+            "prep_protocol_idx": 1,
+            "owner_idx": 1,
+            "sequenced_pool_item_id": "P1",
+            "primary_study_idx": 1,
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+@pytest.mark.parametrize("blank_value", ["", " ", "   ", "\t", "\n", " \t\n "])
+def test_metadata_request_models_reject_blank_value(
+    model_name: str, other_kwargs: dict, blank_value: str
+):
+    """Tests the case where a metadata value carries no content: every request
+    model with a metadata dict rejects it at the wire boundary, naming the
+    offending field in the error location. A blank value would otherwise occupy
+    the field's slot carrying no information, where declining to answer is
+    expressed with a missing-value marker.
+    """
+    import qiita_common.models as models_module
+
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(metadata={"ph": blank_value}, **other_kwargs)
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert ("metadata", "ph") in error_locs
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+def test_metadata_request_models_accept_padded_value(model_name: str, other_kwargs: dict):
+    """Tests the case where a metadata value has content but surrounding
+    whitespace: the blank-value rejection does not fire, and the value is
+    stored unchanged (the parse layer owns stripping).
+    """
+    import qiita_common.models as models_module
+
+    model_cls = getattr(models_module, model_name)
+
+    built = model_cls(metadata={"ph": " 7.2 "}, **other_kwargs)
+
+    assert built.metadata == {"ph": " 7.2 "}
+
+
 def test_sample_metadata_write_request_rejects_extra_field():
     """Tests the case where an unknown top-level key is supplied: extra="forbid"
     rejects it rather than silently ignoring it.

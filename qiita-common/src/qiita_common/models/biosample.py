@@ -7,7 +7,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, ClassVar, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, SystemRole
 from qiita_common.models._base import PatchRequestModel
@@ -30,6 +30,24 @@ MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see
 
 # Defined here so the wire models and the repository layer share one definition.
 type MetadataFieldScope = Literal["global", "local"]
+
+
+def _reject_blank_metadata_text(value: str) -> str:
+    """Reject a metadata value carrying no content. Returns it unchanged."""
+    if not value.strip():
+        raise ValueError("metadata value must not be blank or whitespace-only")
+    return value
+
+
+# The value half of every metadata dict on the wire. Outer whitespace is
+# stripped before a value is parsed into its field's data type, so a blank
+# string would reach storage as '' — occupying the field's slot while carrying
+# no information. Declining to give a value is expressed with a missing-value
+# marker instead. `min_length` states the constraint in the OpenAPI schema;
+# the validator covers the whitespace-only forms it cannot express.
+NonBlankMetadataText = Annotated[
+    str, Field(min_length=1), AfterValidator(_reject_blank_metadata_text)
+]
 
 
 class FieldWriteOutcome(StrEnum):
@@ -55,13 +73,13 @@ class BiosampleImportRequest(BaseModel):
     when global_internal_names is set, on a biosample_global_field's
     internal_name for global fields (local fields stay display-name-keyed);
     the route parses each value into the field's data type before insert.
-    An empty dict is allowed.
+    An empty dict is allowed; a blank value within it is not.
     """
 
     owner_idx: Annotated[int, Field(gt=0)]
     owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     owner_biosample_id_value: str = Field(min_length=1)
-    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata: dict[str, NonBlankMetadataText] = Field(default_factory=dict)
     global_internal_names: bool = False
     metadata_checklist_name: str | None = Field(default=None, min_length=1)
     biosample_accession: str | None = Field(default=None, min_length=1)
@@ -350,13 +368,13 @@ class SampleMetadataWriteRequest(BaseModel):
     metadata carries text values keyed on field display_name; the route
     resolves each against the study's existing global or study-local fields and
     upserts it. At least one entry is required — an empty write is almost
-    certainly a client error. Unknown field names are rejected by the route
-    rather than created.
+    certainly a client error — and every value must carry content. Unknown
+    field names are rejected by the route rather than created.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    metadata: dict[str, str] = Field(min_length=1)
+    metadata: dict[str, NonBlankMetadataText] = Field(min_length=1)
 
 
 class SampleMetadataWriteResponse(BaseModel):
