@@ -1,4 +1,10 @@
-"""Logging utilities — the Authorization-header scrubber for log records.
+"""Logging utilities — root-logger setup and the Authorization-header scrubber.
+
+`configure_logging()` is what makes any of this reachable: neither service
+configured the root logger, so records fell through to Python's lastResort
+handler at WARNING and every `_log.info` was silently dropped in production. It
+also gives the scrubber below something to attach to — see the ordering note
+under **Where to install**.
 
 httpx's `INFO`-level request logs sometimes include headers verbatim;
 without scrubbing, any `Bearer qk_...` value ends up on disk forever.
@@ -19,9 +25,9 @@ originating at that logger; propagation up the tree skips ancestor
 filters. Records from named loggers (`httpx`, `uvicorn`) therefore need
 the filter attached to **handlers**, not loggers.
 `install_authorization_scrub()` attaches to every handler on the root
-logger. Call it after logging configuration is complete (e.g. inside
-FastAPI's `lifespan`, once uvicorn's handlers are in place) and before
-any request handlers run. Handlers added afterward are not covered.
+logger, so it must run **after** `configure_logging()` — uvicorn puts its
+handlers on its own loggers, not root, so without that call root has no
+handlers and the scrubber is inert. Handlers added afterward are not covered.
 
 **Who installs it.** Every long-running service that wraps httpx via
 `qiita_common.client.ControlPlaneClient` (or otherwise forwards bearer
@@ -30,16 +36,63 @@ tokens). Today: the control plane and the orchestrator.
 Example:
 
     from contextlib import asynccontextmanager
-    from qiita_common.log import install_authorization_scrub
+    from qiita_common.log import configure_logging, install_authorization_scrub
 
     @asynccontextmanager
     async def lifespan(app):
+        configure_logging()
         install_authorization_scrub()
         yield
 """
 
 import logging
+import os
 import re
+
+# Root-logger level when LOG_LEVEL is unset. INFO, not WARNING: the services'
+# operational narration — fan-out pump decisions, dispatch lifecycle, sweeper
+# passes — is all _log.info, and Python's default (no root handler, lastResort at
+# WARNING) silently drops every line of it.
+_DEFAULT_LOG_LEVEL = "INFO"
+
+# `<LEVEL> <logger.name>: <message>`. The leading level followed by a SPACE and the
+# dotted logger name is load-bearing, not cosmetic: it is what distinguishes a record
+# that went through this configuration from uvicorn's own `INFO:` + padding, which
+# reaches the journal whether or not the root logger was ever configured. Anything
+# checking "did app logging actually come up" can only tell the two apart by this
+# shape, so keep the level first and keep `%(name)s`.
+_LOG_FORMAT = "%(levelname)s %(name)s: %(message)s"
+
+
+def configure_logging(level: str | None = None) -> str:
+    """Install a root handler and set the root level. Returns the resolved level name.
+
+    `level` defaults to the LOG_LEVEL env var, then INFO. Raises ValueError on an
+    unknown name rather than falling back, so a typo is a boot failure instead of
+    silently-missing logs. `NOTSET` is rejected with them: it is a real entry in
+    `getLevelNamesMapping()` but resolves to 0, which is a DEBUG-and-below firehose
+    rather than the "unset, use the default" it reads as.
+
+    The return value exists so a caller can narrate the level it actually got — the
+    services log it at boot, which is the only way an operator can tell a quiet
+    journal (`LOG_LEVEL=WARNING`) from a broken one.
+
+    Idempotent: re-running replaces the handler rather than stacking a second one
+    (which would double every line). Call **before**
+    `install_authorization_scrub()`, which walks the handlers this installs — with
+    no root handler it has nothing to attach to and is inert.
+
+    Timestamps are deliberately absent from the format: both services run under
+    systemd, and the journal already stamps every line.
+    """
+    name = (level or os.environ.get("LOG_LEVEL") or _DEFAULT_LOG_LEVEL).upper()
+    resolved = None if name == "NOTSET" else logging.getLevelNamesMapping().get(name)
+    if resolved is None:
+        valid = ", ".join(sorted(n for n in logging.getLevelNamesMapping() if n != "NOTSET"))
+        raise ValueError(f"LOG_LEVEL must be one of: {valid}; got {name!r}")
+    logging.basicConfig(level=resolved, format=_LOG_FORMAT, force=True)
+    return name
+
 
 # Match an Authorization header value in any reasonable string serialisation
 # (key=value, "key": "value", JSON, repr, dict, etc.). The capture group is
