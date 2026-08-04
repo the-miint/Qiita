@@ -393,3 +393,100 @@ async def test_reject_if_link_retired_allows_global_link_propagation(ctx, spec):
         metadata_idx,
     )
     assert dict(row) == {"global_field_idx": gf.idx, "value_text": "kept"}
+
+
+async def _fetch_timestamps(ctx, spec, metadata_idx):
+    """Return the metadata row's (created_at, updated_at) pair."""
+    row = await ctx["pool"].fetchrow(
+        f"SELECT created_at, updated_at FROM {spec.metadata_table} WHERE idx = $1",
+        metadata_idx,
+    )
+    return row["created_at"], row["updated_at"]
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_set_updated_at_matches_created_at_on_insert(ctx, spec):
+    """Tests the case where a metadata row has only ever been inserted: both
+    timestamps default to the same transaction clock, so an untouched row
+    reports an updated_at that claims no edit it did not receive.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    metadata_idx, _ = await _seed_global_value(ctx, spec, entity_idx, "fresh")
+
+    created_at, updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
+    assert updated_at == created_at
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_set_updated_at_bumps_on_value_update(ctx, spec):
+    """Tests the case where a stored value is overwritten: the trigger advances
+    updated_at past the insert-time value and leaves created_at alone, which is
+    what makes the column usable as the row's version.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    metadata_idx, _ = await _seed_global_value(ctx, spec, entity_idx, "before")
+    created_at, seeded_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
+
+    # A separate transaction from the seed, so now() has advanced.
+    await ctx["pool"].execute(
+        f"UPDATE {spec.metadata_table} SET value_text = $1 WHERE idx = $2",
+        "after",
+        metadata_idx,
+    )
+
+    bumped_created_at, bumped_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
+    assert bumped_updated_at > seeded_updated_at
+    assert bumped_created_at == created_at
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_set_updated_at_bumps_on_global_link_propagation(ctx, spec):
+    """Tests the case where a study_field is upgraded local -> global and the
+    propagate trigger denormalizes global_field_idx onto an existing metadata
+    row: updated_at bumps even though no value changed, because the trigger is
+    unscoped and the column tracks any change to the row.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
+
+    # A purely-local field carrying one value, so the upgrade below has a row
+    # to propagate into.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=unique_field_name("upgrade_bump"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+        )
+        metadata_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="kept",
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
+    _, seeded_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
+
+    # The inherited columns are cleared alongside the link so the
+    # *_study_field_inheritance_consistent CHECK still holds after the UPDATE.
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table}"
+        f"   SET {spec.study_field_global_fk_column} = $1,"
+        f"       data_type = NULL,"
+        f"       required = NULL,"
+        f"       terminology_idx = NULL,"
+        f"       tier_override = NULL"
+        f" WHERE idx = $2",
+        gf.idx,
+        field_idx,
+    )
+
+    _, bumped_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
+    assert bumped_updated_at > seeded_updated_at

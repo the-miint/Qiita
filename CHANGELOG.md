@@ -22,6 +22,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`updated_at` on both sample-metadata tables (#386).** `qiita.biosample_metadata`
+  and `qiita.prep_sample_metadata` now carry an `updated_at` bumped by the same
+  `set_updated_at()` trigger the rest of the schema uses, so an overwritten metadata
+  value records when it was overwritten rather than only when it was first written.
+  The trigger is unscoped, so the column tracks any change to the row — including the
+  `global_field_idx` denormalization written when a study field is upgraded from
+  local to global — which is what makes it safe to use as the row's version. Rows
+  predating the migration carry its timestamp; they are deliberately not backfilled
+  to their `created_at`, since that UPDATE would be refused for published rows and
+  would falsely bump every parent's `last_metadata_change_at`. Not exposed on the
+  read wire.
+
 - **Create a study-local prep_sample field — `POST /study/{study_idx}/prep-sample-field`
   (#386).** Mints a prep_sample field definition on one study, either purely-local
   (the caller states `data_type` and its options) or linked to a
