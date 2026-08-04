@@ -60,6 +60,28 @@ duplicates further down are historical strata; leave them where they are.
 - **`qiita mask list` / `show` / `samples` (#423).** The user-CLI front end for the
   reads above — read-only, in the regular CLI rather than `qiita-admin`, which keeps
   the destructive `mask delete` / `purge-failed`.
+- **A runtime control surface for the fan-out dispatch throttle (#406).** The
+  per-cohort in-flight cap was a single boot-time global (`FANOUT_MAX_INFLIGHT`), so
+  retuning one fan-out meant editing an env file and restarting the control plane —
+  which, with in-flight tickets, costs an unthrottled resume of every one of them.
+  Three routes on the work-ticket router, all reusing `work_ticket:cancel`
+  (system_admin, no new scope): `GET /work-ticket/fanout` lists every cohort with
+  held or in-flight children and its throttle state; `PATCH
+  /work-ticket/fanout/{kind}/{key}` sets or clears that cohort's cap **and pumps it
+  in the same call**; `POST /work-ticket/fanout/{kind}/{key}/pump` re-triggers a pump
+  without changing the cap. Pumping inline is the feature, not a convenience: the
+  pump is edge-triggered (a child's terminal transition, or startup reconcile), so a
+  route that only recorded the cap would look inert until unrelated work finished.
+  Every response carries the full status block, so `released: []` is never ambiguous
+  — `fail_stopped` distinguishes "frozen by a failed child" from "no free slots".
+  The override is deliberately **in-memory and process-local**: a restart reverts to
+  the `FANOUT_MAX_INFLIGHT` default, which is the conservative direction for the
+  raise-the-cap case this serves, and it avoids a migration for an incident-time
+  knob. Capped at 100 (`MAX_FANOUT_OVERRIDE`), enforced at the request model, the CLI
+  flag, and the registry — the throttle exists because ~1000 concurrent data-plane
+  streams exhausted its file descriptors, and a typo'd `1000` would walk back into
+  that. Driven by `qiita-admin fanout {list,set,pump}`, whose stderr summary names a
+  fail-stopped cohort explicitly and spells out the other reason for a zero.
 
 - **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
   system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
@@ -411,6 +433,95 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **Both services now narrate one unconditional line at boot, and the deploy check for
+  it can actually fail (#406).** Review found the CO half of that check passing on
+  nothing: it grepped the journal for a bare `INFO ` and got the same result — no match
+  — on a healthy CO and on one with `configure_logging()` stubbed out, so an operator on
+  a correct deploy would conclude the fix had not landed. Two independent causes, both
+  reproduced. uvicorn's formatter emits `INFO:` plus padding, which a trailing-space
+  pattern excludes; and the CO had no unconditional boot INFO at all, its only two
+  `.info()` sites being work-triggered (a SLURM JWT inside its refresh margin, a miint
+  re-stage), so an idle CO narrated nothing. Both lifespans now log one line naming the
+  resolved log level — the CO's also names its compute backend, the CP's its fan-out
+  default — and `configure_logging()` returns the level it resolved so they can. The
+  check greps the **dotted logger name**, which only a configured root logger produces:
+  verified against a real uvicorn boot in both arms (as-shipped matches, pre-fix does
+  not). Dropping the space instead would have been the worse fix — it matches uvicorn's
+  own lines and would pass on a service still carrying the bug.
+
+- **A fan-out override lowered below the default was silently undone by a restart
+  (#406).** The revert-to-default on restart was documented as "the conservative
+  direction", which holds for the raise case the surface exists to serve and not for the
+  other one: a cohort capped at 2 came back at 8 after a restart — 4× what the operator
+  set — because `reconcile_inflight_tickets` re-pumps every held cohort with
+  `settings.fanout_max_inflight` and the registry is already empty by then. Still
+  deliberately in-memory (an incident knob, not durable state), but no longer silent:
+  `set_override` now WARNs when it records a cap below the default, naming the cohort and
+  both numbers, and the asymmetry is spelled out where someone hits it rather than read
+  as true in both directions. The restart is not necessarily operator-initiated — both
+  units are `Restart=on-failure`, so the plausible case is a crash during the very
+  incident being throttled. Both directions are pinned by a two-arm test, since the whole
+  design rests on these semantics.
+
+- **`GET /work-ticket/fanout` hid an override the moment its cohort drained (#406).**
+  Nothing evicts from the override registry except an explicit clear, while the listing
+  showed only cohorts with held or in-flight children — so an override became
+  unenumerable at exactly the point it turned into a surprise, still set and still
+  reapplying if that `(kind, key)` were ever re-run, with no surface left to show it. An
+  operator who set three during an incident could not ask "what have I set?". The listing
+  now unions in every overridden cohort, deduped by identity; a drained one appears with
+  zero counts and a non-null `override`, and `qiita-admin fanout list` flags it as
+  clearable. Also hardened `_cohorts_matching`'s trust boundary from a docstring into an
+  assert over the two module-constant predicates, so a later refactor that threads
+  caller input into that interpolated SQL fails at once instead of opening an injection.
+  Two remaining review findings are deferred rather than silently dropped: the hand-typed
+  work-ticket state literals in this module (#424) and the multi-acquisition read behind
+  this listing (#425).
+
+- **Neither Python service configured logging, so every `_log.info` was silently
+  dropped in production — and the Authorization scrubber was inert (#406).** The CP
+  and CO both called `install_authorization_scrub()` but nothing ever configured the
+  root logger. Records from module loggers therefore fell through to Python's
+  `lastResort` handler, which is WARNING-only, so the services' entire operational
+  narration — fan-out pump decisions, dispatch lifecycle, sweeper passes — never
+  reached the journal. Diagnosing a frozen alignment fan-out took an afternoon
+  because the pump's own `fail-stop` line was among the invisible ones. Worse,
+  `install_authorization_scrub()` walks `root.handlers` and uvicorn installs its
+  handlers on its own loggers, so with root empty the loop body never ran: the filter
+  that keeps `Bearer` tokens out of logs was attached to nothing in both processes.
+  New `qiita_common.log.configure_logging()` installs a root handler and sets the
+  level from an optional `LOG_LEVEL` (default INFO; an unknown name fails the boot
+  rather than silently reverting), called first in both lifespans. It now covers
+  everything that propagates to root, including `httpx`; `uvicorn` and
+  `uvicorn.access` keep `propagate=False` and stay outside it (#408).
+
+- **A fan-out cohort could be stranded with no way to recover it (#406).** Two
+  distinct paths. `_pump_ticket_cohort` swallowed pump failures on the theory that
+  "the next child's completion will re-attempt it" — false at the tail of a fan-out,
+  where the failing child was the last in flight, every remaining ticket is held, and
+  no terminal transition is left to re-trigger anything; only a CP restart recovered.
+  It now retries once and then logs an ERROR naming the cohort. Separately,
+  `top_up_dispatch` commits its release *before* dispatching, so a raise partway
+  through the dispatch loop abandoned the rest of the batch in the one unrecoverable
+  state: no longer `dispatch_held` (so no pump would re-release it) yet never
+  dispatched, while still counting as `running` and so reading as healthy. Each
+  dispatch is now individually guarded, naming the casualty and its `POST
+  /work-ticket/{idx}/run` recovery. The pump's `fail-stop` message also moved
+  INFO → WARNING: a frozen fan-out is operator-actionable and at INFO was
+  indistinguishable from an ordinary "no free slots".
+
+- **`make lake-shell` could not start under bash 3.2, which left CI red on macOS (#406,
+  fixing #418).** `add_pgpass_entry`'s seen-set was an associative array. bash 3.2 — what
+  macOS ships as `/bin/bash`, and what `test_deploy_scripts.py` runs the script under on
+  the mac runner — has none, so the shell died at `declare: -A: invalid option` before
+  reaching any of its own error paths, and the test asserting a *specific* hard failure
+  saw exit 2 instead of 1. It is now two parallel indexed arrays with a linear scan,
+  bounded by an explicit count rather than `${#array[@]}`, because bash 3.2 under `set -u`
+  treats an empty array as unset; a single delimited-string map would have needed escaping
+  the scan does not, since a password may hold any byte. Verified against bash 3.2.57 —
+  both the seen-set semantics and the end-to-end refusal path. No live behaviour changes:
+  the deploy host is Linux. Carried in this PR because it also blocked its CI.
 
 - **An escalated memory/walltime floor now survives a restart or a redrive, instead
   of restarting the ladder from the YAML baseline (#415, closes #413).** The floor

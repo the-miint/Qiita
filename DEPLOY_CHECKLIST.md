@@ -56,6 +56,27 @@ _None yet._
   `fastq-to-parquet|1.1.0|32|08:00:00` and `|1.2.0|32|08:00:00` (both were `16|04:00:00`),
   `fastq-to-parquet|1.3.0|64|08:00:00`, `read-mask|1.0.0|64|08:00:00` and
   `read-mask-block|1.0.0|64|08:00:00` (all three were `32|08:00:00`).
+- (#406) Both services now actually emit INFO to the journal — it was silently dropped
+  before, so this is the fix's own smoke test. Each service logs one unconditional line
+  at boot; expect exactly those two, naming the resolved log level:
+  ```bash
+  sudo journalctl -u qiita-control-plane --since "5 min ago" | grep -m1 'INFO qiita_control_plane'
+  sudo journalctl -u qiita-compute-orchestrator --since "5 min ago" | grep -m1 'INFO qiita_compute_orchestrator'
+  ```
+  Match the **dotted logger name**, not a bare `INFO`. uvicorn writes its own
+  `INFO:` + padding lines to the journal whether or not app logging came up, so a
+  looser pattern passes on a service still carrying the bug — and a bare `INFO ` (with
+  the trailing space) matches neither uvicorn nor a pre-fix service, so it fails on a
+  healthy deploy too. Only the `<LEVEL> <logger.name>:` shape is unique to a configured
+  root logger. If either prints nothing, app logging did not come up: check `LOG_LEVEL`
+  on that unit (an unknown value fails the boot outright) before looking further.
+- (#406) The fan-out control surface answers, as the operator (needs a system_admin token
+  carrying `work_ticket:cancel`). Prints one line per cohort with held or in-flight
+  children — plus any cohort still carrying a runtime override — or "no fan-out cohorts
+  in flight, and no overrides set". On a quiet deploy the last is the expected answer:
+  ```bash
+  qiita-admin fanout list
+  ```
 
 ### 6. After the deploy verifies green
 
@@ -63,6 +84,10 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#406) **`LOG_LEVEL` is new on both CP and CO but needs no action — and expect more journal volume.** It is optional and defaults to `INFO`, so both units boot without it; it is documented in `.env.control-plane.example` / `.env.compute-orchestrator.example` if you ever want to quiet or widen it (an unknown value fails the boot rather than silently reverting). The reason it matters: neither service configured the root logger at all, so every `_log.info` fell through to Python's WARNING-only fallback and never reached the journal. From this deploy the services narrate normally — pump decisions, dispatch lifecycle, sweeper passes — which is a real increase in journal writes on a busy day. Set `LOG_LEVEL=WARNING` on either service to get the old volume back.
+- (#406) **The Authorization-header scrubber was inert in both services and now works.** `install_authorization_scrub()` attaches to the root logger's handlers, and with none configured (above) the loop body never ran — so the filter that rewrites `Bearer <token>` to `Bearer <redacted>` was attached to nothing. It now covers everything propagating to root, including `httpx`. `uvicorn` / `uvicorn.access` keep `propagate=False` and remain outside it, so a bearer token appearing in a uvicorn *access* line would still be unscrubbed; that gap is pre-existing and tracked in #408.
+- (#406) **New operator surface for the fan-out throttle: `qiita-admin fanout {list,set,pump}`** (system_admin, reuses the existing `work_ticket:cancel` scope — no new grant to make). `list` shows every cohort's held/running/failed counts, effective cap, and whether it is fail-stopped; `set <kind> <key> --max-inflight N` retunes one cohort at runtime and pumps it immediately, `--clear` reverts it to `FANOUT_MAX_INFLIGHT`; `pump <kind> <key>` re-triggers a stalled cohort without changing its cap. Caps are bounded at 100. `list` also shows any cohort that has fully drained but still carries an override, flagged as clearable — an override never expires on its own and reapplies if that cohort is re-run. This replaces the old procedure of editing `control-plane.env` and restarting to retune a fan-out, which also triggered an unthrottled resume of every in-flight ticket.
+- (#406) **Overrides are in-memory, and a restart undoes a LOWERED cap in the dangerous direction.** A CP restart drops every override and reverts each cohort to `FANOUT_MAX_INFLIGHT`. If you *raised* a cap, that revert is conservative — fewer in flight than you asked for, and the fan-out just drains slower. If you *lowered* one (throttling a cohort that was hurting the data plane), the revert goes the other way: startup reconcile re-pumps the cohort at the default, so a cap of 2 comes back as 8. **Re-apply any lowering after a restart**, and note the units are `Restart=on-failure`, so this can happen without you initiating it — including a crash during the incident you were throttling. The CP logs a WARNING naming the cohort and both numbers whenever it records a lowering, so `journalctl -u qiita-control-plane | grep 'BELOW the FANOUT_MAX_INFLIGHT'` tells you what to re-apply.
 - After this deploy, a ticket whose step OOM-kills or times out keeps its escalated size
   across a CP restart and a `/run` redrive — the previous behaviour re-burned one failing
   attempt per affected step climbing back (observed on `long-read-assembly` 6978 / 6980 /

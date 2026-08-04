@@ -52,6 +52,7 @@ from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
+from .fanout import add_fanout_parser
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
     _FAILURE_STAGES_REJECTING_STEP_NAME,
@@ -206,6 +207,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="narrow --action-id to tickets under this sequenced pool",
     )
     p_cancel.set_defaults(handler=_handle_ticket_cancel)
+
+    add_fanout_parser(sub)
 
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
