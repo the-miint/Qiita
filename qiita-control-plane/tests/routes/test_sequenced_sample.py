@@ -44,6 +44,7 @@ from qiita_control_plane.testing.db_seeds import (
     fetch_missing_value_reason_idx,
     fetch_ncbi_taxonomy_term,
     fetch_seeded_metagenome_term,
+    retire_prep_sample_to_study_link,
     seed_biosample,
     seed_biosample_to_study_link,
     seed_host_filter_profile,
@@ -2006,27 +2007,6 @@ async def _seed_sequenced_sample_linked_to_study(ctx, *, study_idx: int, suffix:
     return resp.json()
 
 
-async def _retire_prep_sample_to_study_link(
-    pool, *, prep_sample_idx: int, study_idx: int, retired_by_idx: int
-) -> None:
-    """Retire one prep_sample_to_study link via direct SQL; mirrors the
-    retire_biosample_to_study_link seed helper. No dedicated seed helper
-    exists yet because link retirement is otherwise driven by routes that
-    have not landed.
-    """
-    # Populate all three NOT-NULL retirement audit columns alongside the
-    # flag flip so the prep_sample_to_study_retirement_consistent CHECK
-    # passes; retire_reason is left NULL (the CHECK allows it).
-    await pool.execute(
-        "UPDATE qiita.prep_sample_to_study"
-        " SET retired = true, retired_at = now(), retired_by_idx = $3"
-        " WHERE prep_sample_idx = $1 AND study_idx = $2",
-        prep_sample_idx,
-        study_idx,
-        retired_by_idx,
-    )
-
-
 async def test_list_sequenced_sample_idxs_in_study_owner_returns_payload(ctx):
     # Study owner bypasses the tier comparison; two linked sequenced_samples
     # surface newest-linked first with the regular-user system_role.
@@ -2096,7 +2076,7 @@ async def test_list_sequenced_sample_idxs_in_study_excludes_retired_link_and_ret
     retired_prep = await _seed_sequenced_sample_linked_to_study(
         ctx, study_idx=study_idx, suffix="ret-prep"
     )
-    await _retire_prep_sample_to_study_link(
+    await retire_prep_sample_to_study_link(
         ctx["pool"],
         prep_sample_idx=retired_link["prep_sample_idx"],
         study_idx=study_idx,
@@ -3677,6 +3657,29 @@ async def test_get_sequenced_sample_in_study_not_linked_404(ctx):
     assert "not linked" in resp.json()["detail"]
 
 
+async def test_get_sequenced_sample_in_study_retired_link_404(ctx):
+    """Tests the case where the supertype prep_sample's link to the path study
+    is retired while the prep_sample itself stays active: the GET is 404, so a
+    retired link withdraws read access instead of leaving the record fully
+    visible.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-retlink")
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
 async def test_get_sequenced_sample_in_study_retired_404(ctx):
     """Tests the case where the supertype prep_sample is retired while its
     study link remains: the link check passes, then the retired carve-out
@@ -3905,6 +3908,26 @@ async def test_patch_sequenced_sample_metadata_not_linked_404(ctx):
     )
     resp = await _patch_sequenced_metadata(
         ctx["wet"], other_study, seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
+async def test_patch_sequenced_sample_metadata_retired_link_404(ctx):
+    """Tests the case where the supertype prep_sample's link to the path study
+    is retired while the prep_sample itself stays active: the metadata write is
+    404, so a retired link withdraws write access rather than only read access.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-retlink")
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
     )
     assert resp.status_code == 404, resp.text
     assert "not linked" in resp.json()["detail"]

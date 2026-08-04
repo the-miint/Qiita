@@ -73,6 +73,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     _update_metadata,
     create_study_field,
     create_study_field_and_read_back,
+    fetch_entity_is_linked_to_study,
     fetch_global_fields_by_keys,
     fetch_global_metadata,
     fetch_local_metadata,
@@ -251,6 +252,26 @@ def _expected_metadata_row(
     }
     row[column_for_type[data_type]] = value
     return row
+
+
+async def _retire_entity_to_study_link(ctx, spec, entity_idx: int) -> None:
+    """Retire the entity's link to ctx['study_idx'] with the seed helper
+    matching spec.entity_kind, leaving the entity's own row active.
+    """
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+        await retire_biosample_to_study_link(
+            ctx["pool"],
+            biosample_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            retired_by_idx=ctx["principal_idx"],
+        )
+    else:
+        await retire_prep_sample_to_study_link(
+            ctx["pool"],
+            prep_sample_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            retired_by_idx=ctx["principal_idx"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3114,20 +3135,7 @@ async def test_fetch_global_metadata_preserves_link_retired_rows(ctx, spec):
         data_type=FieldDataType.TEXT,
         value="PRESERVED",
     )
-    if is_biosample:
-        await retire_biosample_to_study_link(
-            ctx["pool"],
-            biosample_idx=entity_idx,
-            study_idx=ctx["study_idx"],
-            retired_by_idx=ctx["principal_idx"],
-        )
-    else:
-        await retire_prep_sample_to_study_link(
-            ctx["pool"],
-            prep_sample_idx=entity_idx,
-            study_idx=ctx["study_idx"],
-            retired_by_idx=ctx["principal_idx"],
-        )
+    await _retire_entity_to_study_link(ctx, spec, entity_idx)
 
     result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
 
@@ -3330,6 +3338,39 @@ async def test_insert_entity_to_study_rejects_duplicate(ctx, spec):
                 study_idx=ctx["study_idx"],
                 created_by_idx=ctx["principal_idx"],
             )
+
+
+# ---------------------------------------------------------------------------
+# fetch_entity_is_linked_to_study (parametrized over both specs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_is_linked_to_study_retired_link(ctx, spec):
+    """Tests the case where the entity's only link to the study is retired: the
+    read reports the entity as unlinked even though the link row still exists,
+    so retirement withdraws study-scoped access rather than merely annotating
+    it.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+
+    # The freshly-written link is non-retired, so the read finds it.
+    linked_while_active = await fetch_entity_is_linked_to_study(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"]
+    )
+    assert linked_while_active is True
+
+    # Retiring that same link flips the answer; nothing else about the pair
+    # changes, so the retirement predicate is the only thing under test.
+    await _retire_entity_to_study_link(ctx, spec, entity_idx)
+    linked_after_retire = await fetch_entity_is_linked_to_study(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"]
+    )
+    assert linked_after_retire is False
 
 
 # ---------------------------------------------------------------------------

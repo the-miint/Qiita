@@ -2379,6 +2379,25 @@ async def test_get_biosample_in_study_not_linked_404(ctx):
     assert "not linked" in resp.json()["detail"]
 
 
+async def test_get_biosample_in_study_retired_link_404(ctx):
+    """Tests the case where the biosample's link to the path study is retired
+    while the biosample itself stays active: the GET is 404, so a retired link
+    withdraws read access instead of leaving the record fully visible.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="get-retlink")
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=bs_idx, study_idx=study_idx, retired_by_idx=wet_idx
+    )
+
+    resp = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
 async def test_get_biosample_in_study_retired_404(ctx):
     """Tests the case where the biosample is linked to the study but the
     biosample itself is retired: the link check passes, then the retired
@@ -3492,6 +3511,23 @@ async def test_patch_biosample_metadata_not_linked_404(ctx):
     study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-nolink")
     other_study = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-nolink-other")
     bs_idx = await _seed_link_to_study(ctx, study_idx=other_study, owner_idx=wet_idx)
+
+    resp = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {"F": "x"})
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
+async def test_patch_biosample_metadata_retired_link_404(ctx):
+    """Tests the case where the biosample's link to the path study is retired
+    while the biosample itself stays active: the metadata write is 404, so a
+    retired link withdraws write access rather than only read access.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-retlink")
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=bs_idx, study_idx=study_idx, retired_by_idx=wet_idx
+    )
 
     resp = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {"F": "x"})
     assert resp.status_code == 404, resp.text
