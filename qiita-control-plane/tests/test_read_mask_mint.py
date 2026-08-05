@@ -587,6 +587,41 @@ def test_syndna_threshold_bump_remints_only_syndna_masks(monkeypatch):
     assert before_plain == after_plain, "it must NOT disturb a non-syndna mask"
 
 
+def test_resolved_host_filter_is_none_without_a_rype_reference():
+    """No rype reference in the identity, nothing for a threshold to apply to — so a
+    mask that records no host depletion keeps hashing exactly as it did."""
+    assert runner._mask._resolved_host_filter(None) is None
+    assert _params()["resolved_host_filter"] is None
+
+
+def test_resolved_host_filter_carries_the_rype_threshold():
+    """The reference says WHAT we deplete against; the threshold says how aggressively.
+    rype emits a row per bucket at or above it and the job calls host on any emitted
+    row, so it IS the host call and belongs in the identity.
+
+    Whole-dict equality, deliberately, for the reason the syndna equality above is: a
+    new host-depletion knob must fail here until it is folded into the hash."""
+    assert runner._mask._resolved_host_filter(12) == {"rype_threshold": 0.05}
+    assert _params(host_rype_reference_idx=12)["resolved_host_filter"] == {"rype_threshold": 0.05}
+
+
+def test_rype_threshold_move_remints_only_host_filtered_masks(monkeypatch):
+    """Moving the threshold changes which reads are called host, so a host-filtered
+    mask must re-hash — otherwise the new depletion's output lands under a mask_idx
+    describing the old cutoff, and the per-(mask_idx, prep_sample) gate reads those
+    samples as already masked and never re-runs them. Because `resolved_host_filter`
+    is None when no rype stage runs, an unfiltered mask hashes as before."""
+    before_filtered = _params(host_rype_reference_idx=12)
+    before_plain = _params()
+
+    monkeypatch.setattr(runner._mask, "_HOST_FILTER_RYPE_THRESHOLD", 0.2)
+    after_filtered = _params(host_rype_reference_idx=12)
+    after_plain = _params()
+
+    assert before_filtered != after_filtered, "a threshold move must re-mint a host mask"
+    assert before_plain == after_plain, "it must NOT disturb a mask that ran no rype stage"
+
+
 def test_mask_params_are_canonical_json_serializable():
     """mint_mask_definition hashes canonical JSON of this dict; a non-serializable
     value would fail at mint time, not here."""

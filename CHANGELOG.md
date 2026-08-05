@@ -1169,6 +1169,36 @@ duplicates further down are historical strata; leave them where they are.
   `params`, so its rows stay unstamped and surface in the backfill's report
   instead of reading as converted.
 
+- **The read-mask identity (`mask_idx`) now carries rype's host-call threshold
+  (`resolved_host_filter`).** The hash covered the host *references* a mask depletes
+  against but none of the params it depletes *with*, so the threshold change below
+  would have been invisible to it: reads depleted at two different cutoffs would share
+  one `mask_idx` whose stored params describe neither, and — worse than a mislabel —
+  the per-`(mask_idx, prep_sample)` gate would read every already-masked sample as
+  done under the "same" mask and never re-mask it, so the new threshold would never
+  reach existing data at all. Same defect class the `resolved_lima` / `resolved_syndna`
+  widening closed, and the same fix: a nested block, `None` when no rype stage ran, so
+  a future threshold move re-mints only masks that actually depleted.
+  `test_host_filter_pins` pins the CP mirror to the job's constant by AST (the CP
+  cannot import the orchestrator), including a name-shaped guard so a *new* depletion
+  knob must be pinned deliberately. The minimap2 stage's `preset` is deliberately not
+  hashed: it is pinned in the job to the preset its `.mmi` was built with, not chosen
+  per mask, and as of this deploy only the illumina `host_filter_profile` runs that
+  stage at all.
+  **Consequence: `params_hash` changes for every existing mask.** Existing rows stay
+  valid and referenced; a re-run of an identical config mints one new `mask_idx`
+  rather than reusing the old.
+
+- **The `host_filter` rype threshold is 0.05, up from 0.0.** rype emits a row per
+  bucket scoring at or above the threshold and `host_filter` calls host on any
+  emitted row, so this value *is* the host call. At 0.0 a single incidental
+  minimizer match masked a read; 0.05 still sits below rype's own 0.1 default, so
+  host depletion stays deliberately aggressive relative to upstream. Applies to
+  every read set — the threshold has no per-platform or per-mask variant — and
+  shifts reads scoring in [0.0, 0.05) from `host_rype` to their `qc_mask` reason
+  (`pass` for a QC-pass read), which makes them visible through `read_masked`. The
+  second host stage (minimap2 on rype's survivors) is unchanged.
+
 - **`BaselineResources.as_flat()` is now the single narrowing of the flat
   population (#416).** The runner's dispatch path and the new headroom queries
   both resolve through it instead of each re-asserting the three Optional fields

@@ -101,11 +101,12 @@ YAML_STEP_NAME = "host_filter"
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
-# rype "host = any emitted row": a low threshold so a nonzero score (any host
-# minimizer match) flags the read. Explicit, NOT rype's 0.1 default — host
-# depletion is deliberately aggressive (drop a borderline read rather than retain
-# host contamination). Pinned by the smoke test against the real function.
-_RYPE_THRESHOLD = 0.0
+# rype "host = any emitted row": rype emits a row per bucket scoring at or above
+# this, so the threshold IS the host call. Explicit and below rype's 0.1 default —
+# host depletion is deliberately aggressive (mask a borderline read rather than
+# retain host contamination) — but not 0.0, which called host on a single
+# incidental minimizer match. Pinned by the smoke test against the real function.
+_RYPE_THRESHOLD = 0.05
 
 # minimap2 short-read preset — the host-filter alignment mode, matching the
 # preset the `.mmi` was built with (build_minimap2_index).

@@ -118,6 +118,21 @@ _None yet._
 - (#406) **The Authorization-header scrubber was inert in both services and now works.** `install_authorization_scrub()` attaches to the root logger's handlers, and with none configured (above) the loop body never ran — so the filter that rewrites `Bearer <token>` to `Bearer <redacted>` was attached to nothing. It now covers everything propagating to root, including `httpx`. `uvicorn` / `uvicorn.access` keep `propagate=False` and remain outside it, so a bearer token appearing in a uvicorn *access* line would still be unscrubbed; that gap is pre-existing and tracked in #408.
 - (#406) **New operator surface for the fan-out throttle: `qiita-admin fanout {list,set,pump}`** (system_admin, reuses the existing `work_ticket:cancel` scope — no new grant to make). `list` shows every cohort's held/running/failed counts, effective cap, and whether it is fail-stopped; `set <kind> <key> --max-inflight N` retunes one cohort at runtime and pumps it immediately, `--clear` reverts it to `FANOUT_MAX_INFLIGHT`; `pump <kind> <key>` re-triggers a stalled cohort without changing its cap. Caps are bounded at 100. `list` also shows any cohort that has fully drained but still carries an override, flagged as clearable — an override never expires on its own and reapplies if that cohort is re-run. This replaces the old procedure of editing `control-plane.env` and restarting to retune a fan-out, which also triggered an unthrottled resume of every in-flight ticket.
 - (#406) **Overrides are in-memory, and a restart undoes a LOWERED cap in the dangerous direction.** A CP restart drops every override and reverts each cohort to `FANOUT_MAX_INFLIGHT`. If you *raised* a cap, that revert is conservative — fewer in flight than you asked for, and the fan-out just drains slower. If you *lowered* one (throttling a cohort that was hurting the data plane), the revert goes the other way: startup reconcile re-pumps the cohort at the default, so a cap of 2 comes back as 8. **Re-apply any lowering after a restart**, and note the units are `Restart=on-failure`, so this can happen without you initiating it — including a crash during the incident you were throttling. The CP logs a WARNING naming the cohort and both numbers whenever it records a lowering, so `journalctl -u qiita-control-plane | grep 'BELOW the FANOUT_MAX_INFLIGHT'` tells you what to re-apply.
+- (#426) **Every read mask re-mints after this deploy: `params_hash` changes for all of
+  them.** rype's host-call threshold moved (0.0 → 0.05) and now participates in the
+  mask identity, so an otherwise-identical filtering config mints a *new* `mask_idx`
+  instead of resolving the existing one. Existing `mask_definition` rows stay valid and
+  referenced, and existing `read_mask` data is untouched — no migration, no backfill;
+  the `params` JSONB simply gains a `resolved_host_filter` key on new rows. Nothing
+  re-masks on its own.
+- (#426) **A consequence worth knowing before re-planning a pool:** the per-`(mask_idx,
+  prep_sample)` gate is what refuses to re-plan an already-masked sample, so under the
+  new identity those samples are eligible again and a re-plan will genuinely re-run
+  QC + host filtering for them (that is the point — their stored mask was built at the
+  old threshold). Expect the compute, and re-plan deliberately rather than by habit.
+  To see which masks are old-threshold: `SELECT mask_idx, params->'resolved_host_filter'
+  FROM qiita.mask_definition ORDER BY mask_idx;` — `null` means minted before this
+  deploy.
 - After this deploy, a ticket whose step OOM-kills or times out keeps its escalated size
   across a CP restart and a `/run` redrive — the previous behaviour re-burned one failing
   attempt per affected step climbing back (observed on `long-read-assembly` 6978 / 6980 /
