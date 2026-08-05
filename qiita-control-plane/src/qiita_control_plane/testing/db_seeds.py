@@ -13,10 +13,14 @@ pool-based and commit their writes — for repository-layer trigger tests
 that roll back, build the SQL inline against the open connection instead.
 """
 
+import json
 import secrets
+import uuid
 
 import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
+from qiita_common.chunking import canonical_sequence_hash_expr
+from qiita_common.hashing import canonical_params_hash
 
 # Re-exported (redundant-alias form, so the linter keeps what looks unused here).
 # The taxonomy constants live in qiita_common.models now — production code must
@@ -24,8 +28,9 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 # seed helpers, so they stay reachable from here.
 from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, ReferenceStatus
 
+from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
 
 from ..repositories._sample_helpers import (
@@ -87,6 +92,128 @@ async def seed_host_reference(
         " RETURNING reference_idx",
         name,
         version,
+        created_by_idx,
+    )
+
+
+def canonical_sequence_hashes(sequences: list[str]) -> list[uuid.UUID]:
+    """The `qiita.feature.sequence_hash` each sequence mints under.
+
+    Evaluates `qiita_common.chunking.canonical_sequence_hash_expr` on a
+    miint-loaded DuckDB connection — the expression that module declares every
+    minter must use. Returns UUIDs, deduplicated on the canonical hash the way
+    `qiita.feature`'s UNIQUE does, so a strand pair yields one entry.
+
+    Uses the client connect path (INSTALL-then-LOAD): tests run off the deploy,
+    with no staged `MIINT_EXTENSION_DIRECTORY` and a writable `$HOME`.
+    """
+    if not sequences:
+        return []
+    with connect_with_miint() as conn:
+        conn.execute("CREATE TABLE _seq (sequence VARCHAR)")
+        conn.executemany("INSERT INTO _seq VALUES (?)", [(s,) for s in sequences])
+        # The hash expression embeds its argument several times, so it reads a
+        # column rather than a bare placeholder.
+        rows = conn.execute(
+            f"SELECT DISTINCT {canonical_sequence_hash_expr('sequence')} FROM _seq"
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+async def seed_reference_with_sequences(
+    pool: asyncpg.Pool,
+    *,
+    name: str,
+    created_by_idx: int,
+    sequences: list[str],
+    kind: str = "artifact_sequence_set",
+    version: str = "1.0",
+) -> int:
+    """Insert a qiita.reference plus one member feature per sequence; return its
+    reference_idx.
+
+    Feature hashes come from `qiita_common.chunking.canonical_sequence_hash_expr`
+    on a miint connection — the SAME expression every production minter uses, so
+    the seeded features dedup across references the way real ones do. That
+    expression is strand-canonical (`LEAST` of the md5 of each strand) and calls
+    miint's `sequence_dna_reverse_complement`, so a sequence and its reverse
+    complement seed ONE feature: pick sequences accordingly when a test needs a
+    given member count. Postgres cannot compute this on its own — a plain
+    `md5(sequence)` here would key the seed differently from production and split
+    a strand pair into two features.
+
+    Enough for anything that reads a reference's sequence SET (the read mask's
+    adapter identity). No DuckLake rows, so it is not enough for anything that
+    reads the sequence BYTES.
+    """
+    reference_idx = await pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5)"
+        " RETURNING reference_idx",
+        name,
+        version,
+        kind,
+        ReferenceStatus.ACTIVE.value,
+        created_by_idx,
+    )
+    sequence_hashes = canonical_sequence_hashes(sequences)
+    # Two statements, not one data-modifying CTE: a CTE's INSERT is invisible to
+    # the enclosing query's snapshot, so the membership SELECT would find none of
+    # the features the CTE just minted.
+    await pool.execute(
+        "INSERT INTO qiita.feature (sequence_hash)"
+        " SELECT unnest($1::uuid[])"
+        " ON CONFLICT (sequence_hash) DO NOTHING",
+        sequence_hashes,
+    )
+    await pool.execute(
+        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
+        " SELECT $1, f.feature_idx FROM qiita.feature f"
+        " WHERE f.sequence_hash = ANY($2::uuid[])"
+        " ON CONFLICT DO NOTHING",
+        reference_idx,
+        sequence_hashes,
+    )
+    return reference_idx
+
+
+async def delete_reference_with_sequences(pool: asyncpg.Pool, reference_idx: int) -> None:
+    """Drop a `seed_reference_with_sequences` reference and its membership.
+
+    The features themselves stay: they are content-addressed and shared across
+    references, so deleting them here could strip another reference's members.
+    The reference row is what holds the FK to qiita.principal (ON DELETE
+    RESTRICT), so removing it is what lets a test's principal cleanup succeed.
+    """
+    await pool.execute(
+        "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+    )
+    await pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
+
+
+async def seed_legacy_mask_definition(
+    pool: asyncpg.Pool,
+    *,
+    params: dict,
+    created_by_idx: int,
+) -> int:
+    """Insert a qiita.mask_definition row as it looked before the adapter-identity
+    migration: `adapter_hash_scheme` NULL, whatever `adapter_set_hash` `params`
+    carries. Returns its mask_idx.
+
+    Raw INSERT rather than `mint_mask_definition`, which stamps the scheme on any
+    adapter-bearing config — the point of this helper is the unstamped row, so
+    minting through the current path cannot produce it.
+    """
+    return await pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, $2, $3, $4::jsonb, $5)"
+        " RETURNING mask_idx",
+        canonical_params_hash(params),
+        params["filter_workflow"],
+        params["filter_version"],
+        json.dumps(params),
         created_by_idx,
     )
 

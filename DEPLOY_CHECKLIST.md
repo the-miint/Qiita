@@ -74,7 +74,13 @@ _None yet._
   the runner treats as "nothing escalated yet". Carries the per-step memory/walltime floor
   the OOM/TIMEOUT retry ladder climbs to, so a CP restart or a `/run` redrive continues
   the ladder instead of restarting at the YAML baseline. (#415)
-- `20260804000000_metadata_updated_at.sql` — adds `updated_at` plus its `set_updated_at()` trigger to `biosample_metadata` and `prep_sample_metadata`. Plain `make migrate` — the `ADD COLUMN` takes the fast-default path, so it does not rewrite either table. Existing rows are deliberately **not** backfilled to their `created_at`: they all carry the migration's own timestamp instead. (#386)
+- `make migrate` also applies `20260804000000_mask_definition_adapter_hash_scheme.sql`, no
+  out-of-band setup: an additive nullable `ALTER TABLE qiita.mask_definition ADD COLUMN
+  adapter_hash_scheme TEXT` with a value CHECK, plus a `DROP`/`CREATE` of
+  `qiita.mint_mask_definition` adding two DEFAULT-NULL parameters. The old 5-argument call
+  still resolves against the new signature, so the running CP keeps minting between this
+  step and the bucket-4 restart. (#428)
+- `20260804000001_metadata_updated_at.sql` — adds `updated_at` plus its `set_updated_at()` trigger to `biosample_metadata` and `prep_sample_metadata`. Plain `make migrate` — the `ADD COLUMN` takes the fast-default path, so it does not rewrite either table. Existing rows are deliberately **not** backfilled to their `created_at`: they all carry the migration's own timestamp instead. (#386)
 
 ### 4. Deploy
 
@@ -122,6 +128,18 @@ _None yet._
   ```bash
   qiita-admin fanout list
   ```
+- (#428) Dry-run the mask adapter-hash re-key and read its report before bucket 6 writes.
+  Needs `DATABASE_URL` and `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` (or pass
+  `--reference-idx`):
+  ```bash
+  qiita-admin backfill mask-adapter-hash
+  ```
+  Expect `unattributable (left unwritten): 0`. A non-zero count means more than one
+  distinct `adapter_set_hash` is stored fleet-wide, so the rows cannot be attributed to the
+  one canonical adapter set without the adapter bytes — the report names each hash and the
+  masks on it, and both the command and `apply_rekey` refuse to write in that state (exit
+  1). Bring it to whoever owns the adapter set; once the attribution is decided, convert
+  the named rows with `--mask-idx N [--mask-idx M …] --attribute-all --execute`.
 
 - The rebuilt `long-read-assembly` binning image stages the coverage BAM instead of
   sorting it (#422, closes #374). Anchored at start-of-line so a comment mentioning
@@ -140,7 +158,19 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- (#428) Apply the mask adapter-hash re-key. Note the rollback path is already burned by
+  then: the restarted CP re-keys a row in place the first time it mints that config, so
+  bucket 4 is the point of no return, not this step. What this adds is the rows nothing
+  re-mints. A rolled-back CP derives the byte identity, misses every re-keyed row, and
+  mints duplicate masks — re-masking those samples. `mask_idx` does not move, so
+  `mask_sample`, `work_ticket.mask_idx` and the data plane's `read_mask` rows stay valid.
+  Idempotent:
+  ```bash
+  qiita-admin backfill mask-adapter-hash --execute
+  ```
+  Collided mask_idx values mean that config already exists under both derivations; they are
+  reported at plan time, left unwritten, and need a decision on which mask_idx to keep
+  (merging means repointing `qiita.mask_sample` and `qiita.work_ticket`).
 
 ### Notes (no host action)
 
@@ -185,6 +215,17 @@ _None yet._
   *failing* step now climbs; a healthy ticket requests exactly what it did before. Reaches
   `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no host action, just
   the bucket-5 checks that it took.
+- (#428) **Read-mask identity now keys on the adapter sequences, not the adapter Parquet's
+  bytes — no host action, and existing masks keep their `mask_idx`.** The mint looks the new
+  identity up first and falls back to the old digest, re-keying the row it finds in place, so
+  a mask converts the moment anything re-mints its config. Buckets 5 and 6 convert what
+  nothing re-submits. Why the old digest had to go, and the measured pyarrow-version drift
+  behind it: the `CHANGELOG.md` entry and the `20260804000000` migration header.
+- (#428) **`POST /mask-definition` rows are deliberately left unstamped.** The route mints
+  caller-supplied `params`, so the control plane cannot say which derivation produced any
+  adapter hash in them. Those rows therefore surface in the `mask-adapter-hash` report rather
+  than being marked converted. If bucket 5 reports rows you do not recognise, a client
+  minting through that route is the first thing to check.
 - (#422, closes #374) **The `long-read-assembly` binning SIF auto-rebuilds on this
   deploy** (`activate.sh` → `build-sifs.sh`; its entrypoint and def are build
   inputs) to pick up staging the coverage BAM rather than running
