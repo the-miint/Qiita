@@ -23,6 +23,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories import UpdatableTable
+from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
     retire_principal,
@@ -642,6 +643,22 @@ def audit_failure():
         raise RuntimeError("intentional audit failure")
 
     return _failing
+
+
+@pytest.fixture
+def study_link_gate_reports_live(monkeypatch):
+    """Force the pre-write study-link gate to report a live link.
+
+    Reproduces the window a mid-request retirement opens: the caller clears the
+    gate on a link the database will refuse by the time the write runs. Patching
+    the read is what makes that ordering deterministic instead of a race the test
+    would have to win.
+    """
+
+    async def _linked(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(route_helpers, "fetch_entity_is_linked_to_study", _linked)
 
 
 @pytest_asyncio.fixture

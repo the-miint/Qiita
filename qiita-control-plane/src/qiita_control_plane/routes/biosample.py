@@ -85,6 +85,7 @@ from ._helpers import (
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     create_and_map_study_field,
+    detail_for_unlinked_entity,
     etag_for_updated_at,
     metadata_entries_from_rows,
     raise_for_unique_violation,
@@ -435,7 +436,9 @@ async def patch_biosample_metadata(
     one with no non-retired biosample_to_study link to study_idx share the same
     404 so a caller never learns the state of a biosample outside their study; a
     retired biosample is a 409 (its metadata cannot be written), checked only
-    after the link passes.
+    after the link passes. A link retired between that check and the write is
+    refused by the database and answers the same 404, so the status does not
+    depend on which of the two noticed.
 
     The body maps field display_name -> text value -- or global internal_name ->
     text value when it sets global_internal_names, which leaves study-local
@@ -478,6 +481,9 @@ async def patch_biosample_metadata(
             study_idx=study_idx,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
+            unlinked_detail=detail_for_unlinked_entity(
+                noun="biosample", entity_idx=biosample_idx, study_idx=study_idx
+            ),
             global_internal_names=body.global_internal_names,
         )
     return response

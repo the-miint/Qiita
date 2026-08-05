@@ -21,6 +21,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.routes._helpers import parse_kv_detail
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -315,6 +316,72 @@ async def test_reject_if_link_retired_blocks_value_update(ctx, spec):
         metadata_idx,
     )
     assert stored_value == "before"
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_reject_if_link_retired_detail_identifies_the_trigger_on_update(ctx, spec):
+    """Tests the case where a route needs to tell this rejection from another
+    guard sharing its SQLSTATE: the error DETAIL names the raising function plus
+    the entity and study, so no route has to match message prose.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    metadata_idx, _ = await _seed_global_value(ctx, spec, entity_idx, "before")
+
+    await _retire_link(ctx, spec, entity_idx)
+
+    with pytest.raises(asyncpg.RaiseError) as excinfo:
+        await ctx["pool"].execute(
+            f"UPDATE {spec.metadata_table} SET value_text = $1 WHERE idx = $2",
+            "after",
+            metadata_idx,
+        )
+
+    expected_detail = {
+        "trigger": spec.metadata_retired_link_trigger,
+        spec.entity_key_column: str(entity_idx),
+        "study_idx": str(ctx["study_idx"]),
+    }
+    assert parse_kv_detail(excinfo.value.detail) == expected_detail
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_reject_if_link_retired_detail_identifies_the_trigger_on_insert(ctx, spec):
+    """Tests the case where the first value for a slot is written through a
+    retired link: the INSERT rejection carries the same DETAIL as the overwrite
+    rejection, so one dispatch covers both statement kinds.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _retire_link(ctx, spec, entity_idx)
+    gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
+
+    # The raise escapes the transaction block, so the study field created
+    # alongside the refused row rolls back with it and needs no cleanup.
+    with pytest.raises(asyncpg.RaiseError) as excinfo:
+        async with ctx["pool"].acquire() as conn, conn.transaction():
+            field_idx, _ = await _get_or_create_globally_linked_study_field(
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                global_field_idx=gf.idx,
+                display_name=unique_field_name("retired_link_insert"),
+                created_by_idx=ctx["principal_idx"],
+            )
+            await _insert_metadata(
+                conn,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_field_idx=field_idx,
+                data_type=FieldDataType.TEXT,
+                value="x",
+                created_by_idx=ctx["principal_idx"],
+            )
+
+    expected_detail = {
+        "trigger": spec.metadata_retired_link_trigger,
+        spec.entity_key_column: str(entity_idx),
+        "study_idx": str(ctx["study_idx"]),
+    }
+    assert parse_kv_detail(excinfo.value.detail) == expected_detail
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)

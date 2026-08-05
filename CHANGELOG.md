@@ -463,6 +463,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A study link retired mid-request answers 404 instead of 500 (#386).** The
+  study-scoped metadata write for a biosample or sequenced-sample checks the
+  caller's study link before writing, and the database re-checks it at the write
+  itself; a link retired in the window between the two was refused by the
+  database and surfaced as an unmapped 500. The refusal now answers the same 404
+  a link retired before the request would have, so the status reflects what the
+  caller may do rather than which of the two checks noticed, and a retry sees
+  the same answer. Both retired-link trigger functions tag their rejection with
+  a structured error DETAIL naming the raising function, which is what lets a
+  route tell that rejection from the other guards on those tables sharing its
+  SQLSTATE; every other rejection still surfaces unchanged.
+
 - **A blank sample metadata value is rejected at the wire boundary (#386).** An
   empty or whitespace-only value is a 422 naming the field it was sent for,
   across every request body carrying a metadata dict (biosample import,

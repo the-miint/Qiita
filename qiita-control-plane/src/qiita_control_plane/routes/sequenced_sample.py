@@ -98,6 +98,7 @@ from ._helpers import (
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     detail_for_biosample_link_rejection,
+    detail_for_unlinked_entity,
     etag_for_updated_at,
     metadata_entries_from_rows,
     parse_kv_detail,
@@ -671,7 +672,9 @@ async def patch_sequenced_sample_metadata(
     prep_sample_to_study link to study_idx share the same 404 so a caller never
     learns the state of a sample outside their study; a retired sequenced_sample
     is a 409 (its metadata cannot be written), checked only after the link
-    passes.
+    passes. A link retired between that check and the write is refused by the
+    database and answers the same 404, so the status does not depend on which of
+    the two noticed.
 
     The body maps field display_name -> text value -- or global internal_name ->
     text value when it sets global_internal_names, which leaves study-local
@@ -713,6 +716,13 @@ async def patch_sequenced_sample_metadata(
             study_idx=study_idx,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
+            # The write keys on the supertype prep_sample_idx; a link the
+            # database refuses still answers under the requested idx.
+            unlinked_detail=detail_for_unlinked_entity(
+                noun="sequenced_sample",
+                entity_idx=sequenced_sample_idx,
+                study_idx=study_idx,
+            ),
             global_internal_names=body.global_internal_names,
         )
     return response

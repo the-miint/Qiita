@@ -554,6 +554,11 @@ class EntityMetadataSpec:
     # and the entity-id column on it (biosample_idx / prep_sample_idx).
     link_table: str
     link_entity_key_column: str
+    # Name of the DB function the metadata table's retired-link triggers run.
+    # It tags its error DETAIL with `trigger=<this value>`, which is how a
+    # caller tells that rejection from any other trigger sharing its SQLSTATE.
+    # Renaming the function in a migration means changing this in lockstep.
+    metadata_retired_link_trigger: str
     # The boolean *_metadata column marking an owner-sample-id row, for
     # entities that carry one (is_owner_biosample_id on biosample); None when
     # the entity has no owner-sample-id concept. When set, generic metadata

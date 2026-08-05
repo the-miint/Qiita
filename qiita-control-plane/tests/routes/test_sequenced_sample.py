@@ -4047,6 +4047,54 @@ async def test_patch_sequenced_sample_metadata_retired_link_404(ctx):
     assert "not linked" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("value_exists", [False, True], ids=["insert", "overwrite"])
+async def test_patch_sequenced_sample_metadata_link_retired_mid_write_404(
+    ctx, study_link_gate_reports_live, value_exists
+):
+    """Tests the case where the prep_sample's study link is retired after the
+    route's gate cleared it: the database refuses the write and the route answers
+    the same 404 the gate would have, naming the requested sequenced_sample_idx
+    rather than the supertype idx the metadata keys on.
+    """
+    suffix = "patch-race-over" if value_exists else "patch-race-ins"
+    seeded = await _seed_one_sequenced_sample(ctx, suffix)
+    global_idx, global_name, _global_internal = await _seed_prep_global_field(ctx)
+    if value_exists:
+        seed_resp = await _patch_sequenced_metadata(
+            ctx["wet"],
+            seeded["study_idx"],
+            seeded["sequenced_sample_idx"],
+            {global_name: "BEFORE"},
+        )
+        assert seed_resp.status_code == 200, seed_resp.text
+        await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {global_name: "AFTER"}
+    )
+    assert resp.status_code == 404, resp.text
+    expected_detail = (
+        f"sequenced_sample {seeded['sequenced_sample_idx']} is not linked"
+        f" to study {seeded['study_idx']}"
+    )
+    assert resp.json()["detail"] == expected_detail
+
+    # The refused write left the slot as it was.
+    stored_value = await ctx["pool"].fetchval(
+        "SELECT value_text FROM qiita.prep_sample_metadata"
+        " WHERE prep_sample_idx = $1 AND global_field_idx = $2",
+        seeded["prep_sample_idx"],
+        global_idx,
+    )
+    assert stored_value == ("BEFORE" if value_exists else None)
+
+
 async def test_patch_sequenced_sample_metadata_retired_409(ctx):
     """Tests the case where the supertype prep_sample is retired: its metadata
     cannot be written (409), checked after the link passes.

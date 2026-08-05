@@ -3821,6 +3821,49 @@ async def test_patch_biosample_metadata_retired_link_404(ctx):
     assert "not linked" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("value_exists", [False, True], ids=["insert", "overwrite"])
+async def test_patch_biosample_metadata_link_retired_mid_write_404(
+    ctx, study_link_gate_reports_live, value_exists
+):
+    """Tests the case where the link is retired after the route's gate cleared
+    it: the database refuses the write and the route answers the same 404 the
+    gate would have, for a first value and for an overwrite alike.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    suffix = "patch-race-over" if value_exists else "patch-race-ins"
+    (
+        study_idx,
+        bs_idx,
+        global_idx,
+        global_name,
+        _global_internal,
+    ) = await _seed_linked_biosample_and_global_field(ctx, suffix=suffix)
+    if value_exists:
+        seed_resp = await _patch_biosample_metadata(
+            ctx["wet"], study_idx, bs_idx, {global_name: "BEFORE"}
+        )
+        assert seed_resp.status_code == 200, seed_resp.text
+        await track_biosample_metadata_outputs(
+            ctx["pool"], ctx["created"], bs_idx, study_idx, [global_idx]
+        )
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=bs_idx, study_idx=study_idx, retired_by_idx=wet_idx
+    )
+
+    resp = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {global_name: "AFTER"})
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == f"biosample {bs_idx} is not linked to study {study_idx}"
+
+    # The refused write left the slot as it was.
+    stored_value = await ctx["pool"].fetchval(
+        "SELECT value_text FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND global_field_idx = $2",
+        bs_idx,
+        global_idx,
+    )
+    assert stored_value == ("BEFORE" if value_exists else None)
+
+
 async def test_patch_biosample_metadata_retired_409(ctx):
     """Tests the case where the biosample is retired: its metadata cannot be
     written (409), checked after the link passes.

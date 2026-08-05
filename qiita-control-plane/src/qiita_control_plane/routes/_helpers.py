@@ -112,6 +112,17 @@ async def read_global_and_local_entries(
     return global_metadata, local_metadata
 
 
+def detail_for_unlinked_entity(*, noun: str, entity_idx: int, study_idx: int) -> str:
+    """Build the HTTP-404 detail for an entity with no writable study link.
+
+    One wording for every route and every layer that reports it, so a link
+    rejected by the pre-write gate and one rejected mid-write by the database
+    are indistinguishable on the wire. Returns the bare string; the caller
+    wraps it in HTTPException with status 404.
+    """
+    return f"{noun} {entity_idx} is not linked to study {study_idx}"
+
+
 async def resolve_linked_study_entity(
     conn: asyncpg.Connection,
     *,
@@ -141,7 +152,10 @@ async def resolve_linked_study_entity(
     )
     if not linked:
         raise HTTPException(
-            status_code=404, detail=f"{noun} {entity_idx} is not linked to study {study_idx}"
+            status_code=404,
+            detail=detail_for_unlinked_entity(
+                noun=noun, entity_idx=entity_idx, study_idx=study_idx
+            ),
         )
     if row["retired"]:
         raise HTTPException(status_code=retired_status, detail=retired_detail)
@@ -264,6 +278,7 @@ async def write_and_map_sample_metadata(
     study_idx: int,
     metadata: Mapping[str, str],
     caller_idx: int,
+    unlinked_detail: str,
     global_internal_names: bool = False,
 ) -> SampleMetadataWriteResponse:
     """Upsert a metadata dict for a sample-family entity and shape the result.
@@ -280,6 +295,11 @@ async def write_and_map_sample_metadata(
     same-study, same-field, different-value rewrite is a last-writer-wins
     overwrite -- there is no If-Match on this path, so the caller accepts
     lost-update semantics.
+
+    unlinked_detail is the 404 body for a study link the database refuses at
+    write time; the caller supplies it because only the caller knows which idx
+    it named the entity by (an entity keying its metadata on a supertype idx
+    still answers under the idx the request carried).
     """
     try:
         # on_conflict="upsert" overwrites the caller's own study's value in
@@ -299,6 +319,18 @@ async def write_and_map_sample_metadata(
         )
     except SAMPLE_METADATA_WRITE_ERRORS as exc:
         await raise_http_for_sample_metadata_write_error(conn, exc)
+    except asyncpg.RaiseError as exc:
+        # The retired-link trigger tags its error DETAIL with a `trigger` key
+        # naming the raising DB function. Dispatch on that key (never on message
+        # prose) and re-raise every other RaiseError: several other guards on
+        # these tables share this SQLSTATE, and answering 404 for one of those
+        # would name the wrong cause. The link was writable when the caller was
+        # gated and is not now, so the answer is the gate's own 404 -- what a
+        # retry returns, and one status for one condition.
+        detail_fields = parse_kv_detail(exc.detail)
+        if detail_fields.get("trigger") == spec.metadata_retired_link_trigger:
+            raise HTTPException(status_code=404, detail=unlinked_detail)
+        raise
     return SampleMetadataWriteResponse(
         results={
             # scope is derived from internal_name on the wire model, so it is
