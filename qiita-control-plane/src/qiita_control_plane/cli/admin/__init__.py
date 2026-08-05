@@ -470,6 +470,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "is the direct/on-host form and is not reachable off-host."
         ),
     )
+    p_export.add_argument(
+        "--compress",
+        action="store_true",
+        help=(
+            "Ask the data plane to zstd-compress the DoGet stream. Off by"
+            " default because compression costs more time than it saves on a"
+            " fast link (break-even is around 4 Gbit/s), so it is a loss"
+            " on-host and a large win over the TLS edge from off-site. Output"
+            " files are identical either way."
+        ),
+    )
     p_export.set_defaults(handler=_handle_masked_read_export)
 
     p_readiness = sub.add_parser(

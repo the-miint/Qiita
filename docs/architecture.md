@@ -536,6 +536,35 @@ Client interfaces are the user-facing layer through which researchers and system
 - **DoPut**: upload data (stream RecordBatches to shared filesystem via FlightDescriptor, authorized by signed action token)
 - **DoAction**: register file (`ducklake_add_data_files`), delete by key, insert-from-processing-method (authorized by signed action token)
 
+### DoGet stream compression
+
+A DoGet client may ask for a zstd-compressed Arrow IPC body by sending the
+`qiita-ipc-compression: zstd` gRPC metadata header. **The default is
+uncompressed**, and an unrecognised value is rejected rather than ignored —
+a client that asked for compression and silently did not get it would draw the
+wrong conclusion about its own transfer. `zstd` is the only codec offered; LZ4
+measured at roughly half its ratio on every production shape.
+
+**Off by default is deliberate, and the reason is not obvious: compression makes
+a DoGet *slower* over a fast link.** Break-even is
+`bandwidth = encode_rate × (1 − 1/ratio)`, which measurement puts at ~4 Gbit/s —
+a 775 MiB alignment stream takes 0.65 s uncompressed over 10 GbE against 1.53 s
+with zstd, but 6.5 s against 2.9 s over 1 GbE. Every in-repo caller sits above
+that line (the control-plane runner reaches the data plane over loopback,
+compute jobs over the cluster fabric), so none of them sends the header. It is
+for clients on slow links — which is why `qiita-admin masked-read-export`, the
+one CLI that may run off-site, exposes it as `--compress`.
+
+The server cannot choose this itself: the deciding input is the *client's*
+bandwidth, and behind nginx the data plane cannot even see the client's address.
+gRPC's own `grpc-accept-encoding` negotiation is not the mechanism because the
+Flight protocol has no accept-encoding for IPC bodies — the codec is stamped
+into each record-batch message by the writer.
+
+Header name constants: `IPC_COMPRESSION_HEADER` in
+`qiita-data-plane/src/flight_service.rs` and its twin in
+`qiita-common/src/qiita_common/flight_constants.py`.
+
 ## Auth & Data Access Flow
 
 See [`docs/auth.md`](auth.md) for the principal model, login flow, scopes, endpoints, and runbooks.
