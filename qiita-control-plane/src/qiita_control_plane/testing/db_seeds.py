@@ -634,3 +634,49 @@ async def retire_biosample(
         biosample_idx,
         retired_by_idx,
     )
+
+
+async def seed_block_action_if_absent(pool: asyncpg.Pool, *, action_id: str, version: str) -> bool:
+    """Ensure a block-scoped `qiita.action` row exists; return True iff we made it.
+
+    For the REAL block action ids (`qiita_common.actions.BLOCK_MASK_ACTION_ID` /
+    `ALIGN_ACTION_ID`), which several DB-tier fixtures need because a block ticket's
+    kind is its action_id and both the dispatch pump and the read-mask finalize gate
+    key on it. A throwaway id would make those queries match nothing.
+
+    Unlike a per-test random id, `(action_id, version)` is a FIXED PK several test
+    modules share, so a fixture must neither collide with a row another test owns nor
+    delete one it did not create. Not a concurrency problem — each xdist worker gets
+    its own database and runs its tests serially — but an ORDERING one, across test
+    files in a session and across sessions (a crashed prior run, or a persistent
+    `QIITA_USE_HOST_POSTGRES=1` host DB, leaves the row behind). Hence
+    insert-if-absent plus a did-I-create-it answer: pass the return value to
+    `delete_block_action_if_created` in teardown and the row's lifetime matches its
+    creator's.
+    """
+    created = await pool.fetchval(
+        "INSERT INTO qiita.action"
+        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
+        " VALUES ($1, $2, 'block', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
+        "         1, 1, '1 minute', 'active', 'failed')"
+        " ON CONFLICT (action_id, version) DO NOTHING"
+        " RETURNING action_id",
+        action_id,
+        version,
+        '{"service": false, "human_roles": ["system_admin"]}',
+    )
+    return created is not None
+
+
+async def delete_block_action_if_created(
+    pool: asyncpg.Pool, *, action_id: str, version: str, created: bool
+) -> None:
+    """Teardown twin of `seed_block_action_if_absent`: drop the row only if that
+    call created it. A no-op when the row pre-existed, so a fixture never deletes
+    another test's action out from under it."""
+    if not created:
+        return
+    await pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+    )

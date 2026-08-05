@@ -610,6 +610,126 @@ def test_every_write_membership_step_declares_the_runner_contract_inputs():
     )
 
 
+# Steps pinned at their ceiling on an escalating axis, keyed `action_id:version`
+# → {step label: pinned axes}. Being listed either way means the FIRST OOM (or
+# TIMEOUT) of that step fails its ticket permanently at retry_count=0.
+#
+# TWO dicts, not one with a comment, because the difference is intent and a
+# future author has to make that choice deliberately: an entry is either a
+# decision we stand behind or a defect we owe a fix. The checker unions them, so
+# they behave identically — the split exists to keep the two from being confused
+# for one another, and to let the pending one empty to `{}` mechanically.
+#
+# Neither covers a baseline that EXCEEDS its ceiling. That is a different and
+# worse defect, rejected unconditionally by the second test below, and nothing
+# here can absolve it.
+
+# Deliberate: the step's YAML carries the reasoning at `baseline_resources`, and
+# a new entry belongs here only with the same. `align_sharded` sizes miint's
+# shard concurrency off cpu, which is pinned to the ceiling by design, and its
+# memory is sized to the same budget. Only the memory arm is given up — walltime
+# keeps headroom (PT4H under PT8H), so a TIMEOUT still escalates, which is why
+# the entry names one axis and not both.
+_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "align:1.0.0": {"align_sharded": ("mem_gb",)},
+}
+
+# NOT accepts — a defect being tracked rather than fixed right now, listed so the
+# guard can land ahead of the re-sizing (which needs measured peak-RSS data per
+# workflow rather than a blanket multiplier). Empty today: the six entries this
+# started with, across four workflow directories, were re-sized and so deleted.
+#
+# Raising a ceiling above its step baseline DELETES that entry from here — the
+# exact-equality check below then fails until it is gone, so a re-size cannot
+# silently leave its suppression behind. Nothing is added here except alongside
+# the work to remove it.
+_ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
+
+
+def test_every_shipped_step_can_escalate_on_both_retry_axes():
+    """No shipped workflow may pin a step's `mem_gb`/`walltime` at its
+    `action_ceiling` unless it is listed above.
+
+    A pinned axis silently disables retry: the runner grows the escalation floor
+    by a fixed factor and clamps it to the ceiling, so an equal pair leaves the
+    grown value unchanged, which the retry loop reads as saturation and fails the
+    ticket PERMANENTLY on attempt 0. That is invisible at author time, in the
+    per-workflow unit tests above, and at `qiita-admin actions sync` — it
+    surfaces only in production, as a work ticket dead at retry_count=0 with
+    RESOURCE_CEILING_EXHAUSTED.
+
+    Compared for EXACT equality against the union of the two lists, in both
+    directions: a newly-pinned step fails as an unexpected offender, and a listed
+    step whose workflow has since been re-sized fails as stale. The second half
+    is the point — a suppression that outlives its reason is how this defect
+    would quietly come back.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    expected = _ESCALATION_ACCEPTS | _ESCALATION_PENDING_RESIZE
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    observed = {
+        f"{a.action_id}:{a.version}": pinned
+        for a in actions
+        if (pinned := a.steps_without_escalation_headroom())
+    }
+
+    # Bucketed by which fix each drift needs, so a partial mismatch (a listed
+    # action that gained a SECOND pinned axis) is reported once, as the
+    # disagreement it is, rather than in two buckets with opposite advice.
+    newly_pinned = {k: v for k, v in observed.items() if k not in expected}
+    stale = {k: v for k, v in expected.items() if k not in observed}
+    changed = {
+        k: f"listed as {expected[k]}, YAML now declares {v}"
+        for k, v in observed.items()
+        if k in expected and v != expected[k]
+    }
+    assert observed == expected, (
+        "escalation headroom drift.\n"
+        f"  pinned at the ceiling and listed nowhere — raise the action's "
+        f"mem_gb/walltime ceiling above the step baseline, leaving the baseline "
+        f"alone so ordinary tickets schedule unchanged. If instead this is a "
+        f"defect you are tracking rather than fixing now, it goes in "
+        f"_ESCALATION_PENDING_RESIZE, not _ESCALATION_ACCEPTS: {newly_pinned}\n"
+        f"  listed but no longer pinned — delete the stale entry from whichever "
+        f"list holds it: {stale}\n"
+        f"  listed with different axes — re-decide the entry: {changed}"
+    )
+
+
+def test_no_shipped_step_declares_a_baseline_above_its_ceiling():
+    """No shipped workflow may declare a `baseline_resources` axis ABOVE its
+    `action_ceiling`. Unconditional — there is no accept list, because there is
+    no version of this that is ever intended.
+
+    The runner rejects an over-ceiling baseline per ticket, which makes such a
+    workflow one that cannot run at all: every ticket it accepts fails. Nothing
+    catches it when the YAML is loaded, so it ships.
+
+    Deliberately separate from the escalation-headroom guard above. That one
+    reports an over-ceiling axis too (it is `not (baseline < ceiling)`), but its
+    accept list would absolve it — an accept written to mean "this step knowingly
+    forgoes retry" would silently also cover "this step can never run" if the
+    accepted baseline later drifted past the ceiling.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    over = {
+        f"{a.action_id}:{a.version}": exceeded
+        for a in actions
+        if (exceeded := a.steps_over_ceiling())
+    }
+    assert not over, (
+        "these steps declare a baseline above their action_ceiling; the runner "
+        f"fails every such ticket at dispatch, so the workflow cannot run: {over}"
+    )
+
+
 def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     """All three fastq-to-parquet versions load and coexist: 1.0.0 (fastq only),
     1.1.0 (fastq + an OPTIONAL host_filter step), and 1.2.0 (fastq + ALWAYS-ON qc
@@ -743,7 +863,8 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     step is a container with the SIF filename Settings.path_derived_images
     resolves against; baseline_resources for bcl_convert uses the lookup
     population (from_step_output + profiles with the three supported
-    Illumina families); and action_ceiling matches the largest profile.
+    Illumina families); and action_ceiling leaves escalation headroom
+    above the largest profile.
 
     Locks the YAML shape so the runner's A4 resolution branch (the
     lookup vs flat split in qiita_control_plane.runner._dispatch_step)
@@ -806,13 +927,21 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # Flat-side fields are unset when the lookup population is used.
     assert br.cpu is None and br.mem_gb is None and br.walltime is None
 
-    # action_ceiling matches the largest profile (NovaSeq X). A future
-    # profile bump that exceeds this must update both axes in the same PR
-    # because the runner enforces resolved <= ceiling at dispatch.
+    # The largest profile (NovaSeq X) sits UNDER action_ceiling on both
+    # escalating axes. Equality here — which is what this asserted before —
+    # is the dead-ladder shape: escalation clamps to the ceiling, so an
+    # OOM/TIMEOUT on the NovaSeq X profile failed the ticket permanently at
+    # retry_count=0 instead of retrying larger. cpu is exempt (nothing
+    # escalates it) and stays equal. A future profile bump that exceeds the
+    # ceiling must raise it in the same PR, because the runner enforces
+    # resolved <= ceiling at dispatch; the escalating axes must clear it.
     novaseqx = br.profiles["Illumina NovaSeq X"]
-    assert bcl.action_ceiling.cpu == novaseqx.cpu == 16
-    assert bcl.action_ceiling.mem_gb == novaseqx.mem_gb == 480
-    assert bcl.action_ceiling.walltime == novaseqx.walltime == timedelta(hours=12)
+    assert novaseqx.cpu == 16
+    assert novaseqx.mem_gb == 480
+    assert novaseqx.walltime == timedelta(hours=12)
+    assert bcl.action_ceiling.cpu == novaseqx.cpu
+    assert bcl.action_ceiling.mem_gb > novaseqx.mem_gb
+    assert bcl.action_ceiling.walltime > novaseqx.walltime
 
     # context_schema gates on the operator-supplied BCL folder path; the
     # absolute-path pattern keeps the launcher from resolving against a

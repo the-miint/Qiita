@@ -10,7 +10,8 @@ work_files/. This step is our version of that pre-map, done with miint's embedde
 minimap2 instead of a container-local binary.
 
 Why this is its OWN native step. Each command in this workflow is one step —
-`assemble` (hifiasm_meta), `binning` (metawrap), `bin_refine` (dastool), `checkm`
+`assemble` (hifiasm_meta or myloasm), `binning` (metawrap), `bin_refine` (dastool),
+`checkm`
 — and the minimap2 pre-map is a distinct command from metawrap's binners, so it
 gets its own step, exactly as qp-pacbio splits its step 3 (`minimap2`) from step 4
 (`metawrap binning`). It is a `module:` (native) step rather than a container SIF
@@ -41,18 +42,19 @@ notes below are what a probe against the shipped build adds on top:
     length mismatches, jgi accepts with no warnings. This is why keeping secondaries
     (no `max_secondary := 0`, unlike syndna/host_filter) is safe here.
 
-THIS BAM IS NOT COORDINATE SORTED, and cannot be made so here. A BAM's sort order
-is on *tid* — the @SQ index — and the @SQ order miint's writer emits is not
-derivable from the REFERENCE_LENGTHS table's row order (probed; filed upstream as
-duckdb-miint#173, which asks for a defined or steerable @SQ order — see
-docs/duckdb-miint.md's "Open upstream gaps" table for the removal ticket). So no
-ORDER BY on either the reflen table or the copied relation can produce a
-coordinate sort, and none is attempted: whoever needs one runs `samtools sort`,
-which `binning.sh` does before staging this file for metaWRAP. Do not add a reflen
-ORDER BY back in the belief that it steers @SQ — an earlier version of this step
-did exactly that, called the BAM correct by construction, and cost a production
-ticket (jgi: "ERROR: the bam file 'reads.bam' is not sorted!").
-`tests/jobs/test_assembly_coverage.py` pins the finding.
+THIS BAM IS COORDINATE SORTED, by the `ORDER BY` on the COPY below. `binning.sh`
+stages it for metaWRAP as-is, so nothing downstream sorts it. A BAM is coordinate
+sorted on *tid*, the @SQ index, and miint emits @SQ sorted by reference name
+(<https://the-miint.github.io/duckdb-miint/writing/>), so ordering the copied
+relation by `reference, position` orders it by (tid, position) too. What jgi and
+`samtools index` do with an ordered vs an unordered file was measured against a
+control; docs/duckdb-miint.md's `FORMAT BAM` writer section records it.
+
+The REFERENCE_LENGTHS row order does not steer @SQ, so ordering that table changes
+nothing. An earlier version of this step ordered it and treated the result as
+sorted; @SQ was in hash-bucket order then, so the name `ORDER BY` was not a
+coordinate sort, and a production ticket died in jgi.
+`tests/jobs/test_assembly_coverage.py` pins both halves.
 
 WHY `SEQUENCE_DATA` IS NOT OPTIONAL. By default `FORMAT BAM` writes SEQ as `*`,
 and that silently corrupts the depth jgi reports. Coverage ramps DOWN at both
@@ -202,14 +204,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 ),
                 threads=_DUCKDB_THREADS,
             )
-            # NOTE: no `preserve_insertion_order=true` override. This job used to
-            # set one, to protect an ORDER BY on the COPY that was believed to make
-            # the BAM coordinate sorted. That belief was wrong (see the docstring),
-            # the ORDER BY is gone with it, and nothing downstream reads this file
-            # in record order — `binning.sh` sorts it. So the helper's `false`
-            # stands, and the writer's record order is whatever the engine
-            # produces. If a consumer ever needs a defined order here, sort at the
-            # consumer, not by re-pinning a global setting.
+            # NOTE: no `preserve_insertion_order=true` override, though the COPY
+            # below carries an ORDER BY the consumers depend on. This job once set
+            # that override to protect an ORDER BY, so the setting was measured
+            # against it at production scale, with the sort spilling: the two
+            # settings give the same tid-monotonic file. Numbers and conditions are
+            # in docs/duckdb-miint.md's `FORMAT BAM` writer section.
+            # `test_written_bam_is_tid_monotonic` runs this whole function, so the
+            # ORDER BY cannot stop reaching the writer without a test failing.
 
             # Persistent relations, not TEMP/CTE: miint's table functions resolve
             # relation names on a SEPARATE connection, which sees neither.
@@ -287,14 +289,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # see the module docstring. Without it SEQ is written as `*`, and
             # jgi silently reports a length-dependent under-estimate of depth.
             #
-            # No ORDER BY on the copied relation either, and this one had a price:
-            # it sorted a read-set-sized relation, which the memory split above
-            # says outright can spill to temp_directory. It bought a name order
-            # that is not the tid order, so it was never the coordinate sort it
-            # looked like, and its only consumer (`binning.sh`) re-sorts with
-            # samtools regardless.
+            # The ORDER BY is the coordinate sort: @SQ is name sorted, so this is
+            # (tid, position) order (see the docstring), and `binning.sh` stages
+            # the result without re-sorting it.
+            #
+            # It sorts one row per alignment. SEQ and QUAL are not in this relation
+            # (the writer fetches them per record from SEQUENCE_DATA), so the sort
+            # width is the identifier/CIGAR/tag columns rather than the read bytes;
+            # the row count scales with the read set. DuckDB spills it to
+            # temp_directory — the side of the memory split above that can spill.
             conn.execute(
-                f"COPY (SELECT * FROM {_ALIGNMENT}) "
+                f"COPY (SELECT * FROM {_ALIGNMENT} ORDER BY reference, position) "
                 f"TO '{bam_sql}' (FORMAT BAM, REFERENCE_LENGTHS '{_REFLEN}', "
                 f"SEQUENCE_DATA '{_SEQDATA}')"
             )

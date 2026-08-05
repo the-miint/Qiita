@@ -66,3 +66,36 @@ def test_params_values_are_real_inputs_fields(yaml_path: str, module: str, param
             f"{yaml_path}: params[{ctx_key!r}] -> {field_name!r} is not a field on"
             f" {module}.Inputs (have: {sorted(fields)})"
         )
+
+
+def test_align_cpu_pins_duckdb_threads():
+    """`align`'s `baseline_resources.cpu` must equal `align_sharded._DUCKDB_THREADS`.
+
+    For the sharded align the cpu allocation is spent by the ALIGNER's cross-shard
+    concurrency, not by DuckDB's own operators: miint derives `max_active_shards` from
+    DuckDB's thread pool and ignores its own `threads` argument in sharded mode. But
+    nothing derives that thread count from the cgroup — it is a module literal — so
+    the two numbers are a hand-maintained pair, and drifting them silently either
+    oversubscribes N concurrent shards onto fewer cores or leaves cores idle. Neither
+    fails; the job just runs at the wrong size, which is exactly the class of defect
+    the sizing work was about.
+
+    Deliberately scoped to `align` rather than asserted repo-wide: most native jobs
+    pick threads for DuckDB's per-thread operator memory (sort / HASH_AGG state) and
+    legitimately differ from their `cpu:` — at the time of writing nine steps do,
+    e.g. `hash_sequences` (cpu 4 / threads 8) and `assembly_coverage` (cpu 16 /
+    threads 8, capping DuckDB so the extension work gets the rest). Generalizing this
+    pin would fail all of them for no reason.
+    """
+    align_yaml = _WORKFLOWS_DIR / "align" / "1.0.0.yaml"
+    data = yaml.safe_load(align_yaml.read_text())
+    steps = [e for e in data["steps"] if e.get("step") == "align_sharded"]
+    assert len(steps) == 1, f"expected exactly one align_sharded step, got {len(steps)}"
+    cpu = steps[0]["baseline_resources"]["cpu"]
+
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.align_sharded")
+    assert cpu == mod._DUCKDB_THREADS, (
+        f"{align_yaml.name} baseline cpu={cpu} but align_sharded._DUCKDB_THREADS="
+        f"{mod._DUCKDB_THREADS}; these size the same thing (miint's concurrent-shard"
+        " count) and must be changed together"
+    )

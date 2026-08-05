@@ -148,7 +148,17 @@ steps:
     inputs: []
     outputs: []
 
+# Ceiling must stay strictly ABOVE every step baseline on the escalating axes
+# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
+# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
+# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
+# are unchanged here; cpu/gpu never escalate.
+#
+# Matches read-mask/1.0.0, whose qc -> host_filter chain this mirrors and which
+# carries the measured traffic; see there for the sizing (host_filter peaks at
+# 25.8 GB against a 32 GB baseline). This workflow is enabled but idle today, so
+# the raise is what keeps a first OOM survivable whenever it does take traffic.
 action_ceiling:
   cpu: 8
-  mem_gb: 32
+  mem_gb: 64
   walltime: PT8H

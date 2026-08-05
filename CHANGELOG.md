@@ -88,6 +88,141 @@ duplicates further down are historical strata; leave them where they are.
   A field of that name already on the study is a 409; the 201 body is the created
   field, with a linked field's inherited `data_type`/`required`/`terminology_idx`
   resolved on read.
+
+- **A runtime control surface for the fan-out dispatch throttle (#406).** The
+  per-cohort in-flight cap was a single boot-time global (`FANOUT_MAX_INFLIGHT`), so
+  retuning one fan-out meant editing an env file and restarting the control plane —
+  which, with in-flight tickets, costs an unthrottled resume of every one of them.
+  Three routes on the work-ticket router, all reusing `work_ticket:cancel`
+  (system_admin, no new scope): `GET /work-ticket/fanout` lists every cohort with
+  held or in-flight children and its throttle state; `PATCH
+  /work-ticket/fanout/{kind}/{key}` sets or clears that cohort's cap **and pumps it
+  in the same call**; `POST /work-ticket/fanout/{kind}/{key}/pump` re-triggers a pump
+  without changing the cap. Pumping inline is the feature, not a convenience: the
+  pump is edge-triggered (a child's terminal transition, or startup reconcile), so a
+  route that only recorded the cap would look inert until unrelated work finished.
+  Every response carries the full status block, so `released: []` is never ambiguous
+  — `fail_stopped` distinguishes "frozen by a failed child" from "no free slots".
+  The override is deliberately **in-memory and process-local**: a restart reverts to
+  the `FANOUT_MAX_INFLIGHT` default, which is the conservative direction for the
+  raise-the-cap case this serves, and it avoids a migration for an incident-time
+  knob. Capped at 100 (`MAX_FANOUT_OVERRIDE`), enforced at the request model, the CLI
+  flag, and the registry — the throttle exists because ~1000 concurrent data-plane
+  streams exhausted its file descriptors, and a typo'd `1000` would walk back into
+  that. Driven by `qiita-admin fanout {list,set,pump}`, whose stderr summary names a
+  fail-stopped cohort explicitly and spells out the other reason for a zero.
+
+- **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
+  system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
+  an `ATTACH` from the service env files — risking a writable attach against the live
+  lake — or borrowing a service account. This attaches both catalogs `READ_ONLY`:
+  `qiita_lake` (DuckLake) and `qiita_cp` (Postgres, tables under `qiita_cp.qiita.*`),
+  so one query can join lake data to control-plane metadata while DuckDB rejects every
+  write. **It is a debugging tool, not a data-access path**: it bypasses every
+  authorization check the API enforces and therefore sees all studies, so read-only is
+  not permission — treat what it shows as confidential. Not an export path, not a
+  user-facing query interface.
+
+  Needs no root: the group-reads the operator already grants on
+  `/etc/qiita/data-plane.env` (`root:qiita-data`) and `PATH_PERSISTENT/ducklake`
+  (`qiita-data:qiita-data`) suffice, and a `READ_ONLY` attach performs no catalog
+  writes at all. miint is loaded from the deploy-staged `MIINT_EXTENSION_DIRECTORY`
+  (read from `control-plane.env`, else `compute-orchestrator.env`) so queries behave as
+  they do in a job — it is a core dependency, so failing to load it is a hard error and
+  the shell refuses to open; core `httpfs` is loaded too. Passwords are split into a
+  0600 `PGPASSFILE` and never reach the generated SQL or `argv`
+  (`qiita_split_conn_password` in `deploy/_common.sh`, unit-tested). Starts at 4 threads
+  / 32GB rather than DuckDB's all-cores/80%-of-RAM defaults, since it shares a host with
+  the services. `qiita_cp` is reachability-probed before attaching — the duckdb CLI
+  aborts its whole init file on the first error, so a control-plane outage would
+  otherwise cost the lake shell too — and is skipped by `--no-cp` or an unreadable
+  `control-plane.env`.
+
+- **A dead escalation ladder is now caught at build time, not in production
+  (#416, closes #412).** A workflow whose `action_ceiling` equals its heaviest
+  step's `baseline_resources` silently disables OOM/TIMEOUT retry for it: the
+  runner grows the escalation floor by a fixed factor and clamps it to the
+  ceiling, so an equal pair leaves the grown value unchanged, which the retry
+  loop reads as saturation and fails the ticket **permanently at
+  `retry_count=0`** with `RESOURCE_CEILING_EXHAUSTED`. Nothing caught that — not
+  the model, not the loader, not `qiita-admin actions sync` — so it surfaced only
+  as a live incident. `ActionDefinition.steps_without_escalation_headroom()`
+  reports every step whose `mem_gb`/`walltime` is not strictly below the ceiling
+  (checking each lookup profile independently, so bcl-convert's NovaSeq X is
+  distinguishable from its iSeq), and a new test enumerates every shipped YAML
+  against it. `cpu`/`gpu` are exempt — nothing escalates them, so
+  long-read-assembly's deliberate `cpu: 32` pin is not a finding. The list is
+  matched for **exact** equality in both directions, so an entry whose workflow
+  was since re-sized fails as stale rather than quietly outliving its reason.
+  The six action versions carrying the defect today — across four workflow
+  directories, `fastq-to-parquet` contributing three (#411) — are listed as
+  known-pending in a separate dict rather than fixed here, so re-sizing each one
+  (which needs measured peak-RSS data per workflow, not a blanket multiplier)
+  must delete its entry to go green. `align/1.0.0` is the one genuine accept,
+  documented at the step itself.
+  This closes the **YAML-authored** half of the defect; a
+  `resource_override.mem_gb` submitted equal to the ceiling still reproduces it
+  at runtime, on a workflow this guard passes.
+
+- **A baseline above its ceiling is now caught at build time too (#416).**
+  `ActionDefinition.steps_over_ceiling()` plus an unconditional test — no accept
+  list, since a workflow whose every ticket fails at dispatch is never intended.
+  Split from the headroom guard deliberately: an accept meaning "this step
+  knowingly forgoes retry" would otherwise silently also cover "this step can
+  never run" if the accepted baseline later drifted past the ceiling.
+
+- **`qiita submit-align-pool`: a CLI for starting an alignment (#400, closes #396).**
+  `align-plan` was the only pool-scale entrypoint with no client — the sole way to
+  align a pool was a hand-rolled `curl` with a hand-built JSON body, while its
+  sibling `submit-block-mask-pool` has had a CLI all along. Same thin-client shape:
+  sample selection, aligner choice, reference readiness and block size are all
+  resolved server-side, so it validates nothing the server owns and just POSTs.
+  Takes `--sequencing-run-idx`, `--sequenced-pool-idx`, `--reference-idx`,
+  `--mask-idx`, `--only-missing`. The stderr summary names the planned/skipped
+  breakdown **and the per-block read count** — block size is resolved server-side
+  from the platform, so the plan response is the first place it is observable, and a
+  pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
+  per block later.
+
+- **Two DuckDB memory behaviours job code reasons about are now pinned by test
+  (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
+  in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
+  `temp_directory` and succeeds** rather than failing (so a materialized relation that
+  does not fit is a performance problem, not an OOM), and `DROP TABLE` **returns the
+  table's bytes to the buffer manager immediately** rather than deferring the release
+  to connection close (so dropping a large intermediate mid-job does something). Both
+  were prose-only arguments in job comments before this.
+- **`long-read-assembly`: the `myloasm` assembler option is implemented (#380).**
+  Selecting `assembler: myloasm` previously exited 64 ("not implemented in this
+  image yet"); it now runs `myloasm --hifi` and splits circular (LCG) from linear
+  (noLCG) contigs. The two assemblers **disagree on how circularity is encoded**,
+  so this is a real branch rather than a second tool behind the same tail:
+  hifiasm-meta puts it in the GFA segment name (`…tg……c`), myloasm puts it in the
+  `assembly_primary.fa` header (`_circular-yes`) and marks nothing in its GFA.
+  Reusing the hifiasm regex would have matched nothing and silently demoted every
+  closed genome to binning input, so the split is a separate `myloasm_split.py`
+  that unit tests execute against real myloasm headers. It reads with miint's
+  `read_fastx` and writes with `COPY … (FORMAT FASTA)` — no hand-rolled FASTA
+  parser — and **LOADs the deploy-staged extension** rather than a copy baked into
+  the image, so the assemble container runs the byte-identical miint the CP/CO/DP
+  run. The staged directory reaches the container through the assemble step's new
+  `derived_inputs: {MIINT_EXTENSION_DIRECTORY: duckdb-ext}` (read-only bind), which
+  is the existing per-step mechanism — `slurm/payload.py` still does not forward
+  native-only miint env to containers. Consequence: the image's DuckDB is now in
+  **lockstep** with the orchestrator's, because DuckDB namespaces the staged
+  extension dir by engine version + platform; `assemble.def` pins
+  `python-duckdb=1.5.4` and a unit test fails if it ever diverges from
+  `qiita-compute-orchestrator/uv.lock`. Only `circular-yes` counts as circular
+  (`circular-possibly` routes to noLCG, the recoverable direction), and the contig
+  id is cut at `_len-` so the bin_id carries no per-run coverage statistics (the
+  discarded `depth-` field was probed to vary between read samplings of the same
+  genome). An unrecognised header shape, a duplicate contig id, or a missing
+  `assembly_primary.fa` after a zero exit each fail the step (exit 64) instead of
+  yielding an empty `circular.fa` or a silent no-data ticket. hifiasm_meta and
+  myloasm now live in **separate conda envs** in the image so the unpinned hifiasm
+  solve cannot make the pinned myloasm one unsatisfiable. myloasm is pinned to
+  0.6.0 (the version the header format was probed on), asserted in `%test` and by
+  the SIF spec's `VERIFY_MATCH`.
 - **First-class per-sample `mask_sample` completion gate + `finalize-mask-sample` action (#371).**
   The per-sample read-mask workflows (`read-mask/1.0.0`, `fastq-to-parquet/1.3.0`)
   now record masking completion in `qiita.mask_sample` first-class, via a new
@@ -360,6 +495,362 @@ duplicates further down are historical strata; leave them where they are.
   whose link is retired. The existing trigger functions are reused unchanged.
   Enforcing this in the database also closes the window between a caller's link
   check and its write, which no application-level check can make atomic.
+
+- **`assembly_coverage` writes its BAM coordinate sorted, and `binning.sh` stages it
+  instead of running `samtools sort` over it (#422, closes #374).** The sort ran unconditionally
+  on every long-read-assembly ticket — 19 s wall and 11.1 GiB peak RSS at 16 cpu,
+  measured inside the binning image on the 2.0 GB BAM that first exposed the problem
+  (~13.5 s on the ticket itself) — and it existed only because miint's `@SQ` order
+  was then derivable from nothing, so no `ORDER BY` the step could write made the file
+  sorted. `@SQ` is now sorted by reference name
+  ([duckdb-miint#173](https://github.com/the-miint/duckdb-miint/issues/173)), so tid
+  order is name order and the step's `ORDER BY reference, position` on the `COPY` is a
+  genuine coordinate sort. The sort is one row per alignment and carries no read bytes
+  (SEQ/QUAL come from `SEQUENCE_DATA` at write time), and DuckDB spills it — the side of
+  that step's memory split that is allowed to.
+
+  **Measured against the consumers, not inferred from the header order**, on the binning
+  image's own pins (metabat2 2.15, samtools 1.10), with the same BAM written without the
+  `ORDER BY` as the control: `jgi_summarize_bam_contig_depths` rejects the control
+  ("the bam file is not sorted!") and accepts the ordered file, reporting a
+  depth/variance matrix identical to the one it produces from a `samtools sort` of that
+  same file; `samtools index` — which metaWRAP's concoct block runs — likewise fails on
+  the control and succeeds on the ordered file, despite miint writing no
+  `@HD SO:coordinate` tag ([duckdb-miint#202](https://github.com/the-miint/duckdb-miint/issues/202)).
+  And at production scale, since a small write cannot exercise a parallel sink: 2M records
+  over 20k references (the ticket had 925,483 over 20,975) with `threads=8` and the sort
+  spilling came out fully tid-monotonic under `preserve_insertion_order=false` — identical
+  to the `=true` control, against 999,778 backsteps for the same relation written without
+  the `ORDER BY`. So the `preserve_insertion_order=true` override this job once carried
+  "solely to protect that ORDER BY" is not reinstated. Pinned by
+  `test_written_bam_is_tid_monotonic`, which runs the real step on a 13-contig fixture
+  with shuffled reads and goes red (38 of 72 records backwards) if the `ORDER BY` is
+  deleted; the 3-contig fixture that let the original defect through orders identically
+  whichever way you look at it.
+
+  The staged file is a plain copy: `coverage_bam`'s directory and `QIITA_OUTPUT_PATH` are
+  separate apptainer `--bind`s and `link()` refuses to cross a mount even within one
+  filesystem (measured), and `LocalBackend` — the one backend that could have shared a
+  mount — refuses container steps. So the second reads-sized artifact remains; what goes
+  away is the sort's CPU, RSS and spill. **`binning.sh`'s assembly-FASTA reordering stays
+  and is unaffected**: metabat2 requires the depth matrix and the assembly in the same
+  contig order, `@SQ` is name-sorted while the assembler emits numeric order, and ordering
+  records does not move an `@SQ` line. `test_binning_coverage_sort_pin.py` becomes
+  `test_long_read_assembly_entrypoint_pins.py`, covering the bin_refine/checkm/image pins
+  in it as well as the staging ones.
+
+- **Both services now narrate one unconditional line at boot, and the deploy check for
+  it can actually fail (#406).** Review found the CO half of that check passing on
+  nothing: it grepped the journal for a bare `INFO ` and got the same result — no match
+  — on a healthy CO and on one with `configure_logging()` stubbed out, so an operator on
+  a correct deploy would conclude the fix had not landed. Two independent causes, both
+  reproduced. uvicorn's formatter emits `INFO:` plus padding, which a trailing-space
+  pattern excludes; and the CO had no unconditional boot INFO at all, its only two
+  `.info()` sites being work-triggered (a SLURM JWT inside its refresh margin, a miint
+  re-stage), so an idle CO narrated nothing. Both lifespans now log one line naming the
+  resolved log level — the CO's also names its compute backend, the CP's its fan-out
+  default — and `configure_logging()` returns the level it resolved so they can. The
+  check greps the **dotted logger name**, which only a configured root logger produces:
+  verified against a real uvicorn boot in both arms (as-shipped matches, pre-fix does
+  not). Dropping the space instead would have been the worse fix — it matches uvicorn's
+  own lines and would pass on a service still carrying the bug.
+
+- **A fan-out override lowered below the default was silently undone by a restart
+  (#406).** The revert-to-default on restart was documented as "the conservative
+  direction", which holds for the raise case the surface exists to serve and not for the
+  other one: a cohort capped at 2 came back at 8 after a restart — 4× what the operator
+  set — because `reconcile_inflight_tickets` re-pumps every held cohort with
+  `settings.fanout_max_inflight` and the registry is already empty by then. Still
+  deliberately in-memory (an incident knob, not durable state), but no longer silent:
+  `set_override` now WARNs when it records a cap below the default, naming the cohort and
+  both numbers, and the asymmetry is spelled out where someone hits it rather than read
+  as true in both directions. The restart is not necessarily operator-initiated — both
+  units are `Restart=on-failure`, so the plausible case is a crash during the very
+  incident being throttled. Both directions are pinned by a two-arm test, since the whole
+  design rests on these semantics.
+
+- **`GET /work-ticket/fanout` hid an override the moment its cohort drained (#406).**
+  Nothing evicts from the override registry except an explicit clear, while the listing
+  showed only cohorts with held or in-flight children — so an override became
+  unenumerable at exactly the point it turned into a surprise, still set and still
+  reapplying if that `(kind, key)` were ever re-run, with no surface left to show it. An
+  operator who set three during an incident could not ask "what have I set?". The listing
+  now unions in every overridden cohort, deduped by identity; a drained one appears with
+  zero counts and a non-null `override`, and `qiita-admin fanout list` flags it as
+  clearable. Also hardened `_cohorts_matching`'s trust boundary from a docstring into an
+  assert over the two module-constant predicates, so a later refactor that threads
+  caller input into that interpolated SQL fails at once instead of opening an injection.
+  Two remaining review findings are deferred rather than silently dropped: the hand-typed
+  work-ticket state literals in this module (#424) and the multi-acquisition read behind
+  this listing (#425).
+
+- **Neither Python service configured logging, so every `_log.info` was silently
+  dropped in production — and the Authorization scrubber was inert (#406).** The CP
+  and CO both called `install_authorization_scrub()` but nothing ever configured the
+  root logger. Records from module loggers therefore fell through to Python's
+  `lastResort` handler, which is WARNING-only, so the services' entire operational
+  narration — fan-out pump decisions, dispatch lifecycle, sweeper passes — never
+  reached the journal. Diagnosing a frozen alignment fan-out took an afternoon
+  because the pump's own `fail-stop` line was among the invisible ones. Worse,
+  `install_authorization_scrub()` walks `root.handlers` and uvicorn installs its
+  handlers on its own loggers, so with root empty the loop body never ran: the filter
+  that keeps `Bearer` tokens out of logs was attached to nothing in both processes.
+  New `qiita_common.log.configure_logging()` installs a root handler and sets the
+  level from an optional `LOG_LEVEL` (default INFO; an unknown name fails the boot
+  rather than silently reverting), called first in both lifespans. It now covers
+  everything that propagates to root, including `httpx`; `uvicorn` and
+  `uvicorn.access` keep `propagate=False` and stay outside it (#408).
+
+- **A fan-out cohort could be stranded with no way to recover it (#406).** Two
+  distinct paths. `_pump_ticket_cohort` swallowed pump failures on the theory that
+  "the next child's completion will re-attempt it" — false at the tail of a fan-out,
+  where the failing child was the last in flight, every remaining ticket is held, and
+  no terminal transition is left to re-trigger anything; only a CP restart recovered.
+  It now retries once and then logs an ERROR naming the cohort. Separately,
+  `top_up_dispatch` commits its release *before* dispatching, so a raise partway
+  through the dispatch loop abandoned the rest of the batch in the one unrecoverable
+  state: no longer `dispatch_held` (so no pump would re-release it) yet never
+  dispatched, while still counting as `running` and so reading as healthy. Each
+  dispatch is now individually guarded, naming the casualty and its `POST
+  /work-ticket/{idx}/run` recovery. The pump's `fail-stop` message also moved
+  INFO → WARNING: a frozen fan-out is operator-actionable and at INFO was
+  indistinguishable from an ordinary "no free slots".
+
+- **`make lake-shell` could not start under bash 3.2, which left CI red on macOS (#406,
+  fixing #418).** `add_pgpass_entry`'s seen-set was an associative array. bash 3.2 — what
+  macOS ships as `/bin/bash`, and what `test_deploy_scripts.py` runs the script under on
+  the mac runner — has none, so the shell died at `declare: -A: invalid option` before
+  reaching any of its own error paths, and the test asserting a *specific* hard failure
+  saw exit 2 instead of 1. It is now two parallel indexed arrays with a linear scan,
+  bounded by an explicit count rather than `${#array[@]}`, because bash 3.2 under `set -u`
+  treats an empty array as unset; a single delimited-string map would have needed escaping
+  the scan does not, since a password may hold any byte. Verified against bash 3.2.57 —
+  both the seen-set semantics and the end-to-end refusal path. No live behaviour changes:
+  the deploy host is Linux. Carried in this PR because it also blocked its CI.
+
+- **An escalated memory/walltime floor now survives a restart or a redrive, instead
+  of restarting the ladder from the YAML baseline (#415, closes #413).** The floor
+  `_run_entry_with_retry` climbs on an OOM/TIMEOUT retry lived only in a local
+  variable, so a control-plane restart or a `/run` redrive discarded it and the
+  ticket re-burned a failing attempt getting back to a size it had already reached.
+  Observed on `long-read-assembly` tickets 6978 / 6980 / 6989: each auto-escalated
+  `assemble` from 192 GB to 384 GB, then came back at 192 GB after the redrive and
+  had to OOM again (~40 min apiece) before re-climbing. Deriving the floor from
+  `work_ticket_step` history would not have covered it — the redrive DELETEs every
+  `failed` row in the same transaction as the state reset — so the floor is now
+  persisted on the ticket itself, in a new `qiita.work_ticket.escalated_resource_floor`
+  JSONB column keyed **per step**, so a ticket that learned `assemble` needs 384 GB
+  doesn't also hand 384 GB to `bin_refine` (YAML: 32) the way the ticket-wide
+  `resource_override` would. Both escalating axes are covered, written independently
+  and merged, so raising the memory floor never drops a walltime floor the same step
+  learned earlier. On a CP restart the saving is more than wall-clock: `retry_count`
+  survives a resume while the floor did not, so the re-climb also spent a rung of a
+  3-rung budget. The column's own `COMMENT ON` carries the semantics, including how
+  to clear it.
+
+- **Drop the GFF `+ 1` now that miint normalizes `read_gff` to half-open (closes #410).**
+  `read_gff` / `read_ncbi_annotation` used to emit GFF3's closed `end` under the same
+  `stop_position` column every other miint reader uses for a half-open one;
+  [duckdb-miint#200](https://github.com/the-miint/duckdb-miint/pull/200) normalized them.
+  `hash_sequences._write_annotation_manifest` compensated with its own `+ 1`, which became a
+  silent double-conversion once the mirror picked that up — every annotation interval one base
+  too long, no error. Stored values are unchanged from before the upstream fix, so nothing
+  already ingested is affected, and the capability is not in production use yet. Its
+  `WHERE type IS NOT NULL` guard goes too: `read_gff` now honours `##FASTA`
+  ([duckdb-miint#186](https://github.com/the-miint/duckdb-miint/issues/186)).
+
+- **Re-pin the `@SQ` contract tests: miint now sorts `@SQ` by reference name
+  ([duckdb-miint#173](https://github.com/the-miint/duckdb-miint/issues/173)).** The two canaries
+  in `test_assembly_coverage.py` exist to fail when `@SQ` gains a defined order, and did; they
+  now pin the order rather than its absence. `binning.sh`'s `samtools sort` and FASTA reordering
+  **stay** — `assembly_coverage` applies no `ORDER BY`, so its output is unsorted regardless, and
+  retiring them needs measuring against metabat2 (#374). The test helper that hand-parsed the BAM
+  binary header is replaced by `read_alignment_header`
+  ([duckdb-miint#174](https://github.com/the-miint/duckdb-miint/issues/174)).
+- **Six workflows had `action_ceiling` equal to their heaviest step's baseline,
+  silently disabling OOM/TIMEOUT retry (#420, closes #411).** With `baseline == ceiling`
+  the escalation helpers (`_escalated_mem_floor_after_oom` /
+  `_escalated_walltime_after_timeout`) grow the floor and clamp it to the ceiling, so the
+  grown value never exceeds the resolved one; the runner reads that as saturation and
+  raises `RESOURCE_CEILING_EXHAUSTED` **permanently, at `retry_count=0`, without ever
+  retrying** — the same shape that made a single `assemble` OOM unrecoverable in
+  `long-read-assembly` (#393). Each ceiling now sits above its heaviest step on the
+  escalating axes: `bcl-convert/1.0.0` 480→500 GB and PT12H→P1D (dead on *both* axes for
+  the NovaSeq X profile), `fastq-to-parquet/1.1.0` and `1.2.0` 16→32 GB and PT4H→PT8H,
+  `fastq-to-parquet/1.3.0`, `read-mask/1.0.0` and `read-mask-block/1.0.0` 32→64 GB.
+  **Every step baseline is unchanged**, so ordinary tickets request exactly what they did
+  before and schedule identically — only a *failing* step climbs. `cpu`/`gpu` are
+  untouched: nothing escalates them, so a step whose cpu equals the ceiling gives nothing
+  up. `align/1.0.0` keeps its documented accept. Also raises the admin
+  `resource_override` envelope, which is bounded by the same ceiling.
+  Sized from `sacct` on the `qiita` partition rather than a blanket multiplier: NovaSeq X
+  demuxes peak at 364.7/282.2 GB against a 480 GB request; `host_filter` OOM-kills at
+  16 GB and completes at 32 GB peaking at 22.0/22.6/25.8 GB — real demand, since
+  `host_filter` deliberately does not size DuckDB from the cgroup. All of it measured on
+  `read-mask/1.0.0` (4558 tickets), which carries essentially all `host_filter` traffic;
+  the module is shared, so the sizing carries to the other workflows that run it. `bcl-convert`'s 500 is
+  the node bound (`RealMemory=514000` MB, no `MemSpecLimit`; a 500 GB request is confirmed
+  schedulable on the partition), so its rung is +4%, not a doubling: strictly better than
+  a terminal first OOM, but not a guaranteed save. `cpu` stays 16 there deliberately —
+  more threads would raise memory demand, and memory is the axis already at the node bound.
+  Step *baseline* sizing is deliberately out of scope — `fastq-to-parquet/1.1.0` and
+  `1.2.0` keep a 16 GB `host_filter` baseline and so still pay an OOM plus a retry to
+  reach 32; raising a baseline changes what every healthy ticket requests, which is a
+  separate call from giving a failing one somewhere to climb. Note `1.0.0`/`1.1.0`/`1.2.0`
+  are disabled in `qiita.action` with no live tickets: their raise is insurance against a
+  future re-enable restoring a dead ladder, not a fix for traffic. Retiring them outright
+  is the better answer and is deliberately not attempted here — `actions sync` has no
+  prune path, so it needs a DB call as well as a YAML deletion.
+- **The six workflows tracked in `_ESCALATION_PENDING_RESIZE` are re-sized, so that dict
+  is now empty (#420, closes #411).** #421 landed the build-time guard and listed the six
+  defective versions there rather than fixing them, because re-sizing each needs measured
+  peak-RSS data per workflow. Raising their ceilings deletes their entries — the guard's
+  exact-equality check fails while a suppression outlives its reason, so the two changes
+  interlock rather than merely coexisting. The dict itself stays, empty: the guard's
+  failure message points a future tracked-but-unfixed defect at it.
+- **Single-end blocks no longer pay double the rype index reads: the routing classify
+  gets `sequence1` alone.** `align_sharded` and `host_filter` both handed
+  `rype_classify` a relation with a `sequence2` column that is entirely NULL for
+  single-end (PacBio HiFi) data. miint derives rype's `is_paired` from the column's
+  **presence**, never its values (`ValidateSequenceTable`) — where the RYpe CLI derives
+  it from **content** — so rype assumed a query twice as long and **halved its Arrow
+  batch size**, and it reloads the whole index once per batch. That CLI/miint asymmetry
+  is why the bug survived: a `rype classify run` on the same Parquet reports
+  `is_paired: false` and the un-halved batch, so a CLI reproduction looks healthy. On a 750k-read HiFi block against the 193 GB `w=20` WoL3 router that
+  turned 2 full index reads into 4, at ~54 min each: **~1.8 h of a 4 h walltime budget,
+  spent re-reading the index**. Both jobs now project a narrowed view
+  (`align_sharded._ROUTING_QUERY`, `host_filter._RYPE_QUERY`); the aligners keep both
+  mates, since `is_paired` reaches rype only through batch sizing and never through
+  `rype_classify_arrow`. Filed upstream as
+  [duckdb-miint#199](https://github.com/the-miint/duckdb-miint/issues/199) (derive
+  `is_paired` from content) and
+  [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
+  per invocation — index load is 98.4% of classify wall clock); removal of our
+  workaround tracked at #403.
+- **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
+  Establishes one invariant across the runner and the redrive route: **only a LIVE
+  attempt is adoptable.** Both defects below were latent until a step could have
+  more than one attempt — an OOM-killed step used to fail permanently at attempt 0,
+  so neither path was ever exercised. Together they killed three
+  `long-read-assembly` tickets whose `assemble` had OOM-escalated: each died with
+  `manifest.json missing (…/assemble/attempt-0/output/manifest.json)` while its
+  escalated attempt-1 job sat queued and untouched.
+  - **Resume adopted a terminated attempt.** The per-invocation `attempt` counter
+    restarts at 0, so a control-plane restart re-entered a step at attempt 0 even
+    when attempt 1 was live. `_attempt_is_unowned` only asks whether a row *exists*,
+    so a terminal `failed` row read as "owned" and the runner re-attached to the
+    ENDED job. slurmrestd had purged it, so the poll loop's filesystem tiebreaker
+    synthesized COMPLETED and verified the dead attempt's workspace — which has no
+    manifest precisely because that attempt failed — failing the ticket with a
+    CONTRACT_VIOLATION. A new `_attempt_is_terminal` predicate skips any attempt
+    already terminal, so recovery lands on the live one. Skipping now also consults
+    the retry budget, which the fresh-submit path would otherwise bypass (it never
+    passes through the `except BackendFailure` arm that enforces `max_retries`).
+  - **`/run` deleted in-flight progress rows.** The redrive dropped every
+    non-`completed` row, justified by "a FAILED ticket has no in-flight job" — no
+    longer true, since escalation can leave attempt N+1 `submitted` with a real
+    `slurm_job_id` while the ticket fails. Deleting that row orphaned the job
+    permanently (adoption re-attaches by exactly that persisted id). The redrive now
+    keeps a live row **when it names an adoptable job**: `completed` survives for
+    fast-forward, `failed` is always dropped, an in-flight row with a job id
+    survives a FAILED redrive, and two carve-outs still drop it — after a CANCEL
+    (whose reap already killed the job, so adopting it would reproduce the same
+    failure through a live row) and for a write-ahead `submitting` row with no
+    persisted id (whose find-by-name closer only runs under `resume=True`, so
+    keeping it would let a fresh submit collide with a possibly-live orphan in the
+    same attempt dir).
+  - `TERMINAL_STEP_PROGRESS_STATES` / `LIVE_STEP_PROGRESS_STATES` join
+    `TERMINAL_WORK_TICKET_STATES` in `qiita-common`, derived the same
+    name-the-terminal-side-and-complement-it way, so a new `StepProgressState`
+    becomes adoptable only by an explicit edit.
+- **`docs/duckdb-miint.md` audited against a built extension; stale warnings that cost us work are gone (#401).**
+  Every claim re-verified against duckdb-miint `97a3fff`. All 84 functions the file
+  named still exist and nothing had been removed upstream — the damage was mirrored
+  upstream detail going stale, plus warnings for bugs since fixed. Removed advice that
+  was actively wrong: `alignment_slice` does **not** coerce `read_id` to VARCHAR (fixed
+  upstream in `e739376`, so the "cast back" advice would have broken the join it claimed
+  to fix); the GPL boundary hosts **only** bowtie2 + FastTree, so `merge_pairs_vsearch`,
+  `detect_chimera_uchime*`, `cluster_sequences_vsearch`, `search_sequences_vsearch`,
+  `align_mafft` and `align_sortmerna*` need no `install_gpl_boundary()`; and
+  `save_bowtie2_index` **does** require it, where the file said the opposite. Every
+  filename in the upstream docs map was dead after miint's 2026-07 docs reorg, and the
+  documented refresh script `curl -fsSL`'d all of them — silent 404s, exit 0 — which is
+  why the rot went unnoticed. The hand-maintained embedded-tool version table is
+  replaced by `miint_versions()` (it claimed WFA2-lib 2.3.5 against a 2.3.6 build), and
+  the file now leads with a catalog-first recipe: `duckdb_functions()` answers existence,
+  named params, overload arities and macro bodies, with COPY writers called out as the
+  one blind spot. Filed the-miint/duckdb-miint#186 (`read_gff` does not stop at
+  `##FASTA`) and #188 (QC bracket notation implies partial arg lists that don't exist);
+  signposts #196 (make miint's surface self-describing).
+- **`qiita reference load --shard-index` now requires `--genome-map`, failing fast instead of after a full ingest (#324).**
+  Without a genome map, `plan-shards` derives zero genome-bearing features from
+  `qiita.feature_genome` and fails with `N=0` ("reference … has no genome-bearing
+  features to shard") after hash → mint → load → register-files have all run —
+  observed in production on Web-of-Life 3 after an ~18h load. A CLI guard fires
+  before any network call, and an `if/then` conditional in both reference-add
+  workflow schemas catches direct `POST /work-ticket` submissions that bypass
+  the CLI. The existing `plan-shards` `N==0` guard is retained as backstop.
+- **`reference-add` / `local-reference-add` schemas now validate `gff_upload_idx` / `gff_path` (#324).**
+  Restructuring the `not:` block into an `if/then` for the `shard_index` guard
+  re-parented `gff_upload_idx` and `gff_path` from inert unknown keywords into
+  declared `properties`. With `additionalProperties` unset, the GFF keys were
+  previously accepted without type or range checking; a malformed GFF handle
+  (e.g. `gff_upload_idx: 0` or `gff_path: "rel/x"`) slipped through to a
+  server-side failure. Both now reject at submission with a 422.
+- **Purging an alignment no longer re-types its block tickets as read-mask blocks (#400, closes #394).**
+  `work_ticket.alignment_idx` is `ON DELETE SET NULL`, and `alignment_idx IS NULL`
+  was also the discriminator for "this block ticket is a read-mask block". So
+  `DELETE /alignment-definition` turned every align block ticket of that alignment
+  into an apparent read-mask block of the `mask_idx` it still carried. A `failed`
+  one then landed in `read_mask_block_cohort(mask_idx)`, where the pump's fail-stop
+  releases nothing — silently halting **all** future block-mask fan-out for that
+  mask, a fleet-wide config hash, in a subsystem the operator was not touching. It
+  also defeated the align-block exclusion in `has_incomplete_covering_block`, whose
+  docstring already named this exact wedge as the thing it was written to prevent.
+  Block kind is now read from `action_id`, which is NOT NULL and which no FK action
+  can clear, at all four sites (`read_mask_block_cohort`, `cohort_for_ticket_row`,
+  `held_cohorts`, `has_incomplete_covering_block`). Same conclusion
+  `block_read.resolve_block_read_scope` already reached from the other direction, for
+  a sharper reason — trusting the nulled column there would stream raw,
+  non-host-depleted reads into an aligner. The two block action ids join
+  `READ_MASK_ACTION_ID` / `BCL_CONVERT_ACTION_ID` in `qiita_common.actions` as bare
+  ids; each submitter still pins its own version. Deliberately version-agnostic: a
+  cohort and a finalize gate must span every in-flight version of an action, so
+  filtering those on version would split one cohort's concurrency accounting across a
+  routine bump. **The fix is retroactive**: existing detached tickets stop
+  contaminating their mask cohort as soon as this deploys, with no cleanup.
+- **`long-read-assembly`: raise the action ceiling above the `assemble` baseline so OOM/TIMEOUT escalation can actually retry (#393).**
+  `action_ceiling` was `32 cpu / 192 GB / PT16H`, byte-identical to the `assemble` step's
+  `baseline_resources` on every axis. A ceiling equal to the baseline silently disables
+  retry on that axis — the runner grows the floor and clamps to the ceiling, so the grown
+  value never exceeds the resolved one, which reads as saturation and fails the ticket
+  **permanently on attempt 0**. A single `assemble` OOM was therefore unrecoverable, dying
+  with `retry_count=0` and "escalation exhausted, not retrying" instead of retrying larger.
+  The ceiling is now `mem_gb: 500` / `walltime: P2D`; every step baseline is unchanged, so
+  ordinary tickets request exactly what they did before and only a *failing* step climbs.
+  Sizing is measured: hifiasm_meta's peak scales with thread count, and the 16-thread
+  reference for this assay peaked at 164.8 GiB across 26 samples with a slowest sample of
+  28h16m, while our 32-thread configuration peaked at 182.3 GiB on the *smallest* input and
+  exceeded 192 GiB on a mid-sized one. `cpu` stays 32 (nothing escalates it).
+- **Native/CLI venv refresh no longer skips qiita-common reinstall, closing a deploy gap that broke every native SLURM job (#332).**
+  `redeploy.sh` steps 5 and 6 dropped the "prove it's current" skip that could fire
+  incorrectly when an operator `git pull`ed manually first (redeploy's own pull was
+  a no-op → `native_pkgs_changed()` returned "provably unchanged" → skip)
+  or when `local-deploy.sh` ran directly (it only syncs the `/opt/qiita` service
+  venvs, never the checkout native venv). Either way the native venv kept the old
+  `qiita-common` while its editable source moved forward. `uv sync
+  --reinstall-package qiita-common` is a sub-second local copy; the optimization
+  traded negligible time for a real correctness gap. The native-import probe also
+  deepens to import `qiita_compute_orchestrator.config` so a stale venv fails
+  deploy verify as a backstop.
+- **Compute-orchestrator no longer floods logs with Acero "poorly aligned buffer" warnings on Flight-sourced DuckDB scans (#333).**
+  pyarrow's Acero engine warns per batch when it receives Arrow buffers whose
+  base address is not 64-byte aligned. The misalignment is introduced by gRPC
+  transport buffers on the receive side — arrow-rs already writes IPC with
+  `alignment=64`, so a producer-side fix is not possible. 8-byte-aligned buffers
+  are valid on all modern x86_64/ARM; the warning is a defensive hint, not a
+  correctness issue. Setting `ACERO_ALIGNMENT_HANDLING=ignore` at module load
+  silences it; `setdefault` preserves operator override.
 - **`long-read-assembly` `checkm` no longer dies with `AF_UNIX path too long` —
   `checkm.sh` shortens `TMPDIR` for CheckM's multiprocessing socket (#379).**
   CheckM's `markerGeneFinder` runs `multiprocessing.Manager()`, which binds an
@@ -792,6 +1283,155 @@ duplicates further down are historical strata; leave them where they are.
   now resolves a name against the study's existing purely-local prep_sample fields as
   well as the global fields, writing the value through the local field row — matching
   what biosample import already does. A name matching neither is still a 422.
+
+- **The read-mask identity (`mask_idx`) now carries rype's host-call threshold
+  (`resolved_host_filter`).** The hash covered the host *references* a mask depletes
+  against but none of the params it depletes *with*, so the threshold change below
+  would have been invisible to it: reads depleted at two different cutoffs would share
+  one `mask_idx` whose stored params describe neither, and — worse than a mislabel —
+  the per-`(mask_idx, prep_sample)` gate would read every already-masked sample as
+  done under the "same" mask and never re-mask it, so the new threshold would never
+  reach existing data at all. Same defect class the `resolved_lima` / `resolved_syndna`
+  widening closed, and the same fix: a nested block, `None` when no rype stage ran, so
+  a future threshold move re-mints only masks that actually depleted.
+  `test_host_filter_pins` pins the CP mirror to the job's constant by AST (the CP
+  cannot import the orchestrator), including a name-shaped guard so a *new* depletion
+  knob must be pinned deliberately. The minimap2 stage's `preset` is deliberately not
+  hashed: it is pinned in the job to the preset its `.mmi` was built with, not chosen
+  per mask, and as of this deploy only the illumina `host_filter_profile` runs that
+  stage at all.
+  **Consequence: `params_hash` changes for every existing mask.** Existing rows stay
+  valid and referenced; a re-run of an identical config mints one new `mask_idx`
+  rather than reusing the old.
+
+- **The `host_filter` rype threshold is 0.05, up from 0.0.** rype emits a row per
+  bucket scoring at or above the threshold and `host_filter` calls host on any
+  emitted row, so this value *is* the host call. At 0.0 a single incidental
+  minimizer match masked a read; 0.05 still sits below rype's own 0.1 default, so
+  host depletion stays deliberately aggressive relative to upstream. Applies to
+  every read set — the threshold has no per-platform or per-mask variant — and
+  shifts reads scoring in [0.0, 0.05) from `host_rype` to their `qc_mask` reason
+  (`pass` for a QC-pass read), which makes them visible through `read_masked`. The
+  second host stage (minimap2 on rype's survivors) is unchanged.
+
+- **`BaselineResources.as_flat()` is now the single narrowing of the flat
+  population (#416).** The runner's dispatch path and the new headroom queries
+  both resolve through it instead of each re-asserting the three Optional fields
+  and rebuilding a `FlatBaselineResources` by hand, so what actually runs and what
+  the guard checks cannot drift.
+
+- **`align_sharded` hands the aligner a materialized query relation instead of the lazy
+  Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
+  a block's sequences are re-read 1000 times at the current shard count. Against the
+  Parquet-backed view each of those reads pays for the block's whole sequence *bytes* — a
+  Parquet scan must decompress a whole column chunk to yield any row from it — while a
+  shard wants ~0.1% of the reads; against a materialized table DuckDB scans the narrow
+  `read_id` column and fetches sequences only for the rows the shard asked for. Measured
+  per shard (1000 shards, scattered membership, `threads=8`, warm): 20.0 ms view /
+  3.4 ms table at 1M × 160 bp, 169.0 ms / 27.2 ms at 10M × 160 bp, 330.5 ms / 40.0 ms
+  for a 10M paired-end block. Over 1000 shards that is 169 s → 27 s for a single-end
+  short-read block and 331 s → 40 s for the paired-end one; scaling the view along the
+  byte axis puts a 1M-read HiFi block (~15 GB) near 26 min against seconds. Building the
+  copy costs one Parquet scan — 22 ms at 1M reads, 241 ms at 10M.
+  **The two costs scale on different axes:** the view tracks total bytes (so read count
+  *and* read length), the table tracks reads-per-shard and is flat in read length. An
+  earlier revision of this change materialized for minimap2 only, on the strength of a
+  per-1000-bp/read slope measured at 1M reads and then applied to the 10M-read short-read
+  block — understating bowtie2's re-read by 10×. The copy is now unconditional, created
+  after routing has committed to an align (`rype_classify` holds its own resident copy of
+  the corpus while classifying, so building ours first would hold two), and dropped once
+  phase 1 is done with it. The win is contingent on the copy fitting in memory — ~15 GB
+  at the 1M long-read block target (#389), under ~1 GB for a short-read block, against a
+  ~57 GB resolved limit (#381) — and degrades rather than fails if it does not: DuckDB
+  spills it to the Lustre workspace and the per-shard fetches read spill files 1000
+  times, plausibly worse than the view. Raising a block's sequence bytes well above the
+  current targets needs this reconsidered, not just the target. Filed upstream as
+  duckdb-miint#184, with removal tracked at #392 and a row in
+  `docs/duckdb-miint.md` → Open upstream gaps; the overdue duckdb-miint#175 row (sharded
+  aligners pin subject ids to VARCHAR) is added there too. Also corrects three stale
+  claims this reasoning rests on — `align_sharded` said `bind_step_reads` "materializes
+  to a real table" (it binds a lazy `read_parquet` view), and `read_source` said a block
+  is tiled to 10M reads "regardless of platform" against a DuckDB "capped at 8 GB"
+  (long-read align blocks are 1M since #389, and align resolves its limit from the
+  allocation since #381), plus its "node-local scratch" description of the drain file (it
+  lands under `PATH_SCRATCH`, which is Lustre on the deploy).
+- **`align_sharded` streams the aligner into its output instead of buffering it three
+  times (#385).** The tail was `CREATE TABLE … AS SELECT * FROM align_*_sharded(…)`,
+  then a pooled-identity `WINDOW`, then a sorted `COPY` — three full buffers of the
+  alignment set, with the selective identity filter running *after* the first two
+  (`EXPLAIN`: `SEQ_SCAN → HASH_JOIN → WINDOW → FILTER → ORDER_BY → BATCH_COPY_TO_FILE`).
+  Both align seams now return `(sql, params)` rather than materializing a table, and
+  `execute()` runs two phases: phase 1 streams align → (single-end) filter →
+  `read_meta` join into a transient staging Parquet inside the DuckDB temp dir, and
+  phase 2 applies the pooled paired-end filter plus the single 6-column identifier
+  sort into `alignment.parquet`. Measured on a 20M-row SAM-shaped fixture at a 2 GB
+  `memory_limit`, with a deliberately non-selective filter so this is pipeline shape
+  alone: 12.0 s and ~4.9 GB spilled → 5.5 s and zero spill. The split is load-bearing
+  rather than cosmetic — `memory_limit` is a ceiling, not a reservation, so sorting in
+  the same statement as the aligner would hold the whole alignment set while the rype
+  router, per-shard indexes and GPL-boundary daemons are still resident. The identity
+  filter now branches on the BATCH SHAPE, not the aligner: the floors stay per-aligner
+  (0.99 bowtie2 / 0.90 minimap2, query coverage minimap2-only) but the pooling is
+  per-shape, and a single-end batch — whose pooled window was a partition of one row,
+  provably equal to a per-row predicate — now filters with a plain `WHERE` in phase 1.
+  A batch that MIXES single- and paired-end reads is rejected with the counts instead
+  of surfacing as bowtie2's opaque `gpl_boundary` bind error or, on minimap2, as a
+  silently mis-pooled filter — and that rejection now runs ahead of the routing pass,
+  so it cannot be skipped by a batch whose reads route nowhere (which previously exited
+  0 with an empty output) and does not pay for a `rype_classify` pass first. Also pins
+  a miint contract the paired-end gate silently depended on: `cigar_sequence_identity`
+  and `cigar_query_coverage` are permutation-invariant over a concatenated CIGAR, which
+  is what lets the pooled `string_agg(cigar, '')` window omit an `ORDER BY`. Upstream
+  documents neither as order-insensitive, so a mirror build changing that would have
+  made the gate nondeterministic; it is now verified over all 120 permutations of a
+  5-fragment CIGAR and recorded in `docs/duckdb-miint.md`.
+
+- **Long-read align blocks are tiled at 1M reads, not 10M (#389).** The align planner
+  tiled every platform at `block_planner._BLOCK_TARGET_READS` (10M), a target sized on
+  read COUNT because short-read work is count-bound. The sharded aligner's cost is
+  driven by BYTES: each of the reference's ~1000 shards re-reads the block to pull its
+  own routed subset, so a block's re-scan is `n_shards × block_bytes`. At ~15 kb/read a
+  10M-read HiFi block is ~150 GB, whose re-scan alone is ~4.5 h against the align
+  step's PT4H baseline — the ticket could not finish. `pacbio_smrt` and
+  `oxford_nanopore` now tile at 1M reads (~15 GB, ~27 min); `illumina` is unchanged at
+  10M. Both timings are *floors* — they assume a scan rate measured warm, on local
+  disk, with idle cores, where the real job reads Lustre while aligning — so the
+  decision rests on the ordering (10M cannot fit even ideally; 1M can be several times
+  worse than ideal and still fit), not the absolute numbers. Applies to NEW plans only:
+  block ranges are persisted, so an alignment planned before this lands keeps its
+  10M-read blocks and must be deleted and re-planned to re-tile. The target is resolved
+  from the run's platform beside the aligner (also
+  platform-derived, never a caller choice), via a new
+  `_BLOCK_TARGET_READS_BY_PLATFORM` whose keys are pinned equal to
+  `_ALIGNER_BY_PLATFORM`'s, so adding a platform forces an explicit block-size
+  decision rather than inheriting the short-read default. Note the total re-scan across
+  a sample's blocks is `n_shards × total_bytes` and therefore *invariant* to block
+  size — what block size controls is the per-JOB share, i.e. whether one ticket fits
+  its walltime. `block_planner._BLOCK_TARGET_READS` is deliberately untouched: read
+  masking has no 1000-shard fan-out, so 10M stays correct there.
+
+- **`align_sharded` gets the memory and cores it was allocated (#381).** The job
+  hardcoded DuckDB to `memory_limit=8GB` / `threads=4`, so a 64 GB allocation reached
+  DuckDB as 8 GB and the alignment output spilled gigabytes to shared scratch.
+  `memory_limit` now resolves from the SLURM cgroup via `resolve_duckdb_memory_gb()`
+  (a small reserve for the co-resident rype router and per-shard aligner indexes), and
+  the `align` workflow's baseline rises to `cpu: 8, mem_gb: 64` — at the existing
+  `action_ceiling`, so an OOM retry has no memory headroom to grow into. The thread
+  count is load-bearing beyond parallelism: `SET threads` **is** miint's cross-shard
+  concurrency (it ignores its own `threads` argument in sharded mode, and defaults
+  `max_threads_per_shard` to 1), so the old literal capped the job at 4 concurrent
+  shards regardless of allocation. Cores are NOT cgroup-resolved the way memory is —
+  the thread count stays a module literal that must be kept equal to the workflow's
+  `cpu:` by hand, now pinned by `test_align_cpu_pins_duckdb_threads`. Also drops a
+  `DISTINCT` from the `read_to_shard` build
+  that deduplicated a set already unique by construction (distinct `sequence_idx` per
+  query row × one rype row per bucket), materializes the two-column `read_meta`
+  relation instead of re-scanning the reads Parquet through a view, and sets bowtie2
+  `ignore_quals := true` explicitly — quality was already unused (SHOGUN's
+  `mismatch_penalty == mismatch_penalty_min` makes it a constant, and the align query
+  projects sequences only), but as a side effect of a projection rather than a stated
+  decision.
+
 - **`align-plan` is told the mask (`mask_idx`); it no longer re-derives it — BREAKING wire change (#371).**
   `POST /sequencing-run/{idx}/sequenced-pool/{idx}/align-plan` now takes a required
   `mask_idx` and aligns the pool's samples whose `mask_sample` gate is `completed`

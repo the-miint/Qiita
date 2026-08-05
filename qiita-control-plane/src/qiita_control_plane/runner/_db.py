@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import asyncpg
@@ -31,7 +34,7 @@ _WORK_TICKET_COLS = (
     "wt.prep_sample_idx, wt.sequenced_pool_idx, sp.sequencing_run_idx, "
     "wt.block_idx, wt.mask_idx, wt.alignment_idx, wt.shard_id, "
     "wt.action_context, wt.state, wt.retry_count, wt.max_retries, "
-    "wt.resource_override"
+    "wt.resource_override, wt.escalated_resource_floor"
 )
 _WORK_TICKET_FROM = (
     " FROM qiita.work_ticket wt LEFT JOIN qiita.sequenced_pool sp ON sp.idx = wt.sequenced_pool_idx"
@@ -53,14 +56,12 @@ async def _fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> dict[s
     if row is None:
         raise RuntimeError(f"work_ticket {work_ticket_idx} not found")
     out = dict(row)
-    # action_context is JSONB — asyncpg returns it as a JSON string by
-    # default; parse it eagerly so the runner can index into it.
-    if out.get("action_context") is not None and isinstance(out["action_context"], str):
-        out["action_context"] = json.loads(out["action_context"])
-    # resource_override is JSONB (nullable) — decode the same way so the runner
-    # can read its mem_gb. NULL stays None (no override).
-    if out.get("resource_override") is not None and isinstance(out["resource_override"], str):
-        out["resource_override"] = json.loads(out["resource_override"])
+    # asyncpg returns JSONB as a JSON *string* (no codec is registered), so
+    # every JSONB column the runner indexes into is parsed eagerly here. A SQL
+    # NULL stays None: no action_context, no override, nothing escalated yet.
+    for jsonb_col in ("action_context", "resource_override", "escalated_resource_floor"):
+        if isinstance(out.get(jsonb_col), str):
+            out[jsonb_col] = json.loads(out[jsonb_col])
     return out
 
 
@@ -98,6 +99,142 @@ async def _fetch_action(
             "failure_status": row["failure_status"],
         }
     )
+
+
+# =============================================================================
+# Escalated resource floor (qiita.work_ticket.escalated_resource_floor)
+# =============================================================================
+#
+# What the column is for, and how it relates to `resource_override`, is on the
+# column itself (`COMMENT ON COLUMN`, reachable from `\d+ qiita.work_ticket`).
+# What lives here is the wire shape, which this pair of functions owns in both
+# directions:
+#
+#     {"<step name>": {"mem_gb": 384, "walltime_seconds": 115200}}
+#
+# `walltime` crosses as whole seconds — JSONB has no interval type, and an int
+# round-trips exactly where a float would not.
+
+
+@dataclass(frozen=True)
+class StepResourceFloor:
+    """One `step:` entry's persisted escalated floor, decoded.
+
+    Both axes are independently optional: a step that has only ever OOM-killed
+    carries `mem_gb` with `walltime=None`, and vice versa. An all-None instance
+    (`_NO_STEP_FLOOR`) means "this step has not escalated" and leaves the
+    dispatch sizing exactly where it is today."""
+
+    mem_gb: int | None = None
+    walltime: timedelta | None = None
+
+
+# Shared "nothing learned yet" value — every step of a fresh ticket, and any
+# entry with no recorded floor.
+_NO_STEP_FLOOR = StepResourceFloor()
+
+
+def _parse_escalated_floor(raw: Any, *, work_ticket_idx: int) -> dict[str, StepResourceFloor]:
+    """Decode `work_ticket.escalated_resource_floor` into per-step floors.
+
+    NULL / absent → an empty map (no step has escalated). Anything else must
+    match the shape this module writes; a mismatch raises rather than being
+    silently dropped, because a floor that decodes to None is indistinguishable
+    from "never escalated" and would quietly resurrect the very re-climb this
+    column exists to prevent. Callers must invoke this somewhere a raise is
+    recorded against the ticket, not before the runner's failure handler is
+    armed."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"work_ticket {work_ticket_idx} escalated_resource_floor is "
+            f"{type(raw).__name__}, expected a JSON object"
+        )
+    out: dict[str, StepResourceFloor] = {}
+    for step_name, axes in raw.items():
+        if not isinstance(axes, dict):
+            raise RuntimeError(
+                f"work_ticket {work_ticket_idx} escalated_resource_floor[{step_name!r}] is "
+                f"{type(axes).__name__}, expected a JSON object"
+            )
+        mem_gb = axes.get("mem_gb")
+        walltime_seconds = axes.get("walltime_seconds")
+        # bool is an int subclass in Python; reject it explicitly so a stray
+        # `true` can't be read as a 1 GB floor.
+        for axis, value in (("mem_gb", mem_gb), ("walltime_seconds", walltime_seconds)):
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise RuntimeError(
+                    f"work_ticket {work_ticket_idx} "
+                    f"escalated_resource_floor[{step_name!r}][{axis!r}] is {value!r}, "
+                    "expected a positive integer"
+                )
+        out[step_name] = StepResourceFloor(
+            mem_gb=mem_gb,
+            walltime=(
+                timedelta(seconds=walltime_seconds) if walltime_seconds is not None else None
+            ),
+        )
+    return out
+
+
+async def _persist_escalated_floor(
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
+    *,
+    step_name: str,
+    mem_gb: int | None = None,
+    walltime: timedelta | None = None,
+) -> None:
+    """Record one step's newly-escalated floor on the ticket.
+
+    Merges the given axis (or axes) into that step's existing object rather
+    than replacing it, so raising the memory floor never drops a walltime floor
+    the same step learned earlier — the two axes escalate independently, from
+    separate arms of the retry loop. One `jsonb_set` statement, so the merge
+    reads and writes the row within a single UPDATE: no application-side
+    read-modify-write window.
+
+    Deliberately NOT best-effort. A lost write silently reintroduces the
+    re-climb this column exists to prevent, and every other write in the same
+    retry arm already raises on failure. A transient CP-DB error raised here is
+    classified RETRIABLE by the runner's catch-all, so a blip leaves the ticket
+    redrivable rather than abandoned."""
+    patch: dict[str, int] = {}
+    if mem_gb is not None:
+        patch["mem_gb"] = mem_gb
+    if walltime is not None:
+        # Whole seconds — see the wire-shape note above. `ceil`, not truncate:
+        # a fractional walltime (ISO 8601 admits one) rounded DOWN would make
+        # the floor compare below the ceiling it was clamped to, so the
+        # ceiling-exhaustion fail-fast would miss once and burn an attempt.
+        patch["walltime_seconds"] = math.ceil(walltime.total_seconds())
+    if not patch:
+        raise ValueError(
+            f"_persist_escalated_floor for work_ticket {work_ticket_idx} step "
+            f"{step_name!r} was given no axis to record"
+        )
+    updated = await pool.fetchval(
+        "UPDATE qiita.work_ticket"
+        "   SET escalated_resource_floor = jsonb_set("
+        "           COALESCE(escalated_resource_floor, '{}'::jsonb),"
+        "           ARRAY[$2::text],"
+        "           COALESCE(escalated_resource_floor -> $2::text, '{}'::jsonb) || $3::jsonb,"
+        "           true"
+        "       )"
+        " WHERE work_ticket_idx = $1"
+        " RETURNING work_ticket_idx",
+        work_ticket_idx,
+        step_name,
+        json.dumps(patch),
+    )
+    if updated is None:
+        raise RuntimeError(
+            f"could not persist escalated resource floor for work_ticket "
+            f"{work_ticket_idx} step {step_name!r}: row not found"
+        )
 
 
 # The non-terminal states a work_ticket may legitimately transition FROM — the

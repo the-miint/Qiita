@@ -15,7 +15,7 @@ description: >
   COPY FORMAT FASTQ — no intermediate Parquet; the native `assembly_run_config`
   step only records the chosen assembler. Four container steps then run the heavy
   tools —
-  `assemble` (hifiasm_meta → circular LCG genomes + noLCG contigs), `binning`
+  `assemble` (hifiasm_meta or myloasm → circular LCG genomes + noLCG contigs), `binning`
   (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
   and `checkm` (per-MAG completeness/contamination). The storage tail REUSES the
   reference-add machinery: `assembly_hash` hashes the LCG + MAG contigs (shared
@@ -53,8 +53,11 @@ context_schema:
     # Step-1 assembler. Threaded (as a scalar param) through the native
     # assembly_run_config step into run_config.json, which the `assemble`
     # container reads — a scalar can't ride a container step's inputs (the runner
-    # would treat it as a bind-mount path). hifiasm_meta is implemented today;
-    # myloasm is a valid enum value that is not implemented yet.
+    # would treat it as a bind-mount path). Both values are implemented; they
+    # differ in HOW circularity is read back (hifiasm_meta: GFA segment name;
+    # myloasm: assembly_primary.fa header), which assemble.sh branches on. The
+    # default stays hifiasm_meta — switching it is an assay decision, not a
+    # mechanical one.
     assembler:
       type: string
       enum: [hifiasm_meta, myloasm]
@@ -76,7 +79,7 @@ steps:
       mem_gb: 2
       walltime: PT10M
 
-  # hifiasm_meta assembly + circular-genome extraction. Reads run_config.json to
+  # hifiasm_meta / myloasm assembly + circular-genome extraction. Reads run_config.json to
   # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
   # terminal no-data outcome inside the container.
   - step: assemble
@@ -84,6 +87,22 @@ steps:
     container: long-read-assembly-assemble-1.0.0.sif
     entrypoint: /opt/qiita/assemble.sh
     inputs: [masked_reads_fastq, run_config]
+    # The deploy-staged miint extension, bind-mounted read-only. The myloasm
+    # branch's circular/linear split reads with miint's read_fastx and writes with
+    # COPY (FORMAT FASTA), and it LOADs the SAME build the CP/CO/DP run rather
+    # than a copy baked into the image — a fourth miint would be one `make
+    # preflight`'s byte-identity check does not compare, free to drift. Resolved
+    # against PATH_DERIVED, matching where the deploy stages it
+    # (PATH_DERIVED/duckdb-ext).
+    #
+    # The bind is UNCONDITIONAL — the backend emits it for every derived_inputs
+    # entry regardless of which assembler the entrypoint then runs — so a missing
+    # or mislocated PATH_DERIVED/duckdb-ext fails apptainer for BOTH branches,
+    # hifiasm_meta included. Only the miint LOAD is myloasm-specific; the mount is
+    # not. That is why the deploy checklist verifies the path exists rather than
+    # treating it as a myloasm-only concern.
+    derived_inputs:
+      MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]
     baseline_resources:
       cpu: 32
@@ -91,7 +110,7 @@ steps:
       walltime: PT16H
 
   # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
-  # minimap2 (`map-hifi`), emitting the BAM the binning step coordinate-sorts and
+  # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step
   # injects into metaWRAP's alignment cache. Its own step because the minimap2
   # pre-map is a distinct command from metawrap's binners (qp-pacbio splits them
   # the same way); native (`module:`) because minimap2 ships in miint, an
@@ -110,11 +129,12 @@ steps:
 
   # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
   # reads. 0 bins → empty bins_dir (exit 0); downstream steps skip cleanly.
-  # `coverage_bam` is `samtools sort`ed into work_files/ so metaWRAP skips its own
-  # bwa mem and derives depth from the minimap2 alignment instead. The sort is the
-  # entrypoint's job: metaWRAP's own `samtools sort` sits inside the same
-  # "is there already a BAM?" guard as its `bwa mem`, so pre-placing the file skips
-  # both, and jgi_summarize_bam_contig_depths rejects an unsorted BAM.
+  # `coverage_bam` is staged into work_files/ so metaWRAP skips its own bwa mem and
+  # derives depth from the minimap2 alignment instead. It must arrive coordinate
+  # sorted — metaWRAP's own `samtools sort` sits inside the same "is there already
+  # a BAM?" guard as its `bwa mem`, so pre-placing the file skips both, and
+  # jgi_summarize_bam_contig_depths rejects an unsorted BAM. The assembly_coverage
+  # step writes it sorted; the entrypoint only places it.
   - step: binning
     step_type: singleton
     container: long-read-assembly-binning-1.0.0.sif
@@ -209,8 +229,27 @@ steps:
     outputs: []
 
 # Per-step cap (the runner enforces resolved <= ceiling on every axis at
-# dispatch). Matches the heaviest step (assemble): 32 cpu / 192 GB / PT16H.
+# dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on
+# TIMEOUT) — must sit strictly ABOVE the heaviest step's baseline, or retry is
+# silently dead: the runner grows the floor by a fixed factor and clamps to the
+# ceiling, so an equal pair leaves the grown value unchanged, which reads as
+# saturation and fails the ticket permanently on attempt 0 rather than ever
+# retrying. `cpu` is deliberately left equal to assemble's baseline — nothing
+# escalates it. See the runner's escalation helpers for the mechanism.
+#
+# Sizing is measured, not guessed. `assemble` is the binding step, and its peak
+# scales with THREAD COUNT, so our 32-thread runs cost materially more than the
+# 16-thread reference the assay was validated on: that reference peaked at
+# 164.8 GiB across 26 samples, while our smallest input peaked at 182.3 GiB and
+# a mid-sized one blew past 192 GiB during minimizer counting. The reference's
+# slowest sample also ran 28h16m, which a PT16H cap cannot express. 500 GB fits
+# a qiita-partition node (RealMemory 514000 MB, no MemSpecLimit) with little to
+# spare, so an escalated retry effectively reserves a whole node.
+#
+# Both assemblers run on this step (hifiasm_meta and myloasm); the numbers above
+# are hifiasm_meta's. Note the retry budget is TICKET-wide, not per-step, so a
+# ticket that already spent retries earlier cannot count on reaching the top rung.
 action_ceiling:
   cpu: 32
-  mem_gb: 192
-  walltime: PT16H
+  mem_gb: 500
+  walltime: P2D

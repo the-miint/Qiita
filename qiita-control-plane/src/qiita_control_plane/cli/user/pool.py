@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
+    PATH_SEQUENCED_POOL_ALIGN_PLAN,
     PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
@@ -42,6 +43,7 @@ from qiita_common.illumina import read_instrument_run_info
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    AlignPlanRequest,
     BiosampleLookupByAccessionRequest,
     BlockMaskPlanRequest,
     HostFilterResolution,
@@ -1374,6 +1376,87 @@ def _handle_submit_block_mask_pool(
         )
 
     return _common.run_http_subcommand(_run)
+
+
+def _render_align_plan(body: dict | list) -> None:
+    """Print the AlignPlanResponse JSON, then a one-line human summary.
+
+    Surfaces what an operator actually needs to see at submit time: how many samples
+    were planned versus silently skipped (four distinct reasons, easy to miss in the
+    raw body), and the tiling — block count plus the per-block read count.
+
+    That last figure earns its place. Block size is resolved SERVER-side from the
+    run's platform, so the client cannot state it up front; it is only observable in
+    the response. A pool tiled by a stale planner reports a read count an order of
+    magnitude off, and reading that here costs nothing, whereas discovering it from
+    the jobs costs a walltime ceiling per block. JSON to stdout (the machine-readable
+    channel); the summary to stderr. Mirrors the render= + stderr-summary pattern in
+    `cli/admin/mask.py`.
+    """
+    print(json.dumps(body, indent=2))
+    # Gate on a discriminating key so an unexpected/partial shape still gets its
+    # JSON but no summary full of None (same guard as `_render_pool_completion`).
+    if not (isinstance(body, dict) and "samples_planned" in body):
+        return
+    blocks = body.get("blocks") or []
+    read_counts = {b.get("read_count") for b in blocks if isinstance(b, dict)}
+    # One size for a uniform plan, "min-max" when the tail block is short (the
+    # normal case) — never a list, which a 46-block plan would make unreadable.
+    if read_counts and None not in read_counts:
+        low, high = min(read_counts), max(read_counts)
+        sizes = f"{low}" if low == high else f"{low}-{high}"
+    else:
+        sizes = "unknown"
+    skipped = (
+        f"{body.get('samples_skipped_existing')} already-gated,"
+        f" {body.get('samples_skipped_no_mask')} unmasked,"
+        f" {body.get('samples_skipped_mask_incomplete')} masking-incomplete,"
+        f" {body.get('samples_skipped_no_reads')} no-reads"
+    )
+    print(
+        f"pool {body.get('sequenced_pool_idx')}: planned {body.get('samples_planned')} sample(s)"
+        f" into {body.get('blocks_created')} block(s) of {sizes} reads"
+        f" via {body.get('aligner')}; skipped {skipped}.",
+        file=sys.stderr,
+    )
+
+
+def _handle_submit_align_pool(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Plan + submit a pool's bulk-block sharded alignment in ONE server call.
+
+    The align analog of submit-block-mask-pool, and just as thin a client: the
+    server selects the samples masked-complete under `--mask-idx`, derives the
+    ALIGNER from the run's sequencing platform (never a caller choice), asserts the
+    reference is ACTIVE + sharded, mints the alignment_idx, tiles into blocks at the
+    platform's target size, and dispatches one work-ticket per block under the
+    fan-out throttle. So this validates nothing the server owns — it POSTs and
+    renders.
+
+    Failure modes are the server's to name, and it names them precisely: an unknown
+    reference or mask is a 404, a pool with no sample masked under that mask a 422, a
+    reference that is not active/sharded a 409, and a pool already carrying alignment
+    gates a 409 directing the caller to delete first or pass --only-missing.
+    """
+
+    def _run(token: str) -> dict:
+        plan_path = PATH_SEQUENCED_POOL_ALIGN_PLAN.format(
+            sequencing_run_idx=args.sequencing_run_idx,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+        )
+        body = AlignPlanRequest(
+            reference_idx=args.reference_idx,
+            mask_idx=args.mask_idx,
+            only_missing=args.only_missing,
+        ).model_dump(mode="json")
+        return _common.call(
+            "POST",
+            args.base_url,
+            token,
+            f"{PATH_SEQUENCING_RUN_PREFIX}{plan_path}",
+            json=body,
+        )
+
+    return _common.run_http_subcommand(_run, render=_render_align_plan)
 
 
 def _render_pool_completion(body: dict | list) -> None:

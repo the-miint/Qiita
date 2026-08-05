@@ -55,6 +55,9 @@ from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_CANCEL,
+    PATH_WORK_TICKET_FANOUT,
+    PATH_WORK_TICKET_FANOUT_COHORT,
+    PATH_WORK_TICKET_FANOUT_COHORT_PUMP,
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
@@ -64,6 +67,10 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
+    FanoutCohortKind,
+    FanoutListResponse,
+    FanoutOverrideRequest,
+    FanoutPumpResponse,
     ReferenceStatus,
     ScopeTargetKind,
     StepProgressState,
@@ -89,6 +96,16 @@ from ..auth.guards import require_caller_has_admin_on_all_studies, require_scope
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
+from ..fanout_dispatch import (
+    COHORT_BUILDERS,
+    FanoutCohort,
+    active_cohorts,
+    clear_override,
+    cohort_status,
+    overridden_cohorts,
+    set_override,
+    top_up_dispatch,
+)
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
@@ -106,9 +123,13 @@ _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 # not-applicable set is the COMPLEMENT of the applicable set, so a new
 # WorkTicketState defaults to REFUSED — the safe direction; listing the refused
 # states positively would silently make a new state runnable.
-# FAILED and CANCELLED both redrive in place (reset → PENDING + dispatch): they are
-# terminal with no in-flight job (a cancel scancelled it), so the same clean-restart
-# path applies. PENDING just (re)dispatches a lost create-time task.
+# FAILED and CANCELLED both redrive in place (reset → PENDING + dispatch), but they
+# differ in what they leave behind. A CANCELLED ticket has no in-flight job (the
+# cancel scancelled it). A FAILED one MAY still have one: an OOM-killed step
+# escalates and submits attempt N+1, so a ticket that then fails leaves that attempt
+# live with a real slurm_job_id. The redrive's step-row cleanup keys off exactly that
+# difference — see the DELETE in the redrive branch. PENDING just (re)dispatches a
+# lost create-time task.
 _RUN_APPLICABLE_STATES = frozenset(
     {
         WorkTicketState.PENDING.value,
@@ -961,6 +982,158 @@ def _row_to_work_ticket_summary(row: asyncpg.Record) -> WorkTicketSummary:
     return WorkTicketSummary.model_validate({**shaped, **summary_fields})
 
 
+# =============================================================================
+# Fan-out throttle control
+# =============================================================================
+# All three routes reuse `work_ticket:cancel` (system_admin) rather than minting a
+# scope: both are operator overrides on work-ticket dispatch at the same privilege
+# tier, and a separate scope would be granted to exactly the same principals.
+#
+# DECLARED BEFORE `GET /{work_ticket_idx}` ON PURPOSE. Starlette matches routes in
+# definition order, so a later `GET /fanout` is swallowed by the int path param and
+# 422s on "fanout". `POST /cancel` has no such problem only because nothing else
+# claims POST on a one-segment path. Keep this block above that route.
+
+
+async def _resolve_cohort(request: Request, kind: FanoutCohortKind, key: int) -> FanoutCohort:
+    """Build the cohort and 404 when nothing matches it.
+
+    An unknown `kind` never reaches here — FastAPI rejects it against the enum. A
+    key with no tickets is a 404 rather than an empty success so a typo cannot
+    silently record an override against a cohort that does not exist.
+    """
+    cohort = COHORT_BUILDERS[kind](key)
+    status_ = await cohort_status(
+        request.app.state.pool, cohort, max_inflight=request.app.state.settings.fanout_max_inflight
+    )
+    if status_.total == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no fan-out cohort {kind.value}/{key} — it has no work tickets",
+        )
+    return cohort
+
+
+async def _pump_and_report(request: Request, cohort: FanoutCohort) -> FanoutPumpResponse:
+    """Pump `cohort`, then report what moved and where it now stands.
+
+    Status is read after the pump, so it reflects this call's release rather than
+    the state before it. Not a strict snapshot — a concurrent pump or a ticket going
+    terminal in between can move it on — which matches `cohort_status` being a read
+    for a human, not an input to a release decision.
+
+    `top_up_dispatch` resolves the override itself, so the default passed here only
+    applies when the cohort has none.
+    """
+    released = await top_up_dispatch(
+        request.app.state.pool,
+        cohort,
+        max_inflight=request.app.state.settings.fanout_max_inflight,
+        dispatch_cb=lambda idx: schedule_dispatch(request.app, idx),
+    )
+    return FanoutPumpResponse(
+        released=released,
+        status=await cohort_status(
+            request.app.state.pool,
+            cohort,
+            max_inflight=request.app.state.settings.fanout_max_inflight,
+        ),
+    )
+
+
+@router.get(PATH_WORK_TICKET_FANOUT, response_model=FanoutListResponse)
+async def list_fanout_cohorts(
+    request: Request,
+    _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
+) -> FanoutListResponse:
+    """Every fan-out cohort with held or in-flight children, plus every cohort
+    carrying a runtime override, with its throttle state.
+
+    The first call an operator makes when a fan-out looks stuck: it distinguishes
+    "fail-stopped", "at its cap", and "nothing held" without a DB session.
+
+    Overrides are unioned in because nothing evicts one — a cohort that has fully
+    drained drops out of `active_cohorts` while its override stays set and reapplies
+    if that (kind, key) is ever re-run. Listing only active cohorts made a set
+    override unenumerable at exactly the moment it became a surprise, so an operator
+    could not ask "what have I set?". A drained cohort appears with zero counts and a
+    non-null `override`, which reads as "set, nothing to apply it to".
+    """
+    pool = request.app.state.pool
+    default = request.app.state.settings.fanout_max_inflight
+    cohorts = await active_cohorts(pool)
+    seen = {(c.kind, c.key) for c in cohorts}
+    cohorts.extend(c for c in overridden_cohorts() if (c.kind, c.key) not in seen)
+    return FanoutListResponse(
+        cohorts=[await cohort_status(pool, cohort, max_inflight=default) for cohort in cohorts]
+    )
+
+
+@router.patch(PATH_WORK_TICKET_FANOUT_COHORT, response_model=FanoutPumpResponse)
+async def set_fanout_cohort_override(
+    kind: FanoutCohortKind,
+    key: int,
+    body: FanoutOverrideRequest,
+    request: Request,
+    _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
+    # 503 without an orchestrator, like every other dispatching route. Not
+    # cosmetic: `schedule_dispatch` raises when the client is unset, the pump's
+    # per-ticket guard swallows it, and the release is already committed — so
+    # without this the route would answer 200 with a `released` list whose tickets
+    # are un-held, undispatched, and unreachable by any later pump.
+    _: None = Depends(_require_compute_backend_client),
+) -> FanoutPumpResponse:
+    """Retune one cohort's in-flight cap and pump it in the same call.
+
+    Pumping here is the point, not a convenience: the pump is edge-triggered (a
+    child's terminal transition or startup reconcile), so a route that only recorded
+    the cap would appear inert until unrelated work finished — which is exactly the
+    confusion this surface exists to end.
+
+    `max_inflight: null` clears the override. Raising it releases immediately;
+    lowering it releases nothing and lets the excess drain, since the pump only ever
+    moves tickets held → released and never recalls one.
+
+    The override is in-memory and process-local, so a CP restart reverts the cohort
+    to the FANOUT_MAX_INFLIGHT default. That revert is conservative for a RAISED cap
+    and not for a LOWERED one, which reverts upward to more in flight than was asked
+    for — `set_override` WARNs on the lowering case, and the `_OVERRIDES` comment
+    carries the full asymmetry.
+    """
+    cohort = await _resolve_cohort(request, kind, key)
+    if body.max_inflight is None:
+        clear_override(cohort)
+    else:
+        # Bounded by the request model; the registry re-checks (fail fast at both).
+        # `default` is what a restart would revert to, and is what makes a lowering
+        # WARN rather than being recorded silently.
+        set_override(
+            cohort,
+            body.max_inflight,
+            default=request.app.state.settings.fanout_max_inflight,
+        )
+    return await _pump_and_report(request, cohort)
+
+
+@router.post(PATH_WORK_TICKET_FANOUT_COHORT_PUMP, response_model=FanoutPumpResponse)
+async def pump_fanout_cohort(
+    kind: FanoutCohortKind,
+    key: int,
+    request: Request,
+    _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
+    # Same reason as the PATCH above: pumping without a dispatch path strands
+    # everything it releases.
+    _: None = Depends(_require_compute_backend_client),
+) -> FanoutPumpResponse:
+    """Re-trigger a cohort's pump without changing its cap.
+
+    Recovery for a cohort stranded by a pump that failed on the last in-flight
+    child's completion hook: with everything remaining held, no terminal transition
+    is left to re-trigger it, and before this route only a CP restart would.
+    """
+    return await _pump_and_report(request, await _resolve_cohort(request, kind, key))
+
+
 @router.get(
     PATH_WORK_TICKET_BY_IDX,
     response_model=WorkTicket,
@@ -1342,24 +1515,50 @@ async def run_work_ticket(
                     detail="work_ticket state changed under /run; retry",
                 )
 
-            # Drop every non-`completed` work_ticket_step row. The runner
-            # re-enters each not-yet-completed entry at attempt 0, but a prior
-            # FAILED run left terminal `failed` rows behind; re-using that
-            # attempt would collide (the step_progress writers reject any
-            # transition out of `failed`, and record_failed refuses
-            # failed→failed), wedging the redrive on the dead row. Dropping
-            # them lets the runner re-enter each entry fresh: finding the prior
-            # run's now-orphaned on-disk attempt dir, it advances past it to a
-            # fresh attempt dir (it can neither reuse the stale read-only output
-            # nor delete the SLURM-job-owned dir — see runner `_attempt_is_unowned`).
-            # `completed` rows are KEPT so the runner still fast-forwards
-            # already-finished entries.
-            # Safe because a FAILED ticket has no in-flight job — every step
-            # row is terminal, so this never races the resume-adoption path.
+            # Which prior progress rows survive the redrive. `completed` always
+            # survives, so the runner still fast-forwards finished entries.
+            #
+            # Of the rest, the question is whether the row still names a job
+            # worth adopting — `_adopt_or_submit` re-attaches by the persisted
+            # `slurm_job_id`, and the runner may only adopt a LIVE attempt.
+            #
+            #   * `failed` — always dropped. Re-using that attempt number would
+            #     collide (record_submitted rejects anything but submitting→,
+            #     and record_failed refuses failed→failed), wedging the redrive
+            #     on the dead row. Dropped, the runner re-enters the entry,
+            #     finds the orphaned on-disk attempt dir and advances past it to
+            #     a fresh one (it can neither reuse the stale read-only output
+            #     nor delete the SLURM-job-owned dir — see `_attempt_is_unowned`).
+            #   * in-flight WITH a job id — kept when redriving a FAILED ticket.
+            #     A FAILED ticket CAN have a live job: when a step OOM-kills, the
+            #     runner escalates and submits attempt N+1, so a ticket that then
+            #     fails leaves that attempt live with a real id. Dropping it
+            #     would strand the job outright — the CP forgets the id, nothing
+            #     polls it, and no later redrive can reclaim it.
+            #   * in-flight WITHOUT a job id (a `submitting` write-ahead row) —
+            #     dropped. Its only handle is the deterministic `job_name`, and
+            #     the find-by-name orphan closer that would use it runs solely
+            #     under `resume=True`; /run dispatches with resume=False, so a
+            #     kept row would fall through to a fresh submit writing into the
+            #     same attempt dir a possibly-live orphan is already using.
+            #     Dropping it restores the advance-to-a-fresh-dir guard.
+            #
+            # CANCELLED is the carve-out: cancel is terminal-flip-then-scancel,
+            # and the runner's abort path stops without recording the step row
+            # terminal — so a cancelled ticket keeps an in-flight row naming a
+            # job the reap already killed. Adopting that is the very bug this
+            # commit fixes, reached through a live row instead of a dead one, so
+            # a post-cancel redrive drops every non-completed row.
+            redrive_after_cancel = current_state == WorkTicketState.CANCELLED.value
             await conn.execute(
-                "DELETE FROM qiita.work_ticket_step WHERE work_ticket_idx = $1 AND state <> $2",
+                "DELETE FROM qiita.work_ticket_step"
+                " WHERE work_ticket_idx = $1"
+                "   AND state <> $2"
+                "   AND ($3::boolean OR state = $4 OR slurm_job_id IS NULL)",
                 work_ticket_idx,
                 StepProgressState.COMPLETED.value,
+                redrive_after_cancel,
+                StepProgressState.FAILED.value,
             )
 
             await _reset_failed_reference_scope_for_dispatch(

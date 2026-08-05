@@ -17,7 +17,10 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
 
+from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
+from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
 from qiita_control_plane.repositories.block import (
     add_block_members,
     create_block,
@@ -33,11 +36,21 @@ from qiita_control_plane.repositories.block import (
 )
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
+    delete_block_action_if_created,
     seed_biosample_with_sequenced_prep_sample,
+    seed_block_action_if_absent,
     seed_user_principal,
 )
 
 pytestmark = pytest.mark.db
+
+# The (action_id -> version) pairs these fixtures seed. Taken from the planners
+# that actually mint these tickets, so a submitter version bump reaches the tests
+# instead of leaving them exercising a version production no longer submits.
+_BLOCK_ACTION_VERSIONS = {
+    BLOCK_MASK_ACTION_ID: BLOCK_MASK_ACTION_VERSION,
+    ALIGN_ACTION_ID: ALIGN_ACTION_VERSION,
+}
 
 
 async def _new_block(blk) -> int:
@@ -397,26 +410,39 @@ async def test_upsert_mask_sample_completed_requires_txn(blk):
 # ---------------------------------------------------------------------------
 
 
-async def _seed_block_action(pool) -> tuple[str, str]:
-    """Create a throwaway block-scoped action; returns (action_id, version)."""
-    action_id = f"blk-cov-{secrets.token_hex(4)}"
-    version = "1.0.0"
-    await pool.execute(
-        "INSERT INTO qiita.action"
-        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
-        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'block', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
-        "         1, 1, '1 minute', 'active', 'failed')",
-        action_id,
-        version,
-        '{"service": false, "human_roles": ["system_admin"]}',
+async def _seed_block_action(pool, action_id: str, created: dict) -> tuple[str, str]:
+    """Ensure the named block-scoped action exists; returns (action_id, version).
+
+    Seeds the REAL action_id (not a throwaway) because `has_incomplete_covering_block`
+    discriminates read-mask blocks from align blocks by it. `created` records whether
+    this call made the row, so teardown drops only what it created — the
+    `(action_id, version)` PK is shared with every other test on this worker's DB.
+    """
+    version = _BLOCK_ACTION_VERSIONS[action_id]
+    created[action_id] = await seed_block_action_if_absent(
+        pool, action_id=action_id, version=version
     )
     return action_id, version
 
 
-async def _block_with_ticket(blk, *, action, mask_idx, state, members) -> int:
+async def _drop_seeded_actions(pool, created: dict) -> None:
+    for action_id, was_created in created.items():
+        await delete_block_action_if_created(
+            pool,
+            action_id=action_id,
+            version=_BLOCK_ACTION_VERSIONS[action_id],
+            created=was_created,
+        )
+
+
+async def _block_with_ticket(blk, *, action, mask_idx, state, members, alignment_idx=None) -> int:
     """Create a block covering `members` under a ticket carrying `mask_idx`, set
-    the block's state, and return its block_idx. Tracked for fixture cleanup."""
+    the block's state, and return its block_idx. Tracked for fixture cleanup.
+
+    `alignment_idx` mirrors the align-block shape (which carries BOTH ids); left
+    None it also reproduces a PURGED align ticket, whose alignment_idx the
+    alignment delete NULLed.
+    """
     pool = blk["pool"]
     action_id, version = action
     async with pool.acquire() as conn, conn.transaction():
@@ -426,13 +452,14 @@ async def _block_with_ticket(blk, *, action, mask_idx, state, members) -> int:
     wt_idx = await pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx, scope_target_kind,"
-        "  block_idx, mask_idx)"
-        " VALUES ($1, $2, $3, 'block', $4, $5) RETURNING work_ticket_idx",
+        "  block_idx, mask_idx, alignment_idx)"
+        " VALUES ($1, $2, $3, 'block', $4, $5, $6) RETURNING work_ticket_idx",
         action_id,
         version,
         blk["principal_idx"],
         block_idx,
         mask_idx,
+        alignment_idx,
     )
     async with pool.acquire() as conn, conn.transaction():
         await set_block_work_ticket(conn, block_idx=block_idx, work_ticket_idx=wt_idx)
@@ -447,7 +474,8 @@ async def test_has_incomplete_covering_block_gates_on_all_blocks_completed(blk):
     pool = blk["pool"]
     mask_idx = blk["mask_idx"]
     ps1, _ = blk["prep_sample_idxs"]
-    action = await _seed_block_action(pool)
+    created_actions: dict = {}
+    action = await _seed_block_action(pool, BLOCK_MASK_ACTION_ID, created_actions)
     try:
         # Two blocks cover ps1 under this mask; block A completed, block B still
         # processing → incomplete (True).
@@ -480,9 +508,60 @@ async def test_has_incomplete_covering_block_gates_on_all_blocks_completed(blk):
             "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])",
             blk["created_blocks"],
         )
-        await pool.execute(
-            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action[0], action[1]
+        await _drop_seeded_actions(pool, created_actions)
+
+
+async def test_has_incomplete_covering_block_ignores_a_purged_align_block(blk):
+    """A PURGED align block must not wedge the read-mask finalize gate.
+
+    An align block ticket carries both mask_idx and alignment_idx, and
+    `DELETE /alignment-definition` NULLs the alignment (`ON DELETE SET NULL`) while
+    leaving mask_idx and block_idx. On column shape alone the leftover is
+    indistinguishable from a read-mask block covering the same sample under the same
+    mask — so a discriminator of `alignment_idx IS NULL` would count it here and
+    refuse to finalize a sample whose masking is genuinely complete. Discriminating
+    by action_id keeps it out.
+    """
+    pool = blk["pool"]
+    mask_idx = blk["mask_idx"]
+    ps1, _ = blk["prep_sample_idxs"]
+    created_actions: dict = {}
+    mask_action = await _seed_block_action(pool, BLOCK_MASK_ACTION_ID, created_actions)
+    align_action = await _seed_block_action(pool, ALIGN_ACTION_ID, created_actions)
+    try:
+        # Masking of ps1 is genuinely finished: its one read-mask block is completed.
+        await _block_with_ticket(
+            blk,
+            action=mask_action,
+            mask_idx=mask_idx,
+            state="completed",
+            members=[(ps1, 0, 999)],
         )
+        assert (
+            await has_incomplete_covering_block(pool, mask_idx=mask_idx, prep_sample_idx=ps1)
+            is False
+        )
+        # A FAILED align block over the same footprint, already purged (alignment_idx
+        # NULL) — the exact leftover an alignment delete produces. Masking is still
+        # complete, so the gate must stay open.
+        await _block_with_ticket(
+            blk,
+            action=align_action,
+            mask_idx=mask_idx,
+            state="failed",
+            members=[(ps1, 0, 999)],
+            alignment_idx=None,
+        )
+        assert (
+            await has_incomplete_covering_block(pool, mask_idx=mask_idx, prep_sample_idx=ps1)
+            is False
+        )
+    finally:
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])",
+            blk["created_blocks"],
+        )
+        await _drop_seeded_actions(pool, created_actions)
 
 
 # ---------------------------------------------------------------------------

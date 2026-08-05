@@ -312,7 +312,18 @@ steps:
     inputs: []
     outputs: []
 
+# Ceiling must stay strictly ABOVE every step baseline on the escalating axes
+# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
+# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
+# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
+# are unchanged here; cpu/gpu never escalate.
+#
+# Sized on host_filter: 25.8 GB against a 32 GB baseline, real demand because it
+# deliberately does not size DuckDB from the cgroup (jobs/host_filter.py).
+# Do NOT size off lima_mask's ~32 GB peaks — it calls resolve_duckdb_memory_gb()
+# with no cap_gb, so its RSS tracks whatever cgroup it is handed and would read
+# ~64 at 64 GB. syndna peaks at 7.3 GB and is unaffected.
 action_ceiling:
   cpu: 8
-  mem_gb: 32
+  mem_gb: 64
   walltime: PT8H
