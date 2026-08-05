@@ -21,6 +21,8 @@ use arrow_flight::{
     Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
     HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_ipc::writer::IpcWriteOptions;
+use arrow_ipc::CompressionType;
 use duckdb::Connection;
 use futures::stream::{self, Stream, StreamExt};
 use parquet::arrow::ArrowWriter;
@@ -32,6 +34,54 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth;
 use crate::ducklake;
+
+/// gRPC metadata key by which a DoGet client asks for a compressed IPC body.
+///
+/// Lowercase because HTTP/2 requires it of header names. **Python twin:**
+/// `qiita_common.flight_constants.IPC_COMPRESSION_HEADER` — the two are a wire
+/// contract and must change together.
+const IPC_COMPRESSION_HEADER: &str = "qiita-ipc-compression";
+
+/// The only codec this server will apply, and the value clients send to get it.
+const IPC_COMPRESSION_ZSTD: &str = "zstd";
+/// Explicitly asking for no compression — the same as sending no header, but
+/// lets a client be unambiguous.
+const IPC_COMPRESSION_NONE: &str = "none";
+
+/// The IPC body codec this DoGet should use, from the client's request metadata.
+///
+/// **The client chooses, not the server.** Whether compression pays depends on
+/// the client's bandwidth: it is a large win over a slow link and a *loss* over
+/// a fast one (M0 measured the break-even at ~4 Gbit/s — a 775 MiB stream takes
+/// 0.65 s uncompressed over 10 GbE against 1.53 s with zstd). The server cannot
+/// know that, and behind nginx it cannot even see the client's address. So the
+/// default is off and the client opts in per call.
+///
+/// An unrecognised value is an **error, not a fallback**. A client that asked
+/// for compression, silently did not get it, and measured the result would draw
+/// the wrong conclusion about its own transfer. `lz4` is rejected along with
+/// everything else: M0 measured it at roughly half zstd's ratio on every shape.
+fn requested_ipc_codec(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<CompressionType>, Status> {
+    let Some(raw) = metadata.get(IPC_COMPRESSION_HEADER) else {
+        return Ok(None);
+    };
+    let value = raw.to_str().map_err(|_| {
+        Status::invalid_argument(format!(
+            "{IPC_COMPRESSION_HEADER} must be valid UTF-8; accepted values are \
+             {IPC_COMPRESSION_ZSTD:?} and {IPC_COMPRESSION_NONE:?}"
+        ))
+    })?;
+    match value {
+        IPC_COMPRESSION_ZSTD => Ok(Some(CompressionType::ZSTD)),
+        IPC_COMPRESSION_NONE => Ok(None),
+        other => Err(Status::invalid_argument(format!(
+            "unsupported {IPC_COMPRESSION_HEADER}: {other:?}; accepted values are \
+             {IPC_COMPRESSION_ZSTD:?} and {IPC_COMPRESSION_NONE:?}"
+        ))),
+    }
+}
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
@@ -391,6 +441,8 @@ impl FlightService for QiitaFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Read the request metadata before `into_inner()` consumes it.
+        let codec = requested_ipc_codec(request.metadata())?;
         let ticket_bytes = &request.into_inner().ticket;
 
         // Verify Ed25519 signature, expiry, and parse payload
@@ -421,7 +473,17 @@ impl FlightService for QiitaFlightService {
             sql,
             table,
         );
-        let flight_stream = FlightDataEncoderBuilder::new().build(batch_stream);
+        // With no codec this is byte-identical to the uncompressed encoder that
+        // preceded it, which is what keeps every existing client unaffected.
+        // `try_with_compression` only errors if the codec's crate feature is
+        // absent, i.e. a build mistake, so surface it as internal rather than
+        // letting it look like bad client input.
+        let write_options = IpcWriteOptions::default()
+            .try_with_compression(codec)
+            .map_err(|e| Status::internal(format!("IPC codec {codec:?} unavailable: {e}")))?;
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_options(write_options)
+            .build(batch_stream);
         let mapped = flight_stream.map(|result| {
             result.map_err(|e| Status::internal(format!("data plane stream error: {e}")))
         });
@@ -2830,6 +2892,69 @@ mod tests {
         // The dest is inlined into a DuckDB `COPY ... TO '<dest>'` literal.
         let root = Path::new("/scratch");
         assert!(validate_export_dest("/scratch/ti'ck/reads.parquet", root).is_err());
+    }
+
+    // --- requested_ipc_codec (pure; no DuckDB) ---
+
+    fn metadata_with(value: &[u8]) -> tonic::metadata::MetadataMap {
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert(
+            IPC_COMPRESSION_HEADER,
+            tonic::metadata::MetadataValue::try_from(value).expect("valid metadata value"),
+        );
+        map
+    }
+
+    #[test]
+    fn absent_compression_header_means_no_codec() {
+        let map = tonic::metadata::MetadataMap::new();
+        assert_eq!(requested_ipc_codec(&map).expect("absent is valid"), None);
+    }
+
+    #[test]
+    fn zstd_compression_header_selects_zstd() {
+        let map = metadata_with(b"zstd");
+        assert_eq!(
+            requested_ipc_codec(&map).expect("zstd is accepted"),
+            Some(CompressionType::ZSTD)
+        );
+    }
+
+    #[test]
+    fn explicit_none_compression_header_means_no_codec() {
+        let map = metadata_with(b"none");
+        assert_eq!(requested_ipc_codec(&map).expect("none is accepted"), None);
+    }
+
+    /// LZ4 is rejected on purpose, not by omission: M0 measured it at roughly
+    /// half zstd's ratio on every shape, so accepting it would ship a worse
+    /// option that nothing in this repo would ever choose.
+    #[test]
+    fn unknown_compression_header_is_rejected() {
+        for value in [b"lz4".as_slice(), b"gzip", b"ZSTD", b"", b"zstd,none"] {
+            let err = requested_ipc_codec(&metadata_with(value))
+                .expect_err("unknown codec must be rejected, not ignored");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains("zstd") && err.message().contains("none"),
+                "error should name the accepted values, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// A value the transport accepts but that is not UTF-8 must be an error
+    /// rather than a panic or a silent fall-through to uncompressed.
+    #[test]
+    fn non_utf8_compression_header_is_rejected() {
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert(
+            IPC_COMPRESSION_HEADER,
+            tonic::metadata::MetadataValue::try_from(b"\xff\xfe".as_slice())
+                .expect("bytes are valid as an ASCII metadata value"),
+        );
+        let err = requested_ipc_codec(&map).expect_err("non-UTF-8 must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     // --- single_i64_filter (pure; no DuckDB) ---
@@ -5459,6 +5584,150 @@ mod tests {
             staging_root,
             scratch_root,
         )
+    }
+
+    // ------------------------------------------------------------------
+    // DoGet IPC compression (M1) — the parser being right does not prove the
+    // encoder honoured it, so these drive the real `do_get` end to end and
+    // assert on what the encoder stamped into each record-batch message.
+    // ------------------------------------------------------------------
+
+    /// Seed one alignment row and return a signed `alignment_visible` ticket for
+    /// it, plus a service wired to the same catalog.
+    #[cfg(feature = "integration")]
+    fn doget_fixture(align: i64, prep: i64) -> (QiitaFlightService, Vec<u8>) {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_alignment_tables(&conn).unwrap();
+            ducklake::ensure_exclusion_tables(&conn).unwrap();
+            // Enough rows that a compressed body is unambiguously smaller than a
+            // raw one; a handful would be dominated by framing.
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
+                 INSERT INTO qiita_lake.alignment \
+                     (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, \
+                      flags, position, stop_position) \
+                 SELECT {align}, {prep}, i, 1, 0, 100, 200 FROM range(20000) t(i);"
+            ))
+            .unwrap();
+        }
+        let payload = format!(
+            r#"{{"table":"alignment_visible","filter":{{"alignment_idx":[{align}],"prep_sample_idx":[{prep}]}}}}"#
+        );
+        let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
+        let service = QiitaFlightService::new(
+            test_vk(),
+            connstr,
+            data_path,
+            PathBuf::from("/tmp/unused-staging"),
+            PathBuf::from("/tmp"),
+        );
+        (service, ticket)
+    }
+
+    /// Collect a DoGet response, returning the codec stamped into each
+    /// record-batch message and the total payload size.
+    ///
+    /// This restates what `tests/compression_harness::record_batch_codecs` does.
+    /// It cannot be reused: this is a bin-only crate, so `tests/` targets cannot
+    /// see `src` and the check has to exist on both sides of that boundary.
+    #[cfg(feature = "integration")]
+    async fn doget_codecs(
+        service: &QiitaFlightService,
+        ticket: Vec<u8>,
+        header: Option<&str>,
+    ) -> Result<(Vec<Option<CompressionType>>, usize), Status> {
+        let mut request = Request::new(Ticket {
+            ticket: ticket.into(),
+        });
+        if let Some(value) = header {
+            request.metadata_mut().insert(
+                IPC_COMPRESSION_HEADER,
+                tonic::metadata::MetadataValue::try_from(value).unwrap(),
+            );
+        }
+        let response = service.do_get(request).await?;
+        let messages: Vec<FlightData> = response
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, Status>>()?;
+        let bytes = messages.iter().map(|m| m.data_body.len()).sum();
+        let codecs = messages
+            .iter()
+            .filter_map(|m| {
+                Some(
+                    arrow_ipc::root_as_message(&m.data_header)
+                        .ok()?
+                        .header_as_record_batch()?
+                        .compression()
+                        .map(|c| c.codec()),
+                )
+            })
+            .collect();
+        Ok((codecs, bytes))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_with_zstd_header_stamps_the_codec_into_every_batch_message() {
+        let (service, ticket) = doget_fixture(977_000, 977_010);
+        let (codecs, compressed) = doget_codecs(&service, ticket.clone(), Some("zstd"))
+            .await
+            .expect("zstd DoGet should succeed");
+
+        assert!(!codecs.is_empty(), "no record-batch messages in the stream");
+        assert!(
+            codecs.iter().all(|c| *c == Some(CompressionType::ZSTD)),
+            "a batch message shipped uncompressed despite the header: {codecs:?}"
+        );
+
+        // The codec stamp alone would be satisfied by a codec that ran and
+        // achieved nothing; these rows are highly repetitive, so real
+        // compression must show up in the body.
+        let (_, raw) = doget_codecs(&service, ticket, None)
+            .await
+            .expect("uncompressed DoGet should succeed");
+        assert!(
+            compressed * 2 < raw,
+            "expected zstd to at least halve the body, got {compressed} vs {raw} bytes"
+        );
+    }
+
+    /// The regression guard for every existing client: no header must mean
+    /// exactly today's behaviour, not merely "some working stream".
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_without_the_header_is_byte_identical_to_today() {
+        let (service, ticket) = doget_fixture(977_100, 977_110);
+        for header in [None, Some("none")] {
+            let (codecs, _) = doget_codecs(&service, ticket.clone(), header)
+                .await
+                .unwrap_or_else(|e| panic!("DoGet with header {header:?} failed: {e}"));
+            assert!(!codecs.is_empty(), "{header:?}: no record-batch messages");
+            assert!(
+                codecs.iter().all(Option::is_none),
+                "{header:?} must leave the body uncompressed, got {codecs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
+        let (service, ticket) = doget_fixture(977_200, 977_210);
+        let err = doget_codecs(&service, ticket, Some("lz4"))
+            .await
+            .expect_err("lz4 must be rejected, not silently ignored");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

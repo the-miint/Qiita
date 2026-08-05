@@ -255,6 +255,17 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **DoGet streams can be zstd-compressed, at the client's request.** A client
+  sends `qiita-ipc-compression: zstd` as gRPC metadata and the data plane
+  compresses that stream's Arrow IPC bodies; anything else is rejected rather
+  than ignored, and no header means today's uncompressed behaviour byte for
+  byte. Measured 4.4–7.0x on real production shapes. **Off by default on
+  purpose**: compression makes a DoGet *slower* over a fast link (break-even
+  ~4 Gbit/s), and every in-repo caller is above that line — the control-plane
+  runner reaches the data plane over loopback, compute jobs over the cluster
+  fabric. `qiita-admin masked-read-export --compress` opts in for off-site runs,
+  where it is a large win. Rationale and the break-even arithmetic are in
+  `docs/architecture.md`. No operator action: no new env var, no migration.
 - **Three DuckLake facts the export path depends on are now pinned by test.**
   `qiita-data-plane/src/ducklake.rs` (integration tier): DuckDB's Arrow export
   emits **no** `DictionaryArray` for VARCHAR even at 2 distinct values but
