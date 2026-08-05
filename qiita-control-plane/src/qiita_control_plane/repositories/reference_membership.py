@@ -13,11 +13,82 @@ shard-set all MUST agree on it. Centralising the two queries here removes the
 copy-paste drift hazard (a finalizer reading a different threshold than the one
 the planner assigned would fail *wrong*, not fail loud).
 
-Both helpers accept a pool or a connection so they compose standalone (on the
+The junction is also how a reference's SEQUENCE SET is addressed without going
+near the stored bytes — `reference_sequence_hashes` reads the per-sequence content
+hashes the features were minted on, which is what the read mask's adapter identity
+is derived from.
+
+Every helper accepts a pool or a connection so they compose standalone (on the
 pool) or inside an open transaction (the finalizer counts on a txn `conn`).
 """
 
+import hashlib
+
 import asyncpg
+
+
+async def reference_sequence_hashes(
+    db: asyncpg.Pool | asyncpg.Connection, reference_idx: int
+) -> list[bytes]:
+    """Return the reference's per-sequence content hashes, sorted, as raw bytes.
+
+    `qiita.feature.sequence_hash` is the content hash the feature was
+    deduplicated on at mint (`qiita_common.chunking.canonical_sequence_hash_expr`,
+    which every minter is required to use), so this is a function of the
+    reference's SEQUENCES, independent of how they are stored or serialized. That
+    expression is strand-canonical, so a sequence and its reverse complement are
+    one member here. Sorted so the list is order-independent, and returned as the
+    UUID's raw 16 bytes rather than its hex form (the repo's fixed-width-hash
+    rule).
+
+    The row set is the reference's membership, which is exactly what a DoGet of
+    `reference_sequence_chunks` scoped to this reference returns: that read has no
+    reference_idx column of its own and resolves the scope by joining the data
+    plane's `reference_membership` mirror of this table. Annotated intervals are
+    deliberately absent from membership (`actions.library.mint_annotation_features`),
+    so a GFF-bearing reference does not leak interval features in here.
+
+    [] for an unknown reference or one with no members — callers that treat an
+    empty adapter set as a misconfiguration check for it themselves, as
+    `_write_adapter_parquet` already does.
+    """
+    rows = await db.fetch(
+        "SELECT f.sequence_hash"
+        "  FROM qiita.reference_membership m"
+        "  JOIN qiita.feature f ON f.feature_idx = m.feature_idx"
+        " WHERE m.reference_idx = $1"
+        " ORDER BY f.sequence_hash",
+        reference_idx,
+    )
+    return [r["sequence_hash"].bytes for r in rows]
+
+
+async def reference_sequence_set_hash(
+    db: asyncpg.Pool | asyncpg.Connection, reference_idx: int
+) -> str | None:
+    """SHA-256 hex over the reference's sorted per-sequence content hashes — a
+    stable identity for its sequence SET.
+
+    The read mask folds this in as `resolved_qc.adapter_set_hash`, so it is keyed
+    on the sequences (`reference_sequence_hashes`) rather than on the reference
+    idx: a re-pointed-but-identical adapter set collapses to one mask. Digest
+    input is the UUIDs' raw 16 bytes in sorted order.
+
+    Those hashes are strand-canonical, so a sequence and its reverse complement
+    are one member and produce one identity.
+
+    Returns None for a reference with no members. `runner._reference` refuses an
+    empty adapter set on the path that materializes it, so this is reachable only
+    for a caller that resolves the identity without materializing. A digest over
+    no input would be one value shared by every memberless reference; None is not.
+    """
+    hashes = await reference_sequence_hashes(db, reference_idx)
+    if not hashes:
+        return None
+    digest = hashlib.sha256()
+    for sequence_hash in hashes:
+        digest.update(sequence_hash)
+    return digest.hexdigest()
 
 
 async def count_reference_shards(db: asyncpg.Pool | asyncpg.Connection, reference_idx: int) -> int:
