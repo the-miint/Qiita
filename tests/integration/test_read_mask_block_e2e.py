@@ -40,8 +40,14 @@ from pathlib import Path
 import duckdb
 import pytest
 from fastapi import HTTPException
+from qiita_common.actions import BLOCK_MASK_ACTION_ID
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason
+from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
+from qiita_control_plane.testing.db_seeds import (
+    delete_block_action_if_created,
+    seed_block_action_if_absent,
+)
 
 from conftest import ducklake_connect
 
@@ -246,17 +252,15 @@ async def block_pool(postgres_pool, human_admin_session):
             ps,
         )
 
-    action_id = f"rmb-e2e-{suffix}"
-    version = "1.0.0"
-    await postgres_pool.execute(
-        "INSERT INTO qiita.action"
-        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
-        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'block', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
-        "         1, 1, '1 minute', 'active', 'failed')",
-        action_id,
-        version,
-        '{"service": false, "human_roles": ["system_admin"]}',
+    # The REAL bulk-masking action id, not a throwaway: a block ticket's KIND is
+    # its action_id, and `has_incomplete_covering_block` — the gate this e2e
+    # exercises — counts only blocks running this action. Under a throwaway id it
+    # would see no covering block and finalize a split sample after its FIRST
+    # block, which the count assertion then rejects.
+    action_id = BLOCK_MASK_ACTION_ID
+    version = BLOCK_MASK_ACTION_VERSION
+    created_action = await seed_block_action_if_absent(
+        postgres_pool, action_id=action_id, version=version
     )
 
     created_blocks: list[int] = []
@@ -307,8 +311,8 @@ async def block_pool(postgres_pool, human_admin_session):
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
             created_blocks,
         )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1", action_id
+    await delete_block_action_if_created(
+        postgres_pool, action_id=action_id, version=version, created=created_action
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx

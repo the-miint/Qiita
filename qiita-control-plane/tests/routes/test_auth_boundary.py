@@ -304,7 +304,8 @@ async def _seed_active_reference(postgres_pool, suffix: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# POST /reference/{id}/ticket/doget — scope ticket:doget
+# POST /reference/{id}/ticket/doget — any-of reference:read (public reference
+# data, humans) OR ticket:doget (the compute service account)
 # ---------------------------------------------------------------------------
 
 
@@ -318,11 +319,13 @@ async def test_doget_no_auth_401(boundary_client, postgres_pool):
 
 
 async def test_doget_missing_scope_403(boundary_client, postgres_pool):
+    """A principal WITHOUT reference:read is refused — the reference DoGet ticket
+    route is gated on reference:read (reference data is public)."""
     ref_idx = await _seed_active_reference(postgres_pool, "doget-no-scope")
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role=SystemRole.USER,
-        scopes=[Scope.SELF_PROFILE, Scope.REFERENCE_READ],
+        scopes=[Scope.SELF_PROFILE],  # deliberately NO reference:read
         suffix="doget-no-scope",
     )
     resp = await boundary_client.post(
@@ -331,6 +334,59 @@ async def test_doget_missing_scope_403(boundary_client, postgres_pool):
         headers=_h(token),
     )
     assert resp.status_code == 403
+
+
+async def test_doget_reference_read_grants_ticket(boundary_client, postgres_pool):
+    """A human holding only reference:read CAN mint a reference DoGet ticket —
+    reference sequences are public reference data (this is what powers the
+    `qiita reference export` user CLI). Previously this required the service-only
+    ticket:doget scope."""
+    # A streamable ('active') reference so the request reaches (and passes) the
+    # scope gate rather than the status gate (_seed_active_reference is 'hashing').
+    ref_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'active', $2) RETURNING reference_idx",
+        f"doget-ref-read-{_unique_suffix('active')}",
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    token, _ = await _seed_human_with_token(
+        postgres_pool,
+        system_role=SystemRole.USER,
+        scopes=[Scope.SELF_PROFILE, Scope.REFERENCE_READ],
+        suffix="doget-ref-read",
+    )
+    resp = await boundary_client.post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref_idx),
+        json={"table": "reference_sequences"},
+        headers=_h(token),
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_doget_ticket_doget_only_service_account_still_grants(boundary_client, postgres_pool):
+    """The compute service account holds `ticket:doget` but NOT `reference:read`
+    (its live grant is exactly [sequence_range:mint, ticket:doget]). The route
+    accepts EITHER scope (any-of), so this compute-shaped principal keeps minting
+    the reference DoGet tickets its sharded builds + OGU depend on — the change is
+    strictly additive. Regression guard: gating on reference:read ALONE would 403
+    this principal (the fixture masks it by also granting reference:read)."""
+    ref_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'active', $2) RETURNING reference_idx",
+        f"doget-svc-{_unique_suffix('doget-only')}",
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    token, _ = await _seed_service_with_token(
+        postgres_pool,
+        scopes=[Scope.SEQUENCE_RANGE_MINT, Scope.TICKET_DOGET],  # NO reference:read
+        suffix="doget-only-svc",
+    )
+    resp = await boundary_client.post(
+        URL_REFERENCE_DOGET.format(reference_idx=ref_idx),
+        json={"table": "reference_sequence_chunks", "feature_idx": [1, 2, 3]},
+        headers=_h(token),
+    )
+    assert resp.status_code == 201, resp.text
 
 
 # ---------------------------------------------------------------------------

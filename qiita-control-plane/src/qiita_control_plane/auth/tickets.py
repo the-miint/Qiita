@@ -24,6 +24,13 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from qiita_common.hashing import canonical_json
 
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
+
+# The only tables a `members` selector may be signed onto — the block-read
+# selectors, mirroring the data plane's BLOCK_READ_SOURCES. Sourced from the
+# shared constants so the signer and the scope rule cannot drift.
+_MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
+
 TICKET_VERSION = 2
 DEFAULT_TTL_SECONDS = 300
 SIGNATURE_SIZE = 64  # Ed25519
@@ -67,22 +74,56 @@ def sign_ticket(
     table: str,
     filter: dict[str, Any],
     secret: bytes,
+    members: list[dict[str, int]] | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     expiry_epoch: int | None = None,
 ) -> bytes:
     """Sign a DoGet Flight ticket with Ed25519.
 
-    An empty ``filter`` (or a filter with any empty value list) is rejected here
-    at the signing boundary: the data plane treats an empty filter as
-    ``SELECT * FROM <table>``, so signing one would authorize an unscoped
-    full-table dump. Every caller passes a mandatory, non-empty identifier
-    filter; centralizing the check means a future caller can't silently mint a
-    dump-everything ticket even if it forgets the route-level guard.
+    **A signed ticket is always scoped.** The data plane treats an empty filter
+    as ``SELECT * FROM <table>``, so signing an unscoped ticket would authorize a
+    full-table dump. This boundary enforces that a ticket carries at least one of
+    the two scoping mechanisms, so a future caller cannot mint a dump-everything
+    ticket even if it forgets its route-level guard:
+
+    * ``filter`` — the column/value form, non-empty with non-empty value lists.
+    * ``members`` — the block-read selector (``read_block`` /
+      ``read_masked_block``), a non-empty list of ``{prep_sample_idx,
+      sequence_idx_start, sequence_idx_stop}`` triples that a flat column filter
+      cannot express. ``read_masked_block`` carries BOTH (its ``mask_idx``
+      filter plus members); ``read_block`` carries members alone, so an empty
+      ``filter`` is legitimate there and only there.
+
+    ``members`` is omitted from the payload entirely when absent, so every
+    existing ticket signs byte-identical bytes (the data plane defaults the field).
     """
-    if not filter or any(not value for value in filter.values()):
-        raise ValueError("sign_ticket requires a non-empty filter with non-empty values")
+    if filter and any(not value for value in filter.values()):
+        raise ValueError("sign_ticket rejects a filter with an empty value list")
+    if members and table not in _MEMBERS_TABLES:
+        # The members selector is only meaningful for the block-read selectors,
+        # and only they can be scoped by it alone. Signing it onto another table
+        # would mint a ticket the data plane rejects — or, worse, one whose empty
+        # filter passed the scope check below on the strength of a selector that
+        # table ignores. Enforce here so the boundary holds what it documents.
+        raise ValueError(
+            f"sign_ticket: a members selector is only valid for "
+            f"{sorted(_MEMBERS_TABLES)}, got {table!r}"
+        )
+    if members is not None and not members:
+        # Distinct from "no members at all": an explicitly empty selector means
+        # the caller computed a block footprint and got nothing, which is a
+        # planning bug — never a licence to read the whole table.
+        raise ValueError("sign_ticket rejects an empty members selector")
+    if not filter and not members:
+        raise ValueError(
+            "sign_ticket requires a scope: a non-empty filter, a non-empty "
+            "members selector, or both"
+        )
+    payload: dict[str, Any] = {"filter": filter, "table": table}
+    if members:
+        payload["members"] = members
     return _sign_payload(
-        {"filter": filter, "table": table},
+        payload,
         secret,
         ttl_seconds=ttl_seconds,
         expiry_epoch=expiry_epoch,

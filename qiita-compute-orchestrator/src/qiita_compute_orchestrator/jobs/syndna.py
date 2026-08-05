@@ -317,7 +317,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # paired-end set HERE rather than after a full minimap2 pass that the very
             # next consumer would reject anyway. (The gates are client-supplied; see
             # `_partial_mask.assert_single_end`.)
-            assert_single_end(conn, reads_sql, "reads", inputs.reads)
+            assert_single_end(conn, f"read_parquet('{reads_sql}')", "reads", inputs.reads)
 
             # No incoming mask and no trimming yet: minimap2 aligns the raw read.
             # `sequence2` is deliberately NOT selected into the query: a non-NULL

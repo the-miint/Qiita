@@ -188,12 +188,36 @@ steps:
 
   # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir
   # holds read_mask.parquet, which register-files maps to the `read_mask` table.
-  # Moves the parquet out of staging — keep this last (see persist-read-metrics).
+  # Moves the parquet out of staging — must run after persist-read-metrics (which
+  # reads the staging path) and before finalize-mask-sample (the completion gate
+  # must not flip until the reads are durable in DuckLake).
   - action: register-files
     inputs: [read_mask_staging_dir]
     outputs: []
 
+  # Terminal: record this sample's masking as completed in the qiita.mask_sample
+  # gate (state='completed' for this ticket's mask_idx + prep_sample). Identical to
+  # read-mask/1.0.0's terminal step — this mask-model ingest path mints a mask_idx
+  # and writes read_mask exactly like read-mask, so it owes the same first-class
+  # completion gate its consumers (masked-read export, long-read-assembly,
+  # alignment) require. No file inputs: mask_idx from the ticket, prep_sample_idx
+  # from the scope target. MUST run last — after register-files makes the reads
+  # durable — so 'completed' never advertises reads that aren't in DuckLake.
+  - action: finalize-mask-sample
+    inputs: []
+    outputs: []
+
+# Ceiling must stay strictly ABOVE every step baseline on the escalating axes
+# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
+# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
+# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
+# are unchanged here; cpu/gpu never escalate.
+#
+# host_filter peaks at 25.8 GB against a 32 GB baseline — real demand, since it
+# deliberately does not size DuckDB from the cgroup (jobs/host_filter.py). ~6 GB
+# of margin is what the ladder has to absorb. Measured on read-mask/1.0.0, which
+# carries essentially all host_filter traffic; same module, so it carries.
 action_ceiling:
   cpu: 8
-  mem_gb: 32
+  mem_gb: 64
   walltime: PT8H

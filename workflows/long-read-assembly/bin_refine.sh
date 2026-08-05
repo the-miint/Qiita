@@ -59,10 +59,17 @@ labels_csv="$(IFS=,; echo "${das_labels[*]}")"
 # no-bins message; anything else fails the step loudly (the repo's fail-fast
 # ethos). The default on a non-zero exit is to FAIL.
 set +e
+# `--write_bins` is a BOOLEAN flag (DAS_Tool 1.1.x docopt spec: "Export bins as
+# fasta files.", no value) — pass it bare, exactly as qp-pacbio does. A trailing
+# value (`--write_bins 1`) is an unexpected positional that r-docopt 0.7.2 renders
+# as `'short' is not a valid field or method name for reference class "Argument"`
+# and Execution-halts before DAS_Tool runs — a real crash that this step's
+# no-bins/other-crash split (below) correctly fails loud on. Probed against
+# das_tool 1.1.7 / r-docopt 0.7.2: the bare form parses, the `1` form crashes.
 micromamba run -n dastool DAS_Tool \
     --bins="${bins_csv}" --contigs="${NOLCG}" \
     --outputbasename="${WORK}/dastool" --labels="${labels_csv}" \
-    --threads="${THREADS}" --search_engine=diamond --write_bins 1 \
+    --threads="${THREADS}" --search_engine=diamond --write_bins \
     > "${WORK}/dastool.log" 2>&1
 das_rc=$?
 set -e

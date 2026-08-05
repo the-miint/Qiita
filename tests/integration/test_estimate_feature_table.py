@@ -253,9 +253,10 @@ async def feature_table_scenario(postgres_pool, data_plane):
 
 
 def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
-    """Drop-in `open_alignment_stream` that signs the `alignment` DoGet ticket
-    directly with the fixture DP secret (the scope the CP route would derive from
-    action_context) and streams via the real `open_doget_stream`."""
+    """Drop-in `open_alignment_stream` that signs the `alignment_visible` DoGet
+    ticket directly with the fixture DP secret (the scope the CP route would derive
+    from action_context) and streams via the real `open_doget_stream`. Reads go
+    through the exclusion-aware view, matching what routes/alignment.py signs."""
     from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 
     from qiita_control_plane.auth.tickets import sign_ticket
@@ -263,7 +264,7 @@ def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
     @asynccontextmanager
     async def fake(conn, *, work_ticket_idx, relation="alignment"):
         ticket = sign_ticket(
-            table="alignment",
+            table="alignment_visible",
             filter={
                 "alignment_idx": [alignment_idx],
                 "prep_sample_idx": prep_sample_idx,

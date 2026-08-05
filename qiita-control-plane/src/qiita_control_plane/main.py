@@ -1,6 +1,7 @@
 """Control plane FastAPI application."""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from fastapi.openapi.docs import (
 )
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from qiita_common.log import install_authorization_scrub
+from qiita_common.log import configure_logging, install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
 
 from .auth.cli_login_code_sweeper import run_cli_login_code_sweeper
@@ -31,6 +32,8 @@ from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
 from .routes import api_router
 
+_log = logging.getLogger(__name__)
+
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # Bound on how long we wait for in-flight dispatches at shutdown. systemd's
@@ -42,9 +45,22 @@ _DISPATCH_DRAIN_TIMEOUT_SECONDS = 60.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before the scrubber, which attaches to the handlers this installs, and before
+    # Settings.from_env() below so a fail-fast boot error is itself logged.
+    log_level = configure_logging()
     install_authorization_scrub()
 
     settings = Settings.from_env()
+    # Unconditional, and the only proof from outside the process that app logging came
+    # up: uvicorn's own `INFO:` lines reach the journal whether or not the root logger
+    # was ever configured, so a check for them cannot tell a working CP from the bug
+    # this fixed. The fan-out default is here because it is the number an operator
+    # reconciles a `fanout list` reading against, and overrides revert to it on restart.
+    _log.info(
+        "control-plane up: log_level=%s fanout_max_inflight=%d",
+        log_level,
+        settings.fanout_max_inflight,
+    )
     app.state.pool = await get_pool(settings.database_url)
     app.state.settings = settings
     # Build the OIDC verifier eagerly when AUTHROCKET_* is set.

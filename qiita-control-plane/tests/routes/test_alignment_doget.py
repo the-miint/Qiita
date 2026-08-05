@@ -191,7 +191,7 @@ async def test_doget_sa_signs_scoped_filter(ctx):
         resp = await ctx["sa"].post(URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx})
         assert resp.status_code == 201, resp.text
         payload = _decode_ticket_payload(resp.json()["ticket"])
-        assert payload["table"] == "alignment"
+        assert payload["table"] == "alignment_visible"
         assert payload["filter"] == {
             "alignment_idx": [777],
             "prep_sample_idx": [11, 12, 13],
@@ -283,16 +283,18 @@ async def test_doget_work_ticket_not_found_404(ctx):
 
 
 async def test_doget_alignment_in_cp_allowlist():
-    """The table the route signs must be in the CP-side DoGet allowlist that
-    mirrors the data plane's ALLOWED_TABLES."""
+    """The view the route signs must be in the CP-side DoGet allowlist that
+    mirrors the data plane's ALLOWED_TABLES — and the raw base table must NOT be
+    (reads go through the exclusion view, never the raw sink)."""
     from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
 
-    assert "alignment" in _DOGET_ALLOWED_TABLES
+    assert "alignment_visible" in _DOGET_ALLOWED_TABLES
+    assert "alignment" not in _DOGET_ALLOWED_TABLES
 
 
 async def test_doget_alignment_not_signable_via_reference_route():
-    """alignment is served only by this route (scoped by alignment_idx +
+    """alignment_visible is served only by this route (scoped by alignment_idx +
     prep_sample_idx), never by the reference route with a reference_idx filter."""
     from qiita_control_plane.routes.reference import _REFERENCE_DOGET_TABLES
 
-    assert "alignment" not in _REFERENCE_DOGET_TABLES
+    assert "alignment_visible" not in _REFERENCE_DOGET_TABLES

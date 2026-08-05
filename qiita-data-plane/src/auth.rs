@@ -32,10 +32,27 @@ const MAX_TICKET_LIFETIME: u64 = 3600;
 pub type TicketFilter = HashMap<String, Vec<serde_json::Value>>;
 
 /// Parsed ticket payload after verification.
+///
+/// Two scoping mechanisms, and a ticket uses exactly one of them (`build_query`
+/// enforces which tables accept which):
+///
+/// * `filter` — the column/value whitelist form (`{"feature_idx": [1, 2, 3]}`),
+///   used by every reference table, `read_masked`, and `alignment`.
+/// * `members` — the block-read selector: `(prep_sample_idx, sequence_idx
+///   sub-range)` tuples, which a flat column filter cannot express. Only the
+///   block-read tables (`read_block` / `read_masked_block`) accept it, and they
+///   REQUIRE it — see `BLOCK_READ_SOURCES` in `flight_service`.
+///
+/// Both default to empty so each ticket carries only the shape it uses; the
+/// per-table guards in `build_query` reject an under-scoped combination rather
+/// than letting an empty scope mean "everything".
 #[derive(Debug, serde::Deserialize)]
 pub struct TicketPayload {
     pub table: String,
+    #[serde(default)]
     pub filter: TicketFilter,
+    #[serde(default)]
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Errors from ticket verification.
@@ -313,14 +330,20 @@ pub fn verify_export_read(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
-/// One member of an `export_read_block` selector: a prep_sample and the
-/// inclusive `sequence_idx` sub-range of it this block covers. A whole sample
-/// is `[start, stop]` == its `qiita.sequence_range`; a sample split across
-/// blocks contributes a sub-range to each. `deny_unknown_fields` pins the shape
-/// to exactly these three columns.
+/// One member of a block-read selector: a prep_sample and the inclusive
+/// `sequence_idx` sub-range of it this block covers. A whole sample is
+/// `[start, stop]` == its `qiita.sequence_range`; a sample split across blocks
+/// contributes a sub-range to each. `deny_unknown_fields` pins the shape to
+/// exactly these three columns.
+///
+/// Shared by every block-footprint payload — the block-read DoGet tickets
+/// (`read_block` / `read_masked_block`) and the `delete_read_mask_block` /
+/// `delete_alignment_block` actions — so one selector shape describes a block
+/// whether we are reading it or deleting it. `block_read_where_clause` in
+/// `flight_service` is the single translator from these members to SQL.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExportReadBlockMember {
+pub struct BlockReadMember {
     /// `i64`, matching the Postgres `prep_sample` identifier source of truth
     /// and the `read.prep_sample_idx BIGINT` column in the DuckLake table.
     pub prep_sample_idx: i64,
@@ -330,92 +353,8 @@ pub struct ExportReadBlockMember {
     pub sequence_idx_stop: i64,
 }
 
-/// Parsed payload for the `export_read_block` DoAction — the block-compute
-/// sibling of `export_read`.
-///
-/// Wire shape pinned by `qiita_control_plane.runner._resolve_staged_reads_block`:
-/// `{"action": "export_read_block", "dest": "<abs path>",
-///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
-///                "sequence_idx_stop": b}, ...]}`.
-/// The data plane re-materializes the union of the members' `read` sub-ranges
-/// from its DuckLake `read` table to `dest` (a per-ticket `reads.parquet` a
-/// read-mask *block* job then consumes) — the bulk read bytes never transit the
-/// control plane. Constraining on `prep_sample_idx` (not `sequence_idx` alone)
-/// keeps the selector correct even where the inner index is only locally unique
-/// (the reusable block-compute case). No `work_ticket_idx`: the `dest` path the
-/// CP builds already carries the ticket. `deny_unknown_fields` keeps the
-/// contract tight: any extra field is a design slip surfaced loudly here.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportReadBlockPayload {
-    /// Action discriminator; the gRPC handler also rejects a payload whose
-    /// `action` is not "export_read_block".
-    pub action: String,
-    /// Absolute destination path for the materialized Parquet. The handler
-    /// re-validates it (`validate_export_dest`) before writing — under the
-    /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is Ed25519-signed by the control plane (defense in depth).
-    pub dest: String,
-    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
-    /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
-}
-
-/// Verify an `export_read_block` DoAction token and return its parsed payload.
-pub fn verify_export_read_block(
-    ticket: &[u8],
-    verifying_key: &VerifyingKey,
-) -> Result<ExportReadBlockPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
-    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
-}
-
-/// Parsed payload for the `export_read_masked_block` DoAction — the MASKED-reads
-/// sibling of `export_read_block`.
-///
-/// Wire shape pinned by
-/// `qiita_control_plane.runner._resolve_staged_masked_reads_block`:
-/// `{"action": "export_read_masked_block", "dest": "<abs path>", "mask_idx": N,
-///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
-///                "sequence_idx_stop": b}, ...]}`.
-/// The data plane re-materializes the union of the members' sub-ranges from its
-/// DuckLake `read_masked` VIEW (filtered `mask_idx = ?`, so already trimmed and
-/// host/QC-`pass`-filtered) to `dest` — a per-ticket `reads.parquet` the sharded
-/// `align_sharded` job then consumes, in the SAME column shape `export_read_block`
-/// writes. It is `export_read_block` (dest + members, reusing
-/// `ExportReadBlockMember`) plus the `mask_idx` scope — the raw `read` export
-/// needs no mask column, a masked export does. `deny_unknown_fields` keeps the
-/// contract tight: any extra field is a design slip surfaced loudly here.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportReadMaskedBlockPayload {
-    /// Action discriminator; the gRPC handler also rejects a payload whose
-    /// `action` is not "export_read_masked_block".
-    pub action: String,
-    /// Absolute destination path for the materialized Parquet. The handler
-    /// re-validates it (`validate_export_dest`) before writing — under the
-    /// data plane's scratch root, no `..`, no single quote — even though the
-    /// token is Ed25519-signed by the control plane (defense in depth).
-    pub dest: String,
-    /// `i64`, matching the Postgres `alignment_definition` mask scope and the
-    /// `read_mask.mask_idx BIGINT` column the `read_masked` view filters on.
-    pub mask_idx: i64,
-    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
-    /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
-}
-
-/// Verify an `export_read_masked_block` DoAction token and return its payload.
-pub fn verify_export_read_masked_block(
-    ticket: &[u8],
-    verifying_key: &VerifyingKey,
-) -> Result<ExportReadMaskedBlockPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
-    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
-}
-
 /// Parsed payload for the `delete_read_mask_block` DoAction — the idempotent
-/// block-replace sibling of `export_read_block`.
+/// block-replace sibling of the `read_block` DoGet selector.
 ///
 /// Wire shape pinned by
 /// `qiita_control_plane.actions.library.delete_read_mask_block_data`:
@@ -427,8 +366,8 @@ pub fn verify_export_read_masked_block(
 /// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
 /// delete-then-re-register without double-counting or clobbering a sibling
 /// block's rows for a shared sample. The footprint is the SAME
-/// `(prep_sample_idx, sub-range)` member list `export_read_block` carries
-/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member
+/// `(prep_sample_idx, sub-range)` member list the `read_block` DoGet selector carries
+/// (reusing `BlockReadMember`); it is exact by construction (per-member
 /// OR residual), so a split member never deletes a sibling block's tail. The
 /// extra `mask_idx` scopes the delete to this filtering identity — the `read`
 /// export needs no such column, `read_mask` does. `deny_unknown_fields` keeps
@@ -444,7 +383,7 @@ pub struct DeleteReadMaskBlockPayload {
     pub mask_idx: i64,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Verify a `delete_read_mask_block` DoAction token and return its parsed payload.
@@ -470,8 +409,8 @@ pub fn verify_delete_read_mask_block(
 /// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
 /// delete-then-re-register without double-counting or clobbering a sibling
 /// block's rows for a shared sample. The footprint is the SAME
-/// `(prep_sample_idx, sub-range)` member list `export_read_masked_block` carries
-/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member OR
+/// `(prep_sample_idx, sub-range)` member list the `read_masked_block` DoGet selector carries
+/// (reusing `BlockReadMember`); it is exact by construction (per-member OR
 /// residual) and feature_idx-agnostic (all of a read's alignment rows go, since a
 /// read produces multiple rows via cross-shard + PE multiplicity). The extra
 /// `alignment_idx` scopes the delete to this align-config identity — the raw
@@ -489,7 +428,7 @@ pub struct DeleteAlignmentBlockPayload {
     pub alignment_idx: i64,
     /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
     /// an empty list (an empty block is a control-plane bug, not a valid ask).
-    pub members: Vec<ExportReadBlockMember>,
+    pub members: Vec<BlockReadMember>,
 }
 
 /// Verify a `delete_alignment_block` DoAction token and return its parsed payload.
@@ -597,6 +536,43 @@ pub fn verify_doput(
     ticket: &[u8],
     verifying_key: &VerifyingKey,
 ) -> Result<DoPutPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `sync_reference_exclusion` DoAction.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.sync_reference_exclusion_data`:
+/// `{"action": "sync_reference_exclusion", "dest": "<abs path>"}`. The control
+/// plane resolves its authoritative blocklist to the excluded `feature_idx` set,
+/// writes that set to a single-column Parquet at `dest` on the shared scratch
+/// tree, and the data plane REPLACES its `reference_exclusion` mirror wholesale
+/// from that file (full-replace ⇒ idempotent / replay-safe). No `reference_idx`
+/// or other scoping field: the blocklist is global and the mirror is a flat
+/// `feature_idx` set. `deny_unknown_fields` keeps the contract tight: any extra
+/// field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncReferenceExclusionPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "sync_reference_exclusion".
+    pub action: String,
+    /// Absolute path to the single-column (`feature_idx`) Parquet the control
+    /// plane wrote. The handler re-validates it (`validate_export_dest`) before
+    /// inlining it into a `read_parquet(...)` literal — under the data plane's
+    /// scratch root, no `..`, no single quote — even though the token is
+    /// Ed25519-signed by the control plane (defense in depth). An empty
+    /// blocklist still ships a valid zero-row Parquet, so the replace clears the
+    /// mirror table.
+    pub dest: String,
+}
+
+/// Verify a `sync_reference_exclusion` DoAction token and return its payload.
+pub fn verify_sync_reference_exclusion(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<SyncReferenceExclusionPayload, AuthError> {
     let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
@@ -786,109 +762,85 @@ mod tests {
         }
     }
 
-    // -------------------- export_read_block --------------------
+    // -------------------- sync_reference_exclusion --------------------
 
     #[test]
-    fn verify_export_read_block_round_trip() {
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/ticket/900/reads.parquet","members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]}"#;
+    fn verify_sync_reference_exclusion_round_trip() {
+        let payload = br#"{"action":"sync_reference_exclusion","dest":"/scratch/exclusion/reference_exclusion.parquet"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        let parsed =
-            verify_export_read_block(&ticket, &test_vk()).expect("valid token should verify");
-        assert_eq!(parsed.action, "export_read_block");
+        let parsed = verify_sync_reference_exclusion(&ticket, &test_vk())
+            .expect("valid token should verify");
+        assert_eq!(parsed.action, "sync_reference_exclusion");
+        assert_eq!(
+            parsed.dest,
+            "/scratch/exclusion/reference_exclusion.parquet"
+        );
+    }
+
+    #[test]
+    fn verify_sync_reference_exclusion_rejects_extra_fields() {
+        // A smuggled scoping field (e.g. reference_idx) is a design slip — the
+        // blocklist is global and the mirror is a flat feature_idx set.
+        let payload =
+            br#"{"action":"sync_reference_exclusion","dest":"/scratch/x","reference_idx":9}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_sync_reference_exclusion(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // -------------------- block-read DoGet ticket members --------------------
+    //
+    // Block-scoped reads are a DoGet ticket carrying `members`. A member is
+    // exactly three fields and a smuggled field is a hard error — guarantees that
+    // live on `BlockReadMember`, which the DoGet payload embeds.
+
+    #[test]
+    fn verify_ticket_parses_block_read_members() {
+        let payload = br#"{"filter":{},"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}],"table":"read_block"}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert_eq!(parsed.table, "read_block");
         assert_eq!(parsed.members.len(), 2);
         assert_eq!(parsed.members[0].prep_sample_idx, 101);
         assert_eq!(parsed.members[1].sequence_idx_stop, 309);
+        assert!(
+            parsed.filter.is_empty(),
+            "read_block scopes by members alone"
+        );
     }
 
     #[test]
-    fn verify_export_read_block_rejects_member_extra_fields() {
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}]}"#;
+    fn verify_ticket_parses_masked_block_members_with_mask_scope() {
+        let payload = br#"{"filter":{"mask_idx":[7]},"members":[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}],"table":"read_masked_block"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
+        let parsed = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert_eq!(parsed.table, "read_masked_block");
+        assert_eq!(parsed.members.len(), 1);
+        assert_eq!(parsed.filter.get("mask_idx").unwrap()[0].as_i64(), Some(7));
+    }
+
+    #[test]
+    fn verify_ticket_rejects_member_extra_fields() {
+        // BlockReadMember is deny_unknown_fields: a member is exactly the three
+        // columns, so a smuggled field is a malformed ticket, not an ignored one.
+        let payload = br#"{"filter":{},"members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}],"table":"read_block"}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_ticket(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
     }
 
     #[test]
-    fn verify_export_read_block_rejects_extra_fields() {
-        // Top-level deny_unknown_fields (distinct from the member-level guard above).
-        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}],"smuggled":9}"#;
+    fn verify_ticket_defaults_members_when_absent() {
+        // Every pre-existing (non-block) ticket omits `members` entirely; it must
+        // still parse, with an empty selector.
+        let payload = br#"{"filter":{"feature_idx":[1]},"table":"reference_sequences"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        match verify_export_read_block(&ticket, &test_vk()).unwrap_err() {
-            AuthError::MalformedPayload(_) => {}
-            other => panic!("expected MalformedPayload, got {other:?}"),
-        }
-    }
-
-    // --------------------------------------------------------------------
-    // export_read_masked_block action token variant
-    // --------------------------------------------------------------------
-
-    fn make_export_read_masked_block_ticket(
-        dest: &str,
-        mask_idx: i64,
-        members: &str,
-        key: &SigningKey,
-        expiry: u64,
-    ) -> Vec<u8> {
-        // Canonical JSON: sorted keys, no whitespace. Top-level keys sorted:
-        // action, dest, mask_idx, members.
-        let payload = format!(
-            r#"{{"action":"export_read_masked_block","dest":"{dest}","mask_idx":{mask_idx},"members":{members}}}"#
-        );
-        build_ticket(payload.as_bytes(), key, expiry)
-    }
-
-    #[test]
-    fn verify_export_read_masked_block_round_trip() {
-        let members =
-            r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109}]"#;
-        let ticket = make_export_read_masked_block_ticket(
-            "/scratch/ticket/900/reads.parquet",
-            7,
-            members,
-            &test_signing_key(),
-            future_expiry(300),
-        );
-        let payload = verify_export_read_masked_block(&ticket, &test_vk())
-            .expect("valid token should verify");
-        assert_eq!(payload.action, "export_read_masked_block");
-        assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
-        assert_eq!(payload.mask_idx, 7);
-        assert_eq!(payload.members.len(), 1);
-        assert_eq!(payload.members[0].prep_sample_idx, 101);
-        assert_eq!(payload.members[0].sequence_idx_start, 100);
-        assert_eq!(payload.members[0].sequence_idx_stop, 109);
-    }
-
-    #[test]
-    fn verify_export_read_masked_block_rejects_bad_signature() {
-        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
-        let mut ticket = make_export_read_masked_block_ticket(
-            "/scratch/ticket/1/reads.parquet",
-            3,
-            members,
-            &test_signing_key(),
-            future_expiry(300),
-        );
-        ticket[12] ^= 0xFF;
-        assert_eq!(
-            verify_export_read_masked_block(&ticket, &test_vk()).unwrap_err(),
-            AuthError::InvalidSignature
-        );
-    }
-
-    #[test]
-    fn verify_export_read_masked_block_rejects_extra_fields() {
-        // deny_unknown_fields: a smuggled top-level field (or a missing mask_idx)
-        // is a contract slip surfaced here.
-        let payload = br#"{"action":"export_read_masked_block","dest":"/scratch/x","mask_idx":1,"members":[],"smuggled":9}"#;
-        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-        match verify_export_read_masked_block(&ticket, &test_vk()).unwrap_err() {
-            AuthError::MalformedPayload(_) => {}
-            other => panic!("expected MalformedPayload, got {other:?}"),
-        }
+        let parsed = verify_ticket(&ticket, &test_vk()).expect("valid ticket should verify");
+        assert!(parsed.members.is_empty());
     }
 
     // -------------------- mask_metrics --------------------

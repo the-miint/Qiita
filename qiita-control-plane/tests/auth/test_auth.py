@@ -50,6 +50,16 @@ def test_sign_ticket_is_deterministic():
     assert t1 == t2
 
 
+def _payload_of(ticket: bytes) -> bytes:
+    """Slice the canonical-JSON payload out of a signed ticket.
+
+    The wire format is `<1B version><4B payload_len><payload><64B sig><8B expiry>`
+    (pinned by test_sign_ticket_wire_format below).
+    """
+    payload_len = struct.unpack(">I", ticket[1:5])[0]
+    return ticket[5 : 5 + payload_len]
+
+
 def test_sign_ticket_wire_format():
     """Ticket wire format: 1B version, 4B payload len, payload, 64B Ed25519 sig, 8B expiry."""
     from qiita_control_plane.auth.tickets import sign_ticket
@@ -136,15 +146,54 @@ def test_sign_ticket_rejects_nonpositive_ttl():
         sign_ticket(table="test", filter={"x": [1]}, secret=_TEST_SEED, ttl_seconds=-1)
 
 
-def test_sign_ticket_rejects_empty_filter():
-    """sign_ticket must refuse an empty filter or one with an empty value list.
+def test_sign_ticket_rejects_unscoped_ticket():
+    """sign_ticket must refuse a ticket carrying NEITHER scoping mechanism.
 
     An empty filter authorizes ``SELECT * FROM <table>`` on the data plane, so
     the signing boundary rejects it rather than minting a dump-everything ticket.
+    A filter with an empty value list is the same hole spelled differently.
     """
     from qiita_control_plane.auth.tickets import sign_ticket
 
-    with pytest.raises(ValueError, match="non-empty filter"):
+    with pytest.raises(ValueError, match="requires a scope"):
         sign_ticket(table="test", filter={}, secret=_TEST_SEED)
-    with pytest.raises(ValueError, match="non-empty filter"):
+    with pytest.raises(ValueError, match="empty value list"):
         sign_ticket(table="test", filter={"prep_sample_idx": []}, secret=_TEST_SEED)
+
+
+def test_sign_ticket_members_selector():
+    """The block-read selector form scopes a ticket in place of a filter.
+
+    ``read_block`` carries members alone (an empty filter is legitimate there and
+    only there); an explicitly EMPTY members list is refused, because it means
+    the caller computed a block footprint and got nothing — a planning bug, never
+    a licence to read the whole table.
+    """
+    import json
+
+    from qiita_control_plane.auth.tickets import sign_ticket
+
+    members = [{"prep_sample_idx": 11, "sequence_idx_start": 1, "sequence_idx_stop": 9}]
+    ticket = sign_ticket(table="read_block", filter={}, members=members, secret=_TEST_SEED)
+    payload = json.loads(_payload_of(ticket))
+    assert payload["table"] == "read_block"
+    assert payload["members"] == members
+
+    with pytest.raises(ValueError, match="empty members selector"):
+        sign_ticket(table="read_block", filter={}, members=[], secret=_TEST_SEED)
+
+
+def test_sign_ticket_omits_members_when_absent():
+    """A ticket with no members must sign byte-identical bytes to before.
+
+    The data plane defaults the field, so emitting ``"members": []`` would change
+    the canonical-JSON payload every existing ticket signs over for no reason.
+    """
+    import json
+
+    from qiita_control_plane.auth.tickets import sign_ticket
+
+    payload = json.loads(
+        _payload_of(sign_ticket(table="read_masked", filter={"mask_idx": [7]}, secret=_TEST_SEED))
+    )
+    assert "members" not in payload

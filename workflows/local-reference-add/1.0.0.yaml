@@ -58,21 +58,30 @@ context_schema:
     minimap2_preset:
       type: string
       enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
-  # A sharded reference must build at least one per-shard index type (same
-  # backstop as reference-add). Fires only when shard_index is true AND both
-  # build_* are explicitly false. The whole-reference rype_router is always built.
-  not:
-    required: [shard_index, build_minimap2, build_bowtie2]
-    properties:
-      shard_index: {const: true}
-      build_minimap2: {const: false}
-      build_bowtie2: {const: false}
     # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
     # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
     # is minted its OWN feature_idx so it can key a feature table while reads align to
     # its parent. Contract + the closed->half-open coordinate conversion:
     # qiita_compute_orchestrator.jobs.hash_sequences.
     gff_path: {type: string, pattern: "^/"}
+  # A sharded reference must build at least one per-shard index type.
+  # The `required` list means this `not:` only fires when all three keys are
+  # present — an omitted `build_*` defaults ON via the build-shard-index steps'
+  # `when:`, so a partial selection (e.g. `build_minimap2: false` alone) is valid.
+  not:
+    required: [shard_index, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
+  # A sharded reference requires a genome map — plan-shards derives the per-shard
+  # feature set from qiita.feature_genome, which mint-features populates only when
+  # a genome map is supplied.
+  if:
+    required: [shard_index]
+    properties: {shard_index: {const: true}}
+  then:
+    required: [genome_map_path]
 
 success_status: active
 failure_status: failed
@@ -127,7 +136,10 @@ steps:
     outputs: [annotation_map]
 
   - action: write-membership
-    inputs: [feature_map]
+    # `manifest` supplies the representative source accession (FASTA-header
+    # read_id) per feature_idx; `feature_map` supplies feature_idx. Resolved by
+    # binding name in the runner, so order here is not load-bearing.
+    inputs: [manifest, feature_map]
     outputs: []
 
   - step: load
@@ -183,6 +195,20 @@ steps:
 
   - action: finalize-shard
     when: router_pending
+    inputs: []
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step, identical to reference-add's tail
+  # sync (see that file for the full rationale). Re-resolves the GLOBAL curated
+  # blocklist and REPLACES the data plane's DuckLake `reference_exclusion` mirror
+  # wholesale (idempotent, replay-safe), so a fresh assembly of an already-blocked
+  # genome is caught by the re-resolve. Unconditional; MUST follow register-files
+  # and is placed DEAD LAST — after the sharded fan-out and its register-index —
+  # so a transient sync FlightError can never strand an already-built index
+  # unregistered. On the unsharded path every step above is skipped
+  # (when: router_pending), so sync still effectively runs right after
+  # register-files. See qiita_control_plane.actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
     inputs: []
     outputs: []
 

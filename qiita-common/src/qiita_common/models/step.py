@@ -281,3 +281,23 @@ class AlignmentDoGetTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
+
+
+class ReadDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/read/ticket/doget.
+
+    Signs a Flight DoGet ticket scoped to ONE block's ``(prep_sample_idx,
+    sequence_idx sub-range)`` members, so a block-scoped compute job streams its
+    reads from the data plane rather than reading a control-plane-materialized
+    Parquet off shared scratch.
+
+    Same shape and rationale as ``AlignmentDoGetTicketRequest``: the body carries
+    only ``work_ticket_idx``, and the route reads the members from
+    ``qiita.block_member`` and the raw-vs-masked selector from the ticket's
+    ``action_context``, so a block's (potentially large) member list never rides
+    the request body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]

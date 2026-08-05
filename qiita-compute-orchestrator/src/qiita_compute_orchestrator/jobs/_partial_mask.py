@@ -38,7 +38,7 @@ import duckdb
 
 
 def assert_single_end(
-    conn: duckdb.DuckDBPyConnection, reads_sql: str, field: str, path: Path
+    conn: duckdb.DuckDBPyConnection, reads_relation: str, field: str, source: Path | str
 ) -> None:
     """Reject a paired-end read set on a long-read-chain step.
 
@@ -55,12 +55,18 @@ def assert_single_end(
     alignment pass rather than after it.
 
     Fail loudly at the boundary instead of shipping an untested path.
+
+    `reads_relation` is the caller's already-bound reads relation (see
+    `read_source.bind_step_reads`), not a filesystem path — so this check reads
+    the SAME rows the job will process regardless of whether they came from a
+    staged Parquet or a data-plane stream. `source` is used only to name the
+    offending input in the error message.
     """
     (pe_rows,) = conn.execute(
-        f"SELECT count(*) FROM read_parquet('{reads_sql}') WHERE sequence2 IS NOT NULL"
+        f"SELECT count(*) FROM {reads_relation} WHERE sequence2 IS NOT NULL"
     ).fetchone()
     if pe_rows:
         raise ValueError(
-            f"{field} is bound ({path}) but reads contain {pe_rows} paired-end "
+            f"{field} is bound ({source}) but reads contain {pe_rows} paired-end "
             "row(s); an incoming mask is single-end only (long reads)"
         )

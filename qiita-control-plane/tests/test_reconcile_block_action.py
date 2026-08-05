@@ -20,24 +20,38 @@ import secrets
 
 import pytest
 import pytest_asyncio
+from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
 
 from qiita_control_plane.actions import library
-from qiita_control_plane.actions.library import reconcile_block
+from qiita_control_plane.actions.library import finalize_mask_sample_gate, reconcile_block
+from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
+from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
 from qiita_control_plane.repositories.block import (
     add_block_members,
     create_block,
+    has_incomplete_covering_block,
     set_block_state,
     set_block_work_ticket,
 )
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.testing.db_seeds import (
+    delete_block_action_if_created,
     seed_biosample_with_sequenced_prep_sample,
+    seed_block_action_if_absent,
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
 
 pytestmark = pytest.mark.db
+
+# The (action_id -> version) pairs these fixtures seed. Taken from the planners
+# that actually mint these tickets, so a submitter version bump reaches the tests
+# instead of leaving them exercising a version production no longer submits.
+_BLOCK_ACTION_VERSIONS = {
+    BLOCK_MASK_ACTION_ID: BLOCK_MASK_ACTION_VERSION,
+    ALIGN_ACTION_ID: ALIGN_ACTION_VERSION,
+}
 
 # The reads-per-sample the seeded sequence_range mints; the stubbed mask_metrics
 # returns row_count == this so the reconcile count-assertion passes.
@@ -87,22 +101,28 @@ async def rb(postgres_pool):
         prep_sample_idx,
     )
 
-    action_id = f"rb-act-{suffix}"
-    version = "1.0.0"
-    await postgres_pool.execute(
-        "INSERT INTO qiita.action"
-        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
-        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'block', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
-        "         1, 1, '1 minute', 'active', 'failed')",
-        action_id,
-        version,
-        '{"service": false, "human_roles": ["system_admin"]}',
-    )
+    # The REAL block action ids, because a block ticket's kind is its action_id
+    # (see qiita_common.actions) and the read-mask finalize gate keys on it.
+    # + delete-only-what-we-made: the (action_id, version) PK is shared with every
+    # other test on this worker's database.
+    created_actions = {
+        block_action_id: await seed_block_action_if_absent(
+            postgres_pool, action_id=block_action_id, version=block_version
+        )
+        for block_action_id, block_version in _BLOCK_ACTION_VERSIONS.items()
+    }
 
     created_blocks: list[int] = []
 
-    async def make_block(*, members, state) -> int:
+    async def make_block(*, members, state, alignment_idx=None, action_id=None) -> int:
+        # A block's KIND is its action_id. By default that follows alignment_idx —
+        # set → an ALIGN block (whose ticket carries BOTH ids), unset → a read-mask
+        # block — which is how the planners actually write them. Pass `action_id`
+        # explicitly to build the one shape that combination cannot express: a
+        # PURGED align block, still the align action but with its alignment_idx
+        # NULLed by `DELETE /alignment-definition`.
+        if action_id is None:
+            action_id = ALIGN_ACTION_ID if alignment_idx is not None else BLOCK_MASK_ACTION_ID
         async with postgres_pool.acquire() as conn, conn.transaction():
             block_idx = await create_block(conn)
             await add_block_members(conn, block_idx=block_idx, members=members)
@@ -110,13 +130,14 @@ async def rb(postgres_pool):
         wt_idx = await postgres_pool.fetchval(
             "INSERT INTO qiita.work_ticket"
             " (action_id, action_version, originator_principal_idx, scope_target_kind,"
-            "  block_idx, mask_idx)"
-            " VALUES ($1, $2, $3, 'block', $4, $5) RETURNING work_ticket_idx",
+            "  block_idx, mask_idx, alignment_idx)"
+            " VALUES ($1, $2, $3, 'block', $4, $5, $6) RETURNING work_ticket_idx",
             action_id,
-            version,
+            _BLOCK_ACTION_VERSIONS[action_id],
             principal_idx,
             block_idx,
             mask_idx,
+            alignment_idx,
         )
         async with postgres_pool.acquire() as conn, conn.transaction():
             await set_block_work_ticket(conn, block_idx=block_idx, work_ticket_idx=wt_idx)
@@ -141,9 +162,13 @@ async def rb(postgres_pool):
         await postgres_pool.execute(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])", created_blocks
         )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
-    )
+    for block_action_id, was_created in created_actions.items():
+        await delete_block_action_if_created(
+            postgres_pool,
+            action_id=block_action_id,
+            version=_BLOCK_ACTION_VERSIONS[block_action_id],
+            created=was_created,
+        )
     await postgres_pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
@@ -190,6 +215,107 @@ async def _metrics(pool, ss_idx):
         " quality_filtered_read_count_r1r2 FROM qiita.sequenced_sample WHERE idx = $1",
         ss_idx,
     )
+
+
+# ---------------------------------------------------------------------------
+# finalize-mask-sample (per-sample path) must not stomp an in-flight block gate.
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_mask_sample_gate_refuses_when_covering_block_in_flight(rb):
+    """The per-sample writer shares mask_idx with the block path. If a covering
+    block is still masking the same footprint under this mask_idx, finalizing the
+    gate would stomp the block's legitimate 'pending' row (and make reconcile
+    short-circuit over double-written reads). It must refuse loudly and leave the
+    gate untouched."""
+    pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
+    start = rb["seq_start"]
+    await rb["make_block"](members=[(ps, start, start + _SAMPLE_READS - 1)], state="processing")
+
+    with pytest.raises(RuntimeError, match="cross-path double-mask"):
+        await finalize_mask_sample_gate(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+
+    # The block's PENDING gate row is untouched — not stomped to 'completed'.
+    assert await _mask_sample_state(pool, mask_idx, ps) == "pending"
+
+
+async def test_finalize_mask_sample_gate_completes_when_no_covering_block(rb):
+    """With no covering block (the ordinary per-sample path), the writer upserts the
+    gate straight to 'completed'."""
+    pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
+    await finalize_mask_sample_gate(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+    assert await _mask_sample_state(pool, mask_idx, ps) == "completed"
+
+
+async def test_finalize_mask_sample_gate_takes_advisory_lock(rb, monkeypatch):
+    """NB1: the per-sample finalize takes the (mask_idx, prep_sample) advisory gate
+    lock across its check→write, serializing against the concurrent block planner
+    (which takes the same lock). Spies on the helper, calling through so the txn
+    still commits normally."""
+    pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
+    real = library.lock_mask_sample_gate_advisory
+    locked: list[tuple[int, int]] = []
+
+    async def spy(conn, *, mask_idx, prep_sample_idx):
+        locked.append((mask_idx, prep_sample_idx))
+        await real(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+
+    monkeypatch.setattr(library, "lock_mask_sample_gate_advisory", spy)
+    await finalize_mask_sample_gate(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+    assert locked == [(mask_idx, ps)]
+    assert await _mask_sample_state(pool, mask_idx, ps) == "completed"
+
+
+async def test_finalize_mask_sample_gate_ignores_inflight_align_block(rb):
+    """Regression: an in-flight ALIGN block over the same (mask_idx, sample) must
+    NOT wedge the per-sample read-mask finalize. Align blocks carry BOTH mask_idx
+    and alignment_idx, so `has_incomplete_covering_block` (keyed on mask_idx alone
+    before the fix) matched them and refused the per-sample gate forever. The
+    `action_id` discriminator restricts the gate to read-mask blocks.
+
+    Covers both align shapes, because they are not the same row: a live align block
+    (alignment_idx set) and a PURGED one, whose alignment_idx
+    `DELETE /alignment-definition` NULLed while leaving the mask_idx and block_idx
+    that make it look like a read-mask block. Only the action tells them apart.
+    """
+    pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
+    start = rb["seq_start"]
+    align_idx = await pool.fetchval(
+        "INSERT INTO qiita.alignment_definition (params_hash, params, created_by_idx)"
+        " VALUES ($1, '{}'::jsonb, $2) RETURNING alignment_idx",
+        secrets.token_bytes(32),
+        rb["principal_idx"],
+    )
+    # A processing ALIGN block covering the sample under this same mask_idx.
+    await rb["make_block"](
+        members=[(ps, start, start + _SAMPLE_READS - 1)],
+        state="processing",
+        alignment_idx=align_idx,
+    )
+    # And the wreckage of a purged, failed align plan over the same footprint.
+    await rb["make_block"](
+        members=[(ps, start, start + _SAMPLE_READS - 1)],
+        state="failed",
+        alignment_idx=None,
+        action_id=ALIGN_ACTION_ID,
+    )
+    try:
+        # The read-mask finalize gate ignores both align blocks (action_id
+        # discriminator) → no incomplete READ-MASK block covers the sample.
+        assert (
+            await has_incomplete_covering_block(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+            is False
+        )
+        # So the per-sample gate finalizes cleanly rather than raising cross-path.
+        await finalize_mask_sample_gate(pool, mask_idx=mask_idx, prep_sample_idx=ps)
+        assert await _mask_sample_state(pool, mask_idx, ps) == "completed"
+    finally:
+        # work_ticket rows detach (alignment_idx FK is ON DELETE SET NULL) at fixture
+        # teardown; drop the alignment_definition here so its cascade can't outlive it.
+        await pool.execute("DELETE FROM qiita.work_ticket WHERE alignment_idx = $1", align_idx)
+        await pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_idx
+        )
 
 
 # ---------------------------------------------------------------------------

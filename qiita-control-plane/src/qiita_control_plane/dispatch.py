@@ -110,21 +110,40 @@ async def _pump_ticket_cohort(app: FastAPI, work_ticket_idx: int) -> None:
     Called from `_run_and_log`'s finally after every dispatch. Resolves the
     ticket's cohort (shard / read-mask block / align block) from its columns and
     releases the next held ticket(s) up to the cap; a no-op if the ticket is not
-    a fan-out child. Best-effort — a pump failure is logged, never raised, so it
-    cannot turn a clean dispatch into a task-level error (and the next child's
-    completion, or startup reconcile, will re-attempt the top-up anyway)."""
-    try:
-        cohort = await cohort_for_work_ticket(app.state.pool, work_ticket_idx)
-        if cohort is None:
+    a fan-out child.
+
+    Retried once, then swallowed. Swallowed because a pump failure must not turn a
+    clean dispatch into a task-level error; retried because "the next child's
+    completion will re-attempt it" does not hold at the tail of a fan-out — if the
+    failing child was the last one in flight, every remaining ticket is held and no
+    terminal transition is left to re-trigger the pump. The cohort would then stay
+    stranded until a CP restart. When both attempts fail the ERROR names the cohort,
+    which is what an operator hands to the fan-out pump route to recover.
+    """
+    cohort = None
+    for attempt in (1, 2):
+        try:
+            if cohort is None:
+                cohort = await cohort_for_work_ticket(app.state.pool, work_ticket_idx)
+            if cohort is None:
+                return
+            await top_up_dispatch(
+                app.state.pool,
+                cohort,
+                max_inflight=app.state.settings.fanout_max_inflight,
+                dispatch_cb=lambda idx: schedule_dispatch(app, idx),
+            )
             return
-        await top_up_dispatch(
-            app.state.pool,
-            cohort,
-            max_inflight=app.state.settings.fanout_max_inflight,
-            dispatch_cb=lambda idx: schedule_dispatch(app, idx),
-        )
-    except Exception:
-        _log.exception("fan-out pump after work_ticket %d failed", work_ticket_idx)
+        except Exception:
+            if attempt == 1:
+                _log.warning("fan-out pump after work_ticket %d failed; retrying", work_ticket_idx)
+                continue
+            _log.exception(
+                "fan-out pump for cohort %s (after work_ticket %d) failed twice; it may hold"
+                " undispatched tickets — re-pump it",
+                cohort.label if cohort is not None else "<unresolved>",
+                work_ticket_idx,
+            )
 
 
 def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = False) -> asyncio.Task:

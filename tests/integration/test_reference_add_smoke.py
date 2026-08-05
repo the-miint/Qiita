@@ -164,6 +164,20 @@ async def test_reference_add_workflow_end_to_end(
         _lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files
     )
 
+    # Stub the post-load exclusion sync for the same reason (its real path signs a
+    # sync_reference_exclusion DoAction to a running data plane). Capturing the
+    # call proves the hook fires once per reference-add; test_e2e_reference covers
+    # the real replace against a live data plane.
+    sync_calls: list[dict] = []
+
+    async def _stub_sync_exclusion(pool, *, dest, signing_key, data_plane_url):
+        sync_calls.append({"dest": dest})
+        return {"synced_feature_count": 0}
+
+    monkeypatch.setitem(
+        _lib.LIBRARY, LibraryPrimitive.SYNC_REFERENCE_EXCLUSION, _stub_sync_exclusion
+    )
+
     workspace_root = tmp_path / "workspace"
     backend_client = LocalComputeBackendClient()
 
@@ -204,6 +218,10 @@ async def test_reference_add_workflow_end_to_end(
     # part files → directory name. `reference_sequence_chunks` is the
     # multi-file form (see reference_load.py).
     assert len(register_calls) == 1
+    # The post-load exclusion sync fired exactly once, staging its Parquet into
+    # this ticket's workspace (shared PATH_SCRATCH tree the data plane re-validates).
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["dest"].name == "reference_exclusion.parquet"
     staging_dir, files = register_calls[0]
     assert "reference_sequences.parquet" in files
     assert files["reference_sequences.parquet"] == "reference_sequences"

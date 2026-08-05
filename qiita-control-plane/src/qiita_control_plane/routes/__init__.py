@@ -11,6 +11,7 @@ from .biosample import router as biosample_router
 from .host_filter_profile import router as host_filter_profile_router
 from .prep_protocol import router as prep_protocol_router
 from .prep_sample import router as prep_sample_router
+from .read import read_router
 from .read_masked import mask_definition_router, read_masked_router
 from .reference import router as reference_router
 from .sequence_range import router as sequence_range_router
@@ -39,6 +40,7 @@ api_router.include_router(sequenced_sample_top_level_router)
 api_router.include_router(sequence_range_router)
 api_router.include_router(mask_definition_router)
 api_router.include_router(read_masked_router)
+api_router.include_router(read_router)
 api_router.include_router(alignment_definition_router)
 api_router.include_router(alignment_router)
 api_router.include_router(prep_protocol_router)

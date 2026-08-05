@@ -133,8 +133,8 @@ async def test_library_mint_features_dispatch(postgres_pool, tmp_path):
 async def test_library_write_membership_dispatch(
     postgres_pool, tmp_path, fresh_reference
 ):
-    """LIBRARY['write-membership'](pool, idx, feature_map_path) inserts
-    qiita.reference_membership rows and returns (linked, already_linked)."""
+    """LIBRARY['write-membership'](pool, idx, manifest_path, feature_map_path)
+    inserts qiita.reference_membership rows and returns (linked, already_linked)."""
     from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
 
@@ -146,7 +146,7 @@ async def test_library_write_membership_dispatch(
     )
 
     linked, already_linked = await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-        postgres_pool, fresh_reference, feature_map_path
+        postgres_pool, fresh_reference, manifest, feature_map_path
     )
     assert linked == 3
     assert already_linked == 0
@@ -160,7 +160,7 @@ async def test_library_write_membership_dispatch(
 
     # Re-dispatch reports already_linked=3.
     linked2, already_linked2 = await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-        postgres_pool, fresh_reference, feature_map_path
+        postgres_pool, fresh_reference, manifest, feature_map_path
     )
     assert linked2 == 0
     assert already_linked2 == 3
@@ -237,9 +237,14 @@ async def test_library_write_membership_raises_on_unknown_feature_idx(
         )
         conn.execute(f"COPY fm TO '{bogus_map}' (FORMAT PARQUET)")
 
+    # A manifest that joins to the bogus feature_map on sequence_hash, so the
+    # unknown feature_idx still reaches the INSERT and trips the FK violation.
+    bogus_manifest = tmp_path / "bogus_manifest.parquet"
+    _write_manifest(bogus_manifest, [uuid.UUID("00000000-0000-0000-0000-000000000001")])
+
     with pytest.raises(ValueError, match="feature_idx"):
         await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-            postgres_pool, fresh_reference, bogus_map
+            postgres_pool, fresh_reference, bogus_manifest, bogus_map
         )
 
 

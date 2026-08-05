@@ -532,10 +532,12 @@ async def do_reference_load(
     build-shard-index ticket per shard (minimap2 + bowtie2 per shard) while the
     parent builds the ONE whole-reference `rype_router` that routes reads to
     shards, so the reference goes loading → indexing → active. Like `host`, it
-    requires `taxonomy_path` (sharding sorts by lineage). `host` and `shard_index`
-    are mutually exclusive (host references build host-filter indexes via a
-    different action; sharding is a context flag on plain reference-add, not a new
-    action).
+    requires `taxonomy_path` (sharding sorts by lineage) and additionally requires
+    `genome_map_path` (plan-shards derives the per-shard feature set from
+    qiita.feature_genome, which mint-features populates only when a genome map is
+    supplied). `host` and `shard_index` are mutually exclusive (host references
+    build host-filter indexes via a different action; sharding is a context flag
+    on plain reference-add, not a new action).
 
     Index selection / params: `build_rype` (host-filter rype) and `rype_w` apply
     to `host` ONLY — a sharded reference builds no per-shard rype (its routing is
@@ -567,12 +569,19 @@ async def do_reference_load(
             " host-filter indexes (host-reference-add); --shard-index builds per-shard"
             " analysis indexes on a plain reference"
         )
-    # Both need taxonomy: host uses it as the rype mapping authority, sharding as
-    # the lineage sort key.
+    # Both need taxonomy.
     if (host or shard_index) and taxonomy_path is None:
         raise ValueError(
             "--host / --shard-index require --taxonomy: host uses it as the rype mapping"
             " authority, sharding as the lineage sort key"
+        )
+    # Sharding requires a genome map (see the error below for rationale).
+    if shard_index and genome_map_path is None:
+        raise ValueError(
+            "--shard-index requires --genome-map: plan-shards derives the per-shard"
+            " feature set from qiita.feature_genome, which mint-features populates only"
+            " when a genome map is supplied. Without it the load runs to completion then"
+            " fails at plan-shards with N=0"
         )
 
     # Index-selection / build-param knobs are index-type-scoped. Reject them up

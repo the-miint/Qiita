@@ -150,11 +150,17 @@ steps:
     inputs: [read_staging_dir]
     outputs: []
 
-# Cap matches the largest profile in `bcl_convert.baseline_resources.profiles`
-# above. Any future profile expansion (or per-instrument tuning that exceeds
-# these numbers) must bump this ceiling in the same PR — the runner enforces
-# `resolved <= ceiling` on every axis at dispatch.
+# Ceiling must stay strictly ABOVE every step baseline on the escalating axes
+# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
+# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
+# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
+# are unchanged here; cpu/gpu never escalate.
+#
+# 500 GB is the node bound (RealMemory=514000 MB, no MemSpecLimit), so NovaSeq X
+# gets one +4% rung rather than a doubling: better than a terminal first OOM, not
+# a guaranteed save. cpu stays 16 on purpose — more threads raise memory demand,
+# and memory is the axis already at the bound.
 action_ceiling:
   cpu: 16
-  mem_gb: 480
-  walltime: PT12H
+  mem_gb: 500
+  walltime: P1D

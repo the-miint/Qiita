@@ -386,6 +386,20 @@ def test_qc_plan_sizes_walltime_from_read_count(tmp_path, write_reads_q):
     assert r.walltime.total_seconds() == 301
 
 
+def test_qc_plan_is_empty_when_reads_stream(tmp_path):
+    """With `reads` unbound (the block path), plan() returns an EMPTY hint.
+
+    A data-plane stream has no Parquet footer to count, and plan() runs at submit
+    time in the orchestrator process, so it must not open a Flight stream to find
+    one. The step then takes the YAML baseline, with TIMEOUT escalation as the
+    backstop — never a 500, never a guessed number.
+    """
+    from qiita_compute_orchestrator.jobs import qc
+
+    plan = qc.plan(qc.Inputs(work_ticket_idx=1))
+    assert plan.resources is None
+
+
 def test_qc_plan_walltime_grows_with_read_count(tmp_path):
     """More reads -> a larger walltime estimate (monotonic in cardinality).
 

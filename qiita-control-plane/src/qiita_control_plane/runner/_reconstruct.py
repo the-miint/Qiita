@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
+    TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
     ScopeTargetKind,
     StepHandleWire,
@@ -73,6 +74,17 @@ def _completed_progress_row(
     return None
 
 
+def _progress_row_for(
+    prior_progress: list[step_progress.StepProgressRow], *, step_index: int, attempt: int
+) -> step_progress.StepProgressRow | None:
+    """The start-of-run progress row for this exact `(step_index, attempt)`, or
+    None. Single home for the key lookup the attempt predicates below share."""
+    for row in prior_progress:
+        if row.step_index == step_index and row.attempt == attempt:
+            return row
+    return None
+
+
 def _attempt_is_unowned(
     prior_progress: list[step_progress.StepProgressRow], *, step_index: int, attempt: int
 ) -> bool:
@@ -81,19 +93,46 @@ def _attempt_is_unowned(
 
     Keyed on the START-OF-RUN progress (the snapshot loaded once before the
     loop). A pre-existing row for this exact `(step_index, attempt)` means a
-    prior process owns the dir and we're resuming/adopting it — `_adopt_or_submit`
-    re-attaches to that row's job and must reuse its workspace, so it is NOT
-    unowned (return False; leave the dir alone). No such row means the attempt is
-    unowned: either a first dispatch (dir absent — the caller just mkdirs it) or a
-    re-run whose row was deliberately dropped (a `/run` redrive clearing failed
-    rows, or `update-lane` invalidating a completed prep row). In the re-run case
-    the prior attempt left stale, read-only (0o440) output + manifest on disk that
-    must not be reused; the caller advances to a fresh attempt dir rather than
-    deleting it (the output is owned by the SLURM job user — the control plane
-    can't unlink or chmod it)."""
-    return not any(
-        row.step_index == step_index and row.attempt == attempt for row in prior_progress
-    )
+    prior process owns the dir, so it is NOT unowned (return False; leave the dir
+    alone). No such row means the attempt is unowned: either a first dispatch
+    (dir absent — the caller just mkdirs it) or a re-run whose row was
+    deliberately dropped (a `/run` redrive clearing dead rows, or `update-lane`
+    invalidating a completed prep row). In the re-run case the prior attempt left
+    stale, read-only (0o440) output + manifest on disk that must not be reused;
+    the caller advances to a fresh attempt dir rather than deleting it (the
+    output is owned by the SLURM job user — the control plane can't unlink or
+    chmod it).
+
+    Ownership here is only about the DIR. It says nothing about whether the
+    owning row is still resumable: a terminal row owns its dir but must not be
+    adopted. `_attempt_is_terminal` is the predicate for that, and the caller
+    checks it first."""
+    return _progress_row_for(prior_progress, step_index=step_index, attempt=attempt) is None
+
+
+def _attempt_is_terminal(
+    prior_progress: list[step_progress.StepProgressRow], *, step_index: int, attempt: int
+) -> bool:
+    """Whether this entry's `(step_index, attempt)` already reached a terminal
+    progress state in a prior run — i.e. is history rather than something to
+    resume into.
+
+    The invariant: **only a LIVE attempt is adoptable.** A terminal attempt's job
+    has already ended, so re-attaching to its persisted `slurm_job_id` reaches a
+    job slurmrestd will eventually purge, and the poll loop's filesystem
+    tiebreaker then decides the step from a workspace whose manifest is missing
+    precisely because that attempt failed. The caller must advance to the next
+    attempt number instead.
+
+    `COMPLETED` is included even though the step-level fast-forward normally
+    consumes a completed entry before the attempt loop is reached: the set is the
+    shared `TERMINAL_STEP_PROGRESS_STATES`, and narrowing it here would encode
+    "unreachable today" as a correctness assumption of this predicate.
+
+    Distinct from `_attempt_is_unowned` (does a row exist at all — a dir
+    question); this asks whether the row that exists is still live."""
+    row = _progress_row_for(prior_progress, step_index=step_index, attempt=attempt)
+    return row is not None and row.state in TERMINAL_STEP_PROGRESS_STATES
 
 
 async def _reconstruct_completed_outputs(
@@ -339,9 +378,19 @@ async def _run_action_primitive(
         return {entry.outputs[0]: annotation_map_path}
 
     if entry.name == LibraryPrimitive.WRITE_MEMBERSHIP:
-        feature_map_path = Path(bound[entry.inputs[0]])
+        # Resolved by fixed binding NAME, not positionally (manifest + feature_map
+        # both carry a sequence_hash column; a YAML reorder must not swap them).
+        # manifest supplies the representative read_id (accession) per feature_idx;
+        # feature_map supplies feature_idx. Mirrors write-assembly-membership below.
+        if set(entry.inputs) != {"manifest", "feature_map"}:
+            raise RuntimeError(
+                f"write-membership expects inputs [manifest, feature_map]; got {entry.inputs!r}"
+            )
         await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-            pool, scope_target["reference_idx"], feature_map_path
+            pool,
+            scope_target["reference_idx"],
+            Path(bound["manifest"]),
+            Path(bound["feature_map"]),
         )
         return {}
 
@@ -540,6 +589,25 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_MASK_SAMPLE:
+        # Terminal step of the per-sample read-mask workflow: record this sample's
+        # masking as completed in the mask_sample gate (the per-sample twin of
+        # reconcile-block's gate flip). Runs AFTER register-files so the gate never
+        # reads 'completed' before the masked reads are in DuckLake. No file inputs:
+        # prep_sample_idx from the scope target, mask_idx from the ticket (runner-bound
+        # above for the prep_sample branch).
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                "finalize-mask-sample requires a prep_sample-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.FINALIZE_MASK_SAMPLE](
+            pool,
+            mask_idx=bound[MASK_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
         # Persist the two fastqc-equivalent QC reports onto this prep_sample's
         # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json
@@ -643,6 +711,22 @@ async def _run_action_primitive(
             pool,
             block_idx=scope_target["block_idx"],
             alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.SYNC_REFERENCE_EXCLUSION:
+        # Post-load exclusion sync: re-resolve the GLOBAL blocklist and REPLACE the
+        # data plane's `reference_exclusion` mirror wholesale, so a fresh assembly
+        # of an already-blocked genome (new feature_idx the standing mirror can't
+        # know about) is caught. No file inputs; the dest Parquet lands in this
+        # attempt's workspace, which is under the shared PATH_SCRATCH tree the data
+        # plane re-validates under its scratch_root (same containment the DoGet
+        # exporters rely on). Idempotent full-replace ⇒ safe to re-run on a redrive.
+        await LIBRARY[LibraryPrimitive.SYNC_REFERENCE_EXCLUSION](
+            pool,
+            dest=workspace / "reference_exclusion.parquet",
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
         )
         return {}
 

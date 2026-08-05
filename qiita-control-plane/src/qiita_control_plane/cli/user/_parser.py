@@ -32,6 +32,7 @@ from qiita_common.models import (
 )
 
 from .. import _common
+from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import _handle_patch, _handle_read, _lane_arg
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
@@ -39,11 +40,17 @@ from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
     _handle_pool_completion,
+    _handle_submit_align_pool,
     _handle_submit_bcl_convert,
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
 )
-from .reference import _handle_reference_list, _handle_reference_load
+from .reference import (
+    _EXPORT_FORMATS,
+    _handle_reference_genome_export,
+    _handle_reference_list,
+    _handle_reference_load,
+)
 from .sequencing import (
     _handle_prep_protocol_list,
     _handle_prep_sample_retire,
@@ -726,7 +733,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Build per-shard ANALYSIS aligner indexes (minimap2 + bowtie2) on a plain"
             " reference, plus the ONE whole-reference rype router: after ingest,"
             " plan-shards fans out one build per lineage-sorted shard (loading ->"
-            " indexing -> active). Requires --taxonomy; mutually exclusive with --host."
+            " indexing -> active). Requires --taxonomy and --genome-map; mutually"
+            " exclusive with --host."
         ),
     )
     # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local
@@ -848,6 +856,54 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_reference_load.set_defaults(handler=_handle_reference_load)
+
+    # `reference export` — pull specific genomes' sequences to FASTA.gz or
+    # Parquet. A user feature (reference:read — both the member route and the
+    # reference DoGet ticket route accept it), and the end-to-end verification that
+    # a genome round-trips with all its contigs incl. a shared plasmid. One output
+    # file per genome: <reference_idx>.<genome_idx>.{fasta.gz|parquet}.
+    p_reference_export = p_reference_sub.add_parser(
+        "export",
+        help="Export one or more genomes' sequences (FASTA.gz or Parquet)",
+    )
+    p_reference_export.add_argument(
+        "--reference-idx", type=int, required=True, dest="reference_idx"
+    )
+    p_reference_export.add_argument(
+        "--genome-idx",
+        type=int,
+        action="append",
+        required=True,
+        dest="genome_idx",
+        help="Genome to export; repeat for several (one file per genome).",
+    )
+    p_reference_export.add_argument(
+        "--format",
+        choices=_EXPORT_FORMATS,
+        default="fasta",
+        help=(
+            "fasta (default) → gzipped FASTA, headers = the reference's accessions,"
+            " sequences reassembled from chunks; parquet → the raw"
+            " reference_sequence_chunks rows (feature_idx, chunk_index, chunk_data)."
+            " Exported bytes are the stored original strand of the representative"
+            " record (reverse-complement-equal inputs collapse to one feature_idx)."
+        ),
+    )
+    p_reference_export.add_argument("--output-dir", type=Path, required=True, dest="output_dir")
+    p_reference_export.add_argument(
+        "--data-plane-url",
+        required=True,
+        help=(
+            "gRPC URL of the data plane the sequence bytes stream from (e.g."
+            " grpc+tls://qiita.example.com:443, or grpc://<host>:50051 on-host)."
+        ),
+    )
+    p_reference_export.set_defaults(handler=_handle_reference_genome_export)
+
+    # `reference exclusion list` — the reference:read query surface any user can
+    # run to see what the global blocklist filtered from their feature table
+    # (add/remove live under qiita-admin; see cli/_reference_exclusion.py).
+    add_user_exclusion_subparsers(p_reference_sub)
 
     p_prep_protocol = sub.add_parser(
         "prep-protocol", help="Prep-protocol discovery (idxes for --prep-protocol-idx)"
@@ -1248,6 +1304,70 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_block.set_defaults(handler=_handle_submit_block_mask_pool)
+
+    p_submit_align = sub.add_parser(
+        "submit-align-pool",
+        help=(
+            "Align a whole pool against a sharded reference as bulk blocks (one"
+            " work-ticket per block), in a single server call."
+        ),
+        description=(
+            "Plan + submit a pool's bulk-block sharded alignment. Aligns the samples"
+            " whose reads are masked-complete under --mask-idx against the sharded"
+            " --reference-idx, tiling them into blocks and dispatching one"
+            " work-ticket per block under the per-alignment fan-out throttle."
+            " Alignment does NOT re-derive the mask config: you name the mask the"
+            " reads were produced under, so a pool masked any way (per-sample or"
+            " block; any host / adapter / lima / syndna config) aligns by pointing at"
+            " its mask_idx. The ALIGNER is not a caller choice either — the server"
+            " derives it from the run's sequencing platform (Illumina bowtie2,"
+            " PacBio HiFi / Nanopore minimap2) and reports it back, as it does the"
+            " block size. Samples that cannot be planned are reported, not fatal."
+        ),
+    )
+    p_submit_align.add_argument(
+        "--sequencing-run-idx",
+        type=int,
+        required=True,
+        help="sequencing_run_idx the pool belongs to (the route checks pool↔run).",
+    )
+    p_submit_align.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        required=True,
+        help="sequenced_pool_idx whose masked samples to align.",
+    )
+    p_submit_align.add_argument(
+        "--reference-idx",
+        type=int,
+        required=True,
+        help=(
+            "ACTIVE reference_idx to align against. Must be sharded (router +"
+            " per-aligner shard indexes built); the server refuses with 409"
+            " otherwise."
+        ),
+    )
+    p_submit_align.add_argument(
+        "--mask-idx",
+        type=int,
+        required=True,
+        help=(
+            "mask_idx the pool's reads were masked under. Only samples whose"
+            " mask_sample gate is 'completed' under it are aligned; the rest are"
+            " reported skipped."
+        ),
+    )
+    p_submit_align.add_argument(
+        "--only-missing",
+        action="store_true",
+        help=(
+            "Skip samples already carrying an alignment gate for the resolved"
+            " alignment (applied server-side), so an interrupted plan re-runs only"
+            " the gap. Off by default, which makes an already-gated pool a 409"
+            " rather than a silent partial re-plan."
+        ),
+    )
+    p_submit_align.set_defaults(handler=_handle_submit_align_pool)
 
     p_pool_completion = sub.add_parser(
         "pool-completion",

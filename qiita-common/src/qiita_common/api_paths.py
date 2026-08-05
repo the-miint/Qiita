@@ -57,6 +57,22 @@ PATH_REFERENCE_STATUS = "/{reference_idx}/status"
 PATH_REFERENCE_INDEX = "/{reference_idx}/index"
 PATH_REFERENCE_SHARD_INDEX_STATUS = "/{reference_idx}/shard-index-status"
 PATH_REFERENCE_DOGET = "/{reference_idx}/ticket/doget"
+# Global exclusion-blocklist curation (POST/DELETE) — keyed on genome_idx /
+# feature_idx alone, NOT scoped to a reference. Literal segment, so it must be
+# registered before the `/{reference_idx}` routes (see routes/reference.py).
+PATH_REFERENCE_EXCLUSION = "/exclusion"
+# Operator force-resync: re-materialize the data-plane exclusion mirror from the
+# current Postgres blocklist with no Postgres change (recovery after a failed
+# sync / rebuilt catalog / fresh data plane). A longer literal than /exclusion, so
+# unambiguous; still a literal, registered before the `/{reference_idx}` routes.
+PATH_REFERENCE_EXCLUSION_SYNC = "/exclusion/sync"
+# Reference-scoped read of what the blocklist filters from one reference.
+PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
+# Resolve a genome to its member features (feature_idx + accession) within one
+# reference — the inverse of export_member_genome, keyed on (reference_idx,
+# genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
+# is per-reference. Param path, distinct 4-segment shape (no literal shadow).
+PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -64,6 +80,10 @@ URL_REFERENCE_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_STATUS}"
 URL_REFERENCE_INDEX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX}"
 URL_REFERENCE_SHARD_INDEX_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_SHARD_INDEX_STATUS}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
+URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
+URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
+URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
+URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 
 # =============================================================================
 # /host-filter-profile/*
@@ -155,6 +175,22 @@ class LibraryPrimitive(StrEnum):
     # No count-assertion (alignment rows are not 1:1 with reads — cross-shard + PE
     # multiplicity). See qiita_control_plane.actions.library.reconcile_alignment_block.
     RECONCILE_ALIGNMENT_BLOCK = "reconcile-alignment-block"
+    # Reference exclusion: re-materialize the GLOBAL curated blocklist onto the
+    # data plane's DuckLake `reference_exclusion` mirror (a wholesale, idempotent,
+    # replay-safe REPLACE). Runs as the post-load tail step of every reference-load
+    # workflow (reference-add, local-reference-add, host-reference-add,
+    # local-host-reference-add) so a fresh assembly of an already-blocked genome —
+    # whose newly-minted feature_idx the standing mirror can't know about — is
+    # caught by the re-resolve. Also fired on every blocklist mutation by the admin
+    # route. See qiita_control_plane.actions.library.sync_reference_exclusion.
+    SYNC_REFERENCE_EXCLUSION = "sync-reference-exclusion"
+    # Per-sample read-mask completion: the terminal step of the per-sample read-mask
+    # workflow. Records this sample's masking as 'completed' in the qiita.mask_sample
+    # gate — the per-sample twin of reconcile-block's gate flip. Per-sample masking is
+    # atomic per ticket (no PENDING phase), so it upserts straight to 'completed'.
+    # Runs AFTER register-files so the gate never reads 'completed' before the masked
+    # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
+    FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
 
 
 # =============================================================================
@@ -232,6 +268,15 @@ PATH_WORK_TICKET_CANCEL = "/cancel"
 # Read a single step attempt's stdout/stderr tail (operator diagnosis without
 # a host shell — the logs live under PATH_SCRATCH/ticket, served by the CP).
 PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
+# Fan-out throttle control (system_admin, work_ticket:cancel). GET the collection
+# lists every cohort with held or in-flight children; PATCH one cohort retunes its
+# in-flight cap AND pumps it in the same call; POST .../pump re-triggers a pump
+# without touching the cap. A cohort is addressed by (kind, key) — the kinds are
+# `FanoutCohortKind`, the key is the reference_idx / mask_idx / alignment_idx the
+# fan-out hangs off. `pump` is a verb segment, the naming carve-out.
+PATH_WORK_TICKET_FANOUT = "/fanout"
+PATH_WORK_TICKET_FANOUT_COHORT = "/fanout/{kind}/{key}"
+PATH_WORK_TICKET_FANOUT_COHORT_PUMP = "/fanout/{kind}/{key}/pump"
 
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 # GET-list URL — same path as the POST root, named distinctly so clients
@@ -241,6 +286,11 @@ URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
 URL_WORK_TICKET_CANCEL = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_CANCEL}"
 URL_WORK_TICKET_STEP_LOGS = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_STEP_LOGS}"
+URL_WORK_TICKET_FANOUT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT}"
+URL_WORK_TICKET_FANOUT_COHORT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT}"
+URL_WORK_TICKET_FANOUT_COHORT_PUMP = (
+    f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT_PUMP}"
+)
 
 
 # =============================================================================
@@ -384,6 +434,28 @@ PATH_READ_MASKED_DOGET = "/ticket/doget"
 
 URL_READ_MASKED_PREFIX = f"{API_PREFIX}{PATH_READ_MASKED_PREFIX}"
 URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
+
+# =============================================================================
+# /read/* — Flight DoGet ticket for a block's reads (block-compute streaming)
+# =============================================================================
+# Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
+# sub-range)` members, so a block-scoped compute job streams its reads from the
+# data plane instead of reading a Parquet the control plane materialized onto
+# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
+# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
+# ticket), the same shape as /alignment/ticket/doget.
+#
+# The body carries only work_ticket_idx. The route reads the block's members
+# from qiita.block_member (keeping a large member list CP-side, off the wire)
+# and picks the selector — raw `read_block` for a read-mask block, mask-scoped
+# `read_masked_block` for an align block — from the ticket's action_context (see
+# block_read.resolve_block_read_scope).
+
+PATH_READ_PREFIX = "/read"
+PATH_READ_DOGET = "/ticket/doget"
+
+URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
+URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 
 
 # =============================================================================

@@ -14,6 +14,7 @@ import json
 import logging
 import uuid
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
@@ -2176,9 +2177,12 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     Re-using that attempt would collide — the step_progress writers reject
     any transition out of 'failed' (and record_failed refuses
     failed->failed), so the redrive would die re-adjudicating the dead row.
-    /run drops every non-'completed' step row so the redrive's
-    attempt-0 writes land on a clean slate, while KEEPING 'completed' rows
-    so the runner still fast-forwards already-finished steps."""
+    /run drops the terminal 'failed' step rows so the redrive's attempt-0
+    writes land on a clean slate, while KEEPING 'completed' rows so the
+    runner still fast-forwards already-finished steps. (Whether an in-flight
+    row survives depends on the state redriven from — see
+    `test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable`
+    and `test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped`.)"""
     token, admin_idx = admin_token
     action_id, version = reference_action
     idx = await postgres_pool.fetchval(
@@ -2231,6 +2235,311 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     )
     surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
     assert surviving == [(0, 0, StepProgressState.COMPLETED.value)]
+
+
+async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A FAILED ticket CAN still have a live SLURM job, and /run must not
+    strand it.
+
+    When a step OOM-kills, the runner escalates and submits attempt N+1; if the
+    ticket then fails for any reason, that attempt's row is left live
+    ('submitted') carrying a real slurm_job_id. Deleting it on redrive would
+    orphan the job outright — the CP would forget the id, nothing would poll it,
+    and `_adopt_or_submit` (which re-attaches by exactly that persisted id)
+    could never reclaim it. So the redrive keeps live rows and drops only the
+    terminal 'failed' one, letting the runner adopt the job already paid for
+    instead of resubmitting the work."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    # attempt 0 died (OOM); attempt 1 is the escalated retry, still live.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        "  'oom_killed', 'OUT_OF_MEMORY')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.FAILED.value,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name)"
+        " VALUES ($1, 0, 1, 'load', $2, $3, 605029, 'qiita-wt-load-a1')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.SUBMITTED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    rows = await postgres_pool.fetch(
+        "SELECT step_index, attempt, state, slurm_job_id FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        idx,
+    )
+    surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
+    # The dead attempt is gone; the live one survives WITH its job id intact,
+    # which is the whole point — that id is the only handle on the running job.
+    assert surviving == [(0, 1, StepProgressState.SUBMITTED.value)]
+    assert rows[0]["slurm_job_id"] == 605029
+
+
+async def test_run_preserves_the_escalated_resource_floor(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A redrive must NOT reset the ladder a ticket already climbed.
+
+    The redrive drops the `failed` step rows, so the escalation history they
+    carry is gone by the time the runner re-enters — which is exactly why the
+    learned floor lives on the work_ticket row instead of being reconstructed
+    from that history. Nothing in the reset UPDATE touches it today; this pins
+    that, because adding the column to that reset (or "clearing the ticket
+    cleanly") would silently reintroduce the re-climb: the ticket would come
+    back at its YAML baseline and burn a failing attempt getting back to a size
+    it had already reached."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason,"
+        "  escalated_resource_floor)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'retriable'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'OOM',"
+        "  $6::jsonb)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+        json.dumps({"load": {"mem_gb": 384, "walltime_seconds": 115200}}),
+    )
+    wt_client._created_tickets.append(idx)
+    # The attempt that taught the ticket it needs 384 GB. The redrive deletes
+    # this row — the floor must outlive it.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        "  'oom_killed', 'OUT_OF_MEMORY')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.FAILED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, escalated_resource_floor"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    # The redrive did its usual reset...
+    assert row["state"] == WorkTicketState.PENDING.value
+    assert row["retry_count"] == 0
+    # ... and the escalation history it drops is indeed gone ...
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", idx
+        )
+        == 0
+    )
+    # ... but the learned floor survived, so the next run resumes the ladder.
+    # asyncpg hands JSONB back as a string — no codec is registered on this pool.
+    floor = row["escalated_resource_floor"]
+    decoded = json.loads(floor) if isinstance(floor, str) else floor
+    assert decoded == {"load": {"mem_gb": 384, "walltime_seconds": 115200}}
+
+
+async def test_escalated_resource_floor_rejects_a_jsonb_null(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """The read side can't distinguish jsonb `null` from SQL NULL — both decode
+    to Python None, which the runner reads as "nothing escalated yet". Clearing
+    this column by hand is a documented operator step, so the CHECK makes the
+    near-miss (`'null'::jsonb` instead of NULL) fail loudly at the DB instead of
+    silently resetting a ticket's ladder. The write path needs no such guard:
+    `jsonb_set` errors on a non-object target."""
+    _token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx)"
+        " VALUES ($1, $2, $3, 'reference', $4) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+    )
+    wt_client._created_tickets.append(idx)
+
+    for bad in ("null", "[]", "42"):
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await postgres_pool.execute(
+                "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+                " WHERE work_ticket_idx = $1",
+                idx,
+                bad,
+            )
+    # The control: SQL NULL (the documented way to clear it) and a real object
+    # both pass, so the CHECK isn't just rejecting everything.
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = NULL WHERE work_ticket_idx = $1",
+        idx,
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        idx,
+        json.dumps({"load": {"mem_gb": 384}}),
+    )
+
+
+async def test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """The CANCELLED carve-out: a post-cancel redrive drops in-flight rows.
+
+    Cancel is terminal-flip-then-scancel, and the runner's abort path stops
+    without recording the step row terminal — so a cancelled ticket keeps a
+    'submitted'/'running' row naming a job the reap ALREADY KILLED. Keeping it
+    (correct for FAILED, where the job may still be live) would make the redrive
+    adopt a dead job: slurmrestd purges it, the poll loop's filesystem
+    tiebreaker synthesizes COMPLETED, and verification fails on a workspace with
+    no manifest — the same failure this commit fixes, reached through a live row
+    instead of a dead one. So after a cancel, every non-completed row goes."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    # A finished step (must survive) and an in-flight row whose job the cancel
+    # already scancelled (must NOT survive).
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
+        " VALUES ($1, 0, 0, 'hash', $2, $3)",
+        idx,
+        ComputeTarget.LOCAL.value,
+        StepProgressState.COMPLETED.value,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name)"
+        " VALUES ($1, 1, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.RUNNING.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    rows = await postgres_pool.fetch(
+        "SELECT step_index, attempt, state FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        idx,
+    )
+    surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
+    assert surviving == [(0, 0, StepProgressState.COMPLETED.value)]
+
+
+async def test_run_on_failed_drops_submitting_row_with_no_job_id(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A write-ahead 'submitting' row with no persisted job id is dropped even
+    when redriving a FAILED ticket.
+
+    Its only handle is the deterministic job_name, and the find-by-name orphan
+    closer that would use it runs solely under `resume=True`; /run dispatches
+    with resume=False. A kept row would therefore fall through to a fresh submit
+    writing into the SAME attempt dir a possibly-live orphan job is already
+    using. Dropping it restores the advance-to-a-fresh-dir guard."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, job_name)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 'qiita-wt-load-a0')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.SUBMITTING.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    remaining = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", idx
+    )
+    assert remaining == 0
 
 
 async def test_run_on_failed_with_non_failed_reference_does_not_abort_redrive(
