@@ -1804,6 +1804,7 @@ name = "qiita-data-plane"
 version = "2026.3.0"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-flight",
  "arrow-ipc",
  "arrow-schema",

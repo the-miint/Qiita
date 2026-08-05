@@ -261,12 +261,39 @@ duplicates further down are historical strata; leave them where they are.
   `IpcWriteOptions::batch_compression_type` was a runtime error, not a
   fallback), and `tonic` carries `gzip`/`zstd`. Both are **inert** — nothing
   sets a codec or calls `send_compressed`, so every DoGet stream is byte-identical
-  to before. `qiita-data-plane/tests/harness/` reports encoded bytes, encode and
-  decode time for a given (codec, dictionary handling, batch geometry) setting,
-  plus real socket bytes for a gRPC round trip; `tests/compression.rs` calibrates
-  it against inputs whose answer is known in advance. The harness refuses to
-  report a measurement whose record-batch messages do not carry the codec that
-  was asked for — a silent fallback would make every number derived from it a lie.
+  to before. `qiita-data-plane/tests/compression_harness/` reports encoded bytes,
+  encode and decode time for a given (codec, dictionary handling, batch geometry)
+  setting, plus real socket bytes for a gRPC round trip; `tests/compression.rs`
+  calibrates it against inputs whose answer is known in advance. The harness
+  refuses to report a measurement whose record-batch messages do not carry the
+  codec that was asked for — a silent fallback would make every number derived
+  from it a lie. A new `fixtures` cargo feature adds
+  `tests/compression_fixtures.rs`, which runs the codec matrix over local-only
+  production fixtures and is deliberately in no `make` tier; it loads through
+  `stream_arrow` (production's path, and the one that preserves DuckDB's batch
+  geometry), refuses to run in a debug build because unoptimised throughput is
+  not a measurement, and reports each column's NULL fraction so an all-NULL
+  column's buffer-of-zeros is not misread as compression. A second target,
+  `tests/representation.rs`, measures the array-representation axis (run-end
+  encoding, `Utf8View`, dictionary `Hydrate`/`Resend`, integer narrowing, batch
+  geometry); the narrowing transform **errors rather than truncating** when a
+  value exceeds `i32`, since silent identifier corruption is the hazard that
+  option carries.
+- **Three DuckLake facts the export path depends on are now pinned by test.**
+  `qiita-data-plane/src/ducklake.rs` (integration tier): DuckDB's Arrow export
+  emits **no** `DictionaryArray` for VARCHAR even at 2 distinct values but
+  **does** for ENUM, so a dictionary on the wire has to be built by us; and a
+  plain DuckLake scan through `stream_arrow` is order-preserving while an
+  equi-join is not, though its disorder stays coarse (~5,000-row sorted runs
+  over 1.6M rows). Row order was a prose assumption behind several encoding
+  options before this.
+
+  The evaluation these support concluded: **ZSTD at the IPC layer**, client-requested
+  per call and defaulting to off, with every array-representation option
+  (run-end encoding, `Utf8View`, dictionaries, integer narrowing) and every batch
+  geometry change measured as neutral or negative. Compression is off by default
+  because above ~4 Gbit/s of client bandwidth it makes a DoGet *slower*, not
+  faster. No production behaviour changes here — M1 implements the decision.
 - **Two DuckDB memory behaviours job code reasons about are now pinned by test
   (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
   in-memory `CREATE TABLE` far larger than `memory_limit` **spills to

@@ -584,6 +584,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::DataType;
     use serial_test::serial;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1483,5 +1484,195 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let result = connect_ducklake(&conn, "dbname=test", "/tmp/it's bad");
         assert!(result.is_err());
+    }
+
+    // --- M0 Phase 4, items 1 and 6 -------------------------------------
+    //
+    // Structural questions about what DuckDB hands the Flight encoder, not
+    // measurements: they need a live DuckLake but no production fixtures, so
+    // they belong in this tier rather than the `fixtures` one.
+
+    /// Item 1. Everything about dictionary encoding follows from this: if the
+    /// export never emits one, `DictionaryHandling` is dead config for us and
+    /// any dictionary must be built data-plane-side.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_arrow_export_never_emits_dictionary_for_varchar() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let table = format!("qiita_lake.m0_dict_probe_{id}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {table} AS
+             SELECT i AS k, ['Bacteria', 'Archaea'][(i % 2) + 1] AS domain
+             FROM range(50000) t(i);"
+        ))
+        .expect("create probe table");
+
+        let schema = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT k, domain FROM {table}"))
+                .expect("prepare");
+            stmt.query_arrow([]).expect("query_arrow").get_schema()
+        };
+        let _ = conn.execute_batch(&format!("DROP TABLE {table};"));
+
+        let domain = schema.field_with_name("domain").expect("domain column");
+        assert!(
+            !matches!(domain.data_type(), DataType::Dictionary(..)),
+            "DuckDB emitted a dictionary for a 2-distinct VARCHAR: {:?} — \
+             this would change the M0 dictionary answer, re-measure Phase 4 item 1",
+            domain.data_type()
+        );
+    }
+
+    /// Item 1, the other half. DuckDB's ENUM is the one type that *should* map to
+    /// an Arrow dictionary. If even ENUM does not, item 1 is closed for good and
+    /// nothing we can store will ever arrive dictionary-encoded.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_arrow_export_emits_dictionary_for_enum() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let enum_type = format!("m0_rank_{id}");
+        conn.execute_batch(&format!(
+            "CREATE TYPE {enum_type} AS ENUM ('Bacteria', 'Archaea');"
+        ))
+        .expect("create enum");
+
+        let schema = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT 'Bacteria'::{enum_type} AS domain FROM range(10) t(i)"
+                ))
+                .expect("prepare");
+            stmt.query_arrow([]).expect("query_arrow").get_schema()
+        };
+        let _ = conn.execute_batch(&format!("DROP TYPE {enum_type};"));
+
+        // Recorded either way: this is a fact about DuckDB we are pinning, not a
+        // behaviour we require. A change here is a signal to re-measure, which is
+        // why the failure message says so rather than just asserting.
+        let domain = schema.field_with_name("domain").expect("domain column");
+        assert!(
+            matches!(domain.data_type(), DataType::Dictionary(..)),
+            "DuckDB ENUM no longer maps to an Arrow dictionary (got {:?}) — \
+             M0 Phase 4 item 1 recorded that it does; re-measure",
+            domain.data_type()
+        );
+    }
+
+    /// Item 6. Run-end encoding and delta-style wins depend on rows arriving in
+    /// the identifier order the files are written in, and the DoGet applies no
+    /// `ORDER BY` — so a parallel scan over several files may interleave.
+    ///
+    /// Both DoGet shapes are covered because they answer differently: a plain
+    /// scan is ordered by `preserve_insertion_order`, but `read_masked` is a
+    /// JOIN, and a hash join carries no such guarantee. Phase 2's fixtures came
+    /// through the join and showed 1-4 inversions; that is the distinction.
+    ///
+    /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
+    /// production — the materialising `query_arrow` is a different execution mode
+    /// and could order differently.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_parallel_scan_preserves_file_sort_order() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let table = format!("qiita_lake.m0_order_probe_{id}");
+        let side = format!("qiita_lake.m0_order_join_{id}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {table} (grp BIGINT, seq BIGINT);
+             CREATE OR REPLACE TABLE {side} (grp BIGINT, seq BIGINT);"
+        ))
+        .expect("create probe tables");
+        // One INSERT per group, so each lands in its own DuckLake file — the
+        // layout a partitioned writer produces, and the one a parallel scan can
+        // interleave. Large enough that DuckDB actually parallelises.
+        const GROUPS: i64 = 16;
+        const PER_GROUP: i64 = 100_000;
+        for group in 0..GROUPS {
+            conn.execute_batch(&format!(
+                "INSERT INTO {table} SELECT {group}, i FROM range({}, {}) t(i);
+                 INSERT INTO {side} SELECT {group}, i FROM range({}, {}) t(i);",
+                group * PER_GROUP,
+                (group + 1) * PER_GROUP,
+                group * PER_GROUP,
+                (group + 1) * PER_GROUP,
+            ))
+            .expect("insert group");
+        }
+
+        let ordered = |sql: &str| -> (usize, usize, usize) {
+            let schema = {
+                let mut probe = conn
+                    .prepare(&format!("SELECT * FROM ({sql}) AS _p LIMIT 0"))
+                    .expect("prepare probe");
+                probe.query_arrow([]).expect("probe").get_schema()
+            };
+            let mut stmt = conn.prepare(sql).expect("prepare");
+            let stream = stmt.stream_arrow([], schema).expect("stream_arrow");
+            let mut seen = Vec::new();
+            let mut batches = 0usize;
+            for batch in stream {
+                batches += 1;
+                let grp = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("grp is Int64");
+                let seq = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("seq is Int64");
+                for row in 0..batch.num_rows() {
+                    seen.push((grp.value(row), seq.value(row)));
+                }
+            }
+            let inversions = seen.windows(2).filter(|w| w[1] < w[0]).count();
+            (seen.len(), inversions, batches)
+        };
+
+        let scan = ordered(&format!("SELECT grp, seq FROM {table}"));
+        let join = ordered(&format!(
+            "SELECT l.grp, l.seq FROM {table} l JOIN {side} r
+               ON l.grp = r.grp AND l.seq = r.seq"
+        ));
+        let _ = conn.execute_batch(&format!("DROP TABLE {table}; DROP TABLE {side};"));
+
+        let expected = (GROUPS * PER_GROUP) as usize;
+        assert_eq!(scan.0, expected, "scan lost rows");
+        assert_eq!(join.0, expected, "join lost rows");
+        println!(
+            "m0 item 6: scan {} rows / {} inversions / {} batches; \
+             join {} rows / {} inversions / {} batches",
+            scan.0, scan.1, scan.2, join.0, join.1, join.2
+        );
+
+        // Assert on *average run length*, not inversion count: the count scales
+        // with row count (1 inversion at 160k rows became 1 at 1.6M for the scan
+        // and 323 for the join), whereas run length is scale-free and is the
+        // property run-end and delta encodings actually consume. Anything in the
+        // thousands is coarse interleaving; row-level scatter would be single
+        // digits.
+        let run_len = |(rows, inversions, _): (usize, usize, usize)| rows / (inversions + 1);
+        assert!(
+            run_len(scan) >= 100_000,
+            "a plain DuckLake scan is no longer near-ordered ({} rows/run) — check \
+             preserve_insertion_order; M0 Phase 4 item 6 depends on it",
+            run_len(scan)
+        );
+        // The join carries no ordering guarantee at all — this is not a promise
+        // DuckDB makes, so the bound is deliberately loose and exists to catch a
+        // collapse to row-level scatter, which would invalidate item 6.
+        assert!(
+            run_len(join) >= 1_000,
+            "the join produced {} rows/run — that is row-level interleaving, not \
+             the coarse runs Phase 2 observed; item 6's conclusions need revisiting",
+            run_len(join)
+        );
     }
 }

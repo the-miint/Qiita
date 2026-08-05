@@ -13,12 +13,17 @@
 //! decoded batches), so size fixtures accordingly.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::RecordBatch;
+use arrow_array::builder::StringDictionaryBuilder;
+use arrow_array::types::{Int32Type, UInt32Type};
+use arrow_array::{
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, RunArray, StringArray, StringViewArray,
+};
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
@@ -30,6 +35,7 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_ipc::{root_as_message, CompressionType};
+use arrow_schema::{Field, Schema};
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +47,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 /// The IPC body codec. Arrow's `Message.fbs` defines exactly these two, so this
 /// is the complete axis — there is no third option to evaluate.
+// Each test target constructs a different subset of these; cargo compiles
+// the module once per target, so an unused variant is expected, not dead.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcCodec {
     None,
@@ -78,6 +87,9 @@ impl From<Dictionaries> for DictionaryHandling {
 /// gRPC per-message compression — the transport alternative to compressing the
 /// IPC body. It also covers the flatbuffer metadata that IPC body compression
 /// leaves untouched.
+// Each test target constructs a different subset of these; cargo compiles
+// the module once per target, so an unused variant is expected, not dead.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     None,
@@ -106,6 +118,23 @@ pub struct IpcSetting {
     pub max_flight_data_size: usize,
 }
 
+impl IpcSetting {
+    /// The default setting with one codec swapped in — the common case, since
+    /// every measurement is relative to `IpcSetting::default()`.
+    pub fn with_codec(codec: IpcCodec) -> Self {
+        Self {
+            codec,
+            ..Self::default()
+        }
+    }
+}
+
+/// Bytes as MiB, for the markdown the measurement targets print.
+#[allow(dead_code)]
+pub fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 impl Default for IpcSetting {
     /// Exactly what the data plane does today: `FlightDataEncoderBuilder::new()`
     /// with no options set. Every measurement is relative to this.
@@ -119,6 +148,9 @@ impl Default for IpcSetting {
 }
 
 /// One encode plus one decode of one input under one setting.
+// Which fields a target reads depends on what it measures, and cargo compiles
+// this module once per target — an unread field here is expected, not dead.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Measurement {
     /// Summed protobuf-encoded length of every `FlightData` produced — schema,
@@ -140,6 +172,188 @@ impl Measurement {
     pub fn ratio_over(&self, baseline: &Measurement) -> f64 {
         baseline.encoded_bytes as f64 / self.encoded_bytes as f64
     }
+}
+
+/// Where the Phase 2 fixtures live: `$QIITA_M0_FIXTURES`, else
+/// `localdocs/ducklake-sampled-data/` beside the workspace.
+// Cargo compiles this module once per test target, so anything only the
+// `fixtures` target calls reads as dead code in the `compression` target.
+#[allow(dead_code)]
+pub fn fixture_dir() -> PathBuf {
+    std::env::var_os("QIITA_M0_FIXTURES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("qiita-data-plane has a parent directory")
+                .join("localdocs/ducklake-sampled-data")
+        })
+}
+
+/// Load a Parquet fixture into `RecordBatch`es the way a DoGet would.
+///
+/// Through `stream_arrow`, not `query_arrow`, because that is what
+/// `stream_ducklake_batches` does in production. The materialising form can
+/// return the whole file as one batch; the streaming form yields DuckDB's
+/// natural chunk geometry. Batch geometry changes the compression ratio, so
+/// reading through the materialising path would measure a shape production
+/// never emits.
+///
+/// A missing file is an error, never an empty result: a silently-skipped
+/// fixture would report a shape as measured when nothing was measured.
+pub fn load_fixture(path: &Path) -> Result<Vec<RecordBatch>, BoxError> {
+    if !path.is_file() {
+        return Err(format!("fixture not found: {}", path.display()).into());
+    }
+    let literal = path
+        .to_str()
+        .ok_or_else(|| format!("fixture path is not UTF-8: {}", path.display()))?;
+    if literal.contains('\'') {
+        return Err(format!("fixture path contains a quote: {literal}").into());
+    }
+    let conn = duckdb::Connection::open_in_memory()?;
+    let sql = format!("SELECT * FROM read_parquet('{literal}')");
+
+    // Same zero-row schema probe as production: streaming execution does not
+    // surface the schema until a chunk is fetched, and `stream_arrow` needs it
+    // up front.
+    let schema = conn
+        .prepare(&format!("SELECT * FROM ({sql}) AS _schema_probe LIMIT 0"))?
+        .query_arrow([])?
+        .get_schema();
+    let mut stmt = conn.prepare(&sql)?;
+    Ok(stmt.stream_arrow([], schema)?.collect())
+}
+
+/// One column of every batch, keeping the batch boundaries.
+///
+/// This is how a per-column measurement is taken. IPC compresses each buffer
+/// independently, so a column measured alone compresses as it does in the whole
+/// table — `per_column_encoded_bytes_sum_to_the_whole_table` is what holds that
+/// claim to account.
+pub fn project(batches: &[RecordBatch], column: &str) -> Result<Vec<RecordBatch>, BoxError> {
+    let Some(first) = batches.first() else {
+        return Ok(Vec::new());
+    };
+    let index = first
+        .schema()
+        .index_of(column)
+        .map_err(|e| format!("no column {column:?} in fixture: {e}"))?;
+    Ok(batches
+        .iter()
+        .map(|b| b.project(&[index]))
+        .collect::<Result<_, _>>()?)
+}
+
+// --- Representation transforms (Phase 4) --------------------------------
+//
+// Arrow IPC has no encoding layer, so the only way to change what goes on the
+// wire is to change the array type handed to the encoder. Each of these rebuilds
+// one column as a different Arrow type; the calibration tests hold them to
+// preserving every value, because a transform that silently dropped rows would
+// make every byte count derived from it meaningless.
+
+/// Rebuild an `Int64` column as run-end encoded (`RunArray<Int32Type>`).
+///
+/// The candidate for identifier columns that are constant or long-running
+/// within a stream. Returns `None` for a column that is not `Int64`.
+#[allow(dead_code)]
+pub fn to_run_end_encoded(batch: &RecordBatch, index: usize) -> Option<RecordBatch> {
+    let column = batch.column(index).as_any().downcast_ref::<Int64Array>()?;
+
+    let mut run_ends: Vec<i32> = Vec::new();
+    let mut values: Vec<Option<i64>> = Vec::new();
+    for row in 0..column.len() {
+        let value = column.is_valid(row).then(|| column.value(row));
+        if values.last().is_none_or(|last| *last != value) {
+            values.push(value);
+            run_ends.push(0);
+        }
+        *run_ends.last_mut().expect("a run was just pushed") = row as i32 + 1;
+    }
+
+    let array = RunArray::<Int32Type>::try_new(
+        &Int32Array::from(run_ends),
+        &Int64Array::from(values) as &dyn Array,
+    )
+    .ok()?;
+    rebuild(batch, index, Arc::new(array))
+}
+
+/// Rebuild a `Utf8` column as `Utf8View` — buffer sharing instead of the
+/// dictionary's index indirection. Returns `None` for a non-`Utf8` column.
+///
+/// `gc()` compacts the builder's block slack so the measurement is about the
+/// format rather than the builder. It is a small effect (~2% of capacity, and
+/// IPC writes buffer *length* anyway) — deliberately not the interesting part.
+///
+/// **The interesting part is that a view array must not be sliced.** Views
+/// reference shared data buffers, so a slice keeps *every* buffer of the
+/// original; `FlightDataEncoderBuilder` splits batches to honour
+/// `max_flight_data_size`, and each slice then re-serializes the whole buffer.
+/// A compact 8.2 MB column measures 8.2 MB unsplit and **32.7 MB split five
+/// ways**. See `string_view_conversion_does_not_inflate_the_layout` and
+/// `slicing_a_string_view_array_duplicates_its_data_buffers`.
+#[allow(dead_code)]
+pub fn to_string_view(batch: &RecordBatch, index: usize) -> Option<RecordBatch> {
+    let column = batch.column(index).as_any().downcast_ref::<StringArray>()?;
+    let array: StringViewArray = column.iter().collect();
+    rebuild(batch, index, Arc::new(array.gc()))
+}
+
+/// Rebuild a `Utf8` column as a dictionary-encoded one. Returns `None` for a
+/// non-`Utf8` column.
+#[allow(dead_code)]
+pub fn to_dictionary(batch: &RecordBatch, index: usize) -> Option<RecordBatch> {
+    let column = batch.column(index).as_any().downcast_ref::<StringArray>()?;
+    let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+    for value in column.iter() {
+        builder.append_option(value);
+    }
+    rebuild(batch, index, Arc::new(builder.finish()))
+}
+
+/// Rebuild an `Int64` column as `Int32`.
+///
+/// **Errors rather than truncating.** Item 5's whole hazard is that a narrowed
+/// identifier which later exceeds its range is a silent corruption, so the
+/// instrument refuses out-of-range input instead of wrapping it — the same
+/// principle as [`verify_codec`]. `Ok(None)` means "not an Int64 column".
+#[allow(dead_code)]
+pub fn to_narrowed_i32(batch: &RecordBatch, index: usize) -> Result<Option<RecordBatch>, BoxError> {
+    let Some(column) = batch.column(index).as_any().downcast_ref::<Int64Array>() else {
+        return Ok(None);
+    };
+    let mut narrowed: Vec<Option<i32>> = Vec::with_capacity(column.len());
+    for row in 0..column.len() {
+        if !column.is_valid(row) {
+            narrowed.push(None);
+            continue;
+        }
+        let value = column.value(row);
+        narrowed.push(Some(i32::try_from(value).map_err(|_| {
+            format!("{value} does not fit in i32 — narrowing would silently truncate")
+        })?));
+    }
+    Ok(rebuild(batch, index, Arc::new(Int32Array::from(narrowed))))
+}
+
+/// Replace one column, deriving the new schema from the array's own type.
+fn rebuild(batch: &RecordBatch, index: usize, array: ArrayRef) -> Option<RecordBatch> {
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields[index] = Field::new(
+        fields[index].name(),
+        array.data_type().clone(),
+        fields[index].is_nullable(),
+    );
+    let mut columns = batch.columns().to_vec();
+    columns[index] = array;
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).ok()
 }
 
 /// The codec stamped into each record-batch message, in stream order. `None`
@@ -260,6 +474,9 @@ pub async fn measure_ipc(
 /// IPC-compressed stream at `Transport::None` against an uncompressed stream at
 /// `Transport::Zstd`. Comparing `wire_bytes` to [`Measurement::encoded_bytes`]
 /// directly would compare different things.
+// Which fields a target reads depends on what it measures, and cargo compiles
+// this module once per target — an unread field here is expected, not dead.
+#[allow(dead_code)]
 pub struct TransportMeasurement {
     /// Server→client bytes over the socket, HTTP/2 framing and headers
     /// included — the whole point of measuring at this layer rather than

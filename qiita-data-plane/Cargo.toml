@@ -51,6 +51,11 @@ futures = "0.3.31"
 # Enable tests that require external services (Postgres on :5433).
 # Run with: cargo test --features integration
 integration = []
+# The M0 compression measurement run over local-only production fixtures
+# (`localdocs/ducklake-sampled-data/`, or `$QIITA_M0_FIXTURES`). Deliberately in
+# no `make` tier: the data is not in the repo, so opting in asserts you have it.
+# Run with: cargo test --release --features fixtures -- --nocapture
+fixtures = []
 
 [dev-dependencies]
 serial_test = "3"
@@ -58,3 +63,6 @@ tempfile = "3"
 # The compression harness sizes each `FlightData` by its protobuf-encoded
 # length — what tonic puts on the wire, not an estimate of it.
 prost = "0.14"
+# Phase 4 calibration casts a transformed column back to its original type to
+# assert the transform preserved every value. Test-only; the service never casts.
+arrow-cast = "58"
