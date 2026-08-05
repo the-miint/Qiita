@@ -19,7 +19,36 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- **Re-run `assembly_coverage` for any `long-read-assembly` ticket that completed it before
+  this deploy** (#422, closes #374). `assembly_coverage` now writes its coverage BAM
+  coordinate sorted and `binning.sh` no longer sorts what it stages, so a BAM
+  written by the old code reaches a post-deploy `binning` unsorted and
+  dies in `jgi_summarize_bam_contig_depths` ("the bam file is not sorted!"). A plain `/run`
+  does not fix it: resume fast-forwards a step already `completed` in
+  `qiita.work_ticket_step` and rebuilds its outputs from the workspace rather than
+  re-running it, so the same BAM comes back.
+
+  Listed states are those a ticket can still reach `binning` from: `failed` and `cancelled`
+  are both redrivable in place via `/run` (`_RUN_REDRIVE_STATES`), so both stay in scope;
+  only `completed` and `no_data` are excluded. Tickets that already cleared `binning` on
+  the old image are excluded too — `binning` is step 5 of 11, so a ticket now in `checkm`
+  is not at risk and must not be restarted (its `assemble` cost 192–384 GB).
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT DISTINCT wt.work_ticket_idx, wt.state FROM qiita.work_ticket wt JOIN qiita.work_ticket_step s USING (work_ticket_idx) WHERE wt.action_id='\''long-read-assembly'\'' AND s.step_name='\''assembly_coverage'\'' AND s.state='\''completed'\'' AND wt.state NOT IN ('\''completed'\'', '\''no_data'\'') AND NOT EXISTS (SELECT 1 FROM qiita.work_ticket_step b WHERE b.work_ticket_idx=wt.work_ticket_idx AND b.step_name='\''binning'\'' AND b.state='\''completed'\'');"'
+  ```
+  For each row, drop just that step's progress row and redrive — the runner then advances
+  to a fresh attempt dir and re-runs `assembly_coverage`, keeping the completed `assemble`.
+  Cancel first if the ticket is still in flight (`/run` applies to `failed` / `cancelled` /
+  `pending`, not to `processing`):
+  ```bash
+  qiita-admin ticket cancel <idx>   # only if still in flight
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "DELETE FROM qiita.work_ticket_step WHERE work_ticket_idx=<idx> AND step_name='\''assembly_coverage'\'';"'
+  qiita ticket run <idx>
+  ```
+  The reverse pairing needs no action: an older binning image re-sorting an already-sorted
+  BAM only costs the sort.
 
 ### 3. Migrations
 
@@ -78,6 +107,21 @@ _None yet._
   qiita-admin fanout list
   ```
 
+- The rebuilt `long-read-assembly` binning image stages the coverage BAM instead of
+  sorting it (#422, closes #374). Anchored at start-of-line so a comment mentioning
+  the command cannot satisfy it:
+  ```bash
+  cd /tmp && sudo -u qiita-orch apptainer exec --no-home \
+    "${PATH_DERIVED}/images/long-read-assembly-binning-1.0.0.sif" \
+    bash -c 'grep -q "^cp .*COVERAGE_BAM" /opt/qiita/binning.sh' \
+    && echo BINNING_STAGE_OK
+  ```
+
+- Re-run the bucket-2 query (#422). The CP keeps serving through buckets 2→4, so a
+  ticket can complete `assembly_coverage` on the old code after that check and
+  before the restart. Expect zero rows; anything listed landed in that
+  window and takes the same fix.
+
 ### 6. After the deploy verifies green
 
 _None yet._
@@ -120,6 +164,15 @@ _None yet._
   *failing* step now climbs; a healthy ticket requests exactly what it did before. Reaches
   `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no host action, just
   the bucket-5 checks that it took.
+- (#422, closes #374) **The `long-read-assembly` binning SIF auto-rebuilds on this
+  deploy** (`activate.sh` → `build-sifs.sh`; its entrypoint and def are build
+  inputs) to pick up staging the coverage BAM rather than running
+  `samtools sort` over it — `assembly_coverage` now writes it coordinate sorted. Each
+  binning step drops a sort of the whole coverage BAM (19 s wall and 11.1 GiB peak RSS at
+  16 cpu, measured in this image on a 2.0 GB BAM); the staged copy itself remains.
+  No host action for the rebuild — but the pairing with BAMs written before the deploy is
+  not free: see the bucket-2 drain step.
+
 - (#420, closes #411) **The admin `resource_override` envelope widens with these ceilings**
   (`POST /work-ticket` 422s when `resource_override.mem_gb` exceeds `mem_ceiling_gb`). A
   per-ticket nudge that used to be rejected at 17 GB on `fastq-to-parquet/1.1.0` is now
