@@ -396,6 +396,49 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`assembly_coverage` writes its BAM coordinate sorted, and `binning.sh` stages it
+  instead of running `samtools sort` over it (#422, closes #374).** The sort ran unconditionally
+  on every long-read-assembly ticket — 19 s wall and 11.1 GiB peak RSS at 16 cpu,
+  measured inside the binning image on the 2.0 GB BAM that first exposed the problem
+  (~13.5 s on the ticket itself) — and it existed only because miint's `@SQ` order
+  was then derivable from nothing, so no `ORDER BY` the step could write made the file
+  sorted. `@SQ` is now sorted by reference name
+  ([duckdb-miint#173](https://github.com/the-miint/duckdb-miint/issues/173)), so tid
+  order is name order and the step's `ORDER BY reference, position` on the `COPY` is a
+  genuine coordinate sort. The sort is one row per alignment and carries no read bytes
+  (SEQ/QUAL come from `SEQUENCE_DATA` at write time), and DuckDB spills it — the side of
+  that step's memory split that is allowed to.
+
+  **Measured against the consumers, not inferred from the header order**, on the binning
+  image's own pins (metabat2 2.15, samtools 1.10), with the same BAM written without the
+  `ORDER BY` as the control: `jgi_summarize_bam_contig_depths` rejects the control
+  ("the bam file is not sorted!") and accepts the ordered file, reporting a
+  depth/variance matrix identical to the one it produces from a `samtools sort` of that
+  same file; `samtools index` — which metaWRAP's concoct block runs — likewise fails on
+  the control and succeeds on the ordered file, despite miint writing no
+  `@HD SO:coordinate` tag ([duckdb-miint#202](https://github.com/the-miint/duckdb-miint/issues/202)).
+  And at production scale, since a small write cannot exercise a parallel sink: 2M records
+  over 20k references (the ticket had 925,483 over 20,975) with `threads=8` and the sort
+  spilling came out fully tid-monotonic under `preserve_insertion_order=false` — identical
+  to the `=true` control, against 999,778 backsteps for the same relation written without
+  the `ORDER BY`. So the `preserve_insertion_order=true` override this job once carried
+  "solely to protect that ORDER BY" is not reinstated. Pinned by
+  `test_written_bam_is_tid_monotonic`, which runs the real step on a 13-contig fixture
+  with shuffled reads and goes red (38 of 72 records backwards) if the `ORDER BY` is
+  deleted; the 3-contig fixture that let the original defect through orders identically
+  whichever way you look at it.
+
+  The staged file is a plain copy: `coverage_bam`'s directory and `QIITA_OUTPUT_PATH` are
+  separate apptainer `--bind`s and `link()` refuses to cross a mount even within one
+  filesystem (measured), and `LocalBackend` — the one backend that could have shared a
+  mount — refuses container steps. So the second reads-sized artifact remains; what goes
+  away is the sort's CPU, RSS and spill. **`binning.sh`'s assembly-FASTA reordering stays
+  and is unaffected**: metabat2 requires the depth matrix and the assembly in the same
+  contig order, `@SQ` is name-sorted while the assembler emits numeric order, and ordering
+  records does not move an `@SQ` line. `test_binning_coverage_sort_pin.py` becomes
+  `test_long_read_assembly_entrypoint_pins.py`, covering the bin_refine/checkm/image pins
+  in it as well as the staging ones.
+
 - **Both services now narrate one unconditional line at boot, and the deploy check for
   it can actually fail (#406).** Review found the CO half of that check passing on
   nothing: it grepped the journal for a bare `INFO ` and got the same result — no match

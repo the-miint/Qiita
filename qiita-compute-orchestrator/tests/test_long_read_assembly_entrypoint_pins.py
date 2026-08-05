@@ -1,43 +1,41 @@
-"""Pin that `binning.sh` sorts the coverage BAM before staging it for metaWRAP.
+"""Static pins on the `long-read-assembly` container entrypoints and their images.
+
+Most of the file is about `binning.sh` and the coverage BAM (below), but it also
+pins `bin_refine.sh`'s `--write_bins` flag, `checkm.sh`'s TMPDIR shortening for the
+AF_UNIX socket, and the version constraints in `binning.def` / `bin_refine.def` that
+each entrypoint's behaviour depends on. All of it is the same kind of assertion:
+read the shipped file, check the command it pins is still there and still shaped
+correctly.
+
+The coverage BAM: how `binning.sh` puts it where metaWRAP will read it.
 
 metaWRAP guards its own `bwa mem` AND its own `samtools sort` behind one
 `if [[ ! -f <out>/work_files/<sample>.bam ]]`. The workflow pre-places that BAM
 to skip bwa (a short-read aligner) in favour of a minimap2 pre-map -- which
-silently skips the sort along with it. And the writer's output was not sorted to
-begin with: a BAM is coordinate-sorted by tid, i.e. by `@SQ` index, and miint's
-`@SQ` order is not derivable from the REFERENCE_LENGTHS table it is built from
-(duckdb-miint#173), so the reference-NAME `ORDER BY` the step used to apply was
-never the sort it looked like. `jgi_summarize_bam_contig_depths` refuses such a
-file outright:
+silently skips the sort along with it. So whatever is staged there must ALREADY be
+coordinate sorted; `jgi_summarize_bam_contig_depths` refuses anything else:
 
     ERROR: the bam file 'reads.bam' is not sorted!
 
-That reached production and failed a real ticket at the binning step. The fix is
-the `samtools sort` in `binning.sh` that restores what metaWRAP would have done.
+That reached production and failed a real ticket at the binning step. It could,
+because the writer's `@SQ` was in hash-bucket order then (duckdb-miint#173) and the
+step's reference-NAME `ORDER BY` was therefore never the sort it looked like.
 
-Why this test exists, and why it reads text
--------------------------------------------
-The behavioural test (`test_samtools_sort_makes_the_bam_tid_monotonic` in
-`jobs/test_assembly_coverage.py`) needs the samtools binary and is SKIPPED
-everywhere it is absent -- CI and a stock dev box included. It also invokes
-samtools directly, so it pins *samtools'* behaviour rather than ours: deleting
-the sort from `binning.sh` would not fail it.
+`@SQ` is now sorted by reference name, so `assembly_coverage` writes the file
+coordinate sorted (`ORDER BY reference, position`) and this entrypoint stages it
+unmodified rather than running its own `samtools sort` over it. Sortedness is
+pinned where it can be observed -- `test_written_bam_is_tid_monotonic` in
+`jobs/test_assembly_coverage.py`, which runs the real step. This file pins the
+entrypoint's half: that the file staged for metaWRAP is that BAM, that it arrives
+atomically, and that nothing else reaches the path metaWRAP reads.
 
-This one needs no binary, runs everywhere, and pins the part that is actually
-ours -- that the entrypoint still sorts, still stages atomically, and has not
-regressed to the copy-the-writer's-output shape that caused the incident. It is
-a text assertion because the alternative is building a 517 MB metaWRAP image;
-it therefore cannot prove the command *works*, only that it is still there and
-still shaped correctly. Correct-operation evidence lives in the skipped test
-above and in the deploy-checklist verify step.
-
-duckdb-miint#173 has landed: `@SQ` is now sorted by reference name, pinned by
-`test_sq_order_is_reference_name_sorted` in `jobs/test_assembly_coverage.py`. That
-removes the *reason* the sort was added but does not by itself make it safe to
-drop -- the step applies no ORDER BY, and metabat2 needs the depth matrix and the
-assembly in the same order. Removal is tracked at Qiita#374 (see the "Open upstream
-gaps" table in docs/duckdb-miint.md for the exit criteria) and needs measuring
-against metabat2, not inferring from a changelog. Until then it is load-bearing.
+Why these read text
+-------------------
+Exercising the entrypoint means building a 517 MB metaWRAP image, so these are text
+assertions: they show the commands are present and shaped correctly, not that they
+succeed. They need no binary and run everywhere, including CI and a stock dev box.
+Correct-operation evidence is elsewhere: the behavioural test above, the consumer
+measurements in `docs/duckdb-miint.md`, and the deploy verify step.
 """
 
 from __future__ import annotations
@@ -57,11 +55,15 @@ _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
 
 
-@pytest.mark.parametrize("path", [_BINNING_SH, _BINNING_DEF, _BINNING_VERIFY])
+@pytest.mark.parametrize(
+    "path",
+    [_BINNING_SH, _BINNING_DEF, _BINNING_VERIFY, _BIN_REFINE_SH, _BIN_REFINE_DEF, _CHECKM_SH],
+)
 def test_source_file_is_present_and_parses(path: Path) -> None:
     """Anti-vacuity guard, matching the sibling static pins.
 
-    Every assertion below reads one of these files through `_code_lines`. A
+    Every assertion below reads one of these files through `_code_lines` — all six,
+    which is why all six are listed here rather than the three `binning` ones. A
     moved file or a `_REPO_ROOT` that stopped resolving would make the
     absence-shaped pins pass for the wrong reason, so fail loudly here first.
     """
@@ -72,23 +74,26 @@ def test_source_file_is_present_and_parses(path: Path) -> None:
 def _code_lines(path: Path) -> list[str]:
     """Script lines with comments and blanks dropped, `\\` continuations folded.
 
-    Every assertion below runs against these, never the raw text. The
-    deploy-checklist verify step for this same change originally grepped the raw
-    file for `samtools sort` and passed on a file where the only occurrences were
-    the comments describing it -- deleting the command still greened the check.
-    A test that greps raw text would have exactly that hole.
+    Every assertion below runs against these, never the raw text. A deploy-checklist
+    verify step for this same entrypoint once grepped the raw file for the command
+    it cared about and passed on a file where the only occurrences were the comments
+    describing it -- deleting the command still greened the check. A test that greps
+    raw text would have exactly that hole, and this file is mostly comments.
 
     Continuations are folded so one logical command is one entry, the way the
     shell reads it. Without that, a multi-line invocation is several fragments
     and any assertion spanning a command and its arguments silently cannot match
     -- passing only for tests phrased as absences.
 
-    TRAILING comments are stripped too, not just whole-line ones: `cmd # samtools
-    sort ${COVERAGE_BAM}` would otherwise satisfy the assertions below, which is
-    the same hole in a different place. `#` is only a comment when it starts a
-    word and is not inside quotes, so this tracks quote state rather than
-    splitting on the first `#`. Neither script here contains a quoted `#` today;
-    the parser handles it so that a future one cannot quietly break the pin.
+    TRAILING comments are stripped too, not just whole-line ones. That matters for
+    the presence-shaped pins below, which ask whether a command appears at all:
+    `cmd # samtools faidx "${WORK}/assembly.fa"` would otherwise satisfy the
+    reorder pin, the same hole in a different place. (The fail-closed staging pin
+    is immune — a commented `cp` still mentions ${STAGED_BAM} and would fail its
+    allowlist instead.) `#` is only a comment when it starts a word and is not
+    inside quotes, so this tracks quote state rather than splitting on the first
+    `#`. No script here contains a quoted `#` today; the parser handles it so that
+    a future one cannot quietly break the pin.
     """
     out: list[str] = []
     pending = ""
@@ -126,33 +131,47 @@ def _strip_comment(line: str) -> str:
     return line
 
 
-def test_binning_sorts_the_coverage_bam() -> None:
-    """The staged BAM is produced by `samtools sort`, not a copy of the input."""
-    code = "\n".join(_code_lines(_BINNING_SH))
-    assert "samtools sort" in code, (
-        "binning.sh no longer runs `samtools sort`. metaWRAP's own sort is skipped "
-        "along with its bwa when work_files/<sample>.bam is pre-placed, so without "
-        "this the staged BAM is in reference-NAME order and jgi rejects it with "
-        "'the bam file is not sorted!'"
+def test_binning_stages_the_coverage_bam_unrewritten() -> None:
+    """The staging name is filled by copying ${COVERAGE_BAM}, byte for byte.
+
+    Fail-closed, like the sibling below: enumerate every logical line touching
+    ${STAGED_BAM} and require each to be one of the three steps of the staging
+    itself. A denylist would pass on every shape nobody thought of. One shape this
+    excludes is a re-added `samtools sort` writing there: it would absorb a
+    regression in `assembly_coverage`'s ORDER BY, which is what makes the file
+    sorted.
+    """
+    code = _code_lines(_BINNING_SH)
+    touching = [ln for ln in code if "STAGED_BAM" in ln and not ln.startswith("STAGED_BAM=")]
+    assert touching, (
+        "nothing in binning.sh fills ${STAGED_BAM} -- the staging shape or its "
+        "variable names changed, and the assertions here are vacuous as written."
     )
-    sort_cmd = [ln for ln in _code_lines(_BINNING_SH) if "samtools sort" in ln]
-    assert len(sort_cmd) == 1, f"expected exactly one `samtools sort`, got {sort_cmd!r}"
-    assert "COVERAGE_BAM" in sort_cmd[0], (
-        f"`samtools sort` no longer reads ${{COVERAGE_BAM}}: {sort_cmd[0]!r}. The "
-        "sort must consume the coverage step's output directly; sorting anything "
-        "else would stage an unsorted BAM under a sorted-looking name."
+
+    fill = [ln for ln in touching if ln.startswith("cp ")]
+    assert len(fill) == 1, f"expected exactly one `cp` into the staging name, got {fill!r}"
+    assert "COVERAGE_BAM" in fill[0], (
+        f"the staged BAM no longer comes from ${{COVERAGE_BAM}}: {fill[0]!r}. metaWRAP "
+        "reads whatever sits at work_files/<sample>.bam, so staging anything else "
+        "silently substitutes the coverage the depth matrix is built from."
     )
 
+    for line in touching:
+        allowed = line.startswith(("cp ", "rm -f ", "mv "))
+        assert allowed, (
+            f"something other than the staging steps writes ${{STAGED_BAM}}: {line!r}. "
+            "A `samtools sort` here would also absorb an unsorted BAM arriving from "
+            "assembly_coverage -- the sort belongs there, and is pinned there."
+        )
 
-def test_only_the_sorted_bam_is_staged_for_metawrap() -> None:
-    """The ONLY thing written to the path metaWRAP reads is the sorted BAM.
 
-    Fail-closed on purpose. The pre-fix shape was `ln`/`cp` of the writer's
-    output straight to `work_files/<sample>.bam`, and the obvious test is to
-    forbid that -- but a denylist passes on every shape nobody thought of
+def test_only_the_staged_bam_reaches_metawrap() -> None:
+    """The ONLY thing written to the path metaWRAP reads is the staged BAM.
+
+    Fail-closed: a denylist passes on every shape nobody thought of
     (`install`, `cat >`, a `;`-joined `cp`, a redirect). So instead: enumerate
     every logical line that mentions the staged path and require each to be
-    either the sort's own staging name or the `mv` that renames it into place.
+    either the staging name it is renamed from or the `mv` that does it.
     Any new way of putting a file there has to be added here deliberately.
     """
     staged = f"{'${WORK_FILES}'}/{'${READS_STEM}'}.bam"
@@ -175,15 +194,15 @@ def test_only_the_sorted_bam_is_staged_for_metawrap() -> None:
         is_sq_header_read = "samtools view -H" in line and "STAGED_ORDER" in line
         assert is_staging_mv or is_sq_header_read, (
             f"something other than the staging `mv` (or the @SQ-order read) touches "
-            f"the path metaWRAP reads: {line!r}. If miint's name-ordered BAM lands "
-            "there unsorted, jgi rejects it with 'the bam file is not sorted!' -- the "
-            "production failure this test exists for. Stage via the sort, or extend "
-            "this test on purpose."
+            f"the path metaWRAP reads: {line!r}. Whatever lands there is what jgi "
+            "reads, and it rejects an unsorted file with 'the bam file is not "
+            "sorted!' -- the production failure this test exists for. Stage via the "
+            "`mv`, or extend this test to cover the new path."
         )
 
 
-def test_binning_stages_the_sorted_bam_atomically() -> None:
-    """Sort to a scratch name, then rename, so a killed sort cannot leave a
+def test_binning_stages_the_bam_atomically() -> None:
+    """Fill a scratch name, then rename, so a `cp` killed mid-write cannot leave a
     truncated file at the path metaWRAP reads.
 
     The rename must stay inside work_files/: the workspace and QIITA_OUTPUT_PATH
@@ -192,51 +211,32 @@ def test_binning_stages_the_sorted_bam_atomically() -> None:
     """
     code = _code_lines(_BINNING_SH)
     joined = "\n".join(code)
-    assert "STAGED_BAM=" in joined, "binning.sh no longer sorts to a staging name"
+    assert "STAGED_BAM=" in joined, "binning.sh no longer stages under a scratch name"
     staged = next(line for line in code if line.startswith("STAGED_BAM="))
     assert "WORK_FILES" in staged, (
         f"the staging name left work_files/: {staged!r}. A rename out of "
         "QIITA_OUTPUT_PATH crosses a bind mount (EXDEV) and stops being atomic."
     )
     assert re.search(r"^mv\b.*STAGED_BAM", joined, re.MULTILINE), (
-        "the sorted BAM is no longer renamed into place with `mv`"
-    )
-
-
-def test_binning_sort_memory_is_bounded_by_the_allocation() -> None:
-    """The sort's total memory derives from MEM_MB, not from a bare literal.
-
-    `samtools sort -m` is PER THREAD, so pairing it with an unbounded thread
-    count makes the ceiling unbounded too. Inside a container `--containall`
-    scrubs every SLURM_* var, so the thread count falls through to `nproc` --
-    the node's core count, not the allocation, unless the site happens to
-    cpuset-bind. Sizing off MEM_MB is what keeps the product under the cgroup
-    limit regardless.
-    """
-    code = "\n".join(_code_lines(_BINNING_SH))
-    assert re.search(r"SORT_TOTAL_MB=.*MEM_MB", code), (
-        "the sort's memory budget no longer derives from ${MEM_MB}. `-m` is "
-        "per-thread; without a total derived from the step's own allocation the "
-        "ceiling scales with the host's core count and can OOM the cgroup."
-    )
-    assert re.search(r"-m\s+\"\$\{SORT_MEM_MB\}M\"", code), (
-        "`samtools sort -m` no longer uses the derived per-thread value"
+        "the staged BAM is no longer renamed into place with `mv`"
     )
 
 
 def test_binning_reorders_the_assembly_to_sq_order() -> None:
     """The assembly is reordered to the staged BAM's @SQ order before metaWRAP.
 
-    Second consumer of the same duckdb-miint#173 @SQ-order defect: metaWRAP's
+    A separate requirement from record order, and one that outlives it: metaWRAP's
     jgi_summarize writes the depth matrix in @SQ order, and metabat2 aborts unless
     the assembly FASTA is in that SAME order ("the order of contigs in abundance
     file is not the same as the assembly file"). noLCG.fa is in hifiasm's numeric
-    order; the @SQ order is lexicographic; `samtools sort` fixes record order but
-    never @SQ order, so the two disagree and metabat2 rejects. Reproduced and the
-    reorder-fix confirmed on samtools 1.10 / metabat2 2.15 (a numeric-order
-    assembly aborts, the @SQ-reordered one binds).
+    order and @SQ is name-sorted, i.e. lexicographic, so the two disagree. Ordering
+    records by (reference, position) does not move an @SQ line, so the coordinate
+    sort neither causes nor cures this; it comes out when @SQ becomes steerable
+    upstream or the assembler emits name order. Reproduced and the reorder-fix
+    confirmed on samtools 1.10 / metabat2 2.15 (a numeric-order assembly aborts,
+    the @SQ-reordered one binds).
 
-    Text pin, like the sort pins above: proving the reorder *works* needs the
+    Text pin, like the staging pins above: proving the reorder *works* needs the
     metaWRAP/metabat2 image; this proves it is still WIRED -- the order comes from
     the staged BAM's @SQ header and metaWRAP is handed the reordered file, not the
     raw noLCG.
@@ -244,8 +244,8 @@ def test_binning_reorders_the_assembly_to_sq_order() -> None:
     code = _code_lines(_BINNING_SH)
     joined = "\n".join(code)
 
-    # The @SQ order is extracted from the staged BAM header (what jgi will read),
-    # not from noLCG or the unsorted coverage_bam.
+    # The @SQ order is extracted from the staged BAM header -- the file jgi will
+    # read -- rather than from noLCG, whose contig order is the thing being fixed.
     order_src = [ln for ln in code if "ORDERED_NOLCG" in ln or "assembly.ordered" in ln]
     assert any("samtools faidx" in ln for ln in order_src), (
         "binning.sh no longer builds the reordered assembly with `samtools faidx`. "
@@ -404,10 +404,12 @@ def test_binning_image_pins_version_bound_tools(package: str) -> None:
     None is cosmetic:
       maxbin2 <2.2.6 ships `MaxBin` rather than the `run_MaxBin.pl` metaWRAP
         invokes -- see binning.def for the full rationale.
-      samtools provides the `samtools sort` binning.sh runs.
-      metabat2 owns `jgi_summarize_bam_contig_depths`, the tool that rejects an
-        unsorted BAM -- pinning the sort's producer but not the consumer that
-        adjudicates it would leave the acceptance criterion free to move.
+      samtools provides the `samtools faidx` that reorders the assembly, whose
+        region-order and missing-region behaviour the reorder's guard rests on,
+        and the `samtools index` metaWRAP's concoct block runs.
+      metabat2 owns `jgi_summarize_bam_contig_depths`, which rejects an unsorted
+        BAM and whose depth matrix must agree with the assembly's contig order --
+        it adjudicates both criteria this entrypoint is built around.
 
     samtools and metabat2 were both transitive dependencies of metawrap-mg's
     solve before this, so a rebuild could move either with no change to this repo.
