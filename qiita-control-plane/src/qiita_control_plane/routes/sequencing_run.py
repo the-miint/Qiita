@@ -853,7 +853,7 @@ async def submit_block_mask_plan(
     # the read-mask workflow declaring adapter_parquet AND a default reference
     # being configured — and materializes it once (a data-plane hop) only then.
     try:
-        adapter_set_hash = await block_planner.resolve_block_mask_adapter_hash(
+        adapter_set_hashes = await block_planner.resolve_block_mask_adapter_hash(
             pool,
             default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
             data_plane_url=data_plane_url,
@@ -879,7 +879,7 @@ async def submit_block_mask_plan(
                 host_minimap2_reference_idx=body.host_minimap2_reference_idx,
             ),
             only_missing=body.only_missing,
-            adapter_set_hash=adapter_set_hash,
+            adapter_set_hashes=adapter_set_hashes,
             originator_principal_idx=user.principal_idx,
             block_action_id=block_planner.BLOCK_MASK_ACTION_ID,
             block_action_version=block_planner.BLOCK_MASK_ACTION_VERSION,

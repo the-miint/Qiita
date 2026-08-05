@@ -22,6 +22,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita-admin backfill mask-adapter-hash` — re-key mask_definition rows onto
+  the current adapter-identity derivation (#428).** The mint converts a row when
+  something re-mints its config; this converts the ones nothing re-submits, so
+  the contract phase has a column free of NULLs to read as its go-ahead. A row
+  records the adapter *hash*, not the reference behind it, and recomputing the
+  legacy digest to attribute it would need the adapter Parquet bytes — the
+  dependency the change removes. So rows are grouped by stored hash: one distinct
+  value is the single canonical adapter set and converts; more than one is
+  reported unwritten — `--mask-idx N --attribute-all` is how an operator resolves
+  that residue by stating the attribution themselves. Dry-run by default (the
+  plan carries every value the write uses, including the collision check),
+  `--execute` to write, idempotent.
+
 - **A runtime control surface for the fan-out dispatch throttle (#406).** The
   per-cohort in-flight cap was a single boot-time global (`FANOUT_MAX_INFLIGHT`), so
   retuning one fan-out meant editing an env file and restarting the control plane —
@@ -1211,6 +1224,27 @@ duplicates further down are historical strata; leave them where they are.
   `qiita ticket list` prints the envelope. No `caller_system_role` field, unlike
   the two sibling envelopes: this route admits service accounts, whose authz is
   scope-only and which carry no system_role.
+
+- **Mask identity keys on the adapter sequences, not on serialized Parquet bytes
+  (#428, expand phase).** `resolved_qc.adapter_set_hash` was the SHA-256 of the
+  materialized adapter Parquet. The pyarrow writer stamps its version into the
+  file footer, so that digest changed on every pyarrow bump for the same adapter
+  sequences — measured on one fixed two-row table: 19.0.0 `a1677d2f…`, 21.0.0
+  `29a6a873…`, 23.0.1 `53117c74…`, identical across two runs of one version. A
+  block plan re-deriving under a different pyarrow than the mint then mints a
+  second mask for the same filter, and an align run naming the original mask_idx
+  finds no `mask_sample` rows for those samples (`samples_skipped_no_mask`). It
+  is now the SHA-256 over the reference's sorted `qiita.feature.sequence_hash`
+  values, read from Postgres — a strand-canonical hash, so an adapter and its
+  reverse complement are one member. `qiita.mint_mask_definition` takes the
+  legacy digest as a fallback lookup key and re-keys the row it matches in place,
+  keeping its mask_idx, so nothing re-masks. A new
+  `mask_definition.adapter_hash_scheme` column records which derivation produced
+  a row's stored hash; it sits outside `params` because `params` is the hashed
+  blob. The scheme is stated by the caller that derived the hash, never inferred
+  from the blob — the public `POST /mask-definition` route mints caller-supplied
+  `params`, so its rows stay unstamped and surface in the backfill's report
+  instead of reading as converted.
 
 - **The read-mask identity (`mask_idx`) now carries rype's host-call threshold
   (`resolved_host_filter`).** The hash covered the host *references* a mask depletes
