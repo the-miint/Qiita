@@ -41,6 +41,12 @@ from qiita_common.models.sample_field import (
 # Change one and you must change the other in the same PR.
 MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
+# The wire spellings of the two idx fields the biosample study-field shapes
+# re-declare with an entity-qualified alias. Named so a caller writing or
+# reading one of those payload keys resolves it here instead of retyping it.
+BIOSAMPLE_STUDY_FIELD_IDX_WIRE = "biosample_study_field_idx"
+BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE = "biosample_global_field_idx"
+
 # Defined here so the wire models and the repository layer share one definition.
 type MetadataFieldScope = Literal["global", "local"]
 
@@ -583,7 +589,7 @@ class BiosampleStudyFieldCreateRequest(SampleStudyFieldCreateRequest):
     """Body for POST /api/v1/study/{study_idx}/biosample-field."""
 
     global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
-        default=None, alias="biosample_global_field_idx"
+        default=None, alias=BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE
     )
 
 
@@ -592,8 +598,10 @@ class BiosampleStudyFieldResponse(SampleStudyFieldResponse):
     the created resource), carrying every qiita.biosample_study_field column.
     """
 
-    study_field_idx: Annotated[int, Field(gt=0)] = Field(alias="biosample_study_field_idx")
-    global_field_idx: Annotated[int, Field(gt=0)] | None = Field(alias="biosample_global_field_idx")
+    study_field_idx: Annotated[int, Field(gt=0)] = Field(alias=BIOSAMPLE_STUDY_FIELD_IDX_WIRE)
+    global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
+        alias=BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE
+    )
 
 
 class IdxsListResponse(BaseModel):

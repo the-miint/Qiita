@@ -31,6 +31,12 @@ from . import require_transaction
 # Whether a colliding metadata write overwrites the existing value or raises.
 type MetadataConflictMode = Literal["raise", "upsert"]
 
+# How the existing occupant of a metadata slot relates to an attempted write:
+# the two same-kind verdicts, then the two cross-kind ones (a typed value
+# attempted against a missing-reason slot and the reverse), which are not
+# comparable and so carry no same/different answer.
+type SlotCompareResult = Literal["same", "different", "occupied_by_missing", "occupied_by_typed"]
+
 # The only two texts a BOOLEAN-typed metadata value accepts, compared after
 # outer-whitespace stripping and case folding. Anything else is a parse error:
 # the stored value is a real boolean, so admitting a wider vocabulary would
@@ -91,6 +97,13 @@ class SampleEntityKind(StrEnum):
 
     BIOSAMPLE = "biosample"
     PREP_SAMPLE = "prep_sample"
+
+
+def _study_field_location(study_idx: int, display_name: str) -> str:
+    """Render the (study_idx, display_name) pair that uniquely keys one
+    *_study_field row, for embedding in a diagnostic message.
+    """
+    return f"study_idx={study_idx}, display_name={display_name!r}"
 
 
 def _assert_global_link_consistent(global_field_idx: int | None, internal_name: str | None) -> None:
@@ -266,9 +279,9 @@ class StudyFieldConflictError(Exception):
         self.expected_global_field_idx = expected_global_field_idx
         self.found_global_field_idx = found_global_field_idx
         super().__init__(
-            f"{entity_kind}_study_field at study_idx={study_idx},"
-            f" display_name={display_name!r} is bound to global"
-            f" {found_global_field_idx!r}, expected {expected_global_field_idx!r}"
+            f"{entity_kind}_study_field at {_study_field_location(study_idx, display_name)}"
+            f" is bound to global {found_global_field_idx!r},"
+            f" expected {expected_global_field_idx!r}"
         )
 
 
@@ -292,8 +305,8 @@ class StudyFieldAlreadyExistsError(Exception):
         self.study_idx = study_idx
         self.display_name = display_name
         super().__init__(
-            f"{entity_kind}_study_field at study_idx={study_idx},"
-            f" display_name={display_name!r} already exists"
+            f"{entity_kind}_study_field at {_study_field_location(study_idx, display_name)}"
+            f" already exists"
         )
 
 
@@ -569,6 +582,12 @@ class EntityMetadataSpec:
 # SQL identifiers are interpolated into the queries below only from frozen
 # constants and closed in-code mappings, never from caller input; values always
 # bind as $N placeholders.
+
+# The name a study-field read aliases its entity-specific global-FK column to,
+# so the Python access is the same whichever entity's table was queried. Shared
+# by the SELECT that emits it and every read that consumes it: a rename that
+# reached only one side would fail at runtime with a missing record key.
+FOUND_GLOBAL_FIELD_IDX_ALIAS = "found_global_field_idx"
 
 # The columns a global-field lookup may key on. A closed mapping from the
 # public Literal to its SQL column name, so the interpolated identifier is
@@ -1037,7 +1056,7 @@ def _compare_slot_occupant(
     value_column: str,
     existing_row: Mapping[str, object],
     attempted_value: SampleMetadataValue,
-) -> Literal["same", "different", "occupied_by_missing", "occupied_by_typed"]:
+) -> SlotCompareResult:
     """Classify the existing slot occupant vs the attempted write.
 
     - "same" / "different" — both sides typed (incl. terminology-term-idx
@@ -1155,11 +1174,7 @@ def _diagnose_slot_occupant(
     data_type: FieldDataType,
     existing_row: Mapping[str, object],
     attempted_value: SampleMetadataValue,
-) -> tuple[
-    Literal["same", "different", "occupied_by_missing", "occupied_by_typed"],
-    str | Decimal | date | bool | int | None,
-    int | None,
-]:
+) -> tuple[SlotCompareResult, str | Decimal | date | bool | int | None, int | None]:
     """Resolve the typed value column, classify the slot occupant vs the
     attempted write, and extract the existing typed value (or None when
     the slot holds a missing reason). Returns (compare_result,
@@ -1187,7 +1202,7 @@ def _make_collision_error(
     attempted_study_idx: int,
     attempted_value: SampleMetadataValue,
     data_type: FieldDataType,
-    compare_result: Literal["same", "different", "occupied_by_missing", "occupied_by_typed"],
+    compare_result: SlotCompareResult,
     existing_metadata_idx: int,
     existing_value: str | Decimal | date | bool | int | None,
     existing_missing_reason_idx: int | None,
@@ -1233,6 +1248,38 @@ def _make_collision_error(
     if compare_result == "same":
         return DuplicateValueDifferentStudyError(**kwargs)
     return ConflictingValueDifferentStudyError(**kwargs)
+
+
+async def _refetch_conflicting_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+) -> asyncpg.Record:
+    """Re-read the *_study_field row at (study_idx, display_name) whose presence
+    made an ON CONFLICT DO NOTHING insert return nothing. Carries idx plus the
+    global FK under FOUND_GLOBAL_FIELD_IDX_ALIAS.
+
+    Raises TransientWriteRaceError when the row is already gone: a concurrent
+    transaction deleted-and-committed it between the conflict and this read, so
+    the slot is free again — a benign lost race, not schema corruption.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    row = await conn.fetchrow(
+        f"SELECT idx, {spec.study_field_global_fk_column} AS {FOUND_GLOBAL_FIELD_IDX_ALIAS}"
+        f" FROM {spec.study_field_table}"
+        f" WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        display_name,
+    )
+    if row is None:
+        raise TransientWriteRaceError(
+            row_label=f"{spec.entity_kind}_study_field",
+            slot_summary=_study_field_location(study_idx, display_name),
+        )
+    return row
 
 
 async def _get_or_create_globally_linked_study_field(
@@ -1295,30 +1342,18 @@ async def _get_or_create_globally_linked_study_field(
     # Fallback branch — existing row at (study_idx, display_name). Verify
     # its global link matches what the caller asked for; otherwise the row
     # is bound to a different global field (or none) and reusing it would
-    # attach the value to the wrong field. The SELECT aliases the global
-    # FK column so the Python access stays stable across entities.
-    row = await conn.fetchrow(
-        f"SELECT idx, {fk_column} AS found_global_field_idx"
-        f" FROM {spec.study_field_table}"
-        f" WHERE study_idx = $1 AND display_name = $2",
-        study_idx,
-        display_name,
+    # attach the value to the wrong field.
+    row = await _refetch_conflicting_study_field(
+        conn, spec=spec, study_idx=study_idx, display_name=display_name
     )
-    if row is None:
-        # ON CONFLICT fired against a row that was then deleted-and-
-        # committed before this SELECT ran. The slot is free again —
-        # benign race, not schema corruption — so signal a retry.
-        raise TransientWriteRaceError(
-            row_label=f"{spec.entity_kind}_study_field",
-            slot_summary=(f"study_idx={study_idx}, display_name={display_name!r}"),
-        )
-    if row["found_global_field_idx"] != global_field_idx:
+    found_global_field_idx = row[FOUND_GLOBAL_FIELD_IDX_ALIAS]
+    if found_global_field_idx != global_field_idx:
         raise StudyFieldConflictError(
             entity_kind=spec.entity_kind,
             study_idx=study_idx,
             display_name=display_name,
             expected_global_field_idx=global_field_idx,
-            found_global_field_idx=row["found_global_field_idx"],
+            found_global_field_idx=found_global_field_idx,
         )
     return row["idx"], False
 
@@ -1682,13 +1717,11 @@ async def _get_or_create_local_study_field(
     # an implicit-commit boundary.
     require_transaction(conn)
 
-    # f-string interpolation of identifiers is safe: spec fields are frozen
-    # module-level constants, never reached by caller input.
-    fk_column = spec.study_field_global_fk_column
-
     # Create branch — purely-local row, FK column left NULL. ON CONFLICT
     # DO NOTHING absorbs the unique-constraint hit so the concurrent loser
-    # of the race does not raise.
+    # of the race does not raise. f-string interpolation of identifiers is
+    # safe: spec fields are frozen module-level constants, never reached by
+    # caller input.
     idx = await conn.fetchval(
         f"INSERT INTO {spec.study_field_table} ("
         f"    study_idx, display_name, description,"
@@ -1712,25 +1745,12 @@ async def _get_or_create_local_study_field(
 
     # Lookup branch — fallback fires only on conflict; takes a fresh
     # snapshot under READ COMMITTED so it sees the row the concurrent
-    # winner committed. Surface the FK column so callers can detect a
-    # globally-linked resolution; alias to a stable name so the Python
-    # access stays independent of the entity-specific column.
-    row = await conn.fetchrow(
-        f"SELECT idx, {fk_column} AS found_global_field_idx"
-        f" FROM {spec.study_field_table}"
-        f" WHERE study_idx = $1 AND display_name = $2",
-        study_idx,
-        display_name,
+    # winner committed. The resolved row's FK travels back to the caller so
+    # it can detect a globally-linked resolution.
+    row = await _refetch_conflicting_study_field(
+        conn, spec=spec, study_idx=study_idx, display_name=display_name
     )
-    if row is None:
-        # ON CONFLICT fired against a row that was then deleted-and-
-        # committed before this SELECT ran. The slot is free again —
-        # benign race, not schema corruption — so signal a retry.
-        raise TransientWriteRaceError(
-            row_label=f"{spec.entity_kind}_study_field",
-            slot_summary=(f"study_idx={study_idx}, display_name={display_name!r}"),
-        )
-    return row["idx"], False, row["found_global_field_idx"]
+    return row["idx"], False, row[FOUND_GLOBAL_FIELD_IDX_ALIAS]
 
 
 async def fetch_study_field(

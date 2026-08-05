@@ -14,12 +14,18 @@ from qiita_common.models.sample_field import (
     SampleStudyFieldResponse,
 )
 
+# The wire spellings of the two idx fields the prep-sample study-field shapes
+# re-declare with an entity-qualified alias. Named so a caller writing or
+# reading one of those payload keys resolves it here instead of retyping it.
+PREP_SAMPLE_STUDY_FIELD_IDX_WIRE = "prep_sample_study_field_idx"
+PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE = "prep_sample_global_field_idx"
+
 
 class PrepSampleStudyFieldCreateRequest(SampleStudyFieldCreateRequest):
     """Body for POST /api/v1/study/{study_idx}/prep-sample-field."""
 
     global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
-        default=None, alias="prep_sample_global_field_idx"
+        default=None, alias=PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE
     )
 
 
@@ -28,7 +34,7 @@ class PrepSampleStudyFieldResponse(SampleStudyFieldResponse):
     the created resource), carrying every qiita.prep_sample_study_field column.
     """
 
-    study_field_idx: Annotated[int, Field(gt=0)] = Field(alias="prep_sample_study_field_idx")
+    study_field_idx: Annotated[int, Field(gt=0)] = Field(alias=PREP_SAMPLE_STUDY_FIELD_IDX_WIRE)
     global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
-        alias="prep_sample_global_field_idx"
+        alias=PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE
     )

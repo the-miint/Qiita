@@ -94,7 +94,9 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_platform,
 )
 from ._helpers import (
+    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
+    IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     detail_for_biosample_link_rejection,
@@ -130,10 +132,15 @@ _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own prep samples"
 # means updating both sites in lockstep.
 _BIOSAMPLE_LINK_TRIGGER_NAME = "prep_sample_to_study_reject_without_biosample_link"
 
+# The two ENA-accession unique indexes, named because both the create and the
+# PATCH constraint maps below key on them.
+_ENA_EXPERIMENT_ACCESSION_UNIQUE = "sequenced_sample_ena_experiment_accession_unique"
+_ENA_RUN_ACCESSION_UNIQUE = "sequenced_sample_ena_run_accession_unique"
+
 _SEQUENCED_SAMPLE_UNIQUE_MESSAGES: dict[str, str] = {
     "sequenced_sample_pool_item_id_unique": ("sequenced_pool_item_id already in use for this pool"),
-    "sequenced_sample_ena_experiment_accession_unique": ("ena_experiment_accession already in use"),
-    "sequenced_sample_ena_run_accession_unique": "ena_run_accession already in use",
+    _ENA_EXPERIMENT_ACCESSION_UNIQUE: "ena_experiment_accession already in use",
+    _ENA_RUN_ACCESSION_UNIQUE: "ena_run_accession already in use",
     "prep_sample_metadata_unique_per_field": (
         "duplicate metadata entry for the same prep_sample_study_field"
     ),
@@ -152,6 +159,16 @@ _SEQUENCED_SAMPLE_FK_MESSAGES: dict[str, str] = {
     "prep_sample_to_study_study_idx_fkey": ("study_idx does not reference an existing study"),
 }
 _GENERIC_SEQ_UNIQUE_VIOLATION = "conflicts with an existing prep_sample / sequenced_sample"
+
+# Constraint names update_sequenced_sample can trip. Only the two ENA-accession
+# unique indexes appear because the subtype-only PATCH writes no FK column;
+# their wording is selected from the create map so the two cannot drift.
+# Unknown names fall back to the generic string on the matching exception path.
+_SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES: dict[str, str] = {
+    name: _SEQUENCED_SAMPLE_UNIQUE_MESSAGES[name]
+    for name in (_ENA_EXPERIMENT_ACCESSION_UNIQUE, _ENA_RUN_ACCESSION_UNIQUE)
+}
+_SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenced_sample"
 
 
 @router.post(
@@ -634,7 +651,7 @@ async def get_sequenced_sample_in_study(
         )
 
     # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
-    response.headers["ETag"] = etag_for_updated_at(row["effective_updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["effective_updated_at"])
 
     return _study_scoped_sequenced_sample_response_from_row(
         row,
@@ -784,7 +801,7 @@ async def get_sequenced_sample(
     global_metadata = metadata_entries_from_rows(metadata_rows)
 
     # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
-    response.headers["ETag"] = etag_for_updated_at(row["effective_updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["effective_updated_at"])
 
     return _sequenced_sample_response_from_row(
         row,
@@ -793,23 +810,12 @@ async def get_sequenced_sample(
     )
 
 
-# Map of constraint names update_sequenced_sample can trip. Only the two
-# ENA-accession unique indexes appear here because the subtype-only PATCH
-# does not write any FK column; unknown names fall back to the generic
-# string on the matching exception path.
-_SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES: dict[str, str] = {
-    "sequenced_sample_ena_experiment_accession_unique": ("ena_experiment_accession already in use"),
-    "sequenced_sample_ena_run_accession_unique": "ena_run_accession already in use",
-}
-_SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenced_sample"
-
-
 @sequenced_sample_router.patch(PATH_SEQUENCED_SAMPLE_BY_IDX)
 async def patch_sequenced_sample(
     sequenced_sample_idx: Annotated[int, Field(gt=0)],
     body: SequencedSamplePatchRequest,
     response: Response,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
@@ -914,7 +920,7 @@ async def patch_sequenced_sample(
             raise HTTPException(status_code=409, detail=detail)
 
     # Set the new ETag from the updated row's bumped effective_updated_at.
-    response.headers["ETag"] = etag_for_updated_at(updated_row["effective_updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["effective_updated_at"])
 
     # Reuse the GET route's row -> response shaper so PATCH and GET share
     # one source of truth for the response shape.

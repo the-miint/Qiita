@@ -69,6 +69,13 @@ def _attempted_label(value: object) -> str:
 # stays identical across every route that falls back to it.
 GENERIC_FK_VIOLATION = "references a row that does not exist"
 
+# The optimistic-concurrency header pair: every route that emits a version
+# stamp writes ETAG_HEADER, and every PATCH that gates on one reads
+# IF_MATCH_HEADER. A caller round-trips the first into the second, so the two
+# spellings are a contract rather than incidental strings.
+ETAG_HEADER = "ETag"
+IF_MATCH_HEADER = "If-Match"
+
 
 def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
     """Map a metadata-row dict to MetadataEntry, preserving the input keys.
@@ -528,37 +535,34 @@ async def detail_for_slot_collision(
         if exc.global_field_idx is not None
         else f"{exc.entity_kind}_study_field_idx={exc.study_field_idx}"
     )
+    # Where the occupied slot sits — field, entity, and slot identifier. Every
+    # branch below names it, so it is rendered once here.
+    slot_location = (
+        f"field {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx} ({slot_id})"
+    )
     # Match on the concrete subclass to pick the right wording. The
     # generic SlotOccupiedError fallback covers any future subclass
     # added without a wording branch here; reading the catch-all
     # message in production points the maintainer at this dispatch.
     if isinstance(exc, DuplicateValueSameStudyError):
         return (
-            f"your study already wrote this same {what} for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id}); no new row was created"
+            f"your study already wrote this same {what} for {slot_location}; no new row was created"
         )
     if isinstance(exc, ConflictingValueSameStudyError):
         return (
-            f"your study previously wrote a different {what} for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id});"
+            f"your study previously wrote a different {what} for {slot_location};"
             f" correct it via PATCH or DELETE+INSERT, not INSERT"
         )
     if isinstance(exc, DuplicateValueDifferentStudyError):
         return (
-            f"the {what} you attempted is already present for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id}), contributed by"
-            f" study_idx={exc.contributing_study_idx}; your study does"
+            f"the {what} you attempted is already present for {slot_location},"
+            f" contributed by study_idx={exc.contributing_study_idx}; your study does"
             f" not own the row"
         )
     if isinstance(exc, ConflictingValueDifferentStudyError):
         return (
             f"another study (study_idx={exc.contributing_study_idx}) has"
-            f" written a different {what} for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id});"
+            f" written a different {what} for {slot_location};"
             f" the global field's canonical value is in dispute"
         )
     if isinstance(exc, SlotOccupiedByMissingReasonError):
@@ -574,8 +578,7 @@ async def detail_for_slot_collision(
             exc.existing_missing_reason_idx,
         )
         return (
-            f"the value for field {exc.display_name!r} on"
-            f" {exc.entity_kind}_idx={exc.entity_idx} ({slot_id}) is"
+            f"the value for {slot_location} is"
             f" recorded as intentionally missing (reason: {reason_name});"
             f" the missing-reason row must be deleted before a typed"
             f" value can be written"
@@ -604,8 +607,7 @@ async def detail_for_slot_collision(
         else:
             rendered_existing = str(exc.existing_value)
         return (
-            f"the value for field {exc.display_name!r} on"
-            f" {exc.entity_kind}_idx={exc.entity_idx} ({slot_id}) is"
+            f"the value for {slot_location} is"
             f" already recorded as a typed value ({rendered_existing});"
             f" the typed row must be deleted before a missing-reason"
             f" marker can be written"

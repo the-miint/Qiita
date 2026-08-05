@@ -81,7 +81,9 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
 )
 from ._helpers import (
+    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
+    IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     create_and_map_study_field,
@@ -400,7 +402,7 @@ async def get_biosample_in_study(
 
     # Set the ETag header so callers can use it as the If-Match value on a
     # subsequent PATCH; the value is opaque-by-contract.
-    response.headers["ETag"] = etag_for_updated_at(row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
 
     return _study_scoped_response_from_row(
         row,
@@ -634,7 +636,7 @@ async def get_biosample(
 
     # Set the ETag header so callers can use it as the If-Match value on a
     # subsequent PATCH; the value is opaque-by-contract.
-    response.headers["ETag"] = etag_for_updated_at(row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
 
     return _biosample_response_from_row(
         row,
@@ -728,7 +730,7 @@ async def patch_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     body: BiosamplePatchRequest,
     response: Response,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
@@ -852,7 +854,7 @@ async def patch_biosample(
             raise
 
     # Set the new ETag from the updated row's bumped updated_at.
-    response.headers["ETag"] = etag_for_updated_at(updated_row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["updated_at"])
 
     # Reuse the GET route's row -> response shaper so the PATCH and GET
     # surfaces share one source of truth for the response shape.

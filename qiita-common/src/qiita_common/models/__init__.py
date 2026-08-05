@@ -73,6 +73,8 @@ from qiita_common.models.auth import (
 from qiita_common.models.biosample import (
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
     BIOSAMPLE_FIELD_TAXON_ID,
+    BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE,
+    BIOSAMPLE_STUDY_FIELD_IDX_WIRE,
     MATRIX_TUBE_ID_PATTERN,
     MISSING_REASON_CONTROL_SAMPLE,
     MISSING_REASON_NOT_APPLICABLE,
@@ -121,6 +123,8 @@ from qiita_common.models.host_filter_profile import (
     HostFilterResolution,
 )
 from qiita_common.models.prep_sample import (
+    PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE,
+    PREP_SAMPLE_STUDY_FIELD_IDX_WIRE,
     PrepSampleStudyFieldCreateRequest,
     PrepSampleStudyFieldResponse,
 )
@@ -305,6 +309,8 @@ __all__ = [
     # Module-level constants.
     "BIOSAMPLE_FIELD_HOST_TAXON_ID",
     "BIOSAMPLE_FIELD_TAXON_ID",
+    "BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE",
+    "BIOSAMPLE_STUDY_FIELD_IDX_WIRE",
     "GLOBAL_FIELD_IDX_ATTR",
     "HOST_FILTER_INDEX_TYPE_MINIMAP2",
     "HOST_FILTER_INDEX_TYPE_RYPE",
@@ -319,6 +325,8 @@ __all__ = [
     "NCBI_TAXONOMY_HUMAN_TERM_ID",
     "NCBI_TAXONOMY_NAME",
     "ORCID_PATTERN",
+    "PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE",
+    "PREP_SAMPLE_STUDY_FIELD_IDX_WIRE",
     "STUDY_FIELD_IDX_ATTR",
     "TERMINOLOGY_TERM_VALUE_COLUMN",
     "VALID_STATUS_TRANSITIONS",
