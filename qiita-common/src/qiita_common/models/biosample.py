@@ -8,7 +8,6 @@ from enum import StrEnum
 from typing import Annotated, ClassVar, Literal
 
 from pydantic import (
-    AfterValidator,
     AwareDatetime,
     BaseModel,
     ConfigDict,
@@ -17,8 +16,14 @@ from pydantic import (
     model_validator,
 )
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel
+from qiita_common.auth_constants import SystemRole
+from qiita_common.models._base import (
+    AccessionText,
+    MetadataRequestModel,
+    NonBlankName,
+    NonBlankText,
+    PatchRequestModel,
+)
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
 from qiita_common.models.sample_field import (
@@ -52,24 +57,6 @@ def derive_metadata_field_scope(global_link: object) -> MetadataFieldScope:
     return "global" if global_link is not None else "local"
 
 
-def _reject_blank_metadata_text(value: str) -> str:
-    """Reject a metadata value carrying no content. Returns it unchanged."""
-    if not value.strip():
-        raise ValueError("metadata value must not be blank or whitespace-only")
-    return value
-
-
-# The value half of every metadata dict on the wire. Outer whitespace is
-# stripped before a value is parsed into its field's data type, so a blank
-# string would reach storage as '' — occupying the field's slot while carrying
-# no information. Declining to give a value is expressed with a missing-value
-# marker instead. `min_length` states the constraint in the OpenAPI schema;
-# the validator covers the whitespace-only forms it cannot express.
-NonBlankMetadataText = Annotated[
-    str, Field(min_length=1), AfterValidator(_reject_blank_metadata_text)
-]
-
-
 class FieldWriteOutcome(StrEnum):
     """What a single metadata upsert did to one field's slot: created a new
     row, overwrote an existing value in place, or left an already-identical
@@ -82,7 +69,7 @@ class FieldWriteOutcome(StrEnum):
     UNCHANGED = "unchanged"
 
 
-class BiosampleImportRequest(BaseModel):
+class BiosampleImportRequest(MetadataRequestModel):
     """Body for POST /api/v1/study/{study_idx}/biosample.
 
     The route gates on `Tier.ADMIN` access to the path's study
@@ -93,17 +80,19 @@ class BiosampleImportRequest(BaseModel):
     when global_internal_names is set, on a biosample_global_field's
     internal_name for global fields (local fields stay display-name-keyed);
     the route parses each value into the field's data type before insert.
-    An empty dict is allowed; a blank value within it is not.
+    An empty dict is allowed. Every key and value strips on the way in and
+    must still carry content, so the field a key names and the value stored
+    under it are both the stripped form.
     """
 
     owner_idx: Annotated[int, Field(gt=0)]
-    owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
-    owner_biosample_id_value: str = Field(min_length=1)
-    metadata: dict[str, NonBlankMetadataText] = Field(default_factory=dict)
+    owner_biosample_id_field_name: NonBlankName
+    owner_biosample_id_value: NonBlankText
+    metadata: dict[NonBlankText, NonBlankText] = Field(default_factory=dict)
     global_internal_names: bool = False
-    metadata_checklist_name: str | None = Field(default=None, min_length=1)
-    biosample_accession: str | None = Field(default=None, min_length=1)
-    ena_sample_accession: str | None = Field(default=None, min_length=1)
+    metadata_checklist_name: NonBlankText | None = None
+    biosample_accession: AccessionText | None = None
+    ena_sample_accession: AccessionText | None = None
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
@@ -401,12 +390,16 @@ class MetadataFieldWriteResult(BaseModel):
         """
         if not isinstance(data, dict) or "scope" not in data:
             return data
-        derived = derive_metadata_field_scope(data.get("internal_name"))
-        if data["scope"] != derived:
-            raise ValueError(
-                f"scope {data['scope']!r} contradicts internal_name; scope is derived"
-                f" and must be omitted or {derived!r}"
-            )
+        # An absent internal_name is its own error. Deriving from the missing
+        # key would report a contradiction against a value never supplied,
+        # naming the wrong field as the one to fix.
+        if "internal_name" in data:
+            derived = derive_metadata_field_scope(data["internal_name"])
+            if data["scope"] != derived:
+                raise ValueError(
+                    f"scope {data['scope']!r} contradicts internal_name; scope is derived"
+                    f" and must be omitted or {derived!r}"
+                )
         return {key: value for key, value in data.items() if key != "scope"}
 
     @computed_field  # type: ignore[prop-decorator]
@@ -418,7 +411,7 @@ class MetadataFieldWriteResult(BaseModel):
         return derive_metadata_field_scope(self.internal_name)
 
 
-class SampleMetadataWriteRequest(BaseModel):
+class SampleMetadataWriteRequest(MetadataRequestModel):
     """Body for a study-scoped sample-family metadata write (the
     PATCH .../{entity}/metadata routes, e.g. biosample and sequenced-sample).
 
@@ -427,8 +420,10 @@ class SampleMetadataWriteRequest(BaseModel):
     fields stay display-name-keyed either way). The route resolves each key
     against the study's existing global or study-local fields and upserts it. At
     least one entry is required — an empty write is almost certainly a client
-    error — and every value must carry content. Unknown field names are rejected
-    by the route rather than created.
+    error — and every key and value strips on the way in and must still carry
+    content, so a name written with stray padding resolves to the same field as
+    its unpadded spelling. Unknown field names are rejected by the route rather
+    than created.
 
     Under global_internal_names, a key matching a global field's internal_name
     reads back under that same key, because the globally-linked read is
@@ -442,7 +437,7 @@ class SampleMetadataWriteRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metadata: dict[str, NonBlankMetadataText] = Field(min_length=1)
+    metadata: dict[NonBlankText, NonBlankText] = Field(min_length=1)
     global_internal_names: bool = False
 
 
@@ -450,9 +445,11 @@ class SampleMetadataWriteResponse(BaseModel):
     """Returned by a study-scoped sample-family metadata write route.
 
     results maps each key the caller sent to what the write did to that field,
-    in the caller's input order. The keys are the caller's own, which for a
-    globally-linked field is not the key the value reads back under; each
-    result's internal_name carries that.
+    in the caller's input order. The keys are the caller's own in their stripped
+    form, since keys strip at the wire — a key sent with surrounding whitespace
+    comes back without it. For a globally-linked field the caller's key is also
+    not the key the value reads back under; each result's internal_name carries
+    that.
     """
 
     results: dict[str, MetadataFieldWriteResult]
@@ -480,7 +477,7 @@ class BiosampleLookupByAccessionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+    accessions: list[NonBlankText] = Field(min_length=1, max_length=10_000)
     accession_field: BiosampleAccessionField = "biosample_accession"
 
 
@@ -544,7 +541,7 @@ class StudyLookupByAccessionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+    accessions: list[NonBlankText] = Field(min_length=1, max_length=10_000)
     accession_field: StudyAccessionField = "bioproject_accession"
 
 
@@ -570,10 +567,10 @@ class BiosamplePatchRequest(PatchRequestModel):
 
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"owner_idx"})
 
-    metadata_checklist_name: str | None = Field(default=None, min_length=1)
+    metadata_checklist_name: NonBlankText | None = None
     owner_idx: Annotated[int, Field(gt=0)] | None = None
-    biosample_accession: str | None = Field(default=None, min_length=1)
-    ena_sample_accession: str | None = Field(default=None, min_length=1)
+    biosample_accession: AccessionText | None = None
+    ena_sample_accession: AccessionText | None = None
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),

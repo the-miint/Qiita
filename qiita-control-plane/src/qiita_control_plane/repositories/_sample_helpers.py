@@ -38,6 +38,12 @@ type MetadataConflictMode = Literal["raise", "upsert"]
 BOOLEAN_TRUE_TEXT = "true"
 BOOLEAN_FALSE_TEXT = "false"
 
+# The widest unconstrained NUMERIC Postgres stores: past either bound it
+# rejects the value as overflowing the numeric format, so a value beyond them
+# has nowhere to land.
+MAX_PG_NUMERIC_INTEGER_DIGITS = 131072
+MAX_PG_NUMERIC_SCALE_DIGITS = 16383
+
 # Maps each data_type to the qiita.*_metadata.value_* column carrying its typed
 # value. Every member of FieldDataType must appear: a data_type absent here has
 # no column to read or write, so it reaches the closed-set guards as a
@@ -361,9 +367,31 @@ class TransientWriteRaceError(Exception):
         )
 
 
+def _fits_pg_numeric(value: Decimal) -> bool:
+    """Report whether a Decimal falls within the digit bounds Postgres stores.
+
+    Callers must clear a value through here before rendering it: the rendered
+    form carries one character per digit, and the exponent setting that count
+    arrives as caller text, so a value of a few bytes can name a width of
+    gigabytes.
+    """
+    # Infinity and every NaN flavour render to a fixed token, and carry a
+    # string exponent that no digit bound can be compared against.
+    if not value.is_finite():
+        return True
+    exponent = value.as_tuple().exponent
+    integer_digits = value.adjusted() + 1
+    scale_digits = -exponent if exponent < 0 else 0
+    return (
+        integer_digits <= MAX_PG_NUMERIC_INTEGER_DIGITS
+        and scale_digits <= MAX_PG_NUMERIC_SCALE_DIGITS
+    )
+
+
 def _pg_numeric_text(value: Decimal) -> str:
     """Render a Decimal in the exact text form an unconstrained Postgres
-    NUMERIC column stores it as.
+    NUMERIC column stores it as. The value must already have cleared
+    _fits_pg_numeric, which bounds how wide this render can run.
 
     Postgres expands exponent notation into plain digits and keeps whatever
     scale those digits carry, so fixed-point formatting matches it — except
@@ -410,6 +438,15 @@ def parse_text_for_data_type(
                 text_value=text_value,
                 reason="not a valid decimal number",
             ) from exc
+        # Turn away what the database has no room for before rendering it,
+        # since rendering is what pays for every digit the exponent names.
+        if not _fits_pg_numeric(parsed_decimal):
+            raise MetadataParseError(
+                field_key=field_key,
+                data_type=data_type,
+                text_value=text_value,
+                reason="more digits than a numeric column can store",
+            )
         # Adopt the stored representation here, so no later step has to know
         # which of the two forms it is holding.
         stored_form = _pg_numeric_text(parsed_decimal)
@@ -1115,7 +1152,7 @@ def _diagnose_slot_occupant(
     attempted_value: SampleMetadataValue,
 ) -> tuple[
     Literal["same", "different", "occupied_by_missing", "occupied_by_typed"],
-    str | Decimal | date | int | None,
+    str | Decimal | date | bool | int | None,
     int | None,
 ]:
     """Resolve the typed value column, classify the slot occupant vs the
@@ -1147,7 +1184,7 @@ def _make_collision_error(
     data_type: FieldDataType,
     compare_result: Literal["same", "different", "occupied_by_missing", "occupied_by_typed"],
     existing_metadata_idx: int,
-    existing_value: str | Decimal | date | int | None,
+    existing_value: str | Decimal | date | bool | int | None,
     existing_missing_reason_idx: int | None,
     contributing_study_idx: int,
     global_field_idx: int | None = None,

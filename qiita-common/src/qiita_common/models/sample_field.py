@@ -9,13 +9,26 @@ from typing import Annotated
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH
+from qiita_common.models._base import NonBlankName, NonBlankText
 from qiita_common.models.reference import FieldDataType, Tier
 
-# Attribute name of the global-field link, whose wire spelling each subclass
-# supplies as an alias. Read back off the model to name the field in a
-# validation message, so the message always matches what the caller sent.
-_GLOBAL_FK_ATTR = "global_field_idx"
+# Attribute names of the two idx fields each entity subclass re-declares with
+# its own wire alias.
+STUDY_FIELD_IDX_ATTR = "study_field_idx"
+GLOBAL_FIELD_IDX_ATTR = "global_field_idx"
+
+
+def field_wire_name(model: type[BaseModel], attr: str) -> str:
+    """Return the wire spelling of one of model's fields: the alias it declares
+    for that field, or the attribute name itself when it declares none.
+
+    Callers naming a field on the wire must resolve it through here rather than
+    reading .alias directly — a model that leaves a field unaliased carries
+    alias None, which is usable neither as a payload key nor as a message
+    token.
+    """
+    declared_alias = model.model_fields[attr].alias
+    return declared_alias or attr
 
 
 class SampleStudyFieldCreateRequest(BaseModel):
@@ -31,8 +44,8 @@ class SampleStudyFieldCreateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    display_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
-    description: str | None = Field(default=None, min_length=1)
+    display_name: NonBlankName
+    description: NonBlankText | None = None
     global_field_idx: Annotated[int, Field(gt=0)] | None = None
     data_type: FieldDataType | None = None
     required: bool | None = None
@@ -41,7 +54,7 @@ class SampleStudyFieldCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_mode_coupling(self) -> SampleStudyFieldCreateRequest:
-        global_fk_name = type(self).model_fields[_GLOBAL_FK_ATTR].alias or _GLOBAL_FK_ATTR
+        global_fk_name = field_wire_name(type(self), GLOBAL_FIELD_IDX_ATTR)
 
         # Linked mode: the inherited columns live on the global-field row and
         # must be NULL on the study-field row, so reject them at the wire.

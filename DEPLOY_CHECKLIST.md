@@ -36,6 +36,7 @@ _None yet._
 - `20260725000000_metadata_global_field_alias_index_comments.sql` — attaches explanatory COMMENTs to the per-global metadata uniqueness indexes (no schema change). Plain `make migrate`. (#386)
 - `20260725000001_global_field_display_name_unique.sql` — adds `UNIQUE(display_name)` to both global-field tables. Plain `make migrate` — **but only after the bucket-2 pre-check passes** (the constraint build aborts on existing duplicate display_names). (#386)
 - `20260725000002_metadata_reject_link_retired_on_update.sql` — adds a `BEFORE UPDATE` twin of the existing retired-link guard on `biosample_metadata` and `prep_sample_metadata` (reuses the existing trigger functions; no schema change). Plain `make migrate`. (#386)
+- `20260804000000_metadata_updated_at.sql` — adds `updated_at` plus its `set_updated_at()` trigger to `biosample_metadata` and `prep_sample_metadata`. Plain `make migrate` — the `ADD COLUMN` takes the fast-default path, so it does not rewrite either table. Existing rows are deliberately **not** backfilled to their `created_at`: they all carry the migration's own timestamp instead. (#386)
 
 ### 4. Deploy
 

@@ -201,7 +201,9 @@ Every metadata *value* — for a biosample or a prep_sample — is stored attach
 
 Note that **multiple study-local fields in one study may link to the same global field and this is intended.** For example, two contributors to one study can arrive with distinct sets of biosamples that carry different column names for the same global concept (say "host age" and "host age in years"); each becomes its own study-local field, with its own `display_name`, and both linked to the `host_age` global field. EAVs for a given contributor-provided study-local field are populated only for that contributor's biosamples. A whole-study read for host age is `WHERE global_field_idx = host_age`, which reunites the aliases under the global field's canonical label and ignores which study-local field each value came through.
 
-The guardrail that keeps this coherent is the uniqueness on globally-linked values — `biosample_metadata_one_value_per_global_field` / `prep_sample_metadata_one_value_per_global_field`, `UNIQUE (entity_idx, global_field_idx)` — which forbids a *single* entity from carrying two values for one global field while permitting the disjoint-coverage aliasing above. It is deliberately keyed per entity, **not** per study: a `UNIQUE (study_idx, global_field_idx)` would forbid disjoint aliasing and must not be added. Consistent with this, resolving a column to a global field is keyed on `display_name` (get-or-create) — a new label mints a new alias, a matching label reuses the existing field.
+**What a metadata read is keyed on.** A globally-linked value reads back under its global field's `internal_name`; a purely study-local value reads back under its study-local `display_name`. A client that wrote a value keyed on a display_name therefore cannot assume it reads back under that key — each per-field write result reports the `internal_name` the value will read under, and null when the write resolved to a purely-local field. The `display_name` still travels alongside every global value as its canonical label.
+
+The guardrail that keeps this coherent is the uniqueness on globally-linked values — `biosample_metadata_one_value_per_global_field` / `prep_sample_metadata_one_value_per_global_field`, `UNIQUE (entity_idx, global_field_idx)` — which forbids a *single* entity from carrying two values for one global field while permitting the disjoint-coverage aliasing above. It is deliberately keyed per entity, **not** per study: a `UNIQUE (study_idx, global_field_idx)` would forbid disjoint aliasing and must not be added. Consistent with this, resolving a column to a global field is keyed on `display_name` by default, or on the global field's `internal_name` when the caller sets `global_internal_names`. A globally-linked write then get-or-creates the study-local row it needs on `(study_idx, display_name)` — a new label mints a new alias, a matching label reuses the existing one — using the global field's own `display_name` when the caller keyed by `internal_name`, since the key it sent is not a label. Neither the import nor the metadata-write path creates a global field or a purely-local one: a key matching no existing field is rejected, and minting a field is the study-local field-create route's job.
 
 A study-local field's global link may be **added** (a local→global upgrade propagates the link onto the field's existing values, gated by the per-entity uniqueness index) but never **rebound** to a different global field, nor **unlinked** while values exist; the propagate trigger rejects both, and the correct move is to create a new study-local field.
 
@@ -216,7 +218,7 @@ Two mechanisms compose to set the tier a caller must hold — on the study, via 
 
 When enforcement is built, the effective required tier for a field or value is the most restrictive that applies (field-level tier, further tightened by any matching value-level exception). A caller whose study-access tier is below that threshold must not see the value on any read path, and must be refused when attempting to write it. This applies uniformly to reads and writes and to both globally-linked and study-local metadata.
 
-This is the mechanism that will ultimately decide who can see or change the owner-biosample-id (a study-local field pinned to `member` tier) and any other tier-restricted field or value — replacing today's coarse interim rule that clamps the study-scoped biosample metadata read and write routes to admin-tier callers.
+This is the mechanism that will ultimately decide who can see or change the owner-biosample-id (a study-local field pinned to `member` tier) and any other tier-restricted field or value — replacing today's coarse interim rule, which clamps to admin-tier callers every study-scoped route that reads or writes sample-family metadata, or that mints a study-local field. The idx-listing reads stay at viewer tier: they expose no metadata. Field creation sits under the clamp only for want of the finer gate — when enforcement lands it returns to member tier, since minting a study-local field is work a study member is meant to do.
 
 ### Raw Data Fingerprint
 
@@ -931,13 +933,24 @@ qiita/
 │   │       ├── repositories/       # asyncpg query layer per resource (biosample, study, user, ...)
 │   │       ├── testing/            # shared test fixtures (postgres, sessions, JWKS harness)
 │   │       └── routes/
-│   │           ├── admin.py        # admin endpoints (service-account mint, role grants, ...)
-│   │           ├── auth.py         # login flow + PAT mint + handoff
-│   │           ├── biosample.py
-│   │           ├── reference.py    # reference CRUD, membership, genome/feature minting
+│   │           ├── _helpers.py              # response shaping shared by sibling route modules
+│   │           ├── admin.py                 # admin endpoints (service-account mint, role grants, ...)
+│   │           ├── alignment.py             # sharded-alignment config identity (alignment_idx minting)
+│   │           ├── auth.py                  # login flow + PAT mint + handoff
+│   │           ├── biosample.py             # biosample import + study-scoped metadata / field routes
+│   │           ├── host_filter_profile.py   # read-only host-filter profile catalog
+│   │           ├── prep_protocol.py         # prep-protocol discovery for the bcl-convert flow
+│   │           ├── prep_sample.py           # prep-sample reads, retirement, study-local field create
+│   │           ├── read.py                  # block-read DoGet ticket minting
+│   │           ├── read_masked.py           # mask_idx minting + masked-read DoGet ticket
+│   │           ├── reference.py             # reference CRUD, membership, genome/feature minting
+│   │           ├── sequence_range.py        # contiguous sequence-range allocation per prep_sample
+│   │           ├── sequenced_sample.py      # sequenced-sample import + study-scoped reads / metadata
+│   │           ├── sequencing_run.py        # sequencing-run + sequenced-pool mint routes
 │   │           ├── study.py
+│   │           ├── upload.py                # generic Arrow-data staging slots + DoPut ticket
 │   │           ├── user.py
-│   │           └── work_ticket.py  # work-ticket CRUD + Flight ticket issuance
+│   │           └── work_ticket.py           # work-ticket CRUD + Flight ticket issuance
 │   └── tests/
 │       ├── conftest.py
 │       ├── _postgres/              # docker-compose.yml + initdb for Postgres harness (shared with tests/integration)

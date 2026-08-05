@@ -11,6 +11,8 @@ from typing import NoReturn
 import asyncpg
 from fastapi import HTTPException
 from qiita_common.models import (
+    GLOBAL_FIELD_IDX_ATTR,
+    STUDY_FIELD_IDX_ATTR,
     IdxsListResponse,
     MetadataEntry,
     MetadataFieldWriteResult,
@@ -19,6 +21,7 @@ from qiita_common.models import (
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
     TerminologyTermRef,
+    field_wire_name,
 )
 
 from ..repositories._sample_helpers import (
@@ -364,9 +367,9 @@ async def create_and_map_study_field(
     # The row names the global link by its SQL column; the response names both
     # idx fields by the subclass's alias.
     payload = {
-        response_model.model_fields["study_field_idx"].alias: row["idx"],
+        field_wire_name(response_model, STUDY_FIELD_IDX_ATTR): row["idx"],
         "study_idx": row["study_idx"],
-        response_model.model_fields["global_field_idx"].alias: row[
+        field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR): row[
             spec.study_field_global_fk_column
         ],
         "display_name": row["display_name"],

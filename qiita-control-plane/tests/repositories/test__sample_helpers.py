@@ -44,6 +44,8 @@ from qiita_common.models import (
 
 from qiita_control_plane.repositories._sample_helpers import (
     GLOBAL_METADATA_VALUE_COLUMN,
+    MAX_PG_NUMERIC_INTEGER_DIGITS,
+    MAX_PG_NUMERIC_SCALE_DIGITS,
     METADATA_VALUE_COLUMNS_SELECT,
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -865,6 +867,51 @@ async def test_write_global_metadata_or_diagnose_raises_slot_occupied_by_typed_v
     exc = excinfo.value
     assert exc.existing_metadata_idx == first.metadata_idx
     assert exc.existing_value == "typed_value"
+    assert exc.existing_missing_reason_idx is None
+
+
+async def test_write_global_metadata_or_diagnose_reports_a_boolean_occupant(ctx):
+    """Tests the case where the occupied slot holds a boolean value: the raised
+    error carries the stored bool itself, so a false value is distinguishable
+    from an absent one on every typed column the diagnosis can read.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.BOOLEAN, "bool_then_missing")
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    display_name_first = unique_field_name("bool_first")
+    display_name_second = unique_field_name("missing_second")
+
+    # First write seeds a false boolean through the first display_name.
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name_first,
+        data_type=FieldDataType.BOOLEAN,
+        value=False,
+    )
+
+    # Second write through a different display_name attempts a missing-reason
+    # against the boolean-occupant slot.
+    with pytest.raises(SlotOccupiedByTypedValueError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.BOOLEAN,
+                    value=MissingReasonRef(idx=reason_idx, name="ignored"),
+                    caller_idx=ctx["principal_idx"],
+                )
+
+    exc = excinfo.value
+    assert exc.existing_metadata_idx == first.metadata_idx
+    assert exc.existing_value is False
     assert exc.existing_missing_reason_idx is None
 
 
@@ -1751,10 +1798,33 @@ def test_parse_text_for_data_type_numeric_canonicalizes(text_value, expected_sto
 
 
 @pytest.mark.parametrize(
+    "text_value",
+    [
+        f"1e{MAX_PG_NUMERIC_INTEGER_DIGITS - 1}",
+        f"1e-{MAX_PG_NUMERIC_SCALE_DIGITS}",
+    ],
+)
+def test_parse_text_for_data_type_numeric_accepts_widest_storable(text_value):
+    """Tests the case where NUMERIC text sits exactly at a digit bound the
+    database can still store: it parses rather than being turned away with the
+    values one digit wider. Asserted on numeric equality because the stored
+    text runs to tens of thousands of digits.
+    """
+    parsed = parse_text_for_data_type("field_x", FieldDataType.NUMERIC, text_value)
+    assert parsed == Decimal(text_value)
+
+
+@pytest.mark.parametrize(
     "data_type, text_value",
     [
         (FieldDataType.NUMERIC, "abc"),
         (FieldDataType.NUMERIC, ""),
+        # Past either digit bound the database cannot store the value, and
+        # rendering it costs one character per digit of a caller-set exponent.
+        (FieldDataType.NUMERIC, f"1e{MAX_PG_NUMERIC_INTEGER_DIGITS}"),
+        (FieldDataType.NUMERIC, f"1e-{MAX_PG_NUMERIC_SCALE_DIGITS + 1}"),
+        (FieldDataType.NUMERIC, "1e999999999"),
+        (FieldDataType.NUMERIC, "1e-999999999"),
         (FieldDataType.DATE, "not-a-date"),
         (FieldDataType.DATE, "2026/05/06"),
         (FieldDataType.BOOLEAN, "yes"),
