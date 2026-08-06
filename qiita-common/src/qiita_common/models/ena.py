@@ -69,3 +69,4 @@ class EnaSampleAttributes(BaseModel):
             if not isinstance(value, str):
                 raise ValueError(f"attribute value for tag {tag!r} must be a string; got {value!r}")
         return v
+
