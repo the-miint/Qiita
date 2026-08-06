@@ -36,9 +36,9 @@ from qiita_control_plane.repositories.block import (
 )
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
-    delete_block_action_if_created,
+    delete_action_if_created,
+    seed_action_if_absent,
     seed_biosample_with_sequenced_prep_sample,
-    seed_block_action_if_absent,
     seed_user_principal,
 )
 
@@ -419,15 +419,13 @@ async def _seed_block_action(pool, action_id: str, created: dict) -> tuple[str, 
     `(action_id, version)` PK is shared with every other test on this worker's DB.
     """
     version = _BLOCK_ACTION_VERSIONS[action_id]
-    created[action_id] = await seed_block_action_if_absent(
-        pool, action_id=action_id, version=version
-    )
+    created[action_id] = await seed_action_if_absent(pool, action_id=action_id, version=version)
     return action_id, version
 
 
 async def _drop_seeded_actions(pool, created: dict) -> None:
     for action_id, was_created in created.items():
-        await delete_block_action_if_created(
+        await delete_action_if_created(
             pool,
             action_id=action_id,
             version=_BLOCK_ACTION_VERSIONS[action_id],

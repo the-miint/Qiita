@@ -853,6 +853,37 @@ class SequenceRange(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+MaskSampleState = Literal["pending", "completed"]
+"""A sample's per-`(mask_idx, prep_sample)` masking state.
+
+Mirrors the `qiita.mask_sample.state` TEXT/CHECK column (NOT a Postgres ENUM —
+see the `mask_sample` migration for why the gate stays out of the enum-parity
+discipline). `'completed'` means the read_mask is whole; `'pending'` means it is
+not. The canonical statement of the gate contract lives on
+`qiita_control_plane.repositories.block.fetch_mask_sample_state`.
+
+Consumers of masked reads act only on `'completed'`. Absence of a state is not
+`'pass'`: `MaskedReadExportSample.mask_state` is `None` when no gate row exists,
+and the DoGet ticket route 409s that case the same as `'pending'`.
+"""
+
+MaskStateSource = Literal["mask_sample", "work_ticket"]
+"""Which source a roster row's `mask_state` was resolved from.
+
+`'mask_sample'` — the gate row. Both masking paths write it, so a
+masked-COMPLETE sample always has one.
+
+`'work_ticket'` — the sample's own per-sample masking ticket, read where no gate
+row exists. The per-sample path has no PENDING phase (it writes the gate
+`'completed'` in one upsert at its terminal step), so a ticket that ran and did
+not complete leaves no gate row at all — indistinguishable there from a sample
+nobody ever tried to mask. These rows are what the ticket supplies.
+
+A ticket that has not started is not among them: the mask is written onto the
+ticket inside the run, so a queued ticket carries no mask to be found by.
+"""
+
+
 class MaskDefinitionMintRequest(BaseModel):
     """Body for POST /api/v1/mask-definition.
 
@@ -873,11 +904,21 @@ class MaskDefinitionMintRequest(BaseModel):
 
 
 class MaskDefinition(BaseModel):
-    """Returned by POST /api/v1/mask-definition (200/201).
+    """Returned by POST /api/v1/mask-definition (200/201) and
+    GET /api/v1/mask-definition/{mask_idx}.
 
     `mask_idx` is the filtering-config discriminator that tags the data plane's
     read_mask / read_masked rows. The same `params` (canonically hashed) always
     yields the same `mask_idx`.
+
+    `params` carries the resolved config the mask was minted from — host/spike-in
+    reference idxs and the QC constants — so a non-null `host_rype_reference_idx`
+    separates a human-filtered mask from a QC-only one.
+
+    Scope: `params` is the mask's dedup key. It covers the hashed gate thresholds,
+    not the scoring expressions that consume them, so two masks with identical
+    `params` can have scored differently if those expressions changed between
+    their runs.
     """
 
     mask_idx: Annotated[int, Field(gt=0)]
@@ -885,6 +926,83 @@ class MaskDefinition(BaseModel):
     filter_version: str
     params: dict[str, Any]
     created_at: AwareDatetime
+
+
+class MaskDefinitionSummary(MaskDefinition):
+    """One row of GET /api/v1/mask-definition (the list view).
+
+    A MaskDefinition plus the per-mask sample tally, so a pool carrying several
+    masks is separable in one round trip instead of a GET per mask. The tally is
+    over the same rows the roster read returns — scoped to the filters the list
+    was called with (a `sequenced_pool_idx` filter tallies only that pool's
+    samples; an unfiltered list tallies fleet-wide), narrowed to the samples the
+    caller may see, and excluding entity-retired prep_samples.
+
+    `samples_completed` are masked and durable — the set a masked-read pull or an
+    assembly submission can act on. `samples_pending` are not whole: a covering
+    block still in flight on the block path, a ticket not yet completed on the
+    per-sample one.
+    """
+
+    samples_completed: Annotated[int, Field(ge=0)]
+    samples_pending: Annotated[int, Field(ge=0)]
+
+
+class MaskDefinitionListResponse(BaseModel):
+    """Returned by GET /api/v1/mask-definition.
+
+    `masks` is ordered by descending `mask_idx` (newest first), capped at the
+    route's hard limit; `truncated` is True when the underlying set exceeded it.
+    The optional `sequenced_pool_idx` / `prep_sample_idx` filters the caller
+    passed are echoed back so a stored response is self-describing.
+    """
+
+    masks: list[MaskDefinitionSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
+    sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    prep_sample_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class MaskPrepSample(BaseModel):
+    """One sample in a mask's per-sample roster.
+
+    `mask_state` answers "is this sample's read_mask whole?" — `'completed'` if
+    so, `'pending'` if not. `source` names where that came from:
+
+      * `'mask_sample'` — the gate row, which both masking paths write.
+        `work_ticket_state` is None; the gate is a rollup, so no single ticket
+        describes it.
+      * `'work_ticket'` — the sample's own per-sample masking ticket, read where
+        no gate row exists, which on that path means the ticket has not completed.
+        So these rows are `'pending'`, and `work_ticket_state` is what separates
+        "still running" from "failed, resubmit it".
+
+    Retries collapse to one row per sample: a completed ticket if any exists,
+    else the newest.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None = None
+    mask_state: MaskSampleState
+    source: MaskStateSource
+    work_ticket_state: WorkTicketState | None = None
+
+
+class MaskPrepSampleListResponse(BaseModel):
+    """Returned by GET /api/v1/mask-definition/{mask_idx}/prep-sample.
+
+    The roster of samples masked under one mask, ascending by `prep_sample_idx`,
+    optionally narrowed to one `sequenced_pool_idx` and always narrowed to the
+    samples the caller may see. `truncated` is True when the underlying set
+    exceeded the route's hard cap.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    samples: list[MaskPrepSample]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
+    sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
 class MaskDefinitionDeleteResponse(BaseModel):
@@ -941,19 +1059,21 @@ class MaskedReadExportSample(BaseModel):
     per row.
 
     `mask_state` is the sample's per-`(mask_idx, prep_sample)` completion gate
-    (`qiita.mask_sample.state`): `'completed'` (masked and durable — exportable),
-    `'pending'` (a covering block is mid-flight, so the read_mask is partial — NOT
-    exportable, the ticket route 409s), or `None` (no gate row). Only `'completed'`
-    is exportable: `None` means "not masked-complete under this mask", NOT exempt, so
-    the ticket route 409s it too. The CLI reads it to fail the whole export up front
-    (before minting any per-sample ticket) when a sample is not `'completed'`, rather
-    than abort the download loop mid-run on the ticket route's 409 and leave a partial
-    output set.
+    (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
+    exists. Only `'completed'` is exportable: `None` means "not masked-complete
+    under this mask", NOT exempt, so the ticket route 409s it the same as
+    `'pending'`. The CLI reads it to fail the whole export up front (before minting
+    any per-sample ticket) when a sample is not `'completed'`, rather than abort the
+    download loop mid-run on the ticket route's 409 and leave a partial output set.
+
+    This roster LEFT JOINs the gate table alone, so a sample whose per-sample mask
+    has not completed comes back `None` rather than showing why. `MaskPrepSample`
+    is the mask-side roster that also reads the ticket.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
-    mask_state: str | None = None
+    mask_state: MaskSampleState | None = None
 
 
 class MaskedReadExportManifest(BaseModel):

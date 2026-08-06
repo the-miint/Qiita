@@ -41,6 +41,7 @@ from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import _handle_patch, _handle_read, _handle_study_field_create, _lane_arg
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
+from .mask import _handle_mask_list, _handle_mask_samples, _handle_mask_show
 from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
@@ -632,6 +633,48 @@ def _build_parser() -> argparse.ArgumentParser:
     p_prepsample_unretire.set_defaults(
         handler=_handle_prep_sample_retire, retired=False, reason=None
     )
+
+    p_mask = sub.add_parser("mask", help="Read-mask discovery (read-only)")
+    p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
+    p_mask_list = p_mask_sub.add_parser(
+        "list",
+        help=(
+            "List read-filtering masks with their per-mask sample tallies (GET /mask-definition)"
+        ),
+    )
+    p_mask_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only masks with at least one sample on this sequenced_pool",
+    )
+    p_mask_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only masks this prep_sample is masked under",
+    )
+    p_mask_list.set_defaults(handler=_handle_mask_list)
+
+    p_mask_show = p_mask_sub.add_parser(
+        "show",
+        help="Print one mask's filtering config (GET /mask-definition/{mask_idx})",
+    )
+    p_mask_show.add_argument("--mask-idx", type=int, required=True)
+    p_mask_show.set_defaults(handler=_handle_mask_show)
+
+    p_mask_samples = p_mask_sub.add_parser(
+        "samples",
+        help=(
+            "List the samples masked under one mask, with their masking state"
+            " (GET /mask-definition/{mask_idx}/prep-sample)"
+        ),
+    )
+    p_mask_samples.add_argument("--mask-idx", type=int, required=True)
+    p_mask_samples.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only samples on this sequenced_pool",
+    )
+    p_mask_samples.set_defaults(handler=_handle_mask_samples)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)

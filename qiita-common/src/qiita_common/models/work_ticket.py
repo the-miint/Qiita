@@ -239,6 +239,14 @@ class WorkTicket(BaseModel):
     # concurrent same-action build tickets fan out over one reference without
     # colliding on work_ticket_one_in_flight_per_reference.
     shard_id: int | None = None
+    # The mask this ticket minted or filtered against (qiita.mask_definition),
+    # None for every ticket that carries no mask. Mirrors qiita.work_ticket.
+    # mask_idx, whose FK is ON DELETE SET NULL — a purged mask detaches its
+    # tickets, so a None here can also mean "the mask this ticket used is gone".
+    # Surfaced so `qiita ticket status` on a read-mask ticket names the mask it
+    # produced, which is one of the ways a client resolves a mask_idx without a
+    # DB shell (the mask-definition reads are the other).
+    mask_idx: int | None = None
     action_context: dict[str, Any] = Field(default_factory=dict)
     state: WorkTicketState
     # Retry accounting. retry_count starts at 0 and increments on each

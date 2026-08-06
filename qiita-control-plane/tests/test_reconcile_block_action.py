@@ -36,9 +36,9 @@ from qiita_control_plane.repositories.block import (
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.testing.db_seeds import (
-    delete_block_action_if_created,
+    delete_action_if_created,
+    seed_action_if_absent,
     seed_biosample_with_sequenced_prep_sample,
-    seed_block_action_if_absent,
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
@@ -106,7 +106,7 @@ async def rb(postgres_pool):
     # + delete-only-what-we-made: the (action_id, version) PK is shared with every
     # other test on this worker's database.
     created_actions = {
-        block_action_id: await seed_block_action_if_absent(
+        block_action_id: await seed_action_if_absent(
             postgres_pool, action_id=block_action_id, version=block_version
         )
         for block_action_id, block_version in _BLOCK_ACTION_VERSIONS.items()
@@ -163,7 +163,7 @@ async def rb(postgres_pool):
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])", created_blocks
         )
     for block_action_id, was_created in created_actions.items():
-        await delete_block_action_if_created(
+        await delete_action_if_created(
             postgres_pool,
             action_id=block_action_id,
             version=_BLOCK_ACTION_VERSIONS[block_action_id],

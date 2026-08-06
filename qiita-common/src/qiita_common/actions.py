@@ -80,6 +80,25 @@ FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 # regardless of version), while the submitter pins its own version separately.
 READ_MASK_ACTION_ID = "read-mask"
 
+# The ingest-and-mask action's bare id (workflows/fastq-to-parquet/<version>.yaml).
+# Bare id for the same reason as the one above. Versions 1.0.0–1.2.0 predate the
+# mask model: they physically dropped reads and minted no mask_idx, so a reader
+# that keys on "which tickets carry a mask" filters on `mask_idx IS NOT NULL`
+# rather than on version.
+FASTQ_TO_PARQUET_ACTION_ID = "fastq-to-parquet"
+
+# The PER-SAMPLE masking actions: one ticket masks one prep_sample, minting a
+# mask_idx and writing read_mask, and writing the qiita.mask_sample gate row at
+# its terminal step. Distinct from the block path (BLOCK_MASK_ACTION_ID), where
+# one ticket masks many samples so its state describes none of them individually.
+#
+# A reader that asks "which tickets carry a per-sample mask" keys on this set.
+# The same pair is spelled out as SQL literals in the per-sample gate backfill
+# migration, which cannot import it (an applied migration is never edited) — so
+# adding a per-sample masking action means updating this set AND writing a fresh
+# backfill migration for it.
+PER_SAMPLE_MASK_ACTION_IDS = (READ_MASK_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID)
+
 # The pool-scoped demux action's bare id (its YAML lives at
 # workflows/bcl-convert/<version>.yaml). One sequenced_pool-scoped work ticket
 # per pool demultiplexes the run and stores each sample's reads once. Defined

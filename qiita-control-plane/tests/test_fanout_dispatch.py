@@ -43,8 +43,8 @@ from qiita_control_plane.repositories.alignment_definition import mint_alignment
 from qiita_control_plane.repositories.block import create_block
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
-    delete_block_action_if_created,
-    seed_block_action_if_absent,
+    delete_action_if_created,
+    seed_action_if_absent,
 )
 
 # The (action_id -> version) pairs these fixtures seed. Taken from the planners
@@ -823,9 +823,7 @@ async def _seed_block_cohort_scaffold(postgres_pool):
             principal_idx=principal_idx,
         )
     created_actions = {
-        action_id: await seed_block_action_if_absent(
-            postgres_pool, action_id=action_id, version=version
-        )
+        action_id: await seed_action_if_absent(postgres_pool, action_id=action_id, version=version)
         for action_id, version in _BLOCK_ACTION_VERSIONS.items()
     }
     return {
@@ -843,7 +841,7 @@ async def _teardown_block_cohort_scaffold(postgres_pool, sc):
         "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", sc["mask_idx"]
     )
     for action_id, created in sc["created_actions"].items():
-        await delete_block_action_if_created(
+        await delete_action_if_created(
             postgres_pool,
             action_id=action_id,
             version=_BLOCK_ACTION_VERSIONS[action_id],

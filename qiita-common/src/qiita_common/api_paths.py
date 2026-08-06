@@ -378,13 +378,22 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 # Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
 # tags the data plane's read_mask / read_masked rows. POST is service-account-
 # only (Scope.READ_MASKED_DOGET).
+#
+# The three GETs are the human read surface: which masks exist, what config a
+# mask encodes, and which samples are masked-complete under it. They carry no
+# read data — only filter metadata and per-sample completion state — so they sit
+# at Scope.PREP_SAMPLE_READ (every human role holds it), narrowed per study for a
+# plain user. The privacy-sensitive pulls (read_masked:doget,
+# admin:masked_read_export) are unchanged.
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
-PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
-PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # DELETE a mask (lake rows + Postgres row)
+PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
+PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
+URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_PREP_SAMPLE}"
 
 # =============================================================================
 # /alignment-definition/* — control-plane sharded-alignment config identity

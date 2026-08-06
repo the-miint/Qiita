@@ -332,6 +332,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_BY_IDX",
     ),
+    (
+        "URL_MASK_DEFINITION_PREP_SAMPLE",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_PREP_SAMPLE",
+    ),
     # /alignment-definition
     (
         "URL_ALIGNMENT_DEFINITION_BY_IDX",
