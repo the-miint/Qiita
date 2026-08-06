@@ -12,7 +12,7 @@ Each guard depends on `get_current_principal`, so FastAPI dedupes the
 underlying resolution per-request even when many guards compose.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import asyncpg
 from fastapi import Depends, HTTPException
@@ -413,6 +413,72 @@ async def require_prep_sample_exists(
         )
 
 
+async def _study_access_allows(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    study_idx: int,
+    min_tier: Tier,
+) -> bool:
+    """Does this one study permit `caller` at `min_tier`?
+
+    The shared predicate behind the raising gate and the narrowing filter below,
+    so the two can never disagree about what "may read" means — one 403s a
+    cohort the other would have silently kept.
+
+    A non-existent study returns True: it is not this predicate's job to 404,
+    and the authoring gates' composers surface a missing study as one 422 from
+    their own FK violation. Comparison goes through `_TIER_ORDER`; see
+    `require_caller_has_tier_on_all_studies`.
+    """
+    row = await fetch_caller_study_access(
+        pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
+    )
+    if row is None:
+        return True
+    if row.owner_idx == caller.principal_idx:
+        return True
+    # Public-by-absence when the caller holds no study_access row, matching
+    # require_study_access.
+    effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
+    return _TIER_ORDER[effective_tier] >= _TIER_ORDER[min_tier]
+
+
+async def filter_studies_caller_can_read(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    study_idxs: Iterable[int],
+    min_tier: Tier,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> set[int]:
+    """The subset of `study_idxs` the caller may read at `min_tier`.
+
+    The narrowing counterpart of `require_caller_has_tier_on_all_studies`: the
+    discovery reads use this to show a caller their own slice of a pool that
+    spans studies, where 403ing the whole pool would make it undiscoverable to
+    someone who legitimately owns part of it. The mint uses the raising form,
+    because there a silently narrowed cohort would change the scientific answer.
+
+    Anonymous returns the empty set rather than raising — a listing route fronts
+    its own 401 via `require_human`, and a filter that raises would be a
+    surprising shape for one. A caller at or above `bypass_role` gets everything
+    back with no DB lookup, matching every other resource gate.
+    """
+    study_idxs = list(dict.fromkeys(study_idxs))
+    if isinstance(caller, Anonymous):
+        return set()
+    if caller.has_role_at_least(bypass_role):
+        return set(study_idxs)
+    return {
+        study_idx
+        for study_idx in study_idxs
+        if await _study_access_allows(
+            pool_or_conn, caller=caller, study_idx=study_idx, min_tier=min_tier
+        )
+    }
+
+
 async def require_caller_has_tier_on_all_studies(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -454,19 +520,9 @@ async def require_caller_has_tier_on_all_studies(
         return
 
     for study_idx in dict.fromkeys(study_idxs):
-        row = await fetch_caller_study_access(
-            pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
-        )
-        if row is None:
-            # Study does not exist — not this gate's job to 404. The
-            # composer's INSERT trips the FK and surfaces one 422.
-            continue
-        if row.owner_idx == caller.principal_idx:
-            continue
-        # Public-by-absence when the caller holds no study_access row,
-        # matching require_study_access.
-        effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
-        if _TIER_ORDER[effective_tier] >= _TIER_ORDER[min_tier]:
+        if await _study_access_allows(
+            pool_or_conn, caller=caller, study_idx=study_idx, min_tier=min_tier
+        ):
             continue
         raise HTTPException(
             status_code=403,

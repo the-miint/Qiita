@@ -41,6 +41,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_ALIGN_PLAN,
+    PATH_SEQUENCED_POOL_ALIGNMENT,
+    PATH_SEQUENCED_POOL_ALIGNMENT_COHORT,
     PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
@@ -62,6 +64,9 @@ from qiita_common.models import (
     AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
+    PoolAlignmentCohort,
+    PoolAlignmentList,
+    PoolAlignmentSummary,
     PoolCompletionStatus,
     PoolExceptionsResponse,
     PoolQCReport,
@@ -82,6 +87,7 @@ from qiita_common.models import (
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
+    Tier,
     WorkTicketState,
     merge_qc_reports,
 )
@@ -99,6 +105,7 @@ from ..actions.sequenced_pool import (
     reap_staged_reads,
 )
 from ..auth.guards import (
+    filter_studies_caller_can_read,
     require_caller_owns_run,
     require_complete_profile,
     require_human,
@@ -117,6 +124,12 @@ from ..deps import (
     get_scratch_staging,
     get_tx_conn_factory,
 )
+from ..repositories.alignment_definition import (
+    list_alignments_over_prep_samples,
+    list_completed_alignment_samples,
+    list_pool_prep_sample_idxs,
+)
+from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_samples
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
@@ -621,6 +634,129 @@ async def get_sequenced_pool_qc_report(
         read_metrics=_pool_read_metrics(rollup),
         merged=merge_qc_reports(samples),
         samples=samples,
+    )
+
+
+async def _readable_pool_prep_samples(
+    pool: asyncpg.Pool, *, sequenced_pool_idx: int, caller: Principal
+) -> list[int]:
+    """The pool's non-retired prep_samples that `caller` may read.
+
+    A sample survives only if the caller holds `Tier.VIEWER` on EVERY study it
+    is still linked to — a sample shared into a study you cannot see is not
+    yours to read through the back door of a pool you can.
+
+    **A sample with no active study link is dropped**, and deliberately so: it
+    has no study to authorize against, and failing open on a data-integrity
+    anomaly is the wrong default for a read. This diverges from the
+    prep_sample-scoped *submission* gate (`_check_prep_sample_study_access` in
+    routes/work_ticket.py), which lets an orphan pass; that gate is guarding a
+    write whose downstream lookups fail anyway, this one is answering "may this
+    person see this". A caller at or above wet_lab_admin bypasses the whole
+    check, so an admin can still see the anomaly.
+    """
+    prep_sample_idxs = await list_pool_prep_sample_idxs(pool, sequenced_pool_idx)
+    # Bypass first, so the whole link/tier resolution below is skipped rather
+    # than computed and discarded — and so the orphan drop is skipped with it,
+    # which is what lets an admin see the anomaly.
+    if not prep_sample_idxs or caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        return prep_sample_idxs
+    links = await fetch_active_study_idxs_for_prep_samples(pool, prep_sample_idxs)
+    readable_studies = await filter_studies_caller_can_read(
+        pool,
+        caller=caller,
+        study_idxs={s for studies in links.values() for s in studies},
+        min_tier=Tier.VIEWER,
+    )
+    return [
+        prep_sample_idx
+        for prep_sample_idx in prep_sample_idxs
+        if links.get(prep_sample_idx) and set(links[prep_sample_idx]) <= readable_studies
+    ]
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT)
+async def list_sequenced_pool_alignments(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentList:
+    """List the alignments over this pool's samples — the answer to "what has
+    been aligned here, against which reference, and is it finished".
+
+    **Narrowed to the caller's readable slice**, not gated on the whole pool. A
+    pool spans studies, so 403ing it would make it undiscoverable to someone who
+    legitimately owns part of it; narrowing is safe on a listing because no
+    scientific result depends on it. The per-study `Tier.VIEWER` check is the
+    boundary, which is why this is open to role `user` where the sibling
+    completion rollup is wet_lab_admin-gated.
+
+    Both counts are over the caller's own samples (see `PoolAlignmentSummary`),
+    so they agree with what the alignment DoGet mint will accept — that mint is
+    all-or-nothing, and showing the pool's real counts here would set the caller
+    up for a 403. An alignment the caller can read no sample of is absent
+    entirely rather than reported with zero counts.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    rows = await list_alignments_over_prep_samples(pool, prep_sample_idxs)
+    return PoolAlignmentList(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignments=[
+            PoolAlignmentSummary(
+                alignment_idx=row["alignment_idx"],
+                # asyncpg hands JSONB back as str under the default codec.
+                params=json.loads(row["params"])
+                if isinstance(row["params"], str)
+                else row["params"],
+                samples_completed=row["samples_completed"],
+                samples_total=row["samples_total"],
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT_COHORT)
+async def get_sequenced_pool_alignment_cohort(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    alignment_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentCohort:
+    """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
+    prep_samples that are both readable by the caller and `'completed'` for this
+    alignment.
+
+    Two filters, and both are load-bearing. Readability makes the result a valid
+    mint body by construction — the mint is all-or-nothing, so a cohort this
+    route hands back can never 403 there. Completion is a first-class state:
+    alignment rows are NOT 1:1 with reads (cross-shard routing and paired-end
+    mates both multiply rows per read), so the presence of rows says nothing
+    about whether a sample is done.
+
+    An empty cohort is a legitimate answer, not a 404 or a 403 — it means
+    "nothing here you may mint", and unlike a rejection it does not confirm
+    which of the pool's alignments touch data the caller lacks.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    return PoolAlignmentCohort(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=await list_completed_alignment_samples(
+            pool, alignment_idx, prep_sample_idxs
+        ),
     )
 
 
