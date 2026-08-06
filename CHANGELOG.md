@@ -1322,6 +1322,13 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **One `cap_rows` helper behind every capped list route (#427).** The
+  fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
+  list route — the two sequenced-sample rosters, the prep-sample study roster,
+  `build_idxs_list_response`, and the work-ticket list this PR adds. It is now
+  `routes/_helpers.cap_rows`, which all five call. No wire change: the same rows
+  and the same `truncated` value come back from each route.
+
 - **BREAKING: `GET /work-ticket` returns an envelope, not a bare array (#427).**
   `{tickets, count, truncated}` — `WorkTicketListResponse`, the same shape
   `IdxsListResponse` and `SequencedSampleListResponse` already use; this route was

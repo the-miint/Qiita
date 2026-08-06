@@ -723,6 +723,20 @@ async def resolve_idxs_by_natural_key(
     return resolved, missing
 
 
+def cap_rows[T](rows: list[T], cap: int) -> tuple[list[T], bool]:
+    """Split a `cap + 1` fetch into `(rows, truncated)`.
+
+    Every capped list route over-fetches by one row, so a length strictly
+    greater than `cap` means the underlying set is larger than the page.
+    Returns the rows sliced back to `cap` and whether the slice dropped
+    anything. Read one row short of `cap + 1` and `truncated` is False on a
+    set that is in fact larger.
+    """
+    if len(rows) > cap:
+        return rows[:cap], True
+    return rows, False
+
+
 def build_idxs_list_response(
     idxs: list[int], *, cap: int, caller_system_role: str
 ) -> IdxsListResponse:
@@ -733,8 +747,7 @@ def build_idxs_list_response(
     Slices back to `cap` and sets `truncated` accordingly, centralizing the
     fetch-cap-plus-one / slice / envelope shaping in one place.
     """
-    truncated = len(idxs) > cap
-    kept = idxs[:cap] if truncated else idxs
+    kept, truncated = cap_rows(idxs, cap)
     return IdxsListResponse(
         idxs=kept,
         count=len(kept),

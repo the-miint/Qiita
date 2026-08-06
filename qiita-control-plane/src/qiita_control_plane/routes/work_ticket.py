@@ -110,6 +110,7 @@ from ..fanout_dispatch import (
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
+from ._helpers import cap_rows
 
 _log = logging.getLogger(__name__)
 
@@ -1306,18 +1307,14 @@ async def list_work_tickets(
             f"            WHERE bm.block_idx = wt.block_idx AND bss.sequenced_pool_idx = ${n}))"
         )
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-    # Fetch limit+1 so a row count strictly greater than the cap signals
-    # truncation; slice back to the cap before returning. Same mechanism the
-    # sequenced-sample rosters use.
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
     args.append(limit + 1)
     rows = await pool.fetch(
         f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME}{where}"
         f" ORDER BY wt.work_ticket_idx DESC LIMIT ${len(args)}",
         *args,
     )
-    truncated = len(rows) > limit
-    if truncated:
-        rows = rows[:limit]
+    rows, truncated = cap_rows(rows, limit)
     return WorkTicketListResponse(
         tickets=[_row_to_work_ticket_summary(row) for row in rows],
         count=len(rows),
