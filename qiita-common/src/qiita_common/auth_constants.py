@@ -58,6 +58,22 @@ class Scope(StrEnum):
     # READ_MASKED_DOGET is below: alignment is not raw human/host reads, so it rides
     # the generic scope rather than a privacy-sensitive one.
     TICKET_DOGET = "ticket:doget"
+    # Mint an alignment DoGet ticket as a HUMAN, naming the cohort directly.
+    #
+    # Split from TICKET_DOGET because the two carry different trust models, not
+    # different data. TICKET_DOGET signs a cohort the control plane read out of a
+    # work ticket's action_context, which the runner resolver already validated
+    # at submit; there is no such upstream for a client-driven request, so this
+    # scope's route resolves the cohort and authorizes it per-study (Tier.VIEWER
+    # on every study each sample links to) before signing. Reusing TICKET_DOGET
+    # would have put a human PAT on the worker path — and it is deliberately
+    # absent from every role ceiling precisely so that cannot happen.
+    #
+    # On every role ceiling, unlike its neighbours: the per-study tier check is
+    # the real boundary here, so the role does not need to be. Correspondingly
+    # NOT on SERVICE_ACCOUNT_SCOPE_CEILING — a worker holding both would be two
+    # ways into one surface with two different validation paths.
+    ALIGNMENT_DOGET = "alignment:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
     # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
     # and alignment tickets): masked reads are privacy-sensitive (the lake
