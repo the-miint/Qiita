@@ -22,6 +22,16 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`terminology_term.alternate_label` — a second name for a term.** Holds the
+  name a source vocabulary supplies alongside the one that becomes the term's
+  label; for NCBI Taxonomy the label is the scientific name and this is the
+  genbank common name, which would otherwise be dropped and is what a person
+  looking for a taxon is most likely to type. Nullable and single-valued, and
+  bounded to the same width as the label so it stays a name rather than
+  accumulating free-text definitions; an empty string is rejected, leaving NULL
+  as the only spelling of absence. A resolved terminology term carries it
+  through metadata reads. No load populates it yet.
+
 - **`qiita-admin terminology` — prepare and load an ontology release.**
   `robot-command` prints the ROBOT export command to run against a staged OWL
   file; nothing in the control plane executes ROBOT, on any host. `prepare`

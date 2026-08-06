@@ -3843,10 +3843,10 @@ async def test_write_resolved_metadata_entries_empty_input_is_noop(ctx, spec):
 # ---------------------------------------------------------------------------
 
 
-async def test_fetch_terminology_term_idxs_by_term_ids_returns_idx_and_label(ctx):
+async def test_fetch_terminology_term_idxs_by_term_ids_returns_idx_and_labels(ctx):
     """Tests the case where every requested term_id has a matching row in
     the named terminology: the returned dict carries term_id -> (idx,
-    label) for each one.
+    label, alternate_label) for each one.
     """
     terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
 
@@ -3856,15 +3856,15 @@ async def test_fetch_terminology_term_idxs_by_term_ids_returns_idx_and_label(ctx
         )
 
     # The seeded label pairing is fixed by the migration; assert the full
-    # returned shape against the expected (idx, label) tuples by re-looking
-    # up the idxs since they are GENERATED ALWAYS.
+    # returned shape against the expected tuples by re-looking up the idxs
+    # since they are GENERATED ALWAYS.
     rows = await ctx["pool"].fetch(
-        "SELECT term_id, idx, label FROM qiita.terminology_term"
+        "SELECT term_id, idx, label, alternate_label FROM qiita.terminology_term"
         " WHERE terminology_idx = $1 AND term_id = ANY($2::text[])",
         terminology_idx,
         ["256318", "408170"],
     )
-    expected = {r["term_id"]: (r["idx"], r["label"]) for r in rows}
+    expected = {r["term_id"]: (r["idx"], r["label"], r["alternate_label"]) for r in rows}
     assert result == expected
 
 
@@ -3912,8 +3912,8 @@ async def test_fetch_terminology_term_idxs_by_term_ids_no_matches(ctx):
 async def test_preflight_sample_metadata_routes_terminology_term(ctx, spec):
     """Tests the case where a TERMINOLOGY-typed field's text value matches
     a qiita.terminology_term row in the field's terminology: preflight
-    emits a TerminologyTermRef carrying idx, term_id, and label and the
-    field's data_type is reflected on the ResolvedField.
+    emits a TerminologyTermRef carrying the resolved term and the field's
+    data_type is reflected on the ResolvedField.
     """
     term_row = await fetch_seeded_metagenome_term(ctx["pool"])
     terminology_idx = term_row["terminology_idx"]
@@ -4941,21 +4941,51 @@ async def test_write_global_metadata_or_diagnose_missing_attempted_against_termi
 # ---------------------------------------------------------------------------
 
 
+async def _seeded_term_without_alternate_label(pool) -> tuple[TerminologyTermRef, int]:
+    """The seeded NCBI Taxonomy term, for which the source supplies no second
+    name, paired with its terminology_idx."""
+    term_row = await fetch_seeded_metagenome_term(pool)
+    ref = TerminologyTermRef(
+        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
+    )
+    return ref, term_row["terminology_idx"]
+
+
+async def _seeded_term_with_alternate_label(pool) -> tuple[TerminologyTermRef, int]:
+    """A term carrying a second name, minted into the seeded terminology under
+    a unique term_id, paired with its terminology_idx."""
+    terminology_idx = (await fetch_seeded_metagenome_term(pool))["terminology_idx"]
+    term_id = f"alt_term_{secrets.token_hex(4)}"
+    term_idx = await pool.fetchval(
+        "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label, alternate_label)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        terminology_idx,
+        term_id,
+        "Homo sapiens",
+        "human",
+    )
+    ref = TerminologyTermRef(
+        idx=term_idx, term_id=term_id, label="Homo sapiens", alternate_label="human"
+    )
+    return ref, terminology_idx
+
+
 @pytest.mark.parametrize(
     "spec",
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec):
+@pytest.mark.parametrize(
+    "make_term",
+    [_seeded_term_without_alternate_label, _seeded_term_with_alternate_label],
+    ids=["no_alternate_label", "with_alternate_label"],
+)
+async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec, make_term):
     """Tests the case where the entity carries one TERMINOLOGY-typed row:
-    fetch returns a TerminologyTermRef carrying the term's idx, term_id,
-    and label.
+    fetch returns a TerminologyTermRef carrying the term's identity, including
+    the alternate label for a term that has one.
     """
-    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
-    terminology_idx = term_row["terminology_idx"]
-    ref = TerminologyTermRef(
-        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
-    )
+    ref, terminology_idx = await make_term(ctx["pool"])
     entity_idx = await (
         _create_biosample_with_link(ctx)
         if spec.entity_kind is SampleEntityKind.BIOSAMPLE

@@ -8,6 +8,7 @@ status-transition rules those primitives back are exercised against the
 action-layer entry point instead.
 """
 
+import asyncpg
 import pytest
 from qiita_common.models import TerminologyStatus
 
@@ -38,6 +39,25 @@ def _term(term_id: str, label: str) -> ParsedTerm:
         is_obsolete=False,
         replaced_by_term_id=None,
         obsoletion_kind=None,
+    )
+
+
+async def _insert_term(
+    pool: asyncpg.Pool,
+    terminology_idx: int,
+    term_id: str,
+    label: str,
+    alternate_label: str | None,
+) -> None:
+    """Insert one term row directly, so alternate_label can be written on its
+    own — no ParsedTerm carries it."""
+    await pool.execute(
+        "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label, alternate_label)"
+        " VALUES ($1, $2, $3, $4)",
+        terminology_idx,
+        term_id,
+        label,
+        alternate_label,
     )
 
 
@@ -185,3 +205,102 @@ async def test_fetch_terminology_idx_by_name_not_found(postgres_pool):
     """Tests the case where no terminology carries the given name: the read
     returns None rather than an empty record."""
     assert await fetch_terminology_idx_by_name(postgres_pool, "tr_no_such_name") is None
+
+
+# ---------------------------------------------------------------------------
+# terminology_term.alternate_label
+# ---------------------------------------------------------------------------
+
+
+async def test_terminology_term_alternate_label_column(postgres_pool):
+    """Tests the case where the column's declared shape is read back from the
+    catalog: a nullable VARCHAR(500), the same width as label because it holds
+    a name rather than a definition."""
+    row = await postgres_pool.fetchrow(
+        "SELECT format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull"
+        "  FROM pg_attribute a"
+        "  JOIN pg_class c ON c.oid = a.attrelid"
+        "  JOIN pg_namespace n ON n.oid = c.relnamespace"
+        " WHERE n.nspname = 'qiita'"
+        "   AND c.relname = 'terminology_term'"
+        "   AND a.attname = 'alternate_label'"
+        "   AND NOT a.attisdropped"
+    )
+    expected = {"type": "character varying(500)", "attnotnull": False}
+    assert dict(row) == expected
+
+
+async def test_terminology_term_alternate_label_rejects_empty(postgres_pool, created_terminologies):
+    """Tests the case where a write supplies an empty string: the CHECK
+    rejects it, leaving NULL as the only spelling of absence."""
+    terminology_idx = await seed_terminology(postgres_pool, name="tr_alt_empty")
+    created_terminologies.append(terminology_idx)
+
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await _insert_term(postgres_pool, terminology_idx, "TR:1", "one", "")
+
+
+async def test_terminology_term_alternate_label_null_and_value(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where one term carries a second name and another does
+    not: both rows are accepted, and each reads back as written."""
+    terminology_idx = await seed_terminology(postgres_pool, name="tr_alt_roundtrip")
+    created_terminologies.append(terminology_idx)
+
+    await _insert_term(postgres_pool, terminology_idx, "TR:1", "Homo sapiens", "human")
+    await _insert_term(postgres_pool, terminology_idx, "TR:2", "Mus musculus", None)
+
+    rows = await postgres_pool.fetch(
+        "SELECT term_id, label, alternate_label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 ORDER BY term_id",
+        terminology_idx,
+    )
+    expected = [
+        {"term_id": "TR:1", "label": "Homo sapiens", "alternate_label": "human"},
+        {"term_id": "TR:2", "label": "Mus musculus", "alternate_label": None},
+    ]
+    assert [dict(row) for row in rows] == expected
+
+
+async def test_import_terminology_release_preserves_alternate_label(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a term carrying a second name is reloaded from a
+    release supplying none: the upsert names every column it writes, so a
+    relabelling reload leaves the stored alternate_label standing."""
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        first = await import_terminology_release(
+            conn,
+            name="tr_alt_preserved",
+            version="1.0.0",
+            parsed_terms=[_term("TR:1", "Homo sapiens")],
+            parsed_closure=[],
+        )
+    created_terminologies.append(first.terminology_idx)
+
+    await postgres_pool.execute(
+        "UPDATE qiita.terminology_term SET alternate_label = $1"
+        " WHERE terminology_idx = $2 AND term_id = $3",
+        "human",
+        first.terminology_idx,
+        "TR:1",
+    )
+
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        await import_terminology_release(
+            conn,
+            name="tr_alt_preserved",
+            version="2.0.0",
+            parsed_terms=[_term("TR:1", "Homo sapiens sapiens")],
+            parsed_closure=[],
+        )
+
+    row = await postgres_pool.fetchrow(
+        "SELECT label, alternate_label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 AND term_id = $2",
+        first.terminology_idx,
+        "TR:1",
+    )
+    expected = {"label": "Homo sapiens sapiens", "alternate_label": "human"}
+    assert dict(row) == expected
