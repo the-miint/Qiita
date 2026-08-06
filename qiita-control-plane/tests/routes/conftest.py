@@ -7,7 +7,6 @@ route test still owns its own `ctx` and `_cleanup_tracked` because the
 tracked table set differs per route.
 """
 
-import json
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
@@ -26,14 +25,17 @@ from qiita_common.models import FieldDataType
 from qiita_common.models.reference import Tier
 
 from qiita_control_plane.repositories import UpdatableTable
+from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
+    retire_prep_sample_to_study_link,
     retire_principal,
     seed_biosample_global_field,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_global_field,
+    seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
     seed_service_principal,
     seed_user_principal,
@@ -691,16 +693,9 @@ async def fail_safe_client(postgres_pool):
 
 
 async def _mint_alignment(pool, *, owner_idx: int, tag: str) -> int:
-    from qiita_common.hashing import canonical_params_hash
-
     params = {"reference_idx": 1, "aligner": "minimap2", "mask_idx": 1, "shard_ids": [0], "t": tag}
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT alignment_idx FROM qiita.mint_alignment_definition($1, $2::jsonb, $3)",
-            canonical_params_hash(params),
-            json.dumps(params),
-            owner_idx,
-        )
+        row = await mint_alignment_definition(conn, params=params, principal_idx=owner_idx)
     return row["alignment_idx"]
 
 
@@ -735,33 +730,27 @@ async def pool_alignment_seed(role_keyed_clients):
     db = role_keyed_clients["pool"]
     owner = role_keyed_clients["wet_session"]["principal_idx"]
     reader = role_keyed_clients["user_session"]["principal_idx"]
-    tracker = {"pool": db, "created": {"study": [], "study_access": []}}
+    tracked = {"pool": db, "created": {"study": [], "study_access": []}}
 
-    study_1 = await _seed_study(tracker, owner_idx=owner, suffix="align-disc-1")
-    study_2 = await _seed_study(tracker, owner_idx=owner, suffix="align-disc-2")
+    study_1 = await _seed_study(tracked, owner_idx=owner, suffix="align-disc-1")
+    study_2 = await _seed_study(tracked, owner_idx=owner, suffix="align-disc-2")
     # The reader can see study_1 and NOT study_2 — the whole point of the shape.
     await _grant_study_access(
-        tracker, study_idx=study_1, principal_idx=reader, tier=Tier.VIEWER, granted_by_idx=owner
+        tracked, study_idx=study_1, principal_idx=reader, tier=Tier.VIEWER, granted_by_idx=owner
     )
 
     samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
     run_idx = pool_idx = None
     for i in range(4):
         bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
-        if run_idx is None:
-            run_idx, pool_idx, ss = await seed_sequenced_sample_subtype(
-                db, prep_sample_idx=ps, owner_idx=owner, sequenced_pool_item_id=f"disc-{i}"
-            )
-        else:
-            ss = await db.fetchval(
-                "INSERT INTO qiita.sequenced_sample"
-                "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
-                " VALUES ($1, $2, $3, $4) RETURNING idx",
-                ps,
-                pool_idx,
-                f"disc-{i}",
-                owner,
-            )
+        run_idx, pool_idx, ss = await seed_sequenced_sample_subtype(
+            db,
+            prep_sample_idx=ps,
+            owner_idx=owner,
+            sequenced_pool_item_id=f"disc-{i}",
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
         samples.append((bs, ps, ss))
     (bs_a, ps_a, _), (bs_b, ps_b, _), (bs_c, ps_c, _), (bs_d, ps_d, _) = samples
 
@@ -769,21 +758,12 @@ async def pool_alignment_seed(role_keyed_clients):
         await seed_biosample_to_study_link(
             db, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner
         )
-        await db.execute(
-            "INSERT INTO qiita.prep_sample_to_study"
-            " (prep_sample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
-            prep_sample_idx,
-            study_idx,
-            owner,
+        await seed_prep_sample_to_study_link(
+            db, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner
         )
         if retired:
-            await db.execute(
-                "UPDATE qiita.prep_sample_to_study"
-                " SET retired = true, retired_at = now(), retired_by_idx = $3"
-                " WHERE prep_sample_idx = $1 AND study_idx = $2",
-                prep_sample_idx,
-                study_idx,
-                owner,
+            await retire_prep_sample_to_study_link(
+                db, prep_sample_idx=prep_sample_idx, study_idx=study_idx, retired_by_idx=owner
             )
 
     await link(bs_a, ps_a, study_1)
@@ -837,12 +817,7 @@ async def pool_alignment_seed(role_keyed_clients):
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_idxs)
     await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs)
-    for study_idx, principal_idx in tracker["created"]["study_access"]:
-        await db.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            study_idx,
-            principal_idx,
-        )
     await db.execute(
-        "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", tracker["created"]["study"]
+        "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", [study_1, study_2]
     )
+    await db.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", [study_1, study_2])

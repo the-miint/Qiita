@@ -20,7 +20,6 @@ schema proves the projection rode the signature rather than being a DP default.
 """
 
 import base64
-import json
 import uuid
 
 import httpx
@@ -33,12 +32,13 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_POOL_ALIGNMENT,
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
 )
-from qiita_common.hashing import canonical_params_hash
 from qiita_common.models.reference import Tier
 
+from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
+    seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
 )
 
@@ -89,45 +89,30 @@ async def two_study_pool(postgres_pool, human_admin_session, regular_user_sessio
         biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
             db, owner_idx=owner
         )
-        if run_idx is None:
-            run_idx, pool_idx, ss_idx = await seed_sequenced_sample_subtype(
-                db,
-                prep_sample_idx=prep_sample_idx,
-                owner_idx=owner,
-                sequenced_pool_item_id=f"cohort-mint-{i}",
-            )
-        else:
-            ss_idx = await db.fetchval(
-                "INSERT INTO qiita.sequenced_sample"
-                "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
-                " VALUES ($1, $2, $3, $4) RETURNING idx",
-                prep_sample_idx,
-                pool_idx,
-                f"cohort-mint-{i}",
-                owner,
-            )
+        run_idx, pool_idx, ss_idx = await seed_sequenced_sample_subtype(
+            db,
+            prep_sample_idx=prep_sample_idx,
+            owner_idx=owner,
+            sequenced_pool_item_id=f"cohort-mint-{i}",
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
         samples.append((biosample_idx, prep_sample_idx, ss_idx))
 
     for (biosample_idx, prep_sample_idx, _), study_idx in zip(samples, studies, strict=True):
         await seed_biosample_to_study_link(
             db, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner
         )
-        await db.execute(
-            "INSERT INTO qiita.prep_sample_to_study"
-            " (prep_sample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
-            prep_sample_idx,
-            study_idx,
-            owner,
+        await seed_prep_sample_to_study_link(
+            db, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner
         )
 
     ps_readable, ps_hidden = samples[0][1], samples[1][1]
     params = {"reference_idx": 1, "aligner": "minimap2", "shard_ids": [0], "t": str(uuid.uuid4())}
-    alignment_idx = await db.fetchval(
-        "SELECT alignment_idx FROM qiita.mint_alignment_definition($1, $2::jsonb, $3)",
-        canonical_params_hash(params),
-        json.dumps(params),
-        owner,
-    )
+    async with db.acquire() as conn:
+        alignment_idx = (await mint_alignment_definition(conn, params=params, principal_idx=owner))[
+            "alignment_idx"
+        ]
     for prep_sample_idx in (ps_readable, ps_hidden):
         await db.execute(
             "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"

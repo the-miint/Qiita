@@ -267,6 +267,27 @@ class DoGetTicketResponse(BaseModel):
     ticket: str  # base64-encoded signed ticket bytes
 
 
+# Columns a DoGet ticket asks to be projected, in this order — so a consumer can
+# opt into a wide column (`cigar` is ~96% of an alignment row) without every
+# other consumer paying for it.
+#
+# `min_length=1` rejects an explicit empty list (422) rather than letting it
+# widen to every column — the same rule, and the same reason, as
+# DoGetTicketRequest.feature_idx above. This is also the LAST layer that can
+# apply it: the data plane defaults an omitted field to an empty list, so on the
+# wire "empty" and "absent" are one value.
+#
+# The names themselves are checked against a per-table allowlist at signing time
+# (auth/tickets.py), which is what bounds this list in practice; the caps here
+# only keep an absurd request from being parsed before it is rejected, and are
+# deliberately wider than any projectable table. One alias so the two ticket
+# bodies that carry a projection cannot drift on any of the four numbers.
+ProjectionColumns = Annotated[
+    list[Annotated[str, Field(min_length=1, max_length=64)]],
+    Field(min_length=1, max_length=128),
+]
+
+
 class AlignmentDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/alignment/ticket/doget.
 
@@ -281,24 +302,9 @@ class AlignmentDoGetTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
-    # Columns the caller wants projected. Omitted ⇒ no projection rides the
-    # ticket, byte-identical to the historical shape. Present ⇒ the data plane
-    # streams exactly these, in this order. Why the alignment surface alone is
-    # projectable: `docs/architecture.md`.
-    #
-    # `min_length=1` rejects an explicit empty list (422) rather than letting it
-    # widen to every column — the same rule, and the same reason, as
-    # DoGetTicketRequest.feature_idx above. This is also the LAST layer that can
-    # apply it: the data plane defaults an omitted field to an empty list, so on
-    # the wire "empty" and "absent" are one value.
-    #
-    # The names themselves are checked against a per-table allowlist at signing
-    # time (auth/tickets.py), which is what bounds this list in practice; the
-    # cap here only keeps an absurd request from being parsed before it is
-    # rejected, and is deliberately wider than any projectable table.
-    columns: list[Annotated[str, Field(min_length=1, max_length=64)]] | None = Field(
-        default=None, min_length=1, max_length=128
-    )
+    # Omitted ⇒ no projection rides the ticket, byte-identical to the historical
+    # shape. See ProjectionColumns for what a present list means.
+    columns: ProjectionColumns | None = None
 
 
 # Upper bound on a human-named alignment cohort. Deliberately an order of
@@ -338,13 +344,8 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     prep_sample_idx: list[Annotated[int, Field(gt=0)]] = Field(
         min_length=1, max_length=_MAX_DOGET_PREP_SAMPLE_IDX
     )
-    # Projected in this order; the names are checked against the per-table
-    # allowlist at signing time (auth/tickets.py), which is what bounds this
-    # list in practice. The cap here only keeps an absurd request from being
-    # parsed before it is rejected.
-    columns: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(
-        min_length=1, max_length=128
-    )
+    # Required here, unlike its optional twin above — see the class docstring.
+    columns: ProjectionColumns
 
 
 class ReadDoGetTicketRequest(BaseModel):

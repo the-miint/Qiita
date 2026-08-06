@@ -392,6 +392,12 @@ fn projection_allowlist(table: &str) -> Option<&'static [&'static str]> {
 /// Every rejection is a control-plane bug rather than client input — the CP
 /// validates the same set before signing — so failing loudly is the point: the
 /// alternative is quietly serving a different set of columns than was signed.
+/// No projectable table takes the membership JOIN, and the two would compose
+/// badly if one ever did: under the JOIN a bare column name is ambiguous (both
+/// sides carry `feature_idx`), so a projection there would need `t.`-qualifying.
+/// The `(None, false)` arm already refuses every table without an allowlist,
+/// which today is every joined one — so adding an allowlist to a joined table
+/// means handling the qualification here, not adding a guard downstream.
 fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
     match (projection_allowlist(table), columns.is_empty()) {
         (None, true) => Ok("*".to_string()),
@@ -2853,16 +2859,6 @@ fn build_query(
 
     let where_str = where_clauses.join(" AND ");
     let sql = if needs_membership_join {
-        // Unreachable today — no table with a projection allowlist takes the
-        // membership JOIN — and kept loud rather than silent because the two
-        // features do compose badly: under the JOIN, a bare column name is
-        // ambiguous (both sides carry feature_idx), so a projection here would
-        // need `t.`-qualifying. Refuse until something actually needs it.
-        if !columns.is_empty() {
-            return Err(Status::internal(format!(
-                "projection column list is not supported on {table:?} (membership JOIN)"
-            )));
-        }
         format!(
             "SELECT t.* FROM {full_table} t \
              JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx \

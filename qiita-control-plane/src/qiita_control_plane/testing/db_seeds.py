@@ -431,6 +431,8 @@ async def seed_sequenced_sample_subtype(
     prep_sample_idx: int,
     owner_idx: int,
     sequenced_pool_item_id: str,
+    sequencing_run_idx: int | None = None,
+    sequenced_pool_idx: int | None = None,
 ) -> tuple[int, int, int]:
     """Seed the run -> pool -> sequenced_sample subtype chain for an
     existing sequenced prep_sample; return
@@ -445,20 +447,31 @@ async def seed_sequenced_sample_subtype(
     that need a prep_sample carrying a pool item id (e.g. the
     work_ticket fastq-filename-prefix gate). Caller does FK-reverse
     cleanup: sequenced_sample, then sequenced_pool, then sequencing_run.
+
+    Pass `sequencing_run_idx` + `sequenced_pool_idx` (both, as returned by an
+    earlier call) to attach this sample to an EXISTING pool instead of standing
+    up a fresh run and pool. Without it a multi-sample pool is unreachable
+    through this helper, which is why fixtures that needed one used to seed the
+    first sample here and hand-write the raw INSERT for the rest.
     """
-    run_idx = await pool.fetchval(
-        "INSERT INTO qiita.sequencing_run"
-        "  (instrument_run_id, platform, created_by_idx)"
-        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
-        f"seed-run-{secrets.token_hex(4)}",
-        owner_idx,
-    )
-    pool_idx = await pool.fetchval(
-        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
-        " VALUES ($1, $2) RETURNING idx",
-        run_idx,
-        owner_idx,
-    )
+    if (sequencing_run_idx is None) != (sequenced_pool_idx is None):
+        raise ValueError("pass both sequencing_run_idx and sequenced_pool_idx, or neither")
+    run_idx = sequencing_run_idx
+    pool_idx = sequenced_pool_idx
+    if pool_idx is None:
+        run_idx = await pool.fetchval(
+            "INSERT INTO qiita.sequencing_run"
+            "  (instrument_run_id, platform, created_by_idx)"
+            " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
+            f"seed-run-{secrets.token_hex(4)}",
+            owner_idx,
+        )
+        pool_idx = await pool.fetchval(
+            "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
+            " VALUES ($1, $2) RETURNING idx",
+            run_idx,
+            owner_idx,
+        )
     sequenced_sample_idx = await pool.fetchval(
         "INSERT INTO qiita.sequenced_sample"
         "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
@@ -711,6 +724,28 @@ async def retire_biosample_to_study_link(
         biosample_idx,
         study_idx,
         retired_by_idx,
+    )
+
+
+async def seed_prep_sample_to_study_link(
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    study_idx: int,
+    created_by_idx: int,
+) -> None:
+    """INSERT the (prep_sample, study) link row.
+
+    The missing sibling of `seed_biosample_to_study_link` and
+    `retire_prep_sample_to_study_link` — without it every fixture that needs a
+    prep_sample in a study hand-writes this INSERT.
+    """
+    await pool.execute(
+        "INSERT INTO qiita.prep_sample_to_study"
+        " (prep_sample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
+        prep_sample_idx,
+        study_idx,
+        created_by_idx,
     )
 
 
