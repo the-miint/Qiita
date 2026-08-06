@@ -775,6 +775,17 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **Landing-page footer now shows the deploy date (calver) instead of the static package version (#430).**
+  `QIITA_BUILD_VERSION` is derived from the deployed commit's date in `local-deploy.sh` and
+  injected via `build.env`; `landing.py` prefers it, falling back to the package version for
+  dev boots.
+- **Acero "poorly aligned buffer" warnings silenced on Flight-sourced DuckDB scans (#430).**
+  `data_plane_client.py` sets `ACERO_ALIGNMENT_HANDLING=ignore` at module load — the
+  misalignment comes from gRPC receive buffers, not the data plane, and is safe to suppress.
+- **`align_sharded` probe comment corrected: the count probe is kept for correctness, not
+  because `LIMIT 1` is slower (#430).** Row-group stats make `LIMIT 1` faster in most shapes;
+  the count probe is needed because the mixed-batch rejection requires `total`.
+
 - **`align_sharded` hands the aligner a materialized query relation instead of the lazy
   Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
   a block's sequences are re-read 1000 times at the current shard count. Against the
