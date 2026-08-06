@@ -380,18 +380,52 @@ fn projection_allowlist(table: &str) -> Option<&'static [&'static str]> {
     is_alignment_doget_surface(table).then_some(ALIGNMENT_PROJECTION_COLUMNS)
 }
 
-/// Validate a signed ticket's projection columns against `table`'s allowlist and
-/// render them as a SQL select list, preserving the ticket's order.
+/// The SQL select list for `table`, given the ticket's (possibly empty) column
+/// list: the signed columns in the ticket's own order, or `*` for a table that
+/// takes no projection.
 ///
-/// Every rejection here is a control-plane bug rather than client input — the CP
+/// **Having an allowlist and requiring a list are the same property.** A table
+/// only gets an allowlist because serving it unprojected is the wrong default,
+/// so the four cases below are total and there is no "projection is optional
+/// here" state to reason about. Splitting them is a one-line change if that ever
+/// becomes something we want.
+///
+/// Every rejection is a control-plane bug rather than client input — the CP
 /// validates the same set before signing — so failing loudly is the point: the
 /// alternative is quietly serving a different set of columns than was signed.
-fn projection_select_list(table: &str, columns: &[String]) -> Result<String, Status> {
-    let Some(allowed) = projection_allowlist(table) else {
-        return Err(Status::invalid_argument(format!(
+fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
+    match (projection_allowlist(table), columns.is_empty()) {
+        (None, true) => Ok("*".to_string()),
+        // No server-side default to fall back to, deliberately: the consumer is
+        // the only component that knows which columns it binds, and a fallback
+        // here would be a second answer to that question, free to drift wider
+        // than what was asked for. A ticket minted before this shipped and
+        // redeemed after lands here — loudly, inside its 300 s TTL — rather than
+        // being silently widened.
+        (Some(_), true) => Err(Status::invalid_argument(format!(
+            "{table} requires an explicit projection column list"
+        ))),
+        // Ignoring the list would serve wider rows than the ticket asked for,
+        // which is the silent widening this whole mechanism exists to prevent.
+        (None, false) => Err(Status::invalid_argument(format!(
             "table {table:?} does not accept a projection column list"
-        )));
-    };
+        ))),
+        (Some(allowed), false) => {
+            check_projection_columns(allowed, columns)?;
+            Ok(columns.join(", "))
+        }
+    }
+}
+
+/// Reject a projection column that is not on `allowed`, or named twice.
+///
+/// Names are whitelisted even though the ticket is signature-verified, because
+/// they are interpolated into SQL — the same defense-in-depth argument
+/// `ALLOWED_FILTER_COLUMNS` makes. A repeated name is refused rather than
+/// deduped: it produces two identically-named Arrow fields, which consumers
+/// collapse or reject inconsistently, and picking a behaviour for them would be
+/// guessing.
+fn check_projection_columns(allowed: &[&str], columns: &[String]) -> Result<(), Status> {
     let mut seen: Vec<&str> = Vec::with_capacity(columns.len());
     for col in columns {
         if !allowed.contains(&col.as_str()) {
@@ -406,7 +440,7 @@ fn projection_select_list(table: &str, columns: &[String]) -> Result<String, Sta
         }
         seen.push(col);
     }
-    Ok(columns.join(", "))
+    Ok(())
 }
 
 /// The block-read DoGet selectors, mapped to the DuckLake relation each streams.
@@ -2696,26 +2730,11 @@ fn build_query(
     members: &[auth::BlockReadMember],
     columns: &[String],
 ) -> Result<(String, String), Status> {
-    // Validate the projection FIRST, before any early return below can build SQL
+    // Resolve the projection FIRST, before any early return below can build SQL
     // on its own path — otherwise the block-read and `read_masked` selectors
     // would silently ignore a column list rather than refuse it, which is the
     // silent-widening failure this mechanism exists to prevent.
-    let projection = if columns.is_empty() {
-        // The alignment surface REQUIRES one. There is no server-side default to
-        // fall back to, deliberately: the consumer is the only component that
-        // knows which columns it binds, and a fallback here would be a second
-        // answer to that question, free to drift wider than what was asked for.
-        // A ticket minted before this shipped and redeemed after it lands here —
-        // loudly, within its 300 s TTL — rather than being silently widened.
-        if is_alignment_doget_surface(table) {
-            return Err(Status::invalid_argument(format!(
-                "{table} requires an explicit projection column list"
-            )));
-        }
-        None
-    } else {
-        Some(projection_select_list(table, columns)?)
-    };
+    let select_list = select_list_for(table, columns)?;
 
     // Block-read selectors resolve to a different relation than their ticket name
     // and are scoped by `members`, not by a column filter — handle them first, and
@@ -2757,7 +2776,6 @@ fn build_query(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
         }
-        let select_list = projection.as_deref().unwrap_or("*");
         return Ok((
             format!("SELECT {select_list} FROM {full_table}"),
             full_table,
@@ -2841,7 +2859,7 @@ fn build_query(
         // features do compose badly: under the JOIN, a bare column name is
         // ambiguous (both sides carry feature_idx), so a projection here would
         // need `t.`-qualifying. Refuse until something actually needs it.
-        if projection.is_some() {
+        if !columns.is_empty() {
             return Err(Status::internal(format!(
                 "projection column list is not supported on {table:?} (membership JOIN)"
             )));
@@ -2852,9 +2870,6 @@ fn build_query(
              WHERE {where_str}"
         )
     } else {
-        // The signed list if the ticket carried one; otherwise every column,
-        // which by the guard above can only be a table that takes no projection.
-        let select_list = projection.as_deref().unwrap_or("*");
         format!("SELECT {select_list} FROM {full_table} WHERE {where_str}")
     };
     Ok((sql, full_table))
