@@ -9,186 +9,31 @@ because no scientific result depends on it. They pair with an all-or-nothing
 mint: you discover exactly the cohort you are then allowed to sign, so the
 two-step flow never surprises you.
 
-The seeded shape, deliberately awkward, is one pool spanning two studies:
-
-    ps_a → study_1            alignment_1: completed
-    ps_b → study_2            alignment_1: completed,  alignment_2: completed
-    ps_c → study_1            alignment_1: pending
-    ps_d → study_1 (retired)  alignment_1: completed   ← orphaned by retirement
-
-`regular_user` holds Tier.VIEWER on study_1 only, so it must see ps_a and ps_c
-and nothing else — which makes alignment_2 invisible to it entirely, and its
-counts on alignment_1 (1 completed of 2) differ from the pool's real ones
-(3 of 4). Reporting the pool's real counts to that caller would set it up for a
-403 from the mint, which is why the counts are caller-scoped.
+The seeded shape is the shared `pool_alignment_seed` fixture (see its docstring
+in conftest.py) — one pool spanning two studies, of which `regular_user` may
+read only the first. The mint tests seed from the same fixture, deliberately:
+these two routes are halves of one contract, and separate fixtures are how the
+cohort discovery hands back drifts from the cohort the mint accepts.
 """
 
-import json
-import uuid
-
 import pytest
-import pytest_asyncio
 from qiita_common.api_paths import (
     URL_SEQUENCED_POOL_ALIGNMENT,
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
 )
-from qiita_common.models.reference import Tier
-
-from qiita_control_plane.testing.db_seeds import (
-    seed_biosample_to_study_link,
-    seed_biosample_with_sequenced_prep_sample,
-    seed_sequenced_sample_subtype,
-)
-
-from .conftest import _grant_study_access, _seed_study
 
 pytestmark = pytest.mark.db
 
 
 @pytest.fixture
 def ctx(role_keyed_clients):
-    base = dict(role_keyed_clients)
-    base["created"] = {"study": [], "study_access": []}
-    return base
+    return dict(role_keyed_clients)
 
 
-async def _mint_alignment(db, *, owner_idx: int, tag: str) -> int:
-    from qiita_common.hashing import canonical_params_hash
-
-    params = {"reference_idx": 1, "aligner": "minimap2", "mask_idx": 1, "shard_ids": [0], "t": tag}
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT alignment_idx FROM qiita.mint_alignment_definition($1, $2::jsonb, $3)",
-            canonical_params_hash(params),
-            json.dumps(params),
-            owner_idx,
-        )
-    return row["alignment_idx"]
-
-
-async def _gate(db, *, alignment_idx: int, prep_sample_idx: int, state: str) -> None:
-    await db.execute(
-        "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, $3)",
-        alignment_idx,
-        prep_sample_idx,
-        state,
-    )
-
-
-@pytest_asyncio.fixture
-async def seeded(ctx):
-    db = ctx["pool"]
-    owner = ctx["wet_session"]["principal_idx"]
-    reader = ctx["user_session"]["principal_idx"]
-
-    study_1 = await _seed_study(ctx, owner_idx=owner, suffix="align-disc-1")
-    study_2 = await _seed_study(ctx, owner_idx=owner, suffix="align-disc-2")
-    # The reader can see study_1 and NOT study_2 — the whole point of the shape.
-    await _grant_study_access(
-        ctx, study_idx=study_1, principal_idx=reader, tier=Tier.VIEWER, granted_by_idx=owner
-    )
-
-    samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
-    run_idx = pool_idx = None
-    for i in range(4):
-        bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
-        if run_idx is None:
-            run_idx, pool_idx, ss = await seed_sequenced_sample_subtype(
-                db, prep_sample_idx=ps, owner_idx=owner, sequenced_pool_item_id=f"disc-{i}"
-            )
-        else:
-            ss = await db.fetchval(
-                "INSERT INTO qiita.sequenced_sample"
-                "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
-                " VALUES ($1, $2, $3, $4) RETURNING idx",
-                ps,
-                pool_idx,
-                f"disc-{i}",
-                owner,
-            )
-        samples.append((bs, ps, ss))
-    (bs_a, ps_a, _), (bs_b, ps_b, _), (bs_c, ps_c, _), (bs_d, ps_d, _) = samples
-
-    async def link(biosample_idx, prep_sample_idx, study_idx, *, retired=False):
-        await seed_biosample_to_study_link(
-            db, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner
-        )
-        await db.execute(
-            "INSERT INTO qiita.prep_sample_to_study"
-            " (prep_sample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
-            prep_sample_idx,
-            study_idx,
-            owner,
-        )
-        if retired:
-            await db.execute(
-                "UPDATE qiita.prep_sample_to_study"
-                " SET retired = true, retired_at = now(), retired_by_idx = $3"
-                " WHERE prep_sample_idx = $1 AND study_idx = $2",
-                prep_sample_idx,
-                study_idx,
-                owner,
-            )
-
-    await link(bs_a, ps_a, study_1)
-    await link(bs_b, ps_b, study_2)
-    await link(bs_c, ps_c, study_1)
-    await link(bs_d, ps_d, study_1, retired=True)
-
-    align_1 = await _mint_alignment(db, owner_idx=owner, tag=f"one-{uuid.uuid4()}")
-    align_2 = await _mint_alignment(db, owner_idx=owner, tag=f"two-{uuid.uuid4()}")
-    await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_a, state="completed")
-    await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_b, state="completed")
-    await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_c, state="pending")
-    await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_d, state="completed")
-    await _gate(db, alignment_idx=align_2, prep_sample_idx=ps_b, state="completed")
-
-    yield {
-        "run_idx": run_idx,
-        "pool_idx": pool_idx,
-        "align_1": align_1,
-        "align_2": align_2,
-        "ps_a": ps_a,
-        "ps_b": ps_b,
-        "ps_c": ps_c,
-        "ps_d": ps_d,
-        "study_1": study_1,
-        "study_2": study_2,
-    }
-
-    prep_idxs = [ps for _, ps, _ in samples]
-    bio_idxs = [bs for bs, _, _ in samples]
-    ss_idxs = [ss for _, _, ss in samples]
-    await db.execute(
-        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = ANY($1::bigint[])",
-        [align_1, align_2],
-    )
-    await db.execute(
-        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
-        [align_1, align_2],
-    )
-    await db.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
-        prep_idxs,
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])", bio_idxs
-    )
-    await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", ss_idxs)
-    await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_idxs)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs)
-    for study_idx, principal_idx in ctx["created"]["study_access"]:
-        await db.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            study_idx,
-            principal_idx,
-        )
-    await db.execute(
-        "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", ctx["created"]["study"]
-    )
+@pytest.fixture
+def seeded(pool_alignment_seed):
+    """Local alias for the shared fixture — the shape lives in conftest.py."""
+    return pool_alignment_seed
 
 
 def _list_url(s):

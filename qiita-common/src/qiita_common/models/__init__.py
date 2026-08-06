@@ -223,6 +223,7 @@ from qiita_common.models.sequencing import (
     merge_qc_reports,
 )
 from qiita_common.models.step import (
+    AlignmentCohortDoGetTicketRequest,
     AlignmentDoGetTicketRequest,
     DoGetTicketRequest,
     DoGetTicketResponse,
@@ -394,6 +395,7 @@ __all__ = [
     "TerminologyTermObsoletionKind",
     "Tier",
     # Step wire contract.
+    "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
     "ReadDoGetTicketRequest",
     "DoGetTicketRequest",

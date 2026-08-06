@@ -105,7 +105,7 @@ from ..actions.sequenced_pool import (
     reap_staged_reads,
 )
 from ..auth.guards import (
-    filter_studies_caller_can_read,
+    filter_prep_samples_caller_can_read,
     require_caller_owns_run,
     require_complete_profile,
     require_human,
@@ -129,7 +129,6 @@ from ..repositories.alignment_definition import (
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
 )
-from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_samples
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
@@ -642,37 +641,17 @@ async def _readable_pool_prep_samples(
 ) -> list[int]:
     """The pool's non-retired prep_samples that `caller` may read.
 
-    A sample survives only if the caller holds `Tier.VIEWER` on EVERY study it
-    is still linked to — a sample shared into a study you cannot see is not
-    yours to read through the back door of a pool you can.
-
-    **A sample with no active study link is dropped**, and deliberately so: it
-    has no study to authorize against, and failing open on a data-integrity
-    anomaly is the wrong default for a read. This diverges from the
-    prep_sample-scoped *submission* gate (`_check_prep_sample_study_access` in
-    routes/work_ticket.py), which lets an orphan pass; that gate is guarding a
-    write whose downstream lookups fail anyway, this one is answering "may this
-    person see this". A caller at or above wet_lab_admin bypasses the whole
-    check, so an admin can still see the anomaly.
+    Pool membership, then the shared per-study read gate
+    (`filter_prep_samples_caller_can_read`) — the same one the all-or-nothing
+    alignment mint raises on, so a cohort discovered here is one the mint
+    accepts. Everything about what "may read" means, including the orphan drop
+    and the wet_lab_admin bypass, lives in that guard rather than here.
     """
     prep_sample_idxs = await list_pool_prep_sample_idxs(pool, sequenced_pool_idx)
-    # Bypass first, so the whole link/tier resolution below is skipped rather
-    # than computed and discarded — and so the orphan drop is skipped with it,
-    # which is what lets an admin see the anomaly.
-    if not prep_sample_idxs or caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
-        return prep_sample_idxs
-    links = await fetch_active_study_idxs_for_prep_samples(pool, prep_sample_idxs)
-    readable_studies = await filter_studies_caller_can_read(
-        pool,
-        caller=caller,
-        study_idxs={s for studies in links.values() for s in studies},
-        min_tier=Tier.VIEWER,
+    access = await filter_prep_samples_caller_can_read(
+        pool, caller=caller, prep_sample_idxs=prep_sample_idxs, min_tier=Tier.VIEWER
     )
-    return [
-        prep_sample_idx
-        for prep_sample_idx in prep_sample_idxs
-        if links.get(prep_sample_idx) and set(links[prep_sample_idx]) <= readable_studies
-    ]
+    return access.readable
 
 
 @router.get(PATH_SEQUENCED_POOL_ALIGNMENT)

@@ -301,6 +301,48 @@ class AlignmentDoGetTicketRequest(BaseModel):
     )
 
 
+# Upper bound on a human-named alignment cohort. Same purpose and same number
+# as _MAX_DOGET_FEATURE_IDX: the list rides the signed ticket payload and becomes
+# a `prep_sample_idx IN (...)` on the data plane, so the cap bounds ticket and
+# query size. It is deliberately NOT sized to the per-study access check, which
+# costs one lookup per DISTINCT study regardless of how many samples there are.
+_MAX_DOGET_PREP_SAMPLE_IDX = 100_000
+
+
+class AlignmentCohortDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/alignment/{alignment_idx}/ticket/doget — the
+    HUMAN-callable alignment mint, where the caller names the cohort itself.
+
+    The sibling ``AlignmentDoGetTicketRequest`` reads its cohort out of a work
+    ticket the runner resolver already validated; there is no such upstream for
+    a client-driven request, so here the caller states the cohort and the route
+    authorizes every sample per-study before signing. The alignment rides the
+    path, not the body, because it is what is being read.
+
+    Both fields are REQUIRED and ``min_length=1``, which is the one place they
+    diverge from the service-account body:
+
+    * An empty ``prep_sample_idx`` would sign an unscoped alignment ticket.
+    * An omitted ``columns`` is rejected at stream time by the data plane (the
+      alignment surface requires a signed projection — ``cigar`` is ~96% of a
+      row, so there is no safe server-side default). Requiring it here turns a
+      Flight ``InvalidArgument`` into a 422 the caller can act on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: list[Annotated[int, Field(gt=0)]] = Field(
+        min_length=1, max_length=_MAX_DOGET_PREP_SAMPLE_IDX
+    )
+    # Projected in this order; the names are checked against the per-table
+    # allowlist at signing time (auth/tickets.py), which is what bounds this
+    # list in practice. The cap here only keeps an absurd request from being
+    # parsed before it is rejected.
+    columns: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(
+        min_length=1, max_length=128
+    )
+
+
 class ReadDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read/ticket/doget.
 

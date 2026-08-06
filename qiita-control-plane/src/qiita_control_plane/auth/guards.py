@@ -13,6 +13,7 @@ underlying resolution per-request even when many guards compose.
 """
 
 from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 import asyncpg
 from fastapi import Depends, HTTPException
@@ -20,7 +21,10 @@ from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER, SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
-from ..repositories.prep_sample import fetch_prep_sample_exists
+from ..repositories.prep_sample import (
+    fetch_active_study_idxs_for_prep_samples,
+    fetch_prep_sample_exists,
+)
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool,
     fetch_sequenced_pool_created_by,
@@ -485,6 +489,82 @@ async def filter_studies_caller_can_read(
             pool_or_conn, caller=caller, study_idx=study_idx, min_tier=min_tier
         )
     }
+
+
+class PrepSampleReadAccess(NamedTuple):
+    """Which prep_samples of a cohort the caller may read, and why not for the rest.
+
+    Three disjoint outcomes rather than a bare readable/denied split, because the
+    two ways a sample can be denied need different words in the 403: `unlinked`
+    is a data-integrity anomaly the caller can do nothing about, while
+    `blocked_by` names studies they can go ask for access to.
+    """
+
+    readable: list[int]  # deduped, input order
+    unlinked: list[int]  # no active prep_sample_to_study link at all
+    blocked_by: dict[int, list[int]]  # prep_sample_idx → the studies that denied it
+
+
+async def filter_prep_samples_caller_can_read(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    prep_sample_idxs: Iterable[int],
+    min_tier: Tier,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> PrepSampleReadAccess:
+    """Resolve a prep_sample cohort against the caller's per-study access.
+
+    A sample is readable only if the caller holds `min_tier` on EVERY study it
+    is still linked to — a sample shared into a study you cannot see is not
+    yours to read through the back door of one you can.
+
+    **A sample with no active study link is NOT readable.** It has no study to
+    authorize against, and failing open on a data-integrity anomaly is the wrong
+    default for a read. This diverges from the prep_sample-scoped *submission*
+    gate (`_check_prep_sample_study_access` in routes/work_ticket.py), which
+    lets an orphan pass; that gate gaurds a write whose downstream lookups fail
+    anyway, this one answers "may this person see this".
+
+    A caller at or above `bypass_role` gets the whole cohort back with no
+    lookups — including the orphans, deliberately, so an admin can still see and
+    act on the anomaly. That is why the bypass cannot simply be delegated to
+    `filter_studies_caller_can_read`, and why it comes first: the link
+    resolution below would otherwise be computed and discarded.
+
+    The one definition of "may this caller read this sample", shared by the
+    narrowing discovery reads and the all-or-nothing alignment mint. Two copies
+    is precisely the drift that ends with discovery advertising a cohort the
+    mint then 403s.
+    """
+    prep_sample_idxs = list(dict.fromkeys(prep_sample_idxs))
+    if not prep_sample_idxs or caller.has_role_at_least(bypass_role):
+        return PrepSampleReadAccess(readable=prep_sample_idxs, unlinked=[], blocked_by={})
+
+    links = await fetch_active_study_idxs_for_prep_samples(pool_or_conn, prep_sample_idxs)
+    readable_studies = await filter_studies_caller_can_read(
+        pool_or_conn,
+        caller=caller,
+        study_idxs={study_idx for studies in links.values() for study_idx in studies},
+        min_tier=min_tier,
+        bypass_role=bypass_role,
+    )
+
+    readable: list[int] = []
+    unlinked: list[int] = []
+    blocked_by: dict[int, list[int]] = {}
+    for prep_sample_idx in prep_sample_idxs:
+        # Absent from the mapping means every link is retired — see
+        # fetch_active_study_idxs_for_prep_samples, which deliberately does not
+        # encode what that means so each gate has to say.
+        studies = links.get(prep_sample_idx)
+        if not studies:
+            unlinked.append(prep_sample_idx)
+        elif denied := sorted(set(studies) - readable_studies):
+            blocked_by[prep_sample_idx] = denied
+        else:
+            readable.append(prep_sample_idx)
+    return PrepSampleReadAccess(readable=readable, unlinked=unlinked, blocked_by=blocked_by)
 
 
 async def require_caller_has_tier_on_all_studies(
