@@ -539,9 +539,11 @@ async def export_owner_biosample_id(
     a study, keyed by minted biosample_idx + public accession.
 
     The owner name (biosample_metadata.value_text where
-    is_owner_biosample_id=true) is PII-pinned and masked on the normal read
-    path; this route is the only way to recover it, so it is gated by
-    system_admin PLUS admin:biosample_owner_id_read.
+    is_owner_biosample_id=true) is the owner's own name for their sample.
+    It is restricted to authorized study members rather than shown on the
+    general read path — submitters sometimes put PII in sample names — so
+    recovering it across a whole study is gated by system_admin PLUS
+    admin:biosample_owner_id_read.
 
     Without sequenced_pool_idx, returns one row per active biosample link in
     the study. With it, returns the study's sequenced_samples in that pool,

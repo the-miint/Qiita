@@ -34,10 +34,14 @@ from ._base import (
     _log,
 )
 from ._db import (
+    _NO_STEP_FLOOR,
+    StepResourceFloor,
     _atomic_transition,
     _bump_retry_and_requeue,
     _fetch_action,
     _fetch_work_ticket,
+    _parse_escalated_floor,
+    _persist_escalated_floor,
     _retry_count,
     _safe_entry_name,
     _transition_to_failed,
@@ -55,6 +59,7 @@ from ._dispatch import (
     _fetch_plan_hint,
     _patch_resource_status,
     _shard_fanout_owns_finalize,
+    _terminal_attempts_exhausted_failure,
 )
 from ._feature_table import (
     GENOME_MAP_PATH_BINDING,
@@ -89,6 +94,7 @@ from ._read_ingest import (
     _workflow_needs_staged_reads,
 )
 from ._reconstruct import (
+    _attempt_is_terminal,
     _attempt_is_unowned,
     _completed_progress_row,
     _dispatch_action,
@@ -154,10 +160,11 @@ async def run_workflow(
     """
     work_ticket = await _fetch_work_ticket(pool, work_ticket_idx)
     # Optional per-run resource bump (gated to wet_lab_admin+ and validated
-    # <= the action ceiling at submission). Read once here as the starting
-    # memory floor; `_run_entry_with_retry` raises it (up to the ceiling) on an
-    # OOM-killed retry. A CP restart re-attaches with this static floor and
-    # re-escalates from there.
+    # <= the action ceiling at submission). Ticket-wide and static: it is the
+    # same floor for every step and never changes for the ticket's life.
+    # `_run_entry_with_retry` composes it with the per-step floor a prior run
+    # escalated to (`escalated_resource_floor`, read below) and raises the
+    # result on an OOM-killed retry.
     _override = work_ticket.get("resource_override")
     mem_gb_override = _override.get("mem_gb") if isinstance(_override, dict) else None
     if not resume and work_ticket["state"] != WorkTicketState.PENDING.value:
@@ -217,6 +224,18 @@ async def run_workflow(
         # resume (or a /run redrive) it carries the COMPLETED rows the loop
         # fast-forwards. Loaded once — this run's own writes don't feed back in.
         progress = await step_progress.load_step_progress(pool, work_ticket_idx)
+
+        # Per-step resource floors a PRIOR run's retry ladder escalated to and
+        # persisted. Empty on a first dispatch. This is what makes the ladder
+        # continue across a restart / redrive instead of restarting at the YAML
+        # baseline: `_run_entry_with_retry` seeds its escalating floors from the
+        # entry's value here. Parsed INSIDE the try (unlike `resource_override`
+        # above, whose read is total) because a malformed value raises — see
+        # `_parse_escalated_floor` — and that raise must land in the handler
+        # below rather than stranding the ticket with no failure recorded.
+        escalated_floor = _parse_escalated_floor(
+            work_ticket.get("escalated_resource_floor"), work_ticket_idx=work_ticket_idx
+        )
 
         _log.info(
             "running workflow %s/%s for work_ticket %d (max_retries=%d)",
@@ -459,6 +478,7 @@ async def run_workflow(
                         originator_principal_idx=work_ticket["originator_principal_idx"],
                         instrument_model=bound.get("instrument_model"),
                         adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
+                        default_adapter_reference_idx=default_adapter_reference_idx,
                         host_rype_reference_idx=bound.get("host_rype_reference_idx"),
                         host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
                         # What actually distinguishes the five PacBio protocols:
@@ -605,6 +625,13 @@ async def run_workflow(
                 entry=entry,
                 action_ceiling=action.action_ceiling,
                 mem_gb_override=mem_gb_override,
+                # Only `step:` entries carry baseline_resources and escalate, so
+                # only they ever WRITE a floor. `_step_entry_names_unique`
+                # constrains `step:` names only, so an `action:` entry may share
+                # a step's name and read that step's floor here — harmless,
+                # because the floors are threaded solely into `_dispatch_step`,
+                # which an `action:` entry never reaches.
+                persisted_floor=escalated_floor.get(entry.name, _NO_STEP_FLOOR),
                 bound=bound,
                 workspace=workspace,
                 scope_target=scope_target,
@@ -777,6 +804,7 @@ async def _run_entry_with_retry(
     entry: WorkflowStep | WorkflowAction,
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
+    persisted_floor: StepResourceFloor = _NO_STEP_FLOOR,
     bound: dict[str, Any],
     workspace: Path,
     scope_target: dict[str, Any],
@@ -814,9 +842,11 @@ async def _run_entry_with_retry(
         floor (×`_TIMEOUT_WALLTIME_GROWTH`, clamped to
         `action_ceiling.walltime`) — a step that hit the wall needs more time,
         not a re-run at the same limit. Other transient kinds retry at the same
-        allocation. Both escalated floors are process-local (not persisted): a
-        CP restart re-attaches to the in-flight job and re-escalates (memory
-        from the ticket's static override, walltime from the YAML baseline).
+        allocation. Both escalated floors are PERSISTED per step, on
+        `qiita.work_ticket.escalated_resource_floor`, as they grow: a CP restart
+        or a `/run` redrive seeds `persisted_floor` from that column and
+        continues the ladder from the size the ticket had already reached,
+        instead of restarting at the baseline and re-burning a failing attempt.
         Once a floor is already pinned at the ceiling, escalation can't grow it
         — a re-run would fail identically — so the OOM/TIMEOUT is reclassified
         as a permanent `RESOURCE_CEILING_EXHAUSTED` and fails the ticket
@@ -840,14 +870,27 @@ async def _run_entry_with_retry(
     # gaps like attempt-0 → attempt-3 for an entry that itself only
     # retried once.
     attempt = 0
-    # Escalating memory floor: starts at the ticket's static override and is
-    # raised on each OOM-killed retry (see the except arm below). Threaded into
-    # every step dispatch in place of the static `mem_gb_override`.
-    effective_mem_override = mem_gb_override
-    # Escalating walltime floor: starts unset (use the YAML baseline) and is
-    # raised on each TIMEOUT retry, clamped to the action ceiling. Threaded into
-    # every step dispatch alongside the memory floor.
-    effective_walltime_override: timedelta | None = None
+    # How many already-terminal attempts this invocation skipped past. Non-zero
+    # only on a resume/redrive, and it means the fresh submit below was never
+    # authorised by the retry budget — see the guard after the skip branches.
+    skipped_terminal_attempts = 0
+    # Escalating memory floor: starts at the HIGHER of the ticket's static
+    # override and whatever a prior run's ladder already escalated this step to
+    # (`persisted_floor`), and is raised on each OOM-killed retry (see the
+    # except arm below). Threaded into every step dispatch in place of the
+    # static `mem_gb_override`. Both inputs are raise-only floors, so the max is
+    # the composition — and the persisted value already grew from a resolution
+    # that included the static override, so it dominates in practice.
+    effective_mem_override = max(
+        (v for v in (mem_gb_override, persisted_floor.mem_gb) if v is not None),
+        default=None,
+    )
+    # Escalating walltime floor: starts at the persisted floor (there is no
+    # static walltime override — see `_escalated_walltime_after_timeout`), or
+    # unset on a step that has never timed out, in which case dispatch uses the
+    # YAML baseline. Raised on each TIMEOUT retry, clamped to the action
+    # ceiling. Threaded into every step dispatch alongside the memory floor.
+    effective_walltime_override: timedelta | None = persisted_floor.walltime
     # Optional plan() sizing hint, fetched ONCE (native steps only) before the
     # loop — it depends only on inputs, not the attempt, and only ever
     # down-sizes below the baseline. Advisory: None (container step, or any
@@ -860,6 +903,25 @@ async def _run_entry_with_retry(
         )
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
+        # Only a LIVE attempt is adoptable. `attempt` restarts at 0 on every
+        # invocation, so a restart-recovery resume of a step that failed at
+        # attempt N and escalated to N+1 lands back on N first — and
+        # `_attempt_is_unowned` (a row-EXISTS check) reports that dead row as
+        # owned. Advancing past it is what keeps `_adopt_or_submit` from
+        # re-attaching to a job that already ended. Checked before the
+        # orphan-dir branch and independently of whether the dir exists: a row
+        # is terminal whether or not its workspace survived.
+        if _attempt_is_terminal(prior_progress, step_index=index, attempt=attempt):
+            _log.info(
+                "work_ticket %d entry %r attempt %d: prior attempt already terminal; "
+                "advancing to the next attempt",
+                work_ticket_idx,
+                entry.name,
+                attempt,
+            )
+            attempt += 1
+            skipped_terminal_attempts += 1
+            continue
         # Skip past a stale attempt dir to a fresh one. This fires only when an
         # attempt dir already exists on disk but NO start-of-run progress row
         # owns this (step_index, attempt) — i.e. a re-run after the row was
@@ -869,10 +931,10 @@ async def _run_entry_with_retry(
         # reuse (it would trip the verifier or block the overwrite) nor delete —
         # a container step's output is owned by the SLURM job user, so the
         # control-plane process here can't unlink or chmod it. So advance to the
-        # next attempt dir, which this process creates fresh. A row PRESENT means
-        # resume-adoption owns the dir (see `_attempt_is_unowned`):
-        # `_adopt_or_submit` must re-attach to its live job and reuse the
-        # workspace, so we leave it and proceed.
+        # next attempt dir, which this process creates fresh. A row PRESENT and
+        # LIVE means resume-adoption owns the dir: `_adopt_or_submit` must
+        # re-attach to its job and reuse the workspace, so we leave it and
+        # proceed. (A present-but-terminal row was already skipped above.)
         if attempt_workspace.exists() and _attempt_is_unowned(
             prior_progress, step_index=index, attempt=attempt
         ):
@@ -885,6 +947,27 @@ async def _run_entry_with_retry(
             )
             attempt += 1
             continue
+        # Skipping dead attempts lands us on a FRESH submit, which the retry
+        # budget has not authorised: `max_retries` is enforced in the
+        # `except BackendFailure` arm below, and we never went through it. The
+        # gap is reachable when a prior process recorded the attempt `failed`
+        # and died before transitioning the ticket — reconcile then re-drives a
+        # still-PROCESSING ticket and would buy a free submit on every restart.
+        if skipped_terminal_attempts:
+            current_retry = await _retry_count(pool, work_ticket_idx)
+            if current_retry >= max_retries:
+                _log.warning(
+                    "work_ticket %d entry %r: %d prior attempt(s) already terminal and "
+                    "retry budget spent (%d/%d); not submitting a fresh attempt",
+                    work_ticket_idx,
+                    entry.name,
+                    skipped_terminal_attempts,
+                    current_retry,
+                    max_retries,
+                )
+                raise _terminal_attempts_exhausted_failure(
+                    entry, retry_count=current_retry, max_retries=max_retries
+                )
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):
@@ -969,6 +1052,14 @@ async def _run_entry_with_retry(
                         ceiling=f"{action_ceiling.mem_gb} GB",
                     ) from exc
                 effective_mem_override = grown
+                # Persist BEFORE the requeue below, so the ladder's position is
+                # durable the moment it is learned: a crash between here and the
+                # next dispatch resumes at `grown`, never back at the baseline.
+                # `entry` is a WorkflowStep on this arm, so its name is unique
+                # within the action — the key this floor is stored under.
+                await _persist_escalated_floor(
+                    pool, work_ticket_idx, step_name=entry.name, mem_gb=grown
+                )
             # A timed-out step needs more wall to finish, not a re-run at the same
             # limit; grow its walltime floor (clamped to the action ceiling) before
             # re-queuing. Steps only — `action:` entries carry no baseline_resources.
@@ -998,6 +1089,12 @@ async def _run_entry_with_retry(
                         ceiling=str(action_ceiling.walltime),
                     ) from exc
                 effective_walltime_override = grown_walltime
+                # Same durability as the memory arm above. Merged into this
+                # step's existing object, so it never clobbers a memory floor
+                # the same step learned from an earlier OOM.
+                await _persist_escalated_floor(
+                    pool, work_ticket_idx, step_name=entry.name, walltime=grown_walltime
+                )
             _log.warning(
                 "work_ticket %d step %r transient failure (%s); retrying %d/%d "
                 "(mem_gb floor=%s, walltime floor=%s)",

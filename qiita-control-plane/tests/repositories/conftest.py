@@ -20,9 +20,8 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories._sample_helpers import (
-    GlobalFieldRow,
+    FieldRow,
     SampleEntityKind,
-    _get_or_create_local_study_field,
     insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import insert_biosample
@@ -30,6 +29,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_global_field,
+    seed_local_study_field,
     seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
 )
@@ -303,16 +303,14 @@ async def _create_biosample_with_link(ctx):
 async def _create_local_field(ctx, suffix=""):
     """Helper: create a purely-local biosample_study_field, track for cleanup."""
     field_name = f"{unique_field_name()}_{suffix}"
-    async with ctx["pool"].acquire() as conn:
-        async with conn.transaction():
-            idx, _, _ = await _get_or_create_local_study_field(
-                conn,
-                spec=BIOSAMPLE_METADATA_SPEC,
-                study_idx=ctx["study_idx"],
-                display_name=field_name,
-                created_by_idx=ctx["principal_idx"],
-                required=True,
-            )
+    idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        display_name=field_name,
+        created_by_idx=ctx["principal_idx"],
+        required=True,
+    )
     ctx["created"]["biosample_study_field"].append(idx)
     return idx
 
@@ -415,17 +413,20 @@ async def _seed_secondary_studies_for_entity(ctx, spec, entity_idx, count):
 
 
 async def _seed_global_field_for_spec(
-    ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None
+    ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None, internal_name=None
 ):
     """Seed one global field of the given data_type for spec.entity_kind
-    and track the row for cleanup. Returns a GlobalFieldRow shape so the
+    and track the row for cleanup. Returns a FieldRow shape so the
     caller can drive metadata writes against it directly. terminology_idx
     must be supplied when data_type=TERMINOLOGY (the *_global_field
-    CHECK enforces the iff coupling) and omitted otherwise.
+    CHECK enforces the iff coupling) and omitted otherwise. internal_name
+    defaults to a generated unique value; pass it when a test keys on the
+    internal_name (internal-name resolution), since FieldRow carries only
+    the display_name.
     """
     # Token suffix defends against unique-name collisions across re-runs.
     suffix = secrets.token_hex(4)
-    internal_name = f"gf_{suffix}"
+    internal_name = internal_name if internal_name is not None else f"gf_{suffix}"
     display_name = f"GF {suffix}"
 
     # Branch on the spec's entity_kind to pick the matching seed helper;
@@ -450,8 +451,13 @@ async def _seed_global_field_for_spec(
             terminology_idx=terminology_idx,
         )
         ctx["created"]["prep_sample_global_field"].append(gf_idx)
-    return GlobalFieldRow(
-        idx=gf_idx, display_name=display_name, data_type=data_type, terminology_idx=terminology_idx
+    return FieldRow(
+        idx=gf_idx,
+        display_name=display_name,
+        data_type=data_type,
+        terminology_idx=terminology_idx,
+        global_field_idx=gf_idx,
+        internal_name=internal_name,
     )
 
 

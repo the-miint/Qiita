@@ -18,6 +18,7 @@ state machine is serialized by the database, not by application-level reads.
 from collections.abc import Sequence
 
 import asyncpg
+from qiita_common.actions import BLOCK_MASK_ACTION_ID
 
 from . import require_transaction
 
@@ -313,19 +314,23 @@ async def has_incomplete_covering_block(
     failed block correctly blocks finalize until it is re-driven to completion —
     the strict, fail-closed reading of the export gate this invariant protects.
 
-    Only READ-MASK blocks count: `wt.alignment_idx IS NULL` (the codebase's
-    read-mask-vs-align block discriminator — align blocks carry BOTH mask_idx and
-    alignment_idx). Without it a pending/failed ALIGN block over the same
-    (mask_idx, sample) would spuriously wedge this sample's read-mask finalize."""
+    Only READ-MASK blocks count: `wt.action_id` names the bulk-masking workflow.
+    Without that filter a pending/failed ALIGN block over the same (mask_idx,
+    sample) would spuriously wedge this sample's read-mask finalize — align blocks
+    carry BOTH mask_idx and alignment_idx. The filter is deliberately NOT
+    `wt.alignment_idx IS NULL`: purging an alignment NULLs that column
+    (`ON DELETE SET NULL`), which would hand this query exactly the align blocks it
+    exists to exclude. See `qiita_common.actions`."""
     incomplete = await conn.fetchval(
         "SELECT 1 FROM qiita.block b"
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
         " WHERE bm.prep_sample_idx = $1 AND wt.mask_idx = $2"
-        "   AND wt.alignment_idx IS NULL AND b.state <> 'completed'"
+        "   AND wt.action_id = $3 AND b.state <> 'completed'"
         " LIMIT 1",
         prep_sample_idx,
         mask_idx,
+        BLOCK_MASK_ACTION_ID,
     )
     return incomplete is not None
 
@@ -457,7 +462,16 @@ async def has_incomplete_covering_alignment_block(
     sibling block leaves the sample's alignment partial, so it must not finalize.
     Checking `state <> 'completed'` (not "non-terminal") means a failed block
     correctly blocks finalize until re-driven — the strict, fail-closed reading.
-    Twin of `has_incomplete_covering_block` (joins on alignment_idx not mask_idx)."""
+    Twin of `has_incomplete_covering_block` (joins on alignment_idx not mask_idx).
+
+    Needs no `action_id` filter, unlike that twin: `alignment_idx` is set only by
+    an align block, so the join column is already unambiguous — whereas `mask_idx`
+    is carried by both block kinds. Any block covering this sample under this
+    alignment should count here, whatever workflow produced it — which is why the
+    filter is absent by intent, not by omission. Note `fanout_dispatch.align_block_cohort`
+    DOES carry one (a cohort is a per-workflow throttle): if a second action ever
+    sets `alignment_idx`, the two diverge — it would stop throttling those tickets
+    while this keeps gating on them. Revisit both together."""
     incomplete = await conn.fetchval(
         "SELECT 1 FROM qiita.block b"
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"

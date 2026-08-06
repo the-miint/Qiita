@@ -18,6 +18,7 @@ Coverage strategy:
 
 import json
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -1104,6 +1105,356 @@ async def test_timeout_at_walltime_ceiling_fails_without_retry(
     assert row["failure_type"] == "permanent"
     assert "walltime ceiling" in row["failure_reason"]
     assert backend.attempts["hash"] == 1
+
+
+# =============================================================================
+# Persisted escalated resource floor — the ladder survives restart / redrive
+# =============================================================================
+#
+# The escalated floor used to live only in a local variable, so a CP restart or
+# a `/run` redrive discarded it and the ticket re-burned a failing attempt
+# climbing back to a size it had already reached. It is now written to
+# `qiita.work_ticket.escalated_resource_floor` per step as it grows, and seeded
+# from there on every run.
+#
+# `reference_add_action` deliberately pins its ceilings AT the hash step's
+# baseline (mem 1 GB, walltime 1 min) so the at-ceiling fail-fast tests above
+# work, which leaves escalation no headroom. These tests need a ladder, so they
+# use their own action with room above the same baselines:
+#
+#     memory   1 → 2 → 4 → 8 (ceiling)
+#     walltime 1m → 2m → 4m → 8m (ceiling)
+
+
+class _RecordingBackendClient(_RetryingBackendClient):
+    """`_RetryingBackendClient` that also records the resources each attempt was
+    dispatched at. The parent drops `baseline_resources`; the escalation tests
+    assert on exactly that, since the size a step is submitted at is the whole
+    observable behaviour of the floor."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # (step_name, mem_gb, walltime_seconds) per submit, in dispatch order.
+        self.dispatched: list[tuple[str, int, int]] = []
+
+    async def run_step(self, *, step_name, inputs, workspace, scope_target, work_ticket_idx, **kw):
+        baseline = kw.get("baseline_resources")
+        if baseline is not None:
+            self.dispatched.append((step_name, baseline.mem_gb, baseline.walltime_seconds))
+        # `load` is not under test here — hand it the staging dir register-files
+        # expects so the workflow can reach COMPLETED, and count it ourselves
+        # since we don't delegate. `hash` drives the ladder and goes through the
+        # parent, which does its own counting alongside the fail-N-times logic.
+        if step_name == "load":
+            self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+            (workspace / "staging").mkdir(parents=True, exist_ok=True)
+            (workspace / "staging" / "reference_sequences.parquet").touch()
+            return {"staging_dir": workspace / "staging"}
+        return await super().run_step(
+            step_name=step_name,
+            inputs=inputs,
+            workspace=workspace,
+            scope_target=scope_target,
+            work_ticket_idx=work_ticket_idx,
+            **kw,
+        )
+
+    def sizes_for(self, step_name: str) -> list[tuple[int, int]]:
+        return [(mem, wall) for name, mem, wall in self.dispatched if name == step_name]
+
+
+@pytest.fixture
+async def escalating_action(postgres_pool):
+    """`reference-add` with ceilings ABOVE the hash step's baseline, so the
+    OOM / TIMEOUT ladders actually have rungs to climb."""
+    action_id = "reference-add"
+    version = f"runner-escalation-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience, "
+        "  context_schema, steps, "
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, "
+        "  success_status, failure_status"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 8, '8 minutes', $7, $8)",
+        action_id,
+        version,
+        ["feature:mint", "reference:write", "reference:register_files"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_REFERENCE_ADD_STEPS),
+        "active",
+        "failed",
+    )
+    yield action_id, version
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        action_id,
+        version,
+    )
+
+
+@pytest.fixture
+async def escalating_work_ticket(postgres_pool, escalating_action, reference_idx, tmp_path):
+    action_id, version = escalating_action
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">seq1\nACGT\n")
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_path": str(fasta)}),
+    )
+    yield {"work_ticket_idx": idx, "reference_idx": reference_idx, "fasta_path": fasta}
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+
+
+async def _escalated_floor(pool, work_ticket_idx: int):
+    raw = await pool.fetchval(
+        "SELECT escalated_resource_floor FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+async def test_oom_escalation_persists_the_memory_floor(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """Each OOM retry writes the grown memory floor to the ticket before
+    re-queuing, so the ladder's position is durable the moment it is learned.
+    Two OOMs climb 1 → 2 → 4 GB; the third attempt succeeds at 4."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+
+    backend = _RecordingBackendClient(
+        fail_step="hash",
+        fail_n_times=2,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # The observable behaviour: each retry was submitted at the grown size.
+    assert [mem for mem, _wall in backend.sizes_for("hash")] == [1, 2, 4]
+    # ... and the last floor learned is on the ticket, not just in memory.
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {"hash": {"mem_gb": 4}}
+
+
+async def test_run_seeds_memory_floor_from_the_persisted_value(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """The regression this column exists for. A ticket that already escalated
+    `hash` to 4 GB dispatches its NEXT run at 4 GB — not back at the 1 GB YAML
+    baseline. Before this, a CP restart or a `/run` redrive re-burned a failing
+    attempt climbing back to a size the ticket had already reached."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"hash": {"mem_gb": 4, "walltime_seconds": 240}}),
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="none",
+        fail_n_times=0,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # One dispatch, at the persisted floor on BOTH axes (baseline is 1 GB / 60s).
+    assert backend.sizes_for("hash") == [(4, 240)]
+    # A step with no persisted floor is untouched — the floor is per step, which
+    # is why it is not folded into the ticket-wide `resource_override`.
+    assert backend.sizes_for("load") == [(1, 60)]
+
+
+async def test_walltime_escalation_merges_without_clobbering_memory(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """The two axes escalate from separate arms of the retry loop, so writing
+    one must merge into the step's existing object rather than replace it. A
+    ticket carrying a memory floor that then TIMES OUT keeps both."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"hash": {"mem_gb": 4}}),
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="hash",
+        fail_n_times=1,
+        kind=FailureKind.TIMEOUT_BEFORE_START,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # Attempt 0 runs at the persisted memory floor with the BASELINE walltime
+    # (nothing has timed out yet); attempt 1 keeps the memory floor and doubles
+    # walltime 60s → 120s.
+    assert backend.sizes_for("hash") == [(4, 60), (4, 120)]
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {
+        "hash": {"mem_gb": 4, "walltime_seconds": 120}
+    }
+
+
+async def test_seeded_floor_at_the_ceiling_fails_fast_without_climbing(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """The flip side of resuming the ladder, and the most visible new behaviour:
+    a ticket whose persisted floor is already AT the action ceiling no longer
+    re-climbs to it before failing. It runs once at the ceiling, the escalation
+    returns the floor unchanged (saturation), and the OOM is reclassified
+    permanent. Before the floor was persisted this ticket would have restarted
+    at the 1 GB baseline and burned three attempts getting back to 8."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"hash": {"mem_gb": 8}}),  # == the action's mem ceiling
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="hash",
+        fail_n_times=999,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    with pytest.raises(BackendFailure) as exc_info:
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+    assert exc_info.value.kind is FailureKind.RESOURCE_CEILING_EXHAUSTED
+
+    # Exactly one attempt, at the ceiling — no climb, no retry budget spent.
+    assert backend.sizes_for("hash") == [(8, 60)]
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == 0
+    # Saturated: the floor is unchanged, not grown past the ceiling.
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {"hash": {"mem_gb": 8}}
+
+
+@pytest.mark.parametrize(
+    ("override_mem_gb", "persisted_mem_gb", "expected"),
+    [
+        (2, 4, 4),  # the learned floor is higher — it wins
+        (4, 2, 4),  # the static override is higher — it wins
+    ],
+)
+async def test_memory_floor_composes_static_override_with_persisted(
+    postgres_pool,
+    escalating_work_ticket,
+    library_spy,
+    tmp_path,
+    override_mem_gb,
+    persisted_mem_gb,
+    expected,
+):
+    """Both are raise-only floors, so the seed is their max in either direction.
+    The learned floor normally dominates (it grew from a resolution that already
+    included the override), but the composition must not depend on that."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket"
+        "   SET resource_override = $2::jsonb, escalated_resource_floor = $3::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"mem_gb": override_mem_gb}),
+        json.dumps({"hash": {"mem_gb": persisted_mem_gb}}),
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="none",
+        fail_n_times=0,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    assert backend.sizes_for("hash") == [(expected, 60)]
+    # `load` has no persisted floor, so it sees the ticket-wide override alone —
+    # which is the difference between the two columns, in one assertion.
+    assert backend.sizes_for("load") == [(override_mem_gb, 60)]
+
+
+async def test_persist_escalated_floor_raises_when_ticket_is_gone(postgres_pool):
+    """Not best-effort: a lost write silently reintroduces the re-climb this
+    column exists to prevent, so a missing row raises rather than no-ops."""
+    from qiita_control_plane.runner import _persist_escalated_floor
+
+    with pytest.raises(RuntimeError, match="row not found"):
+        await _persist_escalated_floor(postgres_pool, 2**62, step_name="assemble", mem_gb=384)
+
+
+async def test_persist_escalated_floor_rounds_walltime_up(postgres_pool, escalating_work_ticket):
+    """Whole seconds on the wire, rounded UP. A fractional walltime (ISO 8601
+    admits one) truncated DOWN would leave the stored floor below the ceiling it
+    was clamped to, so the ceiling-exhaustion fail-fast would miss once and burn
+    an attempt at a size that just failed."""
+    from qiita_control_plane.runner import _persist_escalated_floor
+
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await _persist_escalated_floor(
+        postgres_pool,
+        work_ticket_idx,
+        step_name="hash",
+        walltime=timedelta(seconds=119.4),
+    )
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {
+        "hash": {"walltime_seconds": 120}
+    }
+
+
+async def test_persist_escalated_floor_requires_an_axis(postgres_pool, escalating_work_ticket):
+    """A call recording nothing is a programming bug in the retry loop, not a
+    no-op to swallow."""
+    from qiita_control_plane.runner import _persist_escalated_floor
+
+    with pytest.raises(ValueError, match="no axis to record"):
+        await _persist_escalated_floor(
+            postgres_pool,
+            escalating_work_ticket["work_ticket_idx"],
+            step_name="hash",
+        )
+
+
+async def test_fetch_work_ticket_decodes_escalated_resource_floor(
+    postgres_pool, escalating_work_ticket
+):
+    """Same JSONB-decode seam as `resource_override`: asyncpg returns JSONB as a
+    *string* with no codec registered, and `run_workflow` indexes the decoded
+    object. NULL (never escalated) must stay None."""
+    from qiita_control_plane.runner import _fetch_work_ticket
+
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+
+    fresh = await _fetch_work_ticket(postgres_pool, work_ticket_idx)
+    assert fresh["escalated_resource_floor"] is None
+
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"assemble": {"mem_gb": 384, "walltime_seconds": 115200}}),
+    )
+    escalated = await _fetch_work_ticket(postgres_pool, work_ticket_idx)
+    assert escalated["escalated_resource_floor"] == {
+        "assemble": {"mem_gb": 384, "walltime_seconds": 115200}
+    }
 
 
 async def test_unwrapped_exception_marks_failed_as_permanent(
@@ -3730,6 +4081,12 @@ class FakeSlurmBackendClient:
         self.submit_calls = 0
         self.status_calls = 0
         self.result_calls = 0
+        # Handles the runner actually polled / verified. Which ATTEMPT a resume
+        # re-attached to is only observable here: the job id and output_path
+        # carried by the handle say whether recovery landed on the live attempt
+        # or on a dead one.
+        self.status_handles: list = []
+        self.result_handles: list = []
 
     async def submit_step(
         self,
@@ -3765,6 +4122,7 @@ class FakeSlurmBackendClient:
 
     async def status_step(self, handle):
         self.status_calls += 1
+        self.status_handles.append(handle)
         item = self.status_script.pop(0) if self.status_script else StepStatus.COMPLETED
         if isinstance(item, BackendFailure):
             raise item
@@ -3772,6 +4130,7 @@ class FakeSlurmBackendClient:
 
     async def result_step(self, handle, status):
         self.result_calls += 1
+        self.result_handles.append(handle)
         item = self.result_script.pop(0) if self.result_script else {}
         if isinstance(item, BackendFailure):
             raise item
@@ -4159,6 +4518,81 @@ async def test_resume_purged_job_without_output_fails(postgres_pool, slurm_ticke
     )
     assert row["state"] == "failed"
     assert row["failure_type"] == "permanent"
+
+
+async def _seed_failed_then_escalated_step(
+    pool, work_ticket_idx, *, step_name, dead_job_id, live_job_id, step_index=0
+):
+    """Seed the shape an OOM escalation leaves behind: attempt 0 terminal
+    (`failed`, OOM-killed) and attempt 1 live (`submitted`) with its own job id.
+
+    Unreachable before the action ceiling was raised above the step baseline —
+    an OOM-killed step used to fail permanently at attempt 0, so no step ever
+    had a second attempt."""
+    for attempt, job_id in ((0, dead_job_id), (1, live_job_id)):
+        await step_progress.record_submitting(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            step_name=step_name,
+            compute_target=ComputeTarget.SLURM,
+            job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+        )
+        await step_progress.record_submitted(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            slurm_job_id=job_id,
+        )
+    await step_progress.record_failed(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=0,
+        failure_kind=FailureKind.OOM_KILLED.value,
+        failure_reason="OUT_OF_MEMORY (simulated)",
+    )
+
+
+async def test_resume_skips_terminal_attempt_and_adopts_the_live_one(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """Restart recovery must resume at the LIVE attempt, not a dead one.
+
+    Regression test for the incident: `assemble` OOM-killed at attempt 0, the
+    runner escalated and submitted attempt 1, and a control-plane restart then
+    re-entered at attempt 0 (the per-invocation counter starts there). Its
+    `failed` row read as "owned", so the runner re-attached to the ENDED job;
+    slurmrestd had purged it, the poll loop's filesystem tiebreaker synthesized
+    COMPLETED, and result_step verified attempt-0's workspace — which has no
+    manifest precisely because that attempt failed. The ticket died with a
+    CONTRACT_VIOLATION while its live attempt-1 job sat queued, never adopted.
+
+    Pins the outcome by the job id and workspace the runner actually touched:
+    against the pre-fix code these assert attempt 0's job and dir."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_failed_then_escalated_step(
+        postgres_pool, slurm_ticket, step_name="compute", dead_job_id=903, live_job_id=904
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # Adopted, not resubmitted — the escalated job is the one already paid for.
+    assert backend.submit_calls == 0
+    # ...and it is attempt 1's job, not the dead attempt 0's.
+    assert [h.slurm_job_id for h in backend.status_handles] == [904]
+    # The workspace verified is attempt-1's; verifying attempt-0's is the bug.
+    assert backend.result_handles[0].output_path.endswith("attempt-1/output")
 
 
 async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):

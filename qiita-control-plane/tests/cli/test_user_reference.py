@@ -22,6 +22,8 @@ from pathlib import Path
 
 import duckdb
 import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from qiita_common.api_paths import (
     URL_REFERENCE_BY_IDX,
@@ -369,6 +371,9 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
     flight_client = FakeFlightClient()
     flight_client.queue_response(100)  # FASTA
     flight_client.queue_response(101)  # taxonomy
+    flight_client.queue_response(102)  # genome_map
+    genome_map = tmp_path / "gmap.parquet"
+    pq.write_table(pa.table({"feature_idx": pa.array([1], type=pa.int64())}), genome_map)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
         result = await do_reference_load(
@@ -377,6 +382,7 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
             flight_client=flight_client,
             fasta_path=fasta_file,
             taxonomy_path=taxonomy_file,
+            genome_map_path=genome_map,
             name="shard-ref",
             version="1.0",
             shard_index=True,
@@ -393,6 +399,7 @@ async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_
     assert submit_call[2]["action_context"] == {
         "fasta_upload_idx": 100,
         "taxonomy_upload_idx": 101,
+        "genome_map_upload_idx": 102,
         "shard_index": True,
         "build_minimap2": True,
         "build_bowtie2": True,
@@ -413,6 +420,31 @@ async def test_do_reference_load_shard_index_requires_taxonomy(fasta_file, tmp_p
                 token="t",
                 flight_client=FakeFlightClient(),
                 fasta_path=fasta_file,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_requires_genome_map(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--shard-index` without `--genome-map` is rejected before any network call —
+    plan-shards derives the per-shard feature set from qiita.feature_genome, which
+    mint-features populates only when a genome map is supplied."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="genome-map"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
                 name="shard-ref",
                 version="1.0",
                 shard_index=True,
@@ -457,12 +489,15 @@ async def test_do_reference_load_shard_index_all_off_rejected(
     transport, calls = cp_transport
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
         with pytest.raises(ValueError, match="at least one per-shard index"):
+            genome_map = tmp_path / "gmap.parquet"
+            genome_map.write_text("x")
             await do_reference_load(
                 http=http,
                 token="t",
                 flight_client=FakeFlightClient(),
                 fasta_path=fasta_file,
                 taxonomy_path=taxonomy_file,
+                genome_map_path=genome_map,
                 name="shard-ref",
                 version="1.0",
                 shard_index=True,
@@ -484,12 +519,15 @@ async def test_do_reference_load_shard_index_rejects_rype_knobs(
     transport, calls = cp_transport
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
         with pytest.raises(ValueError, match=r"--no-rype-index / --rype-w apply only with --host"):
+            genome_map = tmp_path / "gmap.parquet"
+            genome_map.write_text("x")
             await do_reference_load(
                 http=http,
                 token="t",
                 flight_client=FakeFlightClient(),
                 fasta_path=fasta_file,
                 taxonomy_path=taxonomy_file,
+                genome_map_path=genome_map,
                 name="shard-ref",
                 version="1.0",
                 shard_index=True,
@@ -510,12 +548,15 @@ async def test_do_reference_load_shard_index_rejects_minimap2_preset(
     transport, calls = cp_transport
     async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
         with pytest.raises(ValueError, match=r"--minimap2-preset applies only with --host"):
+            genome_map = tmp_path / "gmap.parquet"
+            genome_map.write_text("x")
             await do_reference_load(
                 http=http,
                 token="t",
                 flight_client=FakeFlightClient(),
                 fasta_path=fasta_file,
                 taxonomy_path=taxonomy_file,
+                genome_map_path=genome_map,
                 name="shard-ref",
                 version="1.0",
                 shard_index=True,

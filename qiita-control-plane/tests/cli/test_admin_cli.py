@@ -1592,3 +1592,167 @@ def test_ticket_cancel_run_idx_requires_action_id():
     with pytest.raises(SystemExit) as exc:
         cli.main(["ticket", "cancel", "--sequencing-run-idx", "3"])
     assert exc.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# fanout (calls the CP fan-out control routes)
+# ---------------------------------------------------------------------------
+
+
+def _fanout_status(**overrides):
+    base = {
+        "kind": "align_block",
+        "key": 2,
+        "label": "align_block(alignment_idx=2)",
+        "total": 46,
+        "held": 30,
+        "running": 8,
+        "failed": 0,
+        "fail_stopped": False,
+        "max_inflight": 8,
+        "override": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_fanout_list_renders_each_cohort(monkeypatch, capsys):
+    from qiita_common.api_paths import URL_WORK_TICKET_FANOUT
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    body = {
+        "cohorts": [
+            _fanout_status(),
+            _fanout_status(kind="shard", key=16, fail_stopped=True, failed=1, held=900, running=0),
+        ]
+    }
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    rc = cli.main(["fanout", "list"])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith(URL_WORK_TICKET_FANOUT)
+    err = capsys.readouterr().err
+    assert "align_block/2" in err
+    assert "shard/16" in err
+    # A frozen cohort must be called out, not left for the reader to infer from counts.
+    assert "FAIL-STOPPED" in err
+
+
+def test_fanout_set_patches_the_cap(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    body = {
+        "released": [7011, 7012, 7013],
+        "status": _fanout_status(held=27, running=11, max_inflight=16, override=16),
+    }
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = json
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    rc = cli.main(["fanout", "set", "align_block", "2", "--max-inflight", "16"])
+    assert rc == 0
+    assert captured["method"] == "PATCH"
+    assert captured["url"].endswith("/work-ticket/fanout/align_block/2")
+    assert captured["json"] == {"max_inflight": 16}
+    err = capsys.readouterr().err
+    assert "released 3" in err
+
+
+def test_fanout_set_clear_sends_an_explicit_null(monkeypatch):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json={"released": [], "status": _fanout_status()},
+            request=httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    assert cli.main(["fanout", "set", "align_block", "2", "--clear"]) == 0
+    # Explicit null, not an omitted key — the route requires the field.
+    assert captured["json"] == {"max_inflight": None}
+
+
+def test_fanout_set_requires_a_cap_or_clear():
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["fanout", "set", "align_block", "2"])
+    assert exc.value.code == 2
+
+
+def test_fanout_set_rejects_cap_and_clear_together():
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["fanout", "set", "align_block", "2", "--max-inflight", "16", "--clear"])
+    assert exc.value.code == 2
+
+
+def test_fanout_set_rejects_a_cap_above_the_ceiling():
+    """Bounded client-side too, so a typo costs no round trip."""
+    from qiita_common.models import MAX_FANOUT_OVERRIDE
+
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            ["fanout", "set", "align_block", "2", "--max-inflight", str(MAX_FANOUT_OVERRIDE + 1)]
+        )
+    assert exc.value.code == 2
+
+
+def test_fanout_set_rejects_an_unknown_kind():
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["fanout", "set", "not_a_kind", "2", "--max-inflight", "16"])
+    assert exc.value.code == 2
+
+
+def test_fanout_pump_posts_and_reports_fail_stop(monkeypatch, capsys):
+    """A pump that releases nothing because the cohort is frozen must say so —
+    a bare `released 0` is what made the original incident hard to read."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    body = {"released": [], "status": _fanout_status(fail_stopped=True, failed=1)}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    rc = cli.main(["fanout", "pump", "align_block", "2"])
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/work-ticket/fanout/align_block/2/pump")
+    err = capsys.readouterr().err
+    assert "FAIL-STOPPED" in err
+    assert "released 0" in err

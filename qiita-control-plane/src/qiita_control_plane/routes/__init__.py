@@ -12,6 +12,7 @@ from .ena_import import router as ena_import_batch_router
 from .host_filter_profile import router as host_filter_profile_router
 from .prep_protocol import router as prep_protocol_router
 from .prep_sample import router as prep_sample_router
+from .prep_sample import study_scoped_router as prep_sample_study_router
 from .read import read_router
 from .read_masked import mask_definition_router, read_masked_router
 from .reference import router as reference_router
@@ -46,6 +47,7 @@ api_router.include_router(alignment_definition_router)
 api_router.include_router(alignment_router)
 api_router.include_router(prep_protocol_router)
 api_router.include_router(prep_sample_router)
+api_router.include_router(prep_sample_study_router)
 api_router.include_router(study_router)
 api_router.include_router(upload_router)
 api_router.include_router(user_router)

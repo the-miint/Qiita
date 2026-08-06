@@ -9,7 +9,10 @@ DuckLake `read` table; this step only writes mask state keyed by the already-min
 Two-stage host filter, run on the QC-PASS subset only (the reads `read_masked`
 would actually surface):
   1. rype `rype_classify` against the host's POSITIVE index — host = any emitted
-     row (a low explicit threshold, not rype's `-N` negative mode);
+     row (a low explicit threshold, not rype's `-N` negative mode). It is handed a
+     `sequence1`-only projection when no read in the block carries a mate: rype
+     sizes its Arrow batch from the column LIST and reloads the whole index per
+     batch, so an all-NULL `sequence2` would double the index reloads;
   2. minimap2 `align_minimap2` (preset 'sr') on rype's SURVIVORS only — host =
      any alignment hit.
 The hit set is the union; minimap2 runs on the reads rype didn't already flag,
@@ -44,6 +47,10 @@ docs/duckdb-miint.md):
     present) `sequence2`. We DISTINCT the `read_id` — the table-function interface
     does not guarantee one best-hit row per read — and append into a BIGINT
     accumulator column, which coerces rype's `read_id` to BIGINT on insert.
+    **It sizes its Arrow batch from the sequence table's COLUMN LIST, not its
+    contents**, and reloads the whole index once per batch, so an entirely-NULL
+    `sequence2` halves the batch and doubles the reloads (duckdb-miint#199) — hence
+    the `_RYPE_QUERY` projection.
   - `align_minimap2(query_table, [index_path], [preset], [max_secondary], ...)` ->
     SAM-like rows (`read_id, flags, reference, ...`); `read_id` round-trips as
     BIGINT (no cast). It reads `sequence1`/`sequence2` and emits one row per mate
@@ -94,11 +101,12 @@ YAML_STEP_NAME = "host_filter"
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
-# rype "host = any emitted row": a low threshold so a nonzero score (any host
-# minimizer match) flags the read. Explicit, NOT rype's 0.1 default — host
-# depletion is deliberately aggressive (drop a borderline read rather than retain
-# host contamination). Pinned by the smoke test against the real function.
-_RYPE_THRESHOLD = 0.0
+# rype "host = any emitted row": rype emits a row per bucket scoring at or above
+# this, so the threshold IS the host call. Explicit and below rype's 0.1 default —
+# host depletion is deliberately aggressive (mask a borderline read rather than
+# retain host contamination) — but not 0.0, which called host on a single
+# incidental minimizer match. Pinned by the smoke test against the real function.
+_RYPE_THRESHOLD = 0.05
 
 # minimap2 short-read preset — the host-filter alignment mode, matching the
 # preset the `.mmi` was built with (build_minimap2_index).
@@ -110,6 +118,11 @@ _MINIMAP2_PRESET = "sr"
 # VIEW (not a CTE) so the COPY and the query view can both reference it.
 _QC_MASK = "host_filter_qc_mask"
 _QUERY = "host_filter_query"
+# The rype-facing projection of _QUERY: both mates when any read has one, `sequence1`
+# alone otherwise. rype sizes its Arrow batch from the COLUMN LIST, so an all-NULL
+# `sequence2` would halve the batch and double the index reloads — see the note at its
+# CREATE. minimap2 keeps reading `_QUERY`/`_SURVIVORS`, which carry both mates.
+_RYPE_QUERY = "host_filter_rype_query"
 _SURVIVORS = "host_filter_survivors"
 _RYPE_HOST = "host_filter_rype_hits"
 _MM2_HOST = "host_filter_minimap2_hits"
@@ -305,8 +318,56 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 conn.execute(f"CREATE TABLE {_MM2_HOST} (sequence_idx BIGINT)")
 
                 if inputs.host_rype_path is not None:
+                    # rype's classify reads a `sequence1`-only VIEW when no read in the
+                    # block carries a mate.
+                    #
+                    # **A batch-SIZING fix, not a projection tidy-up.** miint derives
+                    # rype's `is_paired` from the mere PRESENCE of a `sequence2` column
+                    # (`ValidateSequenceTable` inspects the column list, never the
+                    # values), and rype then assumes a query twice as long, halving its
+                    # Arrow batch size — and `rype_classify_arrow` reloads the WHOLE
+                    # index once per batch, so an all-NULL `sequence2` doubles the number
+                    # of host-index reloads. See duckdb-miint#199; `align_sharded` carries
+                    # the same narrowing against the far larger sharded router, where it
+                    # was measured at ~54 min per avoided reload.
+                    #
+                    # Sizing is all it changes: `is_paired` never reaches
+                    # `rype_classify_arrow`, and miint projects `NULL::BLOB AS sequence2`
+                    # into its own temp table when the column is absent, so rype
+                    # classifies exactly the same reads either way. `_QUERY` itself keeps
+                    # both mates — minimap2 (below, via `_SURVIVORS`) aligns pairs
+                    # natively and needs `sequence2`.
+                    #
+                    # Probed on the BOUND READS, not on `_QUERY` — measured 0.0003 s
+                    # against 0.5424 s for the `_QUERY` shape, whose `sequence2` is a
+                    # trim EXPRESSION over a `_QC_MASK` join with a `reason` filter, all
+                    # of which must be evaluated per row. (The join is arguably the
+                    # bigger half of that cost, not the trim.)
+                    #
+                    # Note what does NOT happen: DuckDB does not sum row-group null
+                    # counts. `count(sequence2)` is metadata-served only when statistics
+                    # PROVE zero NULLs; otherwise it scans the column. So the single-end
+                    # case this projection exists for scans — it is cheap because an
+                    # all-NULL column encodes to ~1 KB, not because anything was pruned —
+                    # and a mixed batch pays a real scan. The choice of relation is what
+                    # makes this cheap, and that part is measured.
+                    #
+                    # `paired > 0` (rather than an all-or-none test) keeps the mate column
+                    # whenever any read has one, so a mixed batch degrades to the
+                    # conservative sizing instead of dropping mates — this job has no
+                    # mixed-batch policy and this fix does not add one.
+                    paired = conn.execute(f"SELECT count(sequence2) FROM {reads_rel}").fetchone()[0]
+                    conn.execute(
+                        f"CREATE VIEW {_RYPE_QUERY} AS SELECT read_id, sequence1"
+                        + (", sequence2" if paired > 0 else "")
+                        + f" FROM {_QUERY}"
+                    )
                     _run_rype_classify(
-                        conn, inputs.host_rype_path, _QUERY, _RYPE_HOST, threshold=_RYPE_THRESHOLD
+                        conn,
+                        inputs.host_rype_path,
+                        _RYPE_QUERY,
+                        _RYPE_HOST,
+                        threshold=_RYPE_THRESHOLD,
                     )
 
                 if inputs.host_minimap2_path is not None:

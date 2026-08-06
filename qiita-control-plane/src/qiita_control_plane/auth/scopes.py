@@ -92,8 +92,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
-            # Owner-id re-identification export is system_admin-only — the
-            # owner-submitted names are PII-pinned and masked elsewhere.
+            # Owner-id re-identification export is system_admin-only —
+            # owner-submitted names can carry incautiously-entered PII. The
+            # field is pinned to member tier, but nothing enforces that pin
+            # yet, and wet_lab_admin and system_admin reach owner-ids
+            # regardless of tier.
             Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             # Per-pool masked-read export is system_admin-only — the first human
             # masked-read pull, admin-gated until there's a model for picking the
@@ -102,6 +105,12 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # Operator-cancel of in-flight compute (flip terminal + scancel) is
             # system_admin-only — it stops running work and reaps SLURM jobs on the
             # operator's behalf, same privilege tier as the destructive deletes.
+            # It ALSO gates the fan-out throttle surface (read cohorts, retune a
+            # cohort's in-flight cap, pump one) rather than that getting a scope of
+            # its own: both are incident-time operator control over in-flight compute
+            # at the same privilege tier. The cost of the reuse is that it cannot be
+            # split later — granting "cancel a stuck ticket" necessarily grants
+            # "retune the global throttle and pump any cohort".
             Scope.WORK_TICKET_CANCEL,
             Scope.TICKET_DOPUT,
         }
