@@ -290,22 +290,34 @@ def _access_denied_detail(access: PrepSampleReadAccess) -> str:
 
     Both denial modes are reported, and separately — an unreadable study is
     something to go ask for, an unlinked sample is a data anomaly to report.
+
+    **Deliberately truncated, and deliberately NOT correlated.** The caller
+    chooses the cohort, so a message that named every blocked sample alongside
+    the study that blocked it would answer, in one request, "which of these
+    identifiers exist and which studies are they in?" for the whole body — an
+    enumeration oracle over `prep_sample_to_study` handed to the lowest role we
+    have. Naming a few of each is enough to act on and does not scale into a
+    dump. Same reason and same shape as the host-filter refusal's `[:5]` in
+    routes/sequencing_run.py.
     """
     parts = []
     if access.blocked_by:
         studies = sorted({s for denied in access.blocked_by.values() for s in denied})
-        samples = sorted(access.blocked_by)
         parts.append(
             f"requires study access at tier '{Tier.VIEWER}' or higher on"
-            f" study {', '.join(str(s) for s in studies)}"
-            f" (prep_samples {', '.join(str(p) for p in samples)})"
+            f" {len(studies)} study/studies (e.g. {_first_few(studies)})"
         )
     if access.unlinked:
         parts.append(
-            "prep_samples with no active study link, which cannot be authorized:"
-            f" {', '.join(str(p) for p in access.unlinked)}"
+            f"{len(access.unlinked)} prep_sample(s) have no active study link and"
+            f" cannot be authorized (e.g. {_first_few(access.unlinked)})"
         )
     return "; ".join(parts)
+
+
+def _first_few(idxs: list[int], limit: int = 5) -> str:
+    head = ", ".join(str(idx) for idx in idxs[:limit])
+    return f"{head}, …" if len(idxs) > limit else head
 
 
 def _sign_alignment_ticket(

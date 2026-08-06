@@ -32,7 +32,11 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_exists,
 )
 from ..repositories.study import fetch_study_exists
-from ..repositories.study_access import fetch_caller_study_access
+from ..repositories.study_access import (
+    CallerStudyAccessRow,
+    fetch_caller_study_access,
+    fetch_caller_study_access_batch,
+)
 from ..repositories.user_eligibility import fetch_user_eligibility
 from .principal import (
     Anonymous,
@@ -443,9 +447,25 @@ async def _study_access_allows(
     inherit fail-open silently, which is the wrong default for a read gate; give
     it an existence check of its own, or make the branch configurable.
     """
-    row = await fetch_caller_study_access(
-        pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
+    return _access_row_allows(
+        await fetch_caller_study_access(
+            pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
+        ),
+        caller=caller,
+        min_tier=min_tier,
     )
+
+
+def _access_row_allows(
+    row: CallerStudyAccessRow | None, *, caller: Principal, min_tier: Tier
+) -> bool:
+    """The policy itself, on an already-fetched row (None = no such study).
+
+    Split from the fetch so the one-study and batched paths decide identically —
+    the narrowing filter below reads many rows in a single query, and a second
+    copy of this comparison is how it would come to disagree with the raising
+    gate about who may read what.
+    """
     if row is None:
         return True
     if row.owner_idx == caller.principal_idx:
@@ -476,18 +496,29 @@ async def filter_studies_caller_can_read(
     its own 401 via `require_human`, and a filter that raises would be a
     surprising shape for one. A caller at or above `bypass_role` gets everything
     back with no DB lookup, matching every other resource gate.
+
+    ONE query for the whole set, unlike the raising gate, which short-circuits on
+    the first refusal and so never issues more than one lookup either. This form
+    has to resolve every study, and the mint route feeding it takes its
+    identifier list from the CALLER — so a per-study round trip would put the
+    request count under the caller's control.
     """
     study_idxs = list(dict.fromkeys(study_idxs))
     if isinstance(caller, Anonymous):
         return set()
     if caller.has_role_at_least(bypass_role):
         return set(study_idxs)
+    rows = await fetch_caller_study_access_batch(
+        pool_or_conn, principal_idx=caller.principal_idx, study_idxs=study_idxs
+    )
     return {
         study_idx
         for study_idx in study_idxs
-        if await _study_access_allows(
-            pool_or_conn, caller=caller, study_idx=study_idx, min_tier=min_tier
-        )
+        # rows.get() is None for a study that does not exist, which
+        # _access_row_allows reads as "not this predicate's job to 404" — the
+        # same fail-open the single-study path documents, and safe for the same
+        # FK-backed reason.
+        if _access_row_allows(rows.get(study_idx), caller=caller, min_tier=min_tier)
     }
 
 

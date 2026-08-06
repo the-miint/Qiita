@@ -301,12 +301,16 @@ class AlignmentDoGetTicketRequest(BaseModel):
     )
 
 
-# Upper bound on a human-named alignment cohort. Same purpose and same number
-# as _MAX_DOGET_FEATURE_IDX: the list rides the signed ticket payload and becomes
-# a `prep_sample_idx IN (...)` on the data plane, so the cap bounds ticket and
-# query size. It is deliberately NOT sized to the per-study access check, which
-# costs one lookup per DISTINCT study regardless of how many samples there are.
-_MAX_DOGET_PREP_SAMPLE_IDX = 100_000
+# Upper bound on a human-named alignment cohort. Deliberately an order of
+# magnitude tighter than _MAX_DOGET_FEATURE_IDX above, which it would otherwise
+# have mirrored: that cap bounds a machine-driven shard roster and only has to
+# keep the ticket payload and the resulting `IN (...)` sane. This one ALSO
+# bounds how much a rejected request can be made to disclose — the route's 403
+# reports which of the caller's chosen identifiers it could not authorize, so
+# the cohort length is the width of that answer. A cohort here is a study's or a
+# pool's worth of samples (hundreds to low thousands); 10k is generous for
+# anything a scientist assembles and cheap to reject beyond.
+_MAX_DOGET_PREP_SAMPLE_IDX = 10_000
 
 
 class AlignmentCohortDoGetTicketRequest(BaseModel):
