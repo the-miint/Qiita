@@ -186,8 +186,44 @@ install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-pl
 # here, before any service restarts onto a broken image. See build-sifs.sh.
 "$(dirname "${BASH_SOURCE[0]}")/build-sifs.sh"
 
-cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
-sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
+# Data-plane instance set — one list drives the nginx upstream AND the systemd
+# units below, so they cannot disagree (see qiita_data_plane_ports in _common.sh).
+# A malformed QIITA_DATA_PLANE_PORTS aborts here, before any config is written.
+DP_PORTS=$(qiita_data_plane_ports)
+echo "data plane instances: $DP_PORTS"
+# Remote instances, if any. Assigned separately (and BEFORE any config is written)
+# so a malformed entry aborts here like a malformed port does. Peers join the nginx
+# upstream only — they are another host's systemd units, not ours.
+DP_PEERS=$(qiita_data_plane_peers)
+if [ -n "$DP_PEERS" ]; then
+    echo "data plane peers (remote, not managed here): $DP_PEERS"
+    # Resolve every peer HERE rather than letting `nginx -t` catch it further
+    # down, which runs after the restarts — see qiita_assert_peer_resolves.
+    for peer in $DP_PEERS; do
+        qiita_assert_peer_resolves "$peer"
+    done
+fi
+
+cp "$INCOMING/deploy/nginx/qiita.conf" "$QIITA_NGINX_CONF"
+sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" "$QIITA_NGINX_CONF"
+sed -i "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" "$QIITA_NGINX_CONF"
+
+# Render the upstream member lines from the instance list. Built as a file and
+# spliced with `sed -e /pat/r` rather than an in-place substitution because the
+# replacement is multi-line; the placeholder line is then deleted.
+DP_UPSTREAM=$(mktemp)
+for port in $DP_PORTS; do
+    printf '    server 127.0.0.1:%s;\n' "$port" >>"$DP_UPSTREAM"
+done
+# Remote members last, so a `nginx -T` reads local-then-remote. Written verbatim —
+# qiita_data_plane_peers already validated the shape (see _common.sh), which is what
+# keeps a stray `;` out of the generated config.
+for peer in $DP_PEERS; do
+    printf '    server %s;\n' "$peer" >>"$DP_UPSTREAM"
+done
+sed -i -e "/__QIITA_DATA_PLANE_UPSTREAM__/r $DP_UPSTREAM" \
+       -e "/__QIITA_DATA_PLANE_UPSTREAM__/d" "$QIITA_NGINX_CONF"
+rm -f "$DP_UPSTREAM"
 cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/
 # Install systemd dropin directories. Each dropin lives under
 # deploy/systemd/<unit>.service.d/*.conf and is materialized at
@@ -214,9 +250,17 @@ restart_if_env_present() {
 }
 restart_if_env_present qiita-control-plane         /etc/qiita/control-plane.env
 restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrator.env
-restart_if_env_present qiita-data-plane@50051      /etc/qiita/data-plane.env
-# If you scale out the data plane (additional qiita-data-plane@NNNN instances),
-# add a restart_if_env_present line for each here.
+# Every configured data-plane instance, from the same list that rendered the
+# nginx upstream above. `enable` before `restart` so an instance added by growing
+# QIITA_DATA_PLANE_PORTS starts on this deploy AND survives a reboot — previously
+# only @50051 was restarted, so a hand-added instance silently ran stale code.
+# Enabling is idempotent, so this is a no-op for instances already enabled.
+for port in $DP_PORTS; do
+    if [ -r /etc/qiita/data-plane.env ]; then
+        systemctl enable "qiita-data-plane@${port}" >/dev/null
+    fi
+    restart_if_env_present "qiita-data-plane@${port}" /etc/qiita/data-plane.env
+done
 
 # Validate the rendered config before reloading. Skip both when TLS files are
 # absent (nginx -t would fail on the missing cert/key and refuse reload). With

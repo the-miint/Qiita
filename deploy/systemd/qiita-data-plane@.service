@@ -14,8 +14,13 @@ User=qiita-data
 # path to e.g. StateDirectory=qiita-data-%i and update HOME= accordingly.
 StateDirectory=qiita-data/%i
 Environment=HOME=/var/lib/qiita-data/%i
-Environment=LISTEN_ADDR=127.0.0.1:%i
 EnvironmentFile=/etc/qiita/data-plane.env
+# AFTER EnvironmentFile= on purpose. systemd applies Environment= and
+# EnvironmentFile= in the order they appear, last writer wins — so with this line
+# ABOVE the env file, a LISTEN_ADDR set in the SHARED /etc/qiita/data-plane.env
+# would override the per-instance value for EVERY instance, and they would all
+# fight over one port. The instance specifier is the port and must always win.
+Environment=LISTEN_ADDR=127.0.0.1:%i
 ExecStart=/opt/qiita/data-plane/qiita-data-plane
 Restart=on-failure
 

@@ -858,9 +858,15 @@ sudo systemctl enable --now qiita-data-plane@50051
 The systemd template `qiita-data-plane@.service` reads
 `LISTEN_ADDR=127.0.0.1:%i` — the instance number *is* the port.
 `qiita-data-plane@50051` listens on `127.0.0.1:50051`, the upstream
-nginx already routes to. For first deploy a single instance is fine;
-add `qiita-data-plane@50052` (etc.) and the matching nginx upstream
-entry when traffic warrants horizontal scaling.
+nginx already routes to. A single instance is right for first deploy.
+
+To scale later, do **not** add units and nginx entries by hand: set
+`QIITA_DATA_PLANE_PORTS="50051 50052 …"` at deploy time and
+`deploy/activate.sh` renders the upstream *and* enables/restarts each
+unit from that one list. (A hand-added upstream member is lost at the
+next deploy, which overwrites `/etc/nginx/conf.d/qiita.conf` from the
+checked-in file.) `QIITA_DATA_PLANE_PEERS` is the sibling knob for data
+planes on other hosts. See `DEPLOY_CHECKLIST.md` for both.
 
 On first start, the DP attaches DuckLake to `qiita_miint_lake` (creates
 metadata tables) and runs `ensure_reference_tables`. All idempotent —
