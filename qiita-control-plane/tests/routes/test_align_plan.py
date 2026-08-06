@@ -37,17 +37,41 @@ def ctx(role_keyed_clients):
 
 async def _seed_align_action(db, *, enabled: bool = True):
     """Seed the align action so the block ticket FK resolves. Audience wet_lab_admin+
-    (matches the shipped align workflow); scope prep_sample:write."""
+    (matches the shipped align workflow); scope prep_sample:write.
+
+    `ON CONFLICT DO NOTHING` because `(align, 1.0.0)` is a FIXED PK several other
+    DB-tier fixtures also seed. On the xdist path each worker gets a freshly
+    DROP/CREATEd database so nothing can pre-exist, but a SERIAL run shares one base
+    DB, where a prior run that died between another fixture's seed and its teardown
+    leaves the row behind — and a plain INSERT then dies on the PK rather than on
+    anything this test is about.
+    """
     await db.execute(
         "INSERT INTO qiita.action"
         " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
         "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status, enabled)"
         " VALUES ($1, $2, 'block'::qiita.scope_target_kind, ARRAY['prep_sample:write']::text[],"
-        "         $3::jsonb, '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', NULL, NULL, $4)",
+        "         $3::jsonb, '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', NULL, NULL, $4)"
+        " ON CONFLICT (action_id, version) DO NOTHING",
         align_planner.ALIGN_ACTION_ID,
         align_planner.ALIGN_ACTION_VERSION,
         '{"service": false, "human_roles": ["wet_lab_admin", "system_admin"]}',
         enabled,
+    )
+
+
+async def _delete_align_action(db):
+    """Remove the align action row, whoever seeded it.
+
+    The twin of the ON CONFLICT above, for the one test that needs the action
+    ABSENT: insert-if-absent keeps a leaked row from crashing the seeders, but it
+    cannot make a leaked row go away, and a test asserting "no action → 503" would
+    then see a 202 instead.
+    """
+    await db.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        align_planner.ALIGN_ACTION_ID,
+        align_planner.ALIGN_ACTION_VERSION,
     )
 
 
@@ -563,6 +587,9 @@ async def test_align_plan_unknown_reference_404(ctx, planned):
 
 async def test_align_plan_missing_action_503(ctx, planned):
     # No align action seeded → 503 (sync actions first) rather than a 500 at the FK.
+    # Deleted rather than merely not-seeded: on a serial run the shared base DB can
+    # carry a leaked row from another fixture, which would make this a 202.
+    await _delete_align_action(planned["db"])
     resp = await ctx["wet"].post(_url(planned), json=_body(planned))
     assert resp.status_code == 503, resp.text
     assert "actions sync" in resp.json()["detail"]

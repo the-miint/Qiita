@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import asyncpg
 
-from ..repositories.mask_definition import mint_mask_definition
+from ..repositories.mask_definition import (
+    ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
+    ADAPTER_SET_HASH_KEY,
+    RESOLVED_QC_KEY,
+    mint_mask_definition,
+)
+from ..repositories.reference_membership import reference_sequence_set_hash
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
 
@@ -17,11 +24,11 @@ from ._upload import _submission_bad_input
 # Read-mask identity (mask_idx) minting
 # =============================================================================
 #
-# A read mask's identity is its filtering CONFIG: the filter workflow + version,
-# the host reference(s) it depletes against, and the resolved QC config. The
-# control plane mints a `mask_idx` deduplicated on the SHA-256 of that config so
-# the same config resolves to the same mask_idx fleet-wide; the host_filter step
-# stamps it onto every read_mask row. The host references are read from the
+# A read mask's identity is its filtering CONFIG: the filter workflow + version, the
+# host reference(s) it depletes against and the params it depletes with, and the
+# resolved QC config. The control plane mints a `mask_idx` deduplicated on the SHA-256
+# of that config so the same config resolves to the same mask_idx fleet-wide; the
+# host_filter step stamps it onto every read_mask row. The host references are read from the
 # sequenced_sample row (where they are pinned at pool fan-out); the resolved QC
 # values mirror the qc job's fastp-equivalent constants so a metadata edit to a
 # protocol row that doesn't change the effective filter yields the same mask.
@@ -51,6 +58,24 @@ LIMA_ARGS_BINDING = "lima_args"
 # faithful to the filter actually applied.
 _QC_RESOLVED_MIN_LENGTH = 100
 _QC_RESOLVED_FILTER_TAIL = "0, 15, 40, 5, 0"
+
+# rype's host-call threshold, the resolved host-filter param the mask hash covers.
+# Mirrors `qiita_compute_orchestrator.jobs.host_filter._RYPE_THRESHOLD` for the same
+# reason as the QC and syndna values (kept here, not imported: the control plane does
+# not depend on the orchestrator package); `test_host_filter_pins` reads it out of that
+# source by AST so the mirror cannot drift silently.
+#
+# It CHANGES which reads are called host, which is what makes it identity and not
+# detail: rype emits a row per bucket scoring at or above the threshold, and the job
+# calls host on ANY emitted row, so the threshold IS the rype host call.
+#
+# The minimap2 stage's `preset` is deliberately NOT here. It is pinned in the job to
+# the preset its `.mmi` was built with ('sr') rather than chosen per mask, and the
+# index is already named by `host_minimap2_reference_idx` below — so it is invariant,
+# and hashing it would re-mint every mask fleet-wide to discriminate nothing. Should a
+# minimap2 param ever become a per-mask choice (a caller-supplied preset, or one that
+# varies by platform), it belongs in `_resolved_host_filter` alongside the threshold.
+_HOST_FILTER_RYPE_THRESHOLD = 0.05
 
 # Canonical lima argument string per preset. The CLIENT chooses only the preset
 # (`lima_preset` in action_context); the control plane resolves the arguments.
@@ -120,18 +145,94 @@ def _workflow_needs_mask(steps: list[Any]) -> bool:
     return False
 
 
-def _adapter_set_hash(adapter_parquet: Path) -> str:
-    """SHA-256 hex of the materialized adapter-set Parquet's bytes — the resolved
-    adapter identity for the mask config hash. Hashing the staged file (not the
-    reference idx) keeps the mask identity tied to the adapter bytes actually
-    applied, so a re-pointed-but-identical adapter set collapses to one mask.
+class AdapterSetHashes(NamedTuple):
+    """The adapter identity under both derivations, for one resolved adapter set.
 
-    Note the hash is over the SERIALIZED Parquet bytes, not the logical sequence
-    set: mint and backfill agree only because both materialize the adapter Parquet
-    through the same `_write_adapter_parquet` / pyarrow writer. A writer change
-    that alters the byte layout shifts this hash and would force a re-mint rather
-    than collapsing to the existing mask — it is an assumption, not something the
-    code enforces."""
+    `current` is what a mask mints on; `legacy` is the lookup key that finds a
+    mask minted before the derivation changed. Both None when the config carries
+    no adapter set.
+    """
+
+    current: str | None
+    legacy: str | None
+
+    def scheme(self) -> str | None:
+        """The `mask_definition.adapter_hash_scheme` value for a config built from
+        this pair: the current derivation's name, or None when there is no adapter
+        set and so no derivation to record."""
+        return ADAPTER_HASH_SCHEME_SEQUENCE_HASH if self.current is not None else None
+
+
+def mask_params_both_derivations(
+    build: Callable[..., dict[str, Any]], hashes: AdapterSetHashes
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """One config's params under the current adapter identity, and under the legacy
+    one for `mint_mask_definition`'s fallback lookup.
+
+    `build` is `_build_mask_params` (or the block planner's `_mask_params_for`
+    wrapper) with everything except `adapter_set_hash` already bound, so the two
+    dicts differ in exactly that key. The legacy half is None when the config
+    carries no adapter set — the two derivations agree on None, so there is
+    nothing for the fallback to find.
+
+    Used by both mint sites so they build the pair identically.
+    """
+    return (
+        build(adapter_set_hash=hashes.current),
+        build(adapter_set_hash=hashes.legacy) if hashes.legacy else None,
+    )
+
+
+async def _adapter_set_hashes(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    reference_idx: int | None,
+    adapter_parquet: Path | None,
+) -> AdapterSetHashes:
+    """Both adapter-identity derivations for one resolved adapter set.
+
+    Shared by the per-sample mint (`_mint_read_mask`) and the block planner so the
+    two derive the same pair for the same adapter set. `adapter_parquet` is the
+    materialized set, needed only for the legacy digest.
+
+    Raises when the two arguments disagree about whether an adapter set exists, or
+    when the reference has no members while a materialized set does: the current
+    digest reads Postgres membership and the legacy one reads the bytes a DoGet of
+    that same membership produced, so a disagreement means those two have drifted
+    and any mask minted from it would describe an adapter set that was not
+    applied.
+    """
+    if adapter_parquet is None and reference_idx is None:
+        return AdapterSetHashes(None, None)
+    if adapter_parquet is None or reference_idx is None:
+        raise _submission_bad_input(
+            "adapter set is half-resolved: adapter_parquet="
+            f"{adapter_parquet!r}, reference_idx={reference_idx!r}; both must be "
+            "present or both absent"
+        )
+    current = await reference_sequence_set_hash(db, reference_idx)
+    if current is None:
+        raise _submission_bad_input(
+            f"adapter reference {reference_idx} has no members in "
+            "qiita.reference_membership, but its adapter set materialized to "
+            f"{adapter_parquet}"
+        )
+    return AdapterSetHashes(current=current, legacy=_adapter_set_hash_legacy(adapter_parquet))
+
+
+def _adapter_set_hash_legacy(adapter_parquet: Path) -> str:
+    """SHA-256 hex of the materialized adapter-set Parquet's bytes — the ORIGINAL
+    adapter identity derivation, retained only to recognize masks minted under it.
+
+    The pyarrow writer stamps its own version into the Parquet footer
+    (`created_by = "parquet-cpp-arrow version X.Y.Z"`), so this digest is a
+    function of the writer version as well as the sequences: deterministic within
+    a version, different across any bump. The measured digests and the removal
+    plan are in the 20260804000000 migration header.
+
+    Nothing mints on this value. `mint_mask_definition` takes it as the legacy
+    lookup key and re-keys a row it matches onto
+    `repositories.reference_membership.reference_sequence_set_hash`."""
     return hashlib.sha256(adapter_parquet.read_bytes()).hexdigest()
 
 
@@ -198,6 +299,31 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _resolved_host_filter(host_rype_reference_idx: int | None) -> dict[str, Any] | None:
+    """The effective host-filter params for the mask hash, or None when the identity
+    records no rype reference to apply them to.
+
+    Keyed off that reference rather than a separate gate, so the block can never claim
+    a stage the identity does not also name a reference for. Under the two-reference
+    layout that is exactly "no rype stage ran" — the job skips the stage whose index
+    path is unbound, and the path comes from the reference. A LEGACY
+    `host_reference_idx` ticket is the one case where rype can run with this None: that
+    key is not threaded into the mint at all, so such a mask's params already describe
+    no host filtering whatsoever. Pre-existing and not widened here — flagged so the
+    None is not read as a claim that nothing depleted.
+
+    NESTED and None-when-absent, mirroring `resolved_lima` / `resolved_syndna`: the
+    reference names WHAT we deplete against, never HOW aggressively. A read is host
+    when rype scores it at or above `rype_threshold` against that reference, so two
+    masks built at different thresholds describe different filters and must not share
+    a mask_idx. Nesting is what keeps a future threshold change from re-minting a mask
+    that never ran rype at all.
+    """
+    if host_rype_reference_idx is None:
+        return None
+    return {"rype_threshold": _HOST_FILTER_RYPE_THRESHOLD}
+
+
 def _build_mask_params(
     *,
     action_id: str,
@@ -215,13 +341,14 @@ def _build_mask_params(
 
     This is the SINGLE source of truth for the mask's identity shape — the mint
     path (`_mint_read_mask`) and the block planner both call it so they derive the
-    SAME hash for the SAME effective config. Every value is the EFFECTIVE filter (the host refs
-    the filter applies + adapter bytes hash + thresholds), so two callers with the
-    same effective config collapse to one mask even if descriptive metadata
-    differs. `adapter_set_hash` is passed in already computed (the SHA-256 hex of
-    the materialized adapter Parquet, via `_adapter_set_hash`) rather than a file
-    path, so the backfill can supply it from a re-materialized adapter set without
-    this helper touching the filesystem.
+    SAME hash for the SAME effective config. Every value is the EFFECTIVE filter
+    (the host refs the filter applies + the params it applies on top of them + the
+    adapter-set identity + thresholds), so two callers with the same effective config
+    collapse to one mask even if descriptive metadata differs. `adapter_set_hash` is
+    passed in already computed (`reference_sequence_set_hash`, over the adapter
+    reference's sequence hashes) rather than as a reference idx, so a caller can also
+    pass the legacy byte-derived value to build the fallback lookup key — see
+    `mask_params_both_derivations`.
 
     `resolved_lima` and `resolved_syndna` are what distinguish the five PacBio
     protocols. `prep_protocol_idx` cannot: it is the operator's `--prep-protocol-idx`
@@ -242,12 +369,13 @@ def _build_mask_params(
         "filter_version": action_version,
         "host_rype_reference_idx": host_rype_reference_idx,
         "host_minimap2_reference_idx": host_minimap2_reference_idx,
+        "resolved_host_filter": _resolved_host_filter(host_rype_reference_idx),
         "prep_protocol_idx": prep_protocol_idx,
-        "resolved_qc": {
+        RESOLVED_QC_KEY: {
             "instrument_model": instrument_model,
             "min_length": _QC_RESOLVED_MIN_LENGTH,
             "filter_read_tail": _QC_RESOLVED_FILTER_TAIL,
-            "adapter_set_hash": adapter_set_hash,
+            ADAPTER_SET_HASH_KEY: adapter_set_hash,
         },
         "resolved_lima": resolved_lima,
         "resolved_syndna": resolved_syndna,
@@ -263,6 +391,7 @@ async def _mint_read_mask(
     originator_principal_idx: int,
     instrument_model: str | None,
     adapter_parquet: Path | None,
+    default_adapter_reference_idx: int | None,
     host_rype_reference_idx: int | None,
     host_minimap2_reference_idx: int | None,
     resolved_lima: dict[str, Any] | None,
@@ -276,9 +405,13 @@ async def _mint_read_mask(
         from the same action_context values `_resolve_host_filter_indexes`
         consumes (`host_rype_reference_idx` / `host_minimap2_reference_idx`) — so
         the minted mask_idx's params describe the filter that ran. Absent host
-        refs mean no host filtering, a faithful part of the config (None), and
+        refs mean no host filtering, a faithful part of the config (None),
+      * the params those host stages APPLY to those references (`resolved_host_filter`
+        — rype's host-call threshold), because the reference says what we deplete
+        against and never how aggressively, and
       * the resolved QC config (instrument model gating polyG, the fastp-`-l 100`
-        thresholds, and a hash of the materialized adapter set).
+        thresholds, and the adapter-set identity — a hash of the adapter
+        reference's sequences, not of the materialized artifact).
     `mint_mask_definition` hashes `params` (canonical JSON) and upserts on it, so
     the same effective config resolves to the same mask_idx fleet-wide.
 
@@ -311,20 +444,27 @@ async def _mint_read_mask(
 
     # Resolved config — assembled by the shared `_build_mask_params` so the mint
     # path and the block planner derive the SAME hash for the same effective
-    # config. The adapter identity is the SHA-256 of the materialized adapter
-    # bytes (None when this workflow uses no adapter set).
-    params = _build_mask_params(
-        action_id=action_id,
-        action_version=action_version,
-        prep_protocol_idx=prep_protocol_idx,
-        instrument_model=instrument_model,
-        adapter_set_hash=(
-            _adapter_set_hash(adapter_parquet) if adapter_parquet is not None else None
+    # config. The adapter identity is the reference's sorted sequence hashes
+    # (None when this workflow uses no adapter set); the legacy params carry the
+    # same config under the byte derivation, as the mint's fallback lookup key.
+    adapter_hashes = await _adapter_set_hashes(
+        pool,
+        reference_idx=default_adapter_reference_idx if adapter_parquet is not None else None,
+        adapter_parquet=adapter_parquet,
+    )
+    params, legacy_params = mask_params_both_derivations(
+        partial(
+            _build_mask_params,
+            action_id=action_id,
+            action_version=action_version,
+            prep_protocol_idx=prep_protocol_idx,
+            instrument_model=instrument_model,
+            host_rype_reference_idx=host_rype_reference_idx,
+            host_minimap2_reference_idx=host_minimap2_reference_idx,
+            resolved_lima=resolved_lima,
+            resolved_syndna=resolved_syndna,
         ),
-        host_rype_reference_idx=host_rype_reference_idx,
-        host_minimap2_reference_idx=host_minimap2_reference_idx,
-        resolved_lima=resolved_lima,
-        resolved_syndna=resolved_syndna,
+        adapter_hashes,
     )
 
     try:
@@ -335,6 +475,8 @@ async def _mint_read_mask(
                 filter_version=action_version,
                 params=params,
                 principal_idx=originator_principal_idx,
+                legacy_params=legacy_params,
+                adapter_hash_scheme=adapter_hashes.scheme(),
             )
     except asyncpg.ForeignKeyViolationError as exc:
         raise _submission_bad_input(
@@ -357,30 +499,31 @@ async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: 
     )
 
 
-async def _materialize_backfill_adapter_set_hash(
+async def _materialize_adapter_set_hashes(
     pool: asyncpg.Pool,
     *,
     default_adapter_reference_idx: int | None,
     data_plane_url: str,
     signing_key: bytes,
     workspace: Path,
-) -> str | None:
-    """Re-derive the canonical adapter-set hash for the backfill, once.
+) -> AdapterSetHashes:
+    """Re-derive the canonical adapter set's identity, once, for a caller that has
+    no materialized adapter Parquet of its own.
 
-    Every read-mask / fastq-to-parquet ticket masks against the SAME canonical
-    adapter set (`default_adapter_reference_idx`), so the `adapter_set_hash` that
-    feeds `_build_mask_params` is identical across all of them. We re-materialize
-    the adapter Parquet once via the same DoGet path the mint uses
-    (`_resolve_qc_adapters`) and hash its bytes (`_adapter_set_hash`). The hash is
-    over the SERIALIZED Parquet bytes, so this reproduces the mint's hash only as
-    long as the backfill runs under the same pyarrow/Parquet writer the mint did:
-    a writer change that alters the on-disk byte layout would shift the hash and
-    force a re-mint rather than a backfill match. Returns None when no default
-    adapter reference is configured (a deploy that mints maskless / for a test
-    seam) — the caller then builds params with `adapter_set_hash=None`.
+    Every read-mask ticket masks against the SAME canonical adapter set
+    (`default_adapter_reference_idx`), so the pair that feeds `_build_mask_params`
+    is identical across all of them. The current digest reads Postgres membership;
+    the legacy one needs the bytes, so the adapter Parquet is re-materialized via
+    the same DoGet path the mint uses (`_resolve_qc_adapters`). That
+    materialization exists ONLY to feed the legacy digest and comes out with it in
+    the contract phase.
+
+    Returns both-None when no default adapter reference is configured (a deploy
+    that mints maskless / for a test seam) — the caller then builds params with
+    `adapter_set_hash=None`.
     """
     if default_adapter_reference_idx is None:
-        return None
+        return AdapterSetHashes(None, None)
     bound = await _resolve_qc_adapters(
         pool,
         default_adapter_reference_idx=default_adapter_reference_idx,
@@ -388,4 +531,8 @@ async def _materialize_backfill_adapter_set_hash(
         signing_key=signing_key,
         workspace=workspace,
     )
-    return _adapter_set_hash(bound[QC_ADAPTER_BINDING])
+    return await _adapter_set_hashes(
+        pool,
+        reference_idx=default_adapter_reference_idx,
+        adapter_parquet=bound[QC_ADAPTER_BINDING],
+    )

@@ -268,6 +268,15 @@ PATH_WORK_TICKET_CANCEL = "/cancel"
 # Read a single step attempt's stdout/stderr tail (operator diagnosis without
 # a host shell — the logs live under PATH_SCRATCH/ticket, served by the CP).
 PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
+# Fan-out throttle control (system_admin, work_ticket:cancel). GET the collection
+# lists every cohort with held or in-flight children; PATCH one cohort retunes its
+# in-flight cap AND pumps it in the same call; POST .../pump re-triggers a pump
+# without touching the cap. A cohort is addressed by (kind, key) — the kinds are
+# `FanoutCohortKind`, the key is the reference_idx / mask_idx / alignment_idx the
+# fan-out hangs off. `pump` is a verb segment, the naming carve-out.
+PATH_WORK_TICKET_FANOUT = "/fanout"
+PATH_WORK_TICKET_FANOUT_COHORT = "/fanout/{kind}/{key}"
+PATH_WORK_TICKET_FANOUT_COHORT_PUMP = "/fanout/{kind}/{key}/pump"
 
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 # GET-list URL — same path as the POST root, named distinctly so clients
@@ -277,6 +286,11 @@ URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
 URL_WORK_TICKET_CANCEL = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_CANCEL}"
 URL_WORK_TICKET_STEP_LOGS = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_STEP_LOGS}"
+URL_WORK_TICKET_FANOUT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT}"
+URL_WORK_TICKET_FANOUT_COHORT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT}"
+URL_WORK_TICKET_FANOUT_COHORT_PUMP = (
+    f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT_PUMP}"
+)
 
 
 # =============================================================================
@@ -364,13 +378,22 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 # Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
 # tags the data plane's read_mask / read_masked rows. POST is service-account-
 # only (Scope.READ_MASKED_DOGET).
+#
+# The three GETs are the human read surface: which masks exist, what config a
+# mask encodes, and which samples are masked-complete under it. They carry no
+# read data — only filter metadata and per-sample completion state — so they sit
+# at Scope.PREP_SAMPLE_READ (every human role holds it), narrowed per study for a
+# plain user. The privacy-sensitive pulls (read_masked:doget,
+# admin:masked_read_export) are unchanged.
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
-PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
-PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # DELETE a mask (lake rows + Postgres row)
+PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
+PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
+URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_PREP_SAMPLE}"
 
 # =============================================================================
 # /alignment-definition/* — control-plane sharded-alignment config identity
@@ -645,6 +668,14 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
+# Study-scoped single biosample: a GET view carrying this study's local
+# metadata alongside the global metadata, and a metadata upsert PATCH. Both
+# anchor on the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
+PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Create a study-local biosample field definition (POST). The study-scoped
+# mint hangs off the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/biosample-field"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
@@ -662,6 +693,9 @@ PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
+URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
+URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
@@ -688,6 +722,10 @@ PATH_SEQUENCED_SAMPLE_LIST_BY_RUN = "/{sequencing_run_idx}/sequenced-sample/list
 # rather than `list-idxs`, paralleling LIST_BY_POOL.
 PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = "/{sequencing_run_idx}/sequenced-sample/list"
 PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY = "/{study_idx}/sequenced-sample/list-idxs"
+PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenced_sample_idx}"
+PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
+)
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
 # than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
@@ -705,6 +743,12 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
+)
+URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY}"
+)
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )
@@ -725,7 +769,11 @@ PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
 # without a raw production UPDATE. Reversible by design (a misclassified well
 # must be recoverable), unlike the terminal principal retire.
 PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
+# Create a study-local prep_sample field definition (POST). The study-scoped
+# mint hangs off the /study router (the caller is authorized on the study).
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"

@@ -33,6 +33,7 @@ import os
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import asyncpg
@@ -46,12 +47,15 @@ from ...backfill.host_taxon import (
     apply_backfill,
     plan_backfill,
 )
+from ...backfill.mask_adapter_hash import RekeyPlan, apply_rekey, plan_rekey
+from ...config import _parse_optional_positive_int_env
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
-from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
+from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
+from .fanout import add_fanout_parser
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
     _FAILURE_STAGES_REJECTING_STEP_NAME,
@@ -207,6 +211,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_cancel.set_defaults(handler=_handle_ticket_cancel)
 
+    add_fanout_parser(sub)
+
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
     p_mask_delete = p_mask_sub.add_parser(
@@ -309,6 +315,58 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_backfill_host.set_defaults(handler=_handle_backfill_host_taxon_id)
 
+    p_backfill_mask = p_backfill_sub.add_parser(
+        "mask-adapter-hash",
+        help="Re-key mask_definition rows onto the current adapter-identity derivation",
+        description=(
+            "Convert qiita.mask_definition rows whose resolved_qc.adapter_set_hash"
+            " still comes from the SHA-256 of the serialized adapter Parquet (a digest"
+            " that tracked the pyarrow writer version) onto the SHA-256 of the"
+            " reference's sorted qiita.feature.sequence_hash values. The mint already"
+            " converts a row when something re-mints its config; this converts the"
+            " rest, which is what the contract phase reads as its go-ahead. mask_idx is"
+            " unchanged, so nothing re-masks. Rows carrying a stored hash other than the"
+            " single canonical adapter set cannot be attributed without the adapter"
+            " bytes and are REPORTED, not written. Idempotent; dry-run by default."
+            " Needs DATABASE_URL."
+        ),
+    )
+    p_backfill_mask.add_argument(
+        "--reference-idx",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "The adapter reference to derive the current identity from"
+            " (default: QIITA_DEFAULT_ADAPTER_REFERENCE_IDX)."
+        ),
+    )
+    p_backfill_mask.add_argument(
+        "--mask-idx",
+        dest="mask_idxs",
+        type=int,
+        action="append",
+        default=None,
+        metavar="N",
+        help="Restrict the plan to these mask_idx values. Repeatable.",
+    )
+    p_backfill_mask.add_argument(
+        "--attribute-all",
+        action="store_true",
+        help=(
+            "Assert that every --mask-idx row was minted from --reference-idx, so they"
+            " all convert however many distinct hashes they carry. Requires --mask-idx."
+            " This is how an unattributable report is resolved: without it, a deploy"
+            " that has held more than one adapter set can never finish the migration."
+        ),
+    )
+    p_backfill_mask.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the re-keyed rows (default: dry-run, report only, no writes).",
+    )
+    p_backfill_mask.set_defaults(handler=_handle_backfill_mask_adapter_hash)
+
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
     p_actions_sync = p_actions_sub.add_parser(
@@ -328,7 +386,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Export the owner-submitted original sample names for a study as a"
             " TSV (system_admin only). Maps biosample_idx + accession back to"
-            " the PII-pinned owner name."
+            " the owner's original sample name (member-restricted; may contain PII)."
         ),
     )
     p_owner_id.add_argument(
@@ -495,14 +553,7 @@ async def _purge_failed(
     mask_idx and cannot duplicate rows. The command exits non-zero whenever the
     failures list is non-empty.
     """
-    try:
-        pool = await asyncpg.create_pool(
-            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
-        )
-    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
-        raise RuntimeError(
-            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
-        ) from exc
+    pool = await open_admin_pool(database_url)
     try:
         # Mask-idx coverage gate (computed up front so dry-run reports it and
         # --execute can refuse on it before any destructive work). The shared-mask
@@ -832,14 +883,7 @@ async def _backfill_host_taxon_id(database_url: str, *, execute: bool) -> tuple[
     the same way either way, so the report an operator reads before writing is
     the report of exactly what will be written.
     """
-    try:
-        pool = await asyncpg.create_pool(
-            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
-        )
-    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
-        raise RuntimeError(
-            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
-        ) from exc
+    pool = await open_admin_pool(database_url)
     try:
         plan = await plan_backfill(pool)
         if not execute:
@@ -911,6 +955,131 @@ def _handle_backfill_host_taxon_id(
     return 0
 
 
+async def _backfill_mask_adapter_hash(
+    database_url: str,
+    *,
+    reference_idx: int,
+    mask_idxs: list[int] | None,
+    attribute_all: bool,
+    execute: bool,
+    report: Callable[[RekeyPlan], None],
+) -> tuple[RekeyPlan, int]:
+    """Plan the adapter-hash re-key and, when `execute`, apply it.
+
+    Returns `(plan, written)`. `written` is 0 on a dry run and on a blocked plan.
+    The plan carries every value the write uses, including the collision check, so
+    the report an operator reads before writing is the report of exactly what will
+    be written.
+    """
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_rekey(
+            pool,
+            reference_idx=reference_idx,
+            mask_idxs=mask_idxs,
+            attribute_all=attribute_all,
+        )
+        # Print before applying: apply_rekey raises on a blocked plan, and the
+        # rows it is refusing over are exactly what the operator needs to see.
+        report(plan)
+        if not execute or plan.blocked():
+            return plan, 0
+        return plan, await apply_rekey(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_mask_adapter_hash(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+
+    reference_idx = args.reference_idx
+    if reference_idx is None:
+        # Same parse the CP settings loader applies to this var, so a
+        # present-but-invalid value fails the same way here as at boot rather
+        # than raising a bare ValueError traceback.
+        try:
+            reference_idx = _parse_optional_positive_int_env("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if reference_idx is None:
+            print(
+                "error: no --reference-idx and QIITA_DEFAULT_ADAPTER_REFERENCE_IDX not set",
+                file=sys.stderr,
+            )
+            return 2
+
+    def report(plan: RekeyPlan) -> None:
+        in_scope = (
+            len(plan.writable()) + len(plan.collided) + sum(map(len, plan.unattributable.values()))
+        )
+        print(f"adapter reference                  : {plan.reference_idx}")
+        print(f"current adapter_set_hash           : {plan.current_hash}")
+        if args.mask_idxs is not None:
+            # A named row that is already stamped, or carries no adapter set, is
+            # out of scope — say so rather than letting it vanish from the counts.
+            print(f"named / in scope                   : {len(args.mask_idxs)} / {in_scope}")
+        print(f"already current (stamp scheme only): {len(plan.stamp_only)}")
+        print(f"legacy hash -> re-key              : {len(plan.convertible)}")
+        print(f"unattributable (left unwritten)    : {sum(map(len, plan.unattributable.values()))}")
+        print(f"collided (left unwritten)          : {len(plan.collided)}")
+
+        for stored, mask_idxs in plan.unattributable.items():
+            # Name the hash and the masks on it: attributing these needs the
+            # adapter bytes that produced them — an operator decision, not a
+            # default. `--mask-idx … --attribute-all` is how that decision is
+            # stated.
+            print(f"\n  stored adapter_set_hash {stored}")
+            print(f"    mask_idx: {mask_idxs}")
+
+        if plan.collided:
+            print(
+                f"\n  {len(plan.collided)} row(s) would land on a params_hash another row"
+                f" holds, or on the same one as a sibling here: {plan.collided}."
+                " Two mask_idx values would describe one config; merging them means"
+                " repointing qiita.mask_sample and qiita.work_ticket off one of them."
+            )
+
+    try:
+        plan, written = asyncio.run(
+            _backfill_mask_adapter_hash(
+                database_url,
+                reference_idx=reference_idx,
+                mask_idxs=args.mask_idxs,
+                attribute_all=args.attribute_all,
+                execute=args.execute,
+                report=report,
+            )
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if plan.blocked():
+        # Exit non-zero so a wrapping script sees the gate DEPLOY_CHECKLIST.md
+        # turns this report into; `apply_rekey` refuses in this state too.
+        print(
+            "\nerror: nothing written — resolve the rows above first."
+            " An unattributable hash means more than one adapter set is stored"
+            " fleet-wide, which also puts the convertible attribution in doubt.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.execute:
+        print(f"\nwrote {written} mask_definition row(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to write {len(plan.writable())} row(s)."
+        )
+    return 0
+
+
 __all__ = [
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
@@ -941,7 +1110,9 @@ __all__ = [
     "_handle_login",
     "_handle_mask_delete",
     "_backfill_host_taxon_id",
+    "_backfill_mask_adapter_hash",
     "_handle_backfill_host_taxon_id",
+    "_handle_backfill_mask_adapter_hash",
     "_handle_mask_purge_failed",
     "_handle_masked_read_export",
     "_handle_owner_biosample_id",

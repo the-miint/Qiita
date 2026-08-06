@@ -527,7 +527,7 @@ def test_align_sharded_aligner_gets_a_materialized_query(tmp_path, monkeypatch, 
 
 def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, monkeypatch):
     """The materialized copy is for the ALIGNER only — the SE/PE probe and the routing
-    pass still read the VIEW, and the copy does not exist yet when they run.
+    pass still read a VIEW, and the copy does not exist yet when they run.
 
     Both would be actively worse off against a table: the probe is answered from the
     Parquet's row-group statistics without touching the sequence columns, and rype
@@ -559,12 +559,92 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     )
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    assert routed_query_tables == [align_sharded._QUERY]
+    assert routed_query_tables == [align_sharded._ROUTING_QUERY]
     probe = _sole_index(sql_log, "count(sequence2), count(*)", what="SE/PE probe")
     created = _sole_index(
         sql_log, f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}", what="materialize"
     )
     assert probe < created
+
+
+@pytest.mark.parametrize(
+    ("sequence2", "routing_cols"),
+    [
+        (None, ["read_id", "sequence1"]),
+        ("TTGG", ["read_id", "sequence1", "sequence2"]),
+    ],
+    ids=["single-end", "paired-end"],
+)
+def test_align_sharded_routing_query_drops_an_all_null_mate(
+    tmp_path, monkeypatch, sequence2, routing_cols
+):
+    """A single-end block hands the rype routing pass `sequence1` ALONE; a paired-end one
+    keeps both mates. The ALIGNER keeps both mates either way.
+
+    This is a batch-SIZING property, not a projection tidy-up, and it is invisible in the
+    output — which is why it needs pinning here. miint derives rype's `is_paired` from the
+    PRESENCE of a `sequence2` column and never from its values (duckdb-miint#199), and rype
+    then assumes a query twice as long, halving its Arrow batch size. Since
+    `rype_classify_arrow` reloads the whole index once per batch, an all-NULL `sequence2`
+    doubles the number of full router-index reads — measured at ~54 min each against the
+    193 GB w=20 WoL3 router. Nothing about the alignments produced would change, so only
+    an assertion on the relation's COLUMN LIST can catch a regression here.
+
+    The aligner assertion is the other half: `sequence2` must survive into
+    `_QUERY_MATERIALIZED`, because both sharded aligners need it to align a pair natively.
+    Narrowing that relation instead of this one would silently turn PE alignment into SE."""
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", sequence2)])
+    router, shard_dir = _make_indexes(tmp_path)
+
+    calls: list = []
+    _install_stubs(
+        align_sharded,
+        monkeypatch,
+        routing={1: ["0"]},
+        alignments={1: [_se_hit(100)]},
+        calls=calls,
+    )
+
+    # WRAP the installed routing stub rather than replacing it: the stub is what hands
+    # the align seam its connection, so a bare replacement would strand `calls`.
+    seen_routing_cols: list[list[str]] = []
+    seen_routing_kinds: list[str] = []
+    installed_r2s = align_sharded._build_read_to_shard
+
+    def _record_routing_cols(conn, router_index_path, query_table, dest_table, *, threshold):
+        seen_routing_cols.append(
+            [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
+        )
+        # The KIND matters as much as the columns: a TABLE here would hold a second
+        # copy of the block's sequences (~15 GB long-read) concurrently with the
+        # corpus copy rype makes internally — the hazard docs/duckdb-miint.md
+        # documents, and the reason this is a view over a view.
+        seen_routing_kinds.append(
+            conn.execute(
+                "SELECT table_type FROM information_schema.tables WHERE table_name = ?",
+                [query_table],
+            ).fetchone()[0]
+        )
+        installed_r2s(conn, router_index_path, query_table, dest_table, threshold=threshold)
+
+    monkeypatch.setattr(align_sharded, "_build_read_to_shard", _record_routing_cols)
+
+    inputs = align_sharded.Inputs(
+        # reads stream (see _stub_block_read_stream)
+        reference_idx=42,
+        alignment_idx=555,
+        aligner="minimap2",
+        router_index_path=router,
+        shard_directory=shard_dir,
+        work_ticket_idx=1,
+    )
+    asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
+
+    assert seen_routing_cols == [routing_cols]
+    assert seen_routing_kinds == ["VIEW"]
+    assert calls[0]["cols"] == ["read_id", "sequence1", "sequence2"]
 
 
 def test_align_sharded_materialized_query_lives_only_across_the_align(tmp_path, monkeypatch):

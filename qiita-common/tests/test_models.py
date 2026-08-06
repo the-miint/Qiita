@@ -1,11 +1,15 @@
 """Tests for shared Pydantic models."""
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
+import qiita_common.models as models_module
+from qiita_common.auth_constants import MAX_ACCESSION_LENGTH
+from qiita_common.models import FieldDataType
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
@@ -900,3 +904,577 @@ def test_read_mask_reason_sql_list_is_sorted_and_quoted():
         "'host_minimap2', 'host_rype', 'pass'"
     )
     assert read_mask_reason_sql_list(ReadMaskBucket.SPIKEIN) == "'spikein_syndna'"
+
+
+def test_sample_metadata_write_request_rejects_empty_metadata():
+    """Tests the case where the metadata dict is empty: an empty write is
+    rejected at the wire boundary (min_length=1), matching the core PATCH's
+    at-least-one-field rule.
+    """
+    from qiita_common.models import SampleMetadataWriteRequest
+
+    with pytest.raises(ValidationError):
+        SampleMetadataWriteRequest(metadata={})
+
+
+_BIOSAMPLE_IMPORT_KWARGS = {
+    "owner_idx": 1,
+    "owner_biosample_id_field_name": "owner sample id",
+    "owner_biosample_id_value": "S1",
+}
+
+_SEQUENCED_SAMPLE_CREATE_KWARGS = {
+    "biosample_idx": 1,
+    "prep_protocol_idx": 1,
+    "owner_idx": 1,
+    "sequenced_pool_item_id": "P1",
+    "primary_study_idx": 1,
+}
+
+# Every request model carrying a wire-side metadata dict, with the other
+# required fields it needs to reach validation of that dict.
+_METADATA_REQUEST_MODEL_KWARGS = [
+    ("SampleMetadataWriteRequest", {}),
+    ("BiosampleImportRequest", _BIOSAMPLE_IMPORT_KWARGS),
+    ("SequencedSampleCreateRequest", _SEQUENCED_SAMPLE_CREATE_KWARGS),
+]
+
+
+# Every wire field carrying an externally-assigned accession, whose backing
+# column is VARCHAR(50) and UNIQUE.
+_ACCESSION_FIELDS = [
+    ("BiosampleImportRequest", "biosample_accession", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosampleImportRequest", "ena_sample_accession", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosamplePatchRequest", "biosample_accession", {}),
+    ("BiosamplePatchRequest", "ena_sample_accession", {}),
+    (
+        "SequencedSampleCreateRequest",
+        "ena_experiment_accession",
+        _SEQUENCED_SAMPLE_CREATE_KWARGS,
+    ),
+    ("SequencedSampleCreateRequest", "ena_run_accession", _SEQUENCED_SAMPLE_CREATE_KWARGS),
+    ("SequencedSamplePatchRequest", "ena_experiment_accession", {}),
+    ("SequencedSamplePatchRequest", "ena_run_accession", {}),
+]
+
+
+@pytest.mark.parametrize("model_name, field_name, other_kwargs", _ACCESSION_FIELDS)
+def test_accession_fields_reject_over_length(model_name: str, field_name: str, other_kwargs: dict):
+    """Tests the case where an accession exceeds the width of its column: the
+    wire boundary rejects it, rather than passing it to the database to fail
+    there.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(**{**other_kwargs, field_name: "E" * (MAX_ACCESSION_LENGTH + 1)})
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert (field_name,) in error_locs
+
+
+@pytest.mark.parametrize("model_name, field_name, other_kwargs", _ACCESSION_FIELDS)
+def test_accession_fields_accept_widest_storable(
+    model_name: str, field_name: str, other_kwargs: dict
+):
+    """Tests the case where an accession is exactly as wide as its column: it is
+    accepted rather than turned away with the values one character longer.
+    """
+    model_cls = getattr(models_module, model_name)
+    widest = "E" * MAX_ACCESSION_LENGTH
+
+    built = model_cls(**{**other_kwargs, field_name: widest})
+
+    assert getattr(built, field_name) == widest
+
+
+@pytest.mark.parametrize("model_name, field_name, other_kwargs", _ACCESSION_FIELDS)
+@pytest.mark.parametrize("blank_value", ["", " ", "   ", "\t"])
+def test_accession_fields_reject_blank(
+    model_name: str, field_name: str, other_kwargs: dict, blank_value: str
+):
+    """Tests the case where an accession carries no content: it is rejected so
+    the column holds NULL instead. The column is UNIQUE, which admits many NULLs
+    but only one empty string, so empty text would let the first caller block
+    every later one.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(**{**other_kwargs, field_name: blank_value})
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert (field_name,) in error_locs
+
+
+# Every non-metadata wire field that must carry content, with the other
+# required fields its model needs to reach validation of that field. The value
+# under test is supplied by the test, overriding any placeholder here.
+_NON_BLANK_TEXT_FIELDS = [
+    ("BiosampleImportRequest", "owner_biosample_id_field_name", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosampleImportRequest", "owner_biosample_id_value", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosampleImportRequest", "metadata_checklist_name", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosampleImportRequest", "biosample_accession", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosampleImportRequest", "ena_sample_accession", _BIOSAMPLE_IMPORT_KWARGS),
+    ("BiosamplePatchRequest", "metadata_checklist_name", {}),
+    ("BiosamplePatchRequest", "biosample_accession", {}),
+    ("BiosamplePatchRequest", "ena_sample_accession", {}),
+    ("BiosampleStudyFieldCreateRequest", "display_name", {"data_type": FieldDataType.NUMERIC}),
+    (
+        "BiosampleStudyFieldCreateRequest",
+        "description",
+        {"display_name": "pH", "data_type": FieldDataType.NUMERIC},
+    ),
+]
+
+
+@pytest.mark.parametrize("model_name, field_name, other_kwargs", _NON_BLANK_TEXT_FIELDS)
+@pytest.mark.parametrize("blank_value", ["", " ", "   ", "\t", " \t\n "])
+def test_non_blank_text_fields_reject_blank(
+    model_name: str, field_name: str, other_kwargs: dict, blank_value: str
+):
+    """Tests the case where a text field that must carry content is given none:
+    the wire boundary rejects it rather than storing whitespace, which would
+    occupy the column while saying nothing.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(**{**other_kwargs, field_name: blank_value})
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert (field_name,) in error_locs
+
+
+@pytest.mark.parametrize("model_name, field_name, other_kwargs", _NON_BLANK_TEXT_FIELDS)
+def test_non_blank_text_fields_strip_padding(model_name: str, field_name: str, other_kwargs: dict):
+    """Tests the case where a text field carries content with surrounding
+    whitespace: it strips at the wire, so one identifier written with stray
+    padding resolves to the same row as its unpadded spelling.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    built = model_cls(**{**other_kwargs, field_name: "  padded  "})
+
+    assert getattr(built, field_name) == "padded"
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+@pytest.mark.parametrize("blank_value", ["", " ", "   ", "\t", "\n", " \t\n "])
+def test_metadata_request_models_reject_blank_value(
+    model_name: str, other_kwargs: dict, blank_value: str
+):
+    """Tests the case where a metadata value carries no content: every request
+    model with a metadata dict rejects it at the wire boundary, naming the
+    offending field in the error location. A blank value would otherwise occupy
+    the field's slot carrying no information, where declining to answer is
+    expressed with a missing-value marker.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(metadata={"ph": blank_value}, **other_kwargs)
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert ("metadata", "ph") in error_locs
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+def test_metadata_request_models_strip_padded_value(model_name: str, other_kwargs: dict):
+    """Tests the case where a metadata value has content but surrounding
+    whitespace: the blank-value rejection does not fire, and the value strips
+    at the wire so storage never sees the padding.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    built = model_cls(metadata={"ph": " 7.2 "}, **other_kwargs)
+
+    assert built.metadata == {"ph": "7.2"}
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+def test_metadata_request_models_strip_padded_key(model_name: str, other_kwargs: dict):
+    """Tests the case where a metadata key has surrounding whitespace: the key
+    strips at the wire, so it resolves to the same field as its unpadded
+    spelling rather than to a separate one.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    built = model_cls(metadata={" ph ": "7.2"}, **other_kwargs)
+
+    assert built.metadata == {"ph": "7.2"}
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+@pytest.mark.parametrize("blank_key", ["", " ", "   ", "\t", " \t\n "])
+def test_metadata_request_models_reject_blank_key(
+    model_name: str, other_kwargs: dict, blank_key: str
+):
+    """Tests the case where a metadata key carries no content: the key is
+    refused rather than resolved against a field whose name is whitespace.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError):
+        model_cls(metadata={blank_key: "7.2"}, **other_kwargs)
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+def test_metadata_request_models_reject_keys_colliding_on_strip(
+    model_name: str, other_kwargs: dict
+):
+    """Tests the case where two metadata keys differ only in surrounding
+    whitespace: both name one field after stripping, so the write is refused
+    rather than letting one value silently overwrite the other.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(metadata={"ph": "7.2", " ph ": "6.8"}, **other_kwargs)
+
+    assert "differing only in surrounding whitespace" in str(exc_info.value)
+
+
+def test_sample_metadata_write_request_rejects_extra_field():
+    """Tests the case where an unknown top-level key is supplied: extra="forbid"
+    rejects it rather than silently ignoring it.
+    """
+    from qiita_common.models import SampleMetadataWriteRequest
+
+    with pytest.raises(ValidationError):
+        SampleMetadataWriteRequest(metadata={"ph": "7.2"}, typo="x")
+
+
+def test_sample_metadata_write_request_defaults_to_display_names():
+    """Tests the case where the body omits global_internal_names: global fields
+    resolve on display_name, matching every caller written before the flag
+    existed.
+    """
+    from qiita_common.models import SampleMetadataWriteRequest
+
+    built = SampleMetadataWriteRequest(metadata={"collection date": "2026-03-01"})
+
+    assert built.global_internal_names is False
+
+
+def test_sample_metadata_write_request_accepts_global_internal_names():
+    """Tests the case where the body opts into internal-name keying: the flag is
+    carried through so the route can resolve global fields on internal_name.
+    """
+    from qiita_common.models import SampleMetadataWriteRequest
+
+    built = SampleMetadataWriteRequest(
+        metadata={"collection_date": "2026-03-01"}, global_internal_names=True
+    )
+
+    assert built.global_internal_names is True
+
+
+def test_metadata_field_write_result_derives_global_scope():
+    """Tests the case where a write resolved to a globally-linked field: the
+    result carries the internal_name the value reads back under and reports
+    scope "global" without that scope being supplied.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    result = MetadataFieldWriteResult(
+        internal_name="collection_date",
+        outcome=FieldWriteOutcome.INSERTED,
+        value="2026-03-01",
+    )
+
+    assert result.model_dump() == {
+        "internal_name": "collection_date",
+        "outcome": FieldWriteOutcome.INSERTED,
+        "value": "2026-03-01",
+        "scope": "global",
+    }
+
+
+def test_metadata_field_write_result_derives_local_scope():
+    """Tests the case where a write resolved to a purely-local field: there is
+    no internal_name, so the value reads back under the key the caller sent and
+    scope is reported "local".
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    result = MetadataFieldWriteResult(
+        internal_name=None,
+        outcome=FieldWriteOutcome.UPDATED,
+        value="batch 7",
+    )
+
+    assert result.model_dump() == {
+        "internal_name": None,
+        "outcome": FieldWriteOutcome.UPDATED,
+        "value": "batch 7",
+        "scope": "local",
+    }
+
+
+def test_metadata_field_write_result_round_trips_own_serialization():
+    """Tests the case where a serialized result is validated back into the
+    model: the derived scope present in the payload is accepted, so the shared
+    model can parse a response it produced.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    original = MetadataFieldWriteResult(
+        internal_name="host_taxon_id",
+        outcome=FieldWriteOutcome.UNCHANGED,
+        value="9606",
+    )
+
+    reparsed = MetadataFieldWriteResult.model_validate(original.model_dump())
+
+    assert reparsed.model_dump() == original.model_dump()
+
+
+def test_metadata_field_write_result_rejects_contradicting_scope():
+    """Tests the case where a supplied scope disagrees with internal_name:
+    validation fails rather than one of the two silently winning.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    with pytest.raises(ValidationError):
+        MetadataFieldWriteResult.model_validate(
+            {
+                "internal_name": None,
+                "outcome": FieldWriteOutcome.INSERTED,
+                "value": "x",
+                "scope": "global",
+            }
+        )
+
+
+def test_metadata_field_write_result_missing_internal_name_reports_missing():
+    """Tests the case where a scope is supplied but internal_name is absent
+    altogether: the reported error is the missing required field, not a
+    contradiction against a value that was never sent.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    with pytest.raises(ValidationError) as exc_info:
+        MetadataFieldWriteResult.model_validate(
+            {
+                "outcome": FieldWriteOutcome.INSERTED,
+                "value": "x",
+                "scope": "global",
+            }
+        )
+
+    reported = [(err["loc"], err["type"]) for err in exc_info.value.errors()]
+    assert reported == [(("internal_name",), "missing")]
+
+
+def test_metadata_field_write_result_rejects_unknown_key():
+    """Tests the case where a misspelled key is supplied: extra="forbid" rejects
+    it, so stripping the derived scope does not open the model to typos.
+    """
+    from qiita_common.models import FieldWriteOutcome, MetadataFieldWriteResult
+
+    with pytest.raises(ValidationError):
+        MetadataFieldWriteResult.model_validate(
+            {
+                "internal_name": None,
+                "outcome": FieldWriteOutcome.INSERTED,
+                "value": "x",
+                "scoep": "local",
+            }
+        )
+
+
+def test_metadata_entry_round_trips_ref_values():
+    """Tests the case where a MetadataEntry carries the discriminated-union Ref
+    variants: both a MissingReasonRef and a TerminologyTermRef validate and
+    round-trip through the shared SampleMetadataValue alias.
+    """
+    from qiita_common.models import (
+        FieldDataType,
+        MetadataEntry,
+        MissingReasonRef,
+        TerminologyTermRef,
+    )
+
+    missing = MetadataEntry(
+        display_name="pH",
+        description=None,
+        data_type=FieldDataType.NUMERIC,
+        value=MissingReasonRef(idx=3, name="not collected"),
+    )
+    term = MetadataEntry(
+        display_name="Env Material",
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=TerminologyTermRef(idx=5, term_id="ENVO:00002007", label="soil"),
+    )
+
+    assert MetadataEntry.model_validate(missing.model_dump()) == missing
+    assert MetadataEntry.model_validate(term.model_dump()) == term
+
+
+def test_metadata_entry_boolean_value_stays_bool():
+    """Tests the case where a BOOLEAN-typed entry carries a Python bool: the
+    value union keeps it a bool on the wire (JSON true/false, not "True"), and
+    an int still resolves to Decimal so a numeric value cannot be captured by
+    the bool arm.
+    """
+    from qiita_common.models import FieldDataType, MetadataEntry
+
+    is_control = MetadataEntry(
+        display_name="Is Control",
+        description=None,
+        data_type=FieldDataType.BOOLEAN,
+        value=False,
+    )
+    numeric = MetadataEntry(
+        display_name="pH",
+        description=None,
+        data_type=FieldDataType.NUMERIC,
+        value=1,
+    )
+
+    assert is_control.value is False
+    assert '"value":false' in is_control.model_dump_json()
+    assert numeric.value == Decimal("1")
+    assert isinstance(numeric.value, Decimal)
+
+
+def test_field_wire_name_returns_the_declared_alias():
+    """Tests the case where the model aliases the field: the alias is the wire
+    name, so a payload built for that model is keyed the way it validates.
+    """
+    from qiita_common.models import (
+        STUDY_FIELD_IDX_ATTR,
+        PrepSampleStudyFieldResponse,
+        field_wire_name,
+    )
+
+    resolved = field_wire_name(PrepSampleStudyFieldResponse, STUDY_FIELD_IDX_ATTR)
+
+    assert resolved == "prep_sample_study_field_idx"
+
+
+def test_field_wire_name_falls_back_to_the_attribute_name():
+    """Tests the case where the model declares no alias for the field: the
+    attribute name is the wire name, rather than the None the model carries.
+    """
+    from qiita_common.models import (
+        GLOBAL_FIELD_IDX_ATTR,
+        SampleStudyFieldResponse,
+        field_wire_name,
+    )
+
+    resolved = field_wire_name(SampleStudyFieldResponse, GLOBAL_FIELD_IDX_ATTR)
+
+    assert resolved == "global_field_idx"
+
+
+def test_biosample_study_field_create_request_local_valid():
+    """Tests the case where a purely-local field supplies data_type (and an
+    optional required flag) with no global link — the local mode accepts it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    req = BiosampleStudyFieldCreateRequest(display_name="pH", data_type=FieldDataType.NUMERIC)
+
+    assert req.data_type is FieldDataType.NUMERIC
+    assert req.global_field_idx is None
+    assert req.required is None
+
+
+def test_biosample_study_field_create_request_local_requires_data_type():
+    """Tests the case where a purely-local field omits data_type — the local
+    mode rejects it, since the type lives on this row.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(display_name="pH")
+
+
+def test_biosample_study_field_create_request_linked_valid():
+    """Tests the case where a globally-linked field supplies only the global
+    idx and display_name — the linked mode accepts it and leaves the inherited
+    attributes unset.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest
+
+    req = BiosampleStudyFieldCreateRequest(
+        display_name="Sample pH", biosample_global_field_idx=7, description="acidity"
+    )
+
+    assert req.global_field_idx == 7
+    assert req.data_type is None
+    assert req.required is None
+    assert req.terminology_idx is None
+    assert req.tier_override is None
+
+
+def test_biosample_study_field_create_request_rejects_unaliased_global_fk():
+    """Tests the case where the caller sends the entity-agnostic attribute name
+    instead of the entity-qualified wire name: only the alias is accepted, so
+    the unaliased spelling is rejected as an unknown field.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="pH", data_type=FieldDataType.NUMERIC, global_field_idx=7
+        )
+
+
+def test_biosample_study_field_create_request_linked_rejects_inherited():
+    """Tests the case where a globally-linked field also supplies an inherited
+    attribute (data_type) — the linked mode rejects it, since inherited columns
+    live on the global-field row.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="Sample pH",
+            biosample_global_field_idx=7,
+            data_type=FieldDataType.NUMERIC,
+        )
+
+
+def test_biosample_study_field_create_request_terminology_requires_idx():
+    """Tests the case where a local terminology field omits terminology_idx —
+    the coupling validator rejects it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="Env Material", data_type=FieldDataType.TERMINOLOGY
+        )
+
+
+def test_biosample_study_field_create_request_terminology_idx_requires_terminology_type():
+    """Tests the case where a local non-terminology field supplies a
+    terminology_idx — the coupling validator rejects it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="pH", data_type=FieldDataType.TEXT, terminology_idx=3
+        )
+
+
+def test_biosample_study_field_create_request_terminology_valid():
+    """Tests the case where a local terminology field supplies both
+    data_type=terminology and terminology_idx — the coupling validator accepts
+    it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    req = BiosampleStudyFieldCreateRequest(
+        display_name="Env Material",
+        data_type=FieldDataType.TERMINOLOGY,
+        terminology_idx=3,
+    )
+
+    assert req.data_type is FieldDataType.TERMINOLOGY
+    assert req.terminology_idx == 3

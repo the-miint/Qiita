@@ -432,6 +432,15 @@ async def require_caller_has_admin_on_all_studies(
     403 fires on whichever appears first in the input, not 422.
     Iteration is deduped because secondary_study_idxs may repeat the
     primary on misuse paths the composer rejects later.
+
+    This policy has a second implementation: the mask-definition reads
+    restate it as a SQL predicate
+    (`repositories.mask_definition._CALLER_MAY_SEE_SAMPLE`), because
+    narrowing a list one sample at a time in Python would be a query per
+    row. A change to any arm above — the bypass role, the required tier,
+    the treatment of a missing study, the orphan case — has to land there
+    in the same PR, or mask discovery and ticket submission disagree about
+    the same sample.
     """
     if isinstance(caller, Anonymous):
         raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)

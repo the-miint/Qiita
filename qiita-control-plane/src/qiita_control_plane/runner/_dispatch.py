@@ -11,6 +11,7 @@ import asyncpg
 from qiita_common.actions import (
     ActionCeiling,
     FlatBaselineResources,
+    WorkflowAction,
     WorkflowStep,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
@@ -208,10 +209,11 @@ def _resolve_baseline_for_step(
     step below its YAML baseline (a small input needs less); a hint above the
     baseline is a no-op, and an axis with ``baseline == ceiling`` is left alone
     (no headroom to recover — see the inline comment). Applied BEFORE the
-    raise-only override floors below so escalation always wins on a retry: the
-    escalated floor is seeded from the YAML baseline (>= any down-sized value),
-    so a retry after an OOM/TIMEOUT restores at least the baseline regardless of
-    the hint.
+    raise-only override floors below so escalation always wins on a retry: an
+    escalated floor is grown from the YAML baseline and so is always >= any
+    down-sized value, whether it was computed in this run or seeded from the
+    ticket's persisted `escalated_resource_floor`. Either way a step that has
+    ever OOM'd/timed out runs at >= its baseline, regardless of the hint.
 
     ``mem_gb_override`` (the ticket's optional per-run resource bump) raises the
     resolved memory *floor*: ``mem_gb = max(resolved.mem_gb, mem_gb_override)``.
@@ -220,10 +222,11 @@ def _resolve_baseline_for_step(
     below, so an override above ``action_ceiling.mem_gb`` is rejected here too
     (defense in depth; the submission route already 422s it).
 
-    ``walltime_override`` is the symmetric raise-only *walltime* floor — the
-    escalating override raised on each TIMEOUT retry by
-    ``_escalated_walltime_after_timeout`` — applied the same way and bounded by
-    the same ceiling assertion.
+    ``walltime_override`` is the symmetric raise-only *walltime* floor — raised
+    on each TIMEOUT retry by ``_escalated_walltime_after_timeout``, or seeded
+    from the ticket's persisted floor on a run that resumes a ladder an earlier
+    run started — applied the same way and bounded by the same ceiling
+    assertion.
 
     Two paths, picked by which population the YAML declared:
 
@@ -283,15 +286,9 @@ def _resolve_baseline_for_step(
             )
         resolved = br.profiles[key]
     else:
-        # Flat population. model_validator guarantees all three required
-        # fields are populated; the asserts narrow the Optional types
-        # without runtime cost on the happy path.
-        assert br.cpu is not None
-        assert br.mem_gb is not None
-        assert br.walltime is not None
-        resolved = FlatBaselineResources(
-            cpu=br.cpu, mem_gb=br.mem_gb, walltime=br.walltime, gpu=br.gpu
-        )
+        # Flat population, taken verbatim. The model owns the narrowing from the
+        # Optional flat fields its validator already guaranteed.
+        resolved = br.as_flat()
 
     # plan() down-size (raise-NEVER), applied BEFORE the raise-only floors so an
     # OOM/TIMEOUT retry (whose floor is seeded from the YAML baseline) always
@@ -368,6 +365,31 @@ def _ceiling_exhausted_failure(
     )
 
 
+def _terminal_attempts_exhausted_failure(
+    entry: WorkflowStep | WorkflowAction, *, retry_count: int, max_retries: int
+) -> BackendFailure:
+    """Build the permanent failure raised when restart recovery has skipped past
+    one or more already-terminal attempts and the ticket's retry budget is
+    spent.
+
+    The skip path reaches a FRESH submit without passing through the
+    `except BackendFailure` arm that normally enforces `max_retries`, so without
+    this the budget is silently bypassed: a process that recorded an attempt
+    `failed` and died before transitioning the ticket leaves it PROCESSING, and
+    every reconcile would buy another submit. Fail with the budget's own verdict
+    instead."""
+    return BackendFailure(
+        kind=FailureKind.UNKNOWN_PERMANENT,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name=entry.name,
+        reason=(
+            f"every prior attempt of step {entry.name!r} is terminal and the retry "
+            f"budget is spent ({retry_count}/{max_retries}); not submitting a fresh "
+            "attempt. Redrive with /run once the underlying cause is fixed."
+        ),
+    )
+
+
 # Growth factor applied to a step's resolved memory on each OOM_KILLED retry.
 # A step the scheduler OOM-killed will OOM again at the same size, so doubling
 # — clamped to the action's mem ceiling — is the only retry that can fit.
@@ -440,8 +462,11 @@ def _escalated_walltime_after_timeout(
     the headroom guard in ``_resolve_baseline_for_step`` guarantees exceeds the
     baseline. The exact mirror of ``_escalated_mem_floor_after_oom`` for
     walltime, minus the static per-run seed (there is no
-    ``resource_override.walltime``): escalation always starts from the YAML
-    baseline.
+    ``resource_override.walltime``): on a step's FIRST timeout, escalation
+    starts from the YAML baseline. On a later run it starts wherever this
+    ticket already escalated this step to — the runner seeds
+    ``current_override`` from the persisted
+    ``work_ticket.escalated_resource_floor``, exactly as it does for memory.
     """
     resolved = _resolve_baseline_for_step(
         entry=entry,
@@ -762,6 +787,13 @@ async def _adopt_or_submit(
     purged the job (no match), we fall through to a fresh submit."""
     rows = await step_progress.load_step_progress(pool, work_ticket_idx)
     existing = next((r for r in rows if r.step_index == step_index and r.attempt == attempt), None)
+    # Adoption assumes `attempt` names a LIVE attempt. It is the caller's job to
+    # have skipped any already-terminal one (`_attempt_is_terminal`) — adopting a
+    # terminal attempt re-attaches to a job that already ended, which the purged
+    # -job tiebreaker below then resolves from a workspace whose manifest is
+    # missing precisely because that attempt failed. Deliberately not re-checked
+    # here: this reads the CURRENT rows, and by now this run may have legitimately
+    # written its own terminal row for a prior attempt.
     if existing is not None and existing.slurm_job_id is not None:
         _log.info(
             "work_ticket %d step %r attempt %d already submitted as job %s; adopting",

@@ -37,7 +37,10 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      read (a read whose minimisers span K shards yields K rows). Materialised into
      a non-temp TABLE `(read_id BIGINT, shard_name VARCHAR)` — the exact shape
      `align_*_sharded` binds. Factored so a future multi-router just UNIONs more
-     classify results into the same table.
+     classify results into the same table. The classify reads a `sequence1`-only
+     VIEW when the batch is single-end: rype sizes its batch from the column LIST,
+     so an all-NULL `sequence2` would halve the batch and double the number of
+     full router-index reloads it pays (see the note at that CREATE).
   3. ONE `align_{minimap2,bowtie2}_sharded(query, shard_directory:=,
      read_to_shard:=, <params>)` call aligns each read against ONLY its routed
      shard(s), reporting ALL placements (bowtie2 `report_all`, the "modified SHOGUN"
@@ -123,6 +126,10 @@ miint contracts — qiita-verified against the team-mirror build via the
     [threshold=0.1])` -> `(read_id, bucket_id, bucket_name, score)`, ≥0 rows per
     read (one per bucket above threshold — multi-bucket, so a read routes to every
     shard it overlaps). Reads `sequence1` and, when present, `sequence2`.
+    **It sizes its Arrow batch from the sequence table's COLUMN LIST, not its
+    contents**, and reloads the WHOLE index once per batch — so a `sequence2` column
+    that is entirely NULL halves the batch and doubles the index reloads
+    (duckdb-miint#199). Hand it `sequence1` alone for a single-end batch.
   - `align_minimap2_sharded(query_table, shard_directory:=, read_to_shard:=,
     [preset, max_secondary, include_shard_name, …])` and
     `align_bowtie2_sharded(query_table, shard_directory:=, read_to_shard:=,
@@ -312,10 +319,15 @@ _BOWTIE2_ALIGN_PARAMS = (
 # `_QUERY_MATERIALIZED` is a TABLE copy of `_QUERY`, and is the relation handed to
 # the ALIGNER (either aligner — both re-read the query once per shard; see the
 # materialization note in execute()). Every other consumer of the query keeps reading
-# the VIEW: the SE/PE probe, which is answered from Parquet row-group statistics and
+# a VIEW: the SE/PE probe, which is answered from Parquet row-group statistics and
 # would gain nothing, and the rype routing pass, which copies the corpus internally
 # anyway and runs BEFORE this table exists.
+#
+# `_ROUTING_QUERY` is the routing pass's own VIEW over `_QUERY` — identical for a
+# paired-end batch, narrowed to `sequence1` alone for a single-end one. That
+# narrowing is a rype BATCH-SIZING fix, not a tidy-up; see the note at its CREATE.
 _QUERY = "align_sharded_query"
+_ROUTING_QUERY = "align_sharded_routing_query"
 _QUERY_MATERIALIZED = "align_sharded_query_materialized"
 _READ_META = "align_sharded_read_meta"
 _READ_TO_SHARD = "align_sharded_read_to_shard"
@@ -590,8 +602,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     "SELECT sequence_idx AS read_id, sequence1, sequence2 "
                     f"FROM {reads_rel}"
                 )
-                # Is this batch paired-end? Decides only the FILTER SHAPE below, not
-                # the aligner (the CP picks that from the platform). The read set is
+                # Is this batch paired-end? Decides the FILTER SHAPE below and the
+                # ROUTING PROJECTION handed to rype — never the aligner, which the CP
+                # picks from the platform. (The routing use is the expensive one: it
+                # sets rype's batch size, hence how many times the router index is
+                # reloaded. See its CREATE.) The read set is
                 # uniformly SE or PE by construction, so this counts rather than
                 # samples: a MIXED batch is invalid input and fails HERE, naming the
                 # counts, instead of surfacing as bowtie2's opaque `gpl_boundary`
@@ -603,15 +618,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # whose reads happen to route nowhere is still invalid input, and
                 # validating after that return would let it exit 0 with an empty
                 # output. It also means a mixed batch fails before paying for
-                # rype_classify. Costs nothing to do here — DuckDB answers both
-                # aggregates from the reads Parquet's row-group statistics (`count(*)`
-                # from the row counts, `count(sequence2)` from the null counts), so
-                # neither reads a byte of the sequence columns. A `LIMIT 1` probe
-                # would also avoid scanning (row-group stats prune it), but it cannot
-                # produce `total`, and the mixed-batch rejection below needs both
-                # numbers to name the counts in its error (`paired not in (0, total)`).
-                # That correctness requirement — not performance — is why the count
-                # probe is used here.
+                # rype_classify. Cheap here, though NOT by the mechanism this comment
+                # used to claim: DuckDB never sums row-group null counts. `count(*)`
+                # does come from the row counts, but `count(sequence2)` is only
+                # metadata-served when statistics PROVE zero NULLs — then
+                # `statistics_propagation` rewrites it to `count(*)` and constant-folds
+                # it (measured 0.0003 s on a 499 MB zstd column). Otherwise it SCANS:
+                # an all-NULL mate column scans but costs ~nothing because it encodes to
+                # ~1 KB, and a MIXED column pays a real scan (0.147 s at 3M rows, 50/50).
+                # So the single-end case this projection exists for is precisely the one
+                # that does not get the shortcut — it is cheap by encoding, not by
+                # pruning. A `LIMIT 1` probe would also avoid scanning (row-group stats
+                # prune it) and is in fact faster in most shapes, but it cannot produce
+                # `total`, and the mixed-batch rejection below needs both numbers to
+                # name the counts in its error (`paired not in (0, total)`). That
+                # correctness requirement — not performance — is why the count probe is
+                # used here.
                 #
                 # `total > 0` is load-bearing now that this runs ahead of the empty
                 # check: an empty read batch makes `paired == total == 0`, which is
@@ -628,6 +650,38 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     )
                 is_paired = paired == total and total > 0
 
+                # The relation the ROUTING pass classifies: `_QUERY` for a paired-end
+                # batch, narrowed to `sequence1` alone for a single-end one.
+                #
+                # **That narrowing is a rype BATCH-SIZING fix, not a projection
+                # tidy-up.** miint derives rype's `is_paired` from the mere PRESENCE of a
+                # `sequence2` column — `ValidateSequenceTable` inspects the column list
+                # and never the values — and rype then assumes a query twice as long,
+                # which doubles both terms of its per-read memory estimate and so HALVES
+                # its batch size. Every extra batch costs a FULL reload of the router
+                # index, because `rype_classify_arrow` runs one shard loop per Arrow
+                # RecordBatch. So handing a single-end block an all-NULL `sequence2`
+                # silently doubles the number of index loads. Measured on a 750k-read
+                # HiFi block against the 193 GB w=20 WoL3 router: 400k reads/batch ->
+                # 200k, so 2 index loads -> 4, at ~54 min each. See duckdb-miint#199.
+                #
+                # Sizing is ALL it changes, which is what makes this safe: `is_paired`
+                # reaches rype only through the batch-size estimate
+                # (`rype_classify_arrow` takes no such argument), and miint projects
+                # `NULL::BLOB AS sequence2` into its own temp table when the column is
+                # absent — so rype still receives a pair column and classifies exactly
+                # the same reads. The ALIGNER keeps the full `_QUERY` (via
+                # `_QUERY_MATERIALIZED`): both aligners need `sequence2` to align a pair
+                # natively.
+                #
+                # A VIEW over a VIEW, so it costs nothing and the routing pass still
+                # reads the lazy Parquet scan rather than a second materialization.
+                conn.execute(
+                    f"CREATE VIEW {_ROUTING_QUERY} AS SELECT read_id, sequence1"
+                    + (", sequence2" if is_paired else "")
+                    + f" FROM {_QUERY}"
+                )
+
                 # read_to_shard (non-temp — align resolves it by name on its own
                 # connection). One rype_classify pass fills it; multi-bucket, so a read
                 # spanning K shards gets K rows and aligns against all K.
@@ -635,7 +689,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 _build_read_to_shard(
                     conn,
                     inputs.router_index_path,
-                    _QUERY,
+                    _ROUTING_QUERY,
                     _READ_TO_SHARD,
                     threshold=_ROUTING_THRESHOLD,
                 )

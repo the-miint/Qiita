@@ -22,8 +22,10 @@ def _build_body(
     fields Pydantic treats as "set" are the ones the caller actually
     passed (matches the server's exclude_unset semantics on the PATCH
     side; honest with the schema on the POST side). Argparse's dest
-    names line up with the Pydantic field names (snake_case from
-    hyphenated flags), so the filter is a single comprehension.
+    names line up with the on-the-wire key (snake_case from hyphenated
+    flags) — a field's alias where it has one, else its field name — so
+    the filter is a single comprehension, and the dump emits the same
+    keys the server validates.
 
     On ValidationError (e.g. a too-long --title, malformed --orcid),
     flattens the errors into a single stderr line and exits 2 via
@@ -31,13 +33,10 @@ def _build_body(
     failures, so callers don't see a Python traceback for invalid
     input.
     """
-    fields = {
-        name: getattr(args, name)
-        for name in model_cls.model_fields
-        if getattr(args, name, None) is not None
-    }
+    wire_keys = [field.alias or name for name, field in model_cls.model_fields.items()]
+    fields = {key: getattr(args, key) for key in wire_keys if getattr(args, key, None) is not None}
     try:
-        return model_cls(**fields).model_dump(exclude_unset=True, mode="json")
+        return model_cls(**fields).model_dump(exclude_unset=True, mode="json", by_alias=True)
     except ValidationError as exc:
         msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
         parser.error(f"invalid {model_cls.__name__}: {msgs}")
@@ -77,6 +76,23 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     idx_arg = args.read_idx_arg
     path = args.read_path.format(**{idx_arg: getattr(args, idx_arg)})
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
+
+
+def _handle_study_field_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Mint a study-local field definition on one study (POST).
+
+    The per-command `set_defaults` supplies `study_field_model` (the request
+    model, whose mode coupling is enforced at body construction so an invalid
+    flag combination exits 2 without a request) and `study_field_path` (a
+    subpath template filled from --study-idx).
+    """
+
+    def _run(token: str) -> dict:
+        body = _build_body(args.study_field_model, args, parser)
+        path = args.study_field_path.format(study_idx=args.study_idx)
+        return _common.call("POST", args.base_url, token, path, json=body)
+
+    return _common.run_http_subcommand(_run)
 
 
 def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

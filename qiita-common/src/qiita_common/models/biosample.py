@@ -4,14 +4,33 @@ PATCH body."""
 
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated, ClassVar, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    model_validator,
+)
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel
+from qiita_common.auth_constants import SystemRole
+from qiita_common.models._base import (
+    AccessionText,
+    MetadataRequestModel,
+    NonBlankName,
+    NonBlankText,
+    PatchRequestModel,
+    ReadCounts,
+)
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
+from qiita_common.models.sample_field import (
+    SampleStudyFieldCreateRequest,
+    SampleStudyFieldResponse,
+)
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
 # leading zeros; the {10} quantifier fixes the length at exactly ten digits
@@ -23,26 +42,64 @@ from qiita_common.models.reference import FieldDataType
 # Change one and you must change the other in the same PR.
 MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
+# The wire spellings of the two idx fields the biosample study-field shapes
+# re-declare with an entity-qualified alias. Named so a caller writing or
+# reading one of those payload keys resolves it here instead of retyping it.
+BIOSAMPLE_STUDY_FIELD_IDX_WIRE = "biosample_study_field_idx"
+BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE = "biosample_global_field_idx"
 
-class BiosampleImportRequest(BaseModel):
+# Defined here so the wire models and the repository layer share one definition.
+type MetadataFieldScope = Literal["global", "local"]
+
+
+def derive_metadata_field_scope(global_link: object) -> MetadataFieldScope:
+    """Map a nullable global-linkage marker to the scope it implies.
+
+    A global-linkage marker is a value that is populated when the field is
+    globally linked and null when it is purely local: a row's FK to a global
+    field, or the linked global field's internal_name carried alongside it.
+    Callers pass whichever one their own type holds. A global field's own idx is
+    not such a marker -- it is never null, so it distinguishes nothing.
+    """
+    return "global" if global_link is not None else "local"
+
+
+class FieldWriteOutcome(StrEnum):
+    """What a single metadata upsert did to one field's slot: created a new
+    row, overwrote an existing value in place, or left an already-identical
+    value untouched. Reported per field by the metadata-write surface. Not a
+    stored value, so it has no Postgres twin.
+    """
+
+    INSERTED = "inserted"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+
+
+class BiosampleImportRequest(MetadataRequestModel):
     """Body for POST /api/v1/study/{study_idx}/biosample.
 
     The route gates on `Tier.ADMIN` access to the path's study
     (study owner, an ADMIN study_access row, or wet_lab_admin+ via the
     role bypass). owner_idx names the user the biosample is being
     created for and must be supplied explicitly. The metadata dict
-    carries text values keyed on biosample_global_field display_name;
-    the route parses each value into the global field's data type
-    before insert. An empty dict is allowed.
+    carries text values keyed on a biosample field's display_name — or,
+    when global_internal_names is set, on a biosample_global_field's
+    internal_name for global fields (local fields stay display-name-keyed);
+    the route parses each value into the field's data type before insert.
+    An empty dict is allowed. Every key and value strips on the way in and
+    must still carry content, so the field a key names and the value stored
+    under it are both the stripped form.
     """
 
     owner_idx: Annotated[int, Field(gt=0)]
-    owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
-    owner_biosample_id_value: str = Field(min_length=1)
-    metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_name: str | None = Field(default=None, min_length=1)
-    biosample_accession: str | None = Field(default=None, min_length=1)
-    ena_sample_accession: str | None = Field(default=None, min_length=1)
+    owner_biosample_id_field_name: NonBlankName
+    owner_biosample_id_value: NonBlankText
+    metadata: dict[NonBlankText, NonBlankText] = Field(default_factory=dict)
+    global_internal_names: bool = False
+    metadata_checklist_name: NonBlankText | None = None
+    biosample_accession: AccessionText | None = None
+    ena_sample_accession: AccessionText | None = None
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
@@ -54,7 +111,7 @@ class BiosampleImportResponse(BaseModel):
 
     `owner_id_biosample_study_field_*` name the biosample_study_field row
     that holds the owner-biosample-id for this study — the purely-local,
-    PII-tier-pinned field flagged is_owner_biosample_id=True on the
+    member-tier-restricted field flagged is_owner_biosample_id=True on the
     associated biosample_metadata row.
     """
 
@@ -68,9 +125,12 @@ class OwnerBiosampleIdRow(BaseModel):
 
     Pairs a biosample's stable minted idx and public accession with the
     owner-submitted original sample name — biosample_metadata.value_text on
-    the row flagged is_owner_biosample_id=True. That value is PII-pinned and
-    masked on the normal biosample read path; this export is the only way to
-    recover it, hence system_admin + admin:biosample_owner_id_read.
+    the row flagged is_owner_biosample_id=True. That value is the owner's
+    own name for their sample; the owner legitimately needs to recover it.
+    Its visibility is restricted to authorized study members rather than
+    exposed on the general read path, because submitters sometimes
+    incautiously place PII in sample names; this export is the
+    system_admin-gated path for recovering it across studies.
 
     `biosample_accession` is None until the biosample is submitted to NCBI.
     `owner_biosample_id` is None only when the biosample has no owner-id
@@ -167,7 +227,7 @@ class MissingReasonRef(BaseModel):
     for an intentionally-missing entry. Carries the qiita.missing_value_reason
     row's idx (the FK target on *_metadata.value_missing_reason_idx) and
     the matched reason name. `kind` discriminates this variant from other
-    dict-shaped value variants on GlobalMetadataEntry.value. value_column
+    dict-shaped value variants on MetadataEntry.value. value_column
     is the target value_* column for a missing-reason write.
     """
 
@@ -187,7 +247,7 @@ class TerminologyTermRef(BaseModel):
     *_metadata.value_terminology_term_idx), its term_id (the CURIE the
     caller passed) and its label (the human-readable term name).
     `kind` discriminates this variant from other dict-shaped value
-    variants on GlobalMetadataEntry.value. value_column is the target
+    variants on MetadataEntry.value. value_column is the target
     value_* column for a terminology-term write.
     """
 
@@ -199,6 +259,19 @@ class TerminologyTermRef(BaseModel):
     @property
     def value_column(self) -> str:
         return TERMINOLOGY_TERM_VALUE_COLUMN
+
+
+# One resolved metadata value: a scalar, an intentionally-missing marker, or a
+# terminology term; the two Ref variants discriminate on `kind`. bool sits after
+# Decimal so an int-shaped value still resolves to Decimal; a genuine bool wins
+# on exact type either way.
+SampleMetadataValue = (
+    str
+    | Decimal
+    | date
+    | bool
+    | Annotated[MissingReasonRef | TerminologyTermRef, Field(discriminator="kind")]
+)
 
 
 class MetadataChecklistRef(BaseModel):
@@ -219,30 +292,26 @@ class MetadataChecklistRef(BaseModel):
         return cls(idx=idx, name=name)
 
 
-class GlobalMetadataEntry(BaseModel):
-    """One globally-linked metadata value for a biosample or prep_sample,
-    with cosmetic context.
+class MetadataEntry(BaseModel):
+    """One resolved metadata value for a biosample or prep_sample, with
+    cosmetic context.
 
-    Returned as a value inside *Response.global_metadata, keyed on the
-    field's `internal_name`. display_name and description are taken from
-    the canonical *_global_field row, not from any per-study *_study_field
-    override, because these reads are not study-scoped. data_type
-    identifies which Python type carries the value: TEXT -> str,
-    NUMERIC -> Decimal, DATE -> date; a MissingReasonRef carries an
-    intentionally-missing entry's reason idx + name; a TerminologyTermRef
-    carries a terminology-term entry's idx + term_id + label. Both Ref
-    variants supersede data_type-driven decoding.
+    Returned as a value inside a response's metadata dict. On the
+    globally-linked read the dict is keyed on the field's `internal_name` and
+    display_name / description are the canonical *_global_field values; on a
+    study-scoped local read the dict is keyed on `display_name` and both come
+    from the study-local field. data_type identifies which Python type carries
+    the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date,
+    BOOLEAN -> bool; a MissingReasonRef
+    carries an intentionally-missing entry's reason idx + name; a
+    TerminologyTermRef carries a terminology-term entry's idx + term_id + label.
+    Both Ref variants supersede data_type-driven decoding.
     """
 
     display_name: str
     description: str | None
     data_type: FieldDataType
-    value: (
-        str
-        | Decimal
-        | date
-        | Annotated[MissingReasonRef | TerminologyTermRef, Field(discriminator="kind")]
-    )
+    value: SampleMetadataValue
 
 
 class BiosampleResponse(BaseModel):
@@ -278,8 +347,119 @@ class BiosampleResponse(BaseModel):
     retired_by_idx: int | None
     retired_at: AwareDatetime | None
     retire_reason: str | None
-    global_metadata: dict[str, GlobalMetadataEntry]
+    global_metadata: dict[str, MetadataEntry]
     caller_system_role: SystemRole
+
+
+class StudyScopedBiosampleResponse(BiosampleResponse):
+    """Returned by GET /api/v1/study/{study_idx}/biosample/{biosample_idx}.
+
+    A study-scoped view: every field of the biosample-level BiosampleResponse
+    (core columns, caller_system_role, and the globally-linked global_metadata
+    keyed by internal_name) plus this study's purely-local metadata, keyed by
+    display_name. local_metadata is returned only on a study-scoped response,
+    where the caller is already authorized on the study.
+    """
+
+    local_metadata: dict[str, MetadataEntry]
+
+
+class MetadataFieldWriteResult(BaseModel):
+    """What a metadata write did to one field's slot: the key the value reads
+    back under, the write outcome, and the value that now occupies the slot.
+
+    internal_name is the field's globally unique identifier when the write
+    resolved to a globally-linked field, and None when it resolved to a
+    purely-local one. It is what a subsequent read is keyed on: a global value
+    appears in a response's global_metadata under internal_name, a local value
+    in local_metadata under the key the caller sent. The two differ for a
+    global field, so a caller verifying its own write needs this rather than
+    the key it supplied. A numeric value comes back in the form it is stored
+    as, which keeps the caller's scale but resolves exponent notation into
+    plain digits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    internal_name: str | None
+    outcome: FieldWriteOutcome
+    value: SampleMetadataValue
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_contradicting_scope(cls, data: object) -> object:
+        """Accept a supplied scope only when it matches the derived value.
+
+        Permitting the matching case keeps a serialized result parseable by this
+        model; a contradiction raises rather than letting either side win
+        silently. The key is dropped from the returned copy so extra="forbid"
+        does not then reject the derived field as an unknown input.
+        """
+        if not isinstance(data, dict) or "scope" not in data:
+            return data
+        # An absent internal_name is its own error. Deriving from the missing
+        # key would report a contradiction against a value never supplied,
+        # naming the wrong field as the one to fix.
+        if "internal_name" in data:
+            derived = derive_metadata_field_scope(data["internal_name"])
+            if data["scope"] != derived:
+                raise ValueError(
+                    f"scope {data['scope']!r} contradicts internal_name; scope is derived"
+                    f" and must be omitted or {derived!r}"
+                )
+        return {key: value for key, value in data.items() if key != "scope"}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def scope(self) -> MetadataFieldScope:
+        """Whether the write went through a globally-linked or a purely-local
+        field. Computed on read from internal_name, never stored, so the two
+        can't drift."""
+        return derive_metadata_field_scope(self.internal_name)
+
+
+class SampleMetadataWriteRequest(MetadataRequestModel):
+    """Body for a study-scoped sample-family metadata write (the
+    PATCH .../{entity}/metadata routes, e.g. biosample and sequenced-sample).
+
+    metadata carries text values keyed on field display_name — or, when
+    global_internal_names is set, on a global field's internal_name (study-local
+    fields stay display-name-keyed either way). The route resolves each key
+    against the study's existing global or study-local fields and upserts it. At
+    least one entry is required — an empty write is almost certainly a client
+    error — and every key and value strips on the way in and must still carry
+    content, so a name written with stray padding resolves to the same field as
+    its unpadded spelling. Unknown field names are rejected by the route rather
+    than created.
+
+    Under global_internal_names, a key matching a global field's internal_name
+    reads back under that same key, because the globally-linked read is
+    internal-name-keyed. A key matching no global internal_name is still resolved
+    against the study's local fields by display_name; if that field is an alias
+    of a global one, the value goes to the global slot and reads back under the
+    global's internal_name rather than the key sent. So the flag aligns the two
+    keys for a direct global match, not for every key. Each result's
+    internal_name reports the read key in both cases.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: dict[NonBlankText, NonBlankText] = Field(min_length=1)
+    global_internal_names: bool = False
+
+
+class SampleMetadataWriteResponse(BaseModel):
+    """Returned by a study-scoped sample-family metadata write route.
+
+    results maps each key the caller sent to what the write did to that field,
+    in the caller's input order. The keys are the caller's own in their stripped
+    form, since keys strip at the wire — a key sent with surrounding whitespace
+    comes back without it. For a globally-linked field the caller's key is also
+    not the key the value reads back under; each result's internal_name carries
+    that.
+    """
+
+    results: dict[str, MetadataFieldWriteResult]
 
 
 # The two qiita.biosample accession columns a lookup may key on; each value is
@@ -304,7 +484,7 @@ class BiosampleLookupByAccessionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+    accessions: list[NonBlankText] = Field(min_length=1, max_length=10_000)
     accession_field: BiosampleAccessionField = "biosample_accession"
 
 
@@ -368,7 +548,7 @@ class StudyLookupByAccessionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+    accessions: list[NonBlankText] = Field(min_length=1, max_length=10_000)
     accession_field: StudyAccessionField = "bioproject_accession"
 
 
@@ -394,16 +574,35 @@ class BiosamplePatchRequest(PatchRequestModel):
 
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"owner_idx"})
 
-    metadata_checklist_name: str | None = Field(default=None, min_length=1)
+    metadata_checklist_name: NonBlankText | None = None
     owner_idx: Annotated[int, Field(gt=0)] | None = None
-    biosample_accession: str | None = Field(default=None, min_length=1)
-    ena_sample_accession: str | None = Field(default=None, min_length=1)
+    biosample_accession: AccessionText | None = None
+    ena_sample_accession: AccessionText | None = None
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
     ] = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
+
+
+class BiosampleStudyFieldCreateRequest(SampleStudyFieldCreateRequest):
+    """Body for POST /api/v1/study/{study_idx}/biosample-field."""
+
+    global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
+        default=None, alias=BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE
+    )
+
+
+class BiosampleStudyFieldResponse(SampleStudyFieldResponse):
+    """Returned by POST /api/v1/study/{study_idx}/biosample-field (201 body is
+    the created resource), carrying every qiita.biosample_study_field column.
+    """
+
+    study_field_idx: Annotated[int, Field(gt=0)] = Field(alias=BIOSAMPLE_STUDY_FIELD_IDX_WIRE)
+    global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
+        alias=BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE
+    )
 
 
 class IdxsListResponse(BaseModel):
@@ -422,13 +621,14 @@ class IdxsListResponse(BaseModel):
     caller_system_role: SystemRole
 
 
-class SequencedSampleListItem(BaseModel):
+class SequencedSampleListItem(ReadCounts):
     """One active sequenced_sample in a pool- or run-scoped sample list.
 
     Carries the subtype idx, its supertype prep_sample_idx and biosample_idx,
     the sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
-    basename prefix), and the ENA experiment/run plus biosample/ena-sample
-    accessions. Lets a caller fan out per-sample work — the pool host-filter
+    basename prefix), the ENA experiment/run plus biosample/ena-sample
+    accessions, and the sample's four per-stage read counts (`ReadCounts`).
+    Lets a caller fan out per-sample work — the pool host-filter
     fan-out matches each sample's FASTQs by sequenced_pool_item_id, and ENA
     experiment submission needs the biosample's BioSample accession as the
     sample_descriptor — without an N+1 of per-idx GETs. The accession columns
@@ -436,6 +636,10 @@ class SequencedSampleListItem(BaseModel):
     sample property: they parameterize the read mask and are supplied at
     human-filter submission, not carried here.
 
+    The read counts are columns of the SAMPLE, so the list carries them for a
+    sample with no work ticket, and for one masked through the block path whose
+    tickets are block-scoped and span many samples. One pool-scoped call is
+    therefore the pool's whole per-sample read table.
 
     `has_read_mask_ticket` is True when at least one `read-mask` work ticket
     (any state) already exists for the sample's prep_sample_idx. Both list

@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from qiita_common.api_paths import (
@@ -18,7 +19,9 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
+    URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     URL_SEQUENCED_SAMPLE_BY_IDX,
@@ -651,6 +654,40 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
         "owner_idx": 42,
         "owner_biosample_id_field_name": "owner_sample_id",
         "owner_biosample_id_value": "SMK-001",
+    }
+
+
+def test_biosample_create_global_internal_names_sent_only_when_passed(monkeypatch):
+    """--global-internal-names is three-state: passing it puts
+    global_internal_names=true on the POST body, and omitting it leaves the
+    field off the wire (the server model default fills in False)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-idx",
+            "11",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--global-internal-names",
+        ]
+    )
+    assert rc == 0
+    post_req = next(r for r in captured["requests"] if r["method"] == "POST")
+    assert post_req["json"] == {
+        "owner_idx": 11,
+        "owner_biosample_id_field_name": "owner_sample_id",
+        "owner_biosample_id_value": "SMK-001",
+        "global_internal_names": True,
     }
 
 
@@ -1945,30 +1982,34 @@ def test_ticket_logs_requires_step_index(capsys):
 # ---------------------------------------------------------------------------
 
 
-_TICKET_LIST_RESPONSE = [
-    {
-        "work_ticket_idx": 12,
-        "action_id": "fastq-to-parquet",
-        "action_version": "1.0.0",
-        "originator_principal_idx": 7,
-        "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
-        "action_context": {},
-        "state": "processing",
-        "retry_count": 0,
-        "max_retries": 3,
-        "failure_type": None,
-        "failure_stage": None,
-        "failure_step_name": None,
-        "failure_reason": None,
-        "created_at": "2026-05-20T00:00:00+00:00",
-        "updated_at": "2026-05-20T00:00:01+00:00",
-        "current_step_index": 0,
-        "current_step_name": "convert",
-        "compute_target": "slurm",
-        "slurm_job_id": 4242,
-        "step_state": "running",
-    }
-]
+_TICKET_LIST_RESPONSE = {
+    "tickets": [
+        {
+            "work_ticket_idx": 12,
+            "action_id": "fastq-to-parquet",
+            "action_version": "1.0.0",
+            "originator_principal_idx": 7,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+            "action_context": {},
+            "state": "processing",
+            "retry_count": 0,
+            "max_retries": 3,
+            "failure_type": None,
+            "failure_stage": None,
+            "failure_step_name": None,
+            "failure_reason": None,
+            "created_at": "2026-05-20T00:00:00+00:00",
+            "updated_at": "2026-05-20T00:00:01+00:00",
+            "current_step_index": 0,
+            "current_step_name": "convert",
+            "compute_target": "slurm",
+            "slurm_job_id": 4242,
+            "step_state": "running",
+        }
+    ],
+    "count": 1,
+    "truncated": False,
+}
 
 
 def test_ticket_list_issues_get_with_no_filter_params(monkeypatch):
@@ -2015,6 +2056,36 @@ def test_ticket_list_passes_filter_params(monkeypatch):
         "active": "true",
         "all": "true",
         "limit": "10",
+    }
+
+
+def test_ticket_list_passes_scope_filter_params(monkeypatch):
+    """--sequenced-pool-idx / --prep-sample-idx / --action-id map onto the
+    query params the route reads, under their snake_case names."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LIST_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "list",
+            "--sequenced-pool-idx",
+            "9",
+            "--prep-sample-idx",
+            "55",
+            "--action-id",
+            "read-mask",
+        ]
+    )
+    assert rc == 0
+    assert captured["params"] == {
+        "sequenced_pool_idx": "9",
+        "prep_sample_idx": "55",
+        "action_id": "read-mask",
     }
 
 
@@ -4840,3 +4911,323 @@ def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
         )
     assert exc.value.code == 1
     assert "no sample in this pool carries SynDNA" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# biosample create-field
+# ---------------------------------------------------------------------------
+
+
+class _FieldCliSurface(NamedTuple):
+    """One entity's create-field CLI bindings: subcommand, its global-link flag,
+    the URL the POST must reach, and the request model argparse validates
+    against (its name appears in the exit-2 stderr line)."""
+
+    subcommand: str
+    global_fk_flag: str
+    url_template: str
+    model_name: str
+
+
+_FIELD_CLI_SURFACES = [
+    pytest.param(
+        _FieldCliSurface(
+            "biosample",
+            "--biosample-global-field-idx",
+            URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+            "BiosampleStudyFieldCreateRequest",
+        ),
+        id="biosample",
+    ),
+    pytest.param(
+        _FieldCliSurface(
+            "prep-sample",
+            "--prep-sample-global-field-idx",
+            URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+            "PrepSampleStudyFieldCreateRequest",
+        ),
+        id="prep_sample",
+    ),
+]
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_local_sends_expected_body(surface, monkeypatch):
+    """`<entity> create-field` for a purely-local field POSTs display_name +
+    data_type to that entity's field route, omitting unset optionals."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = json
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            surface.subcommand,
+            "create-field",
+            "--study-idx",
+            "5",
+            "--display-name",
+            "pH",
+            "--data-type",
+            "numeric",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (f"https://q.example.test{surface.url_template.format(study_idx=5)}")
+    assert captured["json"] == {"display_name": "pH", "data_type": "numeric"}
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_linked_omits_type_columns(surface, monkeypatch):
+    """Linked mode sends only display_name + the entity-qualified global-field
+    link; the inherited type columns stay absent from the body."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            surface.subcommand,
+            "create-field",
+            "--study-idx",
+            "5",
+            "--display-name",
+            "Sample pH",
+            surface.global_fk_flag,
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "display_name": "Sample pH",
+        surface.global_fk_flag.removeprefix("--").replace("-", "_"): 7,
+    }
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_linked_with_data_type_exits_2(surface, capsys, monkeypatch):
+    """A linked create that also passes an inherited attribute fails the
+    model's mode-coupling validator and exits 2 without a POST."""
+    from qiita_control_plane.cli.user import main
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                surface.subcommand,
+                "create-field",
+                "--study-idx",
+                "5",
+                "--display-name",
+                "X",
+                surface.global_fk_flag,
+                "7",
+                "--data-type",
+                "text",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert surface.model_name in capsys.readouterr().err
+
+
+def test_create_field_required_boolean_optional(monkeypatch):
+    """--required sends True, --no-required sends False, neither omits the
+    field entirely (three-state, so a local field defaults required
+    server-side). The flag is entity-agnostic, so one entity covers it."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    bodies: list[dict] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        bodies.append(json)
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    base = [
+        "biosample",
+        "create-field",
+        "--study-idx",
+        "5",
+        "--display-name",
+        "pH",
+        "--data-type",
+        "text",
+    ]
+    main(base + ["--required"])
+    main(base + ["--no-required"])
+    main(base)
+
+    assert bodies == [
+        {"display_name": "pH", "data_type": "text", "required": True},
+        {"display_name": "pH", "data_type": "text", "required": False},
+        {"display_name": "pH", "data_type": "text"},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# submit-align-pool
+# ---------------------------------------------------------------------------
+# A THIN client, like submit-block-mask-pool: sample selection, aligner choice,
+# reference readiness and block size are ALL resolved server-side, so the CLI does
+# no roster GET, no reference preflight, and no client-side validation beyond
+# argparse. It POSTs one AlignPlanRequest and renders the plan.
+
+
+def _run_submit_align_pool(*, run=3, pool=5, reference=16, mask=10, only_missing=False):
+    from qiita_control_plane.cli.user import main
+
+    argv = [
+        "submit-align-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+        "--reference-idx",
+        str(reference),
+        "--mask-idx",
+        str(mask),
+    ]
+    if only_missing:
+        argv += ["--only-missing"]
+    return main(argv)
+
+
+def _align_plan_body(**overrides):
+    body = {
+        "sequencing_run_idx": 3,
+        "sequenced_pool_idx": 5,
+        "reference_idx": 16,
+        "aligner": "minimap2",
+        "samples_planned": 26,
+        "samples_skipped_existing": 0,
+        "samples_skipped_no_mask": 0,
+        "samples_skipped_mask_incomplete": 0,
+        "samples_skipped_no_reads": 0,
+        "partitions": [],
+        "blocks": [
+            {"block_idx": 1, "work_ticket_idx": 10, "read_count": 1000000},
+            {"block_idx": 2, "work_ticket_idx": 11, "read_count": 451794},
+        ],
+        "blocks_created": 2,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_submit_align_pool_single_plan_call_passthrough(monkeypatch, capsys):
+    """Exactly ONE POST to the align-plan endpoint, carrying the reference + mask +
+    only_missing. No roster GET and no reference-readiness preflight: the server
+    owns both."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    rc = _run_submit_align_pool()
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("/sequencing-run/3/sequenced-pool/5/align-plan")
+    assert posts[0]["json"] == {"reference_idx": 16, "mask_idx": 10, "only_missing": False}
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+def test_submit_align_pool_only_missing_is_passed_through(monkeypatch, capsys):
+    """--only-missing rides the body (applied server-side), still one POST."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    assert _run_submit_align_pool(only_missing=True) == 0
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["json"] == {"reference_idx": 16, "mask_idx": 10, "only_missing": True}
+
+
+def test_submit_align_pool_summary_reports_the_block_read_count(monkeypatch, capsys):
+    """The stderr summary names the per-block read count.
+
+    This is the line that makes a mis-tiled plan visible at SUBMIT time: block size
+    is resolved server-side from the platform, so the response is the first place it
+    is observable. A short tail block renders as a min-max range, not a per-block
+    list, so a 46-block plan stays one readable line. JSON still goes to stdout.
+    """
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    assert _run_submit_align_pool() == 0
+    out = capsys.readouterr()
+    assert json.loads(out.out)["blocks_created"] == 2
+    assert "451794-1000000 reads" in out.err
+    assert "planned 26 sample(s) into 2 block(s)" in out.err
+    assert "minimap2" in out.err
+
+
+def test_submit_align_pool_summary_reports_skipped_samples(monkeypatch, capsys):
+    """Every skip reason reaches the summary — four separate counts in the body that
+    are easy to miss in raw JSON, and the difference between 'nothing to do' and
+    'named the wrong mask'."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (
+                202,
+                _align_plan_body(
+                    samples_planned=0,
+                    samples_skipped_mask_incomplete=4,
+                    samples_skipped_no_reads=1,
+                    blocks=[],
+                    blocks_created=0,
+                ),
+            )
+        ],
+    )
+    assert _run_submit_align_pool() == 0
+    err = capsys.readouterr().err
+    assert "4 masking-incomplete" in err
+    assert "1 no-reads" in err
+    # No blocks: the size is genuinely unknown rather than a misleading 0.
+    assert "unknown reads" in err
+
+
+def test_submit_align_pool_server_refusal_is_surfaced(monkeypatch, capsys):
+    """A 409 (already-gated pool / unsharded reference) is the server's to raise;
+    the CLI surfaces it as a non-zero exit rather than pre-empting it."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(409, {"detail": "samples already have an alignment gate"})],
+    )
+    assert _run_submit_align_pool() != 0
