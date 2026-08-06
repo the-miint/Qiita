@@ -416,18 +416,33 @@ URL_ALIGNMENT_DEFINITION_BY_IDX = (
 # /alignment/* — Flight DoGet ticket for the alignment sink (feature-table OGU)
 # =============================================================================
 # Signs a DoGet ticket scoped to a single alignment run + its explicit
-# prep_sample_idx cohort on the data plane's `alignment` table. POST is
-# service-account-only (Scope.TICKET_DOGET) — the compute job mints it at
-# runtime. The body carries only work_ticket_idx; the route reads alignment_idx
-# and the cohort from that ticket's action_context (keeping the sample list
-# CP-side, off the wire). Distinct prefix from /alignment-definition (the
-# alignment identity CRUD).
+# prep_sample_idx cohort on the data plane's `alignment` table. Distinct prefix
+# from /alignment-definition (the alignment identity CRUD).
+#
+# TWO mint paths, differing in where the cohort comes from and therefore in how
+# it is authorized:
+#
+#   PATH_ALIGNMENT_DOGET         service-account-only (Scope.TICKET_DOGET). The
+#                                compute job mints it at runtime; the body
+#                                carries only work_ticket_idx and the route
+#                                reads alignment_idx + the cohort from that
+#                                ticket's action_context, already validated by
+#                                the runner resolver at submit (and kept CP-side,
+#                                off the wire).
+#   PATH_ALIGNMENT_COHORT_DOGET  human-callable (Scope.ALIGNMENT_DOGET). The
+#                                caller names the alignment in the path and the
+#                                cohort in the body, so the route authorizes
+#                                every sample per-study before signing. Both are
+#                                POSTs under /alignment but never ambiguous:
+#                                one has a path parameter, the other does not.
 
 PATH_ALIGNMENT_PREFIX = "/alignment"
 PATH_ALIGNMENT_DOGET = "/ticket/doget"
+PATH_ALIGNMENT_COHORT_DOGET = "/{alignment_idx}/ticket/doget"
 
 URL_ALIGNMENT_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_PREFIX}"
 URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
+URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
