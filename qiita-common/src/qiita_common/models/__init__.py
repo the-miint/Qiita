@@ -35,8 +35,12 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 from qiita_common.models._base import (
+    AccessionText,
     BlockScopeTarget,
     ComputeTarget,
+    MetadataRequestModel,
+    NonBlankName,
+    NonBlankText,
     PatchRequestModel,
     PrepSampleScopeTarget,
     ReferenceScopeTarget,
@@ -69,6 +73,8 @@ from qiita_common.models.auth import (
 from qiita_common.models.biosample import (
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
     BIOSAMPLE_FIELD_TAXON_ID,
+    BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE,
+    BIOSAMPLE_STUDY_FIELD_IDX_WIRE,
     MATRIX_TUBE_ID_PATTERN,
     MISSING_REASON_CONTROL_SAMPLE,
     MISSING_REASON_NOT_APPLICABLE,
@@ -85,12 +91,20 @@ from qiita_common.models.biosample import (
     BiosampleLookupByMatrixTubeIdResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
-    GlobalMetadataEntry,
+    BiosampleStudyFieldCreateRequest,
+    BiosampleStudyFieldResponse,
+    FieldWriteOutcome,
     IdxsListResponse,
     MetadataChecklistRef,
+    MetadataEntry,
+    MetadataFieldScope,
+    MetadataFieldWriteResult,
     MissingReasonRef,
     OwnerBiosampleIdExportResponse,
     OwnerBiosampleIdRow,
+    SampleMetadataValue,
+    SampleMetadataWriteRequest,
+    SampleMetadataWriteResponse,
     SequencedSampleListItem,
     SequencedSampleListResponse,
     StudyAccessionField,
@@ -98,13 +112,21 @@ from qiita_common.models.biosample import (
     StudyListResponse,
     StudyLookupByAccessionRequest,
     StudyLookupByAccessionResponse,
+    StudyScopedBiosampleResponse,
     TerminologyTermRef,
+    derive_metadata_field_scope,
 )
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
     HostFilterProfile,
     HostFilterResolution,
+)
+from qiita_common.models.prep_sample import (
+    PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE,
+    PREP_SAMPLE_STUDY_FIELD_IDX_WIRE,
+    PrepSampleStudyFieldCreateRequest,
+    PrepSampleStudyFieldResponse,
 )
 from qiita_common.models.reference import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
@@ -140,6 +162,13 @@ from qiita_common.models.reference import (
     TerminologyTermObsoletionKind,
     Tier,
     read_mask_reason_sql_list,
+)
+from qiita_common.models.sample_field import (
+    GLOBAL_FIELD_IDX_ATTR,
+    STUDY_FIELD_IDX_ATTR,
+    SampleStudyFieldCreateRequest,
+    SampleStudyFieldResponse,
+    field_wire_name,
 )
 from qiita_common.models.sequencing import (
     AlignmentDefinitionDeleteResponse,
@@ -180,6 +209,7 @@ from qiita_common.models.sequencing import (
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
+    StudyScopedSequencedSampleResponse,
     merge_qc_reports,
 )
 from qiita_common.models.step import (
@@ -279,6 +309,9 @@ __all__ = [
     # Module-level constants.
     "BIOSAMPLE_FIELD_HOST_TAXON_ID",
     "BIOSAMPLE_FIELD_TAXON_ID",
+    "BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE",
+    "BIOSAMPLE_STUDY_FIELD_IDX_WIRE",
+    "GLOBAL_FIELD_IDX_ATTR",
     "HOST_FILTER_INDEX_TYPE_MINIMAP2",
     "HOST_FILTER_INDEX_TYPE_RYPE",
     "HOST_FILTER_REQUIRED_INDEX_TYPES",
@@ -292,11 +325,18 @@ __all__ = [
     "NCBI_TAXONOMY_HUMAN_TERM_ID",
     "NCBI_TAXONOMY_NAME",
     "ORCID_PATTERN",
+    "PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE",
+    "PREP_SAMPLE_STUDY_FIELD_IDX_WIRE",
+    "STUDY_FIELD_IDX_ATTR",
     "TERMINOLOGY_TERM_VALUE_COLUMN",
     "VALID_STATUS_TRANSITIONS",
     # Shared base types.
+    "AccessionText",
     "BlockScopeTarget",
     "ComputeTarget",
+    "MetadataRequestModel",
+    "NonBlankName",
+    "NonBlankText",
     "PatchRequestModel",
     "PrepSampleScopeTarget",
     "ReferenceScopeTarget",
@@ -381,12 +421,24 @@ __all__ = [
     "BiosampleLookupByMatrixTubeIdResponse",
     "BiosamplePatchRequest",
     "BiosampleResponse",
-    "GlobalMetadataEntry",
+    "BiosampleStudyFieldCreateRequest",
+    "BiosampleStudyFieldResponse",
+    "derive_metadata_field_scope",
+    "field_wire_name",
+    "FieldWriteOutcome",
     "IdxsListResponse",
     "MetadataChecklistRef",
+    "MetadataEntry",
+    "MetadataFieldScope",
+    "MetadataFieldWriteResult",
     "MissingReasonRef",
     "OwnerBiosampleIdExportResponse",
     "OwnerBiosampleIdRow",
+    "SampleMetadataValue",
+    "SampleMetadataWriteRequest",
+    "SampleMetadataWriteResponse",
+    "SampleStudyFieldCreateRequest",
+    "SampleStudyFieldResponse",
     "SequencedSampleListItem",
     "SequencedSampleListResponse",
     "StudyAccessionField",
@@ -394,6 +446,7 @@ __all__ = [
     "StudyListResponse",
     "StudyLookupByAccessionRequest",
     "StudyLookupByAccessionResponse",
+    "StudyScopedBiosampleResponse",
     "TerminologyTermRef",
     # Study.
     "StudyCreate",
@@ -453,6 +506,9 @@ __all__ = [
     "AlignPlanPartition",
     "AlignPlanRequest",
     "AlignPlanResponse",
+    # Prep sample (the processing-kind supertype of sequenced_sample).
+    "PrepSampleStudyFieldCreateRequest",
+    "PrepSampleStudyFieldResponse",
     # Sequencing-run / sequenced-pool / sequenced-sample.
     "AlignmentDefinitionDeleteResponse",
     "MaskDefinition",
@@ -487,6 +543,7 @@ __all__ = [
     "SequencedSampleExceptionFlag",
     "SequencedSamplePatchRequest",
     "SequencedSampleResponse",
+    "StudyScopedSequencedSampleResponse",
     "SequencingRunCreateRequest",
     "SequencingRunCreateResponse",
     "SequencingRunLookupByInstrumentRunIdRequest",

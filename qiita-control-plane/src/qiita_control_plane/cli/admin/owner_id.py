@@ -40,9 +40,10 @@ def _write_owner_biosample_id_tsv(body: dict, output: Path) -> int:
     as a header + tab-separated rows. NULL JSON values become empty cells.
 
     Written to a temp file in the same directory (created mode 0600 — the rows
-    hold the owner-submitted names, which are PII) then atomically `os.replace`d
-    into place, so a mid-write failure (disk full, etc.) can never truncate an
-    existing export: either the new file lands whole or the old one is untouched.
+    hold the owner-submitted names, which can contain PII) then atomically
+    `os.replace`d into place, so a mid-write failure (disk full, etc.) can
+    never truncate an existing export: either the new file lands whole or the
+    old one is untouched.
     The temp file is removed on any failure so a stray partial is never left.
 
     Returns the row count written (excluding the header).
@@ -73,8 +74,9 @@ def _handle_owner_biosample_id(args: argparse.Namespace, parser: argparse.Argume
     Not routed through run_http_subcommand because it writes a file rather than
     printing to stdout: it owns its own token-read, HTTP-error, and write-error
     handling so each failure surfaces as a clean stderr message + non-zero exit
-    (not a traceback). The owner names are PII, so they go only to the (0600)
-    output file — stdout gets a row-count summary, never the names themselves.
+    (not a traceback). The owner names can contain PII, so they go only to the
+    (0600) output file — stdout gets a row-count summary, never the names
+    themselves.
     """
     output: Path = args.output
     if not output.parent.is_dir():

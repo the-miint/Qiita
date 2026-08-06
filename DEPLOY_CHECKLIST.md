@@ -19,6 +19,18 @@ _None yet._
 
 ### 2. One-time host setup
 
+- **PRE-CHECK before the bucket-3 `20260725000001` migration.** That migration adds `UNIQUE(display_name)` to `biosample_global_field` and `prep_sample_global_field`; the `ALTER TABLE ... ADD CONSTRAINT UNIQUE` **fails** if either table already holds duplicate display_names. Find and resolve any before `make migrate`: (#386)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "
+    SELECT 'biosample_global_field' AS table_name, display_name, count(*) AS n
+      FROM qiita.biosample_global_field GROUP BY display_name HAVING count(*) > 1
+    UNION ALL
+    SELECT 'prep_sample_global_field' AS table_name, display_name, count(*) AS n
+      FROM qiita.prep_sample_global_field GROUP BY display_name HAVING count(*) > 1"
+  # expect: zero rows. Any row → resolve the duplicate display_name(s) first.
+  ```
+
 - **Re-run `assembly_coverage` for any `long-read-assembly` ticket that completed it before
   this deploy** (#422, closes #374). `assembly_coverage` now writes its coverage BAM
   coordinate sorted and `binning.sh` no longer sorts what it stages, so a BAM
@@ -52,6 +64,9 @@ _None yet._
 
 ### 3. Migrations
 
+- `20260725000000_metadata_global_field_alias_index_comments.sql` — attaches explanatory COMMENTs to the per-global metadata uniqueness indexes (no schema change). Plain `make migrate`. (#386)
+- `20260725000001_global_field_display_name_unique.sql` — adds `UNIQUE(display_name)` to both global-field tables. Plain `make migrate` — **but only after the bucket-2 pre-check passes** (the constraint build aborts on existing duplicate display_names). (#386)
+- `20260725000002_metadata_reject_link_retired_on_update.sql` — adds a `BEFORE UPDATE` twin of the existing retired-link guard on `biosample_metadata` and `prep_sample_metadata` (reuses the existing trigger functions; no schema change). Plain `make migrate`. (#386)
 - `make migrate` applies `20260802000000_work_ticket_escalated_resource_floor.sql`, no
   out-of-band setup: an additive `ALTER TABLE qiita.work_ticket ADD COLUMN
   escalated_resource_floor JSONB`, plus a shape CHECK (`NULL` or a JSON object) and the
@@ -65,6 +80,7 @@ _None yet._
   `qiita.mint_mask_definition` adding two DEFAULT-NULL parameters. The old 5-argument call
   still resolves against the new signature, so the running CP keeps minting between this
   step and the bucket-4 restart. (#428)
+- `20260804000001_metadata_updated_at.sql` — adds `updated_at` plus its `set_updated_at()` trigger to `biosample_metadata` and `prep_sample_metadata`. Plain `make migrate` — the `ADD COLUMN` takes the fast-default path, so it does not rewrite either table. Existing rows are deliberately **not** backfilled to their `created_at`: they all carry the migration's own timestamp instead. (#386)
 
 ### 4. Deploy
 
@@ -157,6 +173,11 @@ _None yet._
   (merging means repointing `qiita.mask_sample` and `qiita.work_ticket`).
 
 ### Notes (no host action)
+
+- Metadata values for a `boolean`-typed biosample/prep_sample field now write and read back (`true`/`false`, case-insensitive; anything else 422s). (#386)
+- A metadata write returns a `numeric` value in the form it is stored, so exponent notation comes back resolved (`1e3` → `1000`). A rewrite differing only in scale now reports `updated` and overwrites — `5` then `5.0` stores `5.0` — where it previously reported `unchanged` and wrote nothing. (#386)
+- A sample-family metadata write rejects a blank or whitespace-only value with 422; previously a `text`-typed field stored it as `''`. Supplying no value is still expressed with a missing-value marker. (#386)
+- Each per-field result from a sample-family metadata write carries `internal_name`, the key that value reads back under: a globally-linked value returns in `global_metadata` keyed on `internal_name`, never on the display_name the caller wrote, so a client verifying its own write reads this rather than reusing its key. Null for a purely-local field, which does read back under the key sent. `scope` is still on the wire but is derived from `internal_name`. A metadata PATCH body may also set `global_internal_names` to key global fields on `internal_name` instead of display_name, matching the import path's flag; that makes the write and read keys identical for a direct global match, but a key naming a study-local alias of a global field still resolves through the alias, so `internal_name` stays the reliable read key either way. (#386)
 
 - (#406) **`LOG_LEVEL` is new on both CP and CO but needs no action — and expect more journal volume.** It is optional and defaults to `INFO`, so both units boot without it; it is documented in `.env.control-plane.example` / `.env.compute-orchestrator.example` if you ever want to quiet or widen it (an unknown value fails the boot rather than silently reverting). The reason it matters: neither service configured the root logger at all, so every `_log.info` fell through to Python's WARNING-only fallback and never reached the journal. From this deploy the services narrate normally — pump decisions, dispatch lifecycle, sweeper passes — which is a real increase in journal writes on a busy day. Set `LOG_LEVEL=WARNING` on either service to get the old volume back.
 - (#406) **The Authorization-header scrubber was inert in both services and now works.** `install_authorization_scrub()` attaches to the root logger's handlers, and with none configured (above) the loop body never ran — so the filter that rewrites `Bearer <token>` to `Bearer <redacted>` was attached to nothing. It now covers everything propagating to root, including `httpx`. `uvicorn` / `uvicorn.access` keep `propagate=False` and remain outside it, so a bearer token appearing in a uvicorn *access* line would still be unscrubbed; that gap is pre-existing and tracked in #408.

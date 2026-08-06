@@ -386,7 +386,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Export the owner-submitted original sample names for a study as a"
             " TSV (system_admin only). Maps biosample_idx + accession back to"
-            " the PII-pinned owner name."
+            " the owner's original sample name (member-restricted; may contain PII)."
         ),
     )
     p_owner_id.add_argument(
