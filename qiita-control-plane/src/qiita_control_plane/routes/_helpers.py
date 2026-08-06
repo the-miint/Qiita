@@ -4,24 +4,50 @@ Centralizing them keeps response wording consistent across parallel
 endpoints — same input shape, same on-the-wire output.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
+from typing import NoReturn
 
 import asyncpg
 from fastapi import HTTPException
-from qiita_common.models import IdxsListResponse, MissingReasonRef, TerminologyTermRef
+from qiita_common.models import (
+    GLOBAL_FIELD_IDX_ATTR,
+    STUDY_FIELD_IDX_ATTR,
+    IdxsListResponse,
+    MetadataEntry,
+    MetadataFieldWriteResult,
+    MissingReasonRef,
+    SampleMetadataWriteResponse,
+    SampleStudyFieldCreateRequest,
+    SampleStudyFieldResponse,
+    TerminologyTermRef,
+    field_wire_name,
+)
 
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
+    DuplicateGlobalFieldTargetError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
+    EntityMetadataSpec,
     MetadataChecklistUnknownError,
+    MetadataParseError,
+    MetadataRow,
+    MetadataUnknownFieldsError,
+    OwnerSampleIdMetadataWriteError,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
+    StudyFieldAlreadyExistsError,
+    StudyFieldConflictError,
     TransientWriteRaceError,
+    create_study_field_and_read_back,
+    fetch_entity_is_linked_to_study,
+    fetch_global_metadata,
+    fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
+    write_sample_metadata,
 )
 
 
@@ -42,6 +68,359 @@ def _attempted_label(value: object) -> str:
 # is not in a route's specific message map. Lifted here so the wording
 # stays identical across every route that falls back to it.
 GENERIC_FK_VIOLATION = "references a row that does not exist"
+
+# The optimistic-concurrency header pair: every route that emits a version
+# stamp writes ETAG_HEADER, and every PATCH that gates on one reads
+# IF_MATCH_HEADER. A caller round-trips the first into the second, so the two
+# spellings are a contract rather than incidental strings.
+ETAG_HEADER = "ETag"
+IF_MATCH_HEADER = "If-Match"
+
+
+def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
+    """Map a metadata-row dict to MetadataEntry, preserving the input keys.
+
+    Each input key is reused unchanged as the output key, so whatever the rows
+    were keyed on carries through. Only the four MetadataEntry fields are read
+    from each row; a row's internal_name, when it has one, rides along as the
+    key rather than as an entry field.
+    """
+    return {
+        key: MetadataEntry(
+            display_name=row.display_name,
+            description=row.description,
+            data_type=row.data_type,
+            value=row.value,
+        )
+        for key, row in rows.items()
+    }
+
+
+async def read_global_and_local_entries(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+) -> tuple[dict[str, MetadataEntry], dict[str, MetadataEntry]]:
+    """Read an entity's globally-linked and study-local metadata and shape both
+    into MetadataEntry dicts.
+
+    Spec-driven. The caller owns the connection/snapshot and the
+    link/existence/retired gating. Returns (global_metadata keyed by
+    internal_name, local_metadata keyed by display_name).
+    """
+    global_rows = await fetch_global_metadata(conn, spec=spec, entity_idx=entity_idx)
+    local_rows = await fetch_local_metadata(
+        conn, spec=spec, entity_idx=entity_idx, study_idx=study_idx
+    )
+    global_metadata = metadata_entries_from_rows(global_rows)
+    local_metadata = metadata_entries_from_rows(local_rows)
+    return global_metadata, local_metadata
+
+
+def detail_for_unlinked_entity(*, noun: str, entity_idx: int, study_idx: int) -> str:
+    """Build the HTTP-404 detail for an entity with no writable study link.
+
+    One wording for every route and every layer that reports it, so a link
+    rejected by the pre-write gate and one rejected mid-write by the database
+    are indistinguishable on the wire. Returns the bare string; the caller
+    wraps it in HTTPException with status 404.
+    """
+    return f"{noun} {entity_idx} is not linked to study {study_idx}"
+
+
+async def resolve_linked_study_entity(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
+    entity_idx: int,
+    metadata_idx_column: str,
+    study_idx: int,
+    noun: str,
+    retired_status: int,
+    retired_detail: str,
+) -> tuple[asyncpg.Record, int]:
+    """Fetch a study-scoped entity and gate it on its study link + retirement.
+
+    metadata_idx_column names the row column that keys metadata and the study
+    link -- the entity's own idx for a direct entity, a supertype idx for a
+    subtype (prep_sample_idx on a sequenced_sample). A nonexistent row and an
+    unlinked one share the "not linked" 404 so existence never leaks across the
+    study boundary; retirement is checked only after the link passes and raises
+    retired_status/retired_detail (a read passes 404, a write passes 409).
+    Returns the (non-None) row plus its metadata/link idx.
+    """
+    row = await fetch_row(conn, entity_idx)
+    metadata_entity_idx = None if row is None else row[metadata_idx_column]
+    linked = metadata_entity_idx is not None and await fetch_entity_is_linked_to_study(
+        conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
+    )
+    if not linked:
+        raise HTTPException(
+            status_code=404,
+            detail=detail_for_unlinked_entity(
+                noun=noun, entity_idx=entity_idx, study_idx=study_idx
+            ),
+        )
+    if row["retired"]:
+        raise HTTPException(status_code=retired_status, detail=retired_detail)
+    return row, metadata_entity_idx
+
+
+async def read_study_scoped_entity(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
+    entity_idx: int,
+    metadata_idx_column: str,
+    study_idx: int,
+    noun: str,
+) -> tuple[asyncpg.Record, dict[str, MetadataEntry], dict[str, MetadataEntry]]:
+    """Fetch a study-scoped entity for reading and return its metadata.
+
+    Gates via resolve_linked_study_entity with a read's 404-on-retired, then
+    reads the entity's global and study-local metadata. Returns the (non-None)
+    row plus the two MetadataEntry dicts.
+    """
+    row, metadata_entity_idx = await resolve_linked_study_entity(
+        conn,
+        spec=spec,
+        fetch_row=fetch_row,
+        entity_idx=entity_idx,
+        metadata_idx_column=metadata_idx_column,
+        study_idx=study_idx,
+        noun=noun,
+        retired_status=404,
+        retired_detail=f"{noun} {entity_idx} not found",
+    )
+    global_metadata, local_metadata = await read_global_and_local_entries(
+        conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
+    )
+    return row, global_metadata, local_metadata
+
+
+# Sample-family metadata-write exceptions carrying one shared HTTP mapping.
+# Entity-specific errors (owner-id-field-collision, required-field, asyncpg) are
+# excluded — they are mapped per entity, not here.
+SAMPLE_METADATA_WRITE_ERRORS = (
+    MetadataUnknownFieldsError,
+    MetadataParseError,
+    StudyFieldConflictError,
+    DuplicateGlobalFieldTargetError,
+    OwnerSampleIdMetadataWriteError,
+    SlotOccupiedError,
+    TransientWriteRaceError,
+)
+
+
+async def raise_http_for_sample_metadata_write_error(
+    conn: asyncpg.Connection, exc: Exception
+) -> NoReturn:
+    """Map a sample-family metadata-write exception to its HTTPException.
+
+    One exception maps to exactly one response, so the mapping cannot drift.
+    Parse, unknown-field, study-field-conflict, duplicate-global-target, and
+    owner-sample-id errors map to 422; a slot collision to 409 (diagnosed
+    against conn); a transient write race to 503. Always raises.
+    """
+    if isinstance(exc, MetadataUnknownFieldsError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown metadata fields: {', '.join(exc.field_keys)}",
+        )
+    if isinstance(exc, MetadataParseError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"could not parse metadata field {exc.field_key!r}"
+                f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
+            ),
+        )
+    if isinstance(exc, StudyFieldConflictError):
+        # found_global_field_idx None means the shadowing study field is
+        # purely-local; otherwise it is bound to a different global field.
+        if exc.found_global_field_idx is None:
+            conflict = "a purely-local field of that name"
+        else:
+            conflict = "a field of that name bound to a different global field"
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} conflicts with"
+                f" {conflict} already on this study"
+            ),
+        )
+    if isinstance(exc, DuplicateGlobalFieldTargetError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"metadata fields {exc.field_keys!r} all resolve to the same global field",
+        )
+    if isinstance(exc, OwnerSampleIdMetadataWriteError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} is an owner-sample-id field"
+                " and cannot be written as ordinary metadata"
+            ),
+        )
+    if isinstance(exc, SlotOccupiedError):
+        detail = await detail_for_slot_collision(conn, exc)
+        raise HTTPException(status_code=409, detail=detail)
+    if isinstance(exc, TransientWriteRaceError):
+        raise_for_transient_write_race(exc)
+    # Reached only if SAMPLE_METADATA_WRITE_ERRORS above gained a member with no
+    # branch here; a parity test pins the two together. Fail loud rather than
+    # swallow the exception or answer with a status picked for a different error.
+    raise exc
+
+
+async def write_and_map_sample_metadata(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    metadata: Mapping[str, str],
+    caller_idx: int,
+    unlinked_detail: str,
+    global_internal_names: bool = False,
+) -> SampleMetadataWriteResponse:
+    """Upsert a metadata dict for a sample-family entity and shape the result.
+
+    Writes each field (allow_local=True), maps the metadata-write exceptions to
+    their HTTP responses, and returns the per-field results keyed by the key the
+    caller sent, in its input order. global_internal_names keys global fields on
+    internal_name rather than display_name; study-local fields are display-name-
+    keyed either way. Each result carries the resolved field's internal_name,
+    which is the key a globally-linked value reads back under; it equals the key
+    the caller sent only when that key was the global's own internal_name, so a
+    value resolved through a study-local alias reads back under a different key
+    whatever the flag says. A cross-study slot collision still 409s; a
+    same-study, same-field, different-value rewrite is a last-writer-wins
+    overwrite -- there is no If-Match on this path, so the caller accepts
+    lost-update semantics.
+
+    unlinked_detail is the 404 body for a study link the database refuses at
+    write time; the caller supplies it because only the caller knows which idx
+    it named the entity by (an entity keying its metadata on a supertype idx
+    still answers under the idx the request carried).
+    """
+    try:
+        # on_conflict="upsert" overwrites the caller's own study's value in
+        # place. No If-Match guards this, so a concurrent same-study rewrite of
+        # the same field is last-writer-wins (lost update); a foreign study's
+        # value still raises (409) rather than being overwritten.
+        results = await write_sample_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=study_idx,
+            metadata=metadata,
+            caller_idx=caller_idx,
+            allow_local=True,
+            on_conflict="upsert",
+            global_internal_names=global_internal_names,
+        )
+    except SAMPLE_METADATA_WRITE_ERRORS as exc:
+        await raise_http_for_sample_metadata_write_error(conn, exc)
+    except asyncpg.RaiseError as exc:
+        # The retired-link trigger tags its error DETAIL with a `trigger` key
+        # naming the raising DB function. Dispatch on that key (never on message
+        # prose) and re-raise every other RaiseError: several other guards on
+        # these tables share this SQLSTATE, and answering 404 for one of those
+        # would name the wrong cause. The link was writable when the caller was
+        # gated and is not now, so the answer is the gate's own 404 -- what a
+        # retry returns, and one status for one condition.
+        detail_fields = parse_kv_detail(exc.detail)
+        if detail_fields.get("trigger") == spec.metadata_retired_link_trigger:
+            raise HTTPException(status_code=404, detail=unlinked_detail)
+        raise
+    return SampleMetadataWriteResponse(
+        results={
+            # scope is derived from internal_name on the wire model, so it is
+            # not passed here (extra="forbid" would reject it).
+            r.field_key: MetadataFieldWriteResult(
+                internal_name=r.internal_name, outcome=r.outcome, value=r.value
+            )
+            for r in results
+        }
+    )
+
+
+async def create_and_map_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    body: SampleStudyFieldCreateRequest,
+    caller_idx: int,
+    response_model: type[SampleStudyFieldResponse],
+) -> SampleStudyFieldResponse:
+    """Create one study-local field for a sample-family entity and shape the
+    stored row into response_model.
+
+    Create-side conflicts map to 409 and DB-level violations to 422 (the
+    Pydantic body should preempt the CHECK, but it is the last defense). The
+    caller owns the transaction. Response keys come from response_model's own
+    aliases, so each entity's wire spelling of the two idx fields follows its
+    model rather than being rebuilt here.
+    """
+    noun = spec.entity_kind
+    try:
+        row = await create_study_field_and_read_back(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=body.display_name,
+            created_by_idx=caller_idx,
+            description=body.description,
+            global_field_idx=body.global_field_idx,
+            data_type=body.data_type,
+            required=body.required,
+            terminology_idx=body.terminology_idx,
+            tier_override=body.tier_override,
+        )
+    except StudyFieldAlreadyExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"a {noun} field named {body.display_name!r} already exists on this study",
+        )
+    except StudyFieldConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"a {noun} field named {body.display_name!r} already exists"
+                " on this study bound to a different global field"
+            ),
+        )
+    except TransientWriteRaceError as exc:
+        raise_for_transient_write_race(exc)
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)
+    except asyncpg.CheckViolationError:
+        raise HTTPException(status_code=422, detail=f"violates a database constraint on {noun}")
+
+    # The row names the global link by its SQL column; the response names both
+    # idx fields by the subclass's alias.
+    payload = {
+        field_wire_name(response_model, STUDY_FIELD_IDX_ATTR): row["idx"],
+        "study_idx": row["study_idx"],
+        field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR): row[
+            spec.study_field_global_fk_column
+        ],
+        "display_name": row["display_name"],
+        "description": row["description"],
+        "data_type": row["data_type"],
+        "required": row["required"],
+        "terminology_idx": row["terminology_idx"],
+        "tier_override": row["tier_override"],
+        "created_by_idx": row["created_by_idx"],
+        "created_at": row["created_at"],
+    }
+    return response_model.model_validate(payload)
 
 
 def raise_for_unique_violation(
@@ -156,37 +535,34 @@ async def detail_for_slot_collision(
         if exc.global_field_idx is not None
         else f"{exc.entity_kind}_study_field_idx={exc.study_field_idx}"
     )
+    # Where the occupied slot sits — field, entity, and slot identifier. Every
+    # branch below names it, so it is rendered once here.
+    slot_location = (
+        f"field {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx} ({slot_id})"
+    )
     # Match on the concrete subclass to pick the right wording. The
     # generic SlotOccupiedError fallback covers any future subclass
     # added without a wording branch here; reading the catch-all
     # message in production points the maintainer at this dispatch.
     if isinstance(exc, DuplicateValueSameStudyError):
         return (
-            f"your study already wrote this same {what} for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id}); no new row was created"
+            f"your study already wrote this same {what} for {slot_location}; no new row was created"
         )
     if isinstance(exc, ConflictingValueSameStudyError):
         return (
-            f"your study previously wrote a different {what} for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id});"
+            f"your study previously wrote a different {what} for {slot_location};"
             f" correct it via PATCH or DELETE+INSERT, not INSERT"
         )
     if isinstance(exc, DuplicateValueDifferentStudyError):
         return (
-            f"the {what} you attempted is already present for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id}), contributed by"
-            f" study_idx={exc.contributing_study_idx}; your study does"
+            f"the {what} you attempted is already present for {slot_location},"
+            f" contributed by study_idx={exc.contributing_study_idx}; your study does"
             f" not own the row"
         )
     if isinstance(exc, ConflictingValueDifferentStudyError):
         return (
             f"another study (study_idx={exc.contributing_study_idx}) has"
-            f" written a different {what} for field"
-            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
-            f" ({slot_id});"
+            f" written a different {what} for {slot_location};"
             f" the global field's canonical value is in dispute"
         )
     if isinstance(exc, SlotOccupiedByMissingReasonError):
@@ -202,8 +578,7 @@ async def detail_for_slot_collision(
             exc.existing_missing_reason_idx,
         )
         return (
-            f"the value for field {exc.display_name!r} on"
-            f" {exc.entity_kind}_idx={exc.entity_idx} ({slot_id}) is"
+            f"the value for {slot_location} is"
             f" recorded as intentionally missing (reason: {reason_name});"
             f" the missing-reason row must be deleted before a typed"
             f" value can be written"
@@ -232,8 +607,7 @@ async def detail_for_slot_collision(
         else:
             rendered_existing = str(exc.existing_value)
         return (
-            f"the value for field {exc.display_name!r} on"
-            f" {exc.entity_kind}_idx={exc.entity_idx} ({slot_id}) is"
+            f"the value for {slot_location} is"
             f" already recorded as a typed value ({rendered_existing});"
             f" the typed row must be deleted before a missing-reason"
             f" marker can be written"

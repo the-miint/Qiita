@@ -22,11 +22,13 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_BY_IDX,
+    URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCED_SAMPLE_LIST_BY_POOL,
     URL_SEQUENCED_SAMPLE_LIST_BY_RUN,
     URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     URL_SEQUENCED_SAMPLE_LIST_BY_STUDY,
+    URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType, Platform
@@ -36,15 +38,19 @@ from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     fetch_missing_value_reason_idx,
     fetch_ncbi_taxonomy_term,
     fetch_seeded_metagenome_term,
+    retire_prep_sample_to_study_link,
     seed_biosample,
     seed_biosample_to_study_link,
     seed_host_filter_profile,
     seed_host_reference,
+    seed_local_metadata_value,
+    seed_local_study_field,
     seed_prep_sample_global_field,
     seed_user_principal,
 )
@@ -433,6 +439,65 @@ async def test_import_sequenced_sample_from_run_with_metadata(ctx):
         ("Design description", "amp-001"),
         ("Title", "Wet-lab amplicon prep 001"),
     ]
+
+
+async def test_import_sequenced_sample_from_run_writes_existing_local_field(ctx):
+    """Tests the case where the metadata names a purely-local prep_sample field
+    the study already has: the composer writes the value through that existing
+    field row instead of refusing the name.
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-local")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="local"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    # The field exists on the study before the import, and is purely local:
+    # nothing in the import request can create one.
+    local_display_name = f"Lab note {secrets.token_hex(4)}"
+    local_field_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=local_display_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("WET-LOCAL"),
+        primary_study_idx=study_idx,
+        metadata={local_display_name: "LOCAL-1"},
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+
+    # The row must hang off the pre-seeded field with no global link; a write
+    # through a global slot, or a newly minted field, would change both columns.
+    rows = await ctx["pool"].fetch(
+        "SELECT prep_sample_study_field_idx, global_field_idx, value_text"
+        " FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1",
+        rj["prep_sample_idx"],
+    )
+    expected_rows = [
+        {
+            "prep_sample_study_field_idx": local_field_idx,
+            "global_field_idx": None,
+            "value_text": "LOCAL-1",
+        }
+    ]
+    assert [dict(r) for r in rows] == expected_rows
 
 
 async def test_import_sequenced_prep_sample_metadata_missing_value_persists(ctx):
@@ -2001,27 +2066,6 @@ async def _seed_sequenced_sample_linked_to_study(ctx, *, study_idx: int, suffix:
     return resp.json()
 
 
-async def _retire_prep_sample_to_study_link(
-    pool, *, prep_sample_idx: int, study_idx: int, retired_by_idx: int
-) -> None:
-    """Retire one prep_sample_to_study link via direct SQL; mirrors the
-    retire_biosample_to_study_link seed helper. No dedicated seed helper
-    exists yet because link retirement is otherwise driven by routes that
-    have not landed.
-    """
-    # Populate all three NOT-NULL retirement audit columns alongside the
-    # flag flip so the prep_sample_to_study_retirement_consistent CHECK
-    # passes; retire_reason is left NULL (the CHECK allows it).
-    await pool.execute(
-        "UPDATE qiita.prep_sample_to_study"
-        " SET retired = true, retired_at = now(), retired_by_idx = $3"
-        " WHERE prep_sample_idx = $1 AND study_idx = $2",
-        prep_sample_idx,
-        study_idx,
-        retired_by_idx,
-    )
-
-
 async def test_list_sequenced_sample_idxs_in_study_owner_returns_payload(ctx):
     # Study owner bypasses the tier comparison; two linked sequenced_samples
     # surface newest-linked first with the regular-user system_role.
@@ -2091,7 +2135,7 @@ async def test_list_sequenced_sample_idxs_in_study_excludes_retired_link_and_ret
     retired_prep = await _seed_sequenced_sample_linked_to_study(
         ctx, study_idx=study_idx, suffix="ret-prep"
     )
-    await _retire_prep_sample_to_study_link(
+    await retire_prep_sample_to_study_link(
         ctx["pool"],
         prep_sample_idx=retired_link["prep_sample_idx"],
         study_idx=study_idx,
@@ -3496,3 +3540,759 @@ async def test_roster_unresolved_when_host_has_no_profile_on_this_platform(ctx):
     assert block["host_term_idx"] == human_term["idx"]
     assert "no host_filter_profile" in block["reason"]
     assert block["rype_reference_idx"] is None
+
+
+# ===========================================================================
+# GET /study/{study_idx}/sequenced-sample/{sequenced_sample_idx}
+# ===========================================================================
+
+
+async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(ctx):
+    """Tests the case where a study-linked sequenced_sample carries both a
+    globally-linked prep_sample metadata value and a purely-local prep_sample
+    row: the study-scoped GET returns the joined row, global_metadata keyed by
+    internal_name, and local_metadata keyed by display_name, with an ETag. The
+    caller is wet_lab_admin, whose role bypasses the ADMIN tier clamp.
+    """
+    seeded = await _seed_one_sequenced_sample(
+        ctx,
+        "get-in-study",
+        metadata={"Design description": "amp-007", "Title": "Wet-lab amplicon prep 007"},
+    )
+    local_display_name = f"Lab note {secrets.token_hex(4)}"
+    metadata_idx, _ = await seed_local_metadata_value(
+        ctx["pool"],
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        entity_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        display_name=local_display_name,
+        value="LOCAL-1",
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["prep_sample_metadata"].append(metadata_idx)
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    rj = resp.json()
+    expected = _expected_read_response(
+        seeded,
+        rj=rj,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+        caller_system_role="wet_lab_admin",
+        global_metadata={
+            "design_description": {
+                "display_name": "Design description",
+                "description": None,
+                "data_type": "text",
+                "value": "amp-007",
+            },
+            "title": {
+                "display_name": "Title",
+                "description": None,
+                "data_type": "text",
+                "value": "Wet-lab amplicon prep 007",
+            },
+        },
+        has_metadata=True,
+    )
+    # The study-scoped response adds this study's purely-local metadata, keyed
+    # by display_name, on top of the sequenced-sample-level response.
+    expected["local_metadata"] = {
+        local_display_name: {
+            "display_name": local_display_name,
+            "description": None,
+            "data_type": "text",
+            "value": "LOCAL-1",
+        }
+    }
+    assert rj == expected
+
+    etag = resp.headers["ETag"]
+    assert etag.startswith('"') and etag.endswith('"')
+
+
+async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
+    """Tests the case where a regular user holds ADMIN study access (not the
+    role bypass): the ADMIN tier clamp is satisfied by the study_access row, so
+    the study-scoped GET returns 200 with empty metadata dicts for a bare
+    sequenced_sample.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-admin-tier")
+    await _grant_study_access(
+        ctx,
+        study_idx=seeded["study_idx"],
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    rj = resp.json()
+    expected = _expected_read_response(
+        seeded,
+        rj=rj,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+        caller_system_role="user",
+        global_metadata={},
+        has_metadata=False,
+    )
+    expected["local_metadata"] = {}
+    assert rj == expected
+
+    etag = resp.headers["ETag"]
+    assert etag.startswith('"') and etag.endswith('"')
+
+
+@pytest.mark.parametrize("tier", ["viewer", "member"])
+async def test_get_sequenced_sample_in_study_below_admin_tier_403(ctx, tier):
+    """Tests the case where a regular user's study access is below the ADMIN
+    clamp (viewer or member): the study-scoped GET is 403.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, f"get-{tier}")
+    await _grant_study_access(
+        ctx,
+        study_idx=seeded["study_idx"],
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier=tier,
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_get_sequenced_sample_in_study_no_access_403(ctx):
+    """Tests the case where a regular user has no study_access row on the study
+    (public-by-absence, below the ADMIN clamp): the GET is 403.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-noaccess")
+
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_get_sequenced_sample_in_study_anonymous_401(ctx):
+    """Tests the case where no Authorization header is sent: require_human
+    rejects with 401 before any study or sample read.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-anon")
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(
+            URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+                study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+            )
+        )
+    assert resp.status_code == 401
+
+
+async def test_get_sequenced_sample_in_study_missing_scope_403(ctx, no_prep_sample_read_client):
+    """Tests the case where the caller's PAT omits Scope.PREP_SAMPLE_READ:
+    require_scope rejects with 403 before any DB read.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-noscope")
+
+    resp = await no_prep_sample_read_client.get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 403
+    assert "prep_sample:read" in resp.json()["detail"]
+
+
+async def test_get_sequenced_sample_in_study_nonexistent_study_404(ctx):
+    """Tests the case where study_idx does not exist: require_study_exists
+    returns 404 even for the wet_lab_admin whose role bypasses the tier check.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-nostudy")
+    max_study = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=max_study + 100_000, sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_get_sequenced_sample_in_study_not_linked_404(ctx):
+    """Tests the case where the sequenced_sample's prep_sample has no link to
+    the path study: the GET is 404 with the same wording as a nonexistent
+    sample so existence never leaks across the study boundary.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-unlinked")
+    # A second study the sample's prep_sample is not linked to.
+    other_study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-unlinked-other"
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=other_study_idx, sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
+async def test_get_sequenced_sample_in_study_retired_link_404(ctx):
+    """Tests the case where the supertype prep_sample's link to the path study
+    is retired while the prep_sample itself stays active: the GET is 404, so a
+    retired link withdraws read access instead of leaving the record fully
+    visible.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-retlink")
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
+async def test_get_sequenced_sample_in_study_retired_404(ctx):
+    """Tests the case where the supertype prep_sample is retired while its
+    study link remains: the link check passes, then the retired carve-out
+    returns 404 (mirroring the sequenced-sample-level read).
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "get-retired")
+    await _retire_prep_sample(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not found" in resp.json()["detail"]
+
+
+# ===========================================================================
+# PATCH /api/v1/study/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata
+# ===========================================================================
+
+
+async def _patch_sequenced_metadata(
+    client, study_idx, sequenced_sample_idx, metadata, *, global_internal_names=None
+):
+    """PATCH the study-scoped sequenced-sample metadata route with a metadata dict.
+
+    global_internal_names None omits the flag from the body, exercising the
+    route's own default rather than restating it.
+    """
+    body = {"metadata": metadata}
+    if global_internal_names is not None:
+        body["global_internal_names"] = global_internal_names
+    return await client.patch(
+        URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY.format(
+            study_idx=study_idx, sequenced_sample_idx=sequenced_sample_idx
+        ),
+        json=body,
+    )
+
+
+async def _track_prep_sample_metadata(ctx, prep_sample_idx):
+    """Track every prep_sample_metadata row for a prep_sample for FK-reverse cleanup."""
+    rows = await ctx["pool"].fetch(
+        "SELECT idx FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1", prep_sample_idx
+    )
+    for r in rows:
+        if r["idx"] not in ctx["created"]["prep_sample_metadata"]:
+            ctx["created"]["prep_sample_metadata"].append(r["idx"])
+
+
+async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.TEXT):
+    """Seed one prep_sample global field; track it.
+
+    Returns (global_field_idx, display_name, internal_name). The two names are
+    deliberately distinct spellings, matching every global field the migrations
+    seed.
+    """
+    token = secrets.token_hex(4)
+    display_name = f"Field {token}"
+    internal_name = f"field_{token}"
+    global_idx = await seed_prep_sample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=data_type,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["prep_sample_global_field"].append(global_idx)
+    return global_idx, display_name, internal_name
+
+
+async def test_patch_sequenced_sample_metadata_inserts_global_and_local(ctx):
+    """Tests the case where a wet_lab_admin upserts one globally-linked value and
+    one purely-local value on a sequenced_sample's prep_sample: both are
+    INSERTED, reported per field in input order with scope, stored value, and the
+    internal_name each reads back under -- populated for the global field, None
+    for the local one.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-ins")
+    _global_idx, global_name, global_internal = await _seed_prep_global_field(ctx)
+    local_name = f"Local {secrets.token_hex(4)}"
+    await seed_local_study_field(
+        ctx["pool"],
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        study_idx=seeded["study_idx"],
+        display_name=local_name,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"],
+        seeded["study_idx"],
+        seeded["sequenced_sample_idx"],
+        {global_name: "GVAL", local_name: "LVAL"},
+    )
+    assert resp.status_code == 200, resp.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+
+    rj = resp.json()
+    expected = {
+        "results": {
+            global_name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "GVAL",
+                "internal_name": global_internal,
+            },
+            local_name: {
+                "scope": "local",
+                "outcome": "inserted",
+                "value": "LVAL",
+                "internal_name": None,
+            },
+        }
+    }
+    assert rj == expected
+    # The per-field report is keyed in the caller's input order.
+    assert list(rj["results"].keys()) == [global_name, local_name]
+
+
+async def test_patch_sequenced_sample_metadata_updates_existing_value(ctx):
+    """Tests the case where a second write to the same field with a new value
+    overwrites in place: the outcome is UPDATED and the new value is stored.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-upd")
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
+    first = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V1"}
+    )
+    assert first.status_code == 200, first.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V2"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "updated",
+                "value": "V2",
+                "internal_name": internal_name,
+            }
+        }
+    }
+
+
+async def test_patch_sequenced_sample_metadata_unchanged_on_identical_value(ctx):
+    """Tests the case where a field is rewritten with its current value: the
+    outcome is UNCHANGED and nothing is modified.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-unch")
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
+    first = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
+    )
+    assert first.status_code == 200, first.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "unchanged",
+                "value": "SAME",
+                "internal_name": internal_name,
+            }
+        }
+    }
+
+
+async def test_patch_sequenced_sample_metadata_internal_name_is_the_read_key(ctx):
+    """Tests the case where a caller writes a global field by display_name and
+    then reads the sequenced_sample back: the reported internal_name is the key
+    global_metadata carries, while the display_name the caller sent appears in
+    neither metadata map.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-roundtrip")
+    _global_idx, global_name, global_internal = await _seed_prep_global_field(ctx)
+
+    written = await _patch_sequenced_metadata(
+        ctx["wet"],
+        seeded["study_idx"],
+        seeded["sequenced_sample_idx"],
+        {global_name: "GVAL"},
+    )
+    assert written.status_code == 200, written.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+
+    read = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert read.status_code == 200, read.text
+
+    read_body = read.json()
+    assert written.json()["results"][global_name]["internal_name"] == global_internal
+    assert read_body["global_metadata"][global_internal]["value"] == "GVAL"
+    assert global_name not in read_body["global_metadata"]
+    assert global_name not in read_body["local_metadata"]
+
+
+async def test_patch_sequenced_sample_metadata_internal_name_keying_round_trips(ctx):
+    """Tests the case where the body sets global_internal_names and keys a global
+    prep_sample field on its internal_name: the key the caller sent is the key
+    global_metadata carries, so the sent and read keys match.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-intname")
+    _global_idx, global_name, global_internal = await _seed_prep_global_field(ctx)
+
+    written = await _patch_sequenced_metadata(
+        ctx["wet"],
+        seeded["study_idx"],
+        seeded["sequenced_sample_idx"],
+        {global_internal: "IVAL"},
+        global_internal_names=True,
+    )
+    assert written.status_code == 200, written.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+    assert written.json() == {
+        "results": {
+            global_internal: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "IVAL",
+                "internal_name": global_internal,
+            }
+        }
+    }
+
+    read = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+        )
+    )
+    assert read.status_code == 200, read.text
+    read_body = read.json()
+    assert read_body["global_metadata"][global_internal]["value"] == "IVAL"
+    assert global_name not in read_body["global_metadata"]
+
+
+async def test_patch_sequenced_sample_metadata_unknown_field_422(ctx):
+    """Tests the case where a metadata key resolves to no field on the study:
+    the write is rejected 422 rather than creating a field.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-unk")
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"No Such Field": "x"}
+    )
+    assert resp.status_code == 422, resp.text
+    assert "unknown metadata fields" in resp.json()["detail"]
+
+
+async def test_patch_sequenced_sample_metadata_parse_422(ctx):
+    """Tests the case where a value cannot be parsed as the field's data_type:
+    a non-numeric text for a NUMERIC field is a 422.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-parse")
+    _global_idx, name, _internal_name = await _seed_prep_global_field(
+        ctx, data_type=FieldDataType.NUMERIC
+    )
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "not-a-number"}
+    )
+    assert resp.status_code == 422, resp.text
+    assert "could not parse" in resp.json()["detail"]
+
+
+async def test_patch_sequenced_sample_metadata_foreign_study_409(ctx):
+    """Tests the case where a global slot already carries another study's value:
+    writing a different value from a second study is a cross-study slot
+    collision (409), not an in-place overwrite.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_a = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-fs-a")
+    study_b = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-fs-b")
+    bs_idx = await _seed_biosample_linked_to_study(ctx, owner_idx=wet_idx, study_idx=study_a)
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=bs_idx, study_idx=study_b, created_by_idx=wet_idx
+    )
+    ctx["created"]["biosample_to_study"].append((bs_idx, study_b))
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "patch-fs")
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    post = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=wet_idx,
+        sequenced_pool_item_id=_unique_item_id("PATCHFS"),
+        primary_study_idx=study_a,
+        secondary_study_idxs=[study_b],
+    )
+    assert post.status_code == 201, post.text
+    ss_idx = post.json()["sequenced_sample_idx"]
+    prep_idx = post.json()["prep_sample_idx"]
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
+
+    # Study A writes the global value first (contributing study = A).
+    first = await _patch_sequenced_metadata(ctx["wet"], study_a, ss_idx, {name: "VAL-A"})
+    assert first.status_code == 200, first.text
+    await _track_prep_sample_metadata(ctx, prep_idx)
+
+    # Study B writing a different value to the same global slot collides.
+    resp = await _patch_sequenced_metadata(ctx["wet"], study_b, ss_idx, {name: "VAL-B"})
+    assert resp.status_code == 409, resp.text
+
+
+async def test_patch_sequenced_sample_metadata_empty_body_422(ctx):
+    """Tests the case where the metadata dict is empty: rejected at the wire
+    boundary (min_length=1).
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-empty")
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {}
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_patch_sequenced_sample_metadata_not_linked_404(ctx):
+    """Tests the case where the sequenced_sample's prep_sample is not linked to
+    the path study: 404, the same wording as a nonexistent sample.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-nolink")
+    other_study = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="patch-nolink-other"
+    )
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], other_study, seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
+async def test_patch_sequenced_sample_metadata_retired_link_404(ctx):
+    """Tests the case where the supertype prep_sample's link to the path study
+    is retired while the prep_sample itself stays active: the metadata write is
+    404, so a retired link withdraws write access rather than only read access.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-retlink")
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 404, resp.text
+    assert "not linked" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("value_exists", [False, True], ids=["insert", "overwrite"])
+async def test_patch_sequenced_sample_metadata_link_retired_mid_write_404(
+    ctx, study_link_gate_reports_live, value_exists
+):
+    """Tests the case where the prep_sample's study link is retired after the
+    route's gate cleared it: the database refuses the write and the route answers
+    the same 404 the gate would have, naming the requested sequenced_sample_idx
+    rather than the supertype idx the metadata keys on.
+    """
+    suffix = "patch-race-over" if value_exists else "patch-race-ins"
+    seeded = await _seed_one_sequenced_sample(ctx, suffix)
+    global_idx, global_name, _global_internal = await _seed_prep_global_field(ctx)
+    if value_exists:
+        seed_resp = await _patch_sequenced_metadata(
+            ctx["wet"],
+            seeded["study_idx"],
+            seeded["sequenced_sample_idx"],
+            {global_name: "BEFORE"},
+        )
+        assert seed_resp.status_code == 200, seed_resp.text
+        await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        study_idx=seeded["study_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {global_name: "AFTER"}
+    )
+    assert resp.status_code == 404, resp.text
+    expected_detail = (
+        f"sequenced_sample {seeded['sequenced_sample_idx']} is not linked"
+        f" to study {seeded['study_idx']}"
+    )
+    assert resp.json()["detail"] == expected_detail
+
+    # The refused write left the slot as it was.
+    stored_value = await ctx["pool"].fetchval(
+        "SELECT value_text FROM qiita.prep_sample_metadata"
+        " WHERE prep_sample_idx = $1 AND global_field_idx = $2",
+        seeded["prep_sample_idx"],
+        global_idx,
+    )
+    assert stored_value == ("BEFORE" if value_exists else None)
+
+
+async def test_patch_sequenced_sample_metadata_retired_409(ctx):
+    """Tests the case where the supertype prep_sample is retired: its metadata
+    cannot be written (409), checked after the link passes.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-ret")
+    await _retire_prep_sample(
+        ctx["pool"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    resp = await _patch_sequenced_metadata(
+        ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 409, resp.text
+    assert "retired" in resp.json()["detail"]
+
+
+async def test_patch_sequenced_sample_metadata_anonymous_401(ctx):
+    """Tests the case where no Authorization header is sent: 401 before any read."""
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-anon")
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.patch(
+            URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY.format(
+                study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
+            ),
+            json={"metadata": {"F": "x"}},
+        )
+    assert resp.status_code == 401
+
+
+async def test_patch_sequenced_sample_metadata_missing_scope_403(ctx, no_prep_sample_write_client):
+    """Tests the case where the caller's PAT omits Scope.PREP_SAMPLE_WRITE: 403
+    before any DB read.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-noscope")
+    resp = await _patch_sequenced_metadata(
+        no_prep_sample_write_client, seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 403
+    assert "prep_sample:write" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("tier", ["viewer", "member"])
+async def test_patch_sequenced_sample_metadata_below_admin_tier_403(ctx, tier):
+    """Tests the case where a regular user's study access is below the ADMIN
+    clamp (viewer or member): the write is 403.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, f"patch-{tier}")
+    await _grant_study_access(
+        ctx,
+        study_idx=seeded["study_idx"],
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier=tier,
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    resp = await _patch_sequenced_metadata(
+        ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_patch_sequenced_sample_metadata_no_access_403(ctx):
+    """Tests the case where a regular user has no study_access row on the study:
+    the write is 403.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-noaccess")
+    resp = await _patch_sequenced_metadata(
+        ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
+    """Tests the case where a regular user with ADMIN study access (not the role
+    bypass) writes metadata: the ADMIN clamp is satisfied and the value is
+    INSERTED.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-admin")
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
+    await _grant_study_access(
+        ctx,
+        study_idx=seeded["study_idx"],
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    resp = await _patch_sequenced_metadata(
+        ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "AVAL"}
+    )
+    assert resp.status_code == 200, resp.text
+    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
+    assert resp.json() == {
+        "results": {
+            name: {
+                "scope": "global",
+                "outcome": "inserted",
+                "value": "AVAL",
+                "internal_name": internal_name,
+            }
+        }
+    }

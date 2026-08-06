@@ -21,8 +21,17 @@ from pydantic import (
 from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel, ReadCounts
-from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
+from qiita_common.models._base import (
+    AccessionText,
+    MetadataRequestModel,
+    NonBlankText,
+    PatchRequestModel,
+    ReadCounts,
+)
+from qiita_common.models.biosample import (
+    MetadataChecklistRef,
+    MetadataEntry,
+)
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
 
@@ -631,7 +640,7 @@ class SequencedPoolDeleteResponse(BaseModel):
     staged_reads_reaped: int = 0
 
 
-class SequencedSampleCreateRequest(BaseModel):
+class SequencedSampleCreateRequest(MetadataRequestModel):
     """Body for the sequenced-sample composer POST.
 
     Atomically creates a prep_sample row (with processing_kind='sequenced'),
@@ -650,10 +659,18 @@ class SequencedSampleCreateRequest(BaseModel):
     collapsed (order-preserving) rather than rejected.
 
     `metadata` keys must match seeded prep_sample_global_field display_name
+    values — or, when global_internal_names is set, their internal_name
     values; unknown names surface as a single 422 listing every bad key.
+    Every key and value strips on the way in and must still carry content,
+    so a name written with stray padding matches the same seeded field as
+    its unpadded spelling. A blank value is rejected — a field left
+    unanswered instead takes a missing-value marker, and a field with
+    nothing to say is simply omitted.
     The two ENA accession fields are nullable: a sample may already carry
     ENA accessions when it is created (e.g. ingesting already-submitted
-    data), or have them written back later after an ENA submission.
+    data), or have them written back later after an ENA submission. Absent
+    means null — empty text is refused, because the columns are UNIQUE and
+    admit only one empty string between them all.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -664,10 +681,11 @@ class SequencedSampleCreateRequest(BaseModel):
     sequenced_pool_item_id: str = Field(min_length=1)
     primary_study_idx: Annotated[int, Field(gt=0)]
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
-    metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_name: str | None = Field(default=None, min_length=1)
-    ena_experiment_accession: str | None = Field(default=None, max_length=50)
-    ena_run_accession: str | None = Field(default=None, max_length=50)
+    metadata: dict[NonBlankText, NonBlankText] = Field(default_factory=dict)
+    global_internal_names: bool = False
+    metadata_checklist_name: NonBlankText | None = None
+    ena_experiment_accession: AccessionText | None = None
+    ena_run_accession: AccessionText | None = None
 
     @model_validator(mode="after")
     def dedupe_secondary_study_idxs(self):
@@ -735,8 +753,22 @@ class SequencedSampleResponse(ReadCounts):
     retired_by_idx: int | None
     retired_at: AwareDatetime | None
     retire_reason: str | None
-    global_metadata: dict[str, GlobalMetadataEntry]
+    global_metadata: dict[str, MetadataEntry]
     caller_system_role: SystemRole
+
+
+class StudyScopedSequencedSampleResponse(SequencedSampleResponse):
+    """Returned by GET /api/v1/study/{study_idx}/sequenced-sample/{sequenced_sample_idx}.
+
+    A study-scoped view: every field of the sequenced-sample-level
+    SequencedSampleResponse (core columns, caller_system_role, and the
+    globally-linked global_metadata keyed by internal_name) plus this study's
+    purely-local prep_sample metadata, keyed by display_name. local_metadata is
+    returned only on a study-scoped response, where the caller is already
+    authorized on the study.
+    """
+
+    local_metadata: dict[str, MetadataEntry]
 
 
 class SequencedSamplePatchRequest(PatchRequestModel):
@@ -750,11 +782,12 @@ class SequencedSamplePatchRequest(PatchRequestModel):
     out of scope; the former will land via a future
     PATCH /prep-sample/{idx} endpoint, the latter are not editable.
     Inherits extra="forbid" and the at_least_one_field rule from
-    PatchRequestModel.
+    PatchRequestModel. An accession is cleared by sending explicit null;
+    empty text is refused rather than taken as a clear.
     """
 
-    ena_experiment_accession: str | None = Field(default=None, max_length=50)
-    ena_run_accession: str | None = Field(default=None, max_length=50)
+    ena_experiment_accession: AccessionText | None = None
+    ena_run_accession: AccessionText | None = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
 

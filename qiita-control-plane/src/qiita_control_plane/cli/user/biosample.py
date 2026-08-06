@@ -5,9 +5,8 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 
 import argparse
 
-from qiita_common.models import (
-    BiosampleImportRequest,
-)
+from qiita_common.api_paths import PATH_BIOSAMPLE_BY_STUDY, PATH_STUDY_PREFIX
+from qiita_common.models import BiosampleImportRequest
 
 from .. import _common
 from ._helpers import _build_body
@@ -21,7 +20,8 @@ def _post_biosample(base_url: str, token: str, study_idx: int, body: dict) -> di
     caller can run `qiita biosample create` for themselves without first
     chasing their own principal_idx.
     """
-    return _common.call("POST", base_url, token, f"/study/{study_idx}/biosample", json=body)
+    path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}".format(study_idx=study_idx)
+    return _common.call("POST", base_url, token, path, json=body)
 
 
 def _handle_biosample_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

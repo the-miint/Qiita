@@ -1,26 +1,45 @@
-"""Integration tests for GET /api/v1/prep-sample/{idx}/study/list.
+"""Integration tests for the prep-sample routes.
 
-Covers the happy path (active studies returned ascending by idx, each with
-its accessions), accession surfacing, retired-link exclusion, the empty case
-(prep_sample with no active study links), the 404 on an unknown
-prep_sample_idx, and the auth gates (wet_lab_admin role, prep_sample:read
-scope, and the anonymous 401).
+Covers the study-membership read (active studies ascending by idx with their
+accessions, accession surfacing, retired-link exclusion, the empty case, the
+404 on an unknown prep_sample_idx, and its auth gates), the operator
+retirement PATCH, and the study-scoped create of a study-local prep_sample
+field (both mode branches, the mode-coupling 422s, and the access matrix).
 """
+
+import secrets
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_PREP_SAMPLE_RETIRED, URL_PREP_SAMPLE_STUDY_LIST
+from qiita_common.api_paths import (
+    URL_PREP_SAMPLE_RETIRED,
+    URL_PREP_SAMPLE_STUDY_LIST,
+)
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
+from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
     retire_prep_sample_to_study_link,
     seed_biosample,
     seed_biosample_to_study_link,
+    seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
 )
+from qiita_control_plane.testing.unique_names import unique_field_name
 
-from .conftest import _seed_study, delete_idxs
+from .conftest import (
+    PREP_SAMPLE_FIELD_SURFACE,
+    STUDY_FIELD_CREATE_AUTHZ_CASES,
+    STUDY_FIELD_CREATE_CONFLICT_CASES,
+    _grant_study_access,
+    _seed_study,
+    assert_study_field_create_authz,
+    assert_study_field_create_conflict,
+    delete_idxs,
+    post_study_field,
+)
 
 pytestmark = pytest.mark.db
 
@@ -32,7 +51,8 @@ pytestmark = pytest.mark.db
 
 async def _cleanup_tracked(pool, created: dict) -> None:
     """Drop tracked rows in FK-reverse order (ON DELETE RESTRICT throughout):
-    prep_sample_to_study, prep_sample, biosample_to_study, biosample, study."""
+    prep_sample_to_study, prep_sample, biosample_to_study, biosample,
+    prep_sample_study_field, prep_sample_global_field, study_access, study."""
     for ps, st in created["prep_sample_to_study"]:
         await pool.execute(
             "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
@@ -47,6 +67,16 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             st,
         )
     await delete_idxs(pool, "biosample", created["biosample"])
+    # Study fields reference both their study and, when linked, a global field,
+    # so they drop before either.
+    await delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
+    await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
+    for st, principal in created["study_access"]:
+        await pool.execute(
+            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
+            st,
+            principal,
+        )
     await delete_idxs(pool, "study", created["study"])
 
 
@@ -59,6 +89,9 @@ async def ctx(role_keyed_clients):
         "prep_sample": [],
         "biosample_to_study": [],
         "biosample": [],
+        "prep_sample_study_field": [],
+        "prep_sample_global_field": [],
+        "study_access": [],
         "study": [],
     }
     yield {**role_keyed_clients, "created": created}
@@ -369,3 +402,184 @@ async def test_retire_prep_sample_anonymous_401(ctx):
             json={"retired": True},
         )
     assert resp.status_code == 401
+
+
+# ===========================================================================
+# POST /api/v1/study/{study_idx}/prep-sample-field — create study-local field
+# ===========================================================================
+
+
+async def _post_prep_sample_field(client, ctx, study_idx: int, **body):
+    """POST the create-field route and, on 201, track the created row."""
+    return await post_study_field(
+        ctx,
+        surface=PREP_SAMPLE_FIELD_SURFACE,
+        client=client,
+        study_idx=study_idx,
+        **body,
+    )
+
+
+async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.NUMERIC) -> tuple[int, str]:
+    """Seed one prep_sample_global_field and return (idx, display_name)."""
+    suffix = secrets.token_hex(4)
+    display_name = f"Global {suffix}"
+    global_idx = await seed_prep_sample_global_field(
+        ctx["pool"],
+        internal_name=f"psf_{suffix}",
+        display_name=display_name,
+        data_type=data_type,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["prep_sample_global_field"].append(global_idx)
+    return global_idx, display_name
+
+
+async def test_create_prep_sample_field_admin_local(ctx):
+    """Tests the case where an ADMIN-grant user creates a purely-local field:
+    the 201 body is the created resource, with the local data_type and a
+    defaulted-False required.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pf-adm"
+    )
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    display_name = unique_field_name("Local")
+
+    resp = await _post_prep_sample_field(
+        ctx["user"], ctx, study_idx, display_name=display_name, data_type="numeric"
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    expected = {
+        # Auto-generated; copy actual into expected so the equality confirms
+        # presence without pinning the minted idx or the DB-assigned timestamp.
+        "prep_sample_study_field_idx": body["prep_sample_study_field_idx"],
+        "created_at": body["created_at"],
+        "study_idx": study_idx,
+        "prep_sample_global_field_idx": None,
+        "display_name": display_name,
+        "description": None,
+        "data_type": "numeric",
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["user_session"]["principal_idx"],
+    }
+    assert body == expected
+
+
+async def test_create_prep_sample_field_linked_inherits(ctx):
+    """Tests the case where the create links the field to a global field: the
+    response resolves data_type and required from the global row even though
+    the study-field columns are NULL.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-link"
+    )
+    global_idx, _ = await _seed_prep_global_field(ctx)
+    display_name = unique_field_name("Linked")
+
+    resp = await _post_prep_sample_field(
+        ctx["user"],
+        ctx,
+        study_idx,
+        display_name=display_name,
+        prep_sample_global_field_idx=global_idx,
+        description="linked",
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    expected = {
+        "prep_sample_study_field_idx": body["prep_sample_study_field_idx"],
+        "created_at": body["created_at"],
+        "study_idx": study_idx,
+        "prep_sample_global_field_idx": global_idx,
+        "display_name": display_name,
+        "description": "linked",
+        "data_type": "numeric",
+        "required": False,
+        "terminology_idx": None,
+        "tier_override": None,
+        "created_by_idx": ctx["user_session"]["principal_idx"],
+    }
+    assert body == expected
+
+
+async def test_create_prep_sample_field_linked_with_data_type_422(ctx):
+    """Tests the case where a globally-linked create also supplies an inherited
+    column: the mode-coupling validator rejects it at the wire boundary.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-both"
+    )
+    global_idx, _ = await _seed_prep_global_field(ctx)
+
+    resp = await _post_prep_sample_field(
+        ctx["user"],
+        ctx,
+        study_idx,
+        display_name=unique_field_name("Both"),
+        prep_sample_global_field_idx=global_idx,
+        data_type="numeric",
+    )
+    assert resp.status_code == 422
+
+
+async def test_create_prep_sample_field_local_without_data_type_422(ctx):
+    """Tests the case where a purely-local create omits data_type: the type
+    lives on this row, so the mode-coupling validator rejects it.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-notype"
+    )
+
+    resp = await _post_prep_sample_field(
+        ctx["user"], ctx, study_idx, display_name=unique_field_name("NoType")
+    )
+    assert resp.status_code == 422
+
+
+async def test_create_prep_sample_field_terminology_coupling_422(ctx):
+    """Tests the case where a local terminology-typed create omits
+    terminology_idx: the coupling validator requires them together.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-term"
+    )
+
+    resp = await _post_prep_sample_field(
+        ctx["user"], ctx, study_idx, display_name=unique_field_name("Term"), data_type="terminology"
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
+async def test_create_prep_sample_field_authz(ctx, case, no_prep_sample_write_client):
+    """Tests the case where each row of the shared access matrix calls the
+    create-field route: owner, admin grant, and wet_lab_admin bypass are
+    admitted; no access, sub-ADMIN tier, and a missing scope are refused; a
+    nonexistent study is 404 even for a role-bypass caller.
+    """
+    await assert_study_field_create_authz(
+        ctx,
+        case=case,
+        surface=PREP_SAMPLE_FIELD_SURFACE,
+        no_scope_client=no_prep_sample_write_client,
+    )
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_CREATE_CONFLICT_CASES)
+async def test_create_prep_sample_field_conflict(ctx, case):
+    """Tests the case where each row of the shared conflict matrix calls the
+    create-field route: a name already on the study is a 409, rebinding that
+    name to a different global field is a 409, and a global-field link naming
+    no row is a 422.
+    """
+    await assert_study_field_create_conflict(ctx, case=case, surface=PREP_SAMPLE_FIELD_SURFACE)
