@@ -569,13 +569,13 @@ class GenomeMapResponse(BaseModel):
     `count` is the number of PAIRS and exceeds the number of distinct features.
     Features with no genome are absent — they cannot be rolled up.
 
-    `truncated` is structurally always False and is retained only so the envelope
-    matches every other capped read: this route refuses over its cap with a 413
-    instead of truncating, because a silently short lookup table yields a WRONG
-    feature table rather than a partial one. Branch on the status code, never on
-    this field."""
+    Deliberately has no `truncated`, unlike every other capped read: this route
+    refuses over its cap with a 413 rather than truncating, because a silently
+    short lookup table yields a WRONG feature table rather than a partial one. A
+    200 is always the complete map, so the field could only ever be False — and a
+    boolean that never varies is one a caller checks instead of the status
+    code."""
 
-    reference_idx: int
+    reference_idx: Annotated[int, Field(gt=0)]
     entries: list[GenomeMapEntry]
     count: Annotated[int, Field(ge=0)]
-    truncated: bool
