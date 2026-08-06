@@ -28,6 +28,20 @@ from .repositories.terminology import (
     update_terminology_status,
 )
 
+# Names of the manifest and the two tab-separated tables a staged release
+# carries, and the columns each table holds.
+MANIFEST_FILENAME = "manifest.json"
+TERMS_TSV_FILENAME = "terms.tsv"
+CLOSURE_TSV_FILENAME = "closure.tsv"
+TERMS_TSV_COLUMNS = (
+    "term_id",
+    "label",
+    "is_obsolete",
+    "replaced_by_term_id",
+    "obsoletion_kind",
+)
+CLOSURE_TSV_COLUMNS = ("ancestor_term_id", "descendant_term_id", "distance")
+
 
 class TerminologyNotFound(Exception):
     """Raised when the terminology_idx doesn't exist."""
@@ -87,37 +101,49 @@ def load_manifest(source_dir: Path) -> TerminologyManifest:
     pydantic.ValidationError if its content does not match
     TerminologyManifest.
     """
-    manifest_path = source_dir / "manifest.json"
+    manifest_path = source_dir / MANIFEST_FILENAME
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     payload = json.loads(manifest_path.read_text())
     return TerminologyManifest.model_validate(payload)
 
 
-def verify_manifest_checksums(source_dir: Path, manifest: TerminologyManifest) -> None:
-    """Compute the SHA-256 of the source file declared by the manifest
-    and compare to the manifest's declared digest.
+def write_manifest(source_dir: Path, manifest: TerminologyManifest) -> None:
+    """Write `manifest` to `<source_dir>/manifest.json`, overwriting any
+    manifest already there."""
+    manifest_path = source_dir / MANIFEST_FILENAME
+    manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n")
 
-    Raises FileNotFoundError if the declared source file is missing;
-    raises ValueError on digest mismatch.
+
+def sha256_of_file(path: Path) -> str:
+    """Return the lowercase hex SHA-256 of the bytes at `path`.
+
+    Raises FileNotFoundError if `path` does not exist.
     """
-    source_path = source_dir / manifest.source.path
-    if not source_path.exists():
-        raise FileNotFoundError(f"Source file not found: {source_path}")
-
-    # Stream the file through the hasher in 1 MiB chunks; OWL files can
-    # be hundreds of MB and reading the whole thing into memory just to
-    # hash it is wasteful.
+    # Stream the file through the hasher in 1 MiB chunks; a release table
+    # can be large and reading it whole just to hash it is wasteful.
     digest = hashlib.sha256()
-    with source_path.open("rb") as fh:
+    with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
-    actual = digest.hexdigest()
-    if actual != manifest.source.sha256:
-        raise ValueError(
-            f"sha256 mismatch for {manifest.source.path}: "
-            f"manifest declares {manifest.source.sha256!r}, computed {actual!r}"
-        )
+    return digest.hexdigest()
+
+
+def verify_manifest_checksums(source_dir: Path, manifest: TerminologyManifest) -> None:
+    """Check both release tables the manifest declares against the digests
+    it carries for them.
+
+    Raises FileNotFoundError if a declared table is missing; raises
+    ValueError on digest mismatch, naming the table.
+    """
+    for declared in (manifest.terms, manifest.closure):
+        table_path = source_dir / declared.path
+        actual = sha256_of_file(table_path)
+        if actual != declared.sha256:
+            raise ValueError(
+                f"sha256 mismatch for {declared.path}: "
+                f"manifest declares {declared.sha256!r}, computed {actual!r}"
+            )
 
 
 def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
@@ -160,6 +186,35 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
                 )
             )
     return rows
+
+
+def write_terms_tsv(path: Path, terms: list[ParsedTerm]) -> None:
+    """Write `terms` as the tab-separated terms table at `path`, headed by
+    TERMS_TSV_COLUMNS. A replaced_by_term_id or obsoletion_kind of None
+    becomes an empty cell."""
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(TERMS_TSV_COLUMNS)
+        for term in terms:
+            writer.writerow(
+                [
+                    term.term_id,
+                    term.label,
+                    "true" if term.is_obsolete else "false",
+                    term.replaced_by_term_id or "",
+                    str(term.obsoletion_kind) if term.obsoletion_kind is not None else "",
+                ]
+            )
+
+
+def write_closure_tsv_stub(path: Path) -> None:
+    """Write a closure table at `path` holding only its CLOSURE_TSV_COLUMNS
+    header. A closure table with no data rows leaves the terminology's
+    closure empty, so term resolution works while subsumption queries have
+    nothing to answer from."""
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(CLOSURE_TSV_COLUMNS)
 
 
 def _parse_closure_tsv(path: Path) -> list[tuple[str, str, int]]:
@@ -233,10 +288,13 @@ async def import_terminology(
     rather than a tolerable anomaly.
     """
 
+    # Verify before parsing, so a release table that does not match the
+    # manifest is refused without any of its content being read.
     manifest = load_manifest(source_dir)
     verify_manifest_checksums(source_dir, manifest)
-    parsed_terms = _parse_terms_tsv(source_dir / "terms.tsv")
-    parsed_closure = _parse_closure_tsv(source_dir / "closure.tsv")
+
+    parsed_terms = _parse_terms_tsv(source_dir / TERMS_TSV_FILENAME)
+    parsed_closure = _parse_closure_tsv(source_dir / CLOSURE_TSV_FILENAME)
 
     # Misalignment is always fatal; it indicates malformed source data.
     _check_misaligned_replaced_by(parsed_terms)

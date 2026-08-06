@@ -9,24 +9,35 @@ from datetime import datetime
 import pytest
 from qiita_common.models import (
     TerminologyManifest,
-    TerminologyManifestSource,
+    TerminologyManifestFile,
     TerminologyResponse,
     TerminologyStatus,
     TerminologyTermObsoletionKind,
 )
 
 from qiita_control_plane.repositories.terminology import (
+    ParsedTerm,
     TerminologyImportAnomaly,
     TerminologyImportResult,
     fetch_terminology,
 )
 from qiita_control_plane.terminology import (
+    CLOSURE_TSV_COLUMNS,
+    CLOSURE_TSV_FILENAME,
+    TERMS_TSV_COLUMNS,
+    TERMS_TSV_FILENAME,
     IllegalStatusTransition,
     TerminologyNotFound,
+    _parse_closure_tsv,
+    _parse_terms_tsv,
     import_terminology,
     load_manifest,
+    sha256_of_file,
     transition_terminology_status,
     verify_manifest_checksums,
+    write_closure_tsv_stub,
+    write_manifest,
+    write_terms_tsv,
 )
 from qiita_control_plane.testing.db_seeds import (
     SEEDED_TERMINOLOGY_LOADED_AT,
@@ -161,25 +172,35 @@ def _write_manifest_json(source_dir, payload: dict) -> None:
     (source_dir / "manifest.json").write_text(json.dumps(payload))
 
 
+def _manifest_for(
+    terms_sha256: str,
+    closure_sha256: str,
+    *,
+    name: str = "uberon",
+    version: str = "2026-04-15",
+) -> TerminologyManifest:
+    """A manifest declaring the two release tables at the given digests."""
+    return TerminologyManifest(
+        name=name,
+        version=version,
+        terms=TerminologyManifestFile(path=TERMS_TSV_FILENAME, sha256=terms_sha256),
+        closure=TerminologyManifestFile(path=CLOSURE_TSV_FILENAME, sha256=closure_sha256),
+    )
+
+
 def test_load_manifest(tmp_path):
     """A well-formed manifest.json parses into a TerminologyManifest."""
     payload = {
         "name": "uberon",
         "version": "2026-04-15",
-        "source": {
-            "path": "source.owl",
-            "sha256": "a" * 64,
-        },
+        "terms": {"path": TERMS_TSV_FILENAME, "sha256": "a" * 64},
+        "closure": {"path": CLOSURE_TSV_FILENAME, "sha256": "b" * 64},
     }
     _write_manifest_json(tmp_path, payload)
 
     result = load_manifest(tmp_path)
 
-    expected = TerminologyManifest(
-        name="uberon",
-        version="2026-04-15",
-        source=TerminologyManifestSource(path="source.owl", sha256="a" * 64),
-    )
+    expected = _manifest_for("a" * 64, "b" * 64)
     assert result == expected
 
 
@@ -190,24 +211,58 @@ def test_load_manifest_missing_file(tmp_path):
 
 
 # =============================================================================
+# write_manifest / sha256_of_file
+# =============================================================================
+
+
+def test_write_manifest(tmp_path):
+    """Tests the case where a manifest is written: it reads back through
+    load_manifest unchanged."""
+    manifest = _manifest_for("a" * 64, "b" * 64)
+
+    write_manifest(tmp_path, manifest)
+
+    assert load_manifest(tmp_path) == manifest
+
+
+def test_sha256_of_file(tmp_path):
+    """Tests the case where a file is hashed: the digest matches hashlib's
+    over the same bytes."""
+    content = b"term_id\tlabel\nUBERON:0001\tmouth\n"
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_bytes(content)
+
+    result = sha256_of_file(path)
+
+    assert result == hashlib.sha256(content).hexdigest()
+
+
+def test_sha256_of_file_missing(tmp_path):
+    """Tests the case where the file does not exist."""
+    with pytest.raises(FileNotFoundError):
+        sha256_of_file(tmp_path / "absent.tsv")
+
+
+# =============================================================================
 # verify_manifest_checksums
 # =============================================================================
 
 
-def test_verify_manifest_checksums(tmp_path):
-    """The verifier accepts a manifest whose declared sha256 matches the
-    on-disk source file."""
-    # Stable test content; sha256 computed eagerly so the manifest
-    # carries the digest the verifier will recompute.
-    content = b"@SQ\tSN:chr1\tLN:1000\n"
-    (tmp_path / "source.owl").write_bytes(content)
+def _write_release_tables(source_dir, terms_content: bytes, closure_content: bytes) -> None:
+    """Write both release tables with the given bytes."""
+    (source_dir / TERMS_TSV_FILENAME).write_bytes(terms_content)
+    (source_dir / CLOSURE_TSV_FILENAME).write_bytes(closure_content)
 
-    manifest = TerminologyManifest(
-        name="uberon",
-        version="2026-04-15",
-        source=TerminologyManifestSource(
-            path="source.owl", sha256=hashlib.sha256(content).hexdigest()
-        ),
+
+def test_verify_manifest_checksums(tmp_path):
+    """Tests the case where both declared digests match the release tables on
+    disk."""
+    terms_content = b"term_id\tlabel\nUBERON:0001\tmouth\n"
+    closure_content = b"ancestor_term_id\tdescendant_term_id\tdistance\n"
+    _write_release_tables(tmp_path, terms_content, closure_content)
+    manifest = _manifest_for(
+        hashlib.sha256(terms_content).hexdigest(),
+        hashlib.sha256(closure_content).hexdigest(),
     )
 
     # No exception is the success criterion.
@@ -215,31 +270,80 @@ def test_verify_manifest_checksums(tmp_path):
 
 
 def test_verify_manifest_checksums_mismatch(tmp_path):
-    """A declared sha256 that does not match the on-disk source file raises
-    ValueError."""
-    (tmp_path / "source.owl").write_bytes(b"actual content")
-
-    manifest = TerminologyManifest(
-        name="uberon",
-        version="2026-04-15",
-        source=TerminologyManifestSource(path="source.owl", sha256="b" * 64),
+    """Tests the case where the terms table does not match its declared
+    digest."""
+    closure_content = b"ancestor_term_id\tdescendant_term_id\tdistance\n"
+    _write_release_tables(tmp_path, b"actual content", closure_content)
+    manifest = _manifest_for(
+        "b" * 64,
+        hashlib.sha256(closure_content).hexdigest(),
     )
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=TERMS_TSV_FILENAME):
         verify_manifest_checksums(tmp_path, manifest)
 
 
-def test_verify_manifest_checksums_missing_source_file(tmp_path):
-    """A manifest pointing at a non-existent source file raises
-    FileNotFoundError."""
-    manifest = TerminologyManifest(
-        name="uberon",
-        version="2026-04-15",
-        source=TerminologyManifestSource(path="source.owl", sha256="c" * 64),
-    )
+def test_verify_manifest_checksums_closure_mismatch(tmp_path):
+    """Tests the case where the terms table verifies but the closure table
+    does not, so a mismatch in the second table is not skipped."""
+    terms_content = b"term_id\tlabel\nUBERON:0001\tmouth\n"
+    _write_release_tables(tmp_path, terms_content, b"actual content")
+    manifest = _manifest_for(hashlib.sha256(terms_content).hexdigest(), "c" * 64)
+
+    with pytest.raises(ValueError, match=CLOSURE_TSV_FILENAME):
+        verify_manifest_checksums(tmp_path, manifest)
+
+
+def test_verify_manifest_checksums_missing_table(tmp_path):
+    """Tests the case where a declared release table is absent."""
+    manifest = _manifest_for("c" * 64, "d" * 64)
 
     with pytest.raises(FileNotFoundError):
         verify_manifest_checksums(tmp_path, manifest)
+
+
+# =============================================================================
+# write_terms_tsv / write_closure_tsv_stub
+# =============================================================================
+
+
+def test_write_terms_tsv(tmp_path):
+    """Tests the case where terms with and without obsoletion fields are
+    written: the file is headed by the declared columns and reads back
+    through the parser unchanged."""
+    terms = [
+        ParsedTerm(
+            term_id="UBERON:0001",
+            label="mouth",
+            is_obsolete=False,
+            replaced_by_term_id=None,
+            obsoletion_kind=None,
+        ),
+        ParsedTerm(
+            term_id="UBERON:0002",
+            label="obsolete tooth",
+            is_obsolete=True,
+            replaced_by_term_id="UBERON:0001",
+            obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+        ),
+    ]
+    path = tmp_path / TERMS_TSV_FILENAME
+
+    write_terms_tsv(path, terms)
+
+    assert path.read_text().splitlines()[0] == "\t".join(TERMS_TSV_COLUMNS)
+    assert _parse_terms_tsv(path) == terms
+
+
+def test_write_closure_tsv_stub(tmp_path):
+    """Tests the case where a closure table is written with no rows: the file
+    holds only its header and parses to no closure tuples."""
+    path = tmp_path / CLOSURE_TSV_FILENAME
+
+    write_closure_tsv_stub(path)
+
+    assert path.read_text().splitlines() == ["\t".join(CLOSURE_TSV_COLUMNS)]
+    assert _parse_closure_tsv(path) == []
 
 
 # =============================================================================
@@ -255,25 +359,13 @@ def _write_staging(
     terms: list[tuple[str, str, bool, str | None, TerminologyTermObsoletionKind | None]],
     closure: list[tuple[str, str, int]],
 ) -> None:
-    """Write source.owl + manifest.json + terms.tsv + closure.tsv into
-    `staging_dir`. terms rows are
+    """Write manifest.json + terms.tsv + closure.tsv into `staging_dir`.
+    terms rows are
     (term_id, label, is_obsolete, replaced_by_term_id, obsoletion_kind);
-    closure rows are (ancestor_term_id, descendant_term_id, distance)."""
+    closure rows are (ancestor_term_id, descendant_term_id, distance). The
+    manifest declares the digests of the two tables actually written, so the
+    checksum verification the import performs is real."""
     staging_dir.mkdir(parents=True, exist_ok=True)
-
-    # source.owl content varies per (name, version) so each staging dir
-    # gets a distinct sha256 and the manifest's checksum check is real.
-    source_bytes = f"dummy owl content for {name} {version}".encode()
-    (staging_dir / "source.owl").write_bytes(source_bytes)
-    manifest = {
-        "name": name,
-        "version": version,
-        "source": {
-            "path": "source.owl",
-            "sha256": hashlib.sha256(source_bytes).hexdigest(),
-        },
-    }
-    (staging_dir / "manifest.json").write_text(json.dumps(manifest))
 
     with (staging_dir / "terms.tsv").open("w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
@@ -296,6 +388,16 @@ def _write_staging(
         writer.writerow(["ancestor_term_id", "descendant_term_id", "distance"])
         for ancestor, descendant, distance in closure:
             writer.writerow([ancestor, descendant, str(distance)])
+
+    # Digest the tables after writing them, so the manifest describes what is
+    # actually on disk rather than what was intended.
+    manifest = _manifest_for(
+        sha256_of_file(staging_dir / TERMS_TSV_FILENAME),
+        sha256_of_file(staging_dir / CLOSURE_TSV_FILENAME),
+        name=name,
+        version=version,
+    )
+    write_manifest(staging_dir, manifest)
 
 
 async def _read_term_state(pool, terminology_idx: int) -> dict:

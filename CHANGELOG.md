@@ -22,6 +22,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita-admin terminology` — prepare and load an ontology release.**
+  `robot-command` prints the ROBOT export command to run against a staged OWL
+  file; nothing in the control plane executes ROBOT, on any host. `prepare`
+  turns that export into the release's term and closure tables plus a manifest
+  declaring their checksums, keeping only the term ids of a chosen prefix so
+  classes the source imports from other vocabularies stay out. `load` applies a
+  prepared release to the database, verifying both tables against the manifest
+  before it opens a connection, and reporting how many terms were inserted,
+  relabelled, obsoleted, or merged. The three files are named individually and
+  copied into a temporary directory, so no staging directory has to exist on the
+  host.
+
+- **Terminology release extraction — read a staged OWL release into the term
+  records the load applies.** Builds the argv of the ROBOT export that produces
+  the release's export file, reads that export back, and turns it into term
+  rows: a deprecated class is recorded as obsolete, and a class another one
+  absorbed as merged into it. ROBOT itself is run out of band, so nothing here
+  executes it. A manifest may declare a term id prefix to keep classes the
+  source imports from other vocabularies out of the release. ROBOT's export
+  dialect is confined to one module; the obsoletion conventions it feeds are
+  independent of any OWL toolchain.
+
 - **Terminology release load — apply a staged ontology release from a staging
   directory.** Reads the release manifest, verifies the source checksum, parses
   the term and closure tables, and applies the whole release in one transaction,

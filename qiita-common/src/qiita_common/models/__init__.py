@@ -241,7 +241,7 @@ from qiita_common.models.study import StudyCreate, StudyPatchRequest, StudyRespo
 from qiita_common.models.terminology import (
     VALID_TERMINOLOGY_STATUS_TRANSITIONS,
     TerminologyManifest,
-    TerminologyManifestSource,
+    TerminologyManifestFile,
     TerminologyResponse,
     TerminologyStatus,
     TerminologyTermObsoletionKind,
@@ -397,7 +397,7 @@ __all__ = [
     "Tier",
     # Terminology.
     "TerminologyManifest",
-    "TerminologyManifestSource",
+    "TerminologyManifestFile",
     "TerminologyResponse",
     "TerminologyStatus",
     "TerminologyTermObsoletionKind",

@@ -40,8 +40,8 @@ class TerminologyTermObsoletionKind(StrEnum):
     SILENTLY_DROPPED = "silently_dropped"
 
 
-class TerminologyManifestSource(BaseModel):
-    """One source file declared by a terminology manifest.
+class TerminologyManifestFile(BaseModel):
+    """One file declared by a terminology manifest.
 
     `path` is relative to the staging directory holding the manifest;
     `sha256` is the lowercase hex digest of the file's bytes, carrying no
@@ -53,15 +53,19 @@ class TerminologyManifestSource(BaseModel):
 
 
 class TerminologyManifest(BaseModel):
-    """Operator-supplied description of one terminology release staged for
-    load, read from `<staging_dir>/manifest.json`. Carries the (name,
-    version) pair the load applies and the source file whose checksum must
-    verify before the release is extracted.
+    """Description of one terminology release staged for load, read from
+    `<staging_dir>/manifest.json`.
+
+    Carries the (name, version) pair the load applies and the two release
+    tables it reads, each with the checksum that must verify before the
+    tables are parsed. Nothing describing how the tables were produced is
+    recorded here — the manifest declares only what the load consumes.
     """
 
     name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
-    source: TerminologyManifestSource
+    terms: TerminologyManifestFile
+    closure: TerminologyManifestFile
 
 
 class TerminologyResponse(BaseModel):
