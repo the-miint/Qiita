@@ -23,7 +23,12 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `20260806120000_alignment_sample_prep_sample_idx.sql` — plain `make migrate`, no
+  out-of-band setup. Builds `CREATE INDEX CONCURRENTLY` on `qiita.alignment_sample`, so it
+  does **not** lock the table and is safe to run while services are up; it may take a while
+  on a large table, and a failed CONCURRENTLY build leaves an INVALID index that
+  `make migrate` will not retry — drop it by hand and re-run if that happens.
+  (`#m3-human-alignment-mint` — retag with the PR number)
 
 ### 4. Deploy
 
