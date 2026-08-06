@@ -26,6 +26,12 @@ from __future__ import annotations
 
 import base64
 import os
+
+# Silence Acero's "poorly aligned buffer" warnings that flood logs on every
+# Flight-sourced DuckDB scan. The misalignment comes from gRPC receive buffers
+# on the pyarrow side, not from the data plane (arrow-rs already writes
+# 64-byte-aligned IPC). Safe to ignore on modern x86_64/ARM — see #333.
+os.environ.setdefault("ACERO_ALIGNMENT_HANDLING", "ignore")
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
