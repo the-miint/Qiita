@@ -28,12 +28,12 @@
       "GENOMIC",
       "RANDOM",
       "LS454",
-      "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz",
-      "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz",
-      "89054035",
+      ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"],
+      ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"],
+      [89054035],
       "791595268ae7a965664652bde3444a2b",
-      "298966",
-      "158722947"
+      298966,
+      158722947
     ],
     [
       "SRR096343",
@@ -45,12 +45,12 @@
       "GENOMIC",
       "RANDOM",
       "LS454",
-      "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz",
-      "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz;fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz;fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz",
-      "5686490;22054785;24627105",
-      "9dbbfcd6b19ac17ba166959c912ad9f3;b7aefae0806e3d29f29c8d2ac0686a92;00c8c44e0faf783fac38598e21315fdf",
-      "238252",
-      "87391853"
+      ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz"],
+      ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096343/SRR096343_2.fastq.gz"],
+      [5686490, 22054785, 24627105],
+      ["9dbbfcd6b19ac17ba166959c912ad9f3", "b7aefae0806e3d29f29c8d2ac0686a92", "00c8c44e0faf783fac38598e21315fdf"],
+      238252,
+      87391853
     ]
   ]
 }
