@@ -125,6 +125,25 @@ duplicates further down are historical strata; leave them where they are.
   that. Driven by `qiita-admin fanout {list,set,pump}`, whose stderr summary names a
   fail-stopped cohort explicitly and spells out the other reason for a zero.
 
+- **A pool's per-sample read table without a host shell (#427, closes #348).** Two additions,
+  because read counts are a property of the SAMPLE while state and step placement
+  are properties of the TICKET:
+  - `GET /work-ticket` takes `?sequenced_pool_idx=`, `?prep_sample_idx=` and
+    `?action_id=`. The pool filter matches a ticket by any of the three ways a
+    ticket reaches a pool — pool-scoped (bcl-convert), on one of the pool's samples
+    (read-mask, the join that also feeds `read_outcome`), or on a block covering one
+    of them (read-mask-block, whose own `prep_sample_idx` is NULL). Filters
+    AND-compose with the existing originator scoping, so a pool filter is not a way
+    around "you see only tickets you originated". `qiita ticket list` gains
+    `--sequenced-pool-idx` / `--prep-sample-idx` / `--action-id`.
+  - The pool- and run-scoped `sequenced-sample/list` rosters now carry each sample's
+    four per-stage read counts plus `fraction_passing_quality_filter`. A sample with
+    no ticket, and a sample masked through the block path, reports its counts here —
+    neither is reachable through the ticket list.
+
+  Before this, assembling a pool's per-sample read decay meant paging every ticket the
+  caller ever originated and filtering client-side, or `psql` on the deploy host.
+
 - **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
   system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
   an `ATTACH` from the service env files — risking a writable attach against the live
@@ -1302,6 +1321,28 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **One `cap_rows` helper behind every capped list route (#427).** The
+  fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
+  list route — the two sequenced-sample rosters, the prep-sample study roster,
+  `build_idxs_list_response`, and the work-ticket list this PR adds. It is now
+  `routes/_helpers.cap_rows`, which all five call. No wire change: the same rows
+  and the same `truncated` value come back from each route.
+
+- **BREAKING: `GET /work-ticket` returns an envelope, not a bare array (#427).**
+  `{tickets, count, truncated}` — `WorkTicketListResponse`, the same shape
+  `IdxsListResponse` and `SequencedSampleListResponse` already use; this route was
+  the only list route without it. The page is capped at `limit` (default 50, max
+  500), and until now a capped page was indistinguishable from a complete one. That
+  became load-bearing with the pool filter above: one read-mask ticket per sample
+  against a pool of a few hundred samples silently returned the newest 50 rows, so
+  a per-sample read table assembled from it would be a prefix with nothing saying
+  so. Truncation is now decided server-side (fetch `limit + 1`, slice back).
+
+  A client that indexed the response as a list reads `["tickets"]` instead;
+  `qiita ticket list` prints the envelope. No `caller_system_role` field, unlike
+  the two sibling envelopes: this route admits service accounts, whose authz is
+  scope-only and which carry no system_role.
 
 - **Sequenced-sample import accepts study-local prep_sample fields (#386).** The
   `metadata` dict on `POST /sequencing-run/{idx}/sequenced-pool/{idx}/sequenced-sample`

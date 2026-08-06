@@ -42,6 +42,24 @@ from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 # via GENERATED ALWAYS AS so no caller passes it there.
 _PROCESSING_KIND_SEQUENCED = "sequenced"
 
+# The SequencedSampleListItem projection, shared verbatim by the pool- and
+# run-scoped roster reads (they differ only in their join and WHERE). Every
+# column is named exactly as the model field it fills — ss.idx is aliased —
+# so a row maps straight onto the model via model_validate(dict(row)) with no
+# renaming. `$3` is the read-mask action_id the has_read_mask_ticket EXISTS
+# matches on; both callers bind it in that position.
+_LIST_ITEM_COLUMNS = (
+    "ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
+    " ps.biosample_idx, ss.sequenced_pool_item_id,"
+    " ss.ena_experiment_accession, ss.ena_run_accession,"
+    " bs.biosample_accession, bs.ena_sample_accession,"
+    " ss.raw_read_count_r1r2, ss.biological_read_count_r1r2,"
+    " ss.quality_filtered_read_count_r1r2, ss.spikein_read_count_r1r2,"
+    " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
+    "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
+    "            AND wt.action_id = $3) AS has_read_mask_ticket"
+)
+
 
 async def fetch_sequenced_sample_with_prep_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
@@ -397,8 +415,8 @@ async def fetch_sequenced_pool_samples(
 ) -> list[asyncpg.Record]:
     """Return up to `limit` active sequenced_samples in one pool, each with
     the SequencedSampleListItem column set (prep_sample_idx, biosample_idx,
-    sequenced_pool_item_id, and the ENA experiment/run + biosample/ena-sample
-    accessions).
+    sequenced_pool_item_id, the ENA experiment/run + biosample/ena-sample
+    accessions, and the four per-stage read counts).
 
     Pool-scoped sibling of fetch_sequenced_sample_idxs_for_run: that one
     spans every pool in a run and returns bare idxs; this one is scoped to a
@@ -416,15 +434,7 @@ async def fetch_sequenced_pool_samples(
     # retired = false predicate and the join filters down to one pool. The
     # has_read_mask_ticket EXISTS rides the work_ticket_prep_sample_idx index.
     rows = await pool_or_conn.fetch(
-        # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
-        # model_validate(dict(row)) — the route does no field renaming.
-        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
-        " ps.biosample_idx, ss.sequenced_pool_item_id,"
-        " ss.ena_experiment_accession, ss.ena_run_accession,"
-        " bs.biosample_accession, bs.ena_sample_accession,"
-        " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
-        "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
-        "            AND wt.action_id = $3) AS has_read_mask_ticket"
+        f"SELECT {_LIST_ITEM_COLUMNS}"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
@@ -449,8 +459,8 @@ async def fetch_sequenced_samples_for_run(
 ) -> list[asyncpg.Record]:
     """Return up to `limit` active sequenced_samples across every pool in one
     run, each with the SequencedSampleListItem column set (prep_sample_idx,
-    biosample_idx, sequenced_pool_item_id, and the ENA experiment/run +
-    biosample/ena-sample accessions).
+    biosample_idx, sequenced_pool_item_id, the ENA experiment/run +
+    biosample/ena-sample accessions, and the four per-stage read counts).
 
     Run-scoped sibling of fetch_sequenced_pool_samples (pool-scoped): walks
     run -> sequenced_pool -> sequenced_sample -> prep_sample -> biosample and
@@ -460,15 +470,7 @@ async def fetch_sequenced_samples_for_run(
     the underlying set exceeded the cap.
     """
     rows = await pool_or_conn.fetch(
-        # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
-        # model_validate(dict(row)) — the route does no field renaming.
-        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
-        " ps.biosample_idx, ss.sequenced_pool_item_id,"
-        " ss.ena_experiment_accession, ss.ena_run_accession,"
-        " bs.biosample_accession, bs.ena_sample_accession,"
-        " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
-        "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
-        "            AND wt.action_id = $3) AS has_read_mask_ticket"
+        f"SELECT {_LIST_ITEM_COLUMNS}"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"

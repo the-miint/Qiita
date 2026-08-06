@@ -1715,6 +1715,13 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
         # A freshly seeded sample has no work tickets, so both list routes report
         # has_read_mask_ticket False.
         "has_read_mask_ticket": False,
+        # Read counts are written by persist-read-metrics, so an unprocessed
+        # sample reports all four NULL and no fraction.
+        "raw_read_count_r1r2": None,
+        "biological_read_count_r1r2": None,
+        "quality_filtered_read_count_r1r2": None,
+        "spikein_read_count_r1r2": None,
+        "fraction_passing_quality_filter": None,
         # Only the POOL-scoped list resolves host filtering (it needs the run's
         # platform); the run-scoped list leaves it None. Pool-scoped tests that
         # compare the full item override this via _with_host_filter().
@@ -1777,6 +1784,58 @@ async def test_list_pool_samples_happy_path(ctx):
         "caller_system_role": "wet_lab_admin",
     }
     assert resp.json() == expected
+
+
+async def test_list_pool_samples_carries_read_counts(ctx):
+    # The pool roster is the pool's per-sample read table: each row carries the
+    # four per-stage counts and the fraction recomputed from them. Seeded with
+    # no work ticket, so this also pins that the counts come from the SAMPLE —
+    # a sample the ticket list cannot reach still reports its reads.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-reads")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-reads"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    processed = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-READS-A",
+    )
+    unprocessed = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-READS-B",
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = 1000,"
+        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 800,"
+        " spikein_read_count_r1r2 = 10 WHERE idx = $1",
+        processed["sequenced_sample_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    by_idx = {s["sequenced_sample_idx"]: s for s in resp.json()["samples"]}
+    got = by_idx[processed["sequenced_sample_idx"]]
+    assert got["raw_read_count_r1r2"] == 1000
+    assert got["biological_read_count_r1r2"] == 900
+    assert got["quality_filtered_read_count_r1r2"] == 800
+    assert got["spikein_read_count_r1r2"] == 10
+    assert got["fraction_passing_quality_filter"] == pytest.approx(0.8)
+    assert got["has_read_mask_ticket"] is False
+    # An unprocessed sample keeps its own row with all four counts null.
+    assert by_idx[unprocessed["sequenced_sample_idx"]]["raw_read_count_r1r2"] is None
+    assert by_idx[unprocessed["sequenced_sample_idx"]]["fraction_passing_quality_filter"] is None
 
 
 async def test_list_pool_samples_unparseable_preflight_degrades_to_null(ctx):
@@ -3082,6 +3141,46 @@ async def test_list_run_samples_returns_items_across_pools(ctx):
         "caller_system_role": "wet_lab_admin",
     }
     assert resp.json() == expected
+
+
+async def test_list_run_samples_carries_read_counts(ctx):
+    # The run-scoped list carries the same per-sample read counts as the
+    # pool-scoped one — its own copy of the projection, so it needs its own
+    # populated-value assertion.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "run-reads")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="run-reads"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    sample = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="RUN-READS",
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = 1000,"
+        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 800,"
+        " spikein_read_count_r1r2 = 10 WHERE idx = $1",
+        sample["sequenced_sample_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+    )
+    assert resp.status_code == 200, resp.text
+    got = next(
+        s
+        for s in resp.json()["samples"]
+        if s["sequenced_sample_idx"] == sample["sequenced_sample_idx"]
+    )
+    assert got["raw_read_count_r1r2"] == 1000
+    assert got["biological_read_count_r1r2"] == 900
+    assert got["quality_filtered_read_count_r1r2"] == 800
+    assert got["spikein_read_count_r1r2"] == 10
+    assert got["fraction_passing_quality_filter"] == pytest.approx(0.8)
 
 
 async def test_list_run_samples_surfaces_accessions(ctx):

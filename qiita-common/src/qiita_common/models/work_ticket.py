@@ -19,15 +19,14 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    computed_field,
     model_validator,
 )
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
 from qiita_common.models._base import (
     ComputeTarget,
+    ReadCounts,
     ScopeTarget,
-    _fraction_passing_quality_filter,
 )
 
 
@@ -518,26 +517,12 @@ class AlignPlanResponse(BaseModel):
     blocks: list[AlignPlanBlock]
 
 
-class WorkTicketReadOutcome(BaseModel):
+class WorkTicketReadOutcome(ReadCounts):
     """The read outcome of a work ticket's prep_sample — the same per-stage read
-    counts the sequenced_sample carries, so a read-mask ticket can be assessed
-    without joining sequenced_sample by hand. `fraction_passing_quality_filter`
-    is recomputed from the counts (shared `_fraction_passing_quality_filter`).
-    Present only on a prep_sample-scoped ticket whose prep_sample has a
-    sequenced_sample row; the counts are individually None until the sample is
-    processed."""
-
-    raw_read_count_r1r2: int | None
-    biological_read_count_r1r2: int | None
-    quality_filtered_read_count_r1r2: int | None
-    spikein_read_count_r1r2: int | None
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def fraction_passing_quality_filter(self) -> float | None:
-        return _fraction_passing_quality_filter(
-            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
-        )
+    counts the sequenced_sample carries (see `ReadCounts`), so a read-mask ticket
+    can be assessed without joining sequenced_sample by hand. Present only on a
+    prep_sample-scoped ticket whose prep_sample has a sequenced_sample row; a
+    block ticket spans many samples and carries none."""
 
 
 class WorkTicketSummary(WorkTicket):
@@ -576,6 +561,25 @@ class WorkTicketSummary(WorkTicket):
     # sequenced_sample lookup. None for a non-prep_sample-scoped ticket (block /
     # pool / reference / study) or a prep_sample with no sequenced_sample row.
     read_outcome: WorkTicketReadOutcome | None = None
+
+
+class WorkTicketListResponse(BaseModel):
+    """Returned by `GET /api/v1/work-ticket` (the list view).
+
+    Envelope, not a bare array, so a hard-capped page says so: `truncated` is
+    True when the underlying set exceeded `limit`, and a caller reading a whole
+    pool's tickets can tell a complete answer from a prefix. `count` is the
+    number of rows in `tickets` after the cap. Same contract as
+    `IdxsListResponse` / `SequencedSampleListResponse`.
+
+    No `caller_system_role`, unlike those two: this route admits service
+    accounts, whose authz is scope-only and which carry no system_role at all
+    (see `ServiceAccount`). The other list envelopes sit on human-only routes.
+    """
+
+    tickets: list[WorkTicketSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool
 
 
 class WorkTicketStepLogs(BaseModel):

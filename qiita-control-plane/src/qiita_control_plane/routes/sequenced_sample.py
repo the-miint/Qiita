@@ -99,6 +99,7 @@ from ._helpers import (
     IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
+    cap_rows,
     detail_for_biosample_link_rejection,
     detail_for_unlinked_entity,
     etag_for_updated_at,
@@ -387,17 +388,19 @@ async def list_sequenced_samples_in_pool(
     Each sample carries `host_filter` — what host filtering it WOULD get, resolved
     from its own `host_taxon_id` metadata plus the run's platform. This is what the
     submit path reads (there is no intake host-filter flag any more).
+
+    Each sample also carries its four per-stage read counts and the fraction
+    surviving quality filtering, making one call the pool's per-sample read
+    table; `SequencedSampleListItem` records which samples that covers and the
+    work-ticket list does not.
     """
-    # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
     rows = await fetch_sequenced_pool_samples(
         pool,
         sequenced_pool_idx=sequenced_pool_idx,
         limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
-    if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    rows, truncated = cap_rows(rows, _SEQUENCED_SAMPLE_HARD_CAP)
     # PacBio protocol facts from the pool's stored pre-flight, keyed by
     # sequenced_pool_item_id. Empty for an Illumina pool (it has none) and for a
     # pool whose blob cannot be parsed.
@@ -463,17 +466,17 @@ async def list_sequenced_samples_in_run(
     run instead of one pool. require_sequencing_run_exists fires a 404 for an
     unknown run. Excludes rows whose supertype prep_sample is retired; the
     `truncated` flag indicates the underlying set exceeded the hard cap.
+
+    Carries the same per-sample read counts as the pool-scoped list; `host_filter`
+    stays None here (it needs the run's platform and is resolved per pool).
     """
-    # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
     rows = await fetch_sequenced_samples_for_run(
         pool,
         sequencing_run_idx=sequencing_run_idx,
         limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
-    if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    rows, truncated = cap_rows(rows, _SEQUENCED_SAMPLE_HARD_CAP)
     # same-pattern-ok: run-scoped twin of list_sequenced_samples_in_pool's
     # envelope; the scope variants are kept as separate routes, not
     # parameterized into one shared pool/run handler

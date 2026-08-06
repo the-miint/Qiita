@@ -50,7 +50,7 @@ from ..repositories.prep_sample import (
     set_prep_sample_retired,
 )
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
-from ._helpers import create_and_map_study_field
+from ._helpers import cap_rows, create_and_map_study_field
 
 router = APIRouter(prefix=PATH_PREP_SAMPLE_PREFIX, tags=["prep-sample"])
 study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["prep-sample"])
@@ -82,14 +82,11 @@ async def list_studies_for_prep_sample(
     study_ref) without a per-study GET. The `truncated` flag indicates the
     underlying set exceeded the hard cap.
     """
-    # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
     rows = await fetch_active_studies_for_prep_sample(
         pool, prep_sample_idx, limit=_PREP_SAMPLE_STUDIES_HARD_CAP + 1
     )
-    truncated = len(rows) > _PREP_SAMPLE_STUDIES_HARD_CAP
-    if truncated:
-        rows = rows[:_PREP_SAMPLE_STUDIES_HARD_CAP]
+    rows, truncated = cap_rows(rows, _PREP_SAMPLE_STUDIES_HARD_CAP)
     return StudyListResponse(
         studies=[StudyListItem.model_validate(dict(r)) for r in rows],
         count=len(rows),

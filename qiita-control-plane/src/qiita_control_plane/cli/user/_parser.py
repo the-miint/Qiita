@@ -728,6 +728,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="All originators' tickets (requires wet_lab_admin+); default is your own.",
     )
     p_ticket_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help=(
+            "Only tickets that touch this sequenced_pool: pool-scoped, on one of its"
+            " samples, or on a block covering one of them."
+        ),
+    )
+    p_ticket_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only tickets scoped to this prep_sample.",
+    )
+    p_ticket_list.add_argument(
+        "--action-id",
+        help="Only tickets for this action_id (e.g. read-mask), across every version.",
+    )
+    p_ticket_list.add_argument(
         "--limit",
         type=int,
         help="Max tickets to return (server default 50, max 500).",
