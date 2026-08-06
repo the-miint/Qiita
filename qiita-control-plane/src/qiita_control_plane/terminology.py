@@ -29,18 +29,43 @@ from .repositories.terminology import (
 )
 
 # Names of the manifest and the two tab-separated tables a staged release
-# carries, and the columns each table holds.
+# carries.
 MANIFEST_FILENAME = "manifest.json"
 TERMS_TSV_FILENAME = "terms.tsv"
 CLOSURE_TSV_FILENAME = "closure.tsv"
+
+# The columns each release table holds. Every column is named once here and
+# referenced by name wherever a table is written or read, so the header a
+# writer emits and the keys a parser looks up cannot drift apart.
+_TERMS_COLUMN_TERM_ID = "term_id"
+_TERMS_COLUMN_LABEL = "label"
+_TERMS_COLUMN_ALTERNATE_LABEL = "alternate_label"
+_TERMS_COLUMN_IS_OBSOLETE = "is_obsolete"
+_TERMS_COLUMN_REPLACED_BY_TERM_ID = "replaced_by_term_id"
+_TERMS_COLUMN_OBSOLETION_KIND = "obsoletion_kind"
 TERMS_TSV_COLUMNS = (
-    "term_id",
-    "label",
-    "is_obsolete",
-    "replaced_by_term_id",
-    "obsoletion_kind",
+    _TERMS_COLUMN_TERM_ID,
+    _TERMS_COLUMN_LABEL,
+    _TERMS_COLUMN_ALTERNATE_LABEL,
+    _TERMS_COLUMN_IS_OBSOLETE,
+    _TERMS_COLUMN_REPLACED_BY_TERM_ID,
+    _TERMS_COLUMN_OBSOLETION_KIND,
 )
-CLOSURE_TSV_COLUMNS = ("ancestor_term_id", "descendant_term_id", "distance")
+_CLOSURE_COLUMN_ANCESTOR_TERM_ID = "ancestor_term_id"
+_CLOSURE_COLUMN_DESCENDANT_TERM_ID = "descendant_term_id"
+_CLOSURE_COLUMN_DISTANCE = "distance"
+CLOSURE_TSV_COLUMNS = (
+    _CLOSURE_COLUMN_ANCESTOR_TERM_ID,
+    _CLOSURE_COLUMN_DESCENDANT_TERM_ID,
+    _CLOSURE_COLUMN_DISTANCE,
+)
+
+# How a boolean cell is spelled in a release table, by the writer and by the
+# parser that has to accept exactly what the writer emitted. Deliberately not
+# shared with the OWL extractor's owl:deprecated spelling, which is a separate
+# source's contract that merely happens to coincide.
+_TSV_TRUE = "true"
+_TSV_FALSE = "false"
 
 
 class TerminologyNotFound(Exception):
@@ -148,39 +173,62 @@ def verify_manifest_checksums(source_dir: Path, manifest: TerminologyManifest) -
 
 def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
     """Parse a tab-separated terms table at `path` into a list of
-    ParsedTerm. Empty replaced_by_term_id / obsoletion_kind cells
-    become None; is_obsolete must be 'true' or 'false' case-insensitively;
-    an unrecognized obsoletion_kind raises ValueError naming the row."""
+    ParsedTerm. An empty alternate_label / replaced_by_term_id /
+    obsoletion_kind cell becomes None; is_obsolete must be 'true' or
+    'false' case-insensitively.
+
+    Raises ValueError when the header lacks a declared column, when
+    is_obsolete holds an uninterpretable value, or when obsoletion_kind
+    is unrecognized; the latter two name the offending row.
+    """
     rows: list[ParsedTerm] = []
     with path.open(newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
+
+        # Check the header up front, so a table written against an earlier
+        # column set is refused rather than silently parsing every column it
+        # lacks as absent.
+        present_columns = reader.fieldnames or ()
+        missing_columns = [c for c in TERMS_TSV_COLUMNS if c not in present_columns]
+        if missing_columns:
+            raise ValueError(
+                f"terms table at {path} is missing column(s) {missing_columns};"
+                f" expected {list(TERMS_TSV_COLUMNS)}"
+            )
+
         for row in reader:
-            term_id = row["term_id"]
-            replaced_by = row.get("replaced_by_term_id") or None
+            term_id = row[_TERMS_COLUMN_TERM_ID]
+            replaced_by = row[_TERMS_COLUMN_REPLACED_BY_TERM_ID] or None
+
+            # An absent second name is spelled NULL in the database, so a
+            # blank or whitespace-only cell has to arrive as None.
+            alternate_label = row[_TERMS_COLUMN_ALTERNATE_LABEL].strip() or None
 
             # Reject typo'd is_obsolete values explicitly so they surface
             # at parse time rather than silently coercing to False.
-            is_obsolete_text = row["is_obsolete"].lower()
-            if is_obsolete_text not in ("true", "false"):
+            is_obsolete_text = row[_TERMS_COLUMN_IS_OBSOLETE].lower()
+            if is_obsolete_text not in (_TSV_TRUE, _TSV_FALSE):
                 raise ValueError(
-                    f"invalid is_obsolete value {row['is_obsolete']!r}"
-                    f" for term_id {term_id!r}; expected 'true' or 'false'"
+                    f"invalid {_TERMS_COLUMN_IS_OBSOLETE} value"
+                    f" {row[_TERMS_COLUMN_IS_OBSOLETE]!r} for term_id {term_id!r};"
+                    f" expected {_TSV_TRUE!r} or {_TSV_FALSE!r}"
                 )
 
             # Wrap the enum cast so the offending row is named in the error.
-            kind_text = row.get("obsoletion_kind") or None
+            kind_text = row[_TERMS_COLUMN_OBSOLETION_KIND] or None
             try:
                 obsoletion_kind = TerminologyTermObsoletionKind(kind_text) if kind_text else None
             except ValueError as exc:
                 raise ValueError(
-                    f"invalid obsoletion_kind {kind_text!r} for term_id {term_id!r}"
+                    f"invalid {_TERMS_COLUMN_OBSOLETION_KIND} {kind_text!r} for term_id {term_id!r}"
                 ) from exc
 
             rows.append(
                 ParsedTerm(
                     term_id=term_id,
-                    label=row["label"],
-                    is_obsolete=is_obsolete_text == "true",
+                    label=row[_TERMS_COLUMN_LABEL],
+                    alternate_label=alternate_label,
+                    is_obsolete=is_obsolete_text == _TSV_TRUE,
                     replaced_by_term_id=replaced_by,
                     obsoletion_kind=obsoletion_kind,
                 )
@@ -190,17 +238,21 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
 
 def write_terms_tsv(path: Path, terms: list[ParsedTerm]) -> None:
     """Write `terms` as the tab-separated terms table at `path`, headed by
-    TERMS_TSV_COLUMNS. A replaced_by_term_id or obsoletion_kind of None
-    becomes an empty cell."""
+    TERMS_TSV_COLUMNS. An alternate_label, replaced_by_term_id, or
+    obsoletion_kind of None becomes an empty cell."""
     with path.open("w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(TERMS_TSV_COLUMNS)
+
+        # Cells are written positionally, so this list stays in
+        # TERMS_TSV_COLUMNS order.
         for term in terms:
             writer.writerow(
                 [
                     term.term_id,
                     term.label,
-                    "true" if term.is_obsolete else "false",
+                    term.alternate_label or "",
+                    _TSV_TRUE if term.is_obsolete else _TSV_FALSE,
                     term.replaced_by_term_id or "",
                     str(term.obsoletion_kind) if term.obsoletion_kind is not None else "",
                 ]
@@ -226,9 +278,9 @@ def _parse_closure_tsv(path: Path) -> list[tuple[str, str, int]]:
         for row in reader:
             rows.append(
                 (
-                    row["ancestor_term_id"],
-                    row["descendant_term_id"],
-                    int(row["distance"]),
+                    row[_CLOSURE_COLUMN_ANCESTOR_TERM_ID],
+                    row[_CLOSURE_COLUMN_DESCENDANT_TERM_ID],
+                    int(row[_CLOSURE_COLUMN_DISTANCE]),
                 )
             )
     return rows

@@ -52,10 +52,16 @@ class TerminologyImportAnomaly(Exception):
 
 @dataclass(frozen=True)
 class ParsedTerm:
-    """One term in an incoming release batch."""
+    """One term in an incoming release batch.
+
+    `alternate_label` is the second name the source supplies for the term,
+    None when it supplies none. A source that names its terms only one way
+    leaves it None throughout.
+    """
 
     term_id: str
     label: str
+    alternate_label: str | None
     is_obsolete: bool
     replaced_by_term_id: str | None
     obsoletion_kind: TerminologyTermObsoletionKind | None
@@ -66,6 +72,7 @@ class PriorTermState:
     """Pre-import snapshot of one terminology_term row."""
 
     label: str
+    alternate_label: str | None
     is_obsolete: bool
     obsoletion_kind: TerminologyTermObsoletionKind | None
 
@@ -300,13 +307,14 @@ async def _fetch_prior_term_state(
     """Snapshot term_id → PriorTermState for every term currently in
     this terminology."""
     rows = await conn.fetch(
-        "SELECT term_id, label, is_obsolete, obsoletion_kind"
+        "SELECT term_id, label, alternate_label, is_obsolete, obsoletion_kind"
         "  FROM qiita.terminology_term WHERE terminology_idx = $1",
         terminology_idx,
     )
     return {
         row["term_id"]: PriorTermState(
             label=row["label"],
+            alternate_label=row["alternate_label"],
             is_obsolete=row["is_obsolete"],
             obsoletion_kind=(
                 TerminologyTermObsoletionKind(row["obsoletion_kind"])
@@ -329,10 +337,10 @@ def _handle_silent_drops(
     marker. Already-obsolete terms absent from the batch are benign.
 
     Fail mode raises TerminologyImportAnomaly. Tolerate mode returns
-    synthetic ParsedTerm rows for the dropped term_ids — label carried
-    forward from prior DB state, is_obsolete=True, replaced_by_term_id
-    None, obsoletion_kind=SILENTLY_DROPPED. Returns the empty list when
-    no silent drops are present."""
+    synthetic ParsedTerm rows for the dropped term_ids — both names
+    carried forward from prior DB state, is_obsolete=True,
+    replaced_by_term_id None, obsoletion_kind=SILENTLY_DROPPED. Returns
+    the empty list when no silent drops are present."""
     incoming_term_ids = {term.term_id for term in parsed_terms}
     silently_dropped = sorted(
         term_id
@@ -347,6 +355,7 @@ def _handle_silent_drops(
         ParsedTerm(
             term_id=term_id,
             label=prior_state[term_id].label,
+            alternate_label=prior_state[term_id].alternate_label,
             is_obsolete=True,
             replaced_by_term_id=None,
             obsoletion_kind=TerminologyTermObsoletionKind.SILENTLY_DROPPED,
@@ -370,6 +379,7 @@ async def _upsert_terms_without_replaced_by(
         return
     term_ids = [term.term_id for term in parsed_terms]
     labels = [term.label for term in parsed_terms]
+    alternate_labels = [term.alternate_label for term in parsed_terms]
     is_obsoletes = [term.is_obsolete for term in parsed_terms]
     obsoletion_kinds = [
         str(term.obsoletion_kind) if term.obsoletion_kind is not None else None
@@ -378,29 +388,33 @@ async def _upsert_terms_without_replaced_by(
 
     # One INSERT ... ON CONFLICT DO UPDATE call keyed on
     # (terminology_idx, term_id) drives both new-row and update paths
-    # from the same row source: unnesting four parallel arrays
-    # ($2 term_ids, $3 labels, $4 is_obsoletes, $5 obsoletion_kinds)
-    # zips into one tuple per incoming term.
-    # The INSERT side stamps obsoleted_in_version with loading_version ($6)
+    # from the same row source: unnesting five parallel arrays
+    # ($2 term_ids, $3 labels, $4 alternate_labels, $5 is_obsoletes,
+    # $6 obsoletion_kinds) zips into one tuple per incoming term.
+    # The INSERT side stamps obsoleted_in_version with loading_version ($7)
     # iff the row arrives obsolete, else NULL; NB: replaced_by is always
     # NULL because the in-batch term_id -> idx map is not yet known.
-    # The ON CONFLICT side overwrites label, is_obsolete, and
-    # obsoletion_kind unconditionally; obsoleted_in_version uses
-    # COALESCE(existing, EXCLUDED) when still obsolete so the first
-    # version that obsoleted the term sticks across reloads, and clears
-    # to NULL on un-obsoletion; NB: replaced_by is wiped on every update so
-    # the later replaced_by-setting step starts from a clean slate.
+    # The ON CONFLICT side overwrites label, alternate_label, is_obsolete,
+    # and obsoletion_kind unconditionally, so the release is authoritative
+    # for each of them and one supplying no second name clears a stored one;
+    # obsoleted_in_version uses COALESCE(existing, EXCLUDED) when still
+    # obsolete so the first version that obsoleted the term sticks across
+    # reloads, and clears to NULL on un-obsoletion; NB: replaced_by is wiped
+    # on every update so the later replaced_by-setting step starts from a
+    # clean slate.
     await conn.execute(
         "INSERT INTO qiita.terminology_term"
-        "   (terminology_idx, term_id, label, is_obsolete,"
+        "   (terminology_idx, term_id, label, alternate_label, is_obsolete,"
         "    obsoletion_kind, obsoleted_in_version, replaced_by)"
-        " SELECT $1, t, l, o,"
+        " SELECT $1, t, l, al, o,"
         "        k::qiita.terminology_term_obsoletion_kind,"
-        "        CASE WHEN o THEN $6 ELSE NULL END,"
+        "        CASE WHEN o THEN $7 ELSE NULL END,"
         "        NULL"
-        "   FROM unnest($2::text[], $3::text[], $4::bool[], $5::text[]) AS s(t, l, o, k)"
+        "   FROM unnest($2::text[], $3::text[], $4::text[], $5::bool[], $6::text[])"
+        "        AS s(t, l, al, o, k)"
         " ON CONFLICT (terminology_idx, term_id) DO UPDATE"
         "   SET label = EXCLUDED.label,"
+        "       alternate_label = EXCLUDED.alternate_label,"
         "       is_obsolete = EXCLUDED.is_obsolete,"
         "       obsoletion_kind = EXCLUDED.obsoletion_kind,"
         "       obsoleted_in_version = CASE"
@@ -415,6 +429,7 @@ async def _upsert_terms_without_replaced_by(
         terminology_idx,
         term_ids,
         labels,
+        alternate_labels,
         is_obsoletes,
         obsoletion_kinds,
         loading_version,

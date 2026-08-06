@@ -50,14 +50,17 @@ def parsed_term(
     term_id: str,
     label: str,
     *,
+    alternate_label: str | None = None,
     is_obsolete: bool = False,
     replaced_by_term_id: str | None = None,
     obsoletion_kind: TerminologyTermObsoletionKind | None = None,
 ) -> ParsedTerm:
-    """One complete ParsedTerm, with the non-obsolete defaults filled in."""
+    """One complete ParsedTerm, with the non-obsolete defaults and the
+    alternate_label filled in."""
     return ParsedTerm(
         term_id=term_id,
         label=label,
+        alternate_label=alternate_label,
         is_obsolete=is_obsolete,
         replaced_by_term_id=replaced_by_term_id,
         obsoletion_kind=obsoletion_kind,

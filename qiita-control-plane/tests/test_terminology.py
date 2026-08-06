@@ -24,6 +24,7 @@ from qiita_control_plane.repositories.terminology import (
 from qiita_control_plane.terminology import (
     CLOSURE_TSV_COLUMNS,
     CLOSURE_TSV_FILENAME,
+    MANIFEST_FILENAME,
     TERMS_TSV_COLUMNS,
     TERMS_TSV_FILENAME,
     IllegalStatusTransition,
@@ -43,6 +44,7 @@ from qiita_control_plane.testing.db_seeds import (
     SEEDED_TERMINOLOGY_LOADED_AT,
     seed_terminology,
 )
+from qiita_control_plane.testing.terminology import parsed_term
 
 pytestmark = pytest.mark.db
 
@@ -169,7 +171,7 @@ async def test_transition_terminology_status_illegal(postgres_pool, created_term
 
 
 def _write_manifest_json(source_dir, payload: dict) -> None:
-    (source_dir / "manifest.json").write_text(json.dumps(payload))
+    (source_dir / MANIFEST_FILENAME).write_text(json.dumps(payload))
 
 
 def _manifest_for(
@@ -308,13 +310,22 @@ def test_verify_manifest_checksums_missing_table(tmp_path):
 
 
 def test_write_terms_tsv(tmp_path):
-    """Tests the case where terms with and without obsoletion fields are
-    written: the file is headed by the declared columns and reads back
-    through the parser unchanged."""
+    """Tests the case where terms with and without obsoletion fields and
+    with and without a second name are written: the file is headed by the
+    declared columns and reads back through the parser unchanged."""
     terms = [
         ParsedTerm(
             term_id="UBERON:0001",
             label="mouth",
+            alternate_label=None,
+            is_obsolete=False,
+            replaced_by_term_id=None,
+            obsoletion_kind=None,
+        ),
+        ParsedTerm(
+            term_id="NCBI:9606",
+            label="Homo sapiens",
+            alternate_label="human",
             is_obsolete=False,
             replaced_by_term_id=None,
             obsoletion_kind=None,
@@ -322,6 +333,7 @@ def test_write_terms_tsv(tmp_path):
         ParsedTerm(
             term_id="UBERON:0002",
             label="obsolete tooth",
+            alternate_label=None,
             is_obsolete=True,
             replaced_by_term_id="UBERON:0001",
             obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
@@ -333,6 +345,40 @@ def test_write_terms_tsv(tmp_path):
 
     assert path.read_text().splitlines()[0] == "\t".join(TERMS_TSV_COLUMNS)
     assert _parse_terms_tsv(path) == terms
+
+
+def test__parse_terms_tsv_blank_alternate_label(tmp_path):
+    """Tests the case where the alternate_label cell is blank or holds only
+    whitespace: both arrive as None, because an absent second name is
+    spelled NULL in the database rather than as an empty string."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "NCBI:9606\tHomo sapiens\t\tfalse\t\t\n"
+        "NCBI:10090\tMus musculus\t   \tfalse\t\t\n"
+    )
+
+    result = _parse_terms_tsv(path)
+
+    expected = [
+        parsed_term("NCBI:9606", "Homo sapiens"),
+        parsed_term("NCBI:10090", "Mus musculus"),
+    ]
+    assert result == expected
+
+
+def test__parse_terms_tsv_missing_column(tmp_path):
+    """Tests the case where the terms table was written against an earlier
+    column set: the parse is refused up front naming the absent column,
+    rather than silently reading every row as having no second name."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0001\tmouth\tfalse\t\t\n"
+    )
+
+    with pytest.raises(ValueError, match="alternate_label"):
+        _parse_terms_tsv(path)
 
 
 def test_write_closure_tsv_stub(tmp_path):
@@ -356,34 +402,45 @@ def _write_staging(
     *,
     name: str,
     version: str,
-    terms: list[tuple[str, str, bool, str | None, TerminologyTermObsoletionKind | None]],
+    terms: list[ParsedTerm],
     closure: list[tuple[str, str, int]],
 ) -> None:
     """Write manifest.json + terms.tsv + closure.tsv into `staging_dir`.
-    terms rows are
-    (term_id, label, is_obsolete, replaced_by_term_id, obsoletion_kind);
     closure rows are (ancestor_term_id, descendant_term_id, distance). The
     manifest declares the digests of the two tables actually written, so the
-    checksum verification the import performs is real."""
+    checksum verification the import performs is real.
+
+    Both headers are spelled out here rather than taken from the constants
+    the writers use, so a rename of a declared column fails these tests
+    instead of passing tautologically.
+    """
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    with (staging_dir / "terms.tsv").open("w", newline="") as fh:
+    with (staging_dir / TERMS_TSV_FILENAME).open("w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(
-            ["term_id", "label", "is_obsolete", "replaced_by_term_id", "obsoletion_kind"]
+            [
+                "term_id",
+                "label",
+                "alternate_label",
+                "is_obsolete",
+                "replaced_by_term_id",
+                "obsoletion_kind",
+            ]
         )
-        for term_id, label, is_obsolete, replaced_by_term_id, obsoletion_kind in terms:
+        for term in terms:
             writer.writerow(
                 [
-                    term_id,
-                    label,
-                    "true" if is_obsolete else "false",
-                    replaced_by_term_id or "",
-                    str(obsoletion_kind) if obsoletion_kind is not None else "",
+                    term.term_id,
+                    term.label,
+                    term.alternate_label or "",
+                    "true" if term.is_obsolete else "false",
+                    term.replaced_by_term_id or "",
+                    str(term.obsoletion_kind) if term.obsoletion_kind is not None else "",
                 ]
             )
 
-    with (staging_dir / "closure.tsv").open("w", newline="") as fh:
+    with (staging_dir / CLOSURE_TSV_FILENAME).open("w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(["ancestor_term_id", "descendant_term_id", "distance"])
         for ancestor, descendant, distance in closure:
@@ -401,12 +458,12 @@ def _write_staging(
 
 
 async def _read_term_state(pool, terminology_idx: int) -> dict:
-    """Returns {term_id: {label, is_obsolete, obsoletion_kind,
-    obsoleted_in_version, replaced_by_term_id, notes, idx}} for every
-    term in the terminology."""
+    """Returns {term_id: {label, alternate_label, is_obsolete,
+    obsoletion_kind, obsoleted_in_version, replaced_by_term_id, notes,
+    idx}} for every term in the terminology."""
     rows = await pool.fetch(
-        "SELECT t.idx, t.term_id, t.label, t.is_obsolete, t.obsoletion_kind,"
-        "       t.obsoleted_in_version, t.notes,"
+        "SELECT t.idx, t.term_id, t.label, t.alternate_label, t.is_obsolete,"
+        "       t.obsoletion_kind, t.obsoleted_in_version, t.notes,"
         "       r.term_id AS replaced_by_term_id"
         "  FROM qiita.terminology_term t"
         "  LEFT JOIN qiita.terminology_term r ON t.replaced_by = r.idx"
@@ -421,6 +478,7 @@ def _expected_term_state(
     term_id: str,
     *,
     label: str,
+    alternate_label: str | None = None,
     is_obsolete: bool = False,
     obsoletion_kind: TerminologyTermObsoletionKind | None = None,
     obsoleted_in_version: str | None = None,
@@ -437,6 +495,7 @@ def _expected_term_state(
         "idx": idx_source[term_id]["idx"],
         "term_id": term_id,
         "label": label,
+        "alternate_label": alternate_label,
         "is_obsolete": is_obsolete,
         "obsoletion_kind": obsoletion_kind.value if obsoletion_kind is not None else None,
         "obsoleted_in_version": obsoleted_in_version,
@@ -475,9 +534,9 @@ async def test_import_terminology(postgres_pool, created_terminologies, tmp_path
         name="ldt_brand_new",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
-            ("UBERON:0003", "molar", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
+            parsed_term("UBERON:0003", "molar"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -526,8 +585,8 @@ async def test_import_terminology_reload_preserves_idx(
         name="ldt_reload",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0), ("UBERON:0002", "UBERON:0002", 0)],
     )
@@ -542,8 +601,8 @@ async def test_import_terminology_reload_preserves_idx(
         name="ldt_reload",
         version="2.0.0",
         terms=[
-            ("UBERON:0001", "oral opening", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
+            parsed_term("UBERON:0001", "oral opening"),
+            parsed_term("UBERON:0002", "tooth"),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0), ("UBERON:0002", "UBERON:0002", 0)],
     )
@@ -580,6 +639,87 @@ async def test_import_terminology_reload_preserves_idx(
     assert dict(terminology_row) == expected_row
 
 
+async def test_import_terminology_alternate_label(postgres_pool, created_terminologies, tmp_path):
+    """Tests the case where a release supplies a second name for some of its
+    terms: the value lands on those rows and the terms without one keep
+    NULL, so absence stays distinguishable from an empty name."""
+    _write_staging(
+        tmp_path,
+        name="ldt_alternate_label",
+        version="1.0.0",
+        terms=[
+            parsed_term("9606", "Homo sapiens", alternate_label="human"),
+            parsed_term("10090", "Mus musculus", alternate_label="house mouse"),
+            parsed_term("256318", "metagenome"),
+        ],
+        closure=[],
+    )
+
+    result = await import_terminology(postgres_pool, tmp_path)
+    created_terminologies.append(result.terminology_idx)
+
+    state = await _read_term_state(postgres_pool, result.terminology_idx)
+    expected_state = {
+        "9606": _expected_term_state(state, "9606", label="Homo sapiens", alternate_label="human"),
+        "10090": _expected_term_state(
+            state, "10090", label="Mus musculus", alternate_label="house mouse"
+        ),
+        "256318": _expected_term_state(state, "256318", label="metagenome"),
+    }
+    assert state == expected_state
+
+
+async def test_import_terminology_alternate_label_release_authoritative(
+    postgres_pool, created_terminologies, tmp_path
+):
+    """Tests the case where a second release changes one term's second name
+    and supplies none for another that had one: the changed value is
+    overwritten and the omitted one is cleared to NULL.
+
+    The release is authoritative for alternate_label exactly as it is for
+    label, so a source that stops offering a second name is able to say so.
+    A term the release leaves untouched keeps the value it already had.
+    """
+    v1_dir = tmp_path / "v1"
+    _write_staging(
+        v1_dir,
+        name="ldt_alternate_label_authoritative",
+        version="1.0.0",
+        terms=[
+            parsed_term("9606", "Homo sapiens", alternate_label="human"),
+            parsed_term("10090", "Mus musculus", alternate_label="house mouse"),
+            parsed_term("9598", "Pan troglodytes", alternate_label="chimpanzee"),
+        ],
+        closure=[],
+    )
+    v1_result = await import_terminology(postgres_pool, v1_dir)
+    created_terminologies.append(v1_result.terminology_idx)
+
+    v2_dir = tmp_path / "v2"
+    _write_staging(
+        v2_dir,
+        name="ldt_alternate_label_authoritative",
+        version="2.0.0",
+        terms=[
+            parsed_term("9606", "Homo sapiens", alternate_label="man"),
+            parsed_term("10090", "Mus musculus"),
+            parsed_term("9598", "Pan troglodytes", alternate_label="chimpanzee"),
+        ],
+        closure=[],
+    )
+    await import_terminology(postgres_pool, v2_dir)
+
+    state = await _read_term_state(postgres_pool, v1_result.terminology_idx)
+    expected_state = {
+        "9606": _expected_term_state(state, "9606", label="Homo sapiens", alternate_label="man"),
+        "10090": _expected_term_state(state, "10090", label="Mus musculus"),
+        "9598": _expected_term_state(
+            state, "9598", label="Pan troglodytes", alternate_label="chimpanzee"
+        ),
+    }
+    assert state == expected_state
+
+
 async def test_import_terminology_obsoleted_in_version_set_once(
     postgres_pool, created_terminologies, tmp_path
 ):
@@ -587,28 +727,26 @@ async def test_import_terminology_obsoleted_in_version_set_once(
     still obsolete in v3 — obsoleted_in_version is stamped at v2 and never
     advances on subsequent reloads."""
     for version, terms in [
-        ("1.0.0", [("UBERON:0001", "mouth", False, None, None)]),
+        ("1.0.0", [parsed_term("UBERON:0001", "mouth")]),
         (
             "2.0.0",
             [
-                (
+                parsed_term(
                     "UBERON:0001",
                     "mouth",
-                    True,
-                    None,
-                    TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+                    is_obsolete=True,
+                    obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
                 )
             ],
         ),
         (
             "3.0.0",
             [
-                (
+                parsed_term(
                     "UBERON:0001",
                     "mouth",
-                    True,
-                    None,
-                    TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+                    is_obsolete=True,
+                    obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
                 )
             ],
         ),
@@ -649,7 +787,12 @@ async def test_import_terminology_un_obsoletion_clears_columns(
         name="ldt_un_obsolete",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "mouth", True, None, TerminologyTermObsoletionKind.SOURCE_DEPRECATED),
+            parsed_term(
+                "UBERON:0001",
+                "mouth",
+                is_obsolete=True,
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+            ),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0)],
     )
@@ -661,7 +804,7 @@ async def test_import_terminology_un_obsoletion_clears_columns(
         v2_dir,
         name="ldt_un_obsolete",
         version="2.0.0",
-        terms=[("UBERON:0001", "mouth", False, None, None)],
+        terms=[parsed_term("UBERON:0001", "mouth")],
         closure=[("UBERON:0001", "UBERON:0001", 0)],
     )
     await import_terminology(postgres_pool, v2_dir)
@@ -684,14 +827,13 @@ async def test_import_terminology_re_obsoletion_stamps_new_version(
     version being loaded. The v2 state is asserted before v3 runs, so a v2
     that failed to stamp cannot let the v4 expectation pass vacuously.
     """
-    obsolete_term = (
+    obsolete_term = parsed_term(
         "UBERON:0001",
         "mouth",
-        True,
-        None,
-        TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+        is_obsolete=True,
+        obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
     )
-    active_term = ("UBERON:0001", "mouth", False, None, None)
+    active_term = parsed_term("UBERON:0001", "mouth")
 
     async def _load(version: str, term) -> int:
         version_dir = tmp_path / version
@@ -754,8 +896,13 @@ async def test_import_terminology_kind_and_replaced_by_change(
         name="ldt_kind_change",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "old", True, None, TerminologyTermObsoletionKind.SOURCE_DEPRECATED),
-            ("UBERON:0002", "sibling", False, None, None),
+            parsed_term(
+                "UBERON:0001",
+                "old",
+                is_obsolete=True,
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+            ),
+            parsed_term("UBERON:0002", "sibling"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -771,15 +918,15 @@ async def test_import_terminology_kind_and_replaced_by_change(
         name="ldt_kind_change",
         version="2.0.0",
         terms=[
-            (
+            parsed_term(
                 "UBERON:0001",
                 "old",
-                True,
-                "UBERON:0003",
-                TerminologyTermObsoletionKind.SOURCE_MERGED,
+                is_obsolete=True,
+                replaced_by_term_id="UBERON:0003",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
             ),
-            ("UBERON:0002", "sibling", False, None, None),
-            ("UBERON:0003", "survivor", False, None, None),
+            parsed_term("UBERON:0002", "sibling"),
+            parsed_term("UBERON:0003", "survivor"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -830,8 +977,8 @@ async def test_import_terminology_cross_terminology_closure_untouched(
         name="ldt_sentinel",
         version="1.0.0",
         terms=[
-            ("SENT:0001", "alpha", False, None, None),
-            ("SENT:0002", "beta", False, None, None),
+            parsed_term("SENT:0001", "alpha"),
+            parsed_term("SENT:0002", "beta"),
         ],
         closure=[
             ("SENT:0001", "SENT:0001", 0),
@@ -847,7 +994,7 @@ async def test_import_terminology_cross_terminology_closure_untouched(
         other_dir,
         name="ldt_other",
         version="1.0.0",
-        terms=[("OTHER:0001", "gamma", False, None, None)],
+        terms=[parsed_term("OTHER:0001", "gamma")],
         closure=[("OTHER:0001", "OTHER:0001", 0)],
     )
     other_result = await import_terminology(postgres_pool, other_dir)
@@ -873,9 +1020,9 @@ async def test_import_terminology_silent_drops_raise_and_preserve_state(
         name="ldt_silent_drops",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
-            ("UBERON:0003", "molar", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
+            parsed_term("UBERON:0003", "molar"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -893,8 +1040,8 @@ async def test_import_terminology_silent_drops_raise_and_preserve_state(
         name="ldt_silent_drops",
         version="2.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -940,12 +1087,12 @@ async def test_import_terminology_unresolved_replaced_by_raises(
         name="ldt_unresolved",
         version="1.0.0",
         terms=[
-            (
+            parsed_term(
                 "UBERON:0001",
                 "orphan",
-                True,
-                "UBERON:9999",
-                TerminologyTermObsoletionKind.SOURCE_MERGED,
+                is_obsolete=True,
+                replaced_by_term_id="UBERON:9999",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
             ),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0)],
@@ -969,7 +1116,7 @@ async def test_import_terminology_tolerate_silent_drops(
     new release with no explicit deprecation marker, and tolerate mode
     auto-obsoletes it instead of refusing the load.
 
-    The dropped row carries its prior label forward, picks up
+    The dropped row carries both of its prior names forward, picks up
     obsoletion_kind=silently_dropped, and is stamped with the new
     release as its obsoleted_in_version. The result's
     terms_silently_dropped counter surfaces the count for the caller to
@@ -981,9 +1128,9 @@ async def test_import_terminology_tolerate_silent_drops(
         name="ldt_tolerate_silent",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
-            ("UBERON:0003", "molar", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
+            parsed_term("UBERON:0003", "molar", alternate_label="grinder"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -1001,8 +1148,8 @@ async def test_import_terminology_tolerate_silent_drops(
         name="ldt_tolerate_silent",
         version="2.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -1030,6 +1177,7 @@ async def test_import_terminology_tolerate_silent_drops(
             state,
             "UBERON:0003",
             label="molar",
+            alternate_label="grinder",
             is_obsolete=True,
             obsoletion_kind=TerminologyTermObsoletionKind.SILENTLY_DROPPED,
             obsoleted_in_version="2.0.0",
@@ -1059,12 +1207,12 @@ async def test_import_terminology_tolerate_unresolved_replaced_by(
         name="ldt_tolerate_unresolved",
         version="1.0.0",
         terms=[
-            (
+            parsed_term(
                 "UBERON:0001",
                 "orphan",
-                True,
-                "UBERON:9999",
-                TerminologyTermObsoletionKind.SOURCE_MERGED,
+                is_obsolete=True,
+                replaced_by_term_id="UBERON:9999",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
             ),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0)],
@@ -1109,8 +1257,8 @@ async def test_import_terminology_tolerate_un_obsoletion_clears_silent_drop(
         name="ldt_tolerate_un_obsolete",
         version="1.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -1126,7 +1274,7 @@ async def test_import_terminology_tolerate_un_obsoletion_clears_silent_drop(
         v2_dir,
         name="ldt_tolerate_un_obsolete",
         version="2.0.0",
-        terms=[("UBERON:0001", "mouth", False, None, None)],
+        terms=[parsed_term("UBERON:0001", "mouth")],
         closure=[("UBERON:0001", "UBERON:0001", 0)],
     )
     await import_terminology(postgres_pool, v2_dir, tolerate_anomalies=True)
@@ -1138,8 +1286,8 @@ async def test_import_terminology_tolerate_un_obsoletion_clears_silent_drop(
         name="ldt_tolerate_un_obsolete",
         version="3.0.0",
         terms=[
-            ("UBERON:0001", "mouth", False, None, None),
-            ("UBERON:0002", "tooth", False, None, None),
+            parsed_term("UBERON:0001", "mouth"),
+            parsed_term("UBERON:0002", "tooth"),
         ],
         closure=[
             ("UBERON:0001", "UBERON:0001", 0),
@@ -1177,12 +1325,12 @@ async def test_import_terminology_tolerate_notes_accumulate(
         name="ldt_tolerate_notes",
         version="1.0.0",
         terms=[
-            (
+            parsed_term(
                 "UBERON:0001",
                 "orphan",
-                True,
-                "UBERON:9999",
-                TerminologyTermObsoletionKind.SOURCE_MERGED,
+                is_obsolete=True,
+                replaced_by_term_id="UBERON:9999",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
             ),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0)],
@@ -1196,12 +1344,12 @@ async def test_import_terminology_tolerate_notes_accumulate(
         name="ldt_tolerate_notes",
         version="2.0.0",
         terms=[
-            (
+            parsed_term(
                 "UBERON:0001",
                 "orphan",
-                True,
-                "UBERON:8888",
-                TerminologyTermObsoletionKind.SOURCE_MERGED,
+                is_obsolete=True,
+                replaced_by_term_id="UBERON:8888",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
             ),
         ],
         closure=[("UBERON:0001", "UBERON:0001", 0)],

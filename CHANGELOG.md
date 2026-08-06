@@ -30,7 +30,20 @@ duplicates further down are historical strata; leave them where they are.
   bounded to the same width as the label so it stays a name rather than
   accumulating free-text definitions; an empty string is rejected, leaving NULL
   as the only spelling of absence. A resolved terminology term carries it
-  through metadata reads. No load populates it yet.
+  through metadata reads.
+
+### Changed
+
+- **A terminology release now carries a second name for each term.** The terms
+  table gained an `alternate_label` column, so a source that names a term two
+  ways can supply both instead of having one discarded at extraction. The
+  release is authoritative for the value exactly as it is for the label: a
+  release supplying none clears any value stored against the term, which means
+  the column holds what the source carries rather than content added by hand.
+  A terms table written against the earlier column set is now refused at parse
+  time naming the absent column, rather than loading every row as having no
+  second name. The OWL extractor supplies none, since an ontology release
+  offers no second name to read.
 
 - **`qiita-admin terminology` — prepare and load an ontology release.**
   `robot-command` prints the ROBOT export command to run against a staged OWL

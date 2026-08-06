@@ -13,7 +13,6 @@ import pytest
 from qiita_common.models import TerminologyStatus
 
 from qiita_control_plane.repositories.terminology import (
-    ParsedTerm,
     TerminologyImportResult,
     fetch_terminology,
     fetch_terminology_idx_by_name,
@@ -24,22 +23,12 @@ from qiita_control_plane.testing.db_seeds import (
     SEEDED_TERMINOLOGY_LOADED_AT,
     seed_terminology,
 )
+from qiita_control_plane.testing.terminology import parsed_term
 
 pytestmark = pytest.mark.db
 
 # Far above the identity sequence start, so it can never collide with a real row.
 _ABSENT_TERMINOLOGY_IDX = 2**40
-
-
-def _term(term_id: str, label: str) -> ParsedTerm:
-    """A non-obsolete ParsedTerm, the shape most closure fixtures need."""
-    return ParsedTerm(
-        term_id=term_id,
-        label=label,
-        is_obsolete=False,
-        replaced_by_term_id=None,
-        obsoletion_kind=None,
-    )
 
 
 async def _insert_term(
@@ -49,8 +38,8 @@ async def _insert_term(
     label: str,
     alternate_label: str | None,
 ) -> None:
-    """Insert one term row directly, so alternate_label can be written on its
-    own — no ParsedTerm carries it."""
+    """Insert one term row directly, bypassing the load path, so a value can
+    be placed on a row without a release having supplied it."""
     await pool.execute(
         "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label, alternate_label)"
         " VALUES ($1, $2, $3, $4)",
@@ -75,7 +64,7 @@ async def test_import_terminology_release_requires_transaction(postgres_pool):
                 conn,
                 name="tr_no_transaction",
                 version="1.0.0",
-                parsed_terms=[_term("TR:1", "one")],
+                parsed_terms=[parsed_term("TR:1", "one")],
                 parsed_closure=[],
             )
 
@@ -98,7 +87,7 @@ async def test_import_terminology_release_row_already_loading(postgres_pool, cre
                 conn,
                 name="tr_already_loading",
                 version="2.0.0",
-                parsed_terms=[_term("TR:1", "one")],
+                parsed_terms=[parsed_term("TR:1", "one")],
                 parsed_closure=[],
             )
 
@@ -120,7 +109,7 @@ async def test_import_terminology_release_closure_tuple_with_unknown_term_id(
     """Tests the case where a closure tuple names a term the batch never
     supplied: the inner JOINs drop that tuple, so the reported closure count
     is lower than the number of tuples handed in."""
-    parsed_terms = [_term("TR:1", "one"), _term("TR:2", "two")]
+    parsed_terms = [parsed_term("TR:1", "one"), parsed_term("TR:2", "two")]
     parsed_closure = [("TR:1", "TR:1", 0), ("TR:1", "TR:2", 1), ("TR:1", "TR:404", 1)]
 
     async with postgres_pool.acquire() as conn, conn.transaction():
@@ -263,18 +252,22 @@ async def test_terminology_term_alternate_label_null_and_value(
     assert [dict(row) for row in rows] == expected
 
 
-async def test_import_terminology_release_preserves_alternate_label(
+async def test_import_terminology_release_clears_unsupplied_alternate_label(
     postgres_pool, created_terminologies
 ):
-    """Tests the case where a term carrying a second name is reloaded from a
-    release supplying none: the upsert names every column it writes, so a
-    relabelling reload leaves the stored alternate_label standing."""
+    """Tests the case where a second name was written onto a row outside any
+    load and the next release supplies none: the value is cleared.
+
+    The release is authoritative for alternate_label, so the column is not a
+    place to keep content the source does not carry — a value put there by
+    hand survives only until the terminology is next loaded.
+    """
     async with postgres_pool.acquire() as conn, conn.transaction():
         first = await import_terminology_release(
             conn,
-            name="tr_alt_preserved",
+            name="tr_alt_cleared",
             version="1.0.0",
-            parsed_terms=[_term("TR:1", "Homo sapiens")],
+            parsed_terms=[parsed_term("TR:1", "Homo sapiens")],
             parsed_closure=[],
         )
     created_terminologies.append(first.terminology_idx)
@@ -290,9 +283,9 @@ async def test_import_terminology_release_preserves_alternate_label(
     async with postgres_pool.acquire() as conn, conn.transaction():
         await import_terminology_release(
             conn,
-            name="tr_alt_preserved",
+            name="tr_alt_cleared",
             version="2.0.0",
-            parsed_terms=[_term("TR:1", "Homo sapiens sapiens")],
+            parsed_terms=[parsed_term("TR:1", "Homo sapiens sapiens")],
             parsed_closure=[],
         )
 
@@ -302,5 +295,5 @@ async def test_import_terminology_release_preserves_alternate_label(
         first.terminology_idx,
         "TR:1",
     )
-    expected = {"label": "Homo sapiens sapiens", "alternate_label": "human"}
+    expected = {"label": "Homo sapiens sapiens", "alternate_label": None}
     assert dict(row) == expected

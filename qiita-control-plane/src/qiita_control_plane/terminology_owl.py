@@ -128,6 +128,7 @@ def _assemble_terms(exported_classes: list[ExportedClass]) -> list[ParsedTerm]:
         ParsedTerm(
             term_id=merged_term_id,
             label=_MERGED_LABEL_TEMPLATE.format(survivor_term_id=survivor_term_id),
+            alternate_label=None,
             is_obsolete=True,
             replaced_by_term_id=survivor_term_id,
             obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
@@ -175,6 +176,7 @@ def _term_for_class(
         return ParsedTerm(
             term_id=exported_class.term_id,
             label=exported_class.label,
+            alternate_label=None,
             is_obsolete=exported_class.source_deprecated,
             replaced_by_term_id=exported_class.asserted_replacement_term_id,
             obsoletion_kind=(
@@ -200,6 +202,7 @@ def _term_for_class(
     return ParsedTerm(
         term_id=exported_class.term_id,
         label=exported_class.label,
+        alternate_label=None,
         is_obsolete=True,
         replaced_by_term_id=survivor_term_id,
         obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
