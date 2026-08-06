@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import base64
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
@@ -273,25 +273,35 @@ async def fetch_alignment_doget_ticket(
     *,
     http: httpx.AsyncClient,
     work_ticket_idx: int,
+    columns: Sequence[str],
 ) -> bytes:
     """POST /alignment/ticket/doget and return the raw signed ticket bytes.
 
-    Unlike `fetch_reference_doget_ticket` (which takes `table` + `feature_idx`),
-    the alignment mint route takes ONLY `work_ticket_idx`: the CP reads the
-    `alignment_idx` and the `prep_sample_idx` cohort from that work ticket's
-    `action_context` (set at plan time) and signs the scoped `alignment` ticket
-    itself, keeping the potentially large cohort CP-side rather than on the wire.
-    Called at job RUNTIME (short-TTL ticket; a SLURM queue can outlive a
-    submit-time ticket), same rationale as the reference-chunk mint.
+    The row scope is NOT a parameter: unlike `fetch_reference_doget_ticket`
+    (which takes `table` + `feature_idx`), the CP reads the `alignment_idx` and
+    the `prep_sample_idx` cohort from the work ticket's `action_context` (set at
+    plan time) and signs them itself, keeping the potentially large cohort
+    CP-side rather than on the wire. Called at job RUNTIME (short-TTL ticket; a
+    SLURM queue can outlive a submit-time ticket), same rationale as the
+    reference-chunk mint.
+
+    `columns` IS a parameter, and required, because it is the one part of the
+    ticket the control plane cannot derive: only the caller knows which columns
+    it will bind. The CP validates them against a per-table allowlist and signs
+    them; the DP then streams exactly those, in that order. Asking for less than
+    the whole row is the point — `cigar` alone is ~96% of an alignment row.
 
     `http` is the authed httpx client (Bearer with the compute SA PAT, base_url =
     the CP) from `cp_client.make_cp_client()`. The CP returns the ticket
     base64-encoded; this decodes it to the raw bytes `open_doget_stream` wraps in a
     `flight.Ticket`. Raises `httpx.HTTPStatusError` on any non-2xx (404 missing
-    ticket, 422 absent/invalid feature-table scope, 403 missing scope, 5xx) — the
-    caller maps it to a BackendFailure.
+    ticket, 422 absent/invalid feature-table scope or bad column list, 403
+    missing scope, 5xx) — the caller maps it to a BackendFailure.
     """
-    resp = await http.post(URL_ALIGNMENT_DOGET, json={"work_ticket_idx": work_ticket_idx})
+    resp = await http.post(
+        URL_ALIGNMENT_DOGET,
+        json={"work_ticket_idx": work_ticket_idx, "columns": list(columns)},
+    )
     resp.raise_for_status()
     return base64.b64decode(resp.json()["ticket"])
 
@@ -301,6 +311,7 @@ async def open_alignment_stream(
     conn: duckdb.DuckDBPyConnection,
     *,
     work_ticket_idx: int,
+    columns: Sequence[str],
     relation: str = "alignment",
 ) -> AsyncIterator[str]:
     """Mint a work-ticket-scoped `alignment` DoGet ticket (CO→CP) and stream that
@@ -308,12 +319,16 @@ async def open_alignment_stream(
     registered relation name for the caller to materialize from inside the
     `async with` body.
 
-    The alignment DoGet is projected DP-side to the six columns the feature-table
-    recipe needs — `prep_sample_idx, sequence_idx, feature_idx, flags, position,
-    stop_position` — so the caller sees exactly those. The caller MATERIALIZES the
-    stream to a real non-temp TABLE (`woltka_ogu` resolves its source on a separate
-    connection → a registered view is invisible there; see docs/duckdb-miint.md),
-    which also drains the stream so the Flight client can close before the compute.
+    `columns` is the caller's, carried through untouched: it is signed into the
+    ticket and the DP streams exactly those columns, in that order, so the
+    relation's schema is whatever was asked for. No default is supplied here on
+    purpose — a seam-level default would quietly become a second source of truth
+    for a list only the consumer can be right about.
+
+    The caller MATERIALIZES the stream to a real non-temp TABLE (`woltka_ogu`
+    resolves its source on a separate connection → a registered view is invisible
+    there; see docs/duckdb-miint.md), which also drains the stream so the Flight
+    client can close before the compute.
 
     Rides the shared `_open_ticket_stream`, so (like `open_reference_chunk_stream`)
     the CP client is closed as soon as the ticket is minted; only the Flight
@@ -322,7 +337,9 @@ async def open_alignment_stream(
     """
 
     async def _mint(http: httpx.AsyncClient) -> bytes:
-        return await fetch_alignment_doget_ticket(http=http, work_ticket_idx=work_ticket_idx)
+        return await fetch_alignment_doget_ticket(
+            http=http, work_ticket_idx=work_ticket_idx, columns=columns
+        )
 
     async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
         yield rel
