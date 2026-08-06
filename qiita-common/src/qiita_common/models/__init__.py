@@ -140,6 +140,8 @@ from qiita_common.models.reference import (
     VALID_STATUS_TRANSITIONS,
     FeatureHashEntry,
     FieldDataType,
+    GenomeMapEntry,
+    GenomeMapResponse,
     GenomeSource,
     Platform,
     PrepProtocolResponse,
@@ -370,6 +372,8 @@ __all__ = [
     # Reference.
     "FeatureHashEntry",
     "FieldDataType",
+    "GenomeMapEntry",
+    "GenomeMapResponse",
     "GenomeSource",
     "Platform",
     "PrepProtocolResponse",
