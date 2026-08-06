@@ -381,12 +381,10 @@ async def get_reference_genome_map(
     genome-member one).
 
     413 — not a truncated 200 — above the hard cap, naming the real size. This is
-    the one capped read here that refuses: a lookup table silently missing rows
-    drops those features from the caller's roll-up, producing a WRONG feature
-    table rather than a partial one, and a caller who checked `truncated` on a
-    listing would never look for a short map. The response's `truncated` is
-    therefore always False and exists only so the envelope matches its
-    neighbours."""
+    the one capped read here that refuses rather than truncating: a lookup table
+    silently missing rows drops those features from the caller's roll-up,
+    producing a WRONG feature table rather than a partial one. So a 200 is always
+    the complete map, which is why the response carries no `truncated`."""
     await _require_reference_exists(pool, reference_idx)
     # Over-fetch by one to detect the overflow; only the refusal path pays for
     # counting the true size, which is what tells a caller whether they are barely
@@ -405,7 +403,6 @@ async def get_reference_genome_map(
         reference_idx=reference_idx,
         entries=[GenomeMapEntry.model_validate(dict(r)) for r in rows],
         count=len(rows),
-        truncated=False,
     )
 
 

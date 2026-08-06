@@ -116,7 +116,9 @@ async def test_genome_map_returns_the_four_columns(client, postgres_pool):
         body = resp.json()
         assert body["reference_idx"] == ref
         assert body["count"] == 1
-        assert body["truncated"] is False
+        # No `truncated`: a 200 is always the whole map (over the cap is a 413), so
+        # the field that every other capped read carries would never vary here.
+        assert "truncated" not in body
         assert body["entries"] == [
             {
                 "feature_idx": feat,
@@ -191,12 +193,7 @@ async def test_genome_map_of_a_reference_with_no_genomes_is_empty_not_404(client
         resp = await client.get(URL_REFERENCE_GENOME_MAP.format(reference_idx=ref))
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body == {
-            "reference_idx": ref,
-            "entries": [],
-            "count": 0,
-            "truncated": False,
-        }
+        assert body == {"reference_idx": ref, "entries": [], "count": 0}
     finally:
         await _cleanup(postgres_pool, ref=ref, feature_idxs=[feat])
 
