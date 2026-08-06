@@ -1053,8 +1053,9 @@ async def test_tier_on_all_studies_compares_by_rank_not_string(study_access_ctx,
 async def test_tier_on_all_studies_admin_wrapper_is_unchanged(study_access_ctx):
     """The ADMIN-specific entry point keeps its exact behaviour and message.
 
-    It has four production call sites; the generalization must be invisible to
-    them. VIEWER is enough for the new read gate but must still fail the old
+    Its two production call sites (routes/sequenced_sample.py, and
+    routes/work_ticket.py via _check_prep_sample_study_access) must not notice
+    the generalization. VIEWER is enough for the new read gate but must still fail the old
     write gate.
     """
     from qiita_control_plane.auth.guards import require_caller_has_admin_on_all_studies
@@ -1105,3 +1106,77 @@ async def test_tier_on_all_studies_401_on_anonymous(study_access_ctx):
             min_tier=Tier.VIEWER,
         )
     assert exc.value.status_code == 401
+
+
+@pytest.mark.db
+async def test_filter_studies_returns_only_the_readable_subset(study_access_ctx):
+    """The narrowing counterpart of the raising gate, tested directly rather
+    than only through the discovery routes.
+
+    The invariant that matters is one-directional: the result must never be
+    WIDER than what was asked for. A study the caller cannot read must not
+    appear, because the set it returns is what decides which prep_samples a
+    pool listing exposes.
+    """
+    from qiita_control_plane.auth.guards import filter_studies_caller_can_read
+
+    await _grant(study_access_ctx, Tier.VIEWER)
+    readable = study_access_ctx["study_idx"]
+    # A second study the caller holds nothing on. Seeded here rather than in the
+    # fixture so the fixture stays shared with the raising-gate tests.
+    unreadable = await _seed_study_for_test(
+        study_access_ctx["pool"], owner_idx=study_access_ctx["owner_idx"]
+    )
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    try:
+        got = await filter_studies_caller_can_read(
+            study_access_ctx["pool"],
+            caller=caller,
+            # Duplicated on purpose: dedup must not change the answer.
+            study_idxs=[readable, unreadable, readable],
+            min_tier=Tier.VIEWER,
+        )
+        assert got == {readable}
+    finally:
+        await study_access_ctx["pool"].execute("DELETE FROM qiita.study WHERE idx = $1", unreadable)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("caller_kind", "expected_all"),
+    [
+        pytest.param("bypass", True, id="wet-lab-admin-gets-everything"),
+        pytest.param("anonymous", False, id="anonymous-gets-nothing"),
+    ],
+)
+async def test_filter_studies_edge_callers(study_access_ctx, caller_kind, expected_all):
+    """Bypass returns the input unfiltered with no DB read; Anonymous returns
+    the empty set rather than raising — a listing route fronts its own 401 via
+    `require_human`, and a filter that raised would be a surprising shape."""
+    from qiita_control_plane.auth.guards import filter_studies_caller_can_read
+
+    caller = (
+        _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.WET_LAB_ADMIN)
+        if caller_kind == "bypass"
+        else _anon()
+    )
+    got = await filter_studies_caller_can_read(
+        study_access_ctx["pool"],
+        caller=caller,
+        study_idxs=[study_access_ctx["study_idx"]],
+        min_tier=Tier.VIEWER,
+    )
+    assert got == ({study_access_ctx["study_idx"]} if expected_all else set())
+
+
+@pytest.mark.db
+async def test_filter_studies_empty_input_is_empty(study_access_ctx):
+    from qiita_control_plane.auth.guards import filter_studies_caller_can_read
+
+    got = await filter_studies_caller_can_read(
+        study_access_ctx["pool"],
+        caller=_human_with_idx(study_access_ctx["caller_idx"]),
+        study_idxs=[],
+        min_tier=Tier.VIEWER,
+    )
+    assert got == set()

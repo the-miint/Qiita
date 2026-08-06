@@ -430,6 +430,14 @@ async def _study_access_allows(
     and the authoring gates' composers surface a missing study as one 422 from
     their own FK violation. Comparison goes through `_TIER_ORDER`; see
     `require_caller_has_tier_on_all_studies`.
+
+    **That fail-open branch is only safe while every caller sources its
+    `study_idx` from an FK-backed column.** Both of today's do — the study_idxs
+    reaching the narrowing filter come from `qiita.prep_sample_to_study`, whose
+    `REFERENCES qiita.study(idx) ON DELETE RESTRICT` makes a phantom study
+    unreachable. A future caller that passes user-supplied study_idxs would
+    inherit fail-open silently, which is the wrong default for a read gate; give
+    it an existence check of its own, or make the branch configurable.
     """
     row = await fetch_caller_study_access(
         pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
