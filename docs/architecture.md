@@ -625,6 +625,41 @@ hand-copies (neither language can import the other) pinned by parity tests, and
 the Rust one is additionally checked against the live `alignment_visible`
 schema.
 
+### Two mint paths for the alignment DoGet
+
+`alignment_visible` is the one Flight surface with two ticket-minting routes, and
+they differ in **where the cohort comes from**, which is what forces two
+authorization models:
+
+| Route | Caller | Cohort source | Authorization |
+|---|---|---|---|
+| `POST /alignment/ticket/doget` | service account, `ticket:doget` | the work ticket's `action_context` | scope only — the runner resolver already validated the cohort at submit |
+| `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check |
+
+The second exists because a scientist pulling their own data has no runner
+upstream to have validated anything. It is also the only place that validation
+can happen: **the signed cohort is the authorization boundary.** The data plane
+verifies the signature and serves exactly the identifiers the ticket names — it
+holds no notion of studies, users, or tiers, by design (see "the data plane is
+intentionally dumb"). There is no second line of defence behind the mint, so a
+control-plane bug that signs an unauthorized `prep_sample_idx` is a data leak,
+not a caught error.
+
+Two consequences worth stating, because both look like over-engineering until
+you know why:
+
+- **The human mint refuses a partially-readable cohort rather than narrowing
+  it.** Coverage filtering makes a feature table cohort-dependent, so a quietly
+  trimmed cohort answers a different scientific question under the name of the
+  one that was asked — and the bundle manifest would record a cohort the caller
+  never requested. The paired *discovery* reads
+  (`GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment[/{idx}/cohort]`) do
+  narrow, because a listing carries no scientific result; between them, you
+  discover exactly the cohort you are then allowed to mint.
+- **Access is checked before completeness.** Reversed, the 422 naming the
+  incomplete samples would tell a caller which samples are finished for an
+  alignment they have no right to read at all.
+
 ## Auth & Data Access Flow
 
 See [`docs/auth.md`](auth.md) for the principal model, login flow, scopes, endpoints, and runbooks.

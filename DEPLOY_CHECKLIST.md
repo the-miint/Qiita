@@ -44,6 +44,15 @@ _None yet._
 
 ### Notes (no host action)
 
+- **A user whose PAT predates this deploy cannot use the new alignment mint
+  until they re-mint it.** A new scope `alignment:doget` is added to all three
+  role ceilings, so callers on the OIDC path pick it up automatically (that path
+  returns the role's full ceiling per request). The token path returns the
+  token's **own** stored scope set, so an existing PAT does not — the holder
+  runs `qiita login` (or `POST /auth/pat`) once. The 403 says so itself: the
+  stale-token hint fires precisely when a scope is in the caller's live ceiling
+  but absent from their token. Nothing to do on the host.
+  (`#m3-human-alignment-mint` — retag with the PR number)
 - **A feature-table (`estimate_feature_table`) job that is already running when
   the data plane restarts will fail with `InvalidArgument: alignment_visible
   requires an explicit projection column list`.** The alignment DoGet now
