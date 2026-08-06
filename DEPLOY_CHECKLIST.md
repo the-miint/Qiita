@@ -28,7 +28,7 @@ _None yet._
   does **not** lock the table and is safe to run while services are up; it may take a while
   on a large table, and a failed CONCURRENTLY build leaves an INVALID index that
   `make migrate` will not retry — drop it by hand and re-run if that happens.
-  (`#m3-human-alignment-mint` — retag with the PR number)
+  (#436)
 
 ### 4. Deploy
 
@@ -52,7 +52,7 @@ _None yet._
   runs `qiita login` (or `POST /auth/pat`) once. The 403 says so itself: the
   stale-token hint fires precisely when a scope is in the caller's live ceiling
   but absent from their token. Nothing to do on the host.
-  (`#m3-human-alignment-mint` — retag with the PR number)
+  (#436)
 - **A feature-table (`estimate_feature_table`) job that is already running when
   the data plane restarts will fail with `InvalidArgument: alignment_visible
   requires an explicit projection column list`.** The alignment DoGet now
