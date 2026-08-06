@@ -281,6 +281,25 @@ class AlignmentDoGetTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
+    # Columns the caller wants projected. Omitted ⇒ no projection rides the
+    # ticket, byte-identical to the historical shape. Present ⇒ the data plane
+    # streams exactly these, in this order, so a consumer can opt into a wide
+    # column (`cigar` is ~96% of an alignment row) without every other consumer
+    # paying for it.
+    #
+    # `min_length=1` rejects an explicit empty list (422) rather than letting it
+    # widen to every column — the same rule, and the same reason, as
+    # DoGetTicketRequest.feature_idx above. This is also the LAST layer that can
+    # apply it: the data plane defaults an omitted field to an empty list, so on
+    # the wire "empty" and "absent" are one value.
+    #
+    # The names themselves are checked against a per-table allowlist at signing
+    # time (auth/tickets.py), which is what bounds this list in practice; the
+    # cap here only keeps an absurd request from being parsed before it is
+    # rejected, and is deliberately wider than any projectable table.
+    columns: list[Annotated[str, Field(min_length=1, max_length=64)]] | None = Field(
+        default=None, min_length=1, max_length=128
+    )
 
 
 class ReadDoGetTicketRequest(BaseModel):

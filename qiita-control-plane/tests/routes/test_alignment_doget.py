@@ -298,3 +298,71 @@ async def test_doget_alignment_not_signable_via_reference_route():
     from qiita_control_plane.routes.reference import _REFERENCE_DOGET_TABLES
 
     assert "alignment_visible" not in _REFERENCE_DOGET_TABLES
+
+
+# ---------------------------------------------------------------------------
+# Signed projection (the columns the consumer asks for)
+# ---------------------------------------------------------------------------
+
+
+async def test_doget_signs_the_requested_columns(ctx):
+    """The consumer names its columns; the route validates and signs them.
+
+    Includes `cigar` — the column the whole mechanism exists for. It is ~96% of
+    an alignment row, so it must be askable without being paid for by default.
+    """
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"], alignment_idx=778, prep_sample_idx=[11]
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET,
+            json={"work_ticket_idx": wt_idx, "columns": ["feature_idx", "cigar", "position"]},
+        )
+        assert resp.status_code == 201, resp.text
+        payload = _decode_ticket_payload(resp.json()["ticket"])
+        assert payload["columns"] == ["feature_idx", "cigar", "position"]
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+async def test_doget_without_columns_signs_no_projection(ctx):
+    """Omitting the field keeps today's ticket exactly as it was — which is what
+    lets the consumer and the data plane be deployed in either order."""
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"], alignment_idx=779, prep_sample_idx=[11]
+    )
+    try:
+        resp = await ctx["sa"].post(URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx})
+        assert resp.status_code == 201, resp.text
+        assert "columns" not in _decode_ticket_payload(resp.json()["ticket"])
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        pytest.param(["feature_idx", "no_such_column"], id="unknown"),
+        pytest.param(["feature_idx", "feature_idx"], id="duplicate"),
+        pytest.param(["cigar; DROP TABLE alignment"], id="injection-shaped"),
+        pytest.param([], id="empty"),
+    ],
+)
+async def test_doget_bad_column_list_422(ctx, columns):
+    """A bad projection is refused at mint and never signed.
+
+    The empty case is the one that could not be caught downstream: on the wire
+    an empty list is indistinguishable from an absent one, so this route is the
+    last place it can be told apart from "no opinion".
+    """
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"], alignment_idx=780, prep_sample_idx=[11]
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx, "columns": columns}
+        )
+        assert resp.status_code == 422, resp.text
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
