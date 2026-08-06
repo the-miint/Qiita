@@ -46,6 +46,10 @@ pub type TicketFilter = HashMap<String, Vec<serde_json::Value>>;
 /// Both default to empty so each ticket carries only the shape it uses; the
 /// per-table guards in `build_query` reject an under-scoped combination rather
 /// than letting an empty scope mean "everything".
+///
+/// `columns` is orthogonal to both: it narrows what each returned row carries,
+/// not which rows are returned. It defaults to empty for the same reason — a
+/// ticket that has no opinion omits the field entirely.
 #[derive(Debug, serde::Deserialize)]
 pub struct TicketPayload {
     pub table: String,
@@ -53,6 +57,8 @@ pub struct TicketPayload {
     pub filter: TicketFilter,
     #[serde(default)]
     pub members: Vec<BlockReadMember>,
+    #[serde(default)]
+    pub columns: Vec<String>,
 }
 
 /// Errors from ticket verification.
