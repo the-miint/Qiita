@@ -16,6 +16,7 @@ that roll back, build the SQL inline against the open connection instead.
 import json
 import secrets
 import uuid
+from datetime import UTC, datetime
 
 import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
@@ -28,7 +29,7 @@ from qiita_common.hashing import canonical_params_hash
 # seed helpers, so they stay reachable from here.
 from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
-from qiita_common.models import FieldDataType, ReferenceStatus
+from qiita_common.models import FieldDataType, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
@@ -43,6 +44,12 @@ from ..repositories._sample_helpers import (
 # Seeded NCBI Taxonomy fixture data — must match the seed migration at
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
 NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
+
+# Pinned loaded_at for seeded terminology rows, so a caller comparing a whole
+# TerminologyResponse can construct the expected object outright instead of
+# copying the timestamp out of the actual. UTC-aware and microsecond-stable
+# for a Postgres TIMESTAMPTZ round trip.
+SEEDED_TERMINOLOGY_LOADED_AT = datetime(2026, 1, 15, 12, 30, 0, tzinfo=UTC)
 
 
 async def fetch_ncbi_taxonomy_term(pool: asyncpg.Pool, term_id: str) -> asyncpg.Record | None:
@@ -72,6 +79,52 @@ async def fetch_missing_value_reason_idx(pool: asyncpg.Pool, name: str) -> int |
     migration ('not applicable', 'not collected', 'missing: control sample', …).
     """
     return await pool.fetchval("SELECT idx FROM qiita.missing_value_reason WHERE name = $1", name)
+
+
+async def seed_terminology(
+    pool: asyncpg.Pool,
+    *,
+    name: str,
+    version: str = "1.0.0",
+    status: TerminologyStatus = TerminologyStatus.LOADING,
+    loaded_at: datetime = SEEDED_TERMINOLOGY_LOADED_AT,
+) -> int:
+    """Insert a qiita.terminology row and return its idx.
+
+    The initial status is settable so a caller can start from 'active' or
+    'failed' rather than only from the column's 'loading' default.
+    """
+    return await pool.fetchval(
+        "INSERT INTO qiita.terminology (name, version, loaded_at, status)"
+        " VALUES ($1, $2, $3, $4::qiita.terminology_status) RETURNING idx",
+        name,
+        version,
+        loaded_at,
+        str(status),
+    )
+
+
+async def delete_terminology_cascade(pool: asyncpg.Pool, terminology_idx: int) -> None:
+    """Delete a terminology along with its closure and term rows.
+
+    replaced_by is nulled before the term delete: that self-referential FK
+    is ON DELETE RESTRICT, so a term another term points at cannot be
+    removed while the pointer stands.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE qiita.terminology_term SET replaced_by = NULL WHERE terminology_idx = $1",
+            terminology_idx,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.terminology_closure WHERE terminology_idx = $1",
+            terminology_idx,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.terminology_term WHERE terminology_idx = $1",
+            terminology_idx,
+        )
+        await conn.execute("DELETE FROM qiita.terminology WHERE idx = $1", terminology_idx)
 
 
 async def seed_host_reference(

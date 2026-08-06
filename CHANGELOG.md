@@ -22,6 +22,29 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Terminology release load — apply a staged ontology release from a staging
+  directory.** Reads the release manifest, verifies the source checksum, parses
+  the term and closure tables, and applies the whole release in one transaction,
+  ending with the terminology row in `active`. Structural anomalies in the source
+  fail the load by default and roll it back; `tolerate_anomalies=True` instead
+  auto-obsoletes terms the release silently dropped and records an audit line for
+  a replacement pointer that resolves to nothing.
+
+- **Terminology repository layer — apply a staged ontology release to the DB.**
+  Owns every SQL string for `terminology`, `terminology_term`, and
+  `terminology_closure`: the atomic row reads and the TOCTOU-safe status UPDATE,
+  plus a composer that runs find-or-create, a pre-import snapshot, silent-drop
+  detection, the two-pass term upsert, and the per-terminology closure rebuild
+  inside one caller-supplied transaction. Term rows are upserted, never
+  replaced, so any term already referenced by biosample metadata stays
+  resolvable; obsoletion is recorded on the row instead.
+
+- **`qiita_common.models.terminology` — the terminology model surface.** Gathers
+  the release-load lifecycle status and its allowed transitions, the term
+  obsoletion kinds, the staging manifest contract, and the terminology row
+  projection into one submodule. The two lifecycle enums move here from
+  `models.reference`; every name stays importable from `qiita_common.models`.
+
 - **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
   `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could
   produce one: `mask-definition` had only `POST` (mint) and `DELETE`, and the admin
