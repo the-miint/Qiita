@@ -1,8 +1,8 @@
 """Tests for the INSDC study-metadata Pydantic models (`models.ena`).
 
-`read_ena` returns an ALL-VARCHAR relation, so these models are the boundary that
-coerces the numeric fields (tax_id, read_count, base_count, fastq_bytes) and
-fails loud on garbage rather than propagating a bad string.
+`read_ena` returns typed columns (duckdb-miint#178): numeric fields arrive as
+`int | None`, and per-file fields arrive as `list[...]`. These tests verify
+the models validate the typed data correctly.
 """
 
 import pytest
@@ -30,7 +30,7 @@ def test_ena_study_header_full():
         first_public="2015-06-01",
         last_updated="2015-06-02",
         scientific_name="human gut metagenome",
-        tax_id="408170",
+        tax_id=408170,
     )
     assert header.secondary_study_accession == "ERP012803"
     assert header.tax_id == 408170
@@ -51,11 +51,10 @@ def test_ena_study_header_rejects_garbage_tax_id():
 
 
 def test_ena_study_header_blank_tax_id_is_none():
-    """A blank VARCHAR means "missing", not a parse failure — only a non-blank
-    unparseable value fails loud."""
+    """A None value means "missing" — only a non-None unparseable value fails loud."""
     from qiita_common.models.ena import EnaStudyHeader
 
-    header = EnaStudyHeader(study_accession="PRJEB11419", tax_id="")
+    header = EnaStudyHeader(study_accession="PRJEB11419", tax_id=None)
     assert header.tax_id is None
 
 
@@ -84,18 +83,21 @@ def test_ena_run_record_field_by_field():
         library_source="METAGENOMIC",
         library_selection="RANDOM",
         instrument_platform="ILLUMINA",
-        fastq_ftp=(
-            "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_1.fastq.gz;"
-            "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_2.fastq.gz"
-        ),
-        fastq_aspera=(
-            "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR107/ERR1074767_1.fastq.gz;"
-            "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR107/ERR1074767_2.fastq.gz"
-        ),
-        fastq_bytes="123456;234567",
-        fastq_md5="d41d8cd98f00b204e9800998ecf8427e;098f6bcd4621d373cade4e832627b4f6",
-        read_count="1000",
-        base_count="150000",
+        fastq_ftp=[
+            "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_1.fastq.gz",
+            "ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767_2.fastq.gz",
+        ],
+        fastq_aspera=[
+            "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR107/ERR1074767_1.fastq.gz",
+            "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR107/ERR1074767_2.fastq.gz",
+        ],
+        fastq_bytes=[123456, 234567],
+        fastq_md5=[
+            "d41d8cd98f00b204e9800998ecf8427e",
+            "098f6bcd4621d373cade4e832627b4f6",
+        ],
+        read_count=1000,
+        base_count=150000,
     )
     assert run.run_accession == "ERR1074767"
     assert run.experiment_accession == "ERX1111111"
@@ -131,11 +133,11 @@ def test_ena_run_record_single_end_lists_are_single_element():
         experiment_accession="ERX1111111",
         sample_accession="SAMEA3610311",
         study_accession="PRJEB11419",
-        fastq_ftp="ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767.fastq.gz",
-        fastq_bytes="123456",
-        fastq_md5="d41d8cd98f00b204e9800998ecf8427e",
-        read_count="1000",
-        base_count="150000",
+        fastq_ftp=["ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767.fastq.gz"],
+        fastq_bytes=[123456],
+        fastq_md5=["d41d8cd98f00b204e9800998ecf8427e"],
+        read_count=1000,
+        base_count=150000,
     )
     assert run.fastq_ftp == ["ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767.fastq.gz"]
     assert run.fastq_bytes == [123456]
@@ -166,7 +168,7 @@ def test_ena_run_record_rejects_garbage_fastq_bytes():
             experiment_accession="ERX1111111",
             sample_accession="SAMEA3610311",
             study_accession="PRJEB11419",
-            fastq_bytes="not-a-number",
+            fastq_bytes=["not-a-number"],
         )
 
 

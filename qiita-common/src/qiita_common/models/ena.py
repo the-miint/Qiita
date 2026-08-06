@@ -1,44 +1,14 @@
 """Pydantic models for INSDC study metadata resolved via miint `read_ena` /
 `read_ena_attributes`.
 
-`read_ena` returns an ALL-VARCHAR relation — every field, including numeric
-ones, arrives as text, and the per-file fields arrive as one `;`-delimited
-string rather than a list (duckdb-miint#178). These models are the boundary
-where that becomes typed: the numeric fields (`tax_id`, `read_count`,
-`base_count`, `fastq_bytes`) are coerced at construction, and a non-blank value
-that fails to parse raises rather than silently becoming `None`/`0`. Removing
-the coercion once miint types these is tracked in Qiita#378.
+`read_ena` returns typed columns (duckdb-miint#178): numeric fields arrive as
+`int | None`, and per-file fields arrive as `list[...]`. These models validate
+the typed data at construction.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
-
-
-def _split_semicolon_list(value: str | list[str] | None) -> list[str]:
-    """Split a semicolon-separated ENA TSV field (`fastq_ftp` / `fastq_aspera` /
-    `fastq_md5` — one segment per run file) into a list, dropping empties. A
-    value that already arrives pre-split passes through unchanged."""
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [item.strip() for item in value if item and item.strip()]
-    return [part.strip() for part in value.split(";") if part.strip()]
-
-
-def _coerce_optional_int(value: str | int | None) -> int | None:
-    """Coerce a `read_ena` VARCHAR numeric field to `int`. Blank/None means "ENA
-    has no value" and is preserved as `None`; a non-blank value that fails to
-    parse raises rather than silently becoming `None`/`0`."""
-    if value is None or isinstance(value, int):
-        return value
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError as exc:
-        raise ValueError(f"{value!r} is not a valid integer") from exc
 
 
 class EnaStudyHeader(BaseModel):
@@ -54,11 +24,6 @@ class EnaStudyHeader(BaseModel):
     last_updated: str | None = None
     scientific_name: str | None = None
     tax_id: int | None = None
-
-    @field_validator("tax_id", mode="before")
-    @classmethod
-    def _coerce_tax_id(cls, v: str | int | None) -> int | None:
-        return _coerce_optional_int(v)
 
 
 class EnaRunRecord(BaseModel):
@@ -86,24 +51,7 @@ class EnaRunRecord(BaseModel):
     read_count: int | None = None
     base_count: int | None = None
 
-    @field_validator("fastq_ftp", "fastq_aspera", "fastq_md5", mode="before")
-    @classmethod
-    def _coerce_fastq_lists(cls, v: str | list[str] | None) -> list[str]:
-        return _split_semicolon_list(v)
 
-    @field_validator("fastq_bytes", mode="before")
-    @classmethod
-    def _coerce_fastq_bytes(cls, v: str | list[str] | list[int] | None) -> list[int]:
-        parts: list[str | int] = _split_semicolon_list(v) if isinstance(v, str | type(None)) else v
-        try:
-            return [int(part) for part in parts]
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"fastq_bytes={v!r} contains a non-integer segment") from exc
-
-    @field_validator("read_count", "base_count", mode="before")
-    @classmethod
-    def _coerce_counts(cls, v: str | int | None) -> int | None:
-        return _coerce_optional_int(v)
 
 
 class EnaSampleAttributes(BaseModel):

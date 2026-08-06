@@ -981,6 +981,12 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA models no longer coerce `read_ena` output (#378).** Once miint returns
+  typed columns (duckdb-miint#178), the boundary coercion helpers
+  (`_coerce_optional_int`, `_split_semicolon_list`) and their `@field_validator`
+  wrappers are unnecessary: numeric fields arrive as `int | None`, list fields
+  arrive as `list[...]`. Removed both helpers and the four validators that
+  called them; tests now pass typed values directly.
 - **ENA import: "ENA/SRA" is now "INSDC" (#369).** The accession validator has
   always accepted ENA, SRA and DDBJ prefixes (`PRJEB` / `PRJNA` / `PRJDB`,
   `ERP` / `SRP` / `DRP`), and all three resolve through ENA's API, so naming two
