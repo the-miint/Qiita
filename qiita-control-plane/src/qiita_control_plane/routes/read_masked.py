@@ -87,6 +87,7 @@ from ..repositories.mask_definition import (
     list_mask_definitions,
     mint_mask_definition,
 )
+from ._helpers import cap_rows
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
 
@@ -131,16 +132,6 @@ def _mask_record_fields(row: asyncpg.Record) -> dict:
 def _mask_record_to_response(row: asyncpg.Record) -> MaskDefinition:
     """The single-mask response: mint, and the by-idx read."""
     return MaskDefinition(**_mask_record_fields(row))
-
-
-def _cap(rows: list, hard_cap: int) -> tuple[list, bool]:
-    """Split a `hard_cap + 1` fetch into (rows, truncated).
-
-    The reads over-fetch by one so a length above the cap distinguishes "the set
-    is exactly cap long" from "the set is larger and was cut"."""
-    if len(rows) > hard_cap:
-        return rows[:hard_cap], True
-    return rows, False
 
 
 @mask_definition_router.post(PATH_MASK_DEFINITION_ROOT, status_code=201)
@@ -221,7 +212,7 @@ async def list_mask_definitions_route(
     wet_lab_admin the result narrows to masks over samples the caller has
     study-admin on.
     """
-    rows, truncated = _cap(
+    rows, truncated = cap_rows(
         await list_mask_definitions(
             pool,
             sequenced_pool_idx=sequenced_pool_idx,
@@ -302,7 +293,7 @@ async def list_mask_prep_samples_route(
     """
     if await fetch_mask_definition_by_idx(pool, mask_idx) is None:
         raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
-    rows, truncated = _cap(
+    rows, truncated = cap_rows(
         await fetch_mask_prep_samples(
             pool,
             mask_idx,

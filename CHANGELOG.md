@@ -1366,7 +1366,8 @@ duplicates further down are historical strata; leave them where they are.
   list route — the two sequenced-sample rosters, the prep-sample study roster,
   `build_idxs_list_response`, and the work-ticket list this PR adds. It is now
   `routes/_helpers.cap_rows`, which all five call. No wire change: the same rows
-  and the same `truncated` value come back from each route.
+  and the same `truncated` value come back from each route. The two
+  mask-definition reads call it too, in place of their own copy (#423).
 
 - **BREAKING: `GET /work-ticket` returns an envelope, not a bare array (#427).**
   `{tickets, count, truncated}` — `WorkTicketListResponse`, the same shape
