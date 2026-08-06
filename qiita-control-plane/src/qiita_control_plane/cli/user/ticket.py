@@ -78,13 +78,19 @@ def _list_work_tickets(
     state: str | None,
     active: bool,
     all_tickets: bool,
+    sequenced_pool_idx: int | None,
+    prep_sample_idx: int | None,
+    action_id: str | None,
     limit: int | None,
-) -> list:
-    """GET /api/v1/work-ticket. Returns a list of WorkTicketSummary records —
-    each ticket plus its current step's compute_target / slurm_job_id /
-    step_state. Scope: the caller's own tickets, or all originators' with
-    `all_tickets` (wet_lab_admin+). Query params are sent only when set so
-    the server's defaults (own, all states, limit 50) apply otherwise."""
+) -> dict:
+    """GET /api/v1/work-ticket. Returns the WorkTicketListResponse envelope:
+    `tickets` (each ticket plus its current step's compute_target /
+    slurm_job_id / step_state, and for a prep_sample-scoped ticket its
+    sample's read_outcome), `count`, and `truncated` — true when the set
+    exceeded `limit`, so a short page is never mistaken for a whole one.
+    Scope: the caller's own tickets, or all originators' with `all_tickets`
+    (wet_lab_admin+). Query params are sent only when set so the server's
+    defaults (own, all states, limit 50) apply otherwise."""
     params: dict[str, str] = {}
     if state is not None:
         params["state"] = state
@@ -92,6 +98,12 @@ def _list_work_tickets(
         params["active"] = "true"
     if all_tickets:
         params["all"] = "true"
+    if sequenced_pool_idx is not None:
+        params["sequenced_pool_idx"] = str(sequenced_pool_idx)
+    if prep_sample_idx is not None:
+        params["prep_sample_idx"] = str(prep_sample_idx)
+    if action_id is not None:
+        params["action_id"] = action_id
     if limit is not None:
         params["limit"] = str(limit)
     return _common.call("GET", base_url, token, PATH_WORK_TICKET_PREFIX, params=params)
@@ -165,9 +177,14 @@ def _handle_ticket_run(args: argparse.Namespace, parser: argparse.ArgumentParser
 
 def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """List work-tickets (your own by default, or every originator's with
-    --all for wet_lab_admin+). Prints the full summary list so a poller sees
-    each ticket's state plus its current step's compute_target / slurm_job_id
-    / step_state in one call."""
+    --all for wet_lab_admin+). Prints the full envelope — `tickets` plus
+    `count` / `truncated` — so a poller sees each ticket's state and its
+    current step's compute_target / slurm_job_id / step_state in one call,
+    and sees when the page was capped. --sequenced-pool-idx narrows to one pool's
+    tickets; with --action-id read-mask that is the pool's per-sample read
+    outcomes, up to --limit rows. A pool masked through the block path has
+    read-mask-block tickets instead, which span many samples and carry no
+    read_outcome — read that pool's counts off its sequenced-sample roster."""
     return _common.run_http_subcommand(
         lambda t: _list_work_tickets(
             args.base_url,
@@ -175,6 +192,9 @@ def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParse
             state=args.state,
             active=args.active,
             all_tickets=args.all_tickets,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+            prep_sample_idx=args.prep_sample_idx,
+            action_id=args.action_id,
             limit=args.limit,
         )
     )

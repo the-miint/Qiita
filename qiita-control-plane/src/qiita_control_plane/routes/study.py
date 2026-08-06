@@ -48,7 +48,9 @@ from ..repositories.study import (
     update_study,
 )
 from ._helpers import (
+    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
+    IF_MATCH_HEADER,
     etag_for_updated_at,
     raise_for_unique_violation,
     require_etag_match,
@@ -224,7 +226,7 @@ async def get_study(
             status_code=404,
             detail=f"study {study_idx} not found",
         )
-    response.headers["ETag"] = etag_for_updated_at(row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
     return _study_response_from_row(row)
 
 
@@ -233,7 +235,7 @@ async def patch_study(
     study_idx: Annotated[int, Field(gt=0)],
     body: StudyPatchRequest,
     response: Response,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     _scope: Principal = Depends(require_scope(Scope.STUDY_WRITE)),
     _exists: None = Depends(require_study_exists),
@@ -319,7 +321,7 @@ async def patch_study(
             raise
 
     # Set the new ETag from the updated row's bumped updated_at.
-    response.headers["ETag"] = etag_for_updated_at(updated_row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["updated_at"])
 
     return _study_response_from_row(updated_row)
 

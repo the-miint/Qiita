@@ -668,6 +668,14 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
+# Study-scoped single biosample: a GET view carrying this study's local
+# metadata alongside the global metadata, and a metadata upsert PATCH. Both
+# anchor on the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
+PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Create a study-local biosample field definition (POST). The study-scoped
+# mint hangs off the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/biosample-field"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
@@ -685,6 +693,9 @@ PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
+URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
+URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
@@ -711,6 +722,10 @@ PATH_SEQUENCED_SAMPLE_LIST_BY_RUN = "/{sequencing_run_idx}/sequenced-sample/list
 # rather than `list-idxs`, paralleling LIST_BY_POOL.
 PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = "/{sequencing_run_idx}/sequenced-sample/list"
 PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY = "/{study_idx}/sequenced-sample/list-idxs"
+PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenced_sample_idx}"
+PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
+)
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
 # than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
@@ -728,6 +743,12 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
+)
+URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY}"
+)
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )
@@ -748,7 +769,11 @@ PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
 # without a raw production UPDATE. Reversible by design (a misclassified well
 # must be recoverable), unlike the terminal principal retire.
 PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
+# Create a study-local prep_sample field definition (POST). The study-scoped
+# mint hangs off the /study router (the caller is authorized on the study).
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"

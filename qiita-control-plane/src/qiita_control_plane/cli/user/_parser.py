@@ -10,7 +10,9 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
@@ -24,7 +26,10 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     BiosamplePatchRequest,
+    BiosampleStudyFieldCreateRequest,
+    FieldDataType,
     Platform,
+    PrepSampleStudyFieldCreateRequest,
     SequencedSamplePatchRequest,
     StudyPatchRequest,
     Tier,
@@ -33,7 +38,7 @@ from qiita_common.models import (
 
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
-from ._helpers import _handle_patch, _handle_read, _lane_arg
+from ._helpers import _handle_patch, _handle_read, _handle_study_field_create, _lane_arg
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
 from .mask import _handle_mask_list, _handle_mask_samples, _handle_mask_show
@@ -69,6 +74,51 @@ from .ticket import (
     _handle_ticket_status,
     _handle_ticket_submit,
 )
+
+
+def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_noun: str) -> None:
+    """Declare the flags every study-local field create subcommand takes.
+
+    `entity_noun` names the entity in the link flag and in help text; that
+    flag's dest matches the request model's alias for the global-field link, so
+    the parsed namespace feeds body construction directly.
+    """
+    subparser.add_argument("--study-idx", type=int, required=True)
+    subparser.add_argument(
+        "--display-name",
+        required=True,
+        help="the field's display_name (unique within the study)",
+    )
+    subparser.add_argument("--description")
+    subparser.add_argument(
+        f"--{entity_noun.replace('_', '-')}-global-field-idx",
+        type=int,
+        help=(
+            f"link the new field to this existing {entity_noun}_global_field;"
+            " omit for a purely-local field (then --data-type is required)"
+        ),
+    )
+    subparser.add_argument(
+        "--data-type",
+        choices=tuple(d.value for d in FieldDataType),
+        help="field data type; local-mode only",
+    )
+    subparser.add_argument(
+        "--required",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="whether the field is required; local-mode only (defaults to false server-side)",
+    )
+    subparser.add_argument(
+        "--terminology-idx",
+        type=int,
+        help="terminology idx; required iff --data-type is terminology (local-mode only)",
+    )
+    subparser.add_argument(
+        "--tier-override",
+        choices=tuple(t.value for t in Tier),
+        help="visibility tier override; local-mode only",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -225,7 +275,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "--matrix-tube-id",
         help="Matrix-tube identifier (digits only); validated server-side",
     )
+    p_biosample_create.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Interpret --metadata KEYs for global fields as their internal_name"
+            " rather than display_name (local fields stay display-name-keyed)"
+        ),
+    )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
+
+    p_biosample_create_field = p_biosample_sub.add_parser(
+        "create-field",
+        help="Create a study-local biosample field (POST /study/{S}/biosample-field)",
+    )
+    _add_study_field_create_args(p_biosample_create_field, entity_noun="biosample")
+    p_biosample_create_field.set_defaults(
+        handler=_handle_study_field_create,
+        study_field_model=BiosampleStudyFieldCreateRequest,
+        study_field_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}",
+    )
 
     p_biosample_get = p_biosample_sub.add_parser(
         "get",
@@ -473,6 +544,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ena-run-accession",
         help="ENA run accession (ERR…), if this sample already has one",
     )
+    p_seqsample_create.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=("Interpret --metadata KEYs as global-field internal_names rather than display_names"),
+    )
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
     p_seqsample_patch = p_seqsample_sub.add_parser(
@@ -518,6 +596,17 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_read,
         read_path=f"{PATH_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}",
         read_idx_arg="prep_sample_idx",
+    )
+
+    p_prepsample_create_field = p_prepsample_sub.add_parser(
+        "create-field",
+        help="Create a study-local prep-sample field (POST /study/{S}/prep-sample-field)",
+    )
+    _add_study_field_create_args(p_prepsample_create_field, entity_noun="prep_sample")
+    p_prepsample_create_field.set_defaults(
+        handler=_handle_study_field_create,
+        study_field_model=PrepSampleStudyFieldCreateRequest,
+        study_field_path=f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}",
     )
 
     p_prepsample_retire = p_prepsample_sub.add_parser(
@@ -680,6 +769,23 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="all_tickets",
         action="store_true",
         help="All originators' tickets (requires wet_lab_admin+); default is your own.",
+    )
+    p_ticket_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help=(
+            "Only tickets that touch this sequenced_pool: pool-scoped, on one of its"
+            " samples, or on a block covering one of them."
+        ),
+    )
+    p_ticket_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only tickets scoped to this prep_sample.",
+    )
+    p_ticket_list.add_argument(
+        "--action-id",
+        help="Only tickets for this action_id (e.g. read-mask), across every version.",
     )
     p_ticket_list.add_argument(
         "--limit",

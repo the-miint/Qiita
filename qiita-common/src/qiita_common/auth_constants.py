@@ -127,9 +127,11 @@ class Scope(StrEnum):
     ADMIN_AUDIT_READ = "admin:audit_read"
     # Re-identification read: dump the owner-submitted original sample names
     # (biosample_metadata where is_owner_biosample_id=true) keyed by minted
-    # idx + public accession. That value is PII-pinned and masked on the
-    # normal biosample:read path, so exporting it gets its own system_admin-only
-    # scope rather than overloading biosample:read. Granted solely to
+    # idx + public accession. That value is the owner's own name for their
+    # sample, restricted to study members rather than shown on the normal
+    # biosample:read path (submitters sometimes put PII in sample names), so
+    # exporting it gets its own system_admin-only scope rather than
+    # overloading biosample:read. Granted solely to
     # system_admin in ROLE_IMPLIED_SCOPES; never wet_lab_admin or service
     # accounts.
     ADMIN_BIOSAMPLE_OWNER_ID_READ = "admin:biosample_owner_id_read"
@@ -215,10 +217,12 @@ STALE_TOKEN_SCOPE_HEADER = "X-Qiita-Stale-Token-Scope"
 # Pydantic Field max_length policy values. 255 is the historical "name-ish"
 # default that lines up with VARCHAR(255) in DB columns; 100 covers reference
 # version strings; 64 caps DuckLake / DB table names per Postgres identifier
-# limits.
+# limits; 50 tracks the VARCHAR(50) accession columns, so an over-long
+# accession fails at the wire rather than in the database.
 MAX_NAME_LENGTH = 255
 MAX_VERSION_LENGTH = 100
 MAX_TABLE_NAME_LENGTH = 64
+MAX_ACCESSION_LENGTH = 50
 
 
 # TTL maxima enforced at the API boundary. Human PATs cap at 1 year so a

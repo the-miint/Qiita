@@ -61,6 +61,73 @@ duplicates further down are historical strata; leave them where they are.
   reads above — read-only, in the regular CLI rather than `qiita-admin`, which keeps
   the destructive `mask delete` / `purge-failed`.
 
+- **`updated_at` on both sample-metadata tables (#386).** `qiita.biosample_metadata`
+  and `qiita.prep_sample_metadata` now carry an `updated_at` bumped by the same
+  `set_updated_at()` trigger the rest of the schema uses, so an overwritten metadata
+  value records when it was overwritten rather than only when it was first written.
+  The trigger is unscoped, so the column tracks any change to the row — including the
+  `global_field_idx` denormalization written when a study field is upgraded from
+  local to global — which is what makes it safe to use as the row's version. Rows
+  predating the migration carry its timestamp; they are deliberately not backfilled
+  to their `created_at`, since that UPDATE would be refused for published rows and
+  would falsely bump every parent's `last_metadata_change_at`. Not exposed on the
+  read wire.
+
+- **Create a study-local prep_sample field — `POST /study/{study_idx}/prep-sample-field`
+  (#386).** Mints a prep_sample field definition on one study, either purely-local
+  (the caller states `data_type` and its options) or linked to a
+  `prep_sample_global_field` whose `data_type` / `required` / terminology / tier are
+  then inherited and resolved on read. Not an upsert: a name already on the study is
+  a 409. Gated at `Tier.ADMIN` study access (wet_lab_admin+ role bypass) with the
+  `prep_sample:write` scope, matching its biosample counterpart; the ADMIN bar is an
+  interim stand-in until per-field visibility-tier enforcement lands, after which the
+  route returns to `Tier.MEMBER`. Closes the gap that left study-local prep_sample
+  fields readable and writable but impossible to create. Reachable from the CLI as
+  `qiita prep-sample create-field`, whose flags mirror `qiita biosample create-field`.
+
+- **BOOLEAN-typed sample metadata values (#386).** A biosample or prep_sample
+  field declared `data_type=boolean` now accepts values: the text `true` or
+  `false` (case-insensitive, surrounding whitespace ignored) is stored in
+  `value_boolean` and read back as a JSON boolean. Any other text is a 422
+  naming the two accepted forms. The per-data_type value-column map is now the one
+  source for every read's column list, so a data_type can no longer be
+  writable but absent from a read.
+
+- **Study-scoped biosample and sequenced-sample metadata read + write —
+  `GET`/`PATCH /study/{study_idx}/{biosample|sequenced-sample}/{idx}[/metadata]` (#386).**
+  Four routes expose a study's view of a sample's metadata. The two GETs return the
+  entity's core row plus its globally-linked metadata and this study's purely-local
+  metadata (`StudyScopedBiosampleResponse` / `StudyScopedSequencedSampleResponse`);
+  the two PATCHes upsert text values keyed by field display_name against the study's
+  existing global or study-local fields, reporting per field the write outcome
+  (inserted / updated / unchanged) and the `internal_name` the value reads back
+  under — populated for a globally-linked field, null for a purely-local one, since
+  a global value comes back in `global_metadata` keyed on `internal_name` rather
+  than on the display_name the caller wrote. `scope` is derived from that field
+  rather than stored, so the two cannot disagree. A PATCH body may set
+  `global_internal_names` to key global fields on `internal_name` instead, matching
+  the import path's flag, which makes the write key and the read key the same for a
+  direct global match; a key naming a study-local alias of a global field still
+  resolves through the alias, so `internal_name` remains the reliable read key.
+  Sequenced-sample metadata lives on the supertype prep_sample. All four are clamped
+  to `Tier.ADMIN` study access (wet_lab_admin+ role bypass), an interim stand-in
+  until per-field visibility-tier enforcement lands. A sample not linked to the path
+  study is 404 (indistinguishable from nonexistent); a retired sample is 404 on read
+  and 409 on write. The PATCH carries no If-Match — a cross-study slot collision is a
+  409, but a same-study rewrite is last-writer-wins. The biosample surface also
+  returns the owner-biosample-id row on read while refusing to write it (422).
+- **Create a study-local biosample field — `POST /study/{study_idx}/biosample-field`
+  and `qiita biosample create-field` (#386).** Mints one
+  `biosample_study_field` definition (no metadata value) in either mode: purely-local
+  (supply `--data-type`, optional `--required`/`--terminology-idx`/`--tier-override`)
+  or globally-linked (supply `--biosample-global-field-idx`, inheriting the type
+  columns from the global field). Requires `biosample:write` scope and `Tier.ADMIN`
+  study access (wet_lab_admin+ role bypass) — an interim stand-in until per-field
+  visibility-tier enforcement lands, after which the route returns to `Tier.MEMBER`.
+  A field of that name already on the study is a 409; the 201 body is the created
+  field, with a linked field's inherited `data_type`/`required`/`terminology_idx`
+  resolved on read.
+
 - **`qiita-admin backfill mask-adapter-hash` — re-key mask_definition rows onto
   the current adapter-identity derivation (#428).** The mint converts a row when
   something re-mints its config; this converts the ones nothing re-submits, so
@@ -96,6 +163,25 @@ duplicates further down are historical strata; leave them where they are.
   streams exhausted its file descriptors, and a typo'd `1000` would walk back into
   that. Driven by `qiita-admin fanout {list,set,pump}`, whose stderr summary names a
   fail-stopped cohort explicitly and spells out the other reason for a zero.
+
+- **A pool's per-sample read table without a host shell (#427, closes #348).** Two additions,
+  because read counts are a property of the SAMPLE while state and step placement
+  are properties of the TICKET:
+  - `GET /work-ticket` takes `?sequenced_pool_idx=`, `?prep_sample_idx=` and
+    `?action_id=`. The pool filter matches a ticket by any of the three ways a
+    ticket reaches a pool — pool-scoped (bcl-convert), on one of the pool's samples
+    (read-mask, the join that also feeds `read_outcome`), or on a block covering one
+    of them (read-mask-block, whose own `prep_sample_idx` is NULL). Filters
+    AND-compose with the existing originator scoping, so a pool filter is not a way
+    around "you see only tickets you originated". `qiita ticket list` gains
+    `--sequenced-pool-idx` / `--prep-sample-idx` / `--action-id`.
+  - The pool- and run-scoped `sequenced-sample/list` rosters now carry each sample's
+    four per-stage read counts plus `fraction_passing_quality_filter`. A sample with
+    no ticket, and a sample masked through the block path, reports its counts here —
+    neither is reachable through the ticket list.
+
+  Before this, assembling a pool's per-sample read decay meant paging every ticket the
+  caller ever originated and filtering client-side, or `psql` on the deploy host.
 
 - **`make lake-shell`: an ADMIN-ONLY read-only DuckDB shell for debugging the live
   system (#418).** `scripts/lake-shell.sh`. Inspecting DuckLake ad-hoc meant hand-assembling
@@ -447,6 +533,51 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **A study link retired mid-request answers 404 instead of 500 (#386).** The
+  study-scoped metadata write for a biosample or sequenced-sample checks the
+  caller's study link before writing, and the database re-checks it at the write
+  itself; a link retired in the window between the two was refused by the
+  database and surfaced as an unmapped 500. The refusal now answers the same 404
+  a link retired before the request would have, so the status reflects what the
+  caller may do rather than which of the two checks noticed, and a retry sees
+  the same answer. Both retired-link trigger functions tag their rejection with
+  a structured error DETAIL naming the raising function, which is what lets a
+  route tell that rejection from the other guards on those tables sharing its
+  SQLSTATE; every other rejection still surfaces unchanged.
+
+- **A blank sample metadata value is rejected at the wire boundary (#386).** An
+  empty or whitespace-only value is a 422 naming the field it was sent for,
+  across every request body carrying a metadata dict (biosample import,
+  sequenced-sample create, and the study-scoped metadata write). Values are
+  outer-stripped before being parsed into their field's data type, so a blank
+  one reached storage as `''` on a `text`-typed field — occupying the field's
+  slot while carrying no information, and satisfying a presence check without
+  answering it. Declining to answer remains expressible with a missing-value
+  marker (`not applicable`, `missing: control sample`, …); a field with nothing
+  to say is omitted.
+
+- **A numeric metadata write reports the value as it is stored, and a change of
+  scale counts as a change (#386).** A NUMERIC value is now parsed into the
+  representation the database stores, so the value written, the value compared
+  against an occupied slot, and the value reported back are one and the same
+  form — a caller sending `1e3` gets `1000` back rather than a form the row does
+  not hold. Occupied-slot comparison for NUMERIC follows the stored
+  representation rather than numeric equality, so rewriting `5` as `5.0`
+  preserves the added precision instead of being reported as an unchanged no-op,
+  while a notation that resolves to what is already stored still reports
+  unchanged and writes nothing. Repeated `NaN` writes now report unchanged too,
+  matching how the database compares them.
+- **Metadata values can no longer be overwritten through a retired study link
+  (#386).** The non-retired-link invariant on `biosample_metadata` /
+  `prep_sample_metadata` was enforced only on INSERT, which was equivalent to
+  guarding every write while metadata rows were insert-only. The new in-place
+  upsert made an overwrite another way for new data to arrive, so a migration
+  adds a `BEFORE UPDATE` twin of the guard, scoped to the value columns and the
+  source field so a local-to-global link upgrade still propagates onto rows
+  whose link is retired. The existing trigger functions are reused unchanged.
+  Enforcing this in the database also closes the window between a caller's link
+  check and its write, which no application-level check can make atomic.
 
 - **`assembly_coverage` writes its BAM coordinate sorted, and `binning.sh` stages it
   instead of running `samtools sort` over it (#422, closes #374).** The sort ran unconditionally
@@ -1230,6 +1361,34 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **One `cap_rows` helper behind every capped list route (#427).** The
+  fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
+  list route — the two sequenced-sample rosters, the prep-sample study roster,
+  `build_idxs_list_response`, and the work-ticket list this PR adds. It is now
+  `routes/_helpers.cap_rows`, which all five call. No wire change: the same rows
+  and the same `truncated` value come back from each route.
+
+- **BREAKING: `GET /work-ticket` returns an envelope, not a bare array (#427).**
+  `{tickets, count, truncated}` — `WorkTicketListResponse`, the same shape
+  `IdxsListResponse` and `SequencedSampleListResponse` already use; this route was
+  the only list route without it. The page is capped at `limit` (default 50, max
+  500), and until now a capped page was indistinguishable from a complete one. That
+  became load-bearing with the pool filter above: one read-mask ticket per sample
+  against a pool of a few hundred samples silently returned the newest 50 rows, so
+  a per-sample read table assembled from it would be a prefix with nothing saying
+  so. Truncation is now decided server-side (fetch `limit + 1`, slice back).
+
+  A client that indexed the response as a list reads `["tickets"]` instead;
+  `qiita ticket list` prints the envelope. No `caller_system_role` field, unlike
+  the two sibling envelopes: this route admits service accounts, whose authz is
+  scope-only and which carry no system_role.
+
+- **Sequenced-sample import accepts study-local prep_sample fields (#386).** The
+  `metadata` dict on `POST /sequencing-run/{idx}/sequenced-pool/{idx}/sequenced-sample`
+  now resolves a name against the study's existing purely-local prep_sample fields as
+  well as the global fields, writing the value through the local field row — matching
+  what biosample import already does. A name matching neither is still a 422.
+
 - **Mask identity keys on the adapter sequences, not on serialized Parquet bytes
   (#428, expand phase).** `resolved_qc.adapter_set_hash` was the SHA-256 of the
   materialized adapter Parquet. The pyarrow writer stamps its version into the
@@ -1432,6 +1591,17 @@ duplicates further down are historical strata; leave them where they are.
   reference data is public; a resource/bandwidth cap can come later if it proves
   necessary. `ticket:doget` also still solely gates the alignment DoGet
   (`POST /alignment/ticket/doget`), whose rows are sample-derived, not public.
+- **Sample-metadata import can key global fields by internal_name.** The
+  biosample and sequenced-prep-sample import surfaces gained an optional
+  `global_internal_names` flag (`--global-internal-names` on both `qiita
+  biosample create` and `qiita sequenced-sample create`): when set, a metadata
+  column naming a global field is resolved against the field's machine-facing
+  `internal_name` instead of its `display_name`, while purely-local fields stay
+  display-name-keyed and the coincidental-collision shadow check is skipped.
+  Defaults off, so existing callers are unaffected. Internally, one resolver
+  now emits a single ordered list of resolved fields, and the pre-write
+  resolution errors report the caller's field key namespace-neutrally. No env
+  var, migration, scope, route, or wire change. (#386)
 - **CLI surfaces a clean re-login prompt on a stale-scope 403 (#161).** When a
   PAT predates a scope its principal's role now grants (or was deliberately
   minted below the ceiling), a scope-gated route 403s even though the role
@@ -2395,6 +2565,13 @@ _None yet._
   per-sample reconcile + export gate, and the delete-then-register no-duplicate
   guarantee against a live data plane). No new env var, migration, or scope; the
   updated `read-mask-block` workflow syncs via `qiita-admin actions sync` at deploy. (#243)
+- **Documented the intended multi-alias field-linkage invariant.** Recorded, in
+  `docs/architecture.md` and as catalog comments on
+  `biosample_metadata_one_value_per_global_field` /
+  `prep_sample_metadata_one_value_per_global_field`, that one study may hold
+  several study-local fields linked to the same global field (keyed by
+  `display_name`), and that the per-`(entity, global field)` uniqueness must not
+  be tightened to per-study. Documentation and comments only; no behavior change. (#386)
 - **Email notification on work-ticket terminal transitions.** When a work
   ticket reaches a terminal state (`completed` / `no_data` / `permanent`-failed),
   the control plane emails the originator. A new in-process asyncio sweeper
@@ -3046,6 +3223,25 @@ _None yet._
   image's own inputs so a change to one tool's def or entrypoint rebuilds only its
   image. `long-read-assembly` is the first consumer, shipping four per-tool images
   (assemble / binning / dastool / checkm). (#255)
+- **Idempotent upsert for sample-metadata writes.** The shared metadata-write
+  path gained an `on_conflict="upsert"` mode: when a write collides with an
+  existing value the caller's own study contributed, it overwrites the value in
+  place (symmetrically across the intentionally-missing↔real boundary) and
+  reports per write whether it inserted, updated, or left an identical value
+  unchanged; a value another study contributed to a global field still raises
+  rather than being overwritten. The default `on_conflict="raise"` preserves
+  the prior insert-only behavior, so existing import callers are unaffected. An
+  upsert that resolves to a value the study already holds through a different
+  study-local alias of the same global field no longer leaves behind the alias
+  minted for the losing insert, and reports the study-local field the value is
+  attached to. No env var, migration, scope, route, or wire change. (#386)
+- **Sample-metadata writes extracted into one composer — no behavior change.**
+  Factored the resolve-markers → validate → write-global → write-local sequence
+  shared by the biosample and sequenced-prep-sample import composers into a
+  single spec-parameterized `write_sample_metadata` helper, and routed both
+  import composers through it. The self-contained composer is the reuse point
+  for the forthcoming update-a-biosample's-metadata surface. No env var,
+  migration, scope, route, or wire change. (#386)
 - **Internal decomposition — no behavior change.** Consolidated the six
   near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
   helper; split the orchestrator's all-nullable `StepHandle` into typed
@@ -3136,6 +3332,17 @@ _None yet._
 - `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)
 - Flight-ticket and login-cookie signing now share `qiita_common.hashing.canonical_json` instead of three hand-rolled `json.dumps(sort_keys=…)` spellings, removing the risk of the HMAC'd wire serialization drifting. (#241)
 - Accepting an AuthRocket invitation redirects to the cookie-anchored `/auth/login` instead of minting a full-ceiling PAT from the un-anchored invitation JWT. (#241)
+- **Biosample import can now populate existing study-local metadata fields.** A
+  `POST /study/{idx}/biosample` metadata column that is not a global field is
+  resolved against the study's existing study-local fields: a purely-local field
+  is written locally, and a study-local alias of a global field writes through to
+  that global field's slot. No new purely-local field is ever minted for a
+  metadata column (the owner-biosample-id field remains the sole create-on-import
+  exception). A column matching nothing is rejected (`422`, unknown field); a
+  column naming a global field shadowed by a conflicting study-local field is
+  rejected (`422`); and two columns resolving to the same global field are
+  rejected (`422`). Enabled by a migration adding `UNIQUE(display_name)` to both
+  `biosample_global_field` and `prep_sample_global_field`. (#386)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
