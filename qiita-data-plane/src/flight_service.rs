@@ -359,6 +359,82 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 const ALIGNMENT_DOGET_PROJECTION: &str =
     "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position";
 
+/// Columns a signed ticket may ask the alignment DoGet to project: every column
+/// of `qiita_lake.alignment`, which `alignment_visible` mirrors (`SELECT a.*`,
+/// see `ducklake::ensure_exclusion_tables`). Keep in step with
+/// `ensure_alignment_tables`' DDL.
+///
+/// This is the Rust half of a CP-mirrored pair — the control plane validates the
+/// same set at mint time, so an unknown column is refused before it is ever
+/// signed. Both halves exist on purpose: the CP's copy turns a consumer's typo
+/// into a 422 with a useful message, and this one is the defense-in-depth that
+/// keeps a signed name out of interpolated SQL.
+///
+/// The allowlist is per-table (see `projection_allowlist`) and today only the
+/// alignment surface has one, because it is the only surface where the payload
+/// justifies it: `cigar` alone is ~96% of an alignment row. Every other DoGet
+/// table streams `SELECT *` and refuses a column list outright.
+const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
+    "alignment_idx",
+    "prep_sample_idx",
+    "sequence_idx",
+    "feature_idx",
+    "mate_feature_idx",
+    "flags",
+    "position",
+    "stop_position",
+    "mapq",
+    "cigar",
+    "mate_position",
+    "template_length",
+    "tag_as",
+    "tag_xs",
+    "tag_ys",
+    "tag_xn",
+    "tag_xm",
+    "tag_xo",
+    "tag_xg",
+    "tag_nm",
+    "tag_yt",
+    "tag_md",
+    "tag_sa",
+];
+
+/// The projection allowlist for `table`, or `None` when the table takes no
+/// column list at all (it streams `SELECT *`, and a list is a control-plane bug).
+fn projection_allowlist(table: &str) -> Option<&'static [&'static str]> {
+    is_alignment_doget_surface(table).then_some(ALIGNMENT_PROJECTION_COLUMNS)
+}
+
+/// Validate a signed ticket's projection columns against `table`'s allowlist and
+/// render them as a SQL select list, preserving the ticket's order.
+///
+/// Every rejection here is a control-plane bug rather than client input — the CP
+/// validates the same set before signing — so failing loudly is the point: the
+/// alternative is quietly serving a different set of columns than was signed.
+fn projection_select_list(table: &str, columns: &[String]) -> Result<String, Status> {
+    let Some(allowed) = projection_allowlist(table) else {
+        return Err(Status::invalid_argument(format!(
+            "table {table:?} does not accept a projection column list"
+        )));
+    };
+    let mut seen: Vec<&str> = Vec::with_capacity(columns.len());
+    for col in columns {
+        if !allowed.contains(&col.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "unknown projection column: {col:?}"
+            )));
+        }
+        if seen.contains(&col.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate projection column: {col:?}"
+            )));
+        }
+        seen.push(col);
+    }
+    Ok(columns.join(", "))
+}
+
 /// The block-read DoGet selectors, mapped to the DuckLake relation each streams.
 ///
 /// These are ticket `table` values, not table names: a block is a set of
@@ -2652,8 +2728,18 @@ fn build_query(
     table: &str,
     filter: &auth::TicketFilter,
     members: &[auth::BlockReadMember],
-    _columns: &[String],
+    columns: &[String],
 ) -> Result<(String, String), Status> {
+    // Validate the projection FIRST, before any early return below can build SQL
+    // on its own path — otherwise the block-read and `read_masked` selectors
+    // would silently ignore a column list rather than refuse it, which is the
+    // silent-widening failure this mechanism exists to prevent.
+    let projection = if columns.is_empty() {
+        None
+    } else {
+        Some(projection_select_list(table, columns)?)
+    };
+
     // Block-read selectors resolve to a different relation than their ticket name
     // and are scoped by `members`, not by a column filter — handle them first, and
     // reject `members` on any other table so a stray selector can never silently
@@ -2694,7 +2780,11 @@ fn build_query(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
         }
-        return Ok((format!("SELECT * FROM {full_table}"), full_table));
+        let select_list = projection.as_deref().unwrap_or("*");
+        return Ok((
+            format!("SELECT {select_list} FROM {full_table}"),
+            full_table,
+        ));
     }
 
     // A feature-table DoGet builds a table for exactly ONE alignment run, and
@@ -2769,20 +2859,33 @@ fn build_query(
 
     let where_str = where_clauses.join(" AND ");
     let sql = if needs_membership_join {
+        // Unreachable today — no table with a projection allowlist takes the
+        // membership JOIN — and kept loud rather than silent because the two
+        // features do compose badly: under the JOIN, a bare column name is
+        // ambiguous (both sides carry feature_idx), so a projection here would
+        // need `t.`-qualifying. Refuse until something actually needs it.
+        if projection.is_some() {
+            return Err(Status::internal(format!(
+                "projection column list is not supported on {table:?} (membership JOIN)"
+            )));
+        }
         format!(
             "SELECT t.* FROM {full_table} t \
              JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx \
              WHERE {where_str}"
         )
     } else {
-        // Most tables stream every column; the alignment surface is projected to
-        // just the feature-table columns (projection pushdown — see ALIGNMENT_DOGET_PROJECTION).
-        let projection = if is_alignment_doget_surface(table) {
-            ALIGNMENT_DOGET_PROJECTION
-        } else {
-            "*"
+        // A signed column list wins; it is the ticket saying exactly what it
+        // wants. Absent one, most tables stream every column and the alignment
+        // surface falls back to the hardcoded feature-table projection — a
+        // transitional fallback that becomes an error once every producer names
+        // its columns (see ALIGNMENT_DOGET_PROJECTION).
+        let select_list = match projection.as_deref() {
+            Some(signed) => signed,
+            None if is_alignment_doget_surface(table) => ALIGNMENT_DOGET_PROJECTION,
+            None => "*",
         };
-        format!("SELECT {projection} FROM {full_table} WHERE {where_str}")
+        format!("SELECT {select_list} FROM {full_table} WHERE {where_str}")
     };
     Ok((sql, full_table))
 }
@@ -5335,6 +5438,152 @@ mod tests {
         assert!(
             build_query("alignment_visible", &empty, &[], &[]).is_err(),
             "empty filter on alignment_visible must be rejected"
+        );
+    }
+
+    /// A minimally-scoped alignment ticket filter. The scoping guards have their
+    /// own tests above; the projection tests below care only about `columns`.
+    fn alignment_scope() -> auth::TicketFilter {
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(7)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3)],
+        );
+        filter
+    }
+
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn signed_columns_are_projected_in_order() {
+        // The whole point of the signed list: a consumer that wants `cigar` asks
+        // for it, and one that doesn't never pays for it (it is ~96% of the
+        // alignment payload). Order is the caller's, verbatim — it keeps the SQL
+        // a pure function of the ticket, and the consumer's Arrow schema
+        // predictable rather than a function of our allowlist's ordering.
+        let cols = columns(&["feature_idx", "cigar", "position"]);
+        let (sql, table) =
+            build_query("alignment_visible", &alignment_scope(), &[], &cols).unwrap();
+        assert_eq!(table, "qiita_lake.alignment_visible");
+        assert!(
+            sql.starts_with(
+                "SELECT feature_idx, cigar, position FROM qiita_lake.alignment_visible WHERE"
+            ),
+            "expected exactly the signed columns, in the signed order, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn unknown_projection_column_is_rejected() {
+        // Defense-in-depth. The list is signature-verified — the control plane
+        // set it, not the client — but column names are interpolated into SQL,
+        // so it is whitelisted anyway, exactly as ALLOWED_FILTER_COLUMNS is.
+        for bad in ["no_such_column", "feature_idx; DROP TABLE alignment", "*"] {
+            let cols = columns(&["feature_idx", bad]);
+            let err = build_query("alignment_visible", &alignment_scope(), &[], &cols)
+                .expect_err("unknown projection column must be rejected");
+            assert!(
+                err.message().contains(bad),
+                "the error should name the offending column, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_projection_columns_are_rejected() {
+        // A repeated name produces two identically-named Arrow fields, which
+        // consumers collapse or reject inconsistently. Refuse to emit the
+        // ambiguous schema rather than pick a behaviour on their behalf.
+        let cols = columns(&["feature_idx", "position", "feature_idx"]);
+        assert!(
+            build_query("alignment_visible", &alignment_scope(), &[], &cols).is_err(),
+            "a duplicated projection column must be rejected"
+        );
+    }
+
+    #[test]
+    fn projection_columns_are_rejected_on_a_table_with_no_allowlist() {
+        // Only the alignment surface takes a column list; every other table
+        // streams SELECT * by decision. A list elsewhere is a control-plane bug,
+        // and *ignoring* it would serve wider rows than the ticket asked for —
+        // the exact silent widening this whole mechanism exists to prevent.
+        let cols = columns(&["feature_idx"]);
+
+        let mut reference = auth::TicketFilter::new();
+        reference.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
+        assert!(
+            build_query("reference_taxonomy", &reference, &[], &cols).is_err(),
+            "a reference table must refuse a projection column list"
+        );
+
+        // The block-read and read_masked selectors build their SQL on their own
+        // early-return paths, so they are the cases that would silently skip a
+        // gate placed further down build_query. Pin them explicitly.
+        assert!(
+            build_query(
+                "read_block",
+                &auth::TicketFilter::new(),
+                &block_members(),
+                &cols
+            )
+            .is_err(),
+            "a block-read selector must refuse a projection column list"
+        );
+        let mut masked = auth::TicketFilter::new();
+        masked.insert("mask_idx".to_string(), vec![serde_json::Value::from(1)]);
+        masked.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3)],
+        );
+        assert!(
+            build_query("read_masked", &masked, &[], &cols).is_err(),
+            "the read_masked macro must refuse a projection column list"
+        );
+    }
+
+    #[test]
+    fn absent_or_empty_columns_keeps_todays_projection() {
+        // Transitional, and deliberately so: a ticket minted before the consumer
+        // started naming its columns still gets the hardcoded projection, which
+        // is what lets the producer and the server be deployed in either order.
+        // Once every producer sends a list this becomes an error, and this test
+        // goes away with it.
+        //
+        // Empty and absent are one case, not two, and cannot be told apart here:
+        // `#[serde(default)]` renders an omitted field as an empty Vec, exactly
+        // as it does for `members`. An explicitly-empty list is refused at mint
+        // instead, which is the layer where the distinction still exists.
+        let (sql, _) = build_query("alignment_visible", &alignment_scope(), &[], &[]).unwrap();
+        assert!(
+            sql.starts_with(&format!(
+                "SELECT {ALIGNMENT_DOGET_PROJECTION} FROM qiita_lake.alignment_visible WHERE"
+            )),
+            "no column list must keep today's projection, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn todays_projection_is_requestable_through_the_allowlist() {
+        // The migration's precondition: the consumer must be able to ask for
+        // exactly what it already gets. If a name in the hardcoded projection
+        // were missing from — or misspelled in — the allowlist, the consumer
+        // would start naming its columns and every ticket would fail at mint.
+        let cols = columns(&ALIGNMENT_DOGET_PROJECTION.split(", ").collect::<Vec<_>>());
+        let (sql, _) = build_query("alignment_visible", &alignment_scope(), &[], &cols).unwrap();
+        assert!(
+            sql.starts_with(&format!(
+                "SELECT {ALIGNMENT_DOGET_PROJECTION} FROM qiita_lake.alignment_visible WHERE"
+            )),
+            "the signed form of today's projection must reproduce it exactly, got: {sql}"
         );
     }
 
