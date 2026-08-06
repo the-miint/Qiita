@@ -252,6 +252,8 @@ The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hiera
 
 `reference:exclusion:write` (curate the global reference blocklist) is a **`system_admin`-only** scope — added to the `system_admin` ceiling alone, mirroring `reference:delete`, so a wet_lab_admin can load references but not mask genomes/features globally. Reading a reference's blocks rides the existing `reference:read`.
 
+`alignment:doget` (mint a Flight DoGet ticket for an alignment cohort you name yourself) is on **every** role ceiling, unlike the worker scopes above, and is deliberately **absent** from `SERVICE_ACCOUNT_SCOPE_CEILING` — the mirror image of `ticket:doget`. The two scopes carry the same data and different trust models: `ticket:doget` signs a cohort the control plane read out of a work ticket, which the runner resolver validated at submit; `alignment:doget`'s route has no such upstream, so it authorizes the caller's cohort per-study (`Tier.VIEWER` on every study each sample links to) before signing. Because that per-study check is the real boundary, the role does not need to be one — hence every ceiling. Splitting them is what keeps a human PAT off the worker path and a worker off the human one, so a single data-plane surface never has two validation paths.
+
 ### Guards (`auth.guards`)
 
 | Guard | Behavior |
@@ -273,7 +275,14 @@ Beyond the kind / role / scope guards above, `auth.guards` carries resource-acce
 | `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison; `min_tier=None` resolves to the study's `default_tier`. |
 | `require_caller_owns_run(bypass_role)` | factory; `sequencing_run.created_by_idx == caller`. |
 | `require_caller_owns_pool(bypass_role)` | factory; `sequenced_pool.created_by_idx == caller`. |
-| `require_caller_has_admin_on_all_studies(...)` | body-time helper (not a `Depends`); caller has `Tier.ADMIN` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. |
+| `require_caller_has_tier_on_all_studies(min_tier, ...)` | body-time helper (not a `Depends`); caller has `min_tier` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. Comparison goes through `_TIER_ORDER`, never the `Tier` members, which are a `StrEnum` and compare *lexically* (`'admin' < 'member' < 'public' < 'viewer'`). |
+| `require_caller_has_admin_on_all_studies(...)` | the `Tier.ADMIN` form of the above, kept named so the ADMIN policy stays greppable at its call sites. |
+| `filter_studies_caller_can_read(min_tier, ...)` | the **narrowing** counterpart: returns the subset of a study list the caller may read, rather than raising. One query for the whole set. Anonymous narrows to nothing. |
+| `filter_prep_samples_caller_can_read(min_tier, ...)` | resolves a **prep_sample** cohort: readable / unlinked / blocked-by-study. A sample survives only if the caller holds `min_tier` on *every* study it is still linked to. |
+
+**Narrowing vs raising is a deliberate split, not two ways of doing one thing.** The discovery reads narrow — a pool spans studies, so 403ing the whole pool would make it undiscoverable to someone who legitimately owns part of it, and no scientific result depends on a listing. The alignment mint raises, because a quietly narrowed *cohort* is a different scientific result under the name of the one that was asked for (coverage filtering makes a feature table cohort-dependent). Both go through `filter_prep_samples_caller_can_read`, which is the single definition of "may this caller read this sample" — two copies is how discovery comes to advertise a cohort the mint then refuses.
+
+That function also decides the **orphan** case, and decides it differently from the authoring gates: a prep_sample whose every `prep_sample_to_study` link is retired has no study to authorize against, so it is **denied**. `_check_prep_sample_study_access` (work-ticket submit) lets an orphan pass, on the reasoning that a *write* whose downstream lookups fail anyway is not worth blocking there. That reasoning does not carry to a *read* gate, where failing open on a data-integrity anomaly means anyone may read the sample. A caller at or above the bypass role sees orphans, deliberately, since they are the ones who can act on the anomaly.
 
 **The authoring routes deliberately use three different shapes**, because the resources differ in what "ownership" means:
 
