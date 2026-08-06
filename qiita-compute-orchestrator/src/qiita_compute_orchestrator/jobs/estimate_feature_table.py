@@ -73,6 +73,30 @@ _MAP_TABLE = "contig_to_genome"
 _GENOME_LENGTHS_TABLE = "genome_lengths"
 _ALIGNMENT_TABLE = "alignment_slice"
 
+# The alignment columns this recipe binds — and, because they ride the DoGet
+# ticket, the only ones the data plane will stream. One list, used twice below
+# (the request and the SELECT), so the two cannot drift; it is deliberately
+# owned HERE rather than by the data plane, because this job is the only thing
+# that knows what it reads.
+#
+# What is absent matters as much as what is present. `cigar` is ~96% of an
+# alignment row and nothing here reads it: coverage is breadth via miint
+# `genome_coverage`, whose `alignments` relation needs only
+# `reference (=feature_idx), position, stop_position` — it merges spans per
+# contig, so no CIGAR is required (unlike `compute_coverage_depth`, which we do
+# not use). The OGU key (`genome_idx`) is derived compute-side from
+# `feature_idx` via the feature→genome map, so the raw `feature_idx` suffices.
+# `alignment_idx` is absent because the ticket is scoped to a single alignment
+# run, so every streamed row shares it and this job already carries it.
+_ALIGNMENT_COLUMNS = (
+    "prep_sample_idx",
+    "sequence_idx",
+    "feature_idx",
+    "flags",
+    "position",
+    "stop_position",
+)
+
 # DuckDB resource caps. This job's heavy work is entirely in-DuckDB (the coverage
 # interval merge + the woltka aggregation over the streamed alignment slice) — no
 # in-process co-consumer, so no `reserve_gb`. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
@@ -234,12 +258,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # cannot see a registered stream relation; the CREATE TABLE also drains
             # the stream so the Flight client closes before the compute.
             async with open_alignment_stream(
-                conn, work_ticket_idx=inputs.work_ticket_idx
+                conn, work_ticket_idx=inputs.work_ticket_idx, columns=_ALIGNMENT_COLUMNS
             ) as alignment_rel:
                 conn.execute(
-                    f"CREATE TABLE {_ALIGNMENT_TABLE} AS SELECT "
-                    "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position "
-                    f"FROM {alignment_rel}"
+                    f"CREATE TABLE {_ALIGNMENT_TABLE} AS "
+                    f"SELECT {', '.join(_ALIGNMENT_COLUMNS)} FROM {alignment_rel}"
                 )
 
             _write_ogu_table(conn, coverage_threshold=inputs.coverage_threshold, out_path=out_path)
