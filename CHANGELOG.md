@@ -269,7 +269,7 @@ duplicates further down are historical strata; leave them where they are.
   partially-readable cohort is refused rather than narrowed: coverage filtering
   makes a feature table cohort-dependent, so a trimmed cohort answers a
   different scientific question under the name of the one that was asked.
-  Rationale in `docs/architecture.md` and `docs/auth.md`. (`#m3-human-alignment-mint`)
+  Rationale in `docs/architecture.md` and `docs/auth.md`. (#436)
 - **Two reads answer "what has been aligned for this pool, and what may I
   mint?"** `GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment` lists the
   alignments over a pool with their config and completion counts;
@@ -282,7 +282,7 @@ duplicates further down are historical strata; leave them where they are.
   pool's real numbers to someone who may read half of them would set them up for
   a 403 from the all-or-nothing mint. Open to role `user`, unlike the
   wet_lab_admin-gated pool-completion rollup beside them.
-  (`#m3-human-alignment-mint`)
+  (#436)
 - **A Flight DoGet ticket can carry a signed column list, and the alignment
   surface now requires one (#435).** The consumer names the columns it wants, the
   control plane validates them against a per-table allowlist at mint time (422
@@ -924,7 +924,7 @@ duplicates further down are historical strata; leave them where they are.
   row per alignment config × sample, across every reference, aligner and rerun)
   from a route open to any authenticated user. Added
   `(prep_sample_idx, alignment_idx)` so the query is served index-only, built
-  `CONCURRENTLY`. (`#m3-human-alignment-mint`)
+  `CONCURRENTLY`. (#436)
 - **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
   is now a scoped table macro instead of a view (#433).** DuckDB derives a transitive
   predicate across a join equality for `col = const` but **not** for
