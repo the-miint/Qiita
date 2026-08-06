@@ -606,8 +606,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # rype_classify. Costs nothing to do here — DuckDB answers both
                 # aggregates from the reads Parquet's row-group statistics (`count(*)`
                 # from the row counts, `count(sequence2)` from the null counts), so
-                # neither reads a byte of the sequence columns; a short-circuiting
-                # `LIMIT 1` probe would be far SLOWER, since that one does scan.
+                # neither reads a byte of the sequence columns. A `LIMIT 1` probe
+                # would also avoid scanning (row-group stats prune it), but it cannot
+                # produce `total`, and the mixed-batch rejection below needs both
+                # numbers to name the counts in its error (`paired not in (0, total)`).
+                # That correctness requirement — not performance — is why the count
+                # probe is used here.
                 #
                 # `total > 0` is load-bearing now that this runs ahead of the empty
                 # check: an empty read batch makes `paired == total == 0`, which is
