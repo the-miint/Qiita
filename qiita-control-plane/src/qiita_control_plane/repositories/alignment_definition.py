@@ -17,6 +17,7 @@ non-32-byte hash — unreachable via this helper) propagate to the caller.
 """
 
 import json
+from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.hashing import canonical_params_hash
@@ -94,3 +95,84 @@ async def fetch_alignment_definition_by_idx(
         " WHERE alignment_idx = $1",
         alignment_idx,
     )
+
+
+async def list_pool_prep_sample_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> list[int]:
+    """The pool's non-retired sequenced samples, as prep_sample_idx.
+
+    Same sample set as the other pool rollups (`ps.retired IS NOT TRUE`), so a
+    pool's alignments are counted over the same population its completion and
+    QC reports describe.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
+    )
+    return [r["prep_sample_idx"] for r in rows]
+
+
+async def list_alignments_over_prep_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    prep_sample_idxs: Sequence[int],
+) -> list[asyncpg.Record]:
+    """Every alignment touching any of `prep_sample_idxs`, with its config and
+    completed/total counts **over exactly those samples**.
+
+    The caller passes the set it may read, so the counts come back already
+    scoped to it — the alignment's real membership never reaches the response.
+    That is what keeps this route's answer consistent with what the all-or-
+    nothing mint will accept.
+
+    An alignment none of these samples belongs to does not appear at all, which
+    is the narrowing the discovery contract wants: a zero-count row would still
+    disclose that the alignment exists. Empty input short-circuits.
+    """
+    if not prep_sample_idxs:
+        return []
+    return await pool_or_conn.fetch(
+        "SELECT als.alignment_idx, ad.params,"
+        "       count(*) FILTER (WHERE als.state = 'completed') AS samples_completed,"
+        "       count(*) AS samples_total"
+        "  FROM qiita.alignment_sample als"
+        "  JOIN qiita.alignment_definition ad ON ad.alignment_idx = als.alignment_idx"
+        " WHERE als.prep_sample_idx = ANY($1::bigint[])"
+        " GROUP BY als.alignment_idx, ad.params"
+        " ORDER BY als.alignment_idx",
+        list(prep_sample_idxs),
+    )
+
+
+async def list_completed_alignment_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    alignment_idx: int,
+    prep_sample_idxs: Sequence[int],
+) -> list[int]:
+    """The subset of `prep_sample_idxs` that are `'completed'` for this alignment.
+
+    The positive twin of `block.list_incomplete_alignment_samples`, which the
+    mint uses to refuse a cohort. Discovery needs the complement: what a caller
+    may ask for, rather than what it got wrong. Both read the same first-class
+    `alignment_sample.state` — alignment rows are NOT 1:1 with reads, so the
+    presence of rows must never be read as done.
+
+    Sorted, because the result becomes a signed ticket's cohort and an unstable
+    order would make two identical requests sign different payload bytes.
+    """
+    if not prep_sample_idxs:
+        return []
+    rows = await pool_or_conn.fetch(
+        "SELECT prep_sample_idx FROM qiita.alignment_sample"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
+        "   AND state = 'completed'"
+        " ORDER BY prep_sample_idx",
+        alignment_idx,
+        list(prep_sample_idxs),
+    )
+    return [r["prep_sample_idx"] for r in rows]

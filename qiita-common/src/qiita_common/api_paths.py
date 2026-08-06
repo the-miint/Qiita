@@ -618,6 +618,18 @@ PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
 PATH_SEQUENCED_POOL_ALIGN_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
 )
+# GET the alignments over this pool's samples: per alignment_idx, its config
+# params and completed/total sample counts. Counts are scoped to the samples the
+# CALLER may read, so they agree with what the alignment DoGet mint will sign.
+PATH_SEQUENCED_POOL_ALIGNMENT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment"
+)
+# GET the cohort to mint an alignment DoGet ticket for: the pool's prep_samples
+# that are BOTH readable by the caller and 'completed' for this alignment. The
+# list this returns is a valid mint body by construction.
+PATH_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment/{alignment_idx}/cohort"
+)
 # GET the pool's exception drill-down: only the anomalous non-retired
 # sequenced_samples — no usable reads (unprocessed or zero survived), missing any
 # of the four submission accessions, or a genuinely-failed read-mask ticket (failed
@@ -653,6 +665,10 @@ URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
 URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_POOL_ALIGNMENT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT}"
+URL_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT_COHORT}"
+)
 URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
 URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"

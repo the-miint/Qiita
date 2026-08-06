@@ -1030,6 +1030,59 @@ class AlignmentDefinitionDeleteResponse(BaseModel):
     rows_deleted: int
 
 
+class PoolAlignmentSummary(BaseModel):
+    """One alignment over a pool, as the CALLER sees it.
+
+    **Both counts are scoped to the samples the caller may read**, not to the
+    alignment's real membership. That is deliberate and load-bearing: the
+    alignment DoGet mint is all-or-nothing, so a caller shown the pool's true
+    counts would request a cohort it cannot fully read and get a 403. Discovery
+    and the mint have to agree about what "your cohort" means.
+
+    `params` is the alignment's config blob verbatim (reference, aligner, mask,
+    shard set) — the same JSON `alignment_definition.params` stores, so an
+    alignment_idx is self-describing without a second lookup.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    params: dict[str, Any]
+    samples_completed: int
+    samples_total: int
+
+
+class PoolAlignmentList(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/alignment.
+
+    An alignment the caller can read NO sample of is absent entirely rather than
+    present with zero counts — a zero-count row would still disclose that the
+    alignment exists over data they have no access to.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    alignments: list[PoolAlignmentSummary]
+
+
+class PoolAlignmentCohort(BaseModel):
+    """Returned by GET .../sequenced-pool/{pool}/alignment/{alignment_idx}/cohort.
+
+    The prep_samples that are BOTH readable by the caller and `'completed'` for
+    this alignment — a valid alignment-DoGet mint body by construction. Sorted,
+    so the same pool and alignment always produce the same request bytes; the
+    cohort is signed into a ticket, and an unstable order would make two
+    identical requests sign different payloads.
+
+    Empty is a legitimate answer, not an error: it means "nothing here you may
+    mint", which is what a narrowing read should say rather than a 403 that
+    would confirm which alignments touch data the caller lacks.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: list[Annotated[int, Field(gt=0)]]
+
+
 class ReadMaskedDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read-masked/ticket/doget.
 
