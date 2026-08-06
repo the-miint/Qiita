@@ -146,6 +146,38 @@ async def test_human_mint_403_names_the_offending_study(ctx, pool_alignment_seed
     assert "viewer" in detail
 
 
+async def test_human_mint_403_does_not_enumerate_the_whole_cohort(ctx, pool_alignment_seed):
+    """The caller chooses the cohort, so an untruncated, per-sample-correlated
+    403 would answer "which of these identifiers exist and which studies are
+    they in?" for the whole body — an enumeration oracle over
+    prep_sample_to_study, handed to the lowest role there is.
+
+    The message reports counts plus a handful of examples, and never pairs a
+    prep_sample with the study that blocked it.
+    """
+    # 40 guessed identifiers around the seeded ones, so real blocked samples are
+    # mixed with ids the caller has no relationship to.
+    guesses = list(range(pool_alignment_seed["ps_b"], pool_alignment_seed["ps_b"] + 40))
+    resp = await ctx["user"].post(
+        _mint_url(pool_alignment_seed["align_1"]),
+        json={"prep_sample_idx": guesses, "columns": _COLUMNS},
+    )
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    named = [idx for idx in guesses if str(idx) in detail]
+    assert len(named) <= 10, f"403 named {len(named)} of {len(guesses)} probed ids: {detail}"
+
+
+async def test_human_mint_caps_the_cohort_length(ctx, pool_alignment_seed):
+    """The cap bounds the width of that 403's answer as well as ticket size, so
+    it is a security parameter and not only a sanity one."""
+    resp = await ctx["user"].post(
+        _mint_url(pool_alignment_seed["align_1"]),
+        json={"prep_sample_idx": list(range(1, 10_002)), "columns": _COLUMNS},
+    )
+    assert resp.status_code == 422, resp.text
+
+
 async def test_human_mint_denies_an_orphaned_prep_sample_403(ctx, pool_alignment_seed):
     """ps_d's only study link is retired, so there is no study left to authorize
     against. A read gate fails CLOSED on that anomaly — the opposite of the
