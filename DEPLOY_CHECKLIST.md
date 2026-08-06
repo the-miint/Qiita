@@ -244,12 +244,12 @@ _None yet._
   as a list reads `["tickets"]` instead; `truncated` is true when the set exceeded
   `limit` (default 50, max 500), which a capped page previously did not report. The
   bundled `qiita ticket list` ships in the same deploy and needs nothing. No host action
-  — flagged for anyone running their own client against this API.
-- (#427) **Additive on the same deploy:** `GET /work-ticket` takes
-  `?sequenced_pool_idx=` / `?prep_sample_idx=` / `?action_id=` (with matching
-  `qiita ticket list` flags), and both `sequenced-sample/list` rosters now carry each
-  sample's four per-stage read counts plus `fraction_passing_quality_filter`. Together
-  they replace the host `psql` a per-sample pool read table used to need.
+  — flagged for anyone running their own client against this API. Additive on the same
+  deploy: `GET /work-ticket` takes `?sequenced_pool_idx=` / `?prep_sample_idx=` /
+  `?action_id=` (with matching `qiita ticket list` flags), and both
+  `sequenced-sample/list` rosters now carry each sample's four per-stage read counts
+  plus `fraction_passing_quality_filter`. Together they replace the host `psql` a
+  per-sample pool read table used to need.
 
 ---
 
