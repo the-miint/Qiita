@@ -102,10 +102,7 @@ def test_doget_zstd_compression_round_trips_through_pyarrow(data_plane, flight_c
     identical data — compression is a transport concern and must never be
     observable in the result.
     """
-    from qiita_common.flight_constants import (
-        IPC_COMPRESSION_HEADER,
-        IPC_COMPRESSION_ZSTD,
-    )
+    from qiita_common.flight_constants import ipc_compression_headers
 
     ticket_bytes = _sign_ticket(
         "reference_sequences",
@@ -115,9 +112,9 @@ def test_doget_zstd_compression_round_trips_through_pyarrow(data_plane, flight_c
     plain = flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
     compressed = flight_client.do_get(
         flight.Ticket(ticket_bytes),
-        flight.FlightCallOptions(
-            headers=[(IPC_COMPRESSION_HEADER.encode(), IPC_COMPRESSION_ZSTD.encode())]
-        ),
+        # Through the shared helper, so the one test that most resembles a real
+        # client exercises what a real client actually calls.
+        flight.FlightCallOptions(headers=ipc_compression_headers(True)),
     ).read_all()
 
     assert compressed.equals(plain), "compression changed the data the client sees"

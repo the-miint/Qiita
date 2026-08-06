@@ -21,6 +21,7 @@ import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
 
 from . import require_transaction
+from .alignment_definition import list_completed_alignment_samples
 
 
 async def create_block(conn: asyncpg.Connection) -> int:
@@ -433,17 +434,16 @@ async def list_incomplete_alignment_samples(
     of rows is never 'done' — completion is a first-class state (see
     qiita.alignment_sample). Accepts a pool or a connection so it composes inside a
     transaction. Result is sorted for a deterministic error message; empty input
-    returns []."""
-    if not prep_sample_idxs:
-        return []
-    rows = await pool_or_conn.fetch(
-        "SELECT prep_sample_idx FROM qiita.alignment_sample"
-        " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
-        "   AND state = 'completed'",
-        alignment_idx,
-        list(prep_sample_idxs),
+    returns [].
+
+    The complement of `list_completed_alignment_samples`, and computed from it
+    rather than re-issuing its SELECT: the completion predicate has one
+    definition, which matters because the two consumers are the discovery read
+    and the mint, whose whole contract is that they never disagree about which
+    samples are done."""
+    completed = set(
+        await list_completed_alignment_samples(pool_or_conn, alignment_idx, prep_sample_idxs)
     )
-    completed = {r["prep_sample_idx"] for r in rows}
     return sorted(set(prep_sample_idxs) - completed)
 
 

@@ -48,7 +48,7 @@ from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..feature_table import parse_feature_table_scope
-from ..repositories.alignment_definition import fetch_alignment_definition_by_idx
+from ..repositories.alignment_definition import alignment_definition_exists
 from ..repositories.block import list_incomplete_alignment_samples
 
 _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
@@ -60,6 +60,11 @@ _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 # (routes/reference.py) and the data plane's ALLOWED_TABLES. A constant so the
 # name has one definition here.
 _ALIGNMENT_TABLE = "alignment_visible"
+
+# Read tier the human mint requires on every study a cohort sample links to.
+# Named once so the check and the 403 that explains it cannot disagree about
+# what the caller has to go ask for.
+_COHORT_MIN_TIER = Tier.VIEWER
 
 alignment_definition_router = APIRouter(
     prefix=PATH_ALIGNMENT_DEFINITION_PREFIX, tags=["alignment-definition"]
@@ -253,7 +258,7 @@ async def create_alignment_cohort_doget_ticket(
        route can skip because its runner resolver already ran it at submit.
     4. **Sign**, sharing one helper with that route so the two cannot drift.
     """
-    if await fetch_alignment_definition_by_idx(pool, alignment_idx) is None:
+    if not await alignment_definition_exists(pool, alignment_idx):
         raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
 
     # Sorted (and deduped) because the cohort is an IN-list whose order carries
@@ -262,10 +267,12 @@ async def create_alignment_cohort_doget_ticket(
     cohort = sorted(set(body.prep_sample_idx))
 
     access = await filter_prep_samples_caller_can_read(
-        pool, caller=caller, prep_sample_idxs=cohort, min_tier=Tier.VIEWER
+        pool, caller=caller, prep_sample_idxs=cohort, min_tier=_COHORT_MIN_TIER
     )
     if access.unlinked or access.blocked_by:
-        raise HTTPException(status_code=403, detail=_access_denied_detail(access))
+        raise HTTPException(
+            status_code=403, detail=_access_denied_detail(access, min_tier=_COHORT_MIN_TIER)
+        )
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
     if incomplete:
@@ -285,7 +292,7 @@ async def create_alignment_cohort_doget_ticket(
     )
 
 
-def _access_denied_detail(access: PrepSampleReadAccess) -> str:
+def _access_denied_detail(access: PrepSampleReadAccess, *, min_tier: Tier) -> str:
     """The 403 body: what the caller would have to change to be allowed.
 
     Both denial modes are reported, and separately — an unreadable study is
@@ -304,7 +311,7 @@ def _access_denied_detail(access: PrepSampleReadAccess) -> str:
     if access.blocked_by:
         studies = sorted({s for denied in access.blocked_by.values() for s in denied})
         parts.append(
-            f"requires study access at tier '{Tier.VIEWER}' or higher on"
+            f"requires study access at tier {str(min_tier)!r} or higher on"
             f" {len(studies)} study/studies (e.g. {_first_few(studies)})"
         )
     if access.unlinked:

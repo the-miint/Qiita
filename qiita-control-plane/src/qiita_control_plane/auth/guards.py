@@ -325,9 +325,9 @@ def require_complete_profile(
 
 # Strict ordering by privilege; mirrors the qiita.tier enum order. The
 # integer ranks let the guard compare tiers with a plain >= rather than
-# relying on enum-string ordering. Lives next to its sole consumer
-# (require_study_access). Unlike Roles, Tiers are not a property of
-# principals.
+# relying on enum-string ordering. Read only through `_access_row_allows`,
+# which is the single definition of the comparison. Unlike Roles, Tiers are
+# not a property of principals.
 _TIER_ORDER = {
     Tier.PUBLIC: 0,
     Tier.VIEWER: 1,
@@ -421,50 +421,35 @@ async def require_prep_sample_exists(
         )
 
 
-async def _study_access_allows(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    *,
-    caller: Principal,
-    study_idx: int,
-    min_tier: Tier,
+def _access_row_allows(
+    row: CallerStudyAccessRow | None, *, caller: Principal, min_tier: Tier
 ) -> bool:
-    """Does this one study permit `caller` at `min_tier`?
+    """Does this study permit `caller` at `min_tier`? (`None` row = no such study.)
 
-    The shared predicate behind the raising gate and the narrowing filter below,
-    so the two can never disagree about what "may read" means — one 403s a
-    cohort the other would have silently kept.
+    **The one definition of the study-access comparison**, split from the fetch
+    so every path decides identically no matter how it read the row — the
+    narrowing filter and the raising gate both read many rows in one query, and
+    `require_study_access` reads one. A second copy of this ladder is how they
+    would come to disagree about who may read what, which shows up as a
+    discovery route advertising something the mint then 403s.
 
-    A non-existent study returns True: it is not this predicate's job to 404,
-    and the authoring gates' composers surface a missing study as one 422 from
-    their own FK violation. Comparison goes through `_TIER_ORDER`; see
-    `require_caller_has_tier_on_all_studies`.
+    A non-existent study returns True: it is not this predicate's job to 404.
+    The authoring gates' composers surface a missing study as one 422 from their
+    own FK violation, and `require_study_access` 404s on the `None` row itself
+    before calling here, so neither loses the error — they just own it.
 
     **That fail-open branch is only safe while every caller sources its
-    `study_idx` from an FK-backed column.** Both of today's do — the study_idxs
+    `study_idx` from an FK-backed column.** Today's all do — the study_idxs
     reaching the narrowing filter come from `qiita.prep_sample_to_study`, whose
     `REFERENCES qiita.study(idx) ON DELETE RESTRICT` makes a phantom study
     unreachable. A future caller that passes user-supplied study_idxs would
     inherit fail-open silently, which is the wrong default for a read gate; give
     it an existence check of its own, or make the branch configurable.
-    """
-    return _access_row_allows(
-        await fetch_caller_study_access(
-            pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
-        ),
-        caller=caller,
-        min_tier=min_tier,
-    )
 
-
-def _access_row_allows(
-    row: CallerStudyAccessRow | None, *, caller: Principal, min_tier: Tier
-) -> bool:
-    """The policy itself, on an already-fetched row (None = no such study).
-
-    Split from the fetch so the one-study and batched paths decide identically —
-    the narrowing filter below reads many rows in a single query, and a second
-    copy of this comparison is how it would come to disagree with the raising
-    gate about who may read what.
+    Comparison goes through `_TIER_ORDER`, never the enum members: `Tier` is a
+    `StrEnum` and compares LEXICALLY, where 'admin' < 'member' < 'public' <
+    'viewer'. A bare `>=` would admit a PUBLIC caller at a VIEWER minimum and
+    reject an ADMIN one.
     """
     if row is None:
         return True
@@ -497,17 +482,18 @@ async def filter_studies_caller_can_read(
     surprising shape for one. A caller at or above `bypass_role` gets everything
     back with no DB lookup, matching every other resource gate.
 
-    ONE query for the whole set, unlike the raising gate, which short-circuits on
-    the first refusal and so never issues more than one lookup either. This form
-    has to resolve every study, and the mint route feeding it takes its
-    identifier list from the CALLER — so a per-study round trip would put the
-    request count under the caller's control.
+    ONE query for the whole set, like the raising gate below. That matters more
+    here than there: the mint route feeding this one takes its identifier list
+    from the CALLER, so a per-study round trip would put the request count under
+    the caller's control.
     """
-    study_idxs = list(dict.fromkeys(study_idxs))
+    # Dedup below the early returns, not above: both discard the result, and the
+    # cohort reaching here can be thousands of ids.
     if isinstance(caller, Anonymous):
         return set()
     if caller.has_role_at_least(bypass_role):
         return set(study_idxs)
+    study_idxs = list(dict.fromkeys(study_idxs))
     rows = await fetch_caller_study_access_batch(
         pool_or_conn, principal_idx=caller.principal_idx, study_idxs=study_idxs
     )
@@ -554,7 +540,7 @@ async def filter_prep_samples_caller_can_read(
     authorize against, and failing open on a data-integrity anomaly is the wrong
     default for a read. This diverges from the prep_sample-scoped *submission*
     gate (`_check_prep_sample_study_access` in routes/work_ticket.py), which
-    lets an orphan pass; that gate gaurds a write whose downstream lookups fail
+    lets an orphan pass; that gate guards a write whose downstream lookups fail
     anyway, this one answers "may this person see this".
 
     A caller at or above `bypass_role` gets the whole cohort back with no
@@ -628,6 +614,11 @@ async def require_caller_has_tier_on_all_studies(
     in the same PR, or mask discovery and ticket submission disagree about
     the same sample.
 
+    ONE query for the whole set, then the decision per study in input order.
+    Short-circuiting on the first refusal saved nothing on the path that
+    matters — a request where every study passes is the common one, and it
+    used to cost one round trip per study.
+
     Comparison goes through `_TIER_ORDER`, never the enum members: `Tier`
     is a `StrEnum` and compares LEXICALLY, where 'admin' < 'member' <
     'public' < 'viewer'. A bare `>=` would admit a PUBLIC caller at a
@@ -638,10 +629,12 @@ async def require_caller_has_tier_on_all_studies(
     if caller.has_role_at_least(bypass_role):
         return
 
-    for study_idx in dict.fromkeys(study_idxs):
-        if await _study_access_allows(
-            pool_or_conn, caller=caller, study_idx=study_idx, min_tier=min_tier
-        ):
+    study_idxs = list(dict.fromkeys(study_idxs))
+    rows = await fetch_caller_study_access_batch(
+        pool_or_conn, principal_idx=caller.principal_idx, study_idxs=study_idxs
+    )
+    for study_idx in study_idxs:
+        if _access_row_allows(rows.get(study_idx), caller=caller, min_tier=min_tier):
             continue
         raise HTTPException(
             status_code=403,
@@ -850,17 +843,13 @@ def require_study_access(
                 detail=f"study {study_idx} not found",
             )
 
-        # Owner bypass — study owner authorized at every tier.
-        if row.owner_idx == p.principal_idx:
-            return
-
         # Resolve the minimum tier per call: explicit factory arg wins,
-        # otherwise fall back to the study's own default_tier.
+        # otherwise fall back to the study's own default_tier. This is the only
+        # part of the decision that is this guard's own — owner bypass and the
+        # tier ladder go through the shared predicate, so the route gate and the
+        # body-time gates cannot drift apart.
         resolved_min_tier = min_tier if min_tier is not None else row.default_tier
-
-        # Tier comparison — public-by-absence when no study_access row.
-        effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
-        if _TIER_ORDER[effective_tier] >= _TIER_ORDER[resolved_min_tier]:
+        if _access_row_allows(row, caller=p, min_tier=resolved_min_tier):
             return
         raise HTTPException(
             status_code=403,

@@ -27,13 +27,16 @@ async def fetch_active_study_idxs_for_prep_sample(
     """Return non-retired qiita.prep_sample_to_study study_idxs for this
     prep_sample. Empty list when every link is retired or the prep_sample is
     orphaned. The bare membership set is uncapped because the per-study
-    admin-access gate must see every linked study to be correct."""
-    rows = await pool_or_conn.fetch(
-        "SELECT study_idx FROM qiita.prep_sample_to_study"
-        " WHERE prep_sample_idx = $1 AND retired = false",
-        prep_sample_idx,
+    admin-access gate must see every linked study to be correct.
+
+    Delegates to the batched form rather than spelling the predicate again: one
+    query either way, and "which links are active" then has one definition. The
+    two disagreeing would put the write gate (which authorizes off this one) and
+    the read gates (which authorize off the batch) on different answers.
+    """
+    return (await fetch_active_study_idxs_for_prep_samples(pool_or_conn, [prep_sample_idx])).get(
+        prep_sample_idx, []
     )
-    return [r["study_idx"] for r in rows]
 
 
 async def fetch_active_study_idxs_for_prep_samples(
