@@ -262,13 +262,17 @@ def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
     from qiita_control_plane.auth.tickets import sign_ticket
 
     @asynccontextmanager
-    async def fake(conn, *, work_ticket_idx, relation="alignment"):
+    async def fake(conn, *, work_ticket_idx, columns, relation="alignment"):
+        # `columns` comes from the job itself and is signed verbatim, so this
+        # test exercises the real chain: the job's list → sign_ticket's
+        # allowlist → the DP's projection → the schema the job then binds.
         ticket = sign_ticket(
             table="alignment_visible",
             filter={
                 "alignment_idx": [alignment_idx],
                 "prep_sample_idx": prep_sample_idx,
             },
+            columns=list(columns),
             secret=data_plane["secret"],
         )
         url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"

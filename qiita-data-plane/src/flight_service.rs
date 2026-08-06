@@ -312,8 +312,9 @@ const ALLOWED_TABLES: &[&str] = &[
     // raw `alignment` is deliberately absent so a blocked feature can't reach an
     // OGU rollup. It holds host-depleted, derived per-read alignments (not raw
     // human reads), so — unlike read_masked — it is not the human-read privacy
-    // surface. Reads are projected to the coverage/OGU columns and always scoped
-    // by alignment_idx + prep_sample_idx (see build_query / ALIGNMENT_DOGET_PROJECTION).
+    // surface. Reads are projected to the ticket's signed column list — required
+    // here, unlike every other table — and always scoped by alignment_idx +
+    // prep_sample_idx (see build_query / ALIGNMENT_PROJECTION_COLUMNS).
     "alignment_visible",
 ];
 
@@ -331,21 +332,6 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     // Scopes an alignment DoGet to a single alignment run (feature-table consumer).
     "alignment_idx",
 ];
-
-/// Columns the `alignment` DoGet projects — exactly what the coverage +
-/// `woltka_ogu` feature-table computation needs, out of the ~20-column alignment
-/// row. Projection pushdown: the wide `tag_*` / `mate_*` columns never cross the
-/// wire. The OGU key (`genome_idx`) is derived compute-side from `feature_idx`
-/// via the reference's feature→genome map, so the raw `feature_idx` suffices here.
-///
-/// Coverage is breadth via miint `genome_coverage(alignments, ...)`, whose
-/// `alignments` relation needs only `reference (=feature_idx), position,
-/// stop_position` — it merges alignment spans per contig, so `cigar` is NOT
-/// required (unlike `compute_coverage_depth`, which we do not use). `alignment_idx`
-/// is intentionally absent: the DoGet is enforced to a single alignment run
-/// (see build_query), so every streamed row shares it and the consumer carries it.
-const ALIGNMENT_DOGET_PROJECTION: &str =
-    "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position";
 
 /// Columns a signed ticket may ask the alignment DoGet to project: every column
 /// of `qiita_lake.alignment`, which `alignment_visible` mirrors (`SELECT a.*`,
@@ -2683,7 +2669,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// The alignment DoGet surface: the exclusion-aware view `alignment_visible`, and
 /// ONLY that — never the raw `alignment` base table (which is out of
 /// `ALLOWED_TABLES`, so unreachable via `do_get`). `build_query` gives this name
-/// the `ALIGNMENT_DOGET_PROJECTION` and the mandatory (non-empty, single
+/// the mandatory projection column list and the mandatory (non-empty, single
 /// `alignment_idx`) scoping. Deliberately NOT recognizing the raw name: if
 /// `"alignment"` were ever re-added to `ALLOWED_TABLES` by mistake, it would fall
 /// through to a bare `SELECT *`, producing an obviously-malformed, unscoped result
@@ -2715,6 +2701,17 @@ fn build_query(
     // would silently ignore a column list rather than refuse it, which is the
     // silent-widening failure this mechanism exists to prevent.
     let projection = if columns.is_empty() {
+        // The alignment surface REQUIRES one. There is no server-side default to
+        // fall back to, deliberately: the consumer is the only component that
+        // knows which columns it binds, and a fallback here would be a second
+        // answer to that question, free to drift wider than what was asked for.
+        // A ticket minted before this shipped and redeemed after it lands here —
+        // loudly, within its 300 s TTL — rather than being silently widened.
+        if is_alignment_doget_surface(table) {
+            return Err(Status::invalid_argument(format!(
+                "{table} requires an explicit projection column list"
+            )));
+        }
         None
     } else {
         Some(projection_select_list(table, columns)?)
@@ -2767,11 +2764,11 @@ fn build_query(
         ));
     }
 
-    // A feature-table DoGet builds a table for exactly ONE alignment run, and
-    // alignment_idx is dropped from the projection (ALIGNMENT_DOGET_PROJECTION),
-    // so require it present and single-valued. Otherwise a ticket could omit the
-    // scope or pass several alignment_idx values and blend rows from
-    // heterogeneous runs into one indistinguishable stream. Fail loud.
+    // A feature-table DoGet builds a table for exactly ONE alignment run, and a
+    // consumer typically leaves alignment_idx out of its projection (every row
+    // shares it), so require it present and single-valued. Otherwise a ticket
+    // could omit the scope, or pass several alignment_idx values and blend rows
+    // from heterogeneous runs into one indistinguishable stream. Fail loud.
     if is_alignment_doget_surface(table) {
         match filter.get("alignment_idx") {
             Some(values) if values.len() == 1 => {}
@@ -2855,16 +2852,9 @@ fn build_query(
              WHERE {where_str}"
         )
     } else {
-        // A signed column list wins; it is the ticket saying exactly what it
-        // wants. Absent one, most tables stream every column and the alignment
-        // surface falls back to the hardcoded feature-table projection — a
-        // transitional fallback that becomes an error once every producer names
-        // its columns (see ALIGNMENT_DOGET_PROJECTION).
-        let select_list = match projection.as_deref() {
-            Some(signed) => signed,
-            None if is_alignment_doget_surface(table) => ALIGNMENT_DOGET_PROJECTION,
-            None => "*",
-        };
+        // The signed list if the ticket carried one; otherwise every column,
+        // which by the guard above can only be a table that takes no projection.
+        let select_list = projection.as_deref().unwrap_or("*");
         format!("SELECT {select_list} FROM {full_table} WHERE {where_str}")
     };
     Ok((sql, full_table))
@@ -5337,14 +5327,15 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(3), serde_json::Value::from(4)],
         );
-        let (sql, table) = build_query("alignment_visible", &filter, &[], &[]).unwrap();
+        let cols = columns(&["prep_sample_idx", "feature_idx", "position"]);
+        let (sql, table) = build_query("alignment_visible", &filter, &[], &cols).unwrap();
         assert_eq!(table, "qiita_lake.alignment_visible");
         assert!(
             sql.starts_with(
-                "SELECT prep_sample_idx, sequence_idx, feature_idx, flags, position, \
-                 stop_position FROM qiita_lake.alignment_visible WHERE"
+                "SELECT prep_sample_idx, feature_idx, position \
+                 FROM qiita_lake.alignment_visible WHERE"
             ),
-            "the view must get the projected coverage/OGU columns, got: {sql}"
+            "the view must get the ticket's signed columns, got: {sql}"
         );
         assert!(sql.contains("alignment_idx IN (7)"), "got: {sql}");
         assert!(sql.contains("prep_sample_idx IN (3,4)"), "got: {sql}");
@@ -5485,39 +5476,33 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_empty_columns_keeps_todays_projection() {
-        // Transitional, and deliberately so: a ticket minted before the consumer
-        // started naming its columns still gets the hardcoded projection, which
-        // is what lets the producer and the server be deployed in either order.
-        // Once every producer sends a list this becomes an error, and this test
-        // goes away with it.
+    fn alignment_doget_without_columns_is_rejected() {
+        // The alignment surface has no default projection any more: the consumer
+        // names its columns or gets nothing. Falling back to a server-side list
+        // would put the wrong component in charge of the answer — only the job
+        // knows what it binds — and a fallback that drifted wider would ship
+        // `cigar` (~96% of the row) to callers that never asked.
         //
         // Empty and absent are one case, not two, and cannot be told apart here:
         // `#[serde(default)]` renders an omitted field as an empty Vec, exactly
-        // as it does for `members`. An explicitly-empty list is refused at mint
-        // instead, which is the layer where the distinction still exists.
-        let (sql, _) = build_query("alignment_visible", &alignment_scope(), &[], &[]).unwrap();
-        assert!(
-            sql.starts_with(&format!(
-                "SELECT {ALIGNMENT_DOGET_PROJECTION} FROM qiita_lake.alignment_visible WHERE"
-            )),
-            "no column list must keep today's projection, got: {sql}"
-        );
-    }
+        // as it does for `members`. Both are refused. An explicitly-empty list
+        // is additionally refused at mint, which is the one layer where the
+        // distinction still exists.
+        let err = build_query("alignment_visible", &alignment_scope(), &[], &[])
+            .expect_err("an alignment ticket with no column list must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err}");
 
-    #[test]
-    fn todays_projection_is_requestable_through_the_allowlist() {
-        // The migration's precondition: the consumer must be able to ask for
-        // exactly what it already gets. If a name in the hardcoded projection
-        // were missing from — or misspelled in — the allowlist, the consumer
-        // would start naming its columns and every ticket would fail at mint.
-        let cols = columns(&ALIGNMENT_DOGET_PROJECTION.split(", ").collect::<Vec<_>>());
-        let (sql, _) = build_query("alignment_visible", &alignment_scope(), &[], &cols).unwrap();
+        // The guard is specific to the projected surface: every other table
+        // still streams SELECT * with no column list, which is what keeps this
+        // change scoped to the one surface that needed it.
+        let mut reference = auth::TicketFilter::new();
+        reference.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
         assert!(
-            sql.starts_with(&format!(
-                "SELECT {ALIGNMENT_DOGET_PROJECTION} FROM qiita_lake.alignment_visible WHERE"
-            )),
-            "the signed form of today's projection must reproduce it exactly, got: {sql}"
+            build_query("reference_taxonomy", &reference, &[], &[]).is_ok(),
+            "an unprojected table must not have acquired a column requirement"
         );
     }
 
@@ -5614,7 +5599,13 @@ mod tests {
                 serde_json::Value::from(prep_b),
             ],
         );
-        let (sql, table) = build_query("alignment_visible", &filter, &[], &[]).unwrap();
+        let (sql, table) = build_query(
+            "alignment_visible",
+            &filter,
+            &[],
+            &columns(FEATURE_TABLE_COLUMNS),
+        )
+        .unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -5700,7 +5691,13 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(prep)],
         );
-        let (sql, table) = build_query("alignment_visible", &filter, &[], &[]).unwrap();
+        let (sql, table) = build_query(
+            "alignment_visible",
+            &filter,
+            &[],
+            &columns(FEATURE_TABLE_COLUMNS),
+        )
+        .unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -5853,8 +5850,12 @@ mod tests {
     // what the encoder stamped into each record-batch message.
     // ------------------------------------------------------------------
 
-    /// Seed one alignment row and return a signed `alignment_visible` ticket for
-    /// it, plus a service wired to the same catalog.
+    /// Seed alignment rows and return a signed `alignment_visible` ticket for
+    /// them projecting `cols`, plus a service wired to the same catalog.
+    ///
+    /// Every row carries a `cigar` — the wide column the projection exists to
+    /// keep off the wire — so a test can prove both that asking for it delivers
+    /// it and that not asking for it costs nothing.
     ///
     /// The returned `TempDir` owns the service's staging and scratch roots and
     /// must stay bound for the test's lifetime — dropping it removes the
@@ -5863,7 +5864,11 @@ mod tests {
     /// self-cleaning rather than `/tmp` literals, so a DoGet that later does
     /// write cannot litter a shared directory.
     #[cfg(feature = "integration")]
-    fn doget_fixture(align: i64, prep: i64) -> (QiitaFlightService, Vec<u8>, tempfile::TempDir) {
+    fn doget_fixture(
+        align: i64,
+        prep: i64,
+        cols: &[&str],
+    ) -> (QiitaFlightService, Vec<u8>, tempfile::TempDir) {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         {
@@ -5878,13 +5883,18 @@ mod tests {
                 "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
                  INSERT INTO qiita_lake.alignment \
                      (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, \
-                      flags, position, stop_position) \
-                 SELECT {align}, {prep}, i, 1, 0, 100, 200 FROM range(20000) t(i);"
+                      flags, position, stop_position, cigar) \
+                 SELECT {align}, {prep}, i, 1, 0, 100, 200, '100M' FROM range(20000) t(i);"
             ))
             .unwrap();
         }
+        let quoted = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
         let payload = format!(
-            r#"{{"table":"alignment_visible","filter":{{"alignment_idx":[{align}],"prep_sample_idx":[{prep}]}}}}"#
+            r#"{{"table":"alignment_visible","filter":{{"alignment_idx":[{align}],"prep_sample_idx":[{prep}]}},"columns":[{quoted}]}}"#
         );
         let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
         let tmp = tempfile::tempdir().unwrap();
@@ -5899,6 +5909,19 @@ mod tests {
         );
         (service, ticket, tmp)
     }
+
+    /// The projection the feature-table consumer signs. Mirrors
+    /// `_ALIGNMENT_COLUMNS` in `estimate_feature_table.py`; used by the M1
+    /// compression tests, which care about the stream, not the column set.
+    #[cfg(feature = "integration")]
+    const FEATURE_TABLE_COLUMNS: &[&str] = &[
+        "prep_sample_idx",
+        "sequence_idx",
+        "feature_idx",
+        "flags",
+        "position",
+        "stop_position",
+    ];
 
     /// Collect a DoGet response, returning the codec stamped into each
     /// record-batch message and the total payload size.
@@ -5948,7 +5971,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     async fn doget_with_zstd_header_stamps_the_codec_into_every_batch_message() {
-        let (service, ticket, _tmp) = doget_fixture(977_000, 977_010);
+        let (service, ticket, _tmp) = doget_fixture(977_000, 977_010, FEATURE_TABLE_COLUMNS);
         let (codecs, compressed) = doget_codecs(&service, ticket.clone(), Some("zstd"))
             .await
             .expect("zstd DoGet should succeed");
@@ -5977,7 +6000,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     async fn doget_without_the_header_is_byte_identical_to_today() {
-        let (service, ticket, _tmp) = doget_fixture(977_100, 977_110);
+        let (service, ticket, _tmp) = doget_fixture(977_100, 977_110, FEATURE_TABLE_COLUMNS);
         for header in [None, Some("none")] {
             let (codecs, _) = doget_codecs(&service, ticket.clone(), header)
                 .await
@@ -5994,11 +6017,136 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
-        let (service, ticket, _tmp) = doget_fixture(977_200, 977_210);
+        let (service, ticket, _tmp) = doget_fixture(977_200, 977_210, FEATURE_TABLE_COLUMNS);
         let err = doget_codecs(&service, ticket, Some("lz4"))
             .await
             .expect_err("lz4 must be rejected, not silently ignored");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ------------------------------------------------------------------
+    // Signed projection (M2) — end to end, over a real Arrow stream. The unit
+    // tests prove build_query emits the right SQL; only these prove the ticket
+    // the control plane signs turns into the schema the consumer receives.
+    // ------------------------------------------------------------------
+
+    /// Drive a real `do_get` and return the streamed schema's field names.
+    #[cfg(feature = "integration")]
+    async fn doget_schema(service: &QiitaFlightService, ticket: Vec<u8>) -> Vec<String> {
+        let response = service
+            .do_get(Request::new(Ticket {
+                ticket: ticket.into(),
+            }))
+            .await
+            .expect("DoGet should succeed");
+        let messages: Vec<FlightData> = response
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, Status>>()
+            .expect("stream should not error");
+        messages
+            .iter()
+            .find_map(|m| arrow_schema::Schema::try_from(m).ok())
+            .expect("no schema message in the stream")
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_streams_cigar_only_when_the_ticket_signed_it() {
+        // The whole point of the signed projection, proven end to end. Two
+        // tickets over identical rows; the only difference is what was signed.
+        let (service, with, _tmp) = doget_fixture(
+            977_300,
+            977_310,
+            &["prep_sample_idx", "feature_idx", "cigar"],
+        );
+        assert_eq!(
+            doget_schema(&service, with).await,
+            vec!["prep_sample_idx", "feature_idx", "cigar"],
+            "the stream must carry exactly the signed columns, in the signed order"
+        );
+
+        let (service, without, _tmp) = doget_fixture(977_400, 977_410, FEATURE_TABLE_COLUMNS);
+        let fields = doget_schema(&service, without).await;
+        assert_eq!(fields, FEATURE_TABLE_COLUMNS);
+        assert!(
+            !fields.iter().any(|f| f == "cigar"),
+            "cigar reached a consumer that never asked for it: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn alignment_doget_without_a_signed_projection_is_rejected() {
+        // The retired fallback, pinned end to end. A ticket minted before this
+        // shipped and redeemed inside its 300 s TTL after it lands here.
+        let (service, _, _tmp) = doget_fixture(977_500, 977_510, FEATURE_TABLE_COLUMNS);
+        let payload = r#"{"table":"alignment_visible","filter":{"alignment_idx":[977500],"prep_sample_idx":[977510]}}"#;
+        let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
+        let err = service
+            .do_get(Request::new(Ticket {
+                ticket: ticket.into(),
+            }))
+            .await
+            .err()
+            .expect("a columnless alignment ticket must be refused");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn projection_allowlist_matches_the_alignment_schema_exactly() {
+        // ALIGNMENT_PROJECTION_COLUMNS is hand-copied from the DDL two files
+        // over, and nothing else checks it. Drift is quiet in both directions:
+        // a column added to the table but not the allowlist simply cannot be
+        // requested (the feature silently does not exist), and one removed from
+        // the table but left in the allowlist mints tickets that fail at bind
+        // time, on the cluster, rather than here.
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(
+            &conn,
+            &delete_test_catalog_connstr(),
+            &delete_test_data_path(),
+        )
+        .unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+        ducklake::ensure_exclusion_tables(&conn).unwrap();
+
+        // The VIEW, not the base table: `alignment_visible` is what a ticket can
+        // name, and its `SELECT a.*` is what makes the two column sets equal.
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM duckdb_columns() WHERE table_name = 'alignment_visible'",
+            )
+            .unwrap();
+        let actual: std::collections::BTreeSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let allowed: std::collections::BTreeSet<String> = ALIGNMENT_PROJECTION_COLUMNS
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+
+        assert_eq!(
+            actual,
+            allowed,
+            "the projection allowlist and alignment_visible's columns have drifted; \
+             only in the view: {:?}; only in the allowlist: {:?}",
+            actual.difference(&allowed).collect::<Vec<_>>(),
+            allowed.difference(&actual).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
