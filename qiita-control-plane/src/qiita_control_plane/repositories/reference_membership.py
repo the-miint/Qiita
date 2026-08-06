@@ -18,6 +18,11 @@ near the stored bytes — `reference_sequence_hashes` reads the per-sequence con
 hashes the features were minted on, which is what the read mask's adapter identity
 is derived from.
 
+Joined to `feature_genome` it is also the reference's GENOME MAP — the
+feature_idx → genome lookup a client rolls alignment rows up through
+(`fetch_genome_map`). That is the same row set `actions.library.export_member_genome`
+streams to Parquet for the compute side, so the two are required to agree.
+
 Every helper accepts a pool or a connection so they compose standalone (on the
 pool) or inside an open transaction (the finalizer counts on a txn `conn`).
 """
@@ -89,6 +94,54 @@ async def reference_sequence_set_hash(
     for sequence_hash in hashes:
         digest.update(sequence_hash)
     return digest.hexdigest()
+
+
+# The genome map's row set, shared verbatim by the fetch and the count so the
+# size a 413 reports is provably the size the fetch refused — an independently
+# written count would drift into a lie.
+_GENOME_MAP_FROM = (
+    " FROM qiita.reference_membership rm"
+    " JOIN qiita.feature_genome fg USING (feature_idx)"
+    " JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
+    " WHERE rm.reference_idx = $1"
+)
+
+
+async def fetch_genome_map(
+    db: asyncpg.Pool | asyncpg.Connection, reference_idx: int, *, limit: int
+) -> list[asyncpg.Record]:
+    """The reference's feature_idx → genome lookup: one row per (feature, genome)
+    pair with the genome's `source` / `source_id` provenance, ordered by
+    (feature_idx, genome_idx), at most `limit` rows.
+
+    `actions.library.export_member_genome`'s row set, widened with the genome
+    columns — the two MUST agree on which features have genomes, since the compute
+    job consumes the Parquet and the client consumes this. Same INNER JOIN, so a
+    feature with no genome is dropped by both: it cannot be rolled up.
+
+    Ordered, unlike `export_member_genome` (which dropped its ORDER BY because no
+    consumer needed one): a capped read needs a stable order for the cap to mean
+    anything, and a client diffing two pulls of an unchanged reference should see
+    no churn. The many-to-many `feature_genome` means a shared plasmid yields one
+    row per genome — this returns PAIRS, not features.
+    """
+    return await db.fetch(
+        "SELECT rm.feature_idx, fg.genome_idx, g.source, g.source_id"
+        + _GENOME_MAP_FROM
+        + " ORDER BY rm.feature_idx, fg.genome_idx LIMIT $2",
+        reference_idx,
+        limit,
+    )
+
+
+async def count_genome_map(db: asyncpg.Pool | asyncpg.Connection, reference_idx: int) -> int:
+    """How many (feature, genome) pairs `fetch_genome_map` would return uncapped.
+
+    Only the refusal path pays for this — the route over-fetches by one to detect
+    the overflow, then counts to name the real size, so a caller learns whether
+    they are 2x or 100x over the cap.
+    """
+    return await db.fetchval("SELECT count(*)" + _GENOME_MAP_FROM, reference_idx)
 
 
 async def count_reference_shards(db: asyncpg.Pool | asyncpg.Connection, reference_idx: int) -> int:
