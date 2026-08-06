@@ -195,5 +195,16 @@ async def create_alignment_doget_ticket(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     filter_ = {"alignment_idx": [alignment_idx], "prep_sample_idx": prep_sample_idx}
-    ticket_bytes = sign_ticket(table=_ALIGNMENT_TABLE, filter=filter_, secret=signing_key)
+    # The projection allowlist lives at the signing boundary, not here, so no
+    # route can mint an unvalidated one — same shape as the scope check above:
+    # one shared rule, each boundary translating to its own error type.
+    try:
+        ticket_bytes = sign_ticket(
+            table=_ALIGNMENT_TABLE,
+            filter=filter_,
+            columns=body.columns,
+            secret=signing_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
