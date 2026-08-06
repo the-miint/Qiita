@@ -1361,6 +1361,12 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`docs/architecture.md` updated: N=0 sharded path no longer exists (#431).**
+  `plan-shards` raises on N=0 (no longer a no-op), and a CLI guard
+  (`--shard-index requires --genome-map`) catches the case before any
+  network call. Two bullets in the sharded-index fan-out section
+  corrected to reflect the current behavior.
+
 - **One `cap_rows` helper behind every capped list route (#427).** The
   fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
   list route — the two sequenced-sample rosters, the prep-sample study roster,
