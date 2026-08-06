@@ -15,6 +15,8 @@ top-level transaction; the caller controls transaction scope so multiple
 calls compose atomically on one connection.
 """
 
+from collections.abc import Sequence
+
 import asyncpg
 
 
@@ -32,6 +34,41 @@ async def fetch_active_study_idxs_for_prep_sample(
         prep_sample_idx,
     )
     return [r["study_idx"] for r in rows]
+
+
+async def fetch_active_study_idxs_for_prep_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    prep_sample_idxs: Sequence[int],
+) -> dict[int, list[int]]:
+    """Batched `fetch_active_study_idxs_for_prep_sample`: one query for a whole
+    cohort, keyed by prep_sample_idx.
+
+    A sample with no active link is **absent from the mapping**, not present
+    with an empty list — the caller must decide what an unlinked sample means,
+    and the two gates that ask differ. The work-ticket submit gate lets it pass;
+    the alignment read gate denies it, because failing open on a data-integrity
+    anomaly is the wrong default when the question is "may this person read
+    this".
+
+    Exists so a per-study access check over a large cohort costs one query plus
+    one lookup per DISTINCT study, rather than one round trip per sample — a
+    pool's cohort can run to thousands. Uncapped for the same reason the
+    single-sample version is: the gate must see every linked study to be
+    correct. Empty input short-circuits, mirroring
+    `list_incomplete_alignment_samples`.
+    """
+    if not prep_sample_idxs:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT prep_sample_idx, study_idx FROM qiita.prep_sample_to_study"
+        " WHERE prep_sample_idx = ANY($1::bigint[]) AND retired = false"
+        " ORDER BY prep_sample_idx, study_idx",
+        list(prep_sample_idxs),
+    )
+    out: dict[int, list[int]] = {}
+    for row in rows:
+        out.setdefault(row["prep_sample_idx"], []).append(row["study_idx"])
+    return out
 
 
 async def fetch_active_studies_for_prep_sample(

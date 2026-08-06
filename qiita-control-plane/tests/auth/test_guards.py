@@ -989,3 +989,119 @@ async def test_require_caller_owns_pool_missing_pool_raises_404(run_and_pool_ctx
             pool=run_and_pool_ctx["pool"],
         )
     assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# require_caller_has_tier_on_all_studies — the tier-parameterized generalization
+# of require_caller_has_admin_on_all_studies. The ADMIN form is a wrapper, so
+# these also cover it.
+# ---------------------------------------------------------------------------
+
+
+async def _grant(ctx, tier: Tier) -> None:
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+        " VALUES ($1, $2, $3)",
+        ctx["study_idx"],
+        ctx["caller_idx"],
+        tier,
+    )
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("granted", "passes"),
+    [
+        pytest.param(Tier.VIEWER, True, id="viewer-meets-viewer"),
+        pytest.param(Tier.MEMBER, True, id="member-exceeds-viewer"),
+        pytest.param(Tier.ADMIN, True, id="admin-exceeds-viewer"),
+        pytest.param(None, False, id="no-row-is-public-and-fails"),
+    ],
+)
+async def test_tier_on_all_studies_compares_by_rank_not_string(study_access_ctx, granted, passes):
+    """A minimum of VIEWER admits VIEWER and everything above it.
+
+    The comparison must go through `_TIER_ORDER`, never the enum members: `Tier`
+    is a StrEnum and compares LEXICALLY, where 'admin' < 'member' < 'public' <
+    'viewer'. A naive `>=` would admit a PUBLIC caller at a VIEWER minimum and
+    reject an ADMIN one — silently inverting the ladder on a read gate.
+    """
+    from qiita_control_plane.auth.guards import require_caller_has_tier_on_all_studies
+
+    if granted is not None:
+        await _grant(study_access_ctx, granted)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+
+    async def _call():
+        await require_caller_has_tier_on_all_studies(
+            study_access_ctx["pool"],
+            caller=caller,
+            study_idxs=[study_access_ctx["study_idx"]],
+            min_tier=Tier.VIEWER,
+        )
+
+    if passes:
+        await _call()
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await _call()
+        assert exc.value.status_code == 403
+        assert str(study_access_ctx["study_idx"]) in str(exc.value.detail)
+
+
+@pytest.mark.db
+async def test_tier_on_all_studies_admin_wrapper_is_unchanged(study_access_ctx):
+    """The ADMIN-specific entry point keeps its exact behaviour and message.
+
+    It has four production call sites; the generalization must be invisible to
+    them. VIEWER is enough for the new read gate but must still fail the old
+    write gate.
+    """
+    from qiita_control_plane.auth.guards import require_caller_has_admin_on_all_studies
+
+    await _grant(study_access_ctx, Tier.VIEWER)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await require_caller_has_admin_on_all_studies(
+            study_access_ctx["pool"],
+            caller=caller,
+            study_idxs=[study_access_ctx["study_idx"]],
+        )
+    assert exc.value.status_code == 403
+    assert "'admin'" in str(exc.value.detail)
+
+
+@pytest.mark.db
+async def test_tier_on_all_studies_keeps_the_owner_and_bypass_shortcuts(study_access_ctx):
+    """Owner and role bypass survive the generalization — the owner holds no
+    study_access row, and wet_lab_admin+ short-circuits before any DB read."""
+    from qiita_control_plane.auth.guards import require_caller_has_tier_on_all_studies
+
+    owner = _human_with_idx(study_access_ctx["owner_idx"])
+    await require_caller_has_tier_on_all_studies(
+        study_access_ctx["pool"],
+        caller=owner,
+        study_idxs=[study_access_ctx["study_idx"]],
+        min_tier=Tier.VIEWER,
+    )
+    wla = _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.WET_LAB_ADMIN)
+    await require_caller_has_tier_on_all_studies(
+        study_access_ctx["pool"],
+        caller=wla,
+        study_idxs=[study_access_ctx["study_idx"]],
+        min_tier=Tier.VIEWER,
+    )
+
+
+@pytest.mark.db
+async def test_tier_on_all_studies_401_on_anonymous(study_access_ctx):
+    from qiita_control_plane.auth.guards import require_caller_has_tier_on_all_studies
+
+    with pytest.raises(HTTPException) as exc:
+        await require_caller_has_tier_on_all_studies(
+            study_access_ctx["pool"],
+            caller=_anon(),
+            study_idxs=[study_access_ctx["study_idx"]],
+            min_tier=Tier.VIEWER,
+        )
+    assert exc.value.status_code == 401

@@ -413,25 +413,26 @@ async def require_prep_sample_exists(
         )
 
 
-async def require_caller_has_admin_on_all_studies(
+async def require_caller_has_tier_on_all_studies(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     caller: Principal,
     study_idxs: list[int],
+    min_tier: Tier,
     bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
 ) -> None:
-    """Require the caller to have `Tier.ADMIN` access to every study_idx
+    """Require the caller to hold `min_tier` or higher on every study_idx
     in the list, deduplicated.
 
     Per study, in input order: role-bypass at or above `bypass_role`
     short-circuits with no DB lookup; 401 on Anonymous (defense in depth);
-    owner bypass or `Tier.ADMIN` passes; anything below 403s naming the
-    offending study. A non-existent study row is silently skipped — the
-    composer's FK violation surfaces as 422 from one source. Precedence:
-    when the body has both a missing study and a no-access study, the
-    403 fires on whichever appears first in the input, not 422.
-    Iteration is deduped because secondary_study_idxs may repeat the
-    primary on misuse paths the composer rejects later.
+    owner bypass or a sufficient tier passes; anything below 403s naming
+    the offending study. A non-existent study row is silently skipped —
+    the composer's FK violation surfaces as 422 from one source.
+    Precedence: when the body has both a missing study and a no-access
+    study, the 403 fires on whichever appears first in the input, not
+    422. Iteration is deduped because secondary_study_idxs may repeat
+    the primary on misuse paths the composer rejects later.
 
     This policy has a second implementation: the mask-definition reads
     restate it as a SQL predicate
@@ -441,6 +442,11 @@ async def require_caller_has_admin_on_all_studies(
     the treatment of a missing study, the orphan case — has to land there
     in the same PR, or mask discovery and ticket submission disagree about
     the same sample.
+
+    Comparison goes through `_TIER_ORDER`, never the enum members: `Tier`
+    is a `StrEnum` and compares LEXICALLY, where 'admin' < 'member' <
+    'public' < 'viewer'. A bare `>=` would admit a PUBLIC caller at a
+    VIEWER minimum and reject an ADMIN one.
     """
     if isinstance(caller, Anonymous):
         raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
@@ -457,14 +463,40 @@ async def require_caller_has_admin_on_all_studies(
             continue
         if row.owner_idx == caller.principal_idx:
             continue
-        if row.access_tier == Tier.ADMIN:
+        # Public-by-absence when the caller holds no study_access row,
+        # matching require_study_access.
+        effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
+        if _TIER_ORDER[effective_tier] >= _TIER_ORDER[min_tier]:
             continue
         raise HTTPException(
             status_code=403,
             detail=(
-                f"requires study access at tier {str(Tier.ADMIN)!r} or higher on study {study_idx}"
+                f"requires study access at tier {str(min_tier)!r} or higher on study {study_idx}"
             ),
         )
+
+
+async def require_caller_has_admin_on_all_studies(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    study_idxs: list[int],
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> None:
+    """`Tier.ADMIN` form of `require_caller_has_tier_on_all_studies`.
+
+    The authoring routes' gate (sequenced-sample compose, prep_sample-scoped
+    work-ticket submit). Kept as a named entry point rather than folded into
+    its callers so the ADMIN policy stays greppable and its call sites read
+    as a policy, not a parameter.
+    """
+    await require_caller_has_tier_on_all_studies(
+        pool_or_conn,
+        caller=caller,
+        study_idxs=study_idxs,
+        min_tier=Tier.ADMIN,
+        bypass_role=bypass_role,
+    )
 
 
 async def _check_caller_owns_resource(
