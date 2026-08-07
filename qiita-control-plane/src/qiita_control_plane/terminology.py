@@ -204,6 +204,13 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
             # blank or whitespace-only cell has to arrive as None.
             alternate_label = row[_TERMS_COLUMN_ALTERNATE_LABEL].strip() or None
 
+            # A blank label means the source named no term, which is distinct
+            # from naming it the empty string. A label the source did supply
+            # passes through untouched, since a release's own spelling of a
+            # name is what the database is meant to agree with.
+            label_cell = row[_TERMS_COLUMN_LABEL]
+            label = label_cell if label_cell.strip() else None
+
             # Reject typo'd is_obsolete values explicitly so they surface
             # at parse time rather than silently coercing to False.
             is_obsolete_text = row[_TERMS_COLUMN_IS_OBSOLETE].lower()
@@ -226,7 +233,7 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
             rows.append(
                 ParsedTerm(
                     term_id=term_id,
-                    label=row[_TERMS_COLUMN_LABEL],
+                    label=label,
                     alternate_label=alternate_label,
                     is_obsolete=is_obsolete_text == _TSV_TRUE,
                     replaced_by_term_id=replaced_by,
@@ -238,7 +245,7 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
 
 def write_terms_tsv(path: Path, terms: list[ParsedTerm]) -> None:
     """Write `terms` as the tab-separated terms table at `path`, headed by
-    TERMS_TSV_COLUMNS. An alternate_label, replaced_by_term_id, or
+    TERMS_TSV_COLUMNS. A label, alternate_label, replaced_by_term_id, or
     obsoletion_kind of None becomes an empty cell."""
     with path.open("w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
@@ -250,7 +257,7 @@ def write_terms_tsv(path: Path, terms: list[ParsedTerm]) -> None:
             writer.writerow(
                 [
                     term.term_id,
-                    term.label,
+                    term.label if term.label is not None else "",
                     term.alternate_label or "",
                     _TSV_TRUE if term.is_obsolete else _TSV_FALSE,
                     term.replaced_by_term_id or "",

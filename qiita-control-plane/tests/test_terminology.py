@@ -347,6 +347,48 @@ def test_write_terms_tsv(tmp_path):
     assert _parse_terms_tsv(path) == terms
 
 
+def test__parse_terms_tsv_blank_label(tmp_path):
+    """Tests the case where the label cell is blank: it parses to None rather
+    than an empty string, so a source that names no term is distinguishable
+    from one that names it the empty string, and the load can decide what to
+    store."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "NCBI:12\t\t\ttrue\t\tsource_deprecated\n"
+    )
+
+    result = _parse_terms_tsv(path)
+
+    expected = [
+        parsed_term(
+            "NCBI:12",
+            None,
+            is_obsolete=True,
+            obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+        )
+    ]
+    assert result == expected
+
+
+def test_write_terms_tsv_unnamed_term(tmp_path):
+    """Tests the case where a term carries no label: it is written as an empty
+    cell and reads back through the parser as None."""
+    terms = [
+        parsed_term(
+            "NCBI:12",
+            None,
+            is_obsolete=True,
+            obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+        )
+    ]
+    path = tmp_path / TERMS_TSV_FILENAME
+
+    write_terms_tsv(path, terms)
+
+    assert _parse_terms_tsv(path) == terms
+
+
 def test__parse_terms_tsv_blank_alternate_label(tmp_path):
     """Tests the case where the alternate_label cell is blank or holds only
     whitespace: both arrive as None, because an absent second name is

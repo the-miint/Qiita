@@ -25,8 +25,6 @@ OWL_DEPRECATED_PROPERTY = "owl:deprecated"
 OBO_REPLACED_BY_PROPERTY = "IAO:0100001"
 OBO_ALTERNATIVE_ID_PROPERTY = "oboInOwl:hasAlternativeId"
 
-_MERGED_LABEL_TEMPLATE = "merged into {survivor_term_id}"
-
 
 @dataclass(frozen=True)
 class ExportedClass:
@@ -121,13 +119,15 @@ def _assemble_terms(exported_classes: list[ExportedClass]) -> list[ParsedTerm]:
         _term_for_class(exported_class, merge_survivors) for exported_class in exported_classes
     ]
 
-    # An absorbed term id with no class of its own has no label to carry
-    # forward, so one naming the surviving class stands in for it.
+    # An absorbed term id with no class of its own is left unnamed: the
+    # release carries no class to take a label from, and what to store in its
+    # place depends on whether the term is already known, which is not visible
+    # from here.
     exported_term_ids = {exported_class.term_id for exported_class in exported_classes}
     terms += [
         ParsedTerm(
             term_id=merged_term_id,
-            label=_MERGED_LABEL_TEMPLATE.format(survivor_term_id=survivor_term_id),
+            label=None,
             alternate_label=None,
             is_obsolete=True,
             replaced_by_term_id=survivor_term_id,

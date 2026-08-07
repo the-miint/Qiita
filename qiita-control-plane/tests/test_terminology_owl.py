@@ -73,7 +73,7 @@ def test_build_terms_prefix_filter():
         parsed_term("UBERON:0003", "molar"),
         parsed_term(
             "UBERON:0004",
-            "merged into UBERON:0003",
+            None,
             is_obsolete=True,
             replaced_by_term_id="UBERON:0003",
             obsoletion_kind=_MERGED,
@@ -88,8 +88,9 @@ def test_build_terms_prefix_filter():
 
 
 def test__assemble_terms_merge_without_class():
-    """Tests the case where an absorbed term id has no class of its own: a
-    label naming the surviving class is synthesized for it."""
+    """Tests the case where an absorbed term id has no class of its own: it
+    carries no label, because the release names no class to take one from and
+    what to store instead is not the extractor's to decide."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", alternative_term_ids=("UBERON:0900",))
     ]
@@ -100,7 +101,7 @@ def test__assemble_terms_merge_without_class():
         parsed_term("UBERON:0002", "tooth"),
         parsed_term(
             "UBERON:0900",
-            "merged into UBERON:0002",
+            None,
             is_obsolete=True,
             replaced_by_term_id="UBERON:0002",
             obsoletion_kind=_MERGED,
@@ -181,7 +182,7 @@ def test__assemble_terms_duplicate_survivor_claim(caplog):
         parsed_term("UBERON:0003", "molar"),
         parsed_term(
             "UBERON:0900",
-            "merged into UBERON:0002",
+            None,
             is_obsolete=True,
             replaced_by_term_id="UBERON:0002",
             obsoletion_kind=_MERGED,

@@ -48,7 +48,7 @@ def exported_class(
 
 def parsed_term(
     term_id: str,
-    label: str,
+    label: str | None,
     *,
     alternate_label: str | None = None,
     is_obsolete: bool = False,

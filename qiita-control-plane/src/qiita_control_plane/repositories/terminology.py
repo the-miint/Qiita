@@ -10,7 +10,7 @@ caller cannot forget to wrap the multi-statement workflow atomically.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import asyncpg
 from qiita_common.models import TerminologyStatus, TerminologyTermObsoletionKind
@@ -54,13 +54,18 @@ class TerminologyImportAnomaly(Exception):
 class ParsedTerm:
     """One term in an incoming release batch.
 
+    A `label` of None says the source supplies no name for the term, which
+    a source can do for a term id it retired without ever naming. What gets
+    stored in its place is decided against the pre-import snapshot, not
+    here.
+
     `alternate_label` is the second name the source supplies for the term,
     None when it supplies none. A source that names its terms only one way
     leaves it None throughout.
     """
 
     term_id: str
-    label: str
+    label: str | None
     alternate_label: str | None
     is_obsolete: bool
     replaced_by_term_id: str | None
@@ -198,7 +203,9 @@ async def import_terminology_release(
     silent_drop_synthetics = _handle_silent_drops(
         parsed_terms, prior_state, tolerate_anomalies=tolerate_anomalies
     )
-    effective_terms = parsed_terms + silent_drop_synthetics
+    # Settle what an unnamed term is stored under before anything reads a
+    # name, so the upsert and the counters see the same values.
+    effective_terms = _resolve_missing_names(parsed_terms + silent_drop_synthetics, prior_state)
 
     # Pass 1: upsert every incoming term with replaced_by=NULL.
     await _upsert_terms_without_replaced_by(
@@ -337,10 +344,10 @@ def _handle_silent_drops(
     marker. Already-obsolete terms absent from the batch are benign.
 
     Fail mode raises TerminologyImportAnomaly. Tolerate mode returns
-    synthetic ParsedTerm rows for the dropped term_ids — both names
-    carried forward from prior DB state, is_obsolete=True,
-    replaced_by_term_id None, obsoletion_kind=SILENTLY_DROPPED. Returns
-    the empty list when no silent drops are present."""
+    synthetic ParsedTerm rows for the dropped term_ids — unnamed, so both
+    names already stored are what they keep, with is_obsolete=True,
+    replaced_by_term_id None, and obsoletion_kind=SILENTLY_DROPPED.
+    Returns the empty list when no silent drops are present."""
     incoming_term_ids = {term.term_id for term in parsed_terms}
     silently_dropped = sorted(
         term_id
@@ -354,14 +361,43 @@ def _handle_silent_drops(
     return [
         ParsedTerm(
             term_id=term_id,
-            label=prior_state[term_id].label,
-            alternate_label=prior_state[term_id].alternate_label,
+            label=None,
+            alternate_label=None,
             is_obsolete=True,
             replaced_by_term_id=None,
             obsoletion_kind=TerminologyTermObsoletionKind.SILENTLY_DROPPED,
         )
         for term_id in silently_dropped
     ]
+
+
+def _resolve_missing_names(
+    parsed_terms: list[ParsedTerm],
+    prior_state: dict[str, PriorTermState],
+) -> list[ParsedTerm]:
+    """Settle both names of every term the source left unnamed: the ones
+    already held for it, or its own term_id and no second name when nothing
+    is held.
+
+    An absent label is the source saying nothing about the term rather than
+    asserting it has no names, so neither name is that release's to clear —
+    which is why both are settled together here. A term the source does name
+    is left alone, and the release stays authoritative for its second name.
+
+    The label column cannot be empty and the extractor that built the batch
+    cannot see what is stored, so falling back to the term_id keeps the row
+    honest: it asserts only what the source actually said, and a later
+    release naming the term overwrites it like any other label."""
+    resolved: list[ParsedTerm] = []
+    for term in parsed_terms:
+        if term.label is not None:
+            resolved.append(term)
+            continue
+        prior = prior_state.get(term.term_id)
+        stored_label = prior.label if prior is not None else term.term_id
+        stored_alternate_label = prior.alternate_label if prior is not None else None
+        resolved.append(replace(term, label=stored_label, alternate_label=stored_alternate_label))
+    return resolved
 
 
 async def _upsert_terms_without_replaced_by(

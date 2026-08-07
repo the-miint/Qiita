@@ -444,3 +444,145 @@ async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
     )
     expected = {"is_obsolete": True, "replaced_by": None}
     assert dict(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# import_terminology_release — resolving a term the source does not name
+# ---------------------------------------------------------------------------
+
+
+async def test_import_terminology_release_unnamed_term_keeps_stored_names(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a term the database already holds is merged away
+    by a release that supplies no name for it: both stored names survive.
+
+    A source that retires a term id often stops naming it, so the release
+    carries nothing for either name column. An absent label is the source
+    saying nothing about the term at all rather than asserting it has no
+    second name, so neither stored name is the release's to clear. The merge
+    is already recorded by is_obsolete, obsoletion_kind, and the replaced_by
+    pointer — the names are the only part a reader cannot reconstruct.
+    """
+    terminology_idx = await _load_release(
+        postgres_pool,
+        name="tr_unnamed_keeps_label",
+        version="1.0.0",
+        terms=[
+            parsed_term("TR:1", "mouth", alternate_label="gob"),
+            parsed_term("TR:2", "oral opening"),
+        ],
+    )
+    created_terminologies.append(terminology_idx)
+
+    await _load_release(
+        postgres_pool,
+        name="tr_unnamed_keeps_label",
+        version="2.0.0",
+        terms=[
+            parsed_term(
+                "TR:1",
+                None,
+                is_obsolete=True,
+                replaced_by_term_id="TR:2",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+            ),
+            parsed_term("TR:2", "oral opening"),
+        ],
+    )
+
+    row = await postgres_pool.fetchrow(
+        "SELECT tt.label, tt.alternate_label, tt.is_obsolete,"
+        "       tt.obsoletion_kind::text AS obsoletion_kind,"
+        "       survivor.term_id AS replaced_by_term_id"
+        "  FROM qiita.terminology_term tt"
+        "  LEFT JOIN qiita.terminology_term survivor ON survivor.idx = tt.replaced_by"
+        " WHERE tt.terminology_idx = $1 AND tt.term_id = $2",
+        terminology_idx,
+        "TR:1",
+    )
+    expected = {
+        "label": "mouth",
+        "alternate_label": "gob",
+        "is_obsolete": True,
+        "obsoletion_kind": TerminologyTermObsoletionKind.SOURCE_MERGED.value,
+        "replaced_by_term_id": "TR:2",
+    }
+    assert dict(row) == expected
+
+
+async def test_import_terminology_release_unnamed_new_term_falls_back_to_term_id(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a term the source does not name has never been
+    loaded before: its own term id becomes its label, since that is the only
+    thing anyone knows about it and the column cannot be empty."""
+    terminology_idx = await _load_release(
+        postgres_pool,
+        name="tr_unnamed_new_term",
+        version="1.0.0",
+        terms=[
+            parsed_term(
+                "TR:1",
+                None,
+                is_obsolete=True,
+                replaced_by_term_id="TR:2",
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+            ),
+            parsed_term("TR:2", "survivor"),
+            parsed_term(
+                "TR:3",
+                None,
+                is_obsolete=True,
+                obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+            ),
+        ],
+    )
+    created_terminologies.append(terminology_idx)
+
+    rows = await postgres_pool.fetch(
+        "SELECT term_id, label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 ORDER BY term_id",
+        terminology_idx,
+    )
+    expected = [
+        {"term_id": "TR:1", "label": "TR:1"},
+        {"term_id": "TR:2", "label": "survivor"},
+        {"term_id": "TR:3", "label": "TR:3"},
+    ]
+    assert [dict(row) for row in rows] == expected
+
+
+async def test_import_terminology_release_unnamed_term_is_not_a_label_update(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a reload merges away a term it does not name: the
+    carried-forward label is the one already stored, so the load reports no
+    label change."""
+    terminology_idx = await _load_release(
+        postgres_pool,
+        name="tr_unnamed_no_count",
+        version="1.0.0",
+        terms=[parsed_term("TR:1", "mouth"), parsed_term("TR:2", "oral opening")],
+    )
+    created_terminologies.append(terminology_idx)
+
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        result = await import_terminology_release(
+            conn,
+            name="tr_unnamed_no_count",
+            version="2.0.0",
+            parsed_terms=[
+                parsed_term(
+                    "TR:1",
+                    None,
+                    is_obsolete=True,
+                    replaced_by_term_id="TR:2",
+                    obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+                ),
+                parsed_term("TR:2", "oral opening"),
+            ],
+            parsed_closure=[],
+        )
+
+    assert result.terms_label_updated == 0

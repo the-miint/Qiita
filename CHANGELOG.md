@@ -46,7 +46,10 @@ duplicates further down are historical strata; leave them where they are.
   copied into a temporary directory, so no staging directory has to exist on the
   host. Loading a release over one already in the database writes only the
   terms whose stored values differ, so the cost tracks what changed between the
-  two releases rather than the size of the vocabulary.
+  two releases rather than the size of the vocabulary. A term the source does
+  not name keeps the label already stored for it, falling back to its own term
+  id when the database holds nothing — so a release that retires a term id
+  without naming it cannot overwrite the name the term was loaded under.
 
 - **Terminology release extraction — read a staged OWL release into the term
   records the load applies.** Builds the argv of the ROBOT export that produces
