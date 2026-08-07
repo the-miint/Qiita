@@ -515,6 +515,12 @@ class PrepSampleReadAccess(NamedTuple):
     two ways a sample can be denied need different words in the 403: `unlinked`
     is a data-integrity anomaly the caller can do nothing about, while
     `blocked_by` names studies they can go ask for access to.
+
+    **Input order is a contract, which is why the dedup below is `dict.fromkeys`
+    and not `set`.** `readable` is returned to the caller verbatim by the pool
+    discovery read, whose roster arrives `ORDER BY prep_sample_idx`; dropping
+    through a set would trade a sorted API response for an arbitrary one. Sort
+    explicitly if the ordering ever needs to change.
     """
 
     readable: list[int]  # deduped, input order

@@ -14,7 +14,7 @@ in DuckLake under the same alignment_idx. The user must receive the first
 sample's rows and never the second's, having named neither: the cohort comes
 from the discovery route and the filter from the ticket.
 
-Also pins the M2 projection end to end for a human ticket: the requested column
+Also pins the signed projection end to end for a human ticket: the requested column
 list is narrow (no `cigar`, which is ~96% of an alignment row), so the returned
 schema proves the projection rode the signature rather than being a DP default.
 """
@@ -42,7 +42,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 
-# Narrow on purpose: `cigar` is the wide column M2 exists to keep off the wire
+# Narrow on purpose: `cigar` is the wide column the projection keeps off the wire
 # unless asked for, so its absence from the result schema is the assertion.
 _COLUMNS = ["prep_sample_idx", "feature_idx", "mapq"]
 
