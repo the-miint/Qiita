@@ -1849,3 +1849,35 @@ def test_fanout_pump_posts_and_reports_fail_stop(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "FAIL-STOPPED" in err
     assert "released 0" in err
+
+
+def test_export_stem_is_the_shared_composite():
+    """The export filename stem IS `pooled_sample_label` — one definition shared
+    with the sample-label map, so an exported file and the label map that ships
+    beside a feature table cannot disagree about what a sample is called."""
+    from qiita_common.sample_label import pooled_sample_label
+
+    from qiita_control_plane.cli.admin.masked_export import _export_stem
+
+    sample = {"biosample_accession": "SAMN_A", "prep_sample_idx": 42}
+    assert _export_stem(sample, 5, 7) == pooled_sample_label(
+        biosample_accession="SAMN_A",
+        sequencing_run_idx=5,
+        sequenced_pool_idx=7,
+        prep_sample_idx=42,
+    )
+
+
+def test_export_stem_ignores_an_ena_run_accession():
+    """Deliberately NOT `compose_sample_label`: that prefers `ena_run_accession`,
+    and adopting it here would silently rename every submitted sample's export
+    file and route around the `_SAFE_ACCESSION` charset check. The stem names a
+    file; the label names a column."""
+    from qiita_control_plane.cli.admin.masked_export import _export_stem
+
+    sample = {
+        "biosample_accession": "SAMN_A",
+        "prep_sample_idx": 42,
+        "ena_run_accession": "ERR1234567",
+    }
+    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"

@@ -22,6 +22,7 @@ from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
 from qiita_common.models._base import (
+    MAX_COHORT_PREP_SAMPLE_IDX,
     AccessionText,
     MetadataRequestModel,
     NonBlankText,
@@ -1127,6 +1128,63 @@ class MaskedReadExportSample(BaseModel):
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
     mask_state: MaskSampleState | None = None
+
+
+class SampleLabelRequest(BaseModel):
+    """Body for POST /api/v1/sample-label — resolve a prep_sample cohort to the
+    public labels a published feature table carries in place of our identifiers.
+
+    POST rather than GET for the same reason as
+    ``BiosampleLookupByAccessionRequest``: a cohort is a pool's or a study's
+    worth of samples and would blow past nginx's 8 KB request-line cap in query
+    params. It is also the only shape that can express a cohort SPANNING pools,
+    which is what a feature table's cohort routinely is.
+
+    ``min_length=1`` because an empty cohort has no answer to give — a caller
+    that meant "all of them" has to say which.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: list[Annotated[int, Field(gt=0)]] = Field(
+        min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX
+    )
+
+
+class SampleLabel(BaseModel):
+    """One sample's public label plus every part it was composed from.
+
+    The parts ship alongside ``label`` deliberately. ``label`` has more than one
+    shape (see ``qiita_common.sample_label``) because a run accession is NULL
+    until submission and a pool is nullable, so a consumer that needed to recover
+    the accession or the pool from the label would have to parse it and guess
+    which shape it was looking at. Reading a column instead of parsing a string
+    removes that hazard entirely.
+
+    ``biosample_accession`` is non-null: the route 422s a cohort containing a
+    sample without one rather than emit a hole in this contract.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    label: str
+    biosample_accession: str
+    ena_run_accession: str | None = None
+    sequencing_run_idx: Annotated[int, Field(gt=0)] | None = None
+    sequenced_pool_idx: Annotated[int, Field(gt=0)] | None = None
+
+
+class SampleLabelResponse(BaseModel):
+    """Returned by POST /api/v1/sample-label: one entry per requested
+    prep_sample, ascending by prep_sample_idx.
+
+    Every requested sample is present or the whole request failed — the route is
+    all-or-nothing on access (403), existence (404), and labellability (422), so
+    there is no partial answer to signal and no `truncated`: the cohort is bounded
+    by the request body's own cap.
+    """
+
+    labels: list[SampleLabel]
+    count: Annotated[int, Field(ge=0)]
 
 
 class MaskedReadExportManifest(BaseModel):
