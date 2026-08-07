@@ -1,0 +1,13 @@
+{
+  "_source": "recorded from https://www.ebi.ac.uk/ena/browser/api/xml/SAMN00199006 on 2026-07-21, pre-pivoted into read_ena_attributes' (sample_accession, tag, value) row shape",
+  "columns": ["sample_accession", "tag", "value"],
+  "rows": [
+    ["SAMN00199006", "strain", "GA17570"],
+    ["SAMN00199006", "INSDC secondary accession", "SRS160620"],
+    ["SAMN00199006", "NCBI submission package", "Generic.1.0"],
+    ["SAMN00199006", "organism", "Streptococcus pneumoniae GA17570"],
+    ["SAMN00199006", "BioSampleModel", "Generic"],
+    ["SAMN00199006", "ENA-FIRST-PUBLIC", "2011-01-25"],
+    ["SAMN00199006", "ENA-LAST-UPDATE", "2014-02-25"]
+  ]
+}
