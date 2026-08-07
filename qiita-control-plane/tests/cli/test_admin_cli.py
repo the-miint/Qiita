@@ -1261,7 +1261,7 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
 #
 # These run the REAL miint FORMAT FASTQ writer (miint is a core dependency,
 # installed/loaded by setup_miint_test_env in tests/conftest.py). The fake
-# Flight stream hands DuckDB a table carrying the read_masked view's columns
+# Flight stream hands DuckDB a table carrying the read_masked macro's columns
 # (read_id, sequence1, qual1, sequence2, qual2; qual* are UTINYINT[]); pairing
 # is read from sequence2 null-ness, since the manifest carries no paired flag.
 # ---------------------------------------------------------------------------

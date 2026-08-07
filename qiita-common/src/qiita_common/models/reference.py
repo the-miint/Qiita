@@ -37,7 +37,7 @@ class ReadMaskReason(StrEnum):
 
     One value per row of the DuckLake `read_mask` table (the `reason` column).
     `pass` survives the mask (its recorded trims are applied by the `read_masked`
-    view); every other value excludes the read from `read_masked`. The `qc_*`
+    macro); every other value excludes the read from `read_masked`. The `qc_*`
     values come from the `qc` step's `filter_read` fail reasons; the `host_*`
     values come from the `host_filter` step's rype / minimap2 hits;
     `twist_no_adaptor` comes from the long-read `lima` adapter chain.

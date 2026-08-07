@@ -61,7 +61,7 @@ class Scope(StrEnum):
     # DoGet against the data plane's masked-read surface (`read_masked`).
     # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
     # and alignment tickets): masked reads are privacy-sensitive (the lake
-    # retains human/host reads, excluded only by the read_masked view), so the
+    # retains human/host reads, excluded only by the read_masked macro), so the
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
     READ_MASKED_DOGET = "read_masked:doget"
@@ -71,7 +71,7 @@ class Scope(StrEnum):
     #
     # Distinct from BOTH neighbours, and strictly the most privileged of the
     # three. `read_block` streams RAW `read` rows: host/human sequence that the
-    # `read_masked` view exists to exclude, so it is a strict superset of what
+    # `read_masked` macro exists to exclude, so it is a strict superset of what
     # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
     # `alignment` slice) would let any service account minting reference tickets
     # pull raw reads — an inversion of the model the two scopes above establish.
@@ -136,7 +136,7 @@ class Scope(StrEnum):
     # accounts.
     ADMIN_BIOSAMPLE_OWNER_ID_READ = "admin:biosample_owner_id_read"
     # Admin per-pool masked-read export: list a sequenced_pool's samples and mint
-    # per-sample DoGet tickets on the data plane's read_masked view, so an admin
+    # per-sample DoGet tickets on the data plane's read_masked macro, so an admin
     # can download masked sequence data locally. This is the first *human*
     # masked-read pull — distinct from the service-account READ_MASKED_DOGET path
     # (which is untouched). Admin-gated until there's a model for auto-selecting

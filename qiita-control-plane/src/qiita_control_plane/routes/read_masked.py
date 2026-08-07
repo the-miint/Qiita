@@ -7,13 +7,13 @@ Two routers live here because they are the two halves of one feature:
   same ``mask_idx`` fleet-wide.
 * ``POST /read-masked/ticket/doget`` signs an Ed25519 DoGet ticket scoped to a
   single ``(prep_sample_idx, mask_idx)`` on the data plane's ``read_masked``
-  view — the only Flight-reachable read surface (raw ``read``/``read_mask`` are
+  macro — the only Flight-reachable read surface (raw ``read``/``read_mask`` are
   out of Flight by construction, so unmasked/human reads are unreachable).
 
 Both are service-account-only, gated on ``Scope.READ_MASKED_DOGET``. Humans
 never mint masks or pull masked reads — the masked-read consumer path is
 service-driven, and the lake retains privacy-sensitive (human/host) reads that
-the ``read_masked`` view excludes only via ``WHERE reason='pass'``.
+the ``read_masked`` macro excludes only via an unconditional ``reason='pass'``.
 
 **The three GETs are the human read surface, and are gated differently.** They
 answer which masks exist, what config a mask encodes, and which samples are
@@ -30,14 +30,22 @@ study), pushed into the query as a predicate so the narrowing happens in one
 round trip. Narrowing also restricts *which masks* the list returns, so a
 zero-tally row never reveals a mask whose samples were all filtered out.
 
-**Mandatory-filter invariant.** The data plane's ``build_query`` returns an
-unfiltered ``SELECT * FROM read_masked`` for an empty filter — i.e. every
-sample's pass reads across every mask, fleet-wide. So the DoGet route MUST
-inject a non-empty ``prep_sample_idx`` AND a ``mask_idx`` into every signed
-ticket and reject anything that would produce an empty filter. Pydantic's
-``gt=0`` on both fields makes an empty/zero filter unrepresentable at the
-request layer; the route re-asserts non-empty before signing as defence in
-depth, so an unfiltered ``read_masked`` ticket can never be signed here.
+**Mandatory-filter invariant — now defence in depth, and keep it that way.**
+This route MUST inject a non-empty ``prep_sample_idx`` AND a ``mask_idx`` into
+every signed ticket. Pydantic's ``gt=0`` on both fields makes an empty/zero
+filter unrepresentable at the request layer; the route re-asserts non-empty
+before signing.
+
+Historically this was the *only* thing standing between a mis-signed ticket and
+a fleet-wide read, because the data plane's ``build_query`` turned an empty
+filter into an unfiltered ``SELECT * FROM read_masked`` over the then-view. That
+is no longer true: ``read_masked`` is a table MACRO whose ``(mask_idx, preps)``
+arguments are required, so the data plane cannot construct an unscoped masked
+read at all — ``build_query`` rejects the ticket and ``SELECT * FROM
+qiita_lake.read_masked`` is a catalog error. **Do not delete these checks on
+that basis.** They now fail a bad ticket at signing time rather than at DoGet
+time, which is where a scoping bug should surface, and they are what keeps the
+guarantee independent of the data plane's query construction.
 """
 
 import base64
@@ -98,9 +106,9 @@ _MSG_MASK_NOT_FOUND = "Mask definition not found"
 _MASK_LIST_HARD_CAP = 1_000
 _MASK_PREP_SAMPLE_HARD_CAP = 100_000
 
-# The masked-read view table this route is allowed to sign tickets for. Must
+# The masked-read surface this route is allowed to sign tickets for. Must
 # match the CP-side _DOGET_ALLOWED_TABLES (routes/reference.py) and the data
-# plane's ALLOWED_TABLES, which back the read_masked view the ticket targets.
+# plane's ALLOWED_TABLES, which back the read_masked macro the ticket targets.
 # A constant rather than a free literal so the read-masked table name has one
 # definition the route signs against.
 _READ_MASKED_TABLE = "read_masked"
@@ -386,8 +394,8 @@ async def create_read_masked_doget_ticket(
     """Sign a DoGet ticket scoped to (prep_sample_idx, mask_idx) on read_masked.
 
     Caller must be a ServiceAccount holding `read_masked:doget`. The ticket
-    filters the data plane's read_masked view to exactly one sample under
-    exactly one mask config; the view's `WHERE reason='pass'` excludes human/host
+    filters the data plane's read_masked macro to exactly one sample under
+    exactly one mask config; the macro's unconditional `reason='pass'` excludes human/host
     reads by construction.
 
     Mandatory-filter invariant: both identifiers are required and positive

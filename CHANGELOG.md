@@ -255,6 +255,36 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **Three DuckLake facts the export path depends on are now pinned by test.**
+  `qiita-data-plane/src/ducklake.rs` (integration tier): DuckDB's Arrow export
+  emits **no** `DictionaryArray` for VARCHAR even at 2 distinct values but
+  **does** for ENUM, so a dictionary on the wire has to be built by us; and a
+  plain DuckLake scan through `stream_arrow` is order-preserving while an
+  equi-join is not, though its disorder stays coarse (~5,000-row sorted runs
+  over 1.6M rows). Row order was a prose assumption behind several encoding
+  options before this. These are facts about DuckDB that the export path relies
+  on whatever we decide about compression, which is why they are in-tree while
+  the compression instrument below is not.
+- **The DoGet compression and representation axes were measured, and the
+  instrument is archived out of tree.** The evaluation concluded **ZSTD at the
+  IPC layer**, requested per call and defaulting to off, with every
+  array-representation option (run-end encoding, `Utf8View`, dictionaries,
+  integer narrowing) and every batch-geometry change measured as neutral or
+  negative. Off by default because compression makes a DoGet *slower* above
+  roughly 4 Gbit/s of client bandwidth, and every in-repo caller is above that
+  line. No production behaviour changes here; the next release note implements
+  the decision.
+
+  The harness that produced these numbers lives in `localdocs/`, not under
+  `qiita-data-plane/tests/`, **because it cannot be re-run from a clean
+  checkout**: two of its three targets consume local-only production Parquet
+  that is not in the repo and will not be. Kept in-tree it would have been a
+  626-line calibration suite for an instrument nothing else called, plus a
+  cargo feature and two dev-dependencies carried solely for it — coverage in
+  appearance only, and the first thing to rot. Re-deriving the decision (a new
+  arrow-rs codec, an unmeasured column shape, a proposal to change the default)
+  means restoring it; its README carries the procedure and the exact dependency
+  delta.
 - **Two DuckDB memory behaviours job code reasons about are now pinned by test
   (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
   in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
@@ -810,6 +840,28 @@ duplicates further down are historical strata; leave them where they are.
   [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
   per invocation — index load is 98.4% of classify wall clock); removal of our
   workaround tracked at #403.
+- **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
+  is now a scoped table macro instead of a view.** DuckDB derives a transitive
+  predicate across a join equality for `col = const` but **not** for
+  `col IN (list)`, so a view could only ever receive a multi-sample scope on one
+  side of the `read`/`read_mask` join: the `read` scan got no filter, DuckLake
+  pruned nothing, and every file in the lake was read. Production `EXPLAIN`
+  confirms it — a single-sample equality returns 5,356 rows in 0.147 s, while a
+  ~100-sample `IN` list fully scans a ~20.7-billion-row table (32 GB RAM and
+  >250 GB swap before being killed). `read_masked(p_mask_idx, p_preps)` takes the
+  scope as arguments so it lands on **both** inputs. On a local DuckLake of
+  1,000,000 rows over 200 samples, a realistic block (one partial head sample, 18
+  complete, one partial tail) selecting 84,600 rows went from 1,033,599 rows
+  scanned to 178,599, against a floor of 169,200. Affects `read_masked` and
+  `read_masked_block` — production's main read path — but **not** single-sample
+  blocks (a one-element `IN` is rewritten to `=`), which is why it went unnoticed.
+  Rejected after measuring: passing the block's `sequence_idx` range as further
+  parameters (identical row counts) and pushing per-member `(sample, range)` pairs
+  down as an `EXISTS` (1,900,000 rows — worse than the view, it defeats file
+  pruning). Result rows, column set and column order are unchanged. Side effect:
+  an unscoped fleet-wide masked read is now **unrepresentable** rather than
+  refused, so the control plane's mandatory-filter invariant is defence in depth
+  instead of the only guard.
 - **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
   Establishes one invariant across the runner and the redrive route: **only a LIVE
   attempt is adoptable.** Both defects below were latent until a step could have
