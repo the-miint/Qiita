@@ -164,9 +164,10 @@ async def test_label_map_refuses_a_partially_readable_cohort_before_labelling(
 
 
 async def test_label_map_403_does_not_enumerate_the_cohort(role_keyed_clients, pool_alignment_seed):
-    """The M3 disclosure lesson, re-pinned on this route: the refusal must not
-    name every blocked sample alongside the study that blocked it — that is an
-    enumeration oracle over a body the caller controls."""
+    """The refusal must not name every blocked sample alongside the study that
+    blocked it — over a caller-controlled body that is an enumeration oracle for
+    "which of these exist, and whose are they". Pinned separately on each cohort
+    route because each one builds its own refusal."""
     seed = pool_alignment_seed
     resp = await role_keyed_clients["user"].post(
         URL_SAMPLE_LABEL,
