@@ -267,9 +267,7 @@ class DoGetTicketResponse(BaseModel):
     ticket: str  # base64-encoded signed ticket bytes
 
 
-# Columns a DoGet ticket asks to be projected, in this order — so a consumer can
-# opt into a wide column (`cigar` is ~96% of an alignment row) without every
-# other consumer paying for it.
+# Columns a DoGet ticket asks to be projected, in this order.
 #
 # `min_length=1` rejects an explicit empty list (422) rather than letting it
 # widen to every column — the same rule, and the same reason, as
@@ -313,9 +311,13 @@ class AlignmentDoGetTicketRequest(BaseModel):
 # keep the ticket payload and the resulting `IN (...)` sane. This one ALSO
 # bounds how much a rejected request can be made to disclose — the route's 403
 # reports which of the caller's chosen identifiers it could not authorize, so
-# the cohort length is the width of that answer. A cohort here is a study's or a
-# pool's worth of samples (hundreds to low thousands); 10k is generous for
-# anything a scientist assembles and cheap to reject beyond.
+# the cohort length is the width of that answer.
+#
+# **10k bounds one REQUEST, not one analysis, and analyses larger than this are
+# expected.** It is a per-request ceiling chosen for payload size and disclosure
+# width, and a caller who needs more issues more requests. Raising it is a
+# deliberate decision about both of those costs, not a formality — so do not
+# treat a cohort that hits the cap as evidence the number is wrong.
 _MAX_DOGET_PREP_SAMPLE_IDX = 10_000
 
 
