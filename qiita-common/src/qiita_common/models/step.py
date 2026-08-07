@@ -283,9 +283,8 @@ class AlignmentDoGetTicketRequest(BaseModel):
     work_ticket_idx: Annotated[int, Field(gt=0)]
     # Columns the caller wants projected. Omitted ⇒ no projection rides the
     # ticket, byte-identical to the historical shape. Present ⇒ the data plane
-    # streams exactly these, in this order, so a consumer can opt into a wide
-    # column (`cigar` is ~96% of an alignment row) without every other consumer
-    # paying for it.
+    # streams exactly these, in this order. Why the alignment surface alone is
+    # projectable: `docs/architecture.md`.
     #
     # `min_length=1` rejects an explicit empty list (422) rather than letting it
     # widen to every column — the same rule, and the same reason, as

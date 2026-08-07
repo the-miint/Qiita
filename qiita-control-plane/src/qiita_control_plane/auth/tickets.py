@@ -38,9 +38,7 @@ _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 #
 # A table absent from this mapping takes no projection at all: the data plane
 # streams every column and rejects a list outright. Only the alignment surface
-# is listed, because it is the only one where the payload justifies it — `cigar`
-# alone is ~96% of an alignment row, so a consumer that does not need it should
-# not pay for it, and one that does should be able to ask.
+# is listed; why it and nothing else is in `docs/architecture.md`.
 _PROJECTION_COLUMNS: dict[str, frozenset[str]] = {
     "alignment_visible": frozenset(
         {

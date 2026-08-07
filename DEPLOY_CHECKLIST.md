@@ -45,8 +45,7 @@ _None yet._
   requires the column list to be signed into the ticket, and a job launched from
   the pre-deploy orchestrator code does not send one. Expected and
   self-clearing — resubmit the ticket, which picks up the new code. Nothing to
-  do on the host; this is *not* a regression. (`#m2-signed-projection` — retag
-  with the PR number)
+  do on the host; this is *not* a regression. (#435)
 
 ---
 

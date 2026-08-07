@@ -308,8 +308,8 @@ async def test_doget_alignment_not_signable_via_reference_route():
 async def test_doget_signs_the_requested_columns(ctx):
     """The consumer names its columns; the route validates and signs them.
 
-    Includes `cigar` — the column the whole mechanism exists for. It is ~96% of
-    an alignment row, so it must be askable without being paid for by default.
+    Includes `cigar`, the column the whole mechanism exists for: it must be
+    askable without being paid for by default.
     """
     wt_idx, *rest = await _seed_feature_table_ticket(
         ctx["pool"], alignment_idx=778, prep_sample_idx=[11]
