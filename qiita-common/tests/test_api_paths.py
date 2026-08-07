@@ -321,6 +321,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_SAMPLE_PREFIX",
         "PATH_SEQUENCED_SAMPLE_BY_IDX",
     ),
+    # /sample-label
+    (
+        "URL_SAMPLE_LABEL",
+        "PATH_SAMPLE_LABEL_PREFIX",
+        "PATH_SAMPLE_LABEL_ROOT",
+    ),
     # /prep-sample
     (
         "URL_PREP_SAMPLE_STUDY_LIST",

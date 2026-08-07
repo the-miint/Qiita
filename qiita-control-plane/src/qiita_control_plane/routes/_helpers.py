@@ -21,9 +21,11 @@ from qiita_common.models import (
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
     TerminologyTermRef,
+    Tier,
     field_wire_name,
 )
 
+from ..auth.guards import PrepSampleReadAccess
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -49,6 +51,52 @@ from ..repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
     write_sample_metadata,
 )
+
+
+def first_few(idxs: list[int], limit: int = 5) -> str:
+    """Render at most `limit` identifiers, eliding the rest with an ellipsis.
+
+    The named form of a `[:5]` that several refusal messages had inlined. Any
+    message built from identifiers the CALLER supplied must truncate: a refusal
+    that echoes the whole cohort back, annotated, answers "which of these exist?"
+    for the entire request body in one round trip.
+    """
+    head = ", ".join(str(idx) for idx in idxs[:limit])
+    return f"{head}, …" if len(idxs) > limit else head
+
+
+def prep_sample_access_denied_detail(access: PrepSampleReadAccess, *, min_tier: Tier) -> str:
+    """The 403 body for a cohort read the caller may not fully perform: what the
+    caller would have to change to be allowed.
+
+    Both denial modes are reported, and separately — an unreadable study is
+    something to go ask for, an unlinked sample is a data anomaly to report.
+
+    **Deliberately truncated, and deliberately NOT correlated.** The caller
+    chooses the cohort, so a message that named every blocked sample alongside
+    the study that blocked it would answer, in one request, "which of these
+    identifiers exist and which studies are they in?" for the whole body — an
+    enumeration oracle over `prep_sample_to_study` handed to the lowest role we
+    have. Naming a few of each is enough to act on and does not scale into a
+    dump. Same reason and same shape as the host-filter refusal's `[:5]` in
+    routes/sequencing_run.py.
+
+    Shared by every all-or-nothing prep_sample cohort route, so the wording of a
+    refusal — and its disclosure ceiling — has one definition.
+    """
+    parts = []
+    if access.blocked_by:
+        studies = sorted({s for denied in access.blocked_by.values() for s in denied})
+        parts.append(
+            f"requires study access at tier {str(min_tier)!r} or higher on"
+            f" {len(studies)} study/studies (e.g. {first_few(studies)})"
+        )
+    if access.unlinked:
+        parts.append(
+            f"{len(access.unlinked)} prep_sample(s) have no active study link and"
+            f" cannot be authorized (e.g. {first_few(access.unlinked)})"
+        )
+    return "; ".join(parts)
 
 
 def _attempted_label(value: object) -> str:

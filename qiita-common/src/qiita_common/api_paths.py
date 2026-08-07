@@ -811,6 +811,20 @@ PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
 # mint hangs off the /study router (the caller is authorized on the study).
 PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
 
+# =============================================================================
+# /sample-label — the public label a published table carries per sample
+# =============================================================================
+# POST-as-read, like /biosample/lookup-by-accession: the cohort rides the body
+# because a feature table's cohort is a pool's or a study's worth of samples and
+# routinely spans pools, neither of which a query string can carry.
+
+PATH_SAMPLE_LABEL_PREFIX = "/sample-label"
+PATH_SAMPLE_LABEL_ROOT = ""  # POST against the prefix itself
+
+URL_SAMPLE_LABEL_PREFIX = f"{API_PREFIX}{PATH_SAMPLE_LABEL_PREFIX}"
+URL_SAMPLE_LABEL = f"{URL_SAMPLE_LABEL_PREFIX}{PATH_SAMPLE_LABEL_ROOT}"
+
+
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"

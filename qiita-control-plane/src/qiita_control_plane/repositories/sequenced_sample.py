@@ -61,6 +61,36 @@ _LIST_ITEM_COLUMNS = (
 )
 
 
+async def fetch_sample_labels(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, prep_sample_idxs: list[int]
+) -> list[asyncpg.Record]:
+    """Everything the public sample label is composed from, for a prep_sample
+    cohort, ascending by prep_sample_idx.
+
+    Rows come back only for prep_samples that EXIST — a caller that needs to
+    distinguish "not labellable" from "not a prep_sample" compares the returned
+    count against its cohort, which the route does (a nonexistent idx would
+    otherwise vanish silently from an all-or-nothing answer).
+
+    `sequenced_sample` is LEFT-joined because a prep_sample of a future
+    non-sequenced processing_kind has no subtype row, and `sequenced_pool` after
+    it because `sequenced_pool_idx` is nullable. `sequencing_run_idx` is reached
+    THROUGH the pool, which is what makes the two co-present or both absent —
+    `compose_sample_label` refuses a row where they are not.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession,"
+        "       ss.ena_run_accession, ss.sequenced_pool_idx, sp.sequencing_run_idx"
+        "  FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
+        "  LEFT JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
+        " WHERE ps.idx = ANY($1::bigint[])"
+        " ORDER BY ps.idx",
+        prep_sample_idxs,
+    )
+
+
 async def fetch_sequenced_sample_with_prep_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_sample_idx: int,

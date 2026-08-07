@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from qiita_common.auth_constants import MAX_TABLE_NAME_LENGTH
 from qiita_common.models._base import (
+    MAX_COHORT_PREP_SAMPLE_IDX,
     ComputeTarget,
     StepStatus,
     _normalize_scope_target,
@@ -305,22 +306,6 @@ class AlignmentDoGetTicketRequest(BaseModel):
     columns: ProjectionColumns | None = None
 
 
-# Upper bound on a human-named alignment cohort. Deliberately an order of
-# magnitude tighter than _MAX_DOGET_FEATURE_IDX above, which it would otherwise
-# have mirrored: that cap bounds a machine-driven shard roster and only has to
-# keep the ticket payload and the resulting `IN (...)` sane. This one ALSO
-# bounds how much a rejected request can be made to disclose — the route's 403
-# reports which of the caller's chosen identifiers it could not authorize, so
-# the cohort length is the width of that answer.
-#
-# **10k bounds one REQUEST, not one analysis, and analyses larger than this are
-# expected.** It is a per-request ceiling chosen for payload size and disclosure
-# width, and a caller who needs more issues more requests. Raising it is a
-# deliberate decision about both of those costs, not a formality — so do not
-# treat a cohort that hits the cap as evidence the number is wrong.
-_MAX_DOGET_PREP_SAMPLE_IDX = 10_000
-
-
 class AlignmentCohortDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/alignment/{alignment_idx}/ticket/doget — the
     HUMAN-callable alignment mint, where the caller names the cohort itself.
@@ -344,7 +329,7 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prep_sample_idx: list[Annotated[int, Field(gt=0)]] = Field(
-        min_length=1, max_length=_MAX_DOGET_PREP_SAMPLE_IDX
+        min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX
     )
     # Required here, unlike its optional twin above — see the class docstring.
     columns: ProjectionColumns
