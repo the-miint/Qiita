@@ -51,16 +51,14 @@ const IPC_COMPRESSION_NONE: &str = "none";
 /// The IPC body codec this DoGet should use, from the client's request metadata.
 ///
 /// **The client chooses, not the server.** Whether compression pays depends on
-/// the client's bandwidth: it is a large win over a slow link and a *loss* over
-/// a fast one (M0 measured the break-even at ~4 Gbit/s — a 775 MiB stream takes
-/// 0.65 s uncompressed over 10 GbE against 1.53 s with zstd). The server cannot
-/// know that, and behind nginx it cannot even see the client's address. So the
-/// default is off and the client opts in per call.
+/// the client's bandwidth, which the server cannot know — behind nginx it cannot
+/// even see the client's address. So the default is off and the client opts in
+/// per call. The break-even arithmetic is in `docs/architecture.md`.
 ///
 /// An unrecognised value is an **error, not a fallback**. A client that asked
 /// for compression, silently did not get it, and measured the result would draw
 /// the wrong conclusion about its own transfer. `lz4` is rejected along with
-/// everything else: M0 measured it at roughly half zstd's ratio on every shape.
+/// everything else rather than served as a quietly worse stream.
 fn requested_ipc_codec(
     metadata: &tonic::metadata::MetadataMap,
 ) -> Result<Option<CompressionType>, Status> {
@@ -2925,9 +2923,8 @@ mod tests {
         assert_eq!(requested_ipc_codec(&map).expect("none is accepted"), None);
     }
 
-    /// LZ4 is rejected on purpose, not by omission: M0 measured it at roughly
-    /// half zstd's ratio on every shape, so accepting it would ship a worse
-    /// option that nothing in this repo would ever choose.
+    /// `lz4` is in this list on purpose: it is rejected by decision, not by
+    /// omission, so a future reader does not "fix" the gap by accepting it.
     #[test]
     fn unknown_compression_header_is_rejected() {
         for value in [b"lz4".as_slice(), b"gzip", b"ZSTD", b"", b"zstd,none"] {
@@ -5585,15 +5582,22 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // DoGet IPC compression (M1) — the parser being right does not prove the
-    // encoder honoured it, so these drive the real `do_get` end to end and
-    // assert on what the encoder stamped into each record-batch message.
+    // DoGet IPC compression — the parser being right does not prove the encoder
+    // honoured it, so these drive the real `do_get` end to end and assert on
+    // what the encoder stamped into each record-batch message.
     // ------------------------------------------------------------------
 
     /// Seed one alignment row and return a signed `alignment_visible` ticket for
     /// it, plus a service wired to the same catalog.
+    ///
+    /// The returned `TempDir` owns the service's staging and scratch roots and
+    /// must stay bound for the test's lifetime — dropping it removes the
+    /// directory. `do_get` reaches neither root today (staging belongs to DoPut,
+    /// scratch to the export DoActions), but they are real, TMPDIR-resident and
+    /// self-cleaning rather than `/tmp` literals, so a DoGet that later does
+    /// write cannot litter a shared directory.
     #[cfg(feature = "integration")]
-    fn doget_fixture(align: i64, prep: i64) -> (QiitaFlightService, Vec<u8>) {
+    fn doget_fixture(align: i64, prep: i64) -> (QiitaFlightService, Vec<u8>, tempfile::TempDir) {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
         {
@@ -5617,22 +5621,25 @@ mod tests {
             r#"{{"table":"alignment_visible","filter":{{"alignment_idx":[{align}],"prep_sample_idx":[{prep}]}}}}"#
         );
         let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
         let service = QiitaFlightService::new(
             test_vk(),
             connstr,
             data_path,
-            PathBuf::from("/tmp/unused-staging"),
-            PathBuf::from("/tmp"),
+            staging,
+            tmp.path().to_path_buf(),
         );
-        (service, ticket)
+        (service, ticket, tmp)
     }
 
     /// Collect a DoGet response, returning the codec stamped into each
     /// record-batch message and the total payload size.
     ///
-    /// This restates what `tests/compression_harness::record_batch_codecs` does.
-    /// It cannot be reused: this is a bin-only crate, so `tests/` targets cannot
-    /// see `src` and the check has to exist on both sides of that boundary.
+    /// Reads the codec back out of each message's IPC header rather than
+    /// trusting that the request was honoured — a codec the encoder silently
+    /// declined to apply would otherwise pass every test below.
     #[cfg(feature = "integration")]
     async fn doget_codecs(
         service: &QiitaFlightService,
@@ -5675,7 +5682,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     async fn doget_with_zstd_header_stamps_the_codec_into_every_batch_message() {
-        let (service, ticket) = doget_fixture(977_000, 977_010);
+        let (service, ticket, _tmp) = doget_fixture(977_000, 977_010);
         let (codecs, compressed) = doget_codecs(&service, ticket.clone(), Some("zstd"))
             .await
             .expect("zstd DoGet should succeed");
@@ -5704,7 +5711,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     async fn doget_without_the_header_is_byte_identical_to_today() {
-        let (service, ticket) = doget_fixture(977_100, 977_110);
+        let (service, ticket, _tmp) = doget_fixture(977_100, 977_110);
         for header in [None, Some("none")] {
             let (codecs, _) = doget_codecs(&service, ticket.clone(), header)
                 .await
@@ -5721,7 +5728,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(feature = "integration")]
     async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
-        let (service, ticket) = doget_fixture(977_200, 977_210);
+        let (service, ticket, _tmp) = doget_fixture(977_200, 977_210);
         let err = doget_codecs(&service, ticket, Some("lz4"))
             .await
             .expect_err("lz4 must be rejected, not silently ignored");

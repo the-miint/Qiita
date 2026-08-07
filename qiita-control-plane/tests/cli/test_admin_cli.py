@@ -1003,9 +1003,9 @@ def _run_masked_export_capturing_options(monkeypatch, tmp_path, fmt, extra_argv)
 
 
 def test_masked_read_export_sends_no_compression_header_by_default(monkeypatch, tmp_path):
-    """Default off. Compression costs more time than it saves above ~4 Gbit/s of
-    client bandwidth, and this CLI is usually run on the deploy host, so the
-    request must be indistinguishable from one made before the flag existed."""
+    """Default off: this CLI usually runs on the deploy host, which is above the
+    break-even bandwidth. The request must stay indistinguishable from one made
+    before the flag existed, so a pre-flag data plane still serves it."""
     from qiita_common.flight_constants import IPC_COMPRESSION_HEADER
 
     options = _run_masked_export_capturing_options(monkeypatch, tmp_path, "parquet", [])
