@@ -1486,22 +1486,21 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- M0 Phase 4, items 1 and 6 -------------------------------------
+    // --- What DuckDB hands the Flight encoder ---------------------------
     //
-    // Structural questions about what DuckDB hands the Flight encoder, not
-    // measurements: they need a live DuckLake but no production fixtures, so
-    // they belong in this tier rather than the `fixtures` one.
+    // Structural facts, not measurements: they need a live DuckLake but no
+    // production fixtures, and the export path's encoding choices rest on them.
 
-    /// Item 1. Everything about dictionary encoding follows from this: if the
-    /// export never emits one, `DictionaryHandling` is dead config for us and
-    /// any dictionary must be built data-plane-side.
+    /// Everything about dictionary encoding follows from this: if the export
+    /// never emits one, `DictionaryHandling` is dead config for us and any
+    /// dictionary must be built data-plane-side.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
     fn ducklake_arrow_export_never_emits_dictionary_for_varchar() {
         let conn = setup_conn();
         let id = next_test_id();
-        let table = format!("qiita_lake.m0_dict_probe_{id}");
+        let table = format!("qiita_lake.dict_probe_{id}");
         conn.execute_batch(&format!(
             "CREATE OR REPLACE TABLE {table} AS
              SELECT i AS k, ['Bacteria', 'Archaea'][(i % 2) + 1] AS domain
@@ -1521,21 +1520,21 @@ mod tests {
         assert!(
             !matches!(domain.data_type(), DataType::Dictionary(..)),
             "DuckDB emitted a dictionary for a 2-distinct VARCHAR: {:?} — \
-             this would change the M0 dictionary answer, re-measure Phase 4 item 1",
+             dictionary encoding would need re-measuring",
             domain.data_type()
         );
     }
 
-    /// Item 1, the other half. DuckDB's ENUM is the one type that *should* map to
-    /// an Arrow dictionary. If even ENUM does not, item 1 is closed for good and
-    /// nothing we can store will ever arrive dictionary-encoded.
+    /// The other half. DuckDB's ENUM is the one type that *should* map to an
+    /// Arrow dictionary. If even ENUM does not, the question is closed for good
+    /// and nothing we can store will ever arrive dictionary-encoded.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
     fn ducklake_arrow_export_emits_dictionary_for_enum() {
         let conn = setup_conn();
         let id = next_test_id();
-        let enum_type = format!("m0_rank_{id}");
+        let enum_type = format!("enum_rank_{id}");
         conn.execute_batch(&format!(
             "CREATE TYPE {enum_type} AS ENUM ('Bacteria', 'Archaea');"
         ))
@@ -1558,18 +1557,18 @@ mod tests {
         assert!(
             matches!(domain.data_type(), DataType::Dictionary(..)),
             "DuckDB ENUM no longer maps to an Arrow dictionary (got {:?}) — \
-             M0 Phase 4 item 1 recorded that it does; re-measure",
+             it did when this was measured; re-measure",
             domain.data_type()
         );
     }
 
-    /// Item 6. Run-end encoding and delta-style wins depend on rows arriving in
-    /// the identifier order the files are written in, and the DoGet applies no
+    /// Run-end encoding and delta-style wins depend on rows arriving in the
+    /// identifier order the files are written in, and the DoGet applies no
     /// `ORDER BY` — so a parallel scan over several files may interleave.
     ///
     /// Both DoGet shapes are covered because they answer differently: a plain
     /// scan is ordered by `preserve_insertion_order`, but `read_masked` is a
-    /// JOIN, and a hash join carries no such guarantee. Phase 2's fixtures came
+    /// JOIN, and a hash join carries no such guarantee. Production fixtures came
     /// through the join and showed 1-4 inversions; that is the distinction.
     ///
     /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
@@ -1581,8 +1580,8 @@ mod tests {
     fn ducklake_parallel_scan_preserves_file_sort_order() {
         let conn = setup_conn();
         let id = next_test_id();
-        let table = format!("qiita_lake.m0_order_probe_{id}");
-        let side = format!("qiita_lake.m0_order_join_{id}");
+        let table = format!("qiita_lake.order_probe_{id}");
+        let side = format!("qiita_lake.order_join_{id}");
         conn.execute_batch(&format!(
             "CREATE OR REPLACE TABLE {table} (grp BIGINT, seq BIGINT);
              CREATE OR REPLACE TABLE {side} (grp BIGINT, seq BIGINT);"
@@ -1647,7 +1646,7 @@ mod tests {
         assert_eq!(scan.0, expected, "scan lost rows");
         assert_eq!(join.0, expected, "join lost rows");
         println!(
-            "m0 item 6: scan {} rows / {} inversions / {} batches; \
+            "scan order: scan {} rows / {} inversions / {} batches; \
              join {} rows / {} inversions / {} batches",
             scan.0, scan.1, scan.2, join.0, join.1, join.2
         );
@@ -1662,16 +1661,16 @@ mod tests {
         assert!(
             run_len(scan) >= 100_000,
             "a plain DuckLake scan is no longer near-ordered ({} rows/run) — check \
-             preserve_insertion_order; M0 Phase 4 item 6 depends on it",
+             preserve_insertion_order; the order-sensitive encodings depend on it",
             run_len(scan)
         );
         // The join carries no ordering guarantee at all — this is not a promise
         // DuckDB makes, so the bound is deliberately loose and exists to catch a
-        // collapse to row-level scatter, which would invalidate item 6.
+        // collapse to row-level scatter.
         assert!(
             run_len(join) >= 1_000,
             "the join produced {} rows/run — that is row-level interleaving, not \
-             the coarse runs Phase 2 observed; item 6's conclusions need revisiting",
+             the coarse runs measured against production fixtures",
             run_len(join)
         );
     }
