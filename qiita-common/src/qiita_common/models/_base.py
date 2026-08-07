@@ -45,6 +45,15 @@ _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # read a cohort that hits the cap as evidence the number is wrong.
 MAX_COHORT_PREP_SAMPLE_IDX = 10_000
 
+# The whole cohort contract, not just its cap: positive idxs, non-empty, bounded.
+# All three parts are load-bearing — an empty cohort would sign an unscoped ticket
+# on one route and have no answer to give on the other — so they travel together
+# rather than being re-spelled per request model.
+PrepSampleCohort = Annotated[
+    list[Annotated[int, Field(gt=0)]],
+    Field(min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX),
+]
+
 
 def _strip_text(value: Any) -> Any:
     """Strip outer whitespace from text, passing anything else through so the

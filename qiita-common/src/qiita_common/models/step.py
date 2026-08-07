@@ -7,8 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from qiita_common.auth_constants import MAX_TABLE_NAME_LENGTH
 from qiita_common.models._base import (
-    MAX_COHORT_PREP_SAMPLE_IDX,
     ComputeTarget,
+    PrepSampleCohort,
     StepStatus,
     _normalize_scope_target,
     check_derived_inputs,
@@ -328,9 +328,7 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    prep_sample_idx: list[Annotated[int, Field(gt=0)]] = Field(
-        min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX
-    )
+    prep_sample_idx: PrepSampleCohort
     # Required here, unlike its optional twin above — see the class docstring.
     columns: ProjectionColumns
 

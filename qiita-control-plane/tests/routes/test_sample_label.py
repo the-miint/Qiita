@@ -143,32 +143,24 @@ async def test_label_map_422_names_samples_with_no_biosample_accession(
     assert "biosample_accession" in detail
 
 
-async def test_label_map_checks_access_before_labellability(
+async def test_label_map_refuses_a_partially_readable_cohort_before_labelling(
     role_keyed_clients, pool_alignment_seed
 ):
-    """ps_b is unreadable AND unlabellable. The 403 must win: a 422 naming it
-    would tell the caller ps_b exists and lacks an accession, for a sample they
-    have no right to read at all."""
-    seed = pool_alignment_seed
+    """ps_b is unreadable AND unlabellable, which pins two rules at once.
 
-    resp = await role_keyed_clients["user"].post(
-        URL_SAMPLE_LABEL, json={"prep_sample_idx": [seed["ps_a"], seed["ps_b"]]}
-    )
-    assert resp.status_code == 403, resp.text
-    assert "biosample_accession" not in resp.json()["detail"]
-
-
-async def test_label_map_rejects_a_cohort_the_caller_cannot_fully_read(
-    role_keyed_clients, pool_alignment_seed
-):
-    """All-or-nothing, never narrowed: a label map that silently covered fewer
-    samples than the table it ships with would be worse than no map."""
+    All-or-nothing: the readable ps_a is not quietly returned on its own — a label
+    map covering fewer samples than the table it ships with is worse than no map.
+    And access wins over labellability: a 422 naming ps_b would tell the caller it
+    exists and lacks an accession, for a sample they may not read at all.
+    """
     seed = pool_alignment_seed
     resp = await role_keyed_clients["user"].post(
         URL_SAMPLE_LABEL, json={"prep_sample_idx": [seed["ps_a"], seed["ps_b"]]}
     )
     assert resp.status_code == 403, resp.text
-    assert "study access" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "study access" in detail
+    assert "biosample_accession" not in detail
 
 
 async def test_label_map_403_does_not_enumerate_the_cohort(role_keyed_clients, pool_alignment_seed):
