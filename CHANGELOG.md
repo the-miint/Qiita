@@ -63,7 +63,7 @@ duplicates further down are historical strata; leave them where they are.
   same `Tier.VIEWER` all-or-nothing gate via `filter_prep_samples_caller_can_read`, same
   refusal wording, and the same access-checked-before-anything-else ordering, so a refusal
   never discloses which samples exist for a cohort the caller may not read. No new scope
-  (`reference:read` and `prep-sample:read` respectively), no migration, no deploy note.
+  (`reference:read` and `prep_sample:read` respectively), no migration, no deploy note.
 
 - **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
   `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could
