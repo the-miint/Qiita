@@ -14,9 +14,9 @@ imports `pyarrow.flight` lazily at its own call site.
 # are a wire contract and must change together.
 IPC_COMPRESSION_HEADER = "qiita-ipc-compression"
 
-# The only codec the data plane will apply. LZ4 is deliberately not offered:
-# M0 measured it at roughly half zstd's ratio on every production shape, and the
-# server rejects it rather than quietly serving a worse stream.
+# The only codec the data plane will apply; anything else is rejected rather
+# than quietly downgraded. Why zstd alone, and why compression defaults to off:
+# `docs/architecture.md`, "DoGet stream compression".
 IPC_COMPRESSION_ZSTD = "zstd"
 # Explicitly asking for no compression. Equivalent to sending no header; it
 # exists so a client can be unambiguous rather than relying on absence.
@@ -30,13 +30,9 @@ def ipc_compression_headers(compress: bool) -> list[tuple[bytes, bytes]]:
     `compress` is false, so the request is indistinguishable from one made by a
     client that predates the feature.
 
-    **Compression is not free, and off is the right default for most callers.**
-    Whether it pays depends on the client's bandwidth: it is a large win over a
-    slow link and a *loss* over a fast one. M0 measured the break-even at
-    ~4 Gbit/s — a 775 MiB stream takes 0.65 s uncompressed over 10 GbE against
-    1.53 s with zstd. Every in-repo caller sits above that (the control-plane
-    runner reaches the data plane over loopback, compute jobs over the cluster
-    fabric), so they send nothing. Turn it on for links slower than that.
+    **Do not pass `True` reflexively.** Above a break-even bandwidth compression
+    makes a DoGet *slower*, and every in-repo caller is above it; this is for
+    clients on slow links. The arithmetic is in `docs/architecture.md`.
     """
     if not compress:
         return []
