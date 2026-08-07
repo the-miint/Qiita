@@ -1196,10 +1196,9 @@ class SampleLabelResponse(BaseModel):
     """Returned by POST /api/v1/sample-label: one entry per requested
     prep_sample, ascending by prep_sample_idx.
 
-    Every requested sample is present or the whole request failed — the route is
-    all-or-nothing on access (403), existence (404), and labellability (422), so
-    there is no partial answer to signal and no `truncated`: the cohort is bounded
-    by the request body's own cap.
+    Every requested sample is present or the whole request failed, so there is no
+    partial answer to signal and no `truncated` — the cohort is already bounded by
+    the request body's own cap.
     """
 
     labels: list[SampleLabel]

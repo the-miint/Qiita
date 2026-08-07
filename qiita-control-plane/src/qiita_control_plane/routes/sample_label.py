@@ -6,11 +6,10 @@ than a Flight ticket for the same reason as the genome map: the accessions it is
 built from live only in Postgres, so there is nothing for the data plane to
 serve.
 
-Sibling of the human alignment mint (routes/alignment.py) — same cohort shape,
-same all-or-nothing access gate, same refusal wording — because a scientist
-minting a ticket for a cohort and labelling that cohort is one workflow, and two
-answers to "may I read this sample" is the drift that ends with one surface
-advertising what the other refuses.
+Cohort authorization is `authorize_prep_sample_cohort`, shared with the human
+alignment mint: minting a ticket for a cohort and labelling that cohort is one
+workflow, and two answers to "may I read this sample" is how one surface comes to
+advertise what the other refuses.
 """
 
 import asyncpg
@@ -55,20 +54,15 @@ async def resolve_sample_labels(
     the parts it was composed from, so nothing downstream has to parse a label to
     recover an accession (see `qiita_common.sample_label` for the three forms).
 
-    Validation is ordered, and the order is load-bearing:
+    Validation is ordered access → existence → labellability, and the order is
+    load-bearing: each later refusal names prep_samples, so running it first would
+    describe a cohort the caller has not yet been shown they may read.
 
-    1. **Access** → 403. All-or-nothing, via the same gate as the alignment
-       cohort mint: the caller must hold `Tier.VIEWER` on every study each
-       requested sample is still linked to. Narrowing instead of refusing would
-       silently ship a label map that does not cover the table it accompanies.
-    2. **Existence** → 404, naming a few of the unknown identifiers. Only a
-       role-bypassed caller can reach this — for everyone else a nonexistent
-       prep_sample has no study link and is already a 403 — but without it a
-       typo'd idx would just vanish from an answer that claims to be complete.
-    3. **Labellability** → 422, naming a few of the samples with no
-       `biosample_accession`. Third, not second, for the same reason the mint
-       checks completeness after access: this list would otherwise tell a caller
-       which samples exist for a cohort they have no right to read.
+    * **404** on an unknown prep_sample. Only a role-bypassed caller reaches it —
+      for everyone else an unknown idx has no study link and the access gate
+      already refused — but without it a typo'd identifier would vanish from an
+      answer that claims to cover the whole cohort.
+    * **422** on a sample with no `biosample_accession`, which cannot be labelled.
     """
     cohort = await authorize_prep_sample_cohort(
         pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=_LABEL_MIN_TIER
