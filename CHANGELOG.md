@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **The two maps that turn alignment rows into a feature table (#m4-maps).** A client can now
+- **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both
   translations are control-plane REST reads rather than signed Flight tickets, for one
