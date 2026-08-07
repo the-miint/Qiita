@@ -39,7 +39,13 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **A feature-table (`estimate_feature_table`) job that is already running when
+  the data plane restarts will fail with `InvalidArgument: alignment_visible
+  requires an explicit projection column list`.** The alignment DoGet now
+  requires the column list to be signed into the ticket, and a job launched from
+  the pre-deploy orchestrator code does not send one. Expected and
+  self-clearing — resubmit the ticket, which picks up the new code. Nothing to
+  do on the host; this is *not* a regression. (#435)
 
 ---
 

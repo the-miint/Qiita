@@ -255,6 +255,16 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **A Flight DoGet ticket can carry a signed column list, and the alignment
+  surface now requires one.** The consumer names the columns it wants, the
+  control plane validates them against a per-table allowlist at mint time (422
+  on an unknown, duplicated, or empty list) and signs them, and the data plane
+  validates again before projecting exactly that set, in that order. Only
+  `alignment_visible` is projectable; every other table streams `SELECT *` and
+  rejects a list rather than ignoring it. This makes a wide column opt-in
+  instead of a design discussion — `cigar` is ~96% of an alignment row, so
+  anything that needs it can now ask, and everything else keeps paying nothing.
+  Rationale in `docs/architecture.md`.
 - **DoGet streams can be zstd-compressed, at the client's request.** A client
   sends `qiita-ipc-compression: zstd` as gRPC metadata and the data plane
   compresses that stream's Arrow IPC bodies; anything else is rejected rather

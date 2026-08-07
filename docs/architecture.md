@@ -565,6 +565,39 @@ Header name constants: `IPC_COMPRESSION_HEADER` in
 `qiita-data-plane/src/flight_service.rs` and its twin in
 `qiita-common/src/qiita_common/flight_constants.py`.
 
+### DoGet column projection
+
+A Flight ticket carries an optional `columns` list beside its row scope. The
+control plane validates it against a per-table allowlist at mint time and signs
+it; the data plane validates it again and projects exactly that set, in that
+order. Validating twice is deliberate — the control plane's copy turns a typo
+into a 422 with a useful message, and the data plane's is the defense-in-depth
+that keeps a signed name out of interpolated SQL, the same argument
+`ALLOWED_FILTER_COLUMNS` makes for the filter.
+
+**Only `alignment_visible` is projectable, and it *requires* a column list.**
+Every other DoGet table streams `SELECT *` and rejects a list rather than
+ignoring one. The asymmetry is not arbitrary: `cigar` alone is ~96% of an
+alignment row, so serving that table unprojected is roughly a 10x payload, while
+the reference tables are broadly readable by design (mirroring the anonymous
+REST `GET /reference/{idx}`) and narrowing them would buy nothing measurable.
+
+There is **no server-side default projection** — a ticket without a column list
+is refused. Only the consumer knows which columns it binds, and a fallback in
+the data plane would be a second answer to that question, free to drift wider
+than what was asked for. The cost is that a ticket minted before a deploy and
+redeemed inside its 300 s TTL after it fails with `InvalidArgument`; that is
+preferred to widening it silently. The one production consumer,
+`estimate_feature_table`, owns its list as `_ALIGNMENT_COLUMNS` and uses it
+twice — for the ticket and for the `SELECT` it binds — so the two cannot drift.
+
+Allowlist constants: `ALIGNMENT_PROJECTION_COLUMNS` in
+`qiita-data-plane/src/flight_service.rs` and `_PROJECTION_COLUMNS` in
+`qiita-control-plane/src/qiita_control_plane/auth/tickets.py`. Both are
+hand-copies (neither language can import the other) pinned by parity tests, and
+the Rust one is additionally checked against the live `alignment_visible`
+schema.
+
 ## Auth & Data Access Flow
 
 See [`docs/auth.md`](auth.md) for the principal model, login flow, scopes, endpoints, and runbooks.
