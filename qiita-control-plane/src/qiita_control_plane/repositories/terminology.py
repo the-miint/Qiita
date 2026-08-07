@@ -216,6 +216,12 @@ async def import_terminology_release(
     )
 
     # Pass 2: populate replaced_by from the in-batch term_id → idx mapping.
+    # Two row versions per replaced row per load: pass 1 wipes the pointer and
+    # this restores it, changed or not, so a reload leaves twice the merge count
+    # in dead tuples. The wipe is what lets a release withdraw a replacement,
+    # and skipping it would need the term_id -> idx map that does not exist
+    # until pass 1 has run.  This is for all replacements, each time, not just
+    # the ones specific to the new release.
     await _resolve_replaced_by(conn, terminology_idx=terminology_idx, parsed_terms=effective_terms)
 
     # Tolerate mode: stamp the attempted-but-unresolvable CURIE on each

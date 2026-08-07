@@ -22,6 +22,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **NCBI Taxonomy releases read from a taxdump archive.**
+  `qiita-admin terminology prepare-taxdump` reads a `new_taxdump.zip` into the
+  term rows of a release, so taxa no longer arrive as hand-written seed
+  migrations. A live taxon takes its scientific name as its label and its genbank
+  common name as its second name; a taxon NCBI merged away becomes an obsolete
+  term pointing at the taxon it merged into; and a taxon NCBI deleted outright
+  becomes an obsolete term with no replacement, so a reload never mistakes
+  routine NCBI deletion for a terminology that silently lost terms. The archive
+  is read in place, with nothing unpacked. Every field is read by name against
+  the column order the taxdump documents, so a member whose layout changed
+  refuses the read instead of shifting fields, as does an archive recording one
+  taxon as live, merged, and deleted at once. The existing OWL command is now
+  `prepare-owl`, so each names the source it reads, and both write a release
+  through one shared step.
+
 - **`terminology_term.alternate_label` — a second name for a term.** Holds the
   name a source vocabulary supplies alongside the one that becomes the term's
   label; for NCBI Taxonomy the label is the scientific name and this is the

@@ -1,8 +1,10 @@
 """Pytest fixtures for tests that create terminology rows, builders for the
-term records an OWL release is read into, and a writer for the ROBOT export
-those records are read from."""
+term records an OWL release is read into, and writers for the two source
+forms those records are read from: a ROBOT export and a taxdump archive."""
 
 import csv
+import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest_asyncio
@@ -17,6 +19,16 @@ from qiita_control_plane.testing.db_seeds import delete_terminology_cascade
 # in both places instead of passing tautologically.
 ROBOT_EXPORT_HEADER = ("ID", "LABEL", "owl:deprecated", "IAO:0100001", "oboInOwl:hasAlternativeId")
 
+TAXDUMP_ARCHIVE_FILENAME = "new_taxdump.zip"
+
+# The taxdump members and delimiters, spelled out independently of the module
+# that reads them for the same reason as the ROBOT header above.
+NAMES_DMP_MEMBER = "names.dmp"
+MERGED_DMP_MEMBER = "merged.dmp"
+DELNODES_DMP_MEMBER = "delnodes.dmp"
+_DMP_FIELD_SEPARATOR = "\t|\t"
+_DMP_ROW_TERMINATOR = "\t|\n"
+
 
 def write_robot_export_tsv(path: Path, rows: list[tuple[str, str, str, str, str]]) -> None:
     """Write `rows` as a ROBOT export at `path`. Each row is
@@ -25,6 +37,38 @@ def write_robot_export_tsv(path: Path, rows: list[tuple[str, str, str, str, str]
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(ROBOT_EXPORT_HEADER)
         writer.writerows(rows)
+
+
+def write_taxdump_zip(path: Path, members: dict[str, list[tuple[str, ...]]]) -> None:
+    """Write `members` as a taxdump archive at `path`, each key a member name
+    and its value that member's rows. A member left out of `members` is
+    absent from the archive."""
+    with zipfile.ZipFile(path, "w") as archive:
+        for member, rows in members.items():
+            body = "".join(_DMP_FIELD_SEPARATOR.join(row) + _DMP_ROW_TERMINATOR for row in rows)
+            archive.writestr(member, body)
+
+
+def write_taxdump(
+    directory: Path,
+    *,
+    names: Sequence[tuple[str, ...]] = (),
+    merged: Sequence[tuple[str, ...]] = (),
+    delnodes: Sequence[tuple[str, ...]] = (),
+) -> Path:
+    """Write a complete taxdump archive into `directory` and return its path.
+    Every member is present, holding no rows unless given, so a caller names
+    only the rows its case is about."""
+    archive_path = directory / TAXDUMP_ARCHIVE_FILENAME
+    write_taxdump_zip(
+        archive_path,
+        {
+            NAMES_DMP_MEMBER: list(names),
+            MERGED_DMP_MEMBER: list(merged),
+            DELNODES_DMP_MEMBER: list(delnodes),
+        },
+    )
+    return archive_path
 
 
 def exported_class(

@@ -17,7 +17,12 @@ from qiita_control_plane.terminology import (
     load_manifest,
     sha256_of_file,
 )
-from qiita_control_plane.testing.terminology import parsed_term, write_robot_export_tsv
+from qiita_control_plane.testing.terminology import (
+    TAXDUMP_ARCHIVE_FILENAME,
+    parsed_term,
+    write_robot_export_tsv,
+    write_taxdump,
+)
 
 # The exact line an operator is shown. Pinned in full rather than rebuilt from
 # the argv builder, so a change to what ROBOT is asked for is visible here as
@@ -71,11 +76,11 @@ def test_terminology_robot_command_executable(capsys):
 
 
 # =============================================================================
-# terminology prepare
+# terminology prepare-owl
 # =============================================================================
 
 
-def test_terminology_prepare(tmp_path, capsys):
+def test_terminology_prepare_owl(tmp_path, capsys):
     """Tests the case where an export is prepared: both release tables and a
     manifest declaring their digests are written, and the terms table reads
     back through the import-side parser."""
@@ -92,7 +97,7 @@ def test_terminology_prepare(tmp_path, capsys):
     rc = cli.main(
         [
             "terminology",
-            "prepare",
+            "prepare-owl",
             "--export",
             str(export_path),
             "--name",
@@ -139,7 +144,7 @@ def test_terminology_prepare(tmp_path, capsys):
     }
 
 
-def test_terminology_prepare_term_id_prefix(tmp_path):
+def test_terminology_prepare_owl_term_id_prefix(tmp_path):
     """Tests the case where a term id prefix is given: classes imported from
     other vocabularies are left out of the written table."""
     export_path = tmp_path / "robot-export.tsv"
@@ -154,7 +159,7 @@ def test_terminology_prepare_term_id_prefix(tmp_path):
     rc = cli.main(
         [
             "terminology",
-            "prepare",
+            "prepare-owl",
             "--export",
             str(export_path),
             "--name",
@@ -170,7 +175,7 @@ def test_terminology_prepare_term_id_prefix(tmp_path):
     assert _parse_terms_tsv(tmp_path / TERMS_TSV_FILENAME) == [parsed_term("UBERON:0001", "mouth")]
 
 
-def test_terminology_prepare_output_dir(tmp_path):
+def test_terminology_prepare_owl_output_dir(tmp_path):
     """Tests the case where an output directory is named: the release files
     land there rather than beside the export."""
     export_dir = tmp_path / "incoming"
@@ -182,7 +187,7 @@ def test_terminology_prepare_output_dir(tmp_path):
     rc = cli.main(
         [
             "terminology",
-            "prepare",
+            "prepare-owl",
             "--export",
             str(export_dir / "robot-export.tsv"),
             "--name",
@@ -200,12 +205,12 @@ def test_terminology_prepare_output_dir(tmp_path):
     assert not (export_dir / TERMS_TSV_FILENAME).exists()
 
 
-def test_terminology_prepare_missing_export(tmp_path, capsys):
+def test_terminology_prepare_owl_missing_export(tmp_path, capsys):
     """Tests the case where the named export does not exist."""
     rc = cli.main(
         [
             "terminology",
-            "prepare",
+            "prepare-owl",
             "--export",
             str(tmp_path / "absent.tsv"),
             "--name",
@@ -219,7 +224,7 @@ def test_terminology_prepare_missing_export(tmp_path, capsys):
     assert "No ROBOT export" in capsys.readouterr().err
 
 
-def test_terminology_prepare_malformed_export(tmp_path, capsys):
+def test_terminology_prepare_owl_malformed_export(tmp_path, capsys):
     """Tests the case where the export is missing a requested column."""
     export_path = tmp_path / "robot-export.tsv"
     export_path.write_text("ID\tLABEL\nUBERON:0001\tmouth\n")
@@ -227,7 +232,7 @@ def test_terminology_prepare_malformed_export(tmp_path, capsys):
     rc = cli.main(
         [
             "terminology",
-            "prepare",
+            "prepare-owl",
             "--export",
             str(export_path),
             "--name",
@@ -248,13 +253,186 @@ def test_terminology_requires_subcommand():
 
 
 # =============================================================================
+# terminology prepare-taxdump
+# =============================================================================
+
+
+def test_terminology_prepare_taxdump(tmp_path, capsys):
+    """Tests the case where a taxdump archive is prepared: both release tables
+    and a manifest declaring their digests are written, and the terms table
+    reads back through the import-side parser."""
+    archive_path = write_taxdump(
+        tmp_path,
+        names=[
+            ("2", "Bacteria", "Bacteria <bacteria>", "scientific name"),
+            ("2", "eubacteria", "", "genbank common name"),
+            ("9606", "Homo sapiens", "", "scientific name"),
+        ],
+        merged=[("30", "9606")],
+        delnodes=[("777",)],
+    )
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-taxdump",
+            "--taxdump-zip",
+            str(archive_path),
+            "--name",
+            "NCBI Taxonomy",
+            "--version",
+            "2026-08-01",
+        ]
+    )
+
+    assert rc == 0
+
+    expected_terms = [
+        parsed_term("2", "Bacteria", alternate_label="eubacteria"),
+        parsed_term("9606", "Homo sapiens"),
+        parsed_term(
+            "30",
+            None,
+            is_obsolete=True,
+            replaced_by_term_id="9606",
+            obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+        ),
+        parsed_term(
+            "777",
+            None,
+            is_obsolete=True,
+            obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_DEPRECATED,
+        ),
+    ]
+    assert _parse_terms_tsv(tmp_path / TERMS_TSV_FILENAME) == expected_terms
+
+    closure_lines = (tmp_path / CLOSURE_TSV_FILENAME).read_text().splitlines()
+    assert closure_lines == ["\t".join(CLOSURE_TSV_COLUMNS)]
+
+    # The manifest must describe the files as written, so the load-side
+    # verification of the same digests passes.
+    manifest = load_manifest(tmp_path)
+    assert manifest.name == "NCBI Taxonomy"
+    assert manifest.version == "2026-08-01"
+    assert manifest.terms.path == TERMS_TSV_FILENAME
+    assert manifest.terms.sha256 == sha256_of_file(tmp_path / TERMS_TSV_FILENAME)
+    assert manifest.closure.path == CLOSURE_TSV_FILENAME
+    assert manifest.closure.sha256 == sha256_of_file(tmp_path / CLOSURE_TSV_FILENAME)
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary == {
+        "name": "NCBI Taxonomy",
+        "version": "2026-08-01",
+        "terms_written": 4,
+        "output_dir": str(tmp_path),
+    }
+
+
+def test_terminology_prepare_taxdump_output_dir(tmp_path):
+    """Tests the case where an output directory is named: the release files
+    land there rather than beside the archive."""
+    archive_dir = tmp_path / "incoming"
+    archive_dir.mkdir()
+    archive_path = write_taxdump(archive_dir, names=[("2", "Bacteria", "", "scientific name")])
+    output_dir = tmp_path / "staged"
+    output_dir.mkdir()
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-taxdump",
+            "--taxdump-zip",
+            str(archive_path),
+            "--name",
+            "NCBI Taxonomy",
+            "--version",
+            "2026-08-01",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert rc == 0
+    assert (output_dir / TERMS_TSV_FILENAME).exists()
+    assert (output_dir / MANIFEST_FILENAME).exists()
+    assert not (archive_dir / TERMS_TSV_FILENAME).exists()
+
+
+def test_terminology_prepare_taxdump_missing_archive(tmp_path, capsys):
+    """Tests the case where the named archive does not exist."""
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-taxdump",
+            "--taxdump-zip",
+            str(tmp_path / TAXDUMP_ARCHIVE_FILENAME),
+            "--name",
+            "NCBI Taxonomy",
+            "--version",
+            "2026-08-01",
+        ]
+    )
+
+    assert rc == 1
+    assert "No taxdump archive" in capsys.readouterr().err
+
+
+def test_terminology_prepare_taxdump_not_an_archive(tmp_path, capsys):
+    """Tests the case where the named path exists but is not an archive."""
+    archive_path = tmp_path / TAXDUMP_ARCHIVE_FILENAME
+    archive_path.write_text("2\t|\tBacteria\t|\n")
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-taxdump",
+            "--taxdump-zip",
+            str(archive_path),
+            "--name",
+            "NCBI Taxonomy",
+            "--version",
+            "2026-08-01",
+        ]
+    )
+
+    assert rc == 1
+    assert "not a zip file" in capsys.readouterr().err
+
+
+def test_terminology_prepare_taxdump_contradictory_members(tmp_path, capsys):
+    """Tests the case where the archive records one taxon as both live and
+    deleted, which no taxdump can mean."""
+    archive_path = write_taxdump(
+        tmp_path,
+        names=[("2", "Bacteria", "", "scientific name")],
+        delnodes=[("2",)],
+    )
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-taxdump",
+            "--taxdump-zip",
+            str(archive_path),
+            "--name",
+            "NCBI Taxonomy",
+            "--version",
+            "2026-08-01",
+        ]
+    )
+
+    assert rc == 1
+    assert "recorded in more than one member" in capsys.readouterr().err
+
+
+# =============================================================================
 # terminology load
 # =============================================================================
 
 
 def _prepare_release(tmp_path, capsys, *, name: str, version: str, export_rows) -> dict:
-    """Produce a prepared release via the prepare subcommand and return the
-    paths of the three files it wrote.
+    """Produce a prepared release via the prepare-owl subcommand and return
+    the paths of the three files it wrote.
 
     Drains the capture so the caller's own assertions see only the output of
     the command under test, not this preparation step's summary."""
@@ -264,7 +442,7 @@ def _prepare_release(tmp_path, capsys, *, name: str, version: str, export_rows) 
     rc = cli.main(
         [
             "terminology",
-            "prepare",
+            "prepare-owl",
             "--export",
             str(export_path),
             "--name",

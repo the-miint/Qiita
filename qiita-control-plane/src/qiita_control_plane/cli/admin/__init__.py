@@ -102,7 +102,8 @@ from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
 from .terminology import (
     DEFAULT_ROBOT_EXPORT_FILENAME,
     _handle_terminology_load,
-    _handle_terminology_prepare,
+    _handle_terminology_prepare_owl,
+    _handle_terminology_prepare_taxdump,
     _handle_terminology_robot_command,
 )
 from .ticket_cancel import _handle_ticket_cancel
@@ -222,12 +223,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")
     p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
 
+    # Note that this command is *intended to be temporary* and will go away
+    # once the terminology release is integrated with apptainer/workflow/slurm.
     p_robot_command = p_terminology_sub.add_parser(
         "robot-command",
         help=(
             "Print the ROBOT export command to run against a staged OWL file."
             " Nothing is executed — run the printed command yourself, then feed"
-            " its output to `terminology prepare`."
+            " its output to `terminology prepare-owl`."
         ),
     )
     p_robot_command.add_argument(
@@ -250,22 +253,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_robot_command.set_defaults(handler=_handle_terminology_robot_command)
 
-    p_prepare = p_terminology_sub.add_parser(
-        "prepare",
+    p_prepare_owl = p_terminology_sub.add_parser(
+        "prepare-owl",
         help=(
             "Turn a ROBOT export into the release tables and the manifest that"
             " declares them, ready for `terminology load`."
         ),
     )
-    p_prepare.add_argument(
+    p_prepare_owl.add_argument(
         "--export",
         type=Path,
         default=Path(DEFAULT_ROBOT_EXPORT_FILENAME),
         help=f"path to ROBOT's export (default: ./{DEFAULT_ROBOT_EXPORT_FILENAME})",
     )
-    p_prepare.add_argument("--name", required=True, help="terminology name to load under")
-    p_prepare.add_argument("--version", required=True, help="release version to load under")
-    p_prepare.add_argument(
+    p_prepare_owl.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_owl.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_owl.add_argument(
         "--term-id-prefix",
         default=None,
         help=(
@@ -273,13 +276,40 @@ def _build_parser() -> argparse.ArgumentParser:
             " classes the release imports from other vocabularies"
         ),
     )
-    p_prepare.add_argument(
+    p_prepare_owl.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help="directory to write the release files into (default: the export's own directory)",
     )
-    p_prepare.set_defaults(handler=_handle_terminology_prepare)
+    p_prepare_owl.set_defaults(handler=_handle_terminology_prepare_owl)
+
+    p_prepare_taxdump = p_terminology_sub.add_parser(
+        "prepare-taxdump",
+        help=(
+            "Turn an NCBI taxdump archive into the release tables and the"
+            " manifest that declares them, ready for `terminology load`. Reads"
+            " the archive in place; nothing is unpacked."
+        ),
+    )
+    # Required, unlike prepare-owl's --export: that names a file our own
+    # robot-command told the operator to create, while the archive is NCBI's
+    # and sits wherever they downloaded it.
+    p_prepare_taxdump.add_argument(
+        "--taxdump-zip",
+        required=True,
+        type=Path,
+        help="path to NCBI's new_taxdump archive",
+    )
+    p_prepare_taxdump.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_taxdump.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_taxdump.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the archive's own directory)",
+    )
+    p_prepare_taxdump.set_defaults(handler=_handle_terminology_prepare_taxdump)
 
     p_terminology_load = p_terminology_sub.add_parser(
         "load",

@@ -2,9 +2,10 @@
 release.
 
 `robot-command` emits the ROBOT export command for a human to run; nothing
-here runs it. `prepare` turns the export that command produced into the
-release tables and the manifest describing them. `load` applies those files
-to the database.
+here runs it. `prepare-owl` turns the export that command produced into the
+release tables and the manifest describing them, and `prepare-taxdump` does
+the same from an NCBI taxdump archive. `load` applies those files to the
+database.
 """
 
 import argparse
@@ -16,11 +17,13 @@ import shlex
 import shutil
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 from qiita_common.models import TerminologyManifest, TerminologyManifestFile
 
 from qiita_control_plane.repositories.terminology import (
+    ParsedTerm,
     TerminologyImportAnomaly,
     TerminologyImportResult,
 )
@@ -38,6 +41,7 @@ from qiita_control_plane.terminology import (
 )
 from qiita_control_plane.terminology_owl import build_terms
 from qiita_control_plane.terminology_owl_robot import parse_robot_export, robot_export_argv
+from qiita_control_plane.terminology_taxdump import build_terms_from_taxdump
 
 from ._helpers import open_admin_pool
 
@@ -46,6 +50,10 @@ from ._helpers import open_admin_pool
 DEFAULT_ROBOT_EXPORT_FILENAME = "robot-export.tsv"
 
 
+# Note that this command is *intended to be temporary*. It is a stop-gap to
+# support the current terminology release process, which is not yet integrated
+# into the apptainer/workflow/slurm pipeline for external software calls.
+# Do not depend on it being here in the future.
 def _handle_terminology_robot_command(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -60,7 +68,44 @@ def _handle_terminology_robot_command(
     return 0
 
 
-def _handle_terminology_prepare(
+def _write_release(
+    output_dir: Path,
+    terms: list[ParsedTerm],
+    *,
+    name: str,
+    version: str,
+) -> None:
+    """Write `terms` and the closure stub into `output_dir` along with the
+    manifest declaring both, and print what was written."""
+    terms_path = output_dir / TERMS_TSV_FILENAME
+    closure_path = output_dir / CLOSURE_TSV_FILENAME
+    write_terms_tsv(terms_path, terms)
+    write_closure_tsv_stub(closure_path)
+
+    # Digest the tables after writing them, so the manifest describes what
+    # landed on disk rather than what was intended.
+    terms_digest = sha256_of_file(terms_path)
+    closure_digest = sha256_of_file(closure_path)
+    declared_terms = TerminologyManifestFile(path=TERMS_TSV_FILENAME, sha256=terms_digest)
+    declared_closure = TerminologyManifestFile(path=CLOSURE_TSV_FILENAME, sha256=closure_digest)
+    manifest = TerminologyManifest(
+        name=name,
+        version=version,
+        terms=declared_terms,
+        closure=declared_closure,
+    )
+    write_manifest(output_dir, manifest)
+
+    summary = {
+        "name": name,
+        "version": version,
+        "terms_written": len(terms),
+        "output_dir": str(output_dir),
+    }
+    print(json.dumps(summary, indent=2))
+
+
+def _handle_terminology_prepare_owl(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> int:
@@ -79,31 +124,30 @@ def _handle_terminology_prepare(
         return 1
 
     terms = build_terms(exported_classes, term_id_prefix=args.term_id_prefix)
+    _write_release(output_dir, terms, name=args.name, version=args.version)
+    return 0
 
-    terms_path = output_dir / TERMS_TSV_FILENAME
-    closure_path = output_dir / CLOSURE_TSV_FILENAME
-    write_terms_tsv(terms_path, terms)
-    write_closure_tsv_stub(closure_path)
 
-    # Digest the tables after writing them, so the manifest describes what
-    # landed on disk rather than what was intended.
-    manifest = TerminologyManifest(
-        name=args.name,
-        version=args.version,
-        terms=TerminologyManifestFile(path=TERMS_TSV_FILENAME, sha256=sha256_of_file(terms_path)),
-        closure=TerminologyManifestFile(
-            path=CLOSURE_TSV_FILENAME, sha256=sha256_of_file(closure_path)
-        ),
-    )
-    write_manifest(output_dir, manifest)
+def _handle_terminology_prepare_taxdump(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Turn an NCBI taxdump archive into the release tables plus the manifest
+    that declares them, and print what was written.
 
-    summary = {
-        "name": args.name,
-        "version": args.version,
-        "terms_written": len(terms),
-        "output_dir": str(output_dir),
-    }
-    print(json.dumps(summary, indent=2))
+    Returns 1 when the archive is absent, is not an archive, or carries a
+    member whose layout or content contradicts what the taxdump documents.
+    """
+    taxdump_zip: Path = args.taxdump_zip
+    output_dir: Path = args.output_dir or taxdump_zip.parent
+
+    try:
+        terms = build_terms_from_taxdump(taxdump_zip)
+    except (FileNotFoundError, ValueError, zipfile.BadZipFile) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    _write_release(output_dir, terms, name=args.name, version=args.version)
     return 0
 
 
