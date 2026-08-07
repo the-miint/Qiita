@@ -345,9 +345,8 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 /// keeps a signed name out of interpolated SQL.
 ///
 /// The allowlist is per-table (see `projection_allowlist`) and today only the
-/// alignment surface has one, because it is the only surface where the payload
-/// justifies it: `cigar` alone is ~96% of an alignment row. Every other DoGet
-/// table streams `SELECT *` and refuses a column list outright.
+/// alignment surface has one; every other DoGet table streams `SELECT *` and
+/// refuses a column list outright. Why the asymmetry: `docs/architecture.md`.
 const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
     "alignment_idx",
     "prep_sample_idx",
@@ -5403,10 +5402,10 @@ mod tests {
     #[test]
     fn signed_columns_are_projected_in_order() {
         // The whole point of the signed list: a consumer that wants `cigar` asks
-        // for it, and one that doesn't never pays for it (it is ~96% of the
-        // alignment payload). Order is the caller's, verbatim — it keeps the SQL
-        // a pure function of the ticket, and the consumer's Arrow schema
-        // predictable rather than a function of our allowlist's ordering.
+        // for it, and one that doesn't never pays for it. Order is the caller's,
+        // verbatim — it keeps the SQL a pure function of the ticket, and the
+        // consumer's Arrow schema predictable rather than a function of our
+        // allowlist's ordering.
         let cols = columns(&["feature_idx", "cigar", "position"]);
         let (sql, table) =
             build_query("alignment_visible", &alignment_scope(), &[], &cols).unwrap();
@@ -5496,7 +5495,7 @@ mod tests {
         // names its columns or gets nothing. Falling back to a server-side list
         // would put the wrong component in charge of the answer — only the job
         // knows what it binds — and a fallback that drifted wider would ship
-        // `cigar` (~96% of the row) to callers that never asked.
+        // `cigar` to callers that never asked.
         //
         // Empty and absent are one case, not two, and cannot be told apart here:
         // `#[serde(default)]` renders an omitted field as an empty Vec, exactly
@@ -5926,7 +5925,7 @@ mod tests {
     }
 
     /// The projection the feature-table consumer signs. Mirrors
-    /// `_ALIGNMENT_COLUMNS` in `estimate_feature_table.py`; used by the M1
+    /// `_ALIGNMENT_COLUMNS` in `estimate_feature_table.py`; used by the
     /// compression tests, which care about the stream, not the column set.
     #[cfg(feature = "integration")]
     const FEATURE_TABLE_COLUMNS: &[&str] = &[
@@ -6040,7 +6039,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Signed projection (M2) — end to end, over a real Arrow stream. The unit
+    // Signed projection — end to end, over a real Arrow stream. The unit
     // tests prove build_query emits the right SQL; only these prove the ticket
     // the control plane signs turns into the schema the consumer receives.
     // ------------------------------------------------------------------

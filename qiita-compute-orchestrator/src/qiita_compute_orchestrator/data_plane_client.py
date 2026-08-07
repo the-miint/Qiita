@@ -288,8 +288,7 @@ async def fetch_alignment_doget_ticket(
     `columns` IS a parameter, and required, because it is the one part of the
     ticket the control plane cannot derive: only the caller knows which columns
     it will bind. The CP validates them against a per-table allowlist and signs
-    them; the DP then streams exactly those, in that order. Asking for less than
-    the whole row is the point — `cigar` alone is ~96% of an alignment row.
+    them; the DP then streams exactly those, in that order.
 
     `http` is the authed httpx client (Bearer with the compute SA PAT, base_url =
     the CP) from `cp_client.make_cp_client()`. The CP returns the ticket

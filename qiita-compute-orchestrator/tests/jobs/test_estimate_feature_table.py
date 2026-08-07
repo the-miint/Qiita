@@ -515,7 +515,6 @@ def test_job_asks_for_exactly_the_columns_it_binds(tmp_path, monkeypatch):
     )
 
     assert captured["columns"] == list(m._ALIGNMENT_COLUMNS)
-    # `cigar` is ~96% of an alignment row and this recipe never reads it — the
-    # single most valuable thing the projection buys, and the one regression a
-    # future edit is most likely to introduce.
+    # This recipe never reads `cigar`, and leaving it out is most of what the
+    # projection buys — the one regression a future edit is likeliest to add.
     assert "cigar" not in captured["columns"]

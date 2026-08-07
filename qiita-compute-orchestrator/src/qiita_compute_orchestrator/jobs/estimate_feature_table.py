@@ -79,8 +79,8 @@ _ALIGNMENT_TABLE = "alignment_slice"
 # owned HERE rather than by the data plane, because this job is the only thing
 # that knows what it reads.
 #
-# What is absent matters as much as what is present. `cigar` is ~96% of an
-# alignment row and nothing here reads it: coverage is breadth via miint
+# What is absent matters as much as what is present. `cigar` is the wide column
+# the projection exists for, and nothing here reads it: coverage is breadth via miint
 # `genome_coverage`, whose `alignments` relation needs only
 # `reference (=feature_idx), position, stop_position` — it merges spans per
 # contig, so no CIGAR is required (unlike `compute_coverage_depth`, which we do
