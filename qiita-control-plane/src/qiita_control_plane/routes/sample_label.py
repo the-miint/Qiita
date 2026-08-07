@@ -33,6 +33,12 @@ router = APIRouter(prefix=PATH_SAMPLE_LABEL_PREFIX, tags=["sample-label"])
 # which is strictly less than being able to read its rows.
 _LABEL_MIN_TIER = Tier.VIEWER
 
+# `require_human`, NOT the mint's `require_complete_profile`, and the difference
+# is the rule rather than an oversight: a metadata/discovery read sits at
+# require_human (as the read-mask discovery GETs do), while a route that hands
+# out access to raw sequence-derived data demands a complete profile. This one
+# returns accession strings the submitting archives already publish.
+
 
 @router.post(PATH_SAMPLE_LABEL_ROOT)
 async def resolve_sample_labels(

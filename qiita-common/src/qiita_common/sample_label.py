@@ -17,6 +17,12 @@ order:
 Forms 2 and 3 end in `prep_sample_idx`, which is unique, so every form is unique
 within a cohort. Consumers never need to parse a label to recover its parts: the
 response ships the accessions and identifiers as columns of their own.
+
+**A label is not a filename.** The masked-read export names its files with form 2
+ALWAYS (`_export_stem` calls `pooled_sample_label` directly), so for a submitted
+sample the label and the export's filename stem deliberately differ. Anything
+correlating a label-map entry back to an exported file must rebuild the composite
+from the shipped parts rather than trust `label`.
 """
 
 
