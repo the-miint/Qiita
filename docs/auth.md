@@ -359,6 +359,13 @@ General `reference:read` resolvers, unrelated to the curation blocklist above.
 | Route | Method | Notes |
 |---|---|---|
 | `/api/v1/reference/{reference_idx}/genome/{genome_idx}/member` | GET | Resolve a genome to its member features within one reference: each `feature_idx` + the reference's `accession`, feature_idx-ordered (the inverse of `export_member_genome`). A feature shared across genomes (a plasmid) is returned for each of its genomes. `404` when the pair has no members (fail-loud — an empty export is a caller error). Requires `reference:read`. The resolution step behind `qiita reference export` (added in the same change). |
+| `/api/v1/reference/{reference_idx}/genome-map` | GET | The whole reference's `feature_idx` → `(genome_idx, source, source_id)` lookup, the inverse direction of the member route above, ordered by `(feature_idx, genome_idx)`. A shared plasmid contributes one entry per genome, so the count is of PAIRS. `404` for an unknown reference but `200` with `entries: []` for one with no genome-bearing features (a 16S reference legitimately has none). **`413`, not a truncated `200`, above the hard cap**, naming the real size — a lookup table silently missing rows yields a *wrong* feature table rather than a partial one. Requires `reference:read`; no new scope. |
+
+### Sample label
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/sample-label` | POST | Resolve a `prep_sample_idx` cohort to the public labels a published feature table carries in place of our identifiers (`ena_run_accession`, else the `<accession>.<run>.<pool>.<prep_sample>` composite, else `<accession>.<prep_sample>` when unpooled), each with the parts it was composed from. `require_human` + `prep-sample:read` — a metadata read, so no complete-profile requirement, unlike the alignment mint which hands out access to raw sequence-derived data. The **same** all-or-nothing gate as that mint (`filter_prep_samples_caller_can_read` at `Tier.VIEWER` on every study a sample is still linked to, `wet_lab_admin` bypassing), so the two cannot disagree about who may read a sample. Refusals are ordered access `403` → existence `404` → labellability `422`, and the `403` is truncated and uncorrelated for the reason given under the alignment mint. POST because a cohort spans pools and would exceed nginx's request-line cap in query params. No new scope. |
 
 ## CLI (`qiita-admin`)
 
