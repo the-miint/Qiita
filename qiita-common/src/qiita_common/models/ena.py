@@ -52,8 +52,6 @@ class EnaRunRecord(BaseModel):
     base_count: int | None = None
 
 
-
-
 class EnaSampleAttributes(BaseModel):
     """One BioSample's submitter-defined tag -> value attribute map —
     `read_ena_attributes(accession)`, pivoted from its (sample_accession, tag,
