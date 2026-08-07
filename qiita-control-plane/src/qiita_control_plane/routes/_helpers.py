@@ -4,7 +4,7 @@ Centralizing them keeps response wording consistent across parallel
 endpoints — same input shape, same on-the-wire output.
 """
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime
 from typing import NoReturn
 
@@ -21,9 +21,12 @@ from qiita_common.models import (
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
     TerminologyTermRef,
+    Tier,
     field_wire_name,
 )
 
+from ..auth.guards import PrepSampleReadAccess, filter_prep_samples_caller_can_read
+from ..auth.principal import Principal
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -49,6 +52,94 @@ from ..repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
     write_sample_metadata,
 )
+
+
+def first_few(idxs: list[int], limit: int = 5) -> str:
+    """Render at most `limit` identifiers, eliding the rest with an ellipsis.
+
+    Any message built from identifiers the CALLER supplied must truncate: a
+    refusal that echoes the whole cohort back, annotated, answers "which of these
+    exist?" for the entire request body in one round trip — and the cohort caps
+    run to 10 000.
+
+    Used by every refusal on the prep_sample cohort routes. The host-filter
+    refusals in routes/sequencing_run.py truncate for the same reason but predate
+    this and render a bare `[:5]` list repr; converting them would change two
+    live messages' wording, so they are deliberately left alone rather than
+    quietly reworded here.
+    """
+    head = ", ".join(str(idx) for idx in idxs[:limit])
+    return f"{head}, …" if len(idxs) > limit else head
+
+
+async def authorize_prep_sample_cohort(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    prep_sample_idx: Iterable[int],
+    min_tier: Tier,
+) -> list[int]:
+    """Resolve a caller-named prep_sample cohort to the sorted, deduped list the
+    route may act on, or 403 naming what would have to change.
+
+    **All-or-nothing, never narrowed.** Every route that takes a cohort in a
+    request body produces something whose meaning depends on the whole cohort — a
+    signed ticket, a label map shipped beside a feature table — so quietly
+    trimming it answers a different question under the name of the one that was
+    asked. The paired *discovery* reads narrow instead, because a listing carries
+    no result.
+
+    Sorted and deduped because a cohort is a set: two spellings of one request
+    should sign the same bytes and return the same rows.
+
+    One function rather than eight copied lines per route, because what is being
+    shared is a security decision — which samples a caller may act on, and how
+    much a refusal is allowed to say — and the second copy is where those start to
+    disagree.
+    """
+    cohort = sorted(set(prep_sample_idx))
+    access = await filter_prep_samples_caller_can_read(
+        pool_or_conn, caller=caller, prep_sample_idxs=cohort, min_tier=min_tier
+    )
+    if access.unlinked or access.blocked_by:
+        raise HTTPException(
+            status_code=403, detail=prep_sample_access_denied_detail(access, min_tier=min_tier)
+        )
+    return cohort
+
+
+def prep_sample_access_denied_detail(access: PrepSampleReadAccess, *, min_tier: Tier) -> str:
+    """The 403 body for a cohort read the caller may not fully perform: what the
+    caller would have to change to be allowed.
+
+    Both denial modes are reported, and separately — an unreadable study is
+    something to go ask for, an unlinked sample is a data anomaly to report.
+
+    **Deliberately truncated, and deliberately NOT correlated.** The caller
+    chooses the cohort, so a message that named every blocked sample alongside
+    the study that blocked it would answer, in one request, "which of these
+    identifiers exist and which studies are they in?" for the whole body — an
+    enumeration oracle over `prep_sample_to_study` handed to the lowest role we
+    have. Naming a few of each is enough to act on and does not scale into a
+    dump. Same reason and same shape as the host-filter refusal's `[:5]` in
+    routes/sequencing_run.py.
+
+    Shared by every all-or-nothing prep_sample cohort route, so the wording of a
+    refusal — and its disclosure ceiling — has one definition.
+    """
+    parts = []
+    if access.blocked_by:
+        studies = sorted({s for denied in access.blocked_by.values() for s in denied})
+        parts.append(
+            f"requires study access at tier {str(min_tier)!r} or higher on"
+            f" {len(studies)} study/studies (e.g. {first_few(studies)})"
+        )
+    if access.unlinked:
+        parts.append(
+            f"{len(access.unlinked)} prep_sample(s) have no active study link and"
+            f" cannot be authorized (e.g. {first_few(access.unlinked)})"
+        )
+    return "; ".join(parts)
 
 
 def _attempted_label(value: object) -> str:
@@ -726,11 +817,17 @@ async def resolve_idxs_by_natural_key(
 def cap_rows[T](rows: list[T], cap: int) -> tuple[list[T], bool]:
     """Split a `cap + 1` fetch into `(rows, truncated)`.
 
-    Every capped list route over-fetches by one row, so a length strictly
-    greater than `cap` means the underlying set is larger than the page.
-    Returns the rows sliced back to `cap` and whether the slice dropped
-    anything. Read one row short of `cap + 1` and `truncated` is False on a
-    set that is in fact larger.
+    A capped route over-fetches by one row, so a length strictly greater than
+    `cap` means the underlying set is larger than the page. Returns the rows
+    sliced back to `cap` and whether the slice dropped anything. Read one row
+    short of `cap + 1` and `truncated` is False on a set that is in fact larger.
+
+    **This is the posture for a LISTING**, where a short answer is still a usable
+    answer and `truncated` tells the caller to narrow. A read whose result is
+    consumed as a JOIN key — a lookup table — must not use it: a silently short
+    lookup makes the caller's derived artifact *wrong* rather than partial, and
+    nobody checks `truncated` on a map. Those refuse instead (413 naming the real
+    size); `routes/reference.py`'s genome map is the worked example.
     """
     if len(rows) > cap:
         return rows[:cap], True

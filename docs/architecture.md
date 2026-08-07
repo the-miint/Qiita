@@ -633,6 +633,42 @@ you know why:
   incomplete samples would tell a caller which samples are finished for an
   alignment they have no right to read at all.
 
+### Two maps that are REST reads, not Flight tickets
+
+Turning those alignment rows into a feature table needs two translations, and
+both are control-plane REST reads rather than signed Flight tickets — the one
+place bulk-shaped analytic data does not come off the data plane:
+
+| Read | Answers | Why not Flight |
+|---|---|---|
+| `GET /reference/{reference_idx}/genome-map` | `feature_idx` → `(genome_idx, source, source_id)` | `genome_idx` and the genome's provenance exist **only in Postgres**; no DuckLake table carries them, and `genome_idx` is not a filter column |
+| `POST /sample-label` | `prep_sample_idx` → the public label | composed from `biosample_accession` / `ena_run_accession` / the pool, all Postgres-only |
+
+That is the whole criterion: **a signed ticket can only name identifiers the
+data plane can resolve**, and neither map's columns exist out there. It is not a
+policy exception and it does not generalize — anything whose columns do live in
+the lake still goes through a ticket.
+
+**Both ship JSON, which is a known limit rather than an oversight.** The genome
+map for a GG2-scale reference is millions of rows, so it **refuses with a 413**
+above its cap instead of truncating: a lookup table silently missing rows drops
+those features from the caller's roll-up, producing a *wrong* feature table
+rather than a partial one, and nobody checks a `truncated` flag on a map. The
+first real reference that trips that 413 is the trigger to build the streamed
+Parquet form (over the server-side cursor `export_member_genome` already uses) —
+which would be the control plane's first non-JSON response body, and is worth
+doing deliberately, with the held-connection cost measured, rather than
+pre-emptively.
+
+The genome map's row set is `export_member_genome`'s widened with the genome
+columns, deliberately: the compute side consumes that Parquet and the client
+consumes this map, so the two must not disagree about which features have
+genomes. The label map is the alignment mint's sibling by the same reasoning —
+same cohort shape, same `Tier.VIEWER` all-or-nothing gate, same refusal wording,
+same access-checked-first ordering. Two answers to "may this caller read this
+sample" is the drift that ends with one surface advertising what the other
+refuses.
+
 ## Auth & Data Access Flow
 
 See [`docs/auth.md`](auth.md) for the principal model, login flow, scopes, endpoints, and runbooks.

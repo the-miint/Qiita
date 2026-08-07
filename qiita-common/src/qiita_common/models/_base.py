@@ -27,6 +27,33 @@ from qiita_common.auth_constants import MAX_ACCESSION_LENGTH, MAX_NAME_LENGTH
 # `--env K=V` apptainer argument it is interpolated into.
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# Upper bound on a prep_sample cohort a HUMAN assembles and names in a request
+# body — the alignment ticket mint and the sample-label map. Shared rather than
+# duplicated because the two bound the same thing for the same two reasons:
+# request-payload size, and the width of a refusal's disclosure (both routes
+# report which of the caller's chosen identifiers they could not authorize, so
+# the cohort length is the width of that answer).
+#
+# Deliberately an order of magnitude tighter than the machine-driven roster caps
+# in models/step.py, which only have to keep a ticket payload and its `IN (...)`
+# sane and disclose nothing.
+#
+# **10k bounds one REQUEST, not one analysis, and analyses larger than this are
+# expected.** It is a per-request ceiling chosen for the two costs above, and a
+# caller who needs more issues more requests. Raising it is a deliberate
+# decision about payload size and disclosure width, not a formality — so do not
+# read a cohort that hits the cap as evidence the number is wrong.
+MAX_COHORT_PREP_SAMPLE_IDX = 10_000
+
+# The whole cohort contract, not just its cap: positive idxs, non-empty, bounded.
+# All three parts are load-bearing — an empty cohort would sign an unscoped ticket
+# on one route and have no answer to give on the other — so they travel together
+# rather than being re-spelled per request model.
+PrepSampleCohort = Annotated[
+    list[Annotated[int, Field(gt=0)]],
+    Field(min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX),
+]
+
 
 def _strip_text(value: Any) -> Any:
     """Strip outer whitespace from text, passing anything else through so the

@@ -15,6 +15,7 @@ from .prep_sample import study_scoped_router as prep_sample_study_router
 from .read import read_router
 from .read_masked import mask_definition_router, read_masked_router
 from .reference import router as reference_router
+from .sample_label import router as sample_label_router
 from .sequence_range import router as sequence_range_router
 from .sequenced_sample import router as sequenced_sample_run_router
 from .sequenced_sample import (
@@ -47,6 +48,7 @@ api_router.include_router(alignment_router)
 api_router.include_router(prep_protocol_router)
 api_router.include_router(prep_sample_router)
 api_router.include_router(prep_sample_study_router)
+api_router.include_router(sample_label_router)
 api_router.include_router(study_router)
 api_router.include_router(upload_router)
 api_router.include_router(user_router)

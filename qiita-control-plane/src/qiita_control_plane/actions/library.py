@@ -60,7 +60,7 @@ from ..repositories.block import (
     upsert_mask_sample_completed,
 )
 from ..repositories.reference_exclusion import resolve_excluded_features
-from ..repositories.reference_membership import count_reference_shards
+from ..repositories.reference_membership import GENOME_MAP_PAIRS_SQL, count_reference_shards
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
 
@@ -1107,6 +1107,10 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
     Public (used by both the reference-load plan-shards step here and the
     feature-table runner resolver, runner/_feature_table.py).
 
+    The row set is `GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST genome
+    map: the compute side consumes this Parquet and a client consumes that map,
+    so which features have genomes cannot be allowed to differ between them.
+
     An empty result still writes a valid two-column Parquet (schema created up
     front) so DuckDB's read_parquet doesn't fail on a zero-genome reference."""
     schema = pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())])
@@ -1114,10 +1118,7 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
     try:
         async with pool.acquire() as conn, conn.transaction():
             cursor = await conn.cursor(
-                "SELECT rm.feature_idx, fg.genome_idx"
-                " FROM qiita.reference_membership rm"
-                " JOIN qiita.feature_genome fg USING (feature_idx)"
-                " WHERE rm.reference_idx = $1",
+                "SELECT rm.feature_idx, fg.genome_idx" + GENOME_MAP_PAIRS_SQL,
                 reference_idx,
             )
             while batch := await cursor.fetch(_CHUNK_SIZE):

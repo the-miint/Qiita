@@ -71,6 +71,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_GENOME_MEMBER",
     ),
+    (
+        "URL_REFERENCE_GENOME_MAP",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_GENOME_MAP",
+    ),
     # /host-filter-profile
     (
         "URL_HOST_FILTER_PROFILE_LIST",
@@ -315,6 +320,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_SEQUENCED_SAMPLE_BY_IDX",
         "PATH_SEQUENCED_SAMPLE_PREFIX",
         "PATH_SEQUENCED_SAMPLE_BY_IDX",
+    ),
+    # /sample-label
+    (
+        "URL_SAMPLE_LABEL",
+        "PATH_SAMPLE_LABEL_PREFIX",
+        "PATH_SAMPLE_LABEL_ROOT",
     ),
     # /prep-sample
     (

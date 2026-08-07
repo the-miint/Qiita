@@ -26,6 +26,7 @@ from qiita_common.models._base import (
     MetadataRequestModel,
     NonBlankText,
     PatchRequestModel,
+    PrepSampleCohort,
     ReadCounts,
 )
 from qiita_common.models.biosample import (
@@ -34,6 +35,7 @@ from qiita_common.models.biosample import (
 )
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
+from qiita_common.sample_label import compose_sample_label
 
 
 class SequencingRunCreateRequest(BaseModel):
@@ -1127,6 +1129,80 @@ class MaskedReadExportSample(BaseModel):
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
     mask_state: MaskSampleState | None = None
+
+
+class SampleLabelRequest(BaseModel):
+    """Body for POST /api/v1/sample-label — resolve a prep_sample cohort to the
+    public labels a published feature table carries in place of our identifiers.
+
+    POST rather than GET for the same reason as
+    ``BiosampleLookupByAccessionRequest``: a cohort is a pool's or a study's
+    worth of samples and would blow past nginx's 8 KB request-line cap in query
+    params. It is also the only shape that can express a cohort SPANNING pools,
+    which is what a feature table's cohort routinely is.
+
+    ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
+    the two bound the same thing — a cohort a scientist assembles — for the same
+    payload-size and disclosure-width reasons. Non-empty because a cohort with no
+    members has no answer to give; a caller that meant "all of them" has to say
+    which.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: PrepSampleCohort
+
+
+class SampleLabel(BaseModel):
+    """One sample's public label plus every part it was composed from.
+
+    The parts ship alongside ``label`` deliberately. ``label`` has more than one
+    shape (see ``qiita_common.sample_label``) because a run accession is NULL
+    until submission and a pool is nullable, so a consumer that needed to recover
+    the accession or the pool from the label would have to parse it and guess
+    which shape it was looking at. Reading a column instead of parsing a string
+    removes that hazard entirely.
+
+    ``label`` is COMPUTED from those parts rather than passed in, which is what
+    makes the guarantee above structural: a label that disagrees with the parts
+    shipped beside it is not constructible.
+
+    ``biosample_accession`` is non-null: the route 422s a cohort containing a
+    sample without one rather than emit a hole in this contract, so
+    ``compose_sample_label``'s raise on a missing accession is unreachable here.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str
+    ena_run_accession: str | None = None
+    sequencing_run_idx: Annotated[int, Field(gt=0)] | None = None
+    sequenced_pool_idx: Annotated[int, Field(gt=0)] | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def label(self) -> str:
+        """The public identifier: `ena_run_accession`, else the pooled composite,
+        else the unpooled short form. See ``qiita_common.sample_label``."""
+        return compose_sample_label(
+            prep_sample_idx=self.prep_sample_idx,
+            biosample_accession=self.biosample_accession,
+            ena_run_accession=self.ena_run_accession,
+            sequencing_run_idx=self.sequencing_run_idx,
+            sequenced_pool_idx=self.sequenced_pool_idx,
+        )
+
+
+class SampleLabelResponse(BaseModel):
+    """Returned by POST /api/v1/sample-label: one entry per requested
+    prep_sample, ascending by prep_sample_idx.
+
+    Every requested sample is present or the whole request failed, so there is no
+    partial answer to signal and no `truncated` — the cohort is already bounded by
+    the request body's own cap.
+    """
+
+    labels: list[SampleLabel]
+    count: Annotated[int, Field(ge=0)]
 
 
 class MaskedReadExportManifest(BaseModel):

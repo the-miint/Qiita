@@ -22,6 +22,49 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **The two maps that turn alignment rows into a feature table (#438).** A client can now
+  mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
+  `feature_idx`, and a published table needs genomes and public sample names. Both
+  translations are control-plane REST reads rather than signed Flight tickets, for one
+  reason — their columns exist **only in Postgres**, so there is nothing for the data plane
+  to serve.
+
+  - `GET /api/v1/reference/{reference_idx}/genome-map` — the whole reference's
+    `feature_idx` → `(genome_idx, source, source_id)` lookup, ordered by
+    `(feature_idx, genome_idx)`. Both genome columns ship because `qiita.genome`'s
+    uniqueness is the composite `(source, source_id)`, so a consumer relabelling
+    `genome_idx` to a public id needs the pair to assert no collision. A feature shared
+    across genomes (a plasmid) contributes one entry per genome, so the count is of
+    PAIRS. Same INNER JOIN as `export_member_genome`, whose Parquet the compute side
+    already consumes — pinned by a test that compares the route's pairs against the real
+    exported file, because the two silently disagreeing about which features have genomes
+    would make the client's roll-up diverge from the cluster's.
+
+  - `POST /api/v1/sample-label` — a `prep_sample_idx` cohort resolved to the public labels
+    a published table carries in place of our identifiers. Three forms, in preference
+    order: `ena_run_accession` (public and unique per sequenced sample, NULL until
+    submission); the `<accession>.<run>.<pool>.<prep_sample>` composite the masked-read
+    export already names its files with; and `<accession>.<prep_sample>` when the sample
+    was never pooled — `sequenced_pool_idx` is nullable, a case the four-part scheme did
+    not cover. Every entry ships the parts beside the label, so nothing parses a label to
+    recover an accession or has to know which form it is looking at. POST because a cohort
+    routinely spans pools and would exceed nginx's 8 KB request-line cap in query params.
+
+  The genome map **refuses with a 413** above its cap rather than truncating, naming the
+  real size — the one capped read here that does. A lookup table silently missing rows
+  drops those features from the caller's roll-up, producing a *wrong* feature table rather
+  than a partial one, and nobody checks `truncated` on a map. JSON for both is a known,
+  accepted limit: the first real reference that trips the 413 is the trigger to build the
+  streamed Parquet form, not to raise the cap. Measured at 196 ms for a 250 001-row fetch
+  off a 1M-member reference, with no sort node — the existing primary keys serve both the
+  filter and the ordering.
+
+  The label map is the human alignment mint's sibling by construction: same cohort cap,
+  same `Tier.VIEWER` all-or-nothing gate via `filter_prep_samples_caller_can_read`, same
+  refusal wording, and the same access-checked-before-anything-else ordering, so a refusal
+  never discloses which samples exist for a cohort the caller may not read. No new scope
+  (`reference:read` and `prep_sample:read` respectively), no migration, no deploy note.
+
 - **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
   `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could
   produce one: `mask-definition` had only `POST` (mint) and `DELETE`, and the admin

@@ -29,6 +29,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_EXCLUSION,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
     PATH_REFERENCE_EXCLUSION_SYNC,
+    PATH_REFERENCE_GENOME_MAP,
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -40,6 +41,8 @@ from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DoGetTicketRequest,
     DoGetTicketResponse,
+    GenomeMapEntry,
+    GenomeMapResponse,
     ReferenceCreateRequest,
     ReferenceDeleteResponse,
     ReferenceExclusionCreateRequest,
@@ -91,7 +94,11 @@ from ..repositories.reference_exclusion import (
     list_for_reference,
     remove_exclusion,
 )
-from ..repositories.reference_membership import count_reference_shards
+from ..repositories.reference_membership import (
+    count_genome_map,
+    count_reference_shards,
+    fetch_genome_map,
+)
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     expected_shard_index_types,
@@ -111,6 +118,25 @@ _DEFAULT_LIST_LIMIT = 1000
 _MAX_LIST_LIMIT = 5000
 
 _MSG_REFERENCE_NOT_FOUND = "Reference not found"
+
+# Hard cap on the genome map, and the one place in the codebase where exceeding a
+# cap is a refusal rather than a truncation — see get_reference_genome_map. Sized
+# from a response-body budget rather than by borrowing another route's number: an
+# entry serializes to roughly 90 bytes of JSON, so this is a ~22 MB worst case,
+# large but deliverable in one body and far above any genome-bearing reference we
+# roll up today. The reference that first trips it is the signal to build the
+# streamed form, not to raise this.
+_GENOME_MAP_HARD_CAP = 250_000
+
+
+async def _require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> None:
+    """404 unless the reference exists. The reference-scoped reads all need this
+    so a typo'd idx is distinguishable from a genuinely empty answer."""
+    exists = await pool.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
 
 
 @router.post(PATH_REFERENCE_ROOT, status_code=201)
@@ -198,11 +224,7 @@ async def get_reference_index(
     visibility / admin). Scoped to reference:read — unlike the anonymous-OK
     reference metadata GETs — because fs_path exposes internal filesystem
     layout; reference:read is held by every human role and service account."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    await _require_reference_exists(pool, reference_idx)
     rows = await pool.fetch(
         "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
         " shard_id"
@@ -242,11 +264,7 @@ async def get_reference_shard_index_status(
     whose sharding fanned out zero shards — reads all-zero / empty (a valid
     "nothing sharded here" answer, not an error). Scoped to reference:read like
     the /index listing: it exposes build progress, not payload."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    await _require_reference_exists(pool, reference_idx)
 
     # N = the shards the planner assigned (COUNT(DISTINCT shard_id) over the
     # non-NULL membership rows — the same derivation finalize_shard uses; there
@@ -334,6 +352,58 @@ async def get_reference_genome_members(
             detail=f"No members for genome {genome_idx} in reference {reference_idx}",
         )
     return [ReferenceGenomeMember.model_validate(dict(r)) for r in rows]
+
+
+@router.get(PATH_REFERENCE_GENOME_MAP)
+async def get_reference_genome_map(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> GenomeMapResponse:
+    """The whole reference's feature_idx → genome lookup: one entry per (feature,
+    genome) pair with the genome's `source` / `source_id`, ordered by
+    (feature_idx, genome_idx).
+
+    This is a control-plane read rather than a Flight ticket because `genome_idx`
+    and the genome's provenance exist only in Postgres — no lake table carries
+    them, so there is nothing for the data plane to serve. Every downstream step
+    of the client-side feature-table recipe rolls features up to genomes through
+    it (per-genome length, breadth, the survivor join, the relabel).
+
+    A feature shared across genomes contributes one entry per genome, so `count`
+    counts PAIRS. Features with no genome are absent — the INNER JOIN matches
+    export_member_genome, whose Parquet the compute side consumes; the two must
+    not disagree about which features have genomes.
+
+    404s an unknown reference, but an existing reference with no genome-bearing
+    features is a 200 with `entries: []` — a 16S reference legitimately has none,
+    so empty is a meaningful clean state (the exclusion-listing posture, not the
+    genome-member one).
+
+    413 — not a truncated 200 — above the hard cap, naming the real size. This is
+    the one capped read here that refuses rather than truncating: a lookup table
+    silently missing rows drops those features from the caller's roll-up,
+    producing a WRONG feature table rather than a partial one. So a 200 is always
+    the complete map, which is why the response carries no `truncated`."""
+    await _require_reference_exists(pool, reference_idx)
+    # Over-fetch by one to detect the overflow; only the refusal path pays for
+    # counting the true size, which is what tells a caller whether they are barely
+    # over or hopelessly over.
+    rows = await fetch_genome_map(pool, reference_idx, limit=_GENOME_MAP_HARD_CAP + 1)
+    if len(rows) > _GENOME_MAP_HARD_CAP:
+        total = await count_genome_map(pool, reference_idx)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Genome map for reference {reference_idx} has {total} entries,"
+                f" over the {_GENOME_MAP_HARD_CAP} maximum this endpoint serves."
+            ),
+        )
+    return GenomeMapResponse(
+        reference_idx=reference_idx,
+        entries=[GenomeMapEntry.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+    )
 
 
 @router.get(PATH_REFERENCE_BY_IDX)
@@ -582,11 +652,7 @@ async def list_reference_exclusions(
     `get_reference_shard_index_status`) so a typo'd idx is distinguishable from a
     genuinely clean reference — an existing reference with no blocked features
     yields `[]`."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    await _require_reference_exists(pool, reference_idx)
     rows = await list_for_reference(pool, reference_idx)
     return [ReferenceExclusionListItem.model_validate(dict(r)) for r in rows]
 
