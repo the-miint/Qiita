@@ -22,11 +22,11 @@ from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
 from qiita_common.models._base import (
-    MAX_COHORT_PREP_SAMPLE_IDX,
     AccessionText,
     MetadataRequestModel,
     NonBlankText,
     PatchRequestModel,
+    PrepSampleCohort,
     ReadCounts,
 )
 from qiita_common.models.biosample import (
@@ -35,6 +35,7 @@ from qiita_common.models.biosample import (
 )
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
+from qiita_common.sample_label import compose_sample_label
 
 
 class SequencingRunCreateRequest(BaseModel):
@@ -1140,15 +1141,16 @@ class SampleLabelRequest(BaseModel):
     params. It is also the only shape that can express a cohort SPANNING pools,
     which is what a feature table's cohort routinely is.
 
-    ``min_length=1`` because an empty cohort has no answer to give — a caller
-    that meant "all of them" has to say which.
+    ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
+    the two bound the same thing — a cohort a scientist assembles — for the same
+    payload-size and disclosure-width reasons. Non-empty because a cohort with no
+    members has no answer to give; a caller that meant "all of them" has to say
+    which.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    prep_sample_idx: list[Annotated[int, Field(gt=0)]] = Field(
-        min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX
-    )
+    prep_sample_idx: PrepSampleCohort
 
 
 class SampleLabel(BaseModel):
@@ -1161,16 +1163,33 @@ class SampleLabel(BaseModel):
     which shape it was looking at. Reading a column instead of parsing a string
     removes that hazard entirely.
 
+    ``label`` is COMPUTED from those parts rather than passed in, which is what
+    makes the guarantee above structural: a label that disagrees with the parts
+    shipped beside it is not constructible.
+
     ``biosample_accession`` is non-null: the route 422s a cohort containing a
-    sample without one rather than emit a hole in this contract.
+    sample without one rather than emit a hole in this contract, so
+    ``compose_sample_label``'s raise on a missing accession is unreachable here.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
-    label: str
     biosample_accession: str
     ena_run_accession: str | None = None
     sequencing_run_idx: Annotated[int, Field(gt=0)] | None = None
     sequenced_pool_idx: Annotated[int, Field(gt=0)] | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def label(self) -> str:
+        """The public identifier: `ena_run_accession`, else the pooled composite,
+        else the unpooled short form. See ``qiita_common.sample_label``."""
+        return compose_sample_label(
+            prep_sample_idx=self.prep_sample_idx,
+            biosample_accession=self.biosample_accession,
+            ena_run_accession=self.ena_run_accession,
+            sequencing_run_idx=self.sequencing_run_idx,
+            sequenced_pool_idx=self.sequenced_pool_idx,
+        )
 
 
 class SampleLabelResponse(BaseModel):

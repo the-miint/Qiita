@@ -96,15 +96,27 @@ async def reference_sequence_set_hash(
     return digest.hexdigest()
 
 
-# The genome map's row set, shared verbatim by the fetch and the count so the
-# size a 413 reports is provably the size the fetch refused — an independently
-# written count would drift into a lie.
-_GENOME_MAP_FROM = (
-    " FROM qiita.reference_membership rm"
-    " JOIN qiita.feature_genome fg USING (feature_idx)"
-    " JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
-    " WHERE rm.reference_idx = $1"
+# The (feature, genome) pair set for one reference — THE definition, shared by
+# all three readers of it: this module's fetch and count, and
+# `actions.library.export_member_genome`'s Parquet cursor. Those three are
+# required to agree (the compute job consumes the Parquet, the client consumes
+# the map, and the count names the size the fetch refused), and sharing the text
+# is what makes agreeing structural rather than a promise in three docstrings.
+# `$1` is the reference_idx; callers bind it in that position. Split in two only
+# because SQL puts every JOIN ahead of the WHERE and the fetch has one more.
+_GENOME_MAP_PAIRS_FROM = (
+    " FROM qiita.reference_membership rm JOIN qiita.feature_genome fg USING (feature_idx)"
 )
+_GENOME_MAP_PAIRS_WHERE = " WHERE rm.reference_idx = $1"
+GENOME_MAP_PAIRS_SQL = _GENOME_MAP_PAIRS_FROM + _GENOME_MAP_PAIRS_WHERE
+
+# Only the fetch needs the genome row, for its provenance columns. Deliberately
+# NOT folded into the fragment above: `feature_genome.genome_idx` is NOT NULL and
+# FKs to `genome`, so the join can neither drop nor duplicate a row — it cannot
+# change a count, and Postgres will not elide it for you (join removal fires only
+# for LEFT joins). Carrying it in the count measured 350 ms against 221 ms on a
+# 1M-member reference, for an answer that could not differ.
+_GENOME_SOURCE_JOIN = " JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
 
 
 async def fetch_genome_map(
@@ -114,10 +126,9 @@ async def fetch_genome_map(
     pair with the genome's `source` / `source_id` provenance, ordered by
     (feature_idx, genome_idx), at most `limit` rows.
 
-    `actions.library.export_member_genome`'s row set, widened with the genome
-    columns — the two MUST agree on which features have genomes, since the compute
-    job consumes the Parquet and the client consumes this. Same INNER JOIN, so a
-    feature with no genome is dropped by both: it cannot be rolled up.
+    `actions.library.export_member_genome`'s row set — literally, via the shared
+    `GENOME_MAP_PAIRS_SQL` — widened with the genome columns. The INNER JOIN drops
+    a feature with no genome from both: it cannot be rolled up.
 
     Ordered, unlike `export_member_genome` (which dropped its ORDER BY because no
     consumer needed one): a capped read needs a stable order for the cap to mean
@@ -127,7 +138,9 @@ async def fetch_genome_map(
     """
     return await db.fetch(
         "SELECT rm.feature_idx, fg.genome_idx, g.source, g.source_id"
-        + _GENOME_MAP_FROM
+        + _GENOME_MAP_PAIRS_FROM
+        + _GENOME_SOURCE_JOIN
+        + _GENOME_MAP_PAIRS_WHERE
         + " ORDER BY rm.feature_idx, fg.genome_idx LIMIT $2",
         reference_idx,
         limit,
@@ -141,7 +154,7 @@ async def count_genome_map(db: asyncpg.Pool | asyncpg.Connection, reference_idx:
     the overflow, then counts to name the real size, so a caller learns whether
     they are 2x or 100x over the cap.
     """
-    return await db.fetchval("SELECT count(*)" + _GENOME_MAP_FROM, reference_idx)
+    return await db.fetchval("SELECT count(*)" + GENOME_MAP_PAIRS_SQL, reference_idx)
 
 
 async def count_reference_shards(db: asyncpg.Pool | asyncpg.Connection, reference_idx: int) -> int:

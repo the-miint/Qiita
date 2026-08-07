@@ -10,6 +10,11 @@ one sequenced sample; it imports the supertype and junction inserts
 from the sibling prep_sample module. Metadata-shaped tables live in the
 sibling prep_sample_metadata module.
 
+`fetch_sample_labels` is the one read here anchored on prep_sample rather
+than the subtype: it LEFT-joins this table precisely because the subtype
+row may be absent. It lives here anyway because what it exists to read —
+the ENA accessions and the pool — are this table's columns.
+
 Write functions take an asyncpg.Connection as their first positional
 argument, never acquire their own connection, and never open their own
 top-level transaction; the caller controls transaction scope so multiple
@@ -77,6 +82,11 @@ async def fetch_sample_labels(
     it because `sequenced_pool_idx` is nullable. `sequencing_run_idx` is reached
     THROUGH the pool, which is what makes the two co-present or both absent —
     `compose_sample_label` refuses a row where they are not.
+
+    Deliberately does NOT filter `ps.retired = false`, unlike the pool- and
+    run-scoped rosters above: retirement is an operator disposition on the sample,
+    not a reason to withhold the name of data already computed. A retired sample
+    that is in an alignment still needs a label in the table that ships with it.
     """
     return await pool_or_conn.fetch(
         "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession,"

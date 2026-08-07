@@ -38,7 +38,6 @@ from qiita_common.models import (
 
 from ..actions.library import delete_alignment_data
 from ..auth.guards import (
-    filter_prep_samples_caller_can_read,
     require_complete_profile,
     require_scope,
     require_service_with_scope,
@@ -49,7 +48,7 @@ from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..feature_table import parse_feature_table_scope
 from ..repositories.alignment_definition import alignment_definition_exists
 from ..repositories.block import list_incomplete_alignment_samples
-from ._helpers import prep_sample_access_denied_detail
+from ._helpers import authorize_prep_sample_cohort, first_few
 
 _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 
@@ -261,27 +260,17 @@ async def create_alignment_cohort_doget_ticket(
     if not await alignment_definition_exists(pool, alignment_idx):
         raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
 
-    # Sorted (and deduped) because the cohort is an IN-list whose order carries
-    # no meaning, but the payload it lands in is signed — so two spellings of
-    # the same request should produce the same bytes.
-    cohort = sorted(set(body.prep_sample_idx))
-
-    access = await filter_prep_samples_caller_can_read(
-        pool, caller=caller, prep_sample_idxs=cohort, min_tier=_COHORT_MIN_TIER
+    cohort = await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=_COHORT_MIN_TIER
     )
-    if access.unlinked or access.blocked_by:
-        raise HTTPException(
-            status_code=403,
-            detail=prep_sample_access_denied_detail(access, min_tier=_COHORT_MIN_TIER),
-        )
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
     if incomplete:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"prep_samples not completed for alignment {alignment_idx}: "
-                f"{', '.join(str(idx) for idx in incomplete)}"
+                f"{len(incomplete)} prep_sample(s) not completed for alignment"
+                f" {alignment_idx} (e.g. {first_few(incomplete)})"
             ),
         )
 

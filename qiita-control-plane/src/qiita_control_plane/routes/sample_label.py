@@ -18,13 +18,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.api_paths import PATH_SAMPLE_LABEL_PREFIX, PATH_SAMPLE_LABEL_ROOT
 from qiita_common.auth_constants import Scope
 from qiita_common.models import SampleLabel, SampleLabelRequest, SampleLabelResponse, Tier
-from qiita_common.sample_label import compose_sample_label
 
-from ..auth.guards import filter_prep_samples_caller_can_read, require_human, require_scope
+from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
 from ..repositories.sequenced_sample import fetch_sample_labels
-from ._helpers import first_few, prep_sample_access_denied_detail
+from ._helpers import authorize_prep_sample_cohort, first_few
 
 router = APIRouter(prefix=PATH_SAMPLE_LABEL_PREFIX, tags=["sample-label"])
 
@@ -71,18 +70,9 @@ async def resolve_sample_labels(
        checks completeness after access: this list would otherwise tell a caller
        which samples exist for a cohort they have no right to read.
     """
-    # Sorted and deduped: the cohort is a set, and the response is ordered by
-    # prep_sample_idx, so two spellings of the same request answer identically.
-    cohort = sorted(set(body.prep_sample_idx))
-
-    access = await filter_prep_samples_caller_can_read(
-        pool, caller=caller, prep_sample_idxs=cohort, min_tier=_LABEL_MIN_TIER
+    cohort = await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=_LABEL_MIN_TIER
     )
-    if access.unlinked or access.blocked_by:
-        raise HTTPException(
-            status_code=403,
-            detail=prep_sample_access_denied_detail(access, min_tier=_LABEL_MIN_TIER),
-        )
 
     rows = await fetch_sample_labels(pool, cohort)
     if len(rows) != len(cohort):
@@ -104,21 +94,5 @@ async def resolve_sample_labels(
             ),
         )
 
-    labels = [
-        SampleLabel(
-            prep_sample_idx=row["prep_sample_idx"],
-            label=compose_sample_label(
-                prep_sample_idx=row["prep_sample_idx"],
-                biosample_accession=row["biosample_accession"],
-                ena_run_accession=row["ena_run_accession"],
-                sequencing_run_idx=row["sequencing_run_idx"],
-                sequenced_pool_idx=row["sequenced_pool_idx"],
-            ),
-            biosample_accession=row["biosample_accession"],
-            ena_run_accession=row["ena_run_accession"],
-            sequencing_run_idx=row["sequencing_run_idx"],
-            sequenced_pool_idx=row["sequenced_pool_idx"],
-        )
-        for row in rows
-    ]
+    labels = [SampleLabel.model_validate(dict(row)) for row in rows]
     return SampleLabelResponse(labels=labels, count=len(labels))
