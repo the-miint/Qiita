@@ -10,7 +10,7 @@ action-layer entry point instead.
 
 import asyncpg
 import pytest
-from qiita_common.models import TerminologyStatus
+from qiita_common.models import TerminologyStatus, TerminologyTermObsoletionKind
 
 from qiita_control_plane.repositories.terminology import (
     TerminologyImportResult,
@@ -48,6 +48,31 @@ async def _insert_term(
         label,
         alternate_label,
     )
+
+
+async def _load_release(pool: asyncpg.Pool, *, name: str, version: str, terms: list) -> int:
+    """Apply one release through the composer and return its terminology_idx."""
+    async with pool.acquire() as conn, conn.transaction():
+        result = await import_terminology_release(
+            conn,
+            name=name,
+            version=version,
+            parsed_terms=terms,
+            parsed_closure=[],
+        )
+    return result.terminology_idx
+
+
+async def _read_row_versions(pool: asyncpg.Pool, terminology_idx: int) -> dict[str, str]:
+    """Return term_id -> the row's transaction stamp, which changes only when
+    the row is physically rewritten. Comparing two of these detects a write
+    that stored the value a row already held."""
+    rows = await pool.fetch(
+        "SELECT term_id, xmin::text AS row_version FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1",
+        terminology_idx,
+    )
+    return {row["term_id"]: row["row_version"] for row in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -296,4 +321,126 @@ async def test_import_terminology_release_clears_unsupplied_alternate_label(
         "TR:1",
     )
     expected = {"label": "Homo sapiens sapiens", "alternate_label": None}
+    assert dict(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# import_terminology_release — rewriting only what changed
+# ---------------------------------------------------------------------------
+
+
+async def test_import_terminology_release_unchanged_rows_are_not_rewritten(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a release is applied twice with identical content:
+    no row is physically rewritten the second time.
+
+    Postgres stores a new row version on every UPDATE without comparing the
+    incoming values to the stored ones, so an upsert that assigns
+    unconditionally leaves one dead tuple per term on a reload that changed
+    nothing. At a few terms that is invisible; at a few million it is the
+    dominant cost of the load.
+    """
+    terms = [
+        parsed_term("TR:1", "one"),
+        parsed_term("TR:2", "two", alternate_label="second"),
+    ]
+    terminology_idx = await _load_release(
+        postgres_pool, name="tr_no_op_reload", version="1.0.0", terms=terms
+    )
+    created_terminologies.append(terminology_idx)
+    before = await _read_row_versions(postgres_pool, terminology_idx)
+
+    await _load_release(postgres_pool, name="tr_no_op_reload", version="2.0.0", terms=terms)
+
+    after = await _read_row_versions(postgres_pool, terminology_idx)
+    assert after == before
+
+
+async def test_import_terminology_release_changed_row_is_rewritten(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a reload changes one term's label and leaves
+    another untouched: only the changed row is rewritten, and it carries the
+    new value."""
+    terminology_idx = await _load_release(
+        postgres_pool,
+        name="tr_partial_reload",
+        version="1.0.0",
+        terms=[parsed_term("TR:1", "one"), parsed_term("TR:2", "two")],
+    )
+    created_terminologies.append(terminology_idx)
+    before = await _read_row_versions(postgres_pool, terminology_idx)
+
+    await _load_release(
+        postgres_pool,
+        name="tr_partial_reload",
+        version="2.0.0",
+        terms=[parsed_term("TR:1", "uno"), parsed_term("TR:2", "two")],
+    )
+
+    after = await _read_row_versions(postgres_pool, terminology_idx)
+    assert after["TR:1"] != before["TR:1"]
+    assert after["TR:2"] == before["TR:2"]
+
+    rows = await postgres_pool.fetch(
+        "SELECT term_id, label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 ORDER BY term_id",
+        terminology_idx,
+    )
+    expected = [
+        {"term_id": "TR:1", "label": "uno"},
+        {"term_id": "TR:2", "label": "two"},
+    ]
+    assert [dict(row) for row in rows] == expected
+
+
+async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a reload keeps a term obsolete but withdraws its
+    replacement pointer: replaced_by returns to NULL.
+
+    Every other column on the row is unchanged between the two releases, so
+    this is the case a change-detecting upsert would skip. The pointer is
+    populated after the upsert rather than by it, which is why the row has to
+    be rewritten on the strength of its stored pointer alone.
+    """
+    merged_term = parsed_term(
+        "TR:1",
+        "one",
+        is_obsolete=True,
+        replaced_by_term_id="TR:2",
+        obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+    )
+    orphaned_term = parsed_term(
+        "TR:1",
+        "one",
+        is_obsolete=True,
+        obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+    )
+    survivor = parsed_term("TR:2", "two")
+
+    terminology_idx = await _load_release(
+        postgres_pool,
+        name="tr_withdrawn_pointer",
+        version="1.0.0",
+        terms=[merged_term, survivor],
+    )
+    created_terminologies.append(terminology_idx)
+
+    await _load_release(
+        postgres_pool,
+        name="tr_withdrawn_pointer",
+        version="2.0.0",
+        terms=[orphaned_term, survivor],
+    )
+
+    row = await postgres_pool.fetchrow(
+        "SELECT is_obsolete, replaced_by FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 AND term_id = $2",
+        terminology_idx,
+        "TR:1",
+    )
+    expected = {"is_obsolete": True, "replaced_by": None}
     assert dict(row) == expected

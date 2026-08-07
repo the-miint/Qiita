@@ -374,7 +374,11 @@ async def _upsert_terms_without_replaced_by(
     """Insert-or-update every incoming term, setting replaced_by=NULL. The
     obsoleted_in_version set-once and un-obsoletion-clear rules live
     inside the UPSERT itself so the invariants are enforced by the same
-    statement that writes them."""
+    statement that writes them.
+
+    A term whose stored values already match the incoming ones is left
+    alone rather than rewritten, so a reload costs row versions only for
+    what actually moved."""
     if not parsed_terms:
         return
     term_ids = [term.term_id for term in parsed_terms]
@@ -402,6 +406,14 @@ async def _upsert_terms_without_replaced_by(
     # reloads, and clears to NULL on un-obsoletion; NB: replaced_by is wiped
     # on every update so the later replaced_by-setting step starts from a
     # clean slate.
+    # The WHERE on the update branch skips a row in which nothing would move, because
+    # Postgres stores a new row version per UPDATE without comparing values
+    # and a reload would otherwise leave one dead tuple per term whether it changed or not.
+    # obsoleted_in_version needs no clause of its own: the alignment CHECK
+    # ties its nullness to is_obsolete, so it can only move when is_obsolete
+    # does. A row carrying a replaced_by must be rewritten whatever else
+    # matches, since the wipe above is what lets the next step drop a pointer
+    # the new release no longer asserts.
     await conn.execute(
         "INSERT INTO qiita.terminology_term"
         "   (terminology_idx, term_id, label, alternate_label, is_obsolete,"
@@ -425,7 +437,14 @@ async def _upsert_terms_without_replaced_by(
         "           )"
         "           ELSE NULL"
         "       END,"
-        "       replaced_by = NULL",
+        "       replaced_by = NULL"
+        " WHERE qiita.terminology_term.label IS DISTINCT FROM EXCLUDED.label"
+        "    OR qiita.terminology_term.alternate_label"
+        "       IS DISTINCT FROM EXCLUDED.alternate_label"
+        "    OR qiita.terminology_term.is_obsolete IS DISTINCT FROM EXCLUDED.is_obsolete"
+        "    OR qiita.terminology_term.obsoletion_kind"
+        "       IS DISTINCT FROM EXCLUDED.obsoletion_kind"
+        "    OR qiita.terminology_term.replaced_by IS NOT NULL",
         terminology_idx,
         term_ids,
         labels,
