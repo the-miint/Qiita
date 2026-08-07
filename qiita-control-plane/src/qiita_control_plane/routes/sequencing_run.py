@@ -41,6 +41,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_ALIGN_PLAN,
+    PATH_SEQUENCED_POOL_ALIGNMENT,
+    PATH_SEQUENCED_POOL_ALIGNMENT_COHORT,
     PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
@@ -62,6 +64,9 @@ from qiita_common.models import (
     AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
+    PoolAlignmentCohort,
+    PoolAlignmentList,
+    PoolAlignmentSummary,
     PoolCompletionStatus,
     PoolExceptionsResponse,
     PoolQCReport,
@@ -82,6 +87,7 @@ from qiita_common.models import (
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
+    Tier,
     WorkTicketState,
     merge_qc_reports,
 )
@@ -99,6 +105,7 @@ from ..actions.sequenced_pool import (
     reap_staged_reads,
 )
 from ..auth.guards import (
+    filter_prep_samples_caller_can_read,
     require_caller_owns_run,
     require_complete_profile,
     require_human,
@@ -116,6 +123,11 @@ from ..deps import (
     get_flight_signing_key,
     get_scratch_staging,
     get_tx_conn_factory,
+)
+from ..repositories.alignment_definition import (
+    list_alignments_over_prep_samples,
+    list_completed_alignment_samples,
+    list_pool_prep_sample_idxs,
 )
 from ..repositories.sequencing_run import (
     PayloadMismatch,
@@ -621,6 +633,109 @@ async def get_sequenced_pool_qc_report(
         read_metrics=_pool_read_metrics(rollup),
         merged=merge_qc_reports(samples),
         samples=samples,
+    )
+
+
+async def _readable_pool_prep_samples(
+    pool: asyncpg.Pool, *, sequenced_pool_idx: int, caller: Principal
+) -> list[int]:
+    """The pool's non-retired prep_samples that `caller` may read.
+
+    Pool membership, then the shared per-study read gate
+    (`filter_prep_samples_caller_can_read`) — the same one the all-or-nothing
+    alignment mint raises on, so a cohort discovered here is one the mint
+    accepts. Everything about what "may read" means, including the orphan drop
+    and the wet_lab_admin bypass, lives in that guard rather than here.
+    """
+    prep_sample_idxs = await list_pool_prep_sample_idxs(pool, sequenced_pool_idx)
+    access = await filter_prep_samples_caller_can_read(
+        pool, caller=caller, prep_sample_idxs=prep_sample_idxs, min_tier=Tier.VIEWER
+    )
+    return access.readable
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT)
+async def list_sequenced_pool_alignments(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentList:
+    """List the alignments over this pool's samples — the answer to "what has
+    been aligned here, against which reference, and is it finished".
+
+    **Narrowed to the caller's readable slice**, not gated on the whole pool. A
+    pool spans studies, so 403ing it would make it undiscoverable to someone who
+    legitimately owns part of it; narrowing is safe on a listing because no
+    scientific result depends on it. The per-study `Tier.VIEWER` check is the
+    boundary, which is why this is open to role `user` where the sibling
+    completion rollup is wet_lab_admin-gated.
+
+    Both counts are over the caller's own samples (see `PoolAlignmentSummary`),
+    so they agree with what the alignment DoGet mint will accept — that mint is
+    all-or-nothing, and showing the pool's real counts here would set the caller
+    up for a 403. An alignment the caller can read no sample of is absent
+    entirely rather than reported with zero counts.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    rows = await list_alignments_over_prep_samples(pool, prep_sample_idxs)
+    return PoolAlignmentList(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignments=[
+            PoolAlignmentSummary(
+                alignment_idx=row["alignment_idx"],
+                # asyncpg hands JSONB back as str under the default codec.
+                params=json.loads(row["params"])
+                if isinstance(row["params"], str)
+                else row["params"],
+                samples_completed=row["samples_completed"],
+                samples_total=row["samples_total"],
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT_COHORT)
+async def get_sequenced_pool_alignment_cohort(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    alignment_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentCohort:
+    """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
+    prep_samples that are both readable by the caller and `'completed'` for this
+    alignment.
+
+    Two filters, and both are load-bearing. Readability makes the result a valid
+    mint body by construction — the mint is all-or-nothing, so a cohort this
+    route hands back can never 403 there. Completion is a first-class state:
+    alignment rows are NOT 1:1 with reads (cross-shard routing and paired-end
+    mates both multiply rows per read), so the presence of rows says nothing
+    about whether a sample is done.
+
+    An empty cohort is a legitimate answer, not a 404 or a 403 — it means
+    "nothing here you may mint", and unlike a rejection it does not confirm
+    which of the pool's alignments touch data the caller lacks.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    return PoolAlignmentCohort(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=await list_completed_alignment_samples(
+            pool, alignment_idx, prep_sample_idxs
+        ),
     )
 
 

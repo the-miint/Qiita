@@ -255,8 +255,36 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **A scientist can pull their own alignment data.**
+  `POST /alignment/{alignment_idx}/ticket/doget` signs a Flight DoGet ticket for
+  a cohort the caller names, closing the gap between "my samples were aligned"
+  and "I can read the alignment" — until now the only mint was
+  service-account-only and read its cohort from a work ticket. Guarded by a new
+  `alignment:doget` scope, on every role ceiling and deliberately off
+  `SERVICE_ACCOUNT_SCOPE_CEILING`, because the real boundary is per-study:
+  `Tier.VIEWER` on every study each `prep_sample_idx` is still linked to.
+  Validation runs 404 (no such alignment) → 403 (access) → 422 (cohort
+  completeness) → sign, and that order is load-bearing — reversed, the 422 would
+  tell a caller which samples are finished for an alignment they cannot read. A
+  partially-readable cohort is refused rather than narrowed: coverage filtering
+  makes a feature table cohort-dependent, so a trimmed cohort answers a
+  different scientific question under the name of the one that was asked.
+  Rationale in `docs/architecture.md` and `docs/auth.md`. (#436)
+- **Two reads answer "what has been aligned for this pool, and what may I
+  mint?"** `GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment` lists the
+  alignments over a pool with their config and completion counts;
+  `.../alignment/{alignment_idx}/cohort` resolves the prep_samples that are both
+  readable and `completed`. Both **narrow** to the caller's slice rather than
+  403ing a pool that spans studies they only partly hold — a pool spans studies,
+  so rejecting it would make it undiscoverable to someone who legitimately owns
+  part of it, and narrowing is safe on a listing where no scientific result
+  depends on it. Counts are caller-scoped for the same reason: showing the
+  pool's real numbers to someone who may read half of them would set them up for
+  a 403 from the all-or-nothing mint. Open to role `user`, unlike the
+  wet_lab_admin-gated pool-completion rollup beside them.
+  (#436)
 - **A Flight DoGet ticket can carry a signed column list, and the alignment
-  surface now requires one.** The consumer names the columns it wants, the
+  surface now requires one (#435).** The consumer names the columns it wants, the
   control plane validates them against a per-table allowlist at mint time (422
   on an unknown, duplicated, or empty list) and signs them, and the data plane
   validates again before projecting exactly that set, in that order. Only
@@ -265,7 +293,7 @@ duplicates further down are historical strata; leave them where they are.
   instead of a design discussion — `cigar` is ~96% of an alignment row, so
   anything that needs it can now ask, and everything else keeps paying nothing.
   Rationale in `docs/architecture.md`.
-- **DoGet streams can be zstd-compressed, at the client's request.** A client
+- **DoGet streams can be zstd-compressed, at the client's request (#434).** A client
   sends `qiita-ipc-compression: zstd` as gRPC metadata and the data plane
   compresses that stream's Arrow IPC bodies; anything else is rejected rather
   than ignored, and no header means today's uncompressed behaviour byte for
@@ -276,7 +304,7 @@ duplicates further down are historical strata; leave them where they are.
   fabric. `qiita-admin masked-read-export --compress` opts in for off-site runs,
   where it is a large win. Rationale and the break-even arithmetic are in
   `docs/architecture.md`. No operator action: no new env var, no migration.
-- **Three DuckLake facts the export path depends on are now pinned by test.**
+- **Three DuckLake facts the export path depends on are now pinned by test (#433).**
   `qiita-data-plane/src/ducklake.rs` (integration tier): DuckDB's Arrow export
   emits **no** `DictionaryArray` for VARCHAR even at 2 distinct values but
   **does** for ENUM, so a dictionary on the wire has to be built by us; and a
@@ -287,7 +315,7 @@ duplicates further down are historical strata; leave them where they are.
   on whatever we decide about compression, which is why they are in-tree while
   the compression instrument below is not.
 - **The DoGet compression and representation axes were measured, and the
-  instrument is archived out of tree.** The evaluation concluded **ZSTD at the
+  instrument is archived out of tree (#433).** The evaluation concluded **ZSTD at the
   IPC layer**, requested per call and defaulting to off, with every
   array-representation option (run-end encoding, `Utf8View`, dictionaries,
   integer narrowing) and every batch-geometry change measured as neutral or
@@ -861,8 +889,18 @@ duplicates further down are historical strata; leave them where they are.
   [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
   per invocation — index load is 98.4% of classify wall clock); removal of our
   workaround tracked at #403.
+- **`qiita.alignment_sample` is now indexed by `prep_sample_idx`.** Its primary
+  key is `(alignment_idx, prep_sample_idx)`, which serves every consumer that
+  leads with a known alignment — but the new pool-alignment discovery read asks
+  the opposite question ("which alignments touch THESE samples?") with no
+  `alignment_idx` predicate, and a composite btree cannot be used on its
+  non-leading column. That sequential-scanned an unboundedly-growing table (one
+  row per alignment config × sample, across every reference, aligner and rerun)
+  from a route open to any authenticated user. Added
+  `(prep_sample_idx, alignment_idx)` so the query is served index-only, built
+  `CONCURRENTLY`. (#436)
 - **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
-  is now a scoped table macro instead of a view.** DuckDB derives a transitive
+  is now a scoped table macro instead of a view (#433).** DuckDB derives a transitive
   predicate across a join equality for `col = const` but **not** for
   `col IN (list)`, so a view could only ever receive a multi-sample scope on one
   side of the `read`/`read_mask` join: the `read` scan got no filter, DuckLake

@@ -21,6 +21,7 @@ import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_DEFINITION_BY_IDX,
     PATH_ALIGNMENT_DEFINITION_PREFIX,
     PATH_ALIGNMENT_DOGET,
@@ -28,17 +29,27 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    AlignmentCohortDoGetTicketRequest,
     AlignmentDefinitionDeleteResponse,
     AlignmentDoGetTicketRequest,
     DoGetTicketResponse,
+    Tier,
 )
 
 from ..actions.library import delete_alignment_data
-from ..auth.guards import require_scope, require_service_with_scope
-from ..auth.principal import Principal, ServiceAccount
+from ..auth.guards import (
+    PrepSampleReadAccess,
+    filter_prep_samples_caller_can_read,
+    require_complete_profile,
+    require_scope,
+    require_service_with_scope,
+)
+from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..feature_table import parse_feature_table_scope
+from ..repositories.alignment_definition import alignment_definition_exists
+from ..repositories.block import list_incomplete_alignment_samples
 
 _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 
@@ -49,6 +60,11 @@ _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 # (routes/reference.py) and the data plane's ALLOWED_TABLES. A constant so the
 # name has one definition here.
 _ALIGNMENT_TABLE = "alignment_visible"
+
+# Read tier the human mint requires on every study a cohort sample links to.
+# Named once so the check and the 403 that explains it cannot disagree about
+# what the caller has to go ask for.
+_COHORT_MIN_TIER = Tier.VIEWER
 
 alignment_definition_router = APIRouter(
     prefix=PATH_ALIGNMENT_DEFINITION_PREFIX, tags=["alignment-definition"]
@@ -194,15 +210,143 @@ async def create_alignment_doget_ticket(
         alignment_idx, prep_sample_idx = parse_feature_table_scope(ctx)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    filter_ = {"alignment_idx": [alignment_idx], "prep_sample_idx": prep_sample_idx}
-    # The projection allowlist lives at the signing boundary, not here, so no
-    # route can mint an unvalidated one — same shape as the scope check above:
-    # one shared rule, each boundary translating to its own error type.
+    return _sign_alignment_ticket(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        columns=body.columns,
+        signing_key=signing_key,
+    )
+
+
+@alignment_router.post(PATH_ALIGNMENT_COHORT_DOGET, status_code=201)
+async def create_alignment_cohort_doget_ticket(
+    alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentCohortDoGetTicketRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    caller: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DOGET)),
+) -> DoGetTicketResponse:
+    """Sign a DoGet ticket for an alignment cohort the CALLER names — the
+    scientist-facing counterpart of the work-ticket mint above.
+
+    Human-callable (``alignment:doget``, on every role ceiling) because the real
+    boundary is per-study, not per-role: the caller must hold ``Tier.VIEWER`` on
+    every study each requested prep_sample is still linked to. Service accounts
+    are deliberately excluded — a worker has the other route, and one surface
+    with two validation paths is what splitting the scopes prevented.
+
+    **The signed cohort IS the authorization boundary.** The data plane serves
+    exactly the prep_sample_idx list this ticket carries and knows nothing about
+    studies or users, so there is no second line of defence behind this
+    function; every check below is the only one there is.
+
+    Validation is ordered, and the order is load-bearing:
+
+    1. **The alignment exists** → 404, before anything discloses cohort state.
+    2. **Access** → 403. All-or-nothing, never narrowed: coverage filtering
+       makes a feature table cohort-dependent, so quietly trimming the request
+       would answer a different scientific question under the name of the one
+       that was asked. The 403 names what to go fix — the unreadable studies, or
+       the samples whose every study link is retired (denied: a read gate fails
+       closed on that anomaly, unlike the work-ticket submit gate).
+    3. **Completeness** → 422, only once access has passed. Reversed, the 422's
+       sample list would tell a caller which samples are completed for an
+       alignment they have no right to read at all. ``alignment_sample.state``
+       is first-class because alignment rows are NOT 1:1 with reads, so the
+       presence of rows never means done — this is the check the work-ticket
+       route can skip because its runner resolver already ran it at submit.
+    4. **Sign**, sharing one helper with that route so the two cannot drift.
+    """
+    if not await alignment_definition_exists(pool, alignment_idx):
+        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
+
+    # Sorted (and deduped) because the cohort is an IN-list whose order carries
+    # no meaning, but the payload it lands in is signed — so two spellings of
+    # the same request should produce the same bytes.
+    cohort = sorted(set(body.prep_sample_idx))
+
+    access = await filter_prep_samples_caller_can_read(
+        pool, caller=caller, prep_sample_idxs=cohort, min_tier=_COHORT_MIN_TIER
+    )
+    if access.unlinked or access.blocked_by:
+        raise HTTPException(
+            status_code=403, detail=_access_denied_detail(access, min_tier=_COHORT_MIN_TIER)
+        )
+
+    incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
+    if incomplete:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"prep_samples not completed for alignment {alignment_idx}: "
+                f"{', '.join(str(idx) for idx in incomplete)}"
+            ),
+        )
+
+    return _sign_alignment_ticket(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=cohort,
+        columns=body.columns,
+        signing_key=signing_key,
+    )
+
+
+def _access_denied_detail(access: PrepSampleReadAccess, *, min_tier: Tier) -> str:
+    """The 403 body: what the caller would have to change to be allowed.
+
+    Both denial modes are reported, and separately — an unreadable study is
+    something to go ask for, an unlinked sample is a data anomaly to report.
+
+    **Deliberately truncated, and deliberately NOT correlated.** The caller
+    chooses the cohort, so a message that named every blocked sample alongside
+    the study that blocked it would answer, in one request, "which of these
+    identifiers exist and which studies are they in?" for the whole body — an
+    enumeration oracle over `prep_sample_to_study` handed to the lowest role we
+    have. Naming a few of each is enough to act on and does not scale into a
+    dump. Same reason and same shape as the host-filter refusal's `[:5]` in
+    routes/sequencing_run.py.
+    """
+    parts = []
+    if access.blocked_by:
+        studies = sorted({s for denied in access.blocked_by.values() for s in denied})
+        parts.append(
+            f"requires study access at tier {str(min_tier)!r} or higher on"
+            f" {len(studies)} study/studies (e.g. {_first_few(studies)})"
+        )
+    if access.unlinked:
+        parts.append(
+            f"{len(access.unlinked)} prep_sample(s) have no active study link and"
+            f" cannot be authorized (e.g. {_first_few(access.unlinked)})"
+        )
+    return "; ".join(parts)
+
+
+def _first_few(idxs: list[int], limit: int = 5) -> str:
+    head = ", ".join(str(idx) for idx in idxs[:limit])
+    return f"{head}, …" if len(idxs) > limit else head
+
+
+def _sign_alignment_ticket(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: list[int],
+    columns: list[str] | None,
+    signing_key: bytes,
+) -> DoGetTicketResponse:
+    """Sign the alignment DoGet ticket both mint routes return.
+
+    Shared so the table name, the filter shape, and the 422-on-bad-projection
+    translation have one definition — two mint routes for one data-plane surface
+    is otherwise an invitation to drift. The projection allowlist itself lives
+    at the signing boundary (`auth/tickets.py`), not here, so no route can mint
+    an unvalidated one.
+    """
     try:
         ticket_bytes = sign_ticket(
             table=_ALIGNMENT_TABLE,
-            filter=filter_,
-            columns=body.columns,
+            filter={"alignment_idx": [alignment_idx], "prep_sample_idx": prep_sample_idx},
+            columns=columns,
             secret=signing_key,
         )
     except ValueError as exc:

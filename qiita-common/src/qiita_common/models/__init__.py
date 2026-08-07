@@ -188,6 +188,9 @@ from qiita_common.models.sequencing import (
     MateQCAggregate,
     MergedQCAggregate,
     PointQCAggregate,
+    PoolAlignmentCohort,
+    PoolAlignmentList,
+    PoolAlignmentSummary,
     PoolCompletionStatus,
     PoolExceptionsResponse,
     PoolQCReport,
@@ -220,6 +223,7 @@ from qiita_common.models.sequencing import (
     merge_qc_reports,
 )
 from qiita_common.models.step import (
+    AlignmentCohortDoGetTicketRequest,
     AlignmentDoGetTicketRequest,
     DoGetTicketRequest,
     DoGetTicketResponse,
@@ -391,6 +395,7 @@ __all__ = [
     "TerminologyTermObsoletionKind",
     "Tier",
     # Step wire contract.
+    "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
     "ReadDoGetTicketRequest",
     "DoGetTicketRequest",
@@ -521,6 +526,9 @@ __all__ = [
     "PrepSampleStudyFieldResponse",
     # Sequencing-run / sequenced-pool / sequenced-sample.
     "AlignmentDefinitionDeleteResponse",
+    "PoolAlignmentCohort",
+    "PoolAlignmentList",
+    "PoolAlignmentSummary",
     "MaskDefinition",
     "MaskDefinitionDeleteResponse",
     "MaskDefinitionListResponse",
