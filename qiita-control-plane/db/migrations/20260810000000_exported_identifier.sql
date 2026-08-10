@@ -24,9 +24,19 @@
 -- FORWARD PLAN, and it is load-bearing rather than aspirational: other data and
 -- processing types are coming, and they will NOT be identified by alignment_idx.
 -- Each arrives as an `ALTER TABLE ... ADD COLUMN <kind>_idx BIGINT` plus its own
--- FK, and `exported_identifier_one_processing` below MUST be updated to name it.
--- The check is written with num_nonnulls precisely so that is a one-token edit
--- (same idiom as qiita.reference_exclusion's genome_idx/feature_idx check).
+-- FK, and TWO things below must be updated with it:
+--
+--   1. `exported_identifier_one_processing` must name the new column. Written with
+--      num_nonnulls precisely so that is a one-token edit (same idiom as
+--      qiita.reference_exclusion's genome_idx/feature_idx check).
+--   2. A partial unique index of its own, scoped to the new column. The existing
+--      `exported_identifier_live_processed_sample` will NOT cover it: a live row of
+--      a new kind has alignment_idx NULL, and a unique index treats every NULL as
+--      distinct, so two live rows for the same new-kind processing would not
+--      collide and the one-live-identifier-per-processed-sample invariant would
+--      silently stop holding for that kind. This is not fixable by widening the
+--      existing index — `NULLS NOT DISTINCT` would instead make two DIFFERENT
+--      new-kind processings of one sample collide. One index per kind.
 
 CREATE TABLE qiita.exported_identifier (
     idx              BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
@@ -94,8 +104,9 @@ COMMENT ON TABLE qiita.exported_identifier IS
     'Exists because no accession identifies a processed sample: a biosample '
     'accession cannot say WHICH sequencing of it, and an ENA run accession is '
     'NULL until submission. Never deleted, only retired, so a published citation '
-    'keeps resolving. Extended by ADD COLUMN per new processing type — the '
-    'one_processing CHECK must be updated with it.';
+    'keeps resolving. Extended by ADD COLUMN per new processing type — which must '
+    'update the one_processing CHECK AND add its own partial unique index (the '
+    'existing one cannot cover a kind whose alignment_idx is NULL).';
 
 COMMENT ON COLUMN qiita.exported_identifier.export_id IS
     'The published identifier, ''QM'' || idx. GENERATED ALWAYS: unforgeable by a '
@@ -103,8 +114,13 @@ COMMENT ON COLUMN qiita.exported_identifier.export_id IS
 
 -- One LIVE identifier per processed sample, so the same (alignment, sample)
 -- always resolves to the same export_id — the mint is an idempotent upsert on
--- this index. PARTIAL on `NOT retired` so a retired tuple can be re-minted with
--- a fresh identifier instead of colliding with its own history forever.
+-- this index.
+--
+-- PARTIAL on `NOT retired` so a retired tuple can be re-minted with a fresh
+-- identifier instead of colliding with its own history forever. The case that
+-- needs this is a DELIBERATE retirement (wrong data published, an embargo) where
+-- alignment_idx stays non-null — not the purge path, which nulls the column and so
+-- could never collide anyway.
 --
 -- alignment_idx LEADS deliberately: the mint looks a cohort up as
 -- `alignment_idx = $1 AND prep_sample_idx = ANY($2)`, so the equality binds the
@@ -131,12 +147,19 @@ CREATE UNIQUE INDEX exported_identifier_export_id_unique
 -- the alignment purge would fail with a check violation instead of succeeding.
 -- BEFORE UPDATE so the retirement lands in the same statement as the detach.
 --
--- The reason text keeps the alignment_idx that was severed, because the column
--- no longer can. Note a purge is not always permanent: mint_alignment_definition
--- deduplicates on params_hash, so re-aligning the same config mints the SAME
--- alignment_idx back. The retired row stays retired and a fresh export_id is
--- minted beside it — the bytes were recomputed, so the honest answer is a new
--- identifier rather than silently re-pointing an old one.
+-- The reason text keeps the alignment_idx that was severed, because the column no
+-- longer can.
+--
+-- A purge is permanent as far as this identifier is concerned. alignment_idx is
+-- GENERATED ALWAYS AS IDENTITY and the purge hard-DELETEs the row, so re-aligning
+-- the identical config does NOT get its old alignment_idx back —
+-- mint_alignment_definition finds no row for that params_hash and inserts a fresh
+-- identity value. The re-aligned data is therefore a new processed sample with a
+-- new export_id, and the retired one keeps naming what was purged.
+--
+-- The trigger fires on any non-null -> null transition, but the FK action is the
+-- only path that produces one today; a future code path that nulls the column for
+-- some other reason would inherit this wording and be wrong about it.
 CREATE OR REPLACE FUNCTION qiita.retire_detached_exported_identifier()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN

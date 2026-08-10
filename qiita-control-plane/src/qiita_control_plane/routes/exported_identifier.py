@@ -30,7 +30,7 @@ from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
 from ..repositories.alignment_definition import alignment_definition_exists
 from ..repositories.block import list_incomplete_alignment_samples
-from ..repositories.exported_identifier import mint_exported_identifiers
+from ..repositories.exported_identifier import IncompleteMintError, mint_exported_identifiers
 from ._helpers import authorize_prep_sample_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])
@@ -112,12 +112,27 @@ async def mint_exported_identifier_map(
             ),
         )
 
-    rows = await mint_exported_identifiers(
-        pool,
-        alignment_idx=body.alignment_idx,
-        prep_sample_idxs=cohort,
-        created_by_idx=caller.principal_idx,
-    )
+    try:
+        rows = await mint_exported_identifiers(
+            pool,
+            alignment_idx=body.alignment_idx,
+            prep_sample_idxs=cohort,
+            created_by_idx=caller.principal_idx,
+        )
+    except IncompleteMintError as exc:
+        # The only way to get here is a concurrent purge of this alignment (which
+        # retires the identifiers it named) between the checks above and the mint.
+        # 409 rather than 500 because nothing is wrong with the request: the
+        # alignment it named stopped existing mid-flight, and a retry against the
+        # re-aligned data is the correct next move.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"alignment {body.alignment_idx} changed while minting; no identifier"
+                f" for {len(exc.missing)} prep_sample(s) (e.g."
+                f" {first_few(exc.missing)}). Nothing partial was returned — retry"
+            ),
+        ) from exc
     identifiers = [ExportedIdentifier.model_validate(dict(row)) for row in rows]
     return ExportedIdentifierResponse(
         alignment_idx=body.alignment_idx,

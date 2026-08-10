@@ -214,3 +214,47 @@ async def test_a_sample_with_a_published_identifier_cannot_be_hard_deleted(postg
         await postgres_pool.execute(
             "DELETE FROM qiita.prep_sample WHERE idx = $1", probe["prep_sample_idx"]
         )
+
+
+async def test_a_purge_does_not_give_the_alignment_idx_back(postgres_pool, probe):
+    """Pins WHY a purge is permanent for an identifier, since the reasoning is easy
+    to get backwards: `mint_alignment_definition` dedups on params_hash, so one
+    might expect re-minting the same config to recover the same alignment_idx. It
+    does not — alignment_idx is GENERATED ALWAYS AS IDENTITY and the purge
+    hard-DELETEs the row, so Postgres issues a fresh value and the re-aligned data
+    is a genuinely new processed sample.
+    """
+    params_hash = await postgres_pool.fetchval(
+        "SELECT params_hash FROM qiita.alignment_definition WHERE alignment_idx = $1",
+        probe["alignment_idx"],
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1",
+        probe["alignment_idx"],
+    )
+    reminted = await postgres_pool.fetchval(
+        "SELECT (qiita.mint_alignment_definition($1, $2, $3)).alignment_idx",
+        params_hash,
+        '{"probe": "exported_identifier"}',
+        probe["principal_idx"],
+    )
+    assert reminted != probe["alignment_idx"]
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", reminted
+    )
+
+
+def test_missing_from_reports_the_gap():
+    """The mint's all-or-nothing guard. Exercised directly because the only thing
+    that makes it fire in production — an alignment purged between the INSERT and
+    the SELECT of one READ COMMITTED transaction — cannot be staged deterministically
+    without racing two connections, and the promise it protects (every requested
+    sample is present or the request fails) is the response's headline claim."""
+    from qiita_control_plane.repositories.exported_identifier import _missing_from
+
+    rows = [{"prep_sample_idx": 4}, {"prep_sample_idx": 9}]
+    assert _missing_from(rows, [4, 9]) == []
+    assert _missing_from(rows, [4, 7, 9, 2]) == [2, 7]
+    assert _missing_from([], [5]) == [5]
+    # Deduped input must not report a phantom gap.
+    assert _missing_from(rows, [4, 4, 9]) == []
