@@ -812,17 +812,18 @@ PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
 PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
 
 # =============================================================================
-# /sample-label — the public label a published table carries per sample
+# /exported-identifier — the public handle a published table carries per sample
 # =============================================================================
-# POST-as-read, like /biosample/lookup-by-accession: the cohort rides the body
-# because a feature table's cohort is a pool's or a study's worth of samples and
-# routinely spans pools, neither of which a query string can carry.
+# POST, and not only because it writes: the cohort has to ride the body, like
+# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
+# a study's worth of samples and routinely spans pools, neither of which a query
+# string can carry.
 
-PATH_SAMPLE_LABEL_PREFIX = "/sample-label"
-PATH_SAMPLE_LABEL_ROOT = ""  # POST against the prefix itself
+PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
+PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
 
-URL_SAMPLE_LABEL_PREFIX = f"{API_PREFIX}{PATH_SAMPLE_LABEL_PREFIX}"
-URL_SAMPLE_LABEL = f"{URL_SAMPLE_LABEL_PREFIX}{PATH_SAMPLE_LABEL_ROOT}"
+URL_EXPORTED_IDENTIFIER_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_IDENTIFIER_PREFIX}"
+URL_EXPORTED_IDENTIFIER = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
 
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"

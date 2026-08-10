@@ -323,9 +323,9 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ),
     # /sample-label
     (
-        "URL_SAMPLE_LABEL",
-        "PATH_SAMPLE_LABEL_PREFIX",
-        "PATH_SAMPLE_LABEL_ROOT",
+        "URL_EXPORTED_IDENTIFIER",
+        "PATH_EXPORTED_IDENTIFIER_PREFIX",
+        "PATH_EXPORTED_IDENTIFIER_ROOT",
     ),
     # /prep-sample
     (

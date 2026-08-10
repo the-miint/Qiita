@@ -10,11 +10,6 @@ one sequenced sample; it imports the supertype and junction inserts
 from the sibling prep_sample module. Metadata-shaped tables live in the
 sibling prep_sample_metadata module.
 
-`fetch_sample_labels` is the one read here anchored on prep_sample rather
-than the subtype: it LEFT-joins this table precisely because the subtype
-row may be absent. It lives here anyway because what it exists to read —
-the ENA accessions and the pool — are this table's columns.
-
 Write functions take an asyncpg.Connection as their first positional
 argument, never acquire their own connection, and never open their own
 top-level transaction; the caller controls transaction scope so multiple
@@ -64,41 +59,6 @@ _LIST_ITEM_COLUMNS = (
     "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
     "            AND wt.action_id = $3) AS has_read_mask_ticket"
 )
-
-
-async def fetch_sample_labels(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection, prep_sample_idxs: list[int]
-) -> list[asyncpg.Record]:
-    """Everything the public sample label is composed from, for a prep_sample
-    cohort, ascending by prep_sample_idx.
-
-    Rows come back only for prep_samples that EXIST — a caller that needs to
-    distinguish "not labellable" from "not a prep_sample" compares the returned
-    count against its cohort, which the route does (a nonexistent idx would
-    otherwise vanish silently from an all-or-nothing answer).
-
-    `sequenced_sample` is LEFT-joined because a prep_sample of a future
-    non-sequenced processing_kind has no subtype row, and `sequenced_pool` after
-    it because `sequenced_pool_idx` is nullable. `sequencing_run_idx` is reached
-    THROUGH the pool, which is what makes the two co-present or both absent —
-    `compose_sample_label` refuses a row where they are not.
-
-    Deliberately does NOT filter `ps.retired = false`, unlike the pool- and
-    run-scoped rosters above: retirement is an operator disposition on the sample,
-    not a reason to withhold the name of data already computed. A retired sample
-    that is in an alignment still needs a label in the table that ships with it.
-    """
-    return await pool_or_conn.fetch(
-        "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession,"
-        "       ss.ena_run_accession, ss.sequenced_pool_idx, sp.sequencing_run_idx"
-        "  FROM qiita.prep_sample ps"
-        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
-        "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
-        "  LEFT JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
-        " WHERE ps.idx = ANY($1::bigint[])"
-        " ORDER BY ps.idx",
-        prep_sample_idxs,
-    )
 
 
 async def fetch_sequenced_sample_with_prep_sample(

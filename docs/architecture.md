@@ -663,21 +663,33 @@ you know why:
 ### Two maps that are REST reads, not Flight tickets
 
 Turning those alignment rows into a feature table needs two translations, and
-both are control-plane REST reads rather than signed Flight tickets — the one
+both are control-plane REST calls rather than signed Flight tickets — the one
 place bulk-shaped analytic data does not come off the data plane:
 
-| Read | Answers | Why not Flight |
+| Call | Answers | Why not Flight |
 |---|---|---|
 | `GET /reference/{reference_idx}/genome-map` | `feature_idx` → `(genome_idx, source, source_id)` | `genome_idx` and the genome's provenance exist **only in Postgres**; no DuckLake table carries them, and `genome_idx` is not a filter column |
-| `POST /sample-label` | `prep_sample_idx` → the public label | composed from `biosample_accession` / `ena_run_accession` / the pool, all Postgres-only |
+| `POST /exported-identifier` | `(alignment_idx, prep_sample_idx)` → `export_id` | the identifier is *minted* here; it exists in Postgres only, and creating one is a write |
 
 That is the whole criterion: **a signed ticket can only name identifiers the
-data plane can resolve**, and neither map's columns exist out there. It is not a
+data plane can resolve**, and neither call's columns exist out there. It is not a
 policy exception and it does not generalize — anything whose columns do live in
 the lake still goes through a ticket.
 
-**Both ship JSON, which is a known limit rather than an oversight.** The genome
-map for a GG2-scale reference is millions of rows, so it **refuses with a 413**
+**The exported identifier is the boundary where our identifiers stop.** A
+published table names its samples `QM<n>`, never `prep_sample_idx` — see the
+opaque-identifier rule in `CLAUDE.md`. No accession can do that job: a biosample
+sequenced repeatedly has several prep_samples, so its accession cannot say which
+sequencing a row came from, and an ENA run accession is NULL until submission,
+which may not have happened. `export_id` names a *processed* sample — the sample
+plus the processing it went through — because a feature table's rows are
+processing-specific, so the same sample under two alignments is two things. The
+map is the only artifact carrying both `export_id` and `prep_sample_idx`; that
+pairing is its entire purpose, and it is what must not be shipped onward.
+
+**Both ship JSON, and for the genome map that is a known limit rather than an
+oversight.** The genome map for a GG2-scale reference is millions of rows, so it
+**refuses with a 413**
 above its cap instead of truncating: a lookup table silently missing rows drops
 those features from the caller's roll-up, producing a *wrong* feature table
 rather than a partial one, and nobody checks a `truncated` flag on a map. The

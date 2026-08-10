@@ -21,7 +21,6 @@ from qiita_common.api_paths import (
 )
 from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.parquet import ROW_GROUP_SIZE_BYTES
-from qiita_common.sample_label import pooled_sample_label
 
 from qiita_control_plane.miint import connect_with_miint
 
@@ -194,18 +193,14 @@ def _export_stem(sample: dict, run_idx, pool_idx) -> str:
     """Per-sample output filename stem, single-sourced so the export loop and the
     fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``.
 
-    Deliberately the composite ALWAYS, never `compose_sample_label`'s preferred
-    `ena_run_accession` form: this names a file, and switching a submitted
-    sample's filename to its run accession would silently rename exports and
-    route around the `_SAFE_ACCESSION` charset check above. The composite itself
-    is shared with the label map so the two cannot drift.
+    **This composite embeds our internal identifiers and predates the rule against
+    letting them leave Qiita** (see CLAUDE.md). It survives because this command is
+    system_admin-only and changing the stem would silently rename every existing
+    export and route around the `_SAFE_ACCESSION` charset check above. Do not copy
+    the shape to a new surface: a published artifact names its samples with
+    `qiita.exported_identifier.export_id`.
     """
-    return pooled_sample_label(
-        biosample_accession=sample["biosample_accession"],
-        sequencing_run_idx=run_idx,
-        sequenced_pool_idx=pool_idx,
-        prep_sample_idx=sample["prep_sample_idx"],
-    )
+    return f"{sample['biosample_accession']}.{run_idx}.{pool_idx}.{sample['prep_sample_idx']}"
 
 
 def _parquet_row_count(path: Path) -> int:

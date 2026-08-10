@@ -40,15 +40,29 @@ duplicates further down are historical strata; leave them where they are.
     exported file, because the two silently disagreeing about which features have genomes
     would make the client's roll-up diverge from the cluster's.
 
-  - `POST /api/v1/sample-label` — a `prep_sample_idx` cohort resolved to the public labels
-    a published table carries in place of our identifiers. Three forms, in preference
-    order: `ena_run_accession` (public and unique per sequenced sample, NULL until
-    submission); the `<accession>.<run>.<pool>.<prep_sample>` composite the masked-read
-    export already names its files with; and `<accession>.<prep_sample>` when the sample
-    was never pooled — `sequenced_pool_idx` is nullable, a case the four-part scheme did
-    not cover. Every entry ships the parts beside the label, so nothing parses a label to
-    recover an accession or has to know which form it is looking at. POST because a cohort
-    routinely spans pools and would exceed nginx's 8 KB request-line cap in query params.
+  - `POST /api/v1/exported-identifier` — mints the public `export_id` (`QM<n>`) for each
+    processed sample in a cohort, backed by a new `qiita.exported_identifier` table.
+    **Replaces a composed label that leaked our identifiers.** The earlier design named
+    samples `<accession>.<run>.<pool>.<prep_sample>` (or `<accession>.<prep_sample>`
+    unpooled), and both forms publish internal idxs — meaningless outside this system,
+    revealing of our structure, and not a handle we promise to keep. No accession can
+    substitute: a biosample sequenced repeatedly has several prep_samples, so its accession
+    cannot say which sequencing a row came from, and `ena_run_accession` is NULL until
+    submission. An identifier names a *processed* sample, `(alignment_idx,
+    prep_sample_idx)` — unique at rest by `qiita.alignment_sample`'s primary key, with
+    `alignment_idx` subsuming reference, aligner, mask and shard-set via
+    `alignment_definition`'s params hash — so the same sample under two alignments gets two
+    handles. Idempotent by a partial unique index on live rows, so a published identifier
+    is stable. `export_id` is a `GENERATED ALWAYS` column: Postgres is its only author, and
+    it can be neither forged by a caller nor edited after publication. Never deleted, only
+    retired — purging an alignment detaches and retires the row (the `ON DELETE SET NULL`
+    plus a retire-on-detach trigger, which is what lets that purge satisfy the
+    exactly-one-processing check at all), so a citation keeps resolving and says what
+    happened. Forward-planned for other processing types by `num_nonnulls`, the same idiom
+    as `qiita.reference_exclusion`. Dropped the label's 422 on a missing
+    `biosample_accession`: an identifier is always constructible, so an unaccessioned
+    sample is now nameable. POST because a cohort routinely spans pools and would exceed
+    nginx's 8 KB request-line cap in query params.
 
   The genome map **refuses with a 413** above its cap rather than truncating, naming the
   real size — the one capped read here that does. A lookup table silently missing rows

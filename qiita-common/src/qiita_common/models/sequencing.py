@@ -35,7 +35,6 @@ from qiita_common.models.biosample import (
 )
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
-from qiita_common.sample_label import compose_sample_label
 
 
 class SequencingRunCreateRequest(BaseModel):
@@ -1131,15 +1130,15 @@ class MaskedReadExportSample(BaseModel):
     mask_state: MaskSampleState | None = None
 
 
-class SampleLabelRequest(BaseModel):
-    """Body for POST /api/v1/sample-label — resolve a prep_sample cohort to the
-    public labels a published feature table carries in place of our identifiers.
+class ExportedIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier — mint (or recover) the public
+    handle for each processed sample in a cohort.
 
-    POST rather than GET for the same reason as
-    ``BiosampleLookupByAccessionRequest``: a cohort is a pool's or a study's
-    worth of samples and would blow past nginx's 8 KB request-line cap in query
-    params. It is also the only shape that can express a cohort SPANNING pools,
-    which is what a feature table's cohort routinely is.
+    ``alignment_idx`` names the processing; together with each ``prep_sample_idx``
+    it identifies one processed sample, which is what an ``export_id`` stands for.
+    The pair is the request's shape rather than the URL's because the cohort has to
+    ride a body: it is a pool's or a study's worth of samples, past nginx's 8 KB
+    request-line cap in query params, and it routinely SPANS pools.
 
     ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
     the two bound the same thing — a cohort a scientist assembles — for the same
@@ -1150,50 +1149,40 @@ class SampleLabelRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
 
 
-class SampleLabel(BaseModel):
-    """One sample's public label plus every part it was composed from.
+class ExportedIdentifier(BaseModel):
+    """One processed sample's public handle, and the accessions it does NOT
+    replace.
 
-    The parts ship alongside ``label`` deliberately. ``label`` has more than one
-    shape (see ``qiita_common.sample_label``) because a run accession is NULL
-    until submission and a pool is nullable, so a consumer that needed to recover
-    the accession or the pool from the label would have to parse it and guess
-    which shape it was looking at. Reading a column instead of parsing a string
-    removes that hazard entirely.
+    ``export_id`` (``QM<idx>``) is the identifier a published table carries. It is
+    minted by Postgres as a generated column, so nothing in Python composes it and
+    no caller can supply one.
 
-    ``label`` is COMPUTED from those parts rather than passed in, which is what
-    makes the guarantee above structural: a label that disagrees with the parts
-    shipped beside it is not constructible.
+    ``prep_sample_idx`` is echoed back because this map's whole job is the
+    translation: the caller's alignment rows are keyed by it, so without it there
+    is nothing to join ``export_id`` to. It is an identifier the caller already
+    sent us, which is why returning it is not a leak — but it belongs in the map
+    only, never in the artifact the map is shipped beside.
 
-    ``biosample_accession`` is non-null: the route 422s a cohort containing a
-    sample without one rather than emit a hole in this contract, so
-    ``compose_sample_label``'s raise on a missing accession is unreachable here.
+    The two accessions ride along because they are already public, and because
+    neither can do ``export_id``'s job: a biosample sequenced repeatedly has
+    several prep_samples, so its accession cannot say which sequencing a row came
+    from, and ``ena_run_accession`` is NULL until the data is submitted. Both are
+    nullable and purely informational — an unaccessioned sample still gets an
+    ``export_id``.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
-    biosample_accession: str
+    export_id: str
+    biosample_accession: str | None = None
     ena_run_accession: str | None = None
-    sequencing_run_idx: Annotated[int, Field(gt=0)] | None = None
-    sequenced_pool_idx: Annotated[int, Field(gt=0)] | None = None
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def label(self) -> str:
-        """The public identifier: `ena_run_accession`, else the pooled composite,
-        else the unpooled short form. See ``qiita_common.sample_label``."""
-        return compose_sample_label(
-            prep_sample_idx=self.prep_sample_idx,
-            biosample_accession=self.biosample_accession,
-            ena_run_accession=self.ena_run_accession,
-            sequencing_run_idx=self.sequencing_run_idx,
-            sequenced_pool_idx=self.sequenced_pool_idx,
-        )
 
 
-class SampleLabelResponse(BaseModel):
-    """Returned by POST /api/v1/sample-label: one entry per requested
+class ExportedIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier: one entry per requested
     prep_sample, ascending by prep_sample_idx.
 
     Every requested sample is present or the whole request failed, so there is no
@@ -1201,7 +1190,8 @@ class SampleLabelResponse(BaseModel):
     the request body's own cap.
     """
 
-    labels: list[SampleLabel]
+    alignment_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
     count: Annotated[int, Field(ge=0)]
 
 
