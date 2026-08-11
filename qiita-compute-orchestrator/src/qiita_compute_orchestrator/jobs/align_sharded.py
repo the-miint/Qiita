@@ -115,7 +115,7 @@ sort match the DuckLake `alignment` table
 `register-files` → `reconcile-alignment-block`. The runner resolves the
 router/shard paths from action_context (`_resolve_sharded_align_indexes`); the
 block's MASKED reads are streamed by the job itself (the control plane scopes the
-ticket to the `read_masked` view under the completed mask). The align planner
+ticket to the `read_masked` macro under the completed mask). The align planner
 fans out one block ticket per ~10M-read block. The integration smoke
 (`tests/integration/test_sharded_alignment.py`) drives `execute()` directly
 against real miint.

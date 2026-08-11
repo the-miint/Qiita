@@ -37,7 +37,7 @@ def _sql_str(path: Path) -> str:
     return str(path).replace("'", "''")
 
 
-# The read_masked view's columns, in the verbatim order the miint FORMAT FASTQ
+# The read_masked macro's columns, in the verbatim order the miint FORMAT FASTQ
 # writer requires (read_id, sequence1, qual1, sequence2, qual2). Projected by the
 # fastq COPY; aliasing any of these away raises a BinderException (pinned by the
 # orchestrator's masked-export fastq contract test).

@@ -255,6 +255,53 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **Three DuckLake facts the export path depends on are now pinned by test (#433).**
+  `qiita-data-plane/src/ducklake.rs` (integration tier): DuckDB's Arrow export
+  emits **no** `DictionaryArray` for VARCHAR even at 2 distinct values but
+  **does** for ENUM, so a dictionary on the wire has to be built by us; and a
+  plain DuckLake scan through `stream_arrow` comes back near-ordered while an
+  equi-join carries no ordering guarantee at all, though its observed disorder
+  stays coarse rather than row-level. The tests assert a **lower bound on average
+  sorted-run length**, not exact inversion counts, because the counts scale with
+  row count and move run to run — so what is pinned is "a scan is near-ordered"
+  and "a join is not row-scattered", which is the property the order-sensitive
+  encodings actually consume. Measured at 1.6M rows: 0 inversions for the scan,
+  a few hundred for the join (~4,000-row runs). Row order was a prose assumption
+  behind several encoding options before this. These are facts about DuckDB that
+  the export path relies on whatever we decide about compression, which is why
+  they are in-tree while the instrument below is not.
+- **The DoGet compression and representation axes were measured (#433).** The
+  evaluation concluded **ZSTD at the IPC layer**, requested per call and
+  defaulting to off, with every array-representation option (run-end encoding,
+  `Utf8View`, dictionaries, integer narrowing) and every batch-geometry change
+  measured as neutral or negative. Off by default because compression makes a
+  DoGet *slower* above roughly 4 Gbit/s of client bandwidth — break-even is
+  `bandwidth = encode_rate × (1 − 1/ratio)` — and every in-repo caller is above
+  that line; LZ4 measured about half zstd's ratio on every production shape and
+  is rejected rather than offered. No production behaviour changes here; the next
+  release note implements the decision.
+
+  **What it was measured on**, recorded here because the decision has to outlive
+  the instrument: six Arrow payloads extracted from production DuckLake and
+  encoded through the same `FlightDataEncoderBuilder` a DoGet uses — masked reads
+  (short-read and HiFi), HiFi alignment, and WOL3 phylogeny + taxonomy. Every
+  shape's bytes are dominated by a single column. The HiFi alignment payload is
+  775.6 MiB, of which `cigar` is 746.1 MiB (96.2%; mean CIGAR ≈ 1,092 bytes over
+  716,187 rows) and the six identifier/position columns are 29.5 MiB combined; the
+  HiFi read payload splits 46.8% `sequence1` / 52.7% `qual1`. Identifier columns
+  are ≤1.1% of those shapes, which is why narrowing and run-end encoding had
+  nothing to play for. The equivalent **short-read alignment** shape was never
+  available, so no CIGAR share is claimed for it — short-read CIGARs are
+  near-degenerate and would be a much smaller fraction.
+
+  **The instrument itself is deliberately not in the repo**, and was never meant
+  to land in it. Two of its three run targets consume local-only production
+  Parquet, so nobody could re-run them from a clean checkout; what would have
+  stayed in CI was a 626-line calibration suite for an instrument nothing else
+  called, plus a cargo feature and two dev-dependencies carried solely for it —
+  coverage in appearance only. Re-deriving the decision (a new arrow-rs codec, an
+  unmeasured column shape, a proposal to change the default) means building an
+  instrument again and comparing against the numbers above.
 - **Two DuckDB memory behaviours job code reasons about are now pinned by test
   (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
   in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
@@ -810,6 +857,28 @@ duplicates further down are historical strata; leave them where they are.
   [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
   per invocation — index load is 98.4% of classify wall clock); removal of our
   workaround tracked at #403.
+- **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
+  is now a scoped table macro instead of a view (#433).** DuckDB derives a transitive
+  predicate across a join equality for `col = const` but **not** for
+  `col IN (list)`, so a view could only ever receive a multi-sample scope on one
+  side of the `read`/`read_mask` join: the `read` scan got no filter, DuckLake
+  pruned nothing, and every file in the lake was read. Production `EXPLAIN`
+  confirms it — a single-sample equality returns 5,356 rows in 0.147 s, while a
+  ~100-sample `IN` list fully scans a ~20.7-billion-row table (32 GB RAM and
+  >250 GB swap before being killed). `read_masked(p_mask_idx, p_preps)` takes the
+  scope as arguments so it lands on **both** inputs. On a local DuckLake of
+  1,000,000 rows over 200 samples, a realistic block (one partial head sample, 18
+  complete, one partial tail) selecting 84,600 rows went from 1,033,599 rows
+  scanned to 178,599, against a floor of 169,200. Affects `read_masked` and
+  `read_masked_block` — production's main read path — but **not** single-sample
+  blocks (a one-element `IN` is rewritten to `=`), which is why it went unnoticed.
+  Rejected after measuring: passing the block's `sequence_idx` range as further
+  parameters (identical row counts) and pushing per-member `(sample, range)` pairs
+  down as an `EXISTS` (1,900,000 rows — worse than the view, it defeats file
+  pruning). Result rows, column set and column order are unchanged. Side effect:
+  an unscoped fleet-wide masked read is now **unrepresentable** rather than
+  refused, so the control plane's mandatory-filter invariant is defence in depth
+  instead of the only guard.
 - **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
   Establishes one invariant across the runner and the redrive route: **only a LIVE
   attempt is adoptable.** Both defects below were latent until a step could have
