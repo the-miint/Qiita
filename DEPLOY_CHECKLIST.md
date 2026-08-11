@@ -43,9 +43,20 @@ _None yet._
   the data plane restarts will fail with `InvalidArgument: alignment_visible
   requires an explicit projection column list`.** The alignment DoGet now
   requires the column list to be signed into the ticket, and a job launched from
-  the pre-deploy orchestrator code does not send one. Expected and
-  self-clearing — resubmit the ticket, which picks up the new code. Nothing to
-  do on the host; this is *not* a regression. (#435)
+  the pre-deploy orchestrator code does not send one. No host configuration
+  changes and no rollback: if a job was in flight, resubmit that ticket and it
+  picks up the new code. This is expected, not a regression. (#435)
+- **`activate.sh` restarts the control plane BEFORE the data plane, so for a few
+  seconds a new CP signs `columns` an old DP ignores.** Harmless on this deploy
+  and only on this deploy: the old data plane applies its retired hardcoded
+  six-column projection, which is exactly the list the one consumer
+  (`estimate_feature_table`) asks for, so the stream is the same either way. The
+  next change to a consumer's column set does not have that luck — it must
+  restart the data plane first, or a ticket minted in the window streams the old
+  six columns while the consumer binds something else. Recorded because the
+  direction is silent: an old DP has no `deny_unknown_fields` on its ticket
+  payload, so it drops what it does not understand rather than refusing (fixed
+  going forward — this build refuses). (#435)
 
 ---
 

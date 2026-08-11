@@ -258,14 +258,22 @@ duplicates further down are historical strata; leave them where they are.
 - **A Flight DoGet ticket can carry a signed column list, and the alignment
   surface now requires one (#435).** The consumer names the columns it wants, the
   control plane validates them against a per-table allowlist at mint time (422
-  on an unknown, duplicated, or empty list) and signs them, and the data plane
-  validates again before projecting exactly that set, in that order. Only
-  `alignment_visible` is projectable; every other table streams `SELECT *` and
-  rejects a list rather than ignoring it. This makes a wide column opt-in
-  instead of a design discussion — `cigar` dominates an alignment payload, so
-  anything that needs it can now ask, and everything else keeps paying nothing.
-  The measured share, and the shape it was measured on, are in
-  `docs/architecture.md`.
+  on an unknown, duplicated, or empty list — **and on an absent one**, since a
+  projectable table's ticket without a list is a ticket the data plane refuses)
+  and signs them, and the data plane validates again before projecting exactly
+  that set, in that order. Only `alignment_visible` is projectable; every other
+  table streams `SELECT *` and rejects a list rather than ignoring it. This makes
+  a wide column opt-in instead of a design discussion — `cigar` dominates an
+  alignment payload, so anything that needs it can now ask, and everything else
+  keeps paying nothing. The measured share, and the shape it was measured on, are
+  in `docs/architecture.md`.
+
+  A signed ticket carrying a field the data plane does not recognise is now
+  **rejected rather than ignored** (`deny_unknown_fields` on `TicketPayload`).
+  Ignoring one means serving a ticket under a wider reading than the signer
+  intended, which is the failure mode a mixed-version deploy produces silently;
+  it now fails loudly instead. `count_masked`, which reuses a DoGet ticket,
+  likewise refuses a projection list rather than disregarding it.
 - **DoGet streams can be zstd-compressed, at the client's request (#434).** A client
   sends `qiita-ipc-compression: zstd` as gRPC metadata and the data plane
   compresses that stream's Arrow IPC bodies; anything else is rejected rather

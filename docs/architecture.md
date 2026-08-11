@@ -588,10 +588,26 @@ that keeps a signed name out of interpolated SQL, the same argument
 
 **Only `alignment_visible` is projectable, and it *requires* a column list.**
 Every other DoGet table streams `SELECT *` and rejects a list rather than
-ignoring one. The asymmetry is not arbitrary: `cigar` alone is ~96% of an
-alignment row, so serving that table unprojected is roughly a 10x payload, while
-the reference tables are broadly readable by design (mirroring the anonymous
-REST `GET /reference/{idx}`) and narrowing them would buy nothing measurable.
+ignoring one. The asymmetry is not arbitrary, and this is the one measured number
+behind it: on a **HiFi** alignment payload of 716,187 rows (mean CIGAR ≈ 1,092
+bytes), the Arrow stream was 775.6 MiB, of which `cigar` alone was 746.1 MiB
+(96.2%) and the six identifier/position columns the feature-table consumer
+actually binds were 29.5 MiB combined. Serving that unprojected is ~26x the
+bytes. Two caveats the figure needs: the projection is 6 of 23 columns rather
+than "everything but `cigar`", so it is not a `cigar`-only saving; and the
+equivalent **short-read** shape was never measured — short-read CIGARs are
+near-degenerate, so expect a much smaller share there and do not quote 96% for
+it. Meanwhile the reference tables are broadly readable by design (mirroring the
+anonymous REST `GET /reference/{idx}`) and narrowing them would buy nothing
+measurable.
+
+**Changing a consumer's column set is a rollout-order decision.** The data plane
+must be restarted before, or with, the control plane that starts signing the new
+list — `deploy/activate.sh` restarts the CP first, so the default order leaves a
+brief window where a new list reaches a data plane that predates it. A data plane
+of this vintage or later refuses a ticket carrying a field it does not know
+(`deny_unknown_fields` on `TicketPayload`), which makes the mismatch loud; an
+older one silently applied its own idea of the projection instead.
 
 There is **no server-side default projection** — a ticket without a column list
 is refused. Only the consumer knows which columns it binds, and a fallback in

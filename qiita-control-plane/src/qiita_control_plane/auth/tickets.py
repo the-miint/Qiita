@@ -134,11 +134,14 @@ def sign_ticket(
       ``filter`` is legitimate there and only there.
 
     ``columns`` is the orthogonal, *projection* scope: it narrows what each
-    returned row carries rather than which rows are returned, and is accepted
-    only for the tables in ``_PROJECTION_COLUMNS``. Validating it here rather
-    than at the route is the same choice ``members`` makes above — this is the
-    one place every ticket passes through, so a future caller cannot mint an
-    unvalidated projection by forgetting a route-level guard.
+    returned row carries rather than which rows are returned. It is **required
+    for, and only accepted for**, the tables in ``_PROJECTION_COLUMNS`` — the
+    data plane refuses a projectable table's ticket that omits the list, so
+    signing one here would only defer the failure to a client already holding a
+    signed ticket. Validating it here rather than at the route is the same choice
+    ``members`` makes above — this is the one place every ticket passes through,
+    so a future caller cannot mint an unvalidated projection by forgetting a
+    route-level guard.
 
     Both ``members`` and ``columns`` are omitted from the payload entirely when
     absent, so every existing ticket signs byte-identical bytes (the data plane
@@ -165,6 +168,17 @@ def sign_ticket(
         raise ValueError(
             "sign_ticket requires a scope: a non-empty filter, a non-empty "
             "members selector, or both"
+        )
+    if columns is None and table in _PROJECTION_COLUMNS:
+        # A projectable table REQUIRES its list, because the data plane refuses a
+        # ticket for one that arrives without it. Signing anyway would mint a 201
+        # ticket that can only ever fail at DoGet — the failure arrives one hop
+        # later, at a client holding a signed ticket, instead of here where the
+        # caller can see what it got wrong. Both halves of the mirrored rule
+        # belong at the same boundary.
+        raise ValueError(
+            f"sign_ticket: table {table!r} requires a projection column list "
+            f"(the data plane rejects a ticket for it without one)"
         )
     if columns is not None:
         allowed = _PROJECTION_COLUMNS.get(table)

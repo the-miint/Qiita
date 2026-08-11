@@ -188,7 +188,10 @@ async def test_doget_sa_signs_scoped_filter(ctx):
         ctx["pool"], alignment_idx=777, prep_sample_idx=[11, 12, 13]
     )
     try:
-        resp = await ctx["sa"].post(URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx})
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET,
+            json={"work_ticket_idx": wt_idx, "columns": ["feature_idx"]},
+        )
         assert resp.status_code == 201, resp.text
         payload = _decode_ticket_payload(resp.json()["ticket"])
         assert payload["table"] == "alignment_visible"
@@ -326,16 +329,21 @@ async def test_doget_signs_the_requested_columns(ctx):
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
 
 
-async def test_doget_without_columns_signs_no_projection(ctx):
-    """Omitting the field keeps today's ticket exactly as it was — which is what
-    lets the consumer and the data plane be deployed in either order."""
+async def test_doget_without_columns_is_refused_at_mint(ctx):
+    """Omitting the list on a projectable table is a 422, not a signed ticket.
+
+    The data plane requires the list for this table, so a ticket signed without
+    one can only fail at DoGet — one hop later, at a client already holding
+    something the server told it was valid. Both halves of that rule live at the
+    signing boundary so the caller learns here.
+    """
     wt_idx, *rest = await _seed_feature_table_ticket(
         ctx["pool"], alignment_idx=779, prep_sample_idx=[11]
     )
     try:
         resp = await ctx["sa"].post(URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx})
-        assert resp.status_code == 201, resp.text
-        assert "columns" not in _decode_ticket_payload(resp.json()["ticket"])
+        assert resp.status_code == 422, resp.text
+        assert "requires a projection column list" in resp.text
     finally:
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
 

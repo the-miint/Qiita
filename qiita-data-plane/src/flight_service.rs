@@ -385,6 +385,15 @@ const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
     "tag_sa",
 ];
 
+/// Tables that resolve a `reference_idx` filter through a JOIN against
+/// `reference_membership` — they have no `reference_idx` column of their own.
+///
+/// Named rather than inlined at the one `if` that needs them because the JOIN and
+/// the projection do not compose (see `build_query`), and an invariant nothing can
+/// name is an invariant nothing can check —
+/// `no_membership_join_table_has_a_projection_allowlist` does.
+const MEMBERSHIP_JOIN_TABLES: &[&str] = &["reference_sequences", "reference_sequence_chunks"];
+
 /// The projection allowlist for `table`, or `None` when the table takes no
 /// column list at all (it streams `SELECT *`, and a list is a control-plane bug).
 fn projection_allowlist(table: &str) -> Option<&'static [&'static str]> {
@@ -1002,6 +1011,18 @@ impl FlightService for QiitaFlightService {
                         "count_masked requires a read_masked ticket, got table {:?}",
                         payload.table
                     )));
+                }
+                // Refused, not ignored — the same rule the DoGet projection
+                // follows. Unreachable today (`read_masked` takes no projection,
+                // so the control plane cannot sign one) and harmless if it were
+                // reached, since this returns a count and no rows. It is here
+                // because "a signed field this arm silently disregards" is the one
+                // shape that turns a narrowed ticket into a wider answer, and this
+                // was the only place in the ticket surface still allowing it.
+                if !payload.columns.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "count_masked takes no projection column list",
+                    ));
                 }
                 let prep_sample_idx = single_i64_filter(&payload.filter, "prep_sample_idx")?;
                 let mask_idx = single_i64_filter(&payload.filter, "mask_idx")?;
@@ -2817,12 +2838,11 @@ fn build_query(
         }
     }
 
-    // reference_sequences and reference_sequence_chunks have no reference_idx
-    // column. When the filter includes reference_idx, resolve via a JOIN with
-    // the membership table.
-    let needs_membership_join = (table == "reference_sequences"
-        || table == "reference_sequence_chunks")
-        && filter.contains_key("reference_idx");
+    // The MEMBERSHIP_JOIN_TABLES have no reference_idx column of their own. When
+    // the filter includes reference_idx, resolve it via a JOIN with the membership
+    // table.
+    let needs_membership_join =
+        MEMBERSHIP_JOIN_TABLES.contains(&table) && filter.contains_key("reference_idx");
 
     let mut where_clauses = Vec::new();
     for (col, values) in filter {
@@ -2873,11 +2893,20 @@ fn build_query(
 
     let where_str = where_clauses.join(" AND ");
     let sql = if needs_membership_join {
-        // Unreachable today — no table with a projection allowlist takes the
-        // membership JOIN — and kept loud rather than silent because the two
-        // features do compose badly: under the JOIN, a bare column name is
-        // ambiguous (both sides carry feature_idx), so a projection here would
-        // need `t.`-qualifying. Refuse until something actually needs it.
+        // This arm hardcodes `SELECT t.*` and does NOT use `select_list`, so a
+        // projection reaching it would be silently dropped and the stream would
+        // carry wider rows than the ticket signed. That is the one failure the
+        // projection mechanism exists to prevent, so refuse instead.
+        //
+        // Unreachable twice over today: no MEMBERSHIP_JOIN_TABLES entry has a
+        // projection allowlist (pinned by
+        // `no_membership_join_table_has_a_projection_allowlist`), and
+        // `select_list_for` at the top of this function already rejects a list for
+        // an allowlist-less table. The day one of them gains an allowlist, this is
+        // what stands between that and a silently widened stream — the two
+        // features compose badly (under the JOIN a bare column name is ambiguous,
+        // since both sides carry feature_idx, so a projection here would need
+        // `t.`-qualifying), so it must be a decision, not a default.
         if !columns.is_empty() {
             return Err(Status::internal(format!(
                 "projection column list is not supported on {table:?} (membership JOIN)"
@@ -5553,6 +5582,75 @@ mod tests {
             build_query("read_masked", &masked, &[], &cols).is_err(),
             "the read_masked macro must refuse a projection column list"
         );
+    }
+
+    /// The allowlist must equal the `alignment` DDL's column list — checked here
+    /// without a catalog, so `make test` catches a drift.
+    ///
+    /// `projection_allowlist_matches_the_alignment_schema_exactly` checks the same
+    /// property against a LIVE catalog, which needs Postgres and therefore only
+    /// runs in the integration tier: a column added to the DDL without an
+    /// allowlist entry would stay green through every pure-unit run until then.
+    /// This closes that window by reading the DDL out of the source at compile
+    /// time. `alignment_visible` is `SELECT a.*` over this table, so the view's
+    /// column set is this one — which is why the cheap check is worth having even
+    /// though the live one is stricter.
+    #[test]
+    fn projection_allowlist_matches_the_alignment_ddl() {
+        const DUCKLAKE_SRC: &str = include_str!("ducklake.rs");
+
+        let start = DUCKLAKE_SRC
+            .find("CREATE TABLE IF NOT EXISTS qiita_lake.alignment (")
+            .expect("the alignment DDL moved; this test reads it out of ducklake.rs");
+        let tail = &DUCKLAKE_SRC[start..];
+        let body = &tail[..tail
+            .find(");")
+            .expect("unterminated alignment CREATE TABLE")];
+
+        let mut ddl_columns: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in body.lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("--") {
+                continue;
+            }
+            ddl_columns.insert(line.split_whitespace().next().expect("non-empty line"));
+        }
+        assert!(
+            ddl_columns.len() > 5,
+            "parsed only {ddl_columns:?} out of the alignment DDL — the shape changed \
+             and this test is no longer reading it"
+        );
+
+        let allowed: std::collections::BTreeSet<&str> =
+            ALIGNMENT_PROJECTION_COLUMNS.iter().copied().collect();
+        assert_eq!(
+            ddl_columns,
+            allowed,
+            "the projection allowlist and the alignment DDL have drifted; \
+             only in the DDL: {:?}; only in the allowlist: {:?}",
+            ddl_columns.difference(&allowed).collect::<Vec<_>>(),
+            allowed.difference(&ddl_columns).collect::<Vec<_>>()
+        );
+    }
+
+    /// The membership-JOIN arm of `build_query` hardcodes `SELECT t.*`, so a
+    /// projection reaching it would be silently dropped and the stream would carry
+    /// wider rows than the ticket signed.
+    ///
+    /// Today nothing can: no joined table has an allowlist. That is an invariant,
+    /// not a coincidence, and this is where it is enforced — adding an allowlist to
+    /// a joined table fails here, at unit time, instead of at runtime behind a
+    /// guard someone may have decided was dead code.
+    #[test]
+    fn no_membership_join_table_has_a_projection_allowlist() {
+        for table in MEMBERSHIP_JOIN_TABLES {
+            assert!(
+                projection_allowlist(table).is_none(),
+                "{table} takes the membership JOIN, whose SELECT t.* would silently \
+                 drop a projection — teach build_query to qualify the columns with \
+                 the base alias before giving it an allowlist"
+            );
+        }
     }
 
     #[test]

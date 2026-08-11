@@ -50,7 +50,17 @@ pub type TicketFilter = HashMap<String, Vec<serde_json::Value>>;
 /// `columns` is orthogonal to both: it narrows what each returned row carries,
 /// not which rows are returned. It defaults to empty for the same reason — a
 /// ticket that has no opinion omits the field entirely.
+///
+/// `deny_unknown_fields`, like most structs in this file, and here it guards a
+/// specific rollout hazard rather than tidiness. A control plane newer than this
+/// data plane will sign fields this build has never heard of; without the guard
+/// serde drops them and the request proceeds under an older, WIDER
+/// interpretation of a ticket the signer believed it had narrowed. That is
+/// silent under-enforcement of a scope, so an unknown field fails the ticket
+/// instead — a mixed-version deploy breaks loudly, in the direction that cannot
+/// leak.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TicketPayload {
     pub table: String,
     #[serde(default)]
@@ -832,6 +842,21 @@ mod tests {
         // BlockReadMember is deny_unknown_fields: a member is exactly the three
         // columns, so a smuggled field is a malformed ticket, not an ignored one.
         let payload = br#"{"filter":{},"members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}],"table":"read_block"}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_ticket(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_ticket_rejects_an_unknown_top_level_field() {
+        // The rollout direction that would otherwise be silent: a control plane
+        // newer than this data plane signs a field this build has never heard of.
+        // Ignoring it means proceeding under a WIDER reading of a ticket the signer
+        // believed it had narrowed, so the ticket fails instead.
+        let payload =
+            br#"{"filter":{"feature_idx":[1]},"row_limit":10,"table":"reference_sequences"}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         match verify_ticket(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
