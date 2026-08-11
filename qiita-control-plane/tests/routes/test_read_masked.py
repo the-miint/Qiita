@@ -7,7 +7,7 @@ and the read_masked table allowlist membership), plus the mandatory-filter
 rejection at the request layer.
 
 The DoGet round-trip against a live data plane is NOT exercised here — the
-read_masked DuckLake view does not exist until PR 2, so these tests assert the
+read_masked DuckLake macro does not exist until PR 2, so these tests assert the
 signing/validation/rejection logic only.
 """
 

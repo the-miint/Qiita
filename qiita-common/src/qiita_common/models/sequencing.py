@@ -1034,10 +1034,10 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read-masked/ticket/doget.
 
     Signs a Flight DoGet ticket scoped to a single (prep_sample_idx, mask_idx)
-    on the data plane's `read_masked` view. Both identifiers are mandatory: the
-    data plane's empty-filter path would dump every sample's pass reads across
-    every mask, so the route never signs an unfiltered read_masked ticket
-    (the mandatory-filter invariant).
+    on the data plane's `read_masked` macro. Both identifiers are mandatory —
+    they are the macro's required arguments — and the route refuses to sign a
+    ticket missing either, as defence in depth (the mandatory-filter invariant,
+    `routes/read_masked.py`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1096,7 +1096,7 @@ class MaskedReadExportTicketRequest(BaseModel):
     """Body for POST /admin/masked-read-export/ticket.
 
     Mints a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on the
-    data plane's read_masked view — the human (system_admin) counterpart to the
+    data plane's read_masked macro — the human (system_admin) counterpart to the
     service-account POST /read-masked/ticket/doget. Minted just-in-time per
     sample by the export CLI. Both identifiers mandatory (the data plane's
     empty-filter path would dump every sample's pass reads). system_admin +

@@ -433,10 +433,10 @@ URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
-# the data plane's `read_masked` view. POST is service-account-only
+# the data plane's `read_masked` macro. POST is service-account-only
 # (Scope.READ_MASKED_DOGET). The route enforces the mandatory-filter invariant:
-# both identifiers are required, so an unfiltered read_masked ticket is never
-# signed.
+# both identifiers are required (they are the macro's arguments), so an
+# unfiltered read_masked ticket is never signed.
 
 PATH_READ_MASKED_PREFIX = "/read-masked"
 PATH_READ_MASKED_DOGET = "/ticket/doget"
@@ -506,7 +506,7 @@ PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = "/principal/{principal_idx}/revoke-all-
 PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = "/study/{study_idx}/owner-biosample-id"
 # Masked-read export (system_admin only): the manifest GET lists a
 # sequenced_pool's non-retired samples to export under ?mask_idx=; the ticket
-# POST mints a per-sample DoGet ticket on the data plane's read_masked view.
+# POST mints a per-sample DoGet ticket on the data plane's read_masked macro.
 PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )

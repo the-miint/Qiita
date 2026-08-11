@@ -208,7 +208,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Create the read + read_mask tables and the read_masked view in DuckLake.
+/// Create the read + read_mask tables and the read_masked macro in DuckLake.
 ///
 /// These hold per-sample sequencing reads and the downstream masks that record,
 /// per read, whether it survives QC/host filtering and how it should be trimmed.
@@ -222,10 +222,12 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 ///
 /// PRIVACY: `read` and `read_mask` are deliberately NOT exposed via Flight
 /// (they are absent from `flight_service::ALLOWED_TABLES`). The only
-/// Flight-reachable read surface is the `read_masked` view, which joins read to
+/// Flight-reachable read surface is the `read_masked` MACRO, which joins read to
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
-/// (host/human hits + QC failures) via `WHERE m.reason = 'pass'`. Human reads
-/// are therefore unreachable by construction, not by a scope check.
+/// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
+/// reads are therefore unreachable by construction, not by a scope check. What
+/// its required (mask, samples) parameters foreclose is on the macro itself,
+/// below.
 pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- Full reads, written ONCE per sequenced sample. Independent of any mask.
@@ -265,26 +267,101 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 
         -- The masking + access boundary: join read to read_mask, apply trims,
         -- and exclude every non-'pass' row. This is the ONLY Flight-reachable
-        -- read surface. substr() takes a 1-based start and a LENGTH; list slicing
-        -- is 1-based and inclusive on both ends. The qual arrays are guarded for
-        -- NULL (FASTA / single-end) symmetrically with their sequence columns.
+        -- read surface.
+        --
+        -- A MACRO, not a view, and the parameters are the point. DuckDB derives a
+        -- transitive predicate across a join equality for `col = const` but NOT for
+        -- `col IN (list)`, so a view can only ever receive a multi-sample scope on
+        -- ONE side of this join: the `read` scan got no filter at all, DuckLake
+        -- pruned nothing, and every file in the lake was read. Taking the scope as
+        -- a parameter puts it on BOTH inputs explicitly instead of hoping the
+        -- optimizer propagates it.
+        --
+        -- Upstream cause, traced 2026-08-03 and NOT reported as of that date (no
+        -- issue number to cite yet — file it against duckdb/duckdb, not ducklake:
+        -- the reproducer needs no DuckLake). DuckDB's filter pull-up
+        -- (`src/optimizer/filter_combiner.cpp`) mirrors only comparison
+        -- expressions: `FilterCombiner::AddFilter` returns UNSUPPORTED for
+        -- anything that is not a comparison/BETWEEN, and `SupportedFilterComparison`
+        -- omits COMPARE_IN, so an IN or an OR-of-equalities lands in
+        -- `remaining_filters` and is emitted verbatim, never entering the
+        -- equivalence-set maps that do the mirroring. Still present on main after
+        -- the join-filter-mirroring work (duckdb PR #23009), so this is not a
+        -- version we can wait out. Note a CONTIGUOUS integer IN list is rewritten
+        -- to a range and DOES mirror — any reproducer must use a SPARSE list.
+        --
+        -- Measured on DuckDB 1.5.4 against a local DuckLake of 1,000,000 `read`
+        -- rows over 200 samples, one file per sample (the layout fastq_to_parquet
+        -- writes), 10% of rows non-'pass'. Query is a realistic block — one partial
+        -- head sample, 18 complete, one partial tail — selecting 84,600 rows.
+        -- Figures are rows the scans actually produced (EXPLAIN ANALYZE):
+        --
+        --     view    948,999 read +  84,600 read_mask = 1,033,599
+        --     macro    93,999 read +  84,600 read_mask =   178,599
+        --     floor    84,600 read +  84,600 read_mask =   169,200
+        --
+        -- The macro's `read` figure is 84,600/0.9 to the row, i.e. its entire
+        -- residual is the non-'pass' rate and the two partial end samples cost
+        -- nothing. In production this shape fully scanned a ~20.7-billion-row
+        -- `read`; a single-sample equality scoped the same query to 5,356 rows in
+        -- 0.147 s — which is why this went unnoticed. A one-element IN is rewritten
+        -- to `=`, so single-sample blocks (every long-read tile) were always fine.
+        --
+        -- Two rejected alternatives, both measured, so they are not re-proposed:
+        -- passing the block's sequence_idx range as further parameters is identical
+        -- to the row (once the sample scope prunes to the right per-sample files the
+        -- block's global range spans them anyway), and pushing per-member
+        -- (sample, range) pairs down as an EXISTS is far WORSE than the view —
+        -- 1,900,000 rows, because it defeats file pruning entirely. Hence ONE macro,
+        -- with `read_masked_block` reusing it and leaving its member terms an outer
+        -- filter.
+        --
+        -- Required parameters also make an unscoped fleet-wide masked read
+        -- UNREPRESENTABLE rather than merely refused — there is no argument list
+        -- that means `every sample`, so the macro has no whole-table form to
+        -- construct. THIS IS THE ONE SITE THAT ENFORCES THAT, and every other
+        -- comment on the subject points here. The control plane's mandatory-filter
+        -- invariant (routes/read_masked.py) stays as defence in depth but is no
+        -- longer the only thing between a mis-signed ticket and every study's reads.
+        --
+        -- Needs DuckDB >= 1.5 (we pin libduckdb 1.5.4): on 1.4 this CREATE fails
+        -- outright with `DuckLake does not support functions`, so the parameterized
+        -- form is not available on an older engine at all.
+        --
+        -- substr() takes a 1-based start and a LENGTH; list slicing is 1-based and
+        -- inclusive on both ends. The qual arrays are guarded for NULL (FASTA /
+        -- single-end) symmetrically with their sequence columns.
         --
         -- Trim arithmetic: length() is signed BIGINT, so `length - left - right`
         -- promotes the UINTEGER trims to signed — no unsigned underflow even when
         -- the result is negative. At the exact full-trim boundary
         -- (left+right == length) substr length is 0 -> '' and the slice end < start
-        -- -> [], consistently. The view ASSUMES the upstream invariant
+        -- -> [], consistently. This ASSUMES the upstream invariant
         -- left_trim+right_trim <= length (enforced upstream at mask-emit time: a
         -- read trimmed below min_length is reason='qc_too_short', never 'pass').
         -- An out-of-contract over-trim row would yield inconsistent bytes; it is
         -- a producer bug, not handled here.
         --
-        -- CREATE OR REPLACE (not IF NOT EXISTS): the view is pure metadata, so a
+        -- CREATE OR REPLACE (not IF NOT EXISTS): the macro is pure metadata, so a
         -- definition change here is reconciled on every DP startup. IF NOT EXISTS
         -- would silently keep a stale definition on an already-attached catalog —
-        -- a privacy-surface footgun (the WHERE reason='pass' predicate lives
-        -- here). Tables stay IF NOT EXISTS — they hold data.
-        CREATE OR REPLACE VIEW qiita_lake.read_masked AS
+        -- a privacy-surface footgun (the reason='pass' predicate lives here).
+        -- Tables stay IF NOT EXISTS — they hold data.
+        --
+        -- The DROP VIEW migrates an already-deployed catalog off the view this
+        -- macro replaces, and it is NOT what keeps the CREATE below working:
+        -- DuckLake keeps views and macros in separate catalog tables, so the two
+        -- coexist under one name and BOTH call forms resolve (probed on 1.5.4
+        -- against a real DuckLake catalog, either creation order; a table-vs-view
+        -- collision does error, so the probe could have failed). That coexistence
+        -- is precisely the problem: without the DROP, the old unparameterized view
+        -- survives the upgrade and `SELECT * FROM qiita_lake.read_masked` keeps
+        -- working unscoped on every catalog that already has one — the exact form
+        -- the arguments exist to remove. With it, that call is a Catalog Error and
+        -- only the parameterized form remains.
+        DROP VIEW IF EXISTS qiita_lake.read_masked;
+
+        CREATE OR REPLACE MACRO qiita_lake.read_masked(p_mask_idx, p_preps) AS TABLE
         SELECT
             m.mask_idx,
             m.prep_sample_idx,
@@ -299,11 +376,14 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
                        length(r.sequence2) - m.left_trim2 - m.right_trim2) END AS sequence2,
             CASE WHEN r.qual2 IS NULL THEN NULL ELSE
                 r.qual2[m.left_trim2 + 1 : len(r.qual2) - m.right_trim2] END AS qual2
-        FROM qiita_lake.read r
-        JOIN qiita_lake.read_mask m
+        FROM (SELECT * FROM qiita_lake.read
+              WHERE prep_sample_idx IN (SELECT unnest(p_preps))) r
+        JOIN (SELECT * FROM qiita_lake.read_mask
+              WHERE mask_idx = p_mask_idx
+                AND reason = 'pass'
+                AND prep_sample_idx IN (SELECT unnest(p_preps))) m
           ON r.prep_sample_idx = m.prep_sample_idx
-         AND r.sequence_idx = m.sequence_idx
-        WHERE m.reason = 'pass';",
+         AND r.sequence_idx = m.sequence_idx;",
     )?;
     Ok(())
 }
@@ -401,7 +481,8 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// `shear_tree`; there is no production tree consumer today, so no phylogeny view
 /// is built.
 ///
-/// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), like `read_masked`: the
+/// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), for the same reason the
+/// `read_masked` macro is `CREATE OR REPLACE`: the
 /// anti-join predicate IS the enforcement surface, so a definition change must
 /// reconcile on every DP startup rather than silently keep a stale view on an
 /// already-attached catalog. Must run AFTER `ensure_reference_tables` +
@@ -516,6 +597,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::DataType;
     use serial_test::serial;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -803,15 +885,34 @@ mod tests {
         ensure_read_tables(&conn).expect("first ensure_read_tables");
         ensure_read_tables(&conn).expect("second ensure_read_tables (idempotent)");
 
-        // The view exists and is queryable.
-        let mut stmt = conn
-            .prepare(
-                "SELECT count(*) FROM information_schema.tables \
-                 WHERE table_name = 'read_masked'",
+        // The macro exists, and — the migration half — no view of that name is
+        // left behind. A catalog that still carried the view would mean the DROP
+        // silently no-op'd, and the next boot would fail on the name collision.
+        let macros: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_functions() \
+                 WHERE function_name = 'read_masked' AND function_type = 'table_macro'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
-        assert_eq!(n, 1, "read_masked view should exist exactly once");
+        assert_eq!(
+            macros, 1,
+            "read_masked table macro should exist exactly once"
+        );
+        let views: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'read_masked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            views, 0,
+            "the superseded read_masked VIEW must be dropped — it can coexist with \
+             the macro, and while it exists the unscoped call form still resolves"
+        );
     }
 
     /// ensure_alignment_tables is idempotent (CREATE TABLE IF NOT EXISTS, run on
@@ -998,7 +1099,7 @@ mod tests {
     /// The `_visible` views are catalog-stored, not session-local: a fresh ATTACH
     /// (a real DP restart) sees them WITHOUT re-running ensure_exclusion_tables and
     /// they still anti-join the mirror. Parity with
-    /// read_masked_view_persists_across_reattach.
+    /// read_masked_macro_persists_across_reattach.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
@@ -1155,10 +1256,7 @@ mod tests {
         // (b) non-'pass' rows excluded: exactly 2 rows for this (mask, prep).
         let total: i64 = conn
             .query_row(
-                &format!(
-                    "SELECT count(*) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND prep_sample_idx = {prep}"
-                ),
+                &format!("SELECT count(*) FROM qiita_lake.read_masked({mask}, [{prep}])"),
                 [],
                 |r| r.get(0),
             )
@@ -1179,8 +1277,8 @@ mod tests {
             .prepare(&format!(
                 "SELECT sequence1, array_to_string(qual1, ','), sequence2, \
                         array_to_string(qual2, ',') \
-                 FROM qiita_lake.read_masked \
-                 WHERE mask_idx = {mask} AND sequence_idx = {seq_se}"
+                 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                 WHERE sequence_idx = {seq_se}"
             ))
             .unwrap();
         let (seq1, qual1, seq2, qual2): (String, String, Option<String>, Option<String>) = stmt
@@ -1201,8 +1299,8 @@ mod tests {
             .prepare(&format!(
                 "SELECT sequence1, array_to_string(qual1, ','), sequence2, \
                         array_to_string(qual2, ',') \
-                 FROM qiita_lake.read_masked \
-                 WHERE mask_idx = {mask} AND sequence_idx = {seq_pe}"
+                 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                 WHERE sequence_idx = {seq_pe}"
             ))
             .unwrap();
         let (pseq1, pqual1, pseq2, pqual2): (String, String, Option<String>, Option<String>) =
@@ -1282,8 +1380,8 @@ mod tests {
         let (s_full, qlen_full): (String, i64) = conn
             .query_row(
                 &format!(
-                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_full}"
+                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_full}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1300,8 +1398,8 @@ mod tests {
             .query_row(
                 &format!(
                     "SELECT sequence1, len(qual1), sequence2, len(qual2) \
-                     FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_full_pe}"
+                     FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_full_pe}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -1316,8 +1414,8 @@ mod tests {
         let (s_zero, qlen_zero): (String, i64) = conn
             .query_row(
                 &format!(
-                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_zero}"
+                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_zero}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1327,14 +1425,15 @@ mod tests {
         assert_eq!(qlen_zero, 4, "zero-trim keeps all quals");
     }
 
-    /// The read_masked view is stored in the Postgres catalog, not the session: a
+    /// The read_masked MACRO is stored in the Postgres catalog, not the session: a
     /// fresh ATTACH (a real DP restart) sees it WITHOUT re-running
-    /// ensure_read_tables. Asserts that catalog-stored view persistence holds on
+    /// ensure_read_tables. That is what makes a macro a drop-in for the view it
+    /// replaced — same lifecycle, created once at boot — so it is worth pinning on
     /// the Postgres catalog the data plane actually uses.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
-    fn read_masked_view_persists_across_reattach() {
+    fn read_masked_macro_persists_across_reattach() {
         let prep = next_test_id();
         let mask = next_test_id();
         let seq = next_test_id();
@@ -1373,8 +1472,8 @@ mod tests {
         let s: String = conn2
             .query_row(
                 &format!(
-                    "SELECT sequence1 FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq}"
+                    "SELECT sequence1 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq}"
                 ),
                 [],
                 |r| r.get(0),
@@ -1382,7 +1481,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             s, "ACGT",
-            "view persisted across re-attach (zero-trim identity)"
+            "macro persisted across re-attach (zero-trim identity)"
         );
     }
 
@@ -1402,5 +1501,194 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let result = connect_ducklake(&conn, "dbname=test", "/tmp/it's bad");
         assert!(result.is_err());
+    }
+
+    // --- What DuckDB hands the Flight encoder ---------------------------
+    //
+    // Structural facts, not measurements: they need a live DuckLake but no
+    // production fixtures, and the export path's encoding choices rest on them.
+
+    /// Everything about dictionary encoding follows from this: if the export
+    /// never emits one, `DictionaryHandling` is dead config for us and any
+    /// dictionary must be built data-plane-side.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_arrow_export_never_emits_dictionary_for_varchar() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let table = format!("qiita_lake.dict_probe_{id}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {table} AS
+             SELECT i AS k, ['Bacteria', 'Archaea'][(i % 2) + 1] AS domain
+             FROM range(50000) t(i);"
+        ))
+        .expect("create probe table");
+
+        let schema = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT k, domain FROM {table}"))
+                .expect("prepare");
+            stmt.query_arrow([]).expect("query_arrow").get_schema()
+        };
+        let _ = conn.execute_batch(&format!("DROP TABLE {table};"));
+
+        let domain = schema.field_with_name("domain").expect("domain column");
+        assert!(
+            !matches!(domain.data_type(), DataType::Dictionary(..)),
+            "DuckDB emitted a dictionary for a 2-distinct VARCHAR: {:?} — \
+             dictionary encoding would need re-measuring",
+            domain.data_type()
+        );
+    }
+
+    /// The other half. DuckDB's ENUM is the one type that *should* map to an
+    /// Arrow dictionary. If even ENUM does not, the question is closed for good
+    /// and nothing we can store will ever arrive dictionary-encoded.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_arrow_export_emits_dictionary_for_enum() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let enum_type = format!("enum_rank_{id}");
+        conn.execute_batch(&format!(
+            "CREATE TYPE {enum_type} AS ENUM ('Bacteria', 'Archaea');"
+        ))
+        .expect("create enum");
+
+        let schema = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT 'Bacteria'::{enum_type} AS domain FROM range(10) t(i)"
+                ))
+                .expect("prepare");
+            stmt.query_arrow([]).expect("query_arrow").get_schema()
+        };
+        let _ = conn.execute_batch(&format!("DROP TYPE {enum_type};"));
+
+        // Recorded either way: this is a fact about DuckDB we are pinning, not a
+        // behaviour we require. A change here is a signal to re-measure, which is
+        // why the failure message says so rather than just asserting.
+        let domain = schema.field_with_name("domain").expect("domain column");
+        assert!(
+            matches!(domain.data_type(), DataType::Dictionary(..)),
+            "DuckDB ENUM no longer maps to an Arrow dictionary (got {:?}) — \
+             it did when this was measured; re-measure",
+            domain.data_type()
+        );
+    }
+
+    /// Run-end encoding and delta-style wins depend on rows arriving in the
+    /// identifier order the files are written in, and the DoGet applies no
+    /// `ORDER BY` — so a parallel scan over several files may interleave.
+    ///
+    /// Both DoGet shapes are covered because they answer differently: a plain
+    /// scan is ordered by `preserve_insertion_order`, but `read_masked` is a
+    /// JOIN, and a hash join carries no such guarantee. Production fixtures came
+    /// through the join and showed 1-4 inversions; that is the distinction.
+    ///
+    /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
+    /// production — the materialising `query_arrow` is a different execution mode
+    /// and could order differently.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_parallel_scan_preserves_file_sort_order() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let table = format!("qiita_lake.order_probe_{id}");
+        let side = format!("qiita_lake.order_join_{id}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {table} (grp BIGINT, seq BIGINT);
+             CREATE OR REPLACE TABLE {side} (grp BIGINT, seq BIGINT);"
+        ))
+        .expect("create probe tables");
+        // One INSERT per group, so each lands in its own DuckLake file — the
+        // layout a partitioned writer produces, and the one a parallel scan can
+        // interleave. Large enough that DuckDB actually parallelises.
+        const GROUPS: i64 = 16;
+        const PER_GROUP: i64 = 100_000;
+        for group in 0..GROUPS {
+            conn.execute_batch(&format!(
+                "INSERT INTO {table} SELECT {group}, i FROM range({}, {}) t(i);
+                 INSERT INTO {side} SELECT {group}, i FROM range({}, {}) t(i);",
+                group * PER_GROUP,
+                (group + 1) * PER_GROUP,
+                group * PER_GROUP,
+                (group + 1) * PER_GROUP,
+            ))
+            .expect("insert group");
+        }
+
+        let ordered = |sql: &str| -> (usize, usize, usize) {
+            let schema = {
+                let mut probe = conn
+                    .prepare(&format!("SELECT * FROM ({sql}) AS _p LIMIT 0"))
+                    .expect("prepare probe");
+                probe.query_arrow([]).expect("probe").get_schema()
+            };
+            let mut stmt = conn.prepare(sql).expect("prepare");
+            let stream = stmt.stream_arrow([], schema).expect("stream_arrow");
+            let mut seen = Vec::new();
+            let mut batches = 0usize;
+            for batch in stream {
+                batches += 1;
+                let grp = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("grp is Int64");
+                let seq = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("seq is Int64");
+                for row in 0..batch.num_rows() {
+                    seen.push((grp.value(row), seq.value(row)));
+                }
+            }
+            let inversions = seen.windows(2).filter(|w| w[1] < w[0]).count();
+            (seen.len(), inversions, batches)
+        };
+
+        let scan = ordered(&format!("SELECT grp, seq FROM {table}"));
+        let join = ordered(&format!(
+            "SELECT l.grp, l.seq FROM {table} l JOIN {side} r
+               ON l.grp = r.grp AND l.seq = r.seq"
+        ));
+        let _ = conn.execute_batch(&format!("DROP TABLE {table}; DROP TABLE {side};"));
+
+        let expected = (GROUPS * PER_GROUP) as usize;
+        assert_eq!(scan.0, expected, "scan lost rows");
+        assert_eq!(join.0, expected, "join lost rows");
+        println!(
+            "scan order: scan {} rows / {} inversions / {} batches; \
+             join {} rows / {} inversions / {} batches",
+            scan.0, scan.1, scan.2, join.0, join.1, join.2
+        );
+
+        // Assert on *average run length*, not inversion count: the count scales
+        // with row count (1 inversion at 160k rows became 1 at 1.6M for the scan
+        // and 323 for the join), whereas run length is scale-free and is the
+        // property run-end and delta encodings actually consume. Anything in the
+        // thousands is coarse interleaving; row-level scatter would be single
+        // digits.
+        let run_len = |(rows, inversions, _): (usize, usize, usize)| rows / (inversions + 1);
+        assert!(
+            run_len(scan) >= 100_000,
+            "a plain DuckLake scan is no longer near-ordered ({} rows/run) — check \
+             preserve_insertion_order; the order-sensitive encodings depend on it",
+            run_len(scan)
+        );
+        // The join carries no ordering guarantee at all — this is not a promise
+        // DuckDB makes, so the bound is deliberately loose and exists to catch a
+        // collapse to row-level scatter.
+        assert!(
+            run_len(join) >= 1_000,
+            "the join produced {} rows/run — that is row-level interleaving, not \
+             the coarse runs measured against production fixtures",
+            run_len(join)
+        );
     }
 }

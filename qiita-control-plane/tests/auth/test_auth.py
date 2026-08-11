@@ -188,12 +188,22 @@ def test_sign_ticket_omits_members_when_absent():
 
     The data plane defaults the field, so emitting ``"members": []`` would change
     the canonical-JSON payload every existing ticket signs over for no reason.
+
+    The filter is the real two-column ``read_masked`` scope even though nothing
+    here reaches a data plane: a payload-shape test that signs a scope the DoGet
+    would reject is a shape no ticket in production has.
     """
     import json
 
     from qiita_control_plane.auth.tickets import sign_ticket
 
     payload = json.loads(
-        _payload_of(sign_ticket(table="read_masked", filter={"mask_idx": [7]}, secret=_TEST_SEED))
+        _payload_of(
+            sign_ticket(
+                table="read_masked",
+                filter={"mask_idx": [7], "prep_sample_idx": [11]},
+                secret=_TEST_SEED,
+            )
+        )
     )
     assert "members" not in payload

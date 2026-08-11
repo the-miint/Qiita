@@ -1522,7 +1522,7 @@ def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int, int]:
     every row; `biological` is `pass` + the `host_*` hits (a human read is still a
     biological read); `spikein` is disjoint from biological (a spike-in is added in
     the lab); `quality_filtered` is the `pass` SUBSET of biological, the rows the
-    read_masked view surfaces. `qc_*` and `twist_no_adaptor` count toward `raw`
+    read_masked macro surfaces. `qc_*` and `twist_no_adaptor` count toward `raw`
     only.
 
     The predicate used to be `reason NOT LIKE 'qc_%'` — fail-OPEN, so any new
