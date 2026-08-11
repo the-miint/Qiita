@@ -22,10 +22,12 @@ clients should be aware of.
 The preflight GET is SA-only via Scope.SEQUENCED_POOL_PREFLIGHT_READ,
 matching the existing CO→CP precedent (routes/sequence_range.py).
 
-Every handler delegates its DB work to the repositories.sequencing_run
-module. The per-item sequenced-sample import composer, the run-scoped
-sequenced_sample bulk-id read, and the single-sequenced-sample
-read/PATCH live in the sibling sequenced_sample route module.
+Handlers delegate their DB work to the repositories layer — mostly
+repositories.sequencing_run, and repositories.alignment_definition for the two
+pool-alignment discovery reads, which query the alignment tables rather than the
+run's own. The per-item sequenced-sample import composer, the run-scoped
+sequenced_sample bulk-id read, and the single-sequenced-sample read/PATCH live in
+the sibling sequenced_sample route module.
 """
 
 import base64
@@ -87,7 +89,6 @@ from qiita_common.models import (
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
-    Tier,
     WorkTicketState,
     merge_qc_reports,
 )
@@ -105,6 +106,7 @@ from ..actions.sequenced_pool import (
     reap_staged_reads,
 )
 from ..auth.guards import (
+    COHORT_MIN_TIER,
     filter_prep_samples_caller_can_read,
     require_caller_owns_run,
     require_complete_profile,
@@ -649,7 +651,7 @@ async def _readable_pool_prep_samples(
     """
     prep_sample_idxs = await list_pool_prep_sample_idxs(pool, sequenced_pool_idx)
     access = await filter_prep_samples_caller_can_read(
-        pool, caller=caller, prep_sample_idxs=prep_sample_idxs, min_tier=Tier.VIEWER
+        pool, caller=caller, prep_sample_idxs=prep_sample_idxs, min_tier=COHORT_MIN_TIER
     )
     return access.readable
 

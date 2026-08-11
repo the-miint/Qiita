@@ -69,10 +69,18 @@ class Scope(StrEnum):
     # would have put a human PAT on the worker path — and it is deliberately
     # absent from every role ceiling precisely so that cannot happen.
     #
-    # On every role ceiling, unlike its neighbours: the per-study tier check is
-    # the real boundary here, so the role does not need to be. Correspondingly
-    # NOT on SERVICE_ACCOUNT_SCOPE_CEILING — a worker holding both would be two
-    # ways into one surface with two different validation paths.
+    # On every role ceiling, unlike its neighbours: for a plain user the
+    # per-study tier check is the real boundary, so the role does not need to be.
+    # That argument is honest only for `user`. `wet_lab_admin` and `system_admin`
+    # are at or above the cohort gate's `bypass_role`
+    # (`filter_prep_samples_caller_can_read`), so for them the whole cohort comes
+    # back readable with no per-study lookup at all and the 403 cannot fire — the
+    # ROLE is the boundary, which is the inverse of the reason above. Both are
+    # deliberate; they are just not the same reason, and a reader who assumes the
+    # per-study check protects every caller is wrong about the two roles that
+    # matter most. Correspondingly NOT on SERVICE_ACCOUNT_SCOPE_CEILING — a
+    # worker holding both would be two ways into one surface with two different
+    # validation paths.
     ALIGNMENT_DOGET = "alignment:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
     # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data

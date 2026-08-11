@@ -94,8 +94,9 @@ async def test_pool_alignment_list_bypasses_at_wet_lab_admin(ctx, seeded):
     resp = await ctx["wet"].get(_list_url(seeded))
     assert resp.status_code == 200, resp.text
     by_idx = {a["alignment_idx"]: a for a in resp.json()["alignments"]}
-    assert by_idx[seeded["align_1"]]["samples_completed"] == 3
-    assert by_idx[seeded["align_1"]]["samples_total"] == 4
+    # 4 of 5: ps_a, ps_b, ps_d, ps_e completed; ps_c pending.
+    assert by_idx[seeded["align_1"]]["samples_completed"] == 4
+    assert by_idx[seeded["align_1"]]["samples_total"] == 5
     assert seeded["align_2"] in by_idx
 
 
@@ -117,13 +118,32 @@ async def test_pool_alignment_list_excludes_an_orphaned_prep_sample(ctx, seeded)
 
 
 async def test_cohort_returns_only_completed_and_readable_samples(ctx, seeded):
-    """Both filters at once: ps_a survives; ps_b is readable-by-nobody-here,
-    ps_c is pending, ps_d is orphaned."""
+    """Every filter at once: ps_a survives; ps_b is in a study this caller cannot
+    see, ps_c is pending, ps_d is orphaned, ps_e is shared into study_2."""
     resp = await ctx["user"].get(_cohort_url(seeded, seeded["align_1"]))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["alignment_idx"] == seeded["align_1"]
     assert body["prep_sample_idx"] == [seeded["ps_a"]]
+
+
+async def test_cohort_excludes_a_sample_shared_into_an_unreadable_study(ctx, seeded):
+    """ps_e is linked to study_1 (readable) AND study_2 (not), and is excluded.
+
+    This is the all-of rule, and it is the one property the discovery/mint
+    contract cannot be wrong about: a signed cohort is the whole authorization
+    boundary, with no second check behind it. A gate that granted a sample on ANY
+    readable link would leak every sample that had ever been shared into a study
+    the caller happens to see. Named separately from the composite test above so a
+    regression reads as "all-of broke" rather than "a list changed".
+    """
+    resp = await ctx["user"].get(_cohort_url(seeded, seeded["align_1"]))
+    assert resp.status_code == 200, resp.text
+    assert seeded["ps_e"] not in resp.json()["prep_sample_idx"]
+
+    # And the admin bypass still sees it — the sample is real, only unreadable.
+    resp = await ctx["wet"].get(_cohort_url(seeded, seeded["align_1"]))
+    assert seeded["ps_e"] in resp.json()["prep_sample_idx"]
 
 
 async def test_cohort_excludes_a_pending_alignment_sample(ctx, seeded):

@@ -133,6 +133,28 @@ async def test_human_mint_rejects_a_cohort_the_caller_cannot_fully_read_403(
     assert resp.status_code == 403, resp.text
 
 
+async def test_human_mint_denies_a_sample_shared_into_an_unreadable_study_403(
+    ctx, pool_alignment_seed
+):
+    """ps_e is linked to study_1 (readable) AND study_2 (not), and is denied.
+
+    The mint's authorization is all-of over a sample's links, and this is the only
+    cohort member that can prove it — every other sample has exactly one link, so
+    a gate that granted on ANY readable link would pass the whole suite. Since the
+    ticket this route signs is the entire authorization boundary, with no second
+    check at the data plane, that distinction is the one this test exists for.
+    """
+    resp = await ctx["user"].post(
+        _mint_url(pool_alignment_seed["align_1"]),
+        json={"prep_sample_idx": [pool_alignment_seed["ps_e"]], "columns": _COLUMNS},
+    )
+    assert resp.status_code == 403, resp.text
+    # And the study it names is the one the caller lacks, not the one they hold.
+    detail = resp.json()["detail"]
+    assert str(pool_alignment_seed["study_2"]) in detail
+    assert str(pool_alignment_seed["study_1"]) not in detail
+
+
 async def test_human_mint_403_names_the_offending_study(ctx, pool_alignment_seed):
     """The 403 has to be actionable: it names the study the caller lacks, so a
     scientist can go ask for access rather than guess."""

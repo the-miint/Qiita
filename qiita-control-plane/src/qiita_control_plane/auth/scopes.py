@@ -34,10 +34,8 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-            # Human-callable alignment DoGet mint. On every ceiling because
-            # the per-study Tier.VIEWER check at the route is the boundary,
-            # not the role; see Scope.ALIGNMENT_DOGET for why it is split
-            # from the workers-only TICKET_DOGET.
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
             Scope.ALIGNMENT_DOGET,
         }
     ),
@@ -53,10 +51,8 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-            # Human-callable alignment DoGet mint. On every ceiling because
-            # the per-study Tier.VIEWER check at the route is the boundary,
-            # not the role; see Scope.ALIGNMENT_DOGET for why it is split
-            # from the workers-only TICKET_DOGET.
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
             Scope.ALIGNMENT_DOGET,
             # Upload slots — needed to drive reference data ingest via the
             # qiita-admin CLI, whose reference-add audience includes
@@ -99,10 +95,8 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ALIGNMENT_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-            # Human-callable alignment DoGet mint. On every ceiling because
-            # the per-study Tier.VIEWER check at the route is the boundary,
-            # not the role; see Scope.ALIGNMENT_DOGET for why it is split
-            # from the workers-only TICKET_DOGET.
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
             Scope.ALIGNMENT_DOGET,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,

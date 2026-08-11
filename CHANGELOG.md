@@ -261,8 +261,10 @@ duplicates further down are historical strata; leave them where they are.
   and "I can read the alignment" — until now the only mint was
   service-account-only and read its cohort from a work ticket. Guarded by a new
   `alignment:doget` scope, on every role ceiling and deliberately off
-  `SERVICE_ACCOUNT_SCOPE_CEILING`, because the real boundary is per-study:
-  `Tier.VIEWER` on every study each `prep_sample_idx` is still linked to.
+  `SERVICE_ACCOUNT_SCOPE_CEILING`. For a plain user the boundary is per-study —
+  `Tier.VIEWER` on every study each `prep_sample_idx` is still linked to — while
+  `wet_lab_admin` and above bypass that check as they do every other resource
+  gate, so for them the role is the boundary.
   Validation runs 404 (no such alignment) → 403 (access) → 422 (cohort
   completeness) → sign, and that order is load-bearing — reversed, the 422 would
   tell a caller which samples are finished for an alignment they cannot read. A
@@ -923,8 +925,10 @@ duplicates further down are historical strata; leave them where they are.
   non-leading column. That sequential-scanned an unboundedly-growing table (one
   row per alignment config × sample, across every reference, aligner and rerun)
   from a route open to any authenticated user. Added
-  `(prep_sample_idx, alignment_idx)` so the query is served index-only, built
-  `CONCURRENTLY`. (#436)
+  `(prep_sample_idx, alignment_idx)`, built `CONCURRENTLY`, turning that
+  sequential scan into an index scan. Not index-only — the query counts
+  `state = 'completed'`, which is off the index — see the migration for why
+  `INCLUDE (state)` was not taken. (#436)
 - **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
   is now a scoped table macro instead of a view (#433).** DuckDB derives a transitive
   predicate across a join equality for `col = const` but **not** for

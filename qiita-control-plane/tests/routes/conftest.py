@@ -717,12 +717,21 @@ async def pool_alignment_seed(role_keyed_clients):
         ps_b → study_2            alignment_1: completed,  alignment_2: completed
         ps_c → study_1            alignment_1: pending
         ps_d → study_1 (retired)  alignment_1: completed   ← orphaned by retirement
+        ps_e → study_1 + study_2  alignment_1: completed   ← shared across both
 
     `regular_user_session` holds Tier.VIEWER on study_1 only, so that caller may
     read ps_a and ps_c and nothing else. That single shape exercises every
     decision in the discovery/mint contract at once — per-study tier narrowing,
     the orphan denial, the completion gate, and whole-alignment invisibility
     (alignment_2 touches only ps_b).
+
+    **ps_e is what makes the all-of rule falsifiable.** Every other sample is
+    linked to exactly one study, so a gate that granted a sample on ANY readable
+    link would return the same answer as the one that requires EVERY link — the
+    two are indistinguishable without a sample that spans both. ps_e is readable
+    under any-of and denied under all-of, and since the signed cohort IS the
+    authorization boundary with no second check behind it, that difference is the
+    single most important thing in this fixture. Do not narrow it to one study.
 
     Tracks and tears down everything it creates, including its own studies and
     study_access rows, so it composes with any module's `ctx`.
@@ -741,7 +750,7 @@ async def pool_alignment_seed(role_keyed_clients):
 
     samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
     run_idx = pool_idx = None
-    for i in range(4):
+    for i in range(5):
         bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
         run_idx, pool_idx, ss = await seed_sequenced_sample_subtype(
             db,
@@ -752,7 +761,7 @@ async def pool_alignment_seed(role_keyed_clients):
             sequenced_pool_idx=pool_idx,
         )
         samples.append((bs, ps, ss))
-    (bs_a, ps_a, _), (bs_b, ps_b, _), (bs_c, ps_c, _), (bs_d, ps_d, _) = samples
+    (bs_a, ps_a, _), (bs_b, ps_b, _), (bs_c, ps_c, _), (bs_d, ps_d, _), (bs_e, ps_e, _) = samples
 
     async def link(biosample_idx, prep_sample_idx, study_idx, *, retired=False):
         await seed_biosample_to_study_link(
@@ -770,6 +779,10 @@ async def pool_alignment_seed(role_keyed_clients):
     await link(bs_b, ps_b, study_2)
     await link(bs_c, ps_c, study_1)
     await link(bs_d, ps_d, study_1, retired=True)
+    # Both, deliberately — see the docstring: this is the only sample that can
+    # tell all-of from any-of.
+    await link(bs_e, ps_e, study_1)
+    await link(bs_e, ps_e, study_2)
 
     align_1 = await _mint_alignment(db, owner_idx=owner, tag=f"one-{uuid.uuid4()}")
     align_2 = await _mint_alignment(db, owner_idx=owner, tag=f"two-{uuid.uuid4()}")
@@ -777,6 +790,7 @@ async def pool_alignment_seed(role_keyed_clients):
     await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_b, state="completed")
     await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_c, state="pending")
     await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_d, state="completed")
+    await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_e, state="completed")
     await _gate(db, alignment_idx=align_2, prep_sample_idx=ps_b, state="completed")
 
     yield {
@@ -788,6 +802,7 @@ async def pool_alignment_seed(role_keyed_clients):
         "ps_b": ps_b,
         "ps_c": ps_c,
         "ps_d": ps_d,
+        "ps_e": ps_e,
         "study_1": study_1,
         "study_2": study_2,
         "owner_idx": owner,

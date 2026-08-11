@@ -335,6 +335,17 @@ _TIER_ORDER = {
     Tier.ADMIN: 3,
 }
 
+# The read tier a prep_sample cohort requires on every study its samples link to.
+#
+# ONE definition, shared by the routes that discover a cohort and the one that
+# mints a ticket for it, because the contract between them is that a cohort
+# discovery returns is a cohort the mint accepts. Two literals would let that
+# drift silently in the one direction that matters: raise it at the mint alone and
+# discovery starts advertising cohorts the mint 403s, which is precisely the
+# failure a named constant is supposed to prevent — and a per-route constant
+# cannot, since nothing compares them.
+COHORT_MIN_TIER = Tier.VIEWER
+
 
 async def require_eligible_owner(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
@@ -555,10 +566,14 @@ async def filter_prep_samples_caller_can_read(
     `filter_studies_caller_can_read`, and why it comes first: the link
     resolution below would otherwise be computed and discarded.
 
-    The one definition of "may this caller read this sample", shared by the
-    narrowing discovery reads and the all-or-nothing alignment mint. Two copies
-    is precisely the drift that ends with discovery advertising a cohort the
-    mint then 403s.
+    The one definition of "may this caller read this sample" **for this surface**
+    — shared by the narrowing discovery reads and the all-or-nothing alignment
+    mint, where two copies would be exactly the drift that ends with discovery
+    advertising a cohort the mint then 403s. It is not the only such predicate in
+    the repo: `repositories/mask_definition.py`'s `_CALLER_MAY_SEE_SAMPLE` answers
+    a similar-sounding question for the admin mask surface, at a different tier,
+    and reaches the OPPOSITE verdict on an orphan. Do not assume a sample's
+    readability has one answer everywhere; assume it has one answer here.
     """
     prep_sample_idxs = list(dict.fromkeys(prep_sample_idxs))
     if not prep_sample_idxs or caller.has_role_at_least(bypass_role):

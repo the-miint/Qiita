@@ -16,8 +16,17 @@
 -- That matters here specifically because the table grows without bound (one
 -- row per (alignment config, sample), across every reference, aligner and
 -- rerun) and the route is open to any authenticated user, so it is meant to be
--- hit often. prep_sample_idx leads; alignment_idx follows so
--- list_alignments_over_prep_samples can be served index-only.
+-- hit often. The win is a sequential scan becoming an index scan; that is the
+-- whole justification.
+--
+-- prep_sample_idx leads because that is the predicate; alignment_idx follows so
+-- the GROUP BY key comes off the index too. This is NOT an index-only scan and
+-- cannot be: list_alignments_over_prep_samples computes
+-- count(*) FILTER (WHERE state = 'completed'), and `state` is neither an index
+-- column nor INCLUDEd, so the heap is visited for every matching row. Adding
+-- INCLUDE (state) would make index-only possible at the cost of a wider index on
+-- an unbounded table — a real trade, deliberately not taken here, and not one to
+-- make on the strength of this comment alone.
 CREATE INDEX CONCURRENTLY qiita_alignment_sample_prep_sample_idx
     ON qiita.alignment_sample (prep_sample_idx, alignment_idx);
 

@@ -1,4 +1,11 @@
-"""Repository functions for the qiita.alignment_definition table.
+"""Repository functions for the qiita.alignment_definition table, plus the reads
+that answer questions ABOUT alignments from the sample side.
+
+Those reads query qiita.alignment_sample (and join sequenced_sample /
+prep_sample) rather than alignment_definition alone — "which alignments touch
+these samples", "which of this cohort is not finished". They live here because
+what they return is alignments; the table they lead with is an implementation
+detail of that answer.
 
 An alignment's identity is its CONFIG: the sharded reference it aligns against,
 the sharded aligner, the host-depletion mask its input reads carry, and the
@@ -155,9 +162,13 @@ async def list_alignments_over_prep_samples(
     `alignment_sample` row rather than once per alignment. Measured on a
     2,000-sample cohort over 40 alignments (~1.5 KB params, `work_mem=4MB`):
     291 ms with a 134 MB external merge sort, against 10.8 ms and no spill in
-    this shape. The threshold is roughly `rows × sizeof(params) > work_mem`,
-    which a 2,000-sample pool crosses at about 7 alignments — and this route is
-    open to any authenticated user over a table that grows without bound.
+    this shape. The sort carries one row per (sample, alignment) pair, so the
+    spill threshold is roughly
+    `samples × alignments × sizeof(params) > work_mem` — about 2,700 pairs at
+    those settings, which a 2,000-sample pool crosses on its SECOND alignment.
+    Not a large-pool problem, in other words: it is the default shape, and this
+    route is open to any authenticated user over a table that grows without
+    bound.
     """
     if not prep_sample_idxs:
         return []

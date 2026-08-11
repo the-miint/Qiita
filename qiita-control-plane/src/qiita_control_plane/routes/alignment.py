@@ -2,11 +2,14 @@
 (`qiita.alignment_definition`).
 
 The `alignment_idx` that keys the DuckLake `alignment` rows is minted at plan time
-by the align-plan route (`POST .../sequenced-pool/{P}/align-plan`), so there is no
-public POST here. This module owns the destructive DELETE — the full purge of an
-alignment (its DuckLake rows + the Postgres `alignment_definition` row) — which is
-the escape hatch the align planner's disallow-without-delete rule requires: an
-operator must DELETE a completed alignment before re-aligning the same config.
+by the align-plan route (`POST .../sequenced-pool/{P}/align-plan`), so **no route
+here mints one** — the POSTs below sign Flight DoGet tickets against an alignment
+that already exists.
+
+This module owns the destructive DELETE — the full purge of an alignment (its
+DuckLake rows + the Postgres `alignment_definition` row) — which is the escape
+hatch the align planner's disallow-without-delete rule requires: an operator must
+DELETE a completed alignment before re-aligning the same config.
 
 Modelled on the mask-definition purge (`routes/read_masked.py`): lake-first,
 system_admin-only, idempotent/retriable.
@@ -38,6 +41,7 @@ from qiita_common.models import (
 
 from ..actions.library import delete_alignment_data
 from ..auth.guards import (
+    COHORT_MIN_TIER,
     PrepSampleReadAccess,
     filter_prep_samples_caller_can_read,
     require_complete_profile,
@@ -60,11 +64,6 @@ _MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
 # (routes/reference.py) and the data plane's ALLOWED_TABLES. A constant so the
 # name has one definition here.
 _ALIGNMENT_TABLE = "alignment_visible"
-
-# Read tier the human mint requires on every study a cohort sample links to.
-# Named once so the check and the 403 that explains it cannot disagree about
-# what the caller has to go ask for.
-_COHORT_MIN_TIER = Tier.VIEWER
 
 alignment_definition_router = APIRouter(
     prefix=PATH_ALIGNMENT_DEFINITION_PREFIX, tags=["alignment-definition"]
@@ -230,11 +229,12 @@ async def create_alignment_cohort_doget_ticket(
     """Sign a DoGet ticket for an alignment cohort the CALLER names — the
     scientist-facing counterpart of the work-ticket mint above.
 
-    Human-callable (``alignment:doget``, on every role ceiling) because the real
-    boundary is per-study, not per-role: the caller must hold ``Tier.VIEWER`` on
-    every study each requested prep_sample is still linked to. Service accounts
-    are deliberately excluded — a worker has the other route, and one surface
-    with two validation paths is what splitting the scopes prevented.
+    Human-callable (``alignment:doget``, on every role ceiling — see that scope
+    for why, including where the reasoning stops applying): the caller must hold
+    ``Tier.VIEWER`` on every study each requested prep_sample is still linked to.
+    Service accounts are deliberately excluded — a worker has the other route,
+    and one surface with two validation paths is what splitting the scopes
+    prevented.
 
     **The signed cohort IS the authorization boundary.** The data plane serves
     exactly the prep_sample_idx list this ticket carries and knows nothing about
@@ -267,11 +267,11 @@ async def create_alignment_cohort_doget_ticket(
     cohort = sorted(set(body.prep_sample_idx))
 
     access = await filter_prep_samples_caller_can_read(
-        pool, caller=caller, prep_sample_idxs=cohort, min_tier=_COHORT_MIN_TIER
+        pool, caller=caller, prep_sample_idxs=cohort, min_tier=COHORT_MIN_TIER
     )
     if access.unlinked or access.blocked_by:
         raise HTTPException(
-            status_code=403, detail=_access_denied_detail(access, min_tier=_COHORT_MIN_TIER)
+            status_code=403, detail=_access_denied_detail(access, min_tier=COHORT_MIN_TIER)
         )
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
