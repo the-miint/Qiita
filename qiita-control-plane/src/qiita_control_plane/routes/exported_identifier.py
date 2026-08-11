@@ -22,10 +22,9 @@ from qiita_common.models import (
     ExportedIdentifier,
     ExportedIdentifierRequest,
     ExportedIdentifierResponse,
-    Tier,
 )
 
-from ..auth.guards import require_human, require_scope
+from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
 from ..repositories.alignment_definition import alignment_definition_exists
@@ -34,11 +33,6 @@ from ..repositories.exported_identifier import IncompleteMintError, mint_exporte
 from ._helpers import authorize_prep_sample_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])
-
-# The tier a caller needs on every study a sample is linked to. Matches the
-# alignment cohort mint: this answers "what is this processed sample called
-# publicly", which is strictly less than being able to read its rows.
-_COHORT_MIN_TIER = Tier.VIEWER
 
 _MSG_ALIGNMENT_NOT_FOUND = "alignment not found"
 
@@ -98,7 +92,7 @@ async def mint_exported_identifier_map(
         raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
 
     cohort = await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=_COHORT_MIN_TIER
+        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=COHORT_MIN_TIER
     )
 
     incomplete = await list_incomplete_alignment_samples(pool, body.alignment_idx, cohort)

@@ -36,7 +36,6 @@ from qiita_common.models import (
     AlignmentDefinitionDeleteResponse,
     AlignmentDoGetTicketRequest,
     DoGetTicketResponse,
-    Tier,
 )
 
 from ..actions.library import delete_alignment_data
