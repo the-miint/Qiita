@@ -293,6 +293,34 @@ def test_terminology_prepare_owl_malformed_export(tmp_path, capsys):
     assert "missing column" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "subcommand,flag",
+    [("prepare-owl", "--export"), ("prepare-taxdump", "--taxdump-zip")],
+)
+def test_terminology_prepare_unreadable_input(tmp_path, capsys, subcommand, flag):
+    """Tests the case where the named source is a directory rather than a file
+    the prepare can open: the operating system's reason is reported and the
+    prepare exits 1 rather than raising."""
+    a_directory = tmp_path / "a-directory"
+    a_directory.mkdir()
+
+    rc = cli.main(
+        [
+            "terminology",
+            subcommand,
+            flag,
+            str(a_directory),
+            "--name",
+            "uberon",
+            "--version",
+            "1.0.0",
+        ]
+    )
+
+    assert rc == 1
+    assert "Is a directory" in capsys.readouterr().err
+
+
 def test_terminology_requires_subcommand():
     """Tests the case where no terminology subcommand is given."""
     with pytest.raises(SystemExit):
@@ -703,6 +731,58 @@ def test_terminology_load_declared_path_refused(tmp_path, monkeypatch, capsys, d
 
     assert rc == 1
     assert declared_path in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--manifest", "--terms", "--closure"])
+@pytest.mark.parametrize("names_a_directory", [True, False], ids=["a_directory", "empty_string"])
+def test_terminology_load_unreadable_file(tmp_path, monkeypatch, capsys, flag, names_a_directory):
+    """Tests the case where one of the three named paths is not a file the load
+    can open — a directory, or the empty string, which names the working
+    directory. The operating system's reason is reported and the load exits 1
+    rather than raising."""
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    paths = _prepare_release(
+        tmp_path,
+        capsys,
+        name="uberon",
+        version="1.0.0",
+        export_rows=[("UBERON:0001", "mouth", "", "", "")],
+    )
+    a_directory = tmp_path / "a-directory"
+    a_directory.mkdir()
+
+    # Both spellings reach the same open of a directory, since the empty string
+    # resolves to the working directory rather than being rejected as a path.
+    argv = _load_argv(paths)
+    argv[argv.index(flag) + 1] = str(a_directory) if names_a_directory else ""
+
+    rc = cli.main(argv)
+
+    assert rc == 1
+    assert "Is a directory" in capsys.readouterr().err
+
+
+def test_terminology_load_invalid_manifest(tmp_path, monkeypatch, capsys):
+    """Tests the case where the manifest does not match the release schema: the
+    load is refused reporting what failed validation, not a traceback."""
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    paths = _prepare_release(
+        tmp_path,
+        capsys,
+        name="uberon",
+        version="1.0.0",
+        export_rows=[("UBERON:0001", "mouth", "", "", "")],
+    )
+
+    # Drop a required field, so the manifest parses as JSON but not as a release.
+    manifest = json.loads(paths["manifest"].read_text())
+    del manifest["version"]
+    paths["manifest"].write_text(json.dumps(manifest))
+
+    rc = cli.main(_load_argv(paths))
+
+    assert rc == 1
+    assert "validation error for TerminologyManifest" in capsys.readouterr().err
 
 
 @pytest.mark.db

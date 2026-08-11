@@ -2,9 +2,10 @@
 the closed value sets a terminology row and its terms are constrained to."""
 
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated
 
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH
 
@@ -17,6 +18,28 @@ MAX_TERMINOLOGY_VERSION_LENGTH = 50
 # every point a name or version is accepted rather than only the manifest.
 TerminologyName = Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)]
 TerminologyVersion = Annotated[str, Field(min_length=1, max_length=MAX_TERMINOLOGY_VERSION_LENGTH)]
+
+
+# The two relative-directory spellings, which name a directory rather than a
+# file in it and so are not filenames even though they carry no separator.
+_DIRECTORY_SPELLINGS = frozenset({".", ".."})
+
+
+def _check_bare_filename(value: str) -> str:
+    """Return `value` if it names a file with no directory part, else raise."""
+    # PurePosixPath, not Path: a manifest is portable JSON, so what counts as a
+    # directory separator cannot depend on the host that reads it.
+    if value in _DIRECTORY_SPELLINGS or PurePosixPath(value).name != value:
+        raise ValueError(
+            f"{value!r} is not a bare filename; a release is read from a single flat directory"
+        )
+    return value
+
+
+# How a release names one of its files. Bare because the name is both where the
+# file is read from and the name a staged copy is given, so one carrying a
+# directory or a `..` would reach outside the directory holding the manifest.
+TerminologyFilename = Annotated[str, Field(min_length=1), AfterValidator(_check_bare_filename)]
 
 
 class TerminologyStatus(StrEnum):
@@ -60,12 +83,12 @@ class TerminologyTermObsoletionKind(StrEnum):
 class TerminologyManifestFile(BaseModel):
     """One file declared by a terminology manifest.
 
-    `path` is relative to the staging directory holding the manifest;
-    `sha256` is the lowercase hex digest of the file's bytes, carrying no
-    `sha256:` prefix.
+    `path` is the file's bare name within the staging directory holding the
+    manifest; `sha256` is the lowercase hex digest of the file's bytes,
+    carrying no `sha256:` prefix.
     """
 
-    path: str = Field(min_length=1)
+    path: TerminologyFilename
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 

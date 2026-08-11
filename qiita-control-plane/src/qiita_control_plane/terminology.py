@@ -152,25 +152,37 @@ def check_tsv_columns(
         )
 
 
-def _required_cell(
+def _row_location(*, path: Path, source_name: str, line_number: int) -> str:
+    """Name the row an error is about: which table, where it is, and the line
+    the row occupies in it.
+
+    A release runs to millions of rows, so an error that names only the column
+    leaves nothing to look up; the line is what an operator opens the file to.
+    """
+    return f"{source_name} at {path} line {line_number}"
+
+
+def _stripped_cell(
     row: Mapping[str, str | None],
     column: str,
     *,
     path: Path,
     source_name: str,
+    line_number: int,
 ) -> str:
-    """Return a cell the parser reads unconditionally, rejecting a row that
-    stops before reaching it.
+    """Return a cell the parser reads unconditionally, stripped, rejecting a
+    row that stops before reaching it. A cell holding only whitespace comes
+    back empty, which is the caller's to interpret.
 
     A row carrying fewer cells than the header leaves the remainder absent
-    rather than empty, so the absence is reported as the row being malformed
-    instead of surfacing from whatever the value is asked to do next.
-    `column`, `source_name`, and `path` name the offending cell in the error.
+    rather than empty, and is reported as the row being malformed.
+    `column` and the row location name the offending cell in the error.
     """
     raw_value = row[column]
     if raw_value is None:
-        raise ValueError(f"{source_name} at {path} carries a row with no {column}")
-    return raw_value
+        location = _row_location(path=path, source_name=source_name, line_number=line_number)
+        raise ValueError(f"{location} carries no {column}")
+    return raw_value.strip()
 
 
 def _stripped_key(
@@ -179,17 +191,18 @@ def _stripped_key(
     *,
     path: Path,
     source_name: str,
+    line_number: int,
 ) -> str:
-    """Strip a cell holding a term id and reject one naming nothing.
+    """Return a cell holding a term id, rejecting one naming nothing.
 
-    The index over a term id is a plain btree, so a padded variant would land
-    as a value distinct from its unpadded twin — and the rows that reference it
-    spell it unpadded.
+    A term id is what the database keys a row by or matches one against, so a
+    cell naming nothing cannot be stored, while a name the source leaves out
+    can.
     """
-    cell = _required_cell(row, column, path=path, source_name=source_name)
-    key = cell.strip()
+    key = _stripped_cell(row, column, path=path, source_name=source_name, line_number=line_number)
     if not key:
-        raise ValueError(f"{source_name} at {path} carries a row with an empty {column}")
+        location = _row_location(path=path, source_name=source_name, line_number=line_number)
+        raise ValueError(f"{location} carries an empty {column}")
     return key
 
 
@@ -241,41 +254,54 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
             path=path,
         )
 
-        # Fixed for every row of this table, so the per-cell calls below name
-        # only what varies between them.
-        cell_kwargs = {"path": path, "source_name": _TERMS_SOURCE_NAME}
-
         for row in reader:
-            term_id = _stripped_key(row, _TERMS_COLUMN_TERM_ID, **cell_kwargs)
-            replaced_by = row[_TERMS_COLUMN_REPLACED_BY_TERM_ID] or None
+            # What every error about this row names, so the per-cell calls below
+            # pass only what varies between them. The reader counts the lines of
+            # the file, so the header is line 1 and the count survives a cell
+            # holding a quoted newline.
+            cell_kwargs = {
+                "path": path,
+                "source_name": _TERMS_SOURCE_NAME,
+                "line_number": reader.line_num,
+            }
 
-            # Both names arrive stripped for the same reason the term id does. A
-            # cell holding nothing but whitespace is the source naming nothing,
-            # which the database spells NULL — distinct from naming the empty
-            # string, so a name may end up absent where a key may not.
-            label_cell = _required_cell(row, _TERMS_COLUMN_LABEL, **cell_kwargs)
-            alternate_label_cell = _required_cell(row, _TERMS_COLUMN_ALTERNATE_LABEL, **cell_kwargs)
-            label = label_cell.strip() or None
-            alternate_label = alternate_label_cell.strip() or None
+            term_id = _stripped_key(row, _TERMS_COLUMN_TERM_ID, **cell_kwargs)
+
+            # A cell holding nothing is the source naming nothing, which the
+            # database spells NULL — distinct from naming the empty string, so
+            # a name may end up absent where a key may not.
+            label = _stripped_cell(row, _TERMS_COLUMN_LABEL, **cell_kwargs) or None
+            alternate_label = (
+                _stripped_cell(row, _TERMS_COLUMN_ALTERNATE_LABEL, **cell_kwargs) or None
+            )
 
             # Reject typo'd is_obsolete values explicitly so they surface
             # at parse time rather than silently coercing to False.
-            is_obsolete_cell = _required_cell(row, _TERMS_COLUMN_IS_OBSOLETE, **cell_kwargs)
+            is_obsolete_cell = _stripped_cell(row, _TERMS_COLUMN_IS_OBSOLETE, **cell_kwargs)
             is_obsolete_text = is_obsolete_cell.lower()
             if is_obsolete_text not in (_TSV_TRUE, _TSV_FALSE):
                 raise ValueError(
-                    f"invalid {_TERMS_COLUMN_IS_OBSOLETE} value"
-                    f" {is_obsolete_cell!r} for term_id {term_id!r};"
+                    f"{_row_location(**cell_kwargs)} carries an invalid"
+                    f" {_TERMS_COLUMN_IS_OBSOLETE} value {is_obsolete_cell!r}"
+                    f" for term_id {term_id!r};"
                     f" expected {_TSV_TRUE!r} or {_TSV_FALSE!r}"
                 )
 
+            # Read in the order the columns are declared, so a row that stops
+            # short is refused naming the first cell it fails to reach.
+            replaced_by = (
+                _stripped_cell(row, _TERMS_COLUMN_REPLACED_BY_TERM_ID, **cell_kwargs) or None
+            )
+
             # Wrap the enum cast so the offending row is named in the error.
-            kind_text = row[_TERMS_COLUMN_OBSOLETION_KIND] or None
+            kind_text = _stripped_cell(row, _TERMS_COLUMN_OBSOLETION_KIND, **cell_kwargs) or None
             try:
                 obsoletion_kind = TerminologyTermObsoletionKind(kind_text) if kind_text else None
             except ValueError as exc:
                 raise ValueError(
-                    f"invalid {_TERMS_COLUMN_OBSOLETION_KIND} {kind_text!r} for term_id {term_id!r}"
+                    f"{_row_location(**cell_kwargs)} carries an invalid"
+                    f" {_TERMS_COLUMN_OBSOLETION_KIND} {kind_text!r}"
+                    f" for term_id {term_id!r}"
                 ) from exc
 
             # The database ties the two columns together: an obsolete term must
@@ -285,12 +311,14 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
             is_obsolete = is_obsolete_text == _TSV_TRUE
             if is_obsolete and obsoletion_kind is None:
                 raise ValueError(
-                    f"{_TERMS_COLUMN_IS_OBSOLETE} is {_TSV_TRUE!r} with no"
+                    f"{_row_location(**cell_kwargs)} carries"
+                    f" {_TERMS_COLUMN_IS_OBSOLETE} {_TSV_TRUE!r} with no"
                     f" {_TERMS_COLUMN_OBSOLETION_KIND} for term_id {term_id!r}"
                 )
             if not is_obsolete and obsoletion_kind is not None:
                 raise ValueError(
-                    f"{_TERMS_COLUMN_OBSOLETION_KIND} {kind_text!r} on a"
+                    f"{_row_location(**cell_kwargs)} carries"
+                    f" {_TERMS_COLUMN_OBSOLETION_KIND} {kind_text!r} on a"
                     f" {_TSV_FALSE!r} {_TERMS_COLUMN_IS_OBSOLETE} row"
                     f" for term_id {term_id!r}"
                 )
@@ -366,27 +394,33 @@ def _parse_closure_tsv(path: Path) -> list[tuple[str, str, int]]:
             path=path,
         )
 
-        cell_kwargs = {"path": path, "source_name": _CLOSURE_SOURCE_NAME}
-
         for row in reader:
+            cell_kwargs = {
+                "path": path,
+                "source_name": _CLOSURE_SOURCE_NAME,
+                "line_number": reader.line_num,
+            }
+
             ancestor_term_id = _stripped_key(row, _CLOSURE_COLUMN_ANCESTOR_TERM_ID, **cell_kwargs)
             descendant_term_id = _stripped_key(
                 row, _CLOSURE_COLUMN_DESCENDANT_TERM_ID, **cell_kwargs
             )
             pair = (ancestor_term_id, descendant_term_id)
 
-            # A row that stops early leaves the cell absent rather than empty,
-            # so the cast is wrapped to name the pair instead of failing on the
-            # absence itself.
-            distance_text = row[_CLOSURE_COLUMN_DISTANCE]
+            # Wrap the cast so the offending row is named in the error.
+            distance_text = _stripped_cell(row, _CLOSURE_COLUMN_DISTANCE, **cell_kwargs)
             try:
                 distance = int(distance_text)
-            except (TypeError, ValueError) as exc:
+            except ValueError as exc:
                 raise ValueError(
-                    f"invalid {_CLOSURE_COLUMN_DISTANCE} {distance_text!r} for {pair}"
+                    f"{_row_location(**cell_kwargs)} carries an invalid"
+                    f" {_CLOSURE_COLUMN_DISTANCE} {distance_text!r} for {pair}"
                 ) from exc
             if distance < 0:
-                raise ValueError(f"negative {_CLOSURE_COLUMN_DISTANCE} {distance} for {pair}")
+                raise ValueError(
+                    f"{_row_location(**cell_kwargs)} carries a negative"
+                    f" {_CLOSURE_COLUMN_DISTANCE} {distance} for {pair}"
+                )
 
             rows.append((ancestor_term_id, descendant_term_id, distance))
 

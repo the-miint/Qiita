@@ -338,40 +338,106 @@ def test__parse_terms_tsv_strips_key_and_names(tmp_path):
     assert result == expected
 
 
+def test__parse_terms_tsv_strips_every_cell(tmp_path):
+    """Tests the case where every cell of a row arrives padded with whitespace:
+    each is stripped, so a padded replacement pointer resolves against the term
+    it names and a padded flag or kind reads as the value it spells."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "  UBERON:0001  \t  mouth  \t  oral opening  \tfalse\t\t\n"
+        "  UBERON:0002  \t  tooth  \t\t  true  \t  UBERON:0001  \t  source_merged  \n"
+    )
+
+    result = _parse_terms_tsv(path)
+
+    expected = [
+        parsed_term("UBERON:0001", "mouth", alternate_label="oral opening"),
+        parsed_term(
+            "UBERON:0002",
+            "tooth",
+            is_obsolete=True,
+            replaced_by_term_id="UBERON:0001",
+            obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
+        ),
+    ]
+    assert result == expected
+
+
 @pytest.mark.parametrize(
     ("row_text", "expected_column"),
     [
         ("UBERON:0001\n", "label"),
         ("UBERON:0001\tmouth\n", "alternate_label"),
         ("UBERON:0001\tmouth\t\n", "is_obsolete"),
+        ("UBERON:0001\tmouth\t\tfalse\n", "replaced_by_term_id"),
+        ("UBERON:0001\tmouth\t\tfalse\t\n", "obsoletion_kind"),
     ],
-    ids=["stops_before_label", "stops_before_alternate_label", "stops_before_is_obsolete"],
+    ids=[
+        "stops_before_label",
+        "stops_before_alternate_label",
+        "stops_before_is_obsolete",
+        "stops_before_replaced_by_term_id",
+        "stops_before_obsoletion_kind",
+    ],
 )
 def test__parse_terms_tsv_short_row(tmp_path, row_text, expected_column):
     """Tests the case where a terms row stops before a cell that is always read:
-    the parse is refused naming the absent column, rather than failing on
-    whatever the missing value was asked to do."""
+    the parse is refused naming the absent column and the line it is on, rather
+    than failing on whatever the missing value was asked to do. The offending
+    row follows a well-formed one, so a line number counted off the wrong
+    origin cannot pass."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0009\tnostril\t\tfalse\t\t\n"
         f"{row_text}"
     )
 
-    with pytest.raises(ValueError, match=f"no {expected_column}"):
+    with pytest.raises(ValueError, match=f"line 3 carries no {expected_column}"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_empty_term_id(tmp_path):
     """Tests the case where a term id cell holds nothing but whitespace: the
-    parse is refused, since the database keys the row by that value and every
-    row referencing the term spells it unpadded."""
+    parse is refused naming the line, since the database keys the row by that
+    value and every row referencing the term spells it unpadded."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0009\tnostril\t\tfalse\t\t\n"
         "   \tmouth\t\tfalse\t\t\n"
     )
 
-    with pytest.raises(ValueError, match="empty term_id"):
+    with pytest.raises(ValueError, match="line 3 carries an empty term_id"):
+        _parse_terms_tsv(path)
+
+
+def test__parse_terms_tsv_invalid_is_obsolete(tmp_path):
+    """Tests the case where an is_obsolete cell spells neither boolean value:
+    the parse is refused naming the line, the value, and the two spellings it
+    accepts, rather than coercing the row to not-obsolete."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0001\tmouth\t\tyes\t\t\n"
+    )
+
+    with pytest.raises(ValueError, match="line 2.*is_obsolete.*'yes'"):
+        _parse_terms_tsv(path)
+
+
+def test__parse_terms_tsv_unrecognized_obsoletion_kind(tmp_path):
+    """Tests the case where an obsoletion_kind cell names a kind the enum does
+    not carry: the parse is refused naming the line and the value, rather than
+    leaving the enum cast to fail without saying which row it read."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0002\ttooth\t\ttrue\t\tsource_vanished\n"
+    )
+
+    with pytest.raises(ValueError, match="line 2.*obsoletion_kind 'source_vanished'"):
         _parse_terms_tsv(path)
 
 
@@ -492,29 +558,29 @@ def test__parse_closure_tsv_duplicate_pair_differing_distance(tmp_path):
 
 def test__parse_terms_tsv_obsolete_without_kind(tmp_path):
     """Tests the case where a row is obsolete but names no obsoletion kind: the
-    parse is refused naming the row, because the database requires an obsolete
-    term to record why it is obsolete."""
+    parse is refused naming the row and its line, because the database requires
+    an obsolete term to record why it is obsolete."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
         "UBERON:0003\tobsolete molar\t\ttrue\t\t\n"
     )
 
-    with pytest.raises(ValueError, match="UBERON:0003"):
+    with pytest.raises(ValueError, match="line 2.*UBERON:0003"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_kind_on_live_row(tmp_path):
     """Tests the case where a live row carries an obsoletion kind: the parse is
-    refused naming the row, because the database allows a kind only on a term
-    that is obsolete."""
+    refused naming the row and its line, because the database allows a kind only
+    on a term that is obsolete."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
         "UBERON:0001\tmouth\t\tfalse\t\tsource_merged\n"
     )
 
-    with pytest.raises(ValueError, match="UBERON:0001"):
+    with pytest.raises(ValueError, match="line 2.*UBERON:0001"):
         _parse_terms_tsv(path)
 
 
@@ -529,13 +595,14 @@ def test__parse_closure_tsv_missing_column(tmp_path):
         _parse_closure_tsv(path)
 
 
-def test__parse_closure_tsv_strips_endpoints(tmp_path):
-    """Tests the case where both endpoints arrive padded with whitespace: each
-    is stripped, so the pair matches the term rows it relates rather than being
-    dropped by the rebuild for naming a term id nothing spells that way."""
+def test__parse_closure_tsv_strips_every_cell(tmp_path):
+    """Tests the case where every cell of a row arrives padded with whitespace:
+    each is stripped, so the pair matches the term rows it relates rather than
+    being dropped by the rebuild for naming a term id nothing spells that way,
+    and the distance reads as the number it spells."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
-        "ancestor_term_id\tdescendant_term_id\tdistance\n  UBERON:0001  \t  UBERON:0002  \t1\n"
+        "ancestor_term_id\tdescendant_term_id\tdistance\n  UBERON:0001  \t  UBERON:0002  \t  1  \n"
     )
 
     result = _parse_closure_tsv(path)
@@ -555,48 +622,58 @@ def test__parse_closure_tsv_empty_endpoint(
     tmp_path, ancestor_cell, descendant_cell, expected_column
 ):
     """Tests the case where one endpoint cell holds nothing but whitespace: the
-    parse is refused naming that column, since a closure row can only relate
-    terms the release defines."""
+    parse is refused naming that column and the line it is on, since a closure
+    row can only relate terms the release defines. The offending row follows a
+    well-formed one, so a line number counted off the wrong origin cannot
+    pass."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
-        f"ancestor_term_id\tdescendant_term_id\tdistance\n{ancestor_cell}\t{descendant_cell}\t1\n"
+        "ancestor_term_id\tdescendant_term_id\tdistance\n"
+        "UBERON:0008\tUBERON:0009\t1\n"
+        f"{ancestor_cell}\t{descendant_cell}\t1\n"
     )
 
-    with pytest.raises(ValueError, match=f"empty {expected_column}"):
+    with pytest.raises(ValueError, match=f"line 3 carries an empty {expected_column}"):
         _parse_closure_tsv(path)
 
 
 def test__parse_closure_tsv_short_row(tmp_path):
     """Tests the case where a closure row stops before its distance: the parse
-    is refused naming the pair, rather than raising on an absent cell."""
+    is refused naming the absent column and the line it is on, rather than
+    raising on an absent cell. The offending row follows a well-formed one, so a
+    line number counted off the wrong origin cannot pass."""
     path = tmp_path / CLOSURE_TSV_FILENAME
-    path.write_text("ancestor_term_id\tdescendant_term_id\tdistance\nUBERON:0001\tUBERON:0002\n")
+    path.write_text(
+        "ancestor_term_id\tdescendant_term_id\tdistance\n"
+        "UBERON:0008\tUBERON:0009\t1\n"
+        "UBERON:0001\tUBERON:0002\n"
+    )
 
-    with pytest.raises(ValueError, match="UBERON:0002"):
+    with pytest.raises(ValueError, match="line 3 carries no distance"):
         _parse_closure_tsv(path)
 
 
 def test__parse_closure_tsv_non_integer_distance(tmp_path):
     """Tests the case where a distance cell is not a number: the parse is
-    refused naming the pair it belongs to."""
+    refused naming the line and the pair it belongs to."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
         "ancestor_term_id\tdescendant_term_id\tdistance\nUBERON:0001\tUBERON:0002\tone\n"
     )
 
-    with pytest.raises(ValueError, match="UBERON:0002"):
+    with pytest.raises(ValueError, match="line 2.*UBERON:0002"):
         _parse_closure_tsv(path)
 
 
 def test__parse_closure_tsv_negative_distance(tmp_path):
     """Tests the case where a distance is negative: the parse is refused naming
-    the pair, because the database holds distance non-negative."""
+    the line and the pair, because the database holds distance non-negative."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
         "ancestor_term_id\tdescendant_term_id\tdistance\nUBERON:0001\tUBERON:0002\t-1\n"
     )
 
-    with pytest.raises(ValueError, match="UBERON:0002"):
+    with pytest.raises(ValueError, match="line 2.*UBERON:0002"):
         _parse_closure_tsv(path)
 
 

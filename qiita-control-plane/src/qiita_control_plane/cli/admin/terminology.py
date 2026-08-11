@@ -195,7 +195,7 @@ def _handle_terminology_prepare_owl(
     declares them, and print what was written.
 
     Returns 2 when the output directory cannot be created, and 1 when the
-    export is absent or malformed or a release file cannot be written.
+    export cannot be read or is malformed or a release file cannot be written.
     """
     export_path: Path = args.export
     return _handle_prepare(
@@ -204,7 +204,7 @@ def _handle_terminology_prepare_owl(
         load_terms=lambda: build_terms(
             parse_robot_export(export_path), term_id_prefix=args.term_id_prefix
         ),
-        load_error_types=(FileNotFoundError, ValueError),
+        load_error_types=(OSError, ValueError),
     )
 
 
@@ -216,16 +216,16 @@ def _handle_terminology_prepare_taxdump(
     that declares them, and print what was written.
 
     Returns 2 when the output directory cannot be created, and 1 when the
-    archive is absent, is not an archive, carries a member whose layout or
-    content contradicts what the taxdump documents, or a release file cannot
-    be written.
+    archive cannot be read, is not an archive, carries a member whose layout
+    or content contradicts what the taxdump documents, or a release file
+    cannot be written.
     """
     taxdump_zip: Path = args.taxdump_zip
     return _handle_prepare(
         args,
         input_path=taxdump_zip,
         load_terms=lambda: build_terms_from_taxdump(taxdump_zip),
-        load_error_types=(FileNotFoundError, ValueError, zipfile.BadZipFile),
+        load_error_types=(OSError, ValueError, zipfile.BadZipFile),
     )
 
 
@@ -253,22 +253,16 @@ def _stage_release_files(
     """Copy the three release files into `staging_dir` under the names the
     manifest declares, and return that manifest.
 
-    Raises ValueError if the manifest declares a path that is not a bare
-    filename, that is the manifest's own name, or that both tables share,
-    since the release is read from one flat directory holding all three files.
+    Raises ValueError if the manifest declares a path that is the manifest's
+    own name, or that both tables share, since the release is read from one
+    flat directory holding all three files.
     """
     shutil.copyfile(manifest_path, staging_dir / MANIFEST_FILENAME)
     manifest = load_manifest(staging_dir)
 
-    # The declared names are what the staged copies are given, so a name
-    # carrying a directory would land outside the flat staging directory, and
-    # the manifest's own name would overwrite the file just staged.
+    # The declared names are what the staged copies are given, so the
+    # manifest's own name would overwrite the file just staged.
     for declared in (manifest.terms, manifest.closure):
-        if Path(declared.path).name != declared.path:
-            raise ValueError(
-                f"manifest declares {declared.path!r}, which is not a bare filename;"
-                " a release is read from a single flat directory"
-            )
         if declared.path == MANIFEST_FILENAME:
             raise ValueError(
                 f"manifest declares {declared.path!r} for a release table, which is"
@@ -296,9 +290,9 @@ def _handle_terminology_load(
 ) -> int:
     """Apply a prepared release to the database and print what changed.
 
-    Returns 1 when the files do not match the manifest, the database is
-    unreachable, or the release carries structural anomalies that were not
-    tolerated.
+    Returns 1 when a named file cannot be read, the files do not match the
+    manifest, the database is unreachable, or the release carries structural
+    anomalies that were not tolerated.
     """
     # The three files are named individually and copied into a directory
     # created here, so loading needs no staging directory on the host.
@@ -311,7 +305,7 @@ def _handle_terminology_load(
                 terms_path=args.terms,
                 closure_path=args.closure,
             )
-        except (FileNotFoundError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
@@ -337,7 +331,7 @@ def _handle_terminology_load(
             print(f"error: {exc}", file=sys.stderr)
             print(json.dumps(payload, indent=2), file=sys.stderr)
             return 1
-        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:

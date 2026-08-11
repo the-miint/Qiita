@@ -66,7 +66,9 @@ duplicates further down are historical strata; leave them where they are.
   directory under the names the manifest declares, so no staging directory has to
   exist on the host; a declared name carrying a directory, one that is the
   manifest's own name, and one shared by both tables are each refused rather
-  than staged. Loading a release over one
+  than staged. A named path that cannot be opened — a directory, an unreadable
+  file, the empty string — is reported with the operating system's own reason
+  and exits 1, on both prepare commands and on `load`. Loading a release over one
   already in the database writes only the terms whose stored values differ, so the
   cost tracks what changed between the two releases rather than the size of the
   vocabulary. A term the source does not name keeps the label already stored for
@@ -91,11 +93,11 @@ duplicates further down are historical strata; leave them where they are.
   transaction, ending with the terminology row in `active`. A release may not
   reference a term it does not define — an obsolete term's replacement pointer
   and both endpoints of every closure row have to resolve within the release
-  itself. Term ids, closure endpoints, and both of a term's names arrive stripped
-  of surrounding whitespace, since the index over them would otherwise hold a
-  padded variant as a value distinct from its unpadded twin; a key cell left
-  holding nothing is refused rather than stored, as is a row that stops before a
-  cell the parse always reads. Structural anomalies in the
+  itself. Every cell of either table arrives stripped of surrounding whitespace,
+  since the index over a term id would otherwise hold a padded variant as a
+  value distinct from its unpadded twin; a key cell left holding nothing is
+  refused rather than stored, as is a row that stops before a cell the parse
+  always reads. Structural anomalies in the
   source fail the load by default and roll it back; `tolerate_anomalies=True`
   instead auto-obsoletes the terms a release silently dropped, records an audit
   line for a replacement pointer that resolves to nothing, and drops a closure
@@ -123,6 +125,8 @@ duplicates further down are historical strata; leave them where they are.
   obsoletion kinds, the staging manifest contract, and the terminology row
   projection into one submodule. The two lifecycle enums move here from
   `models.reference`; every name stays importable from `qiita_common.models`.
+  A manifest may name its release tables only by bare filename, so no declared
+  path can reach outside the directory the manifest itself sits in.
 
 - **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
   `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could

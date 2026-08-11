@@ -241,6 +241,7 @@ from qiita_common.models.study import StudyCreate, StudyPatchRequest, StudyRespo
 from qiita_common.models.terminology import (
     MAX_TERMINOLOGY_VERSION_LENGTH,
     VALID_TERMINOLOGY_STATUS_TRANSITIONS,
+    TerminologyFilename,
     TerminologyManifest,
     TerminologyManifestFile,
     TerminologyName,
@@ -400,6 +401,7 @@ __all__ = [
     "Tier",
     # Terminology.
     "MAX_TERMINOLOGY_VERSION_LENGTH",
+    "TerminologyFilename",
     "TerminologyManifest",
     "TerminologyManifestFile",
     "TerminologyName",
