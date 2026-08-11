@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **NCBI Taxonomy releases read from a taxdump archive.**
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**
   `qiita-admin terminology prepare-taxdump` reads a `new_taxdump.zip` into the
   term rows of a release, so taxa no longer arrive as hand-written seed
   migrations. A live taxon takes its scientific name as its label and its genbank
@@ -37,7 +37,7 @@ duplicates further down are historical strata; leave them where they are.
   `prepare-owl`, so each names the source it reads, and both write a release
   through one shared step.
 
-- **`terminology_term.alternate_label` — a second name for a term.** Holds the
+- **`terminology_term.alternate_label` — a second name for a term (#439).** Holds the
   name a source vocabulary supplies alongside the one that becomes the term's
   label; for NCBI Taxonomy the label is the scientific name and this is the
   genbank common name, which would otherwise be dropped and is what a person
@@ -49,7 +49,7 @@ duplicates further down are historical strata; leave them where they are.
   stored against the term. A resolved terminology term carries it through
   metadata reads.
 
-- **`qiita-admin terminology` — prepare and load an ontology release.**
+- **`qiita-admin terminology` — prepare and load an ontology release (#439).**
   `robot-command` prints the ROBOT export command to run against a staged OWL
   file; nothing in the control plane executes ROBOT, on any host. `prepare-owl`
   turns that export into the release's terms table, a header-only closure stub,
@@ -75,7 +75,7 @@ duplicates further down are historical strata; leave them where they are.
   term was loaded under.
 
 - **Terminology release extraction — read a staged OWL release into the term
-  records the load applies.** Builds the argv of the ROBOT export that produces
+  records the load applies (#439).** Builds the argv of the ROBOT export that produces
   the release's export file, reads that export back, and turns it into term
   rows: a deprecated class is recorded as obsolete, and a class another one
   absorbed as merged into it. ROBOT itself is run out of band, so nothing here
@@ -85,7 +85,7 @@ duplicates further down are historical strata; leave them where they are.
   independent of any OWL toolchain.
 
 - **Terminology release load — apply a staged ontology release from a staging
-  directory.** Reads the release manifest, verifies both tables against the
+  directory (#439).** Reads the release manifest, verifies both tables against the
   digests it declares before any of their content is read, reads each table from
   the path the manifest declares for it, and applies the whole release in one
   transaction, ending with the terminology row in `active`. A release may not
@@ -104,7 +104,7 @@ duplicates further down are historical strata; leave them where they are.
   states how many values offended and names a capped sample of them, so a
   release violating one for millions of terms still reports readably.
 
-- **Terminology repository layer — apply a staged ontology release to the DB.**
+- **Terminology repository layer — apply a staged ontology release to the DB (#439).**
   Owns every SQL string for `terminology`, `terminology_term`, and
   `terminology_closure`: the atomic row reads and the TOCTOU-safe status UPDATE,
   plus a composer that runs find-or-create, a pre-import snapshot, silent-drop
@@ -118,7 +118,7 @@ duplicates further down are historical strata; leave them where they are.
   statements that follow it plan the `terminology_idx` filter against real
   selectivity rather than a default that is orders of magnitude off.
 
-- **`qiita_common.models.terminology` — the terminology model surface.** Gathers
+- **`qiita_common.models.terminology` — the terminology model surface (#439).** Gathers
   the release-load lifecycle status and its allowed transitions, the term
   obsoletion kinds, the staging manifest contract, and the terminology row
   projection into one submodule. The two lifecycle enums move here from
@@ -1904,7 +1904,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Removed
 
-- **The unreached terminology status-transition helper.** A terminology load
+- **The unreached terminology status-transition helper (#439).** A terminology load
   applies as a single transaction, so only `active` is ever observable from
   outside it and the validated transition helper the load was expected to call
   never had a caller. The two status writes now derive their permitted source
