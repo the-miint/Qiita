@@ -100,6 +100,7 @@ from .owner_id import (
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
 from .terminology import (
+    DEFAULT_ROBOT_COMMAND_LINE,
     DEFAULT_ROBOT_EXPORT_FILENAME,
     _handle_terminology_load,
     _handle_terminology_prepare_owl,
@@ -245,10 +246,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_robot_command.add_argument(
         "--executable",
-        default="robot",
+        default=DEFAULT_ROBOT_COMMAND_LINE,
         help=(
             "command that runs ROBOT, ending with the executable itself"
-            ' (e.g. "apptainer exec /images/robot.sif robot"); default: robot'
+            f' (e.g. "apptainer exec /images/robot.sif robot"); default:'
+            f" {DEFAULT_ROBOT_COMMAND_LINE}"
         ),
     )
     p_robot_command.set_defaults(handler=_handle_terminology_robot_command)

@@ -4941,22 +4941,24 @@ async def test_write_global_metadata_or_diagnose_missing_attempted_against_termi
 # ---------------------------------------------------------------------------
 
 
-async def _seeded_term_without_alternate_label(pool) -> tuple[TerminologyTermRef, int]:
+async def _seeded_term_without_alternate_label(ctx) -> tuple[TerminologyTermRef, int]:
     """The seeded NCBI Taxonomy term, for which the source supplies no second
-    name, paired with its terminology_idx."""
-    term_row = await fetch_seeded_metagenome_term(pool)
+    name, paired with its terminology_idx. Inserts nothing, so it registers
+    nothing for cleanup."""
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
     ref = TerminologyTermRef(
         idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
     )
     return ref, term_row["terminology_idx"]
 
 
-async def _seeded_term_with_alternate_label(pool) -> tuple[TerminologyTermRef, int]:
+async def _seeded_term_with_alternate_label(ctx) -> tuple[TerminologyTermRef, int]:
     """A term carrying a second name, minted into the seeded terminology under
-    a unique term_id, paired with its terminology_idx."""
-    terminology_idx = (await fetch_seeded_metagenome_term(pool))["terminology_idx"]
+    a unique term_id, paired with its terminology_idx. The minted row is
+    registered for cleanup, since it outlives the test otherwise."""
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
     term_id = f"alt_term_{secrets.token_hex(4)}"
-    term_idx = await pool.fetchval(
+    term_idx = await ctx["pool"].fetchval(
         "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label, alternate_label)"
         " VALUES ($1, $2, $3, $4) RETURNING idx",
         terminology_idx,
@@ -4964,6 +4966,8 @@ async def _seeded_term_with_alternate_label(pool) -> tuple[TerminologyTermRef, i
         "Homo sapiens",
         "human",
     )
+    ctx["created"]["terminology_term"].append(term_idx)
+
     ref = TerminologyTermRef(
         idx=term_idx, term_id=term_id, label="Homo sapiens", alternate_label="human"
     )
@@ -4985,7 +4989,7 @@ async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec, m
     fetch returns a TerminologyTermRef carrying the term's identity, including
     the alternate label for a term that has one.
     """
-    ref, terminology_idx = await make_term(ctx["pool"])
+    ref, terminology_idx = await make_term(ctx)
     entity_idx = await (
         _create_biosample_with_link(ctx)
         if spec.entity_kind is SampleEntityKind.BIOSAMPLE

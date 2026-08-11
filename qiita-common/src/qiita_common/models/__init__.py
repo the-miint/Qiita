@@ -239,12 +239,15 @@ from qiita_common.models.step import (
 )
 from qiita_common.models.study import StudyCreate, StudyPatchRequest, StudyResponse
 from qiita_common.models.terminology import (
+    MAX_TERMINOLOGY_VERSION_LENGTH,
     VALID_TERMINOLOGY_STATUS_TRANSITIONS,
     TerminologyManifest,
     TerminologyManifestFile,
+    TerminologyName,
     TerminologyResponse,
     TerminologyStatus,
     TerminologyTermObsoletionKind,
+    TerminologyVersion,
 )
 from qiita_common.models.upload import (
     EmailReceiptStatus,
@@ -396,11 +399,14 @@ __all__ = [
     "ReferenceStatusUpdate",
     "Tier",
     # Terminology.
+    "MAX_TERMINOLOGY_VERSION_LENGTH",
     "TerminologyManifest",
     "TerminologyManifestFile",
+    "TerminologyName",
     "TerminologyResponse",
     "TerminologyStatus",
     "TerminologyTermObsoletionKind",
+    "TerminologyVersion",
     # Step wire contract.
     "AlignmentDoGetTicketRequest",
     "ReadDoGetTicketRequest",

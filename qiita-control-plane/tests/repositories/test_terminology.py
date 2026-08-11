@@ -1,11 +1,14 @@
-"""Tests for the terminology repository layer: the atomic row operations and
-the import_terminology_release composer.
+"""Tests for the terminology repository layer: its offender reporting, the
+atomic row operations, and the import_terminology_release composer.
 
-Scope is the connection-level contract — the transaction guard, a conditional
-UPDATE that matches nothing returning None instead of raising, and the closure
-rebuild's tolerance of tuples naming a term the batch never supplied. The
-status-transition rules those primitives back are exercised against the
-action-layer entry point instead.
+Most of the scope is the connection-level contract — the transaction guard, a
+conditional UPDATE that matches nothing returning None instead of raising, and
+the closure rebuild's tolerance of tuples naming a term the batch never
+supplied. The status-transition rules those primitives back are exercised
+against the action-layer entry point instead.
+
+The `db` marker is per test rather than module-wide, so the reporting tests,
+which need no database, stay in the pure-unit tier.
 """
 
 import asyncpg
@@ -13,9 +16,12 @@ import pytest
 from qiita_common.models import TerminologyStatus, TerminologyTermObsoletionKind
 
 from qiita_control_plane.repositories.terminology import (
+    MAX_REPORTED_OFFENDERS,
+    TerminologyImportAnomaly,
     TerminologyImportResult,
     fetch_terminology,
     fetch_terminology_idx_by_name,
+    format_offenders,
     import_terminology_release,
     update_terminology_status,
 )
@@ -25,10 +31,12 @@ from qiita_control_plane.testing.db_seeds import (
 )
 from qiita_control_plane.testing.terminology import parsed_term
 
-pytestmark = pytest.mark.db
-
 # Far above the identity sequence start, so it can never collide with a real row.
 _ABSENT_TERMINOLOGY_IDX = 2**40
+
+# Unqualified, for reads against the catalog (which stores the bare name) and
+# the count it is compared against.
+_TERM_TABLE = "terminology_term"
 
 
 async def _insert_term(
@@ -50,8 +58,10 @@ async def _insert_term(
     )
 
 
-async def _load_release(pool: asyncpg.Pool, *, name: str, version: str, terms: list) -> int:
-    """Apply one release through the composer and return its terminology_idx."""
+async def _load_release(
+    pool: asyncpg.Pool, *, name: str, version: str, terms: list
+) -> TerminologyImportResult:
+    """Apply one release through the composer and return what it reports."""
     async with pool.acquire() as conn, conn.transaction():
         result = await import_terminology_release(
             conn,
@@ -60,7 +70,7 @@ async def _load_release(pool: asyncpg.Pool, *, name: str, version: str, terms: l
             parsed_terms=terms,
             parsed_closure=[],
         )
-    return result.terminology_idx
+    return result
 
 
 async def _read_row_versions(pool: asyncpg.Pool, terminology_idx: int) -> dict[str, str]:
@@ -76,10 +86,94 @@ async def _read_row_versions(pool: asyncpg.Pool, terminology_idx: int) -> dict[s
 
 
 # ---------------------------------------------------------------------------
+# format_offenders / TerminologyImportAnomaly
+# ---------------------------------------------------------------------------
+
+
+def test_format_offenders_within_cap():
+    """Tests the case where the offending values fit under the cap: they render
+    as their own repr, so a message about a handful of rows reads exactly as it
+    would with no cap in place."""
+    values = ["UBERON:0001", "UBERON:0002"]
+
+    result = format_offenders(values)
+
+    assert result == "['UBERON:0001', 'UBERON:0002']"
+
+
+def test_format_offenders_at_cap():
+    """Tests the case where the offending values exactly fill the cap: nothing
+    is summarized, because no value went unnamed."""
+    values = [f"UBERON:{i:04d}" for i in range(MAX_REPORTED_OFFENDERS)]
+
+    result = format_offenders(values)
+
+    assert result == repr(values)
+
+
+def test_format_offenders_over_cap():
+    """Tests the case where more offending values arrive than the cap allows:
+    the total is stated and only the capped sample is named."""
+    over_cap_count = MAX_REPORTED_OFFENDERS + 5
+    values = [f"UBERON:{i:04d}" for i in range(over_cap_count)]
+
+    result = format_offenders(values)
+
+    named = values[:MAX_REPORTED_OFFENDERS]
+    assert result == (f"{over_cap_count} total, first {MAX_REPORTED_OFFENDERS}: {named!r}")
+
+
+def test_format_offenders_pairs():
+    """Tests the case where the offending values are (term, target) pairs rather
+    than single ids: each renders as the pair it is."""
+    values = [("UBERON:0001", "UBERON:9999")]
+
+    result = format_offenders(values)
+
+    assert result == "[('UBERON:0001', 'UBERON:9999')]"
+
+
+def test_TerminologyImportAnomaly_every_kind():
+    """Tests the case where every anomaly kind is populated: each is named in one
+    message, in the order the anomaly declares them."""
+    exc = TerminologyImportAnomaly(
+        silently_dropped_term_ids=["UBERON:0003"],
+        unresolved_replaced_by=[("UBERON:0001", "UBERON:9999")],
+        misaligned_replaced_by=[("UBERON:0002", "UBERON:0004")],
+        unresolved_closure_endpoints=[("UBERON:0005", "UBERON:0006")],
+    )
+
+    assert str(exc) == (
+        "silently_dropped_term_ids=['UBERON:0003'];"
+        " unresolved_replaced_by=[('UBERON:0001', 'UBERON:9999')];"
+        " misaligned_replaced_by=[('UBERON:0002', 'UBERON:0004')];"
+        " unresolved_closure_endpoints=[('UBERON:0005', 'UBERON:0006')]"
+    )
+
+
+def test_TerminologyImportAnomaly_over_cap():
+    """Tests the case where more term ids are dropped than the message names:
+    the message states the total and a sample, while the attribute still carries
+    every id so a caller can report on all of them."""
+    over_cap_count = MAX_REPORTED_OFFENDERS + 3
+    dropped = [f"UBERON:{i:04d}" for i in range(over_cap_count)]
+
+    exc = TerminologyImportAnomaly(silently_dropped_term_ids=dropped)
+
+    named = dropped[:MAX_REPORTED_OFFENDERS]
+    assert str(exc) == (
+        f"silently_dropped_term_ids={over_cap_count} total,"
+        f" first {MAX_REPORTED_OFFENDERS}: {named!r}"
+    )
+    assert exc.silently_dropped_term_ids == dropped
+
+
+# ---------------------------------------------------------------------------
 # import_terminology_release
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.db
 async def test_import_terminology_release_requires_transaction(postgres_pool):
     """Tests the case where the composer runs on a connection with no open
     transaction: the entry guard rejects the call before any write lands."""
@@ -97,6 +191,7 @@ async def test_import_terminology_release_requires_transaction(postgres_pool):
     assert await fetch_terminology_idx_by_name(postgres_pool, "tr_no_transaction") is None
 
 
+@pytest.mark.db
 async def test_import_terminology_release_row_already_loading(postgres_pool, created_terminologies):
     """Tests the case where the terminology row is already in 'loading':
     only 'active' or 'failed' can enter a load, so the composer refuses
@@ -128,6 +223,7 @@ async def test_import_terminology_release_row_already_loading(postgres_pool, cre
     assert dict(row) == expected_row
 
 
+@pytest.mark.db
 async def test_import_terminology_release_closure_tuple_with_unknown_term_id(
     postgres_pool, created_terminologies
 ):
@@ -151,6 +247,7 @@ async def test_import_terminology_release_closure_tuple_with_unknown_term_id(
         terminology_idx=result.terminology_idx,
         terms_inserted=2,
         terms_label_updated=0,
+        terms_alternate_label_updated=0,
         terms_newly_obsoleted=0,
         terms_newly_merged=0,
         terms_silently_dropped=0,
@@ -159,11 +256,114 @@ async def test_import_terminology_release_closure_tuple_with_unknown_term_id(
     assert result == expected
 
 
+@pytest.mark.db
+async def test_import_terminology_release_analyzes_terms(postgres_pool, created_terminologies):
+    """Tests the case where a release has just been applied: the planner's row
+    estimate for the term table matches what it holds, so the statements that
+    filter on terminology_idx are not planned at a default selectivity.
+
+    The estimate is exact at this size because ANALYZE reads every page of a
+    small table; a table never analyzed reports -1 instead of a count.
+    """
+    parsed_terms = [parsed_term("AN:1", "one"), parsed_term("AN:2", "two")]
+    parsed_closure = [("AN:1", "AN:1", 0), ("AN:1", "AN:2", 1)]
+
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        result = await import_terminology_release(
+            conn,
+            name="an_analyze_terms",
+            version="1.0.0",
+            parsed_terms=parsed_terms,
+            parsed_closure=parsed_closure,
+        )
+    created_terminologies.append(result.terminology_idx)
+
+    # Table-wide, not scoped to this terminology: reltuples describes the whole
+    # table, so the row count it is compared against has to as well.
+    estimate = await postgres_pool.fetchval(
+        "SELECT c.reltuples FROM pg_class c"
+        "  JOIN pg_namespace n ON n.oid = c.relnamespace"
+        " WHERE n.nspname = 'qiita' AND c.relname = $1",
+        _TERM_TABLE,
+    )
+    term_count = await postgres_pool.fetchval(f"SELECT count(*) FROM qiita.{_TERM_TABLE}")
+
+    assert int(estimate) == term_count
+
+
+@pytest.mark.db
+async def test_import_terminology_release_alternate_label_only_change(
+    postgres_pool, created_terminologies
+):
+    """Tests the case where a reload changes only a term's second name: the
+    second-name counter moves while the label counter stays at zero, so the
+    reported counts show that something changed."""
+    first_load = await _load_release(
+        postgres_pool,
+        name="tr_alt_only",
+        version="1.0.0",
+        terms=[parsed_term("TR:1", "one", alternate_label="uno")],
+    )
+    created_terminologies.append(first_load.terminology_idx)
+
+    second_load = await _load_release(
+        postgres_pool,
+        name="tr_alt_only",
+        version="2.0.0",
+        terms=[parsed_term("TR:1", "one", alternate_label="ein")],
+    )
+
+    expected = TerminologyImportResult(
+        terminology_idx=first_load.terminology_idx,
+        terms_inserted=0,
+        terms_label_updated=0,
+        terms_alternate_label_updated=1,
+        terms_newly_obsoleted=0,
+        terms_newly_merged=0,
+        terms_silently_dropped=0,
+        closure_rows=0,
+    )
+    assert second_load == expected
+
+
+@pytest.mark.db
+async def test_import_terminology_release_both_names_change(postgres_pool, created_terminologies):
+    """Tests the case where a reload changes both of a term's names: the row
+    counts once against each name's counter, rather than against only one."""
+    first_load = await _load_release(
+        postgres_pool,
+        name="tr_both_names",
+        version="1.0.0",
+        terms=[parsed_term("TR:1", "one", alternate_label="uno")],
+    )
+    created_terminologies.append(first_load.terminology_idx)
+
+    second_load = await _load_release(
+        postgres_pool,
+        name="tr_both_names",
+        version="2.0.0",
+        terms=[parsed_term("TR:1", "ONE", alternate_label="ein")],
+    )
+
+    expected = TerminologyImportResult(
+        terminology_idx=first_load.terminology_idx,
+        terms_inserted=0,
+        terms_label_updated=1,
+        terms_alternate_label_updated=1,
+        terms_newly_obsoleted=0,
+        terms_newly_merged=0,
+        terms_silently_dropped=0,
+        closure_rows=0,
+    )
+    assert second_load == expected
+
+
 # ---------------------------------------------------------------------------
 # update_terminology_status
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.db
 async def test_update_terminology_status_not_found(postgres_pool):
     """Tests the case where the idx names no row: the conditional UPDATE
     matches nothing and returns None instead of raising, leaving the caller
@@ -172,11 +372,11 @@ async def test_update_terminology_status_not_found(postgres_pool):
         postgres_pool,
         _ABSENT_TERMINOLOGY_IDX,
         TerminologyStatus.ACTIVE,
-        [TerminologyStatus.LOADING.value],
     )
     assert row is None
 
 
+@pytest.mark.db
 async def test_update_terminology_status_invalid_source(postgres_pool, created_terminologies):
     """Tests the case where the row exists but its status is not among the
     permitted sources: the UPDATE matches nothing, returns None, and leaves
@@ -190,7 +390,6 @@ async def test_update_terminology_status_invalid_source(postgres_pool, created_t
         postgres_pool,
         terminology_idx,
         TerminologyStatus.ACTIVE,
-        [TerminologyStatus.LOADING.value],
     )
     assert row is None
 
@@ -205,16 +404,50 @@ async def test_update_terminology_status_invalid_source(postgres_pool, created_t
     assert dict(unchanged) == expected_row
 
 
+@pytest.mark.db
+async def test_update_terminology_status_derives_sources(postgres_pool, created_terminologies):
+    """Tests the case where the target is reachable from some state but not
+    from this row's: FAILED is a source for LOADING only, so a FAILED row
+    cannot be promoted straight to ACTIVE."""
+    terminology_idx = await seed_terminology(
+        postgres_pool, name="tr_derived_sources", status=TerminologyStatus.FAILED
+    )
+    created_terminologies.append(terminology_idx)
+
+    row = await update_terminology_status(
+        postgres_pool,
+        terminology_idx,
+        TerminologyStatus.ACTIVE,
+    )
+    assert row is None
+
+    promoted = await update_terminology_status(
+        postgres_pool,
+        terminology_idx,
+        TerminologyStatus.LOADING,
+    )
+    expected_row = {
+        "terminology_idx": terminology_idx,
+        "name": "tr_derived_sources",
+        "version": "1.0.0",
+        "loaded_at": SEEDED_TERMINOLOGY_LOADED_AT,
+        "status": TerminologyStatus.LOADING.value,
+    }
+    assert dict(promoted) == expected_row
+
+
 # ---------------------------------------------------------------------------
 # fetch_terminology / fetch_terminology_idx_by_name
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.db
 async def test_fetch_terminology_not_found(postgres_pool):
     """Tests the case where the idx names no row: the read returns None."""
     assert await fetch_terminology(postgres_pool, _ABSENT_TERMINOLOGY_IDX) is None
 
 
+@pytest.mark.db
 async def test_fetch_terminology_idx_by_name_not_found(postgres_pool):
     """Tests the case where no terminology carries the given name: the read
     returns None rather than an empty record."""
@@ -226,6 +459,7 @@ async def test_fetch_terminology_idx_by_name_not_found(postgres_pool):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.db
 async def test_terminology_term_alternate_label_column(postgres_pool):
     """Tests the case where the column's declared shape is read back from the
     catalog: a nullable VARCHAR(500), the same width as label because it holds
@@ -244,6 +478,7 @@ async def test_terminology_term_alternate_label_column(postgres_pool):
     assert dict(row) == expected
 
 
+@pytest.mark.db
 async def test_terminology_term_alternate_label_rejects_empty(postgres_pool, created_terminologies):
     """Tests the case where a write supplies an empty string: the CHECK
     rejects it, leaving NULL as the only spelling of absence."""
@@ -254,6 +489,7 @@ async def test_terminology_term_alternate_label_rejects_empty(postgres_pool, cre
         await _insert_term(postgres_pool, terminology_idx, "TR:1", "one", "")
 
 
+@pytest.mark.db
 async def test_terminology_term_alternate_label_null_and_value(
     postgres_pool, created_terminologies
 ):
@@ -277,6 +513,7 @@ async def test_terminology_term_alternate_label_null_and_value(
     assert [dict(row) for row in rows] == expected
 
 
+@pytest.mark.db
 async def test_import_terminology_release_clears_unsupplied_alternate_label(
     postgres_pool, created_terminologies
 ):
@@ -329,6 +566,7 @@ async def test_import_terminology_release_clears_unsupplied_alternate_label(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.db
 async def test_import_terminology_release_unchanged_rows_are_not_rewritten(
     postgres_pool, created_terminologies
 ):
@@ -345,9 +583,8 @@ async def test_import_terminology_release_unchanged_rows_are_not_rewritten(
         parsed_term("TR:1", "one"),
         parsed_term("TR:2", "two", alternate_label="second"),
     ]
-    terminology_idx = await _load_release(
-        postgres_pool, name="tr_no_op_reload", version="1.0.0", terms=terms
-    )
+    load = await _load_release(postgres_pool, name="tr_no_op_reload", version="1.0.0", terms=terms)
+    terminology_idx = load.terminology_idx
     created_terminologies.append(terminology_idx)
     before = await _read_row_versions(postgres_pool, terminology_idx)
 
@@ -357,18 +594,20 @@ async def test_import_terminology_release_unchanged_rows_are_not_rewritten(
     assert after == before
 
 
+@pytest.mark.db
 async def test_import_terminology_release_changed_row_is_rewritten(
     postgres_pool, created_terminologies
 ):
     """Tests the case where a reload changes one term's label and leaves
     another untouched: only the changed row is rewritten, and it carries the
     new value."""
-    terminology_idx = await _load_release(
+    load = await _load_release(
         postgres_pool,
         name="tr_partial_reload",
         version="1.0.0",
         terms=[parsed_term("TR:1", "one"), parsed_term("TR:2", "two")],
     )
+    terminology_idx = load.terminology_idx
     created_terminologies.append(terminology_idx)
     before = await _read_row_versions(postgres_pool, terminology_idx)
 
@@ -395,6 +634,7 @@ async def test_import_terminology_release_changed_row_is_rewritten(
     assert [dict(row) for row in rows] == expected
 
 
+@pytest.mark.db
 async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
     postgres_pool, created_terminologies
 ):
@@ -421,12 +661,13 @@ async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
     )
     survivor = parsed_term("TR:2", "two")
 
-    terminology_idx = await _load_release(
+    load = await _load_release(
         postgres_pool,
         name="tr_withdrawn_pointer",
         version="1.0.0",
         terms=[merged_term, survivor],
     )
+    terminology_idx = load.terminology_idx
     created_terminologies.append(terminology_idx)
 
     await _load_release(
@@ -451,6 +692,7 @@ async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.db
 async def test_import_terminology_release_unnamed_term_keeps_stored_names(
     postgres_pool, created_terminologies
 ):
@@ -464,7 +706,7 @@ async def test_import_terminology_release_unnamed_term_keeps_stored_names(
     is already recorded by is_obsolete, obsoletion_kind, and the replaced_by
     pointer — the names are the only part a reader cannot reconstruct.
     """
-    terminology_idx = await _load_release(
+    load = await _load_release(
         postgres_pool,
         name="tr_unnamed_keeps_label",
         version="1.0.0",
@@ -473,6 +715,7 @@ async def test_import_terminology_release_unnamed_term_keeps_stored_names(
             parsed_term("TR:2", "oral opening"),
         ],
     )
+    terminology_idx = load.terminology_idx
     created_terminologies.append(terminology_idx)
 
     await _load_release(
@@ -511,13 +754,14 @@ async def test_import_terminology_release_unnamed_term_keeps_stored_names(
     assert dict(row) == expected
 
 
+@pytest.mark.db
 async def test_import_terminology_release_unnamed_new_term_falls_back_to_term_id(
     postgres_pool, created_terminologies
 ):
     """Tests the case where a term the source does not name has never been
     loaded before: its own term id becomes its label, since that is the only
     thing anyone knows about it and the column cannot be empty."""
-    terminology_idx = await _load_release(
+    load = await _load_release(
         postgres_pool,
         name="tr_unnamed_new_term",
         version="1.0.0",
@@ -538,6 +782,7 @@ async def test_import_terminology_release_unnamed_new_term_falls_back_to_term_id
             ),
         ],
     )
+    terminology_idx = load.terminology_idx
     created_terminologies.append(terminology_idx)
 
     rows = await postgres_pool.fetch(
@@ -553,18 +798,20 @@ async def test_import_terminology_release_unnamed_new_term_falls_back_to_term_id
     assert [dict(row) for row in rows] == expected
 
 
+@pytest.mark.db
 async def test_import_terminology_release_unnamed_term_is_not_a_label_update(
     postgres_pool, created_terminologies
 ):
     """Tests the case where a reload merges away a term it does not name: the
     carried-forward label is the one already stored, so the load reports no
     label change."""
-    terminology_idx = await _load_release(
+    load = await _load_release(
         postgres_pool,
         name="tr_unnamed_no_count",
         version="1.0.0",
         terms=[parsed_term("TR:1", "mouth"), parsed_term("TR:2", "oral opening")],
     )
+    terminology_idx = load.terminology_idx
     created_terminologies.append(terminology_idx)
 
     async with postgres_pool.acquire() as conn, conn.transaction():

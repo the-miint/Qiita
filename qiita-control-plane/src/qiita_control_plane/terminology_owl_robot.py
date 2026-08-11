@@ -12,6 +12,7 @@ import csv
 from collections.abc import Sequence
 from pathlib import Path
 
+from .terminology import check_tsv_columns
 from .terminology_owl import (
     OBO_ALTERNATIVE_ID_PROPERTY,
     OBO_REPLACED_BY_PROPERTY,
@@ -39,16 +40,21 @@ _ROBOT_EXPORT_ENTITY_TYPES = "classes"
 # A typed literal arrives with its datatype after this marker.
 _LITERAL_DATATYPE_SEPARATOR = "^^"
 
-_DEFAULT_ROBOT_EXECUTABLE = ("robot",)
+DEFAULT_ROBOT_EXECUTABLE = ("robot",)
+
+# How owl:deprecated spells a boolean. Deliberately not shared with the release
+# table's own spelling, which is a separate contract that merely coincides.
+_OWL_TRUE = "true"
+_OWL_FALSE = "false"
 
 
 def robot_export_argv(
     input_filename: str,
     export_filename: str,
     *,
-    executable: Sequence[str] = _DEFAULT_ROBOT_EXECUTABLE,
+    executable: Sequence[str] = DEFAULT_ROBOT_EXECUTABLE,
 ) -> list[str]:
-    """Build the argv of a ROBOT export that parse_robot_export can read.
+    """Build the argv of a ROBOT export requesting _ROBOT_EXPORT_COLUMNS.
 
     Naming both files without a directory keeps the command runnable with
     the directory holding them as its working directory, so neither path
@@ -90,15 +96,12 @@ def parse_robot_export(export_path: Path) -> list[ExportedClass]:
     with export_path.open(newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
 
-        # Check the header up front, so a column the export never carried is
-        # reported once rather than as a KeyError on the first row.
-        present_columns = reader.fieldnames or ()
-        missing_columns = [c for c in _ROBOT_EXPORT_COLUMNS if c not in present_columns]
-        if missing_columns:
-            raise ValueError(
-                f"export at {export_path} is missing column(s) {missing_columns};"
-                f" requested {list(_ROBOT_EXPORT_COLUMNS)}"
-            )
+        check_tsv_columns(
+            reader.fieldnames,
+            _ROBOT_EXPORT_COLUMNS,
+            source_name="export",
+            path=export_path,
+        )
 
         for row in reader:
             term_id = row[_ROBOT_COLUMN_TERM_ID].strip()
@@ -128,12 +131,12 @@ def _parse_deprecated_cell(cell: str, term_id: str) -> bool:
     if not values:
         return False
     value = values[0].lower()
-    if value not in ("true", "false"):
+    if value not in (_OWL_TRUE, _OWL_FALSE):
         raise ValueError(
             f"invalid {OWL_DEPRECATED_PROPERTY} value {cell!r} for term_id {term_id!r};"
-            " expected 'true', 'false', or an empty cell"
+            f" expected {_OWL_TRUE!r}, {_OWL_FALSE!r}, or an empty cell"
         )
-    return value == "true"
+    return value == _OWL_TRUE
 
 
 def _split_cell(cell: str) -> list[str]:

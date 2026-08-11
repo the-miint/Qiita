@@ -7,6 +7,7 @@ import zipfile
 import pytest
 from qiita_common.models import TerminologyTermObsoletionKind
 
+from qiita_control_plane.repositories.terminology import MAX_REPORTED_OFFENDERS
 from qiita_control_plane.terminology_taxdump import _read_dmp_rows, build_terms_from_taxdump
 from qiita_control_plane.testing.terminology import (
     DELNODES_DMP_MEMBER,
@@ -162,6 +163,25 @@ def test_build_terms_from_taxdump_tax_id_in_every_member_pair(tmp_path):
     assert f"{MERGED_DMP_MEMBER} and {DELNODES_DMP_MEMBER}: ['4']" in message
 
 
+def test_build_terms_from_taxdump_member_overlap_over_cap(tmp_path):
+    """Tests the case where more taxon ids are recorded two ways than the error
+    names: the total is stated and the tail is left unnamed."""
+    over_cap_count = MAX_REPORTED_OFFENDERS + 5
+    tax_ids = [str(tax_id) for tax_id in range(100, 100 + over_cap_count)]
+    archive_path = write_taxdump(
+        tmp_path,
+        names=[(tax_id, f"Taxon {tax_id}", "", "scientific name") for tax_id in tax_ids],
+        delnodes=[(tax_id,) for tax_id in tax_ids],
+    )
+
+    with pytest.raises(ValueError) as raised:
+        build_terms_from_taxdump(archive_path)
+
+    message = str(raised.value)
+    assert f"{over_cap_count} total, first {MAX_REPORTED_OFFENDERS}" in message
+    assert tax_ids[-1] not in message
+
+
 def test_build_terms_from_taxdump_taxon_without_scientific_name(tmp_path):
     """Tests the case where a taxon is named only in the class the second
     name column is taken from, leaving the label column nothing to hold."""
@@ -172,6 +192,24 @@ def test_build_terms_from_taxdump_taxon_without_scientific_name(tmp_path):
 
     with pytest.raises(ValueError, match="scientific name"):
         build_terms_from_taxdump(archive_path)
+
+
+def test_build_terms_from_taxdump_unnamed_over_cap(tmp_path):
+    """Tests the case where more taxa lack the name the label is taken from than
+    the error names: the total is stated and the tail is left unnamed."""
+    over_cap_count = MAX_REPORTED_OFFENDERS + 5
+    tax_ids = [str(tax_id) for tax_id in range(100, 100 + over_cap_count)]
+    archive_path = write_taxdump(
+        tmp_path,
+        names=[(tax_id, f"common {tax_id}", "", "genbank common name") for tax_id in tax_ids],
+    )
+
+    with pytest.raises(ValueError) as raised:
+        build_terms_from_taxdump(archive_path)
+
+    message = str(raised.value)
+    assert f"{over_cap_count} total, first {MAX_REPORTED_OFFENDERS}" in message
+    assert tax_ids[-1] not in message
 
 
 def test_build_terms_from_taxdump_missing_member(tmp_path):

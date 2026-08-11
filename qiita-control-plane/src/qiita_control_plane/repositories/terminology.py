@@ -10,15 +10,38 @@ caller cannot forget to wrap the multi-statement workflow atomically.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 import asyncpg
-from qiita_common.models import TerminologyStatus, TerminologyTermObsoletionKind
+from qiita_common.models import (
+    VALID_TERMINOLOGY_STATUS_TRANSITIONS,
+    TerminologyStatus,
+    TerminologyTermObsoletionKind,
+)
 
 from . import require_transaction
 
 # Caller-visible column projection for the qiita.terminology row
 _TERMINOLOGY_COLUMNS = "idx AS terminology_idx, name, version, loaded_at, status"
+
+# How many offending values an error names before it summarizes the rest. A
+# release runs to millions of terms, so a check that named every offender would
+# render an error no operator can read.
+MAX_REPORTED_OFFENDERS = 20
+
+
+def format_offenders(values: Sequence[object]) -> str:
+    """Render offending values for an error, naming at most
+    MAX_REPORTED_OFFENDERS of them and stating the total when any go unnamed.
+
+    A collection within the cap renders as its own repr, so an error about a
+    handful of rows reads exactly as it would with no cap in place.
+    """
+    named = list(values[:MAX_REPORTED_OFFENDERS])
+    if len(values) <= MAX_REPORTED_OFFENDERS:
+        return repr(named)
+    return f"{len(values)} total, first {MAX_REPORTED_OFFENDERS}: {named!r}"
 
 
 class TerminologyImportAnomaly(Exception):
@@ -28,7 +51,9 @@ class TerminologyImportAnomaly(Exception):
 
     `silently_dropped_term_ids`: in the DB but absent from the batch.
     `unresolved_replaced_by`: (term_id, target) — target absent from batch.
-    `misaligned_replaced_by`: (term_id, target) — non-obsolete with target set."""
+    `misaligned_replaced_by`: (term_id, target) — non-obsolete with target set.
+    `unresolved_closure_endpoints`: (ancestor, descendant) — an endpoint
+    absent from the batch."""
 
     def __init__(
         self,
@@ -36,18 +61,31 @@ class TerminologyImportAnomaly(Exception):
         silently_dropped_term_ids: list[str] | None = None,
         unresolved_replaced_by: list[tuple[str, str]] | None = None,
         misaligned_replaced_by: list[tuple[str, str]] | None = None,
+        unresolved_closure_endpoints: list[tuple[str, str]] | None = None,
     ) -> None:
         self.silently_dropped_term_ids = silently_dropped_term_ids or []
         self.unresolved_replaced_by = unresolved_replaced_by or []
         self.misaligned_replaced_by = misaligned_replaced_by or []
-        parts: list[str] = []
-        if self.silently_dropped_term_ids:
-            parts.append(f"silently_dropped_term_ids={self.silently_dropped_term_ids!r}")
-        if self.unresolved_replaced_by:
-            parts.append(f"unresolved_replaced_by={self.unresolved_replaced_by!r}")
-        if self.misaligned_replaced_by:
-            parts.append(f"misaligned_replaced_by={self.misaligned_replaced_by!r}")
+        self.unresolved_closure_endpoints = unresolved_closure_endpoints or []
+
+        # Only a populated kind is named, so the message says nothing about a
+        # kind the release did not violate.
+        parts = [
+            f"{attribute}={format_offenders(rows)}"
+            for attribute, rows in self.reported_anomalies()
+            if rows
+        ]
         super().__init__("; ".join(parts) or "TerminologyImportAnomaly")
+
+    def reported_anomalies(self) -> tuple[tuple[str, Sequence[object]], ...]:
+        """Return (attribute name, offending rows) per anomaly kind, populated
+        or not, in one fixed order that a kind added later joins."""
+        return (
+            ("silently_dropped_term_ids", self.silently_dropped_term_ids),
+            ("unresolved_replaced_by", self.unresolved_replaced_by),
+            ("misaligned_replaced_by", self.misaligned_replaced_by),
+            ("unresolved_closure_endpoints", self.unresolved_closure_endpoints),
+        )
 
 
 @dataclass(frozen=True)
@@ -88,6 +126,10 @@ class TerminologyImportResult:
 
     `terms_inserted` — rows newly added to terminology_term.
     `terms_label_updated` — existing rows whose label changed.
+    `terms_alternate_label_updated` — existing rows whose alternate_label
+    changed, counting a change to or from no second name at all. Independent
+    of terms_label_updated: a row whose two names both changed counts once
+    in each.
     `terms_newly_obsoleted` — rows that became obsolete on this load,
     counting both rows that flipped is_obsolete=false → true (including
     silent drops auto-obsoleted under tolerate_anomalies=True) and
@@ -108,6 +150,7 @@ class TerminologyImportResult:
     terminology_idx: int
     terms_inserted: int
     terms_label_updated: int
+    terms_alternate_label_updated: int
     terms_newly_obsoleted: int
     terms_newly_merged: int
     terms_silently_dropped: int
@@ -142,18 +185,24 @@ async def update_terminology_status(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     terminology_idx: int,
     target: TerminologyStatus,
-    valid_sources: list[str],
 ) -> asyncpg.Record | None:
-    """Atomically transition a terminology row's status, conditional on
-    the current status being one of `valid_sources`.
+    """Atomically transition a terminology row's status, conditional on the
+    current status being one VALID_TERMINOLOGY_STATUS_TRANSITIONS admits as
+    a source for `target`.
 
     Returns the post-UPDATE row on success, None when no row matched —
-    either the idx does not exist or the row is in a state not present
-    in `valid_sources`. The conditional UPDATE is what makes the
-    transition TOCTOU-safe against concurrent writers; `valid_sources`
-    is the caller's derivation from VALID_TERMINOLOGY_STATUS_TRANSITIONS.
+    either the idx does not exist or the row is in a state that cannot
+    reach `target`. The conditional UPDATE is what makes the transition
+    TOCTOU-safe against concurrent writers.
     """
-    return await pool_or_conn.fetchrow(
+    # Derive the source states that can reach `target` rather than taking
+    # them from the caller, so the transition table is stated in one place.
+    valid_sources = [
+        str(src)
+        for src, targets in VALID_TERMINOLOGY_STATUS_TRANSITIONS.items()
+        if target in targets
+    ]
+    updated_row = await pool_or_conn.fetchrow(
         "UPDATE qiita.terminology"
         " SET status = $1::qiita.terminology_status"
         " WHERE idx = $2"
@@ -163,6 +212,7 @@ async def update_terminology_status(
         terminology_idx,
         valid_sources,
     )
+    return updated_row
 
 
 async def import_terminology_release(
@@ -215,6 +265,13 @@ async def import_terminology_release(
         loading_version=version,
     )
 
+    # Statistics for the rows just written, so every statement below plans the
+    # terminology_idx filter it carries against real selectivity instead of the
+    # default, which on a release of any size is orders of magnitude off. Runs
+    # here rather than after the commit because the statements that need it are
+    # in this transaction, and ANALYZE counts rows its own transaction inserted.
+    await conn.execute("ANALYZE qiita.terminology_term")
+
     # Pass 2: populate replaced_by from the in-batch term_id → idx mapping.
     # Two row versions per replaced row per load: pass 1 wipes the pointer and
     # this restores it, changed or not, so a reload leaves twice the merge count
@@ -242,12 +299,7 @@ async def import_terminology_release(
     counts = _compute_counts(prior_state, effective_terms)
 
     # Final transition: LOADING → ACTIVE.
-    transitioned = await update_terminology_status(
-        conn,
-        terminology_idx,
-        TerminologyStatus.ACTIVE,
-        [TerminologyStatus.LOADING.value],
-    )
+    transitioned = await update_terminology_status(conn, terminology_idx, TerminologyStatus.ACTIVE)
     if transitioned is None:
         # Since the LOADING transition above succeeded, an empty UPDATE here
         # would mean another writer concurrently mutated the row, which is a
@@ -261,6 +313,7 @@ async def import_terminology_release(
         terminology_idx=terminology_idx,
         terms_inserted=counts["inserted"],
         terms_label_updated=counts["label_updated"],
+        terms_alternate_label_updated=counts["alternate_label_updated"],
         terms_newly_obsoleted=counts["newly_obsoleted"],
         terms_newly_merged=counts["newly_merged"],
         terms_silently_dropped=len(silent_drop_synthetics),
@@ -295,12 +348,7 @@ async def _ensure_loading_row(
                 " retry after the other load completes."
             ) from exc
 
-    transitioned = await update_terminology_status(
-        conn,
-        existing_idx,
-        TerminologyStatus.LOADING,
-        [TerminologyStatus.ACTIVE.value, TerminologyStatus.FAILED.value],
-    )
+    transitioned = await update_terminology_status(conn, existing_idx, TerminologyStatus.LOADING)
     if transitioned is None:
         raise RuntimeError(
             f"qiita.terminology {name!r} could not transition to LOADING;"
@@ -399,6 +447,8 @@ def _resolve_missing_names(
         if term.label is not None:
             resolved.append(term)
             continue
+        # "No label" makes the record names malformed, so neither name it carries is
+        # wanted: any alternate_label it supplied is discarded along with the label.
         prior = prior_state.get(term.term_id)
         stored_label = prior.label if prior is not None else term.term_id
         stored_alternate_label = prior.alternate_label if prior is not None else None
@@ -413,14 +463,12 @@ async def _upsert_terms_without_replaced_by(
     parsed_terms: list[ParsedTerm],
     loading_version: str,
 ) -> None:
-    """Insert-or-update every incoming term, setting replaced_by=NULL. The
-    obsoleted_in_version set-once and un-obsoletion-clear rules live
-    inside the UPSERT itself so the invariants are enforced by the same
-    statement that writes them.
+    """Insert-or-update every incoming term, setting replaced_by=NULL.
 
-    A term whose stored values already match the incoming ones is left
-    alone rather than rewritten, so a reload costs row versions only for
-    what actually moved."""
+    obsoleted_in_version is set once, by the version that first obsoletes a
+    term, and cleared when the term stops being obsolete. A term whose stored
+    values already match the incoming ones is left alone rather than
+    rewritten, so a reload costs row versions only for what actually moved."""
     if not parsed_terms:
         return
     term_ids = [term.term_id for term in parsed_terms]
@@ -448,9 +496,10 @@ async def _upsert_terms_without_replaced_by(
     # reloads, and clears to NULL on un-obsoletion; NB: replaced_by is wiped
     # on every update so the later replaced_by-setting step starts from a
     # clean slate.
-    # The WHERE on the update branch skips a row in which nothing would move, because
-    # Postgres stores a new row version per UPDATE without comparing values
-    # and a reload would otherwise leave one dead tuple per term whether it changed or not.
+    # The WHERE on the update branch skips a row in which nothing would
+    # move, because Postgres stores a new row version per UPDATE without
+    # comparing values and a reload would otherwise leave one dead tuple
+    # per term whether it changed or not.
     # obsoleted_in_version needs no clause of its own: the alignment CHECK
     # ties its nullness to is_obsolete, so it can only move when is_obsolete
     # does. A row carrying a replaced_by must be rewritten whatever else
@@ -506,7 +555,13 @@ async def _resolve_replaced_by(
     """With all term rows currently present at known idxs, populate replaced_by
     for obsolete rows whose incoming entry names within this terminology
     show they have been replaced. Precondition: every term in the
-    batch is already present in terminology_term."""
+    batch is already present in terminology_term.
+
+    For now, resolution is scoped to this terminology. A pointer naming another
+    vocabulary's term — which sources can emit — is removed upstream rather
+    than arriving here, so every pointer in a batch resolves in-terminology
+    by construction. The db itself could accept a cross-terminology
+    target; if we do start supporting that, we should revisit this."""
     pairs = [
         (term.term_id, term.replaced_by_term_id)
         for term in parsed_terms
@@ -572,9 +627,10 @@ async def _rebuild_closure(
     parsed_closure: list[tuple[str, str, int]],
 ) -> int:
     """Replace every closure row scoped to this terminology and return
-    the DB-side inserted count. Closure tuples that reference a term_id
-    not present in terminology_term are silently dropped by the inner
-    JOINs, so the returned count may be less than len(parsed_closure)."""
+    the DB-side inserted count. A tuple naming a term_id not present in
+    terminology_term is dropped by the inner JOINs, so the returned count
+    may be less than len(parsed_closure); whether such a tuple is
+    acceptable at all is settled before this runs."""
     await conn.execute(
         "DELETE FROM qiita.terminology_closure WHERE terminology_idx = $1",
         terminology_idx,
@@ -616,6 +672,7 @@ def _compute_counts(
     merged_kind = TerminologyTermObsoletionKind.SOURCE_MERGED
     inserted = 0
     label_updated = 0
+    alternate_label_updated = 0
     newly_obsoleted = 0
     newly_merged = 0
     for term in parsed_terms:
@@ -629,6 +686,8 @@ def _compute_counts(
             continue
         if prior.label != term.label:
             label_updated += 1
+        if prior.alternate_label != term.alternate_label:
+            alternate_label_updated += 1
         # Was-not-obsolete → is-obsolete is a fresh obsoletion event;
         # the kind-only flip from a prior obsolete state to source_merged
         # is a separate event that still counts toward newly_merged.
@@ -646,6 +705,7 @@ def _compute_counts(
     return {
         "inserted": inserted,
         "label_updated": label_updated,
+        "alternate_label_updated": alternate_label_updated,
         "newly_obsoleted": newly_obsoleted,
         "newly_merged": newly_merged,
     }

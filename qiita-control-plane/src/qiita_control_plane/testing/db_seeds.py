@@ -45,10 +45,9 @@ from ..repositories._sample_helpers import (
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
 NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 
-# Pinned loaded_at for seeded terminology rows, so a caller comparing a whole
-# TerminologyResponse can construct the expected object outright instead of
-# copying the timestamp out of the actual. UTC-aware and microsecond-stable
-# for a Postgres TIMESTAMPTZ round trip.
+# Pinned loaded_at for seeded terminology rows, so a seeded row is fully
+# determined rather than stamped at insert time. UTC-aware and
+# microsecond-stable for a Postgres TIMESTAMPTZ round trip.
 SEEDED_TERMINOLOGY_LOADED_AT = datetime(2026, 1, 15, 12, 30, 0, tzinfo=UTC)
 
 

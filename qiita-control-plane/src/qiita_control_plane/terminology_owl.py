@@ -82,8 +82,8 @@ def _filter_classes_to_prefix(
         if not exported_class.term_id.startswith(term_id_prefix):
             continue
 
-        # A replacement resolves within one terminology, so a pointer at
-        # another vocabulary's class cannot be recorded and is dropped.
+        # Only a same-vocabulary replacement is recorded here, so a pointer at
+        # another vocab is dropped, but the db can permit that, if we later decide to.
         asserted_replacement = exported_class.asserted_replacement_term_id
         if asserted_replacement is not None and not asserted_replacement.startswith(term_id_prefix):
             _log.warning(

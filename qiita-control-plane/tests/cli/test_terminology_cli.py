@@ -5,9 +5,15 @@ import asyncio
 import json
 
 import pytest
-from qiita_common.models import TerminologyTermObsoletionKind
+from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.models import (
+    MAX_NAME_LENGTH,
+    MAX_TERMINOLOGY_VERSION_LENGTH,
+    TerminologyTermObsoletionKind,
+)
 
 from qiita_control_plane.cli import admin as cli
+from qiita_control_plane.cli.admin import terminology as terminology_cli
 from qiita_control_plane.terminology import (
     CLOSURE_TSV_COLUMNS,
     CLOSURE_TSV_FILENAME,
@@ -32,6 +38,11 @@ _EXPECTED_ROBOT_COMMAND = (
     " --header 'ID|LABEL|owl:deprecated|IAO:0100001|oboInOwl:hasAlternativeId'"
     " --include classes --export robot-export.tsv"
 )
+
+# Port 1 on the loopback host accepts no connections, so a case that must be
+# refused before the database is reached fails the assertion rather than the
+# connection if the refusal ever moves later.
+_UNREACHABLE_DATABASE_URL = f"postgresql://nobody@{LOOPBACK_HOST}:1/absent"
 
 
 # =============================================================================
@@ -224,6 +235,42 @@ def test_terminology_prepare_owl_missing_export(tmp_path, capsys):
     assert "No ROBOT export" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--version", "v" * (MAX_TERMINOLOGY_VERSION_LENGTH + 1)),
+        ("--name", "u" * (MAX_NAME_LENGTH + 1)),
+    ],
+    ids=["version", "name"],
+)
+def test_terminology_prepare_owl_identifier_too_long(tmp_path, capsys, option, value):
+    """Tests the case where a release identifier is longer than a manifest can
+    carry: the prepare is refused naming the option, and nothing is written, so
+    the output directory is never left holding tables with no manifest."""
+    export_path = tmp_path / "robot-export.tsv"
+    write_robot_export_tsv(export_path, [("UBERON:0001", "mouth", "", "", "")])
+    output_dir = tmp_path / "out"
+    argv = [
+        "terminology",
+        "prepare-owl",
+        "--export",
+        str(export_path),
+        "--name",
+        "uberon",
+        "--version",
+        "2026-04-15",
+        "--output-dir",
+        str(output_dir),
+    ]
+    argv[argv.index(option) + 1] = value
+
+    rc = cli.main(argv)
+
+    assert rc == 2
+    assert option in capsys.readouterr().err
+    assert not output_dir.exists()
+
+
 def test_terminology_prepare_owl_malformed_export(tmp_path, capsys):
     """Tests the case where the export is missing a requested column."""
     export_path = tmp_path / "robot-export.tsv"
@@ -356,6 +403,117 @@ def test_terminology_prepare_taxdump_output_dir(tmp_path):
     assert (output_dir / TERMS_TSV_FILENAME).exists()
     assert (output_dir / MANIFEST_FILENAME).exists()
     assert not (archive_dir / TERMS_TSV_FILENAME).exists()
+
+
+def test_terminology_prepare_owl_creates_output_dir(tmp_path):
+    """Tests the case where the named output directory does not exist: it is
+    created, along with any missing parent, rather than refusing the run."""
+    write_robot_export_tsv(tmp_path / "robot-export.tsv", [("UBERON:0001", "mouth", "", "", "")])
+    output_dir = tmp_path / "absent" / "staged"
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-owl",
+            "--export",
+            str(tmp_path / "robot-export.tsv"),
+            "--name",
+            "uberon",
+            "--version",
+            "2026-04-15",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert rc == 0
+    assert (output_dir / TERMS_TSV_FILENAME).exists()
+    assert (output_dir / MANIFEST_FILENAME).exists()
+
+
+def test_terminology_prepare_taxdump_creates_output_dir(tmp_path):
+    """Tests the case where the named output directory does not exist: it is
+    created, along with any missing parent, rather than refusing the run."""
+    archive_path = write_taxdump(tmp_path, names=[("2", "Bacteria", "", "scientific name")])
+    output_dir = tmp_path / "absent" / "staged"
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-taxdump",
+            "--taxdump-zip",
+            str(archive_path),
+            "--name",
+            "NCBI Taxonomy",
+            "--version",
+            "2026-08-01",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert rc == 0
+    assert (output_dir / TERMS_TSV_FILENAME).exists()
+    assert (output_dir / MANIFEST_FILENAME).exists()
+
+
+def test_terminology_prepare_owl_output_dir_uncreatable(tmp_path, capsys):
+    """Tests the case where the output directory cannot be created because a
+    file occupies its path: the precondition code is returned, not a
+    traceback."""
+    write_robot_export_tsv(tmp_path / "robot-export.tsv", [("UBERON:0001", "mouth", "", "", "")])
+    blocking_file = tmp_path / "blocking"
+    blocking_file.write_text("not a directory")
+    output_dir = blocking_file / "staged"
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-owl",
+            "--export",
+            str(tmp_path / "robot-export.tsv"),
+            "--name",
+            "uberon",
+            "--version",
+            "2026-04-15",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert rc == 2
+    assert "output directory" in capsys.readouterr().err
+
+
+def test_terminology_prepare_owl_write_failure(tmp_path, capsys, monkeypatch):
+    """Tests the case where a release file cannot be written once the output
+    directory exists: that is a failed run rather than an unmet precondition,
+    so the codes differ."""
+    write_robot_export_tsv(tmp_path / "robot-export.tsv", [("UBERON:0001", "mouth", "", "", "")])
+    output_dir = tmp_path / "staged"
+
+    def refuse_write(path, terms):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(terminology_cli, "write_terms_tsv", refuse_write)
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-owl",
+            "--export",
+            str(tmp_path / "robot-export.tsv"),
+            "--name",
+            "uberon",
+            "--version",
+            "2026-04-15",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert rc == 1
+    assert "no space left on device" in capsys.readouterr().err
 
 
 def test_terminology_prepare_taxdump_missing_archive(tmp_path, capsys):
@@ -492,13 +650,11 @@ def test_terminology_load_missing_database_url(tmp_path, monkeypatch, capsys):
     assert "DATABASE_URL" in capsys.readouterr().err
 
 
-def test_terminology_load_digest_mismatch(tmp_path, monkeypatch, capsys):
-    """Tests the case where a release table no longer matches the manifest.
-
-    DATABASE_URL points at nothing reachable, so a mismatch reported here is
-    proof the files are checked before any connection is attempted.
-    """
-    monkeypatch.setenv("DATABASE_URL", "postgresql://nobody@127.0.0.1:1/absent")
+@pytest.mark.db
+async def test_terminology_load_digest_mismatch(tmp_path, monkeypatch, capsys, postgres_url):
+    """Tests the case where a release table no longer matches the manifest: the
+    load is refused naming the mismatch."""
+    monkeypatch.setenv("DATABASE_URL", postgres_url)
     paths = _prepare_release(
         tmp_path,
         capsys,
@@ -508,16 +664,15 @@ def test_terminology_load_digest_mismatch(tmp_path, monkeypatch, capsys):
     )
     paths["terms"].write_text("term_id\tlabel\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n")
 
-    rc = cli.main(_load_argv(paths))
+    rc = await asyncio.to_thread(cli.main, _load_argv(paths))
 
     assert rc == 1
     assert "sha256 mismatch" in capsys.readouterr().err
 
 
-def test_terminology_load_declared_path_not_bare(tmp_path, monkeypatch, capsys):
-    """Tests the case where the manifest declares a path with a directory in
-    it, which the flat staging directory cannot represent."""
-    monkeypatch.setenv("DATABASE_URL", "postgresql://nobody@127.0.0.1:1/absent")
+def _release_with_declared_terms_path(tmp_path, capsys, declared_path: str) -> dict:
+    """A prepared release whose manifest declares `declared_path` for its terms
+    table, for the cases a declared path is rejected before any load begins."""
     paths = _prepare_release(
         tmp_path,
         capsys,
@@ -526,13 +681,28 @@ def test_terminology_load_declared_path_not_bare(tmp_path, monkeypatch, capsys):
         export_rows=[("UBERON:0001", "mouth", "", "", "")],
     )
     manifest = json.loads(paths["manifest"].read_text())
-    manifest["terms"]["path"] = "nested/terms.tsv"
+    manifest["terms"]["path"] = declared_path
     paths["manifest"].write_text(json.dumps(manifest))
+    return paths
+
+
+@pytest.mark.parametrize(
+    "declared_path",
+    ["nested/terms.tsv", MANIFEST_FILENAME, CLOSURE_TSV_FILENAME],
+    ids=["carries_a_directory", "is_the_manifest", "is_the_other_table"],
+)
+def test_terminology_load_declared_path_refused(tmp_path, monkeypatch, capsys, declared_path):
+    """Tests the case where the manifest declares a terms path the flat staging
+    directory cannot hold: one carrying a directory, one that is the manifest
+    the declared paths were read from, and one already declared for the closure
+    table. Each is refused before any load begins, naming the offending path."""
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    paths = _release_with_declared_terms_path(tmp_path, capsys, declared_path)
 
     rc = cli.main(_load_argv(paths))
 
     assert rc == 1
-    assert "nested/terms.tsv" in capsys.readouterr().err
+    assert declared_path in capsys.readouterr().err
 
 
 @pytest.mark.db
@@ -560,6 +730,7 @@ async def test_terminology_load(tmp_path, monkeypatch, capsys, postgres_url, cre
         "terminology_idx": result["terminology_idx"],
         "terms_inserted": 2,
         "terms_label_updated": 0,
+        "terms_alternate_label_updated": 0,
         "terms_newly_obsoleted": 0,
         "terms_newly_merged": 0,
         "terms_silently_dropped": 0,
@@ -572,7 +743,8 @@ async def test_terminology_load_anomaly(
     tmp_path, monkeypatch, capsys, postgres_url, created_terminologies
 ):
     """Tests the case where a reload drops a term without deprecating it: the
-    load refuses and names the dropped term."""
+    load refuses, names the dropped term, and reports each anomaly kind's count
+    alongside a capped sample rather than every offending value twice."""
     monkeypatch.setenv("DATABASE_URL", postgres_url)
     first = _prepare_release(
         tmp_path / "v1",
@@ -599,7 +771,15 @@ async def test_terminology_load_anomaly(
     rc = await asyncio.to_thread(cli.main, _load_argv(second))
 
     assert rc == 1
-    assert "UBERON:0002" in capsys.readouterr().err
+    # The message is the first line; the payload is the JSON that follows it.
+    message_line, payload_json = capsys.readouterr().err.split("\n", 1)
+    assert "UBERON:0002" in message_line
+    assert json.loads(payload_json) == {
+        "silently_dropped_term_ids": {"count": 1, "sample": ["UBERON:0002"]},
+        "unresolved_replaced_by": {"count": 0, "sample": []},
+        "misaligned_replaced_by": {"count": 0, "sample": []},
+        "unresolved_closure_endpoints": {"count": 0, "sample": []},
+    }
 
 
 @pytest.mark.db
@@ -635,5 +815,42 @@ async def test_terminology_load_tolerate_anomalies(
 
     assert rc == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["terms_silently_dropped"] == 1
-    assert result["terms_newly_obsoleted"] == 1
+    assert result == {
+        "terminology_idx": result["terminology_idx"],
+        "terms_inserted": 0,
+        "terms_label_updated": 0,
+        "terms_alternate_label_updated": 0,
+        "terms_newly_obsoleted": 1,
+        "terms_newly_merged": 0,
+        "terms_silently_dropped": 1,
+        "closure_rows": 0,
+    }
+
+
+def test_terminology_prepare_owl_build_failure(tmp_path, capsys, monkeypatch):
+    """Tests the case where turning the export into term rows fails: it is
+    reported as a failed run rather than escaping as a traceback, so the build
+    step is covered by the same guard as the read that feeds it."""
+    write_robot_export_tsv(tmp_path / "robot-export.tsv", [("UBERON:0001", "mouth", "", "", "")])
+
+    def refuse_build(exported_classes, *, term_id_prefix):
+        raise ValueError("contradictory obsoletion encoding")
+
+    monkeypatch.setattr(terminology_cli, "build_terms", refuse_build)
+
+    rc = cli.main(
+        [
+            "terminology",
+            "prepare-owl",
+            "--export",
+            str(tmp_path / "robot-export.tsv"),
+            "--name",
+            "uberon",
+            "--version",
+            "2026-04-15",
+        ]
+    )
+
+    assert rc == 1
+    assert "contradictory obsoletion encoding" in capsys.readouterr().err
+    assert not (tmp_path / TERMS_TSV_FILENAME).exists()

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from qiita_common.models import TerminologyTermObsoletionKind
 
-from .repositories.terminology import ParsedTerm
+from .repositories.terminology import ParsedTerm, format_offenders
 
 _log = logging.getLogger(__name__)
 
@@ -181,7 +181,7 @@ def _check_taxon_records(
     if unnamed_tax_ids:
         raise ValueError(
             f"{NAMES_DMP_MEMBER} carries no {_NAME_CLASS_SCIENTIFIC!r} for"
-            f" tax_id(s) {unnamed_tax_ids}"
+            f" tax_id(s) {format_offenders(unnamed_tax_ids)}"
         )
 
     # Every pair of id sets is checked before anything raises, so one read of
@@ -199,7 +199,7 @@ def _check_taxon_records(
         for other_member, other_ids in member_id_sets[position + 1 :]:
             overlap = sorted(ids & other_ids)
             if overlap:
-                overlap_reports.append(f"{member} and {other_member}: {overlap}")
+                overlap_reports.append(f"{member} and {other_member}: {format_offenders(overlap)}")
     if overlap_reports:
         raise ValueError(
             "tax_id(s) recorded in more than one member; a taxon is live, merged away,"

@@ -1,6 +1,6 @@
-"""Pytest fixtures for tests that create terminology rows, builders for the
-term records an OWL release is read into, and writers for the two source
-forms those records are read from: a ROBOT export and a taxdump archive."""
+"""Test support for the terminology subsystem: standing up terminology rows,
+building the records a release is read into, and writing the source forms
+those records are read from."""
 
 import csv
 import zipfile

@@ -102,7 +102,7 @@ def test_parse_robot_export_missing_file(tmp_path):
 
 
 def test_parse_robot_export_missing_column(tmp_path):
-    """Tests the case where the export lacks a requested column."""
+    """Tests the case where the export lacks an expected column."""
     export_path = tmp_path / "robot-export.tsv"
     export_path.write_text("ID\tLABEL\nUBERON:0001\tmouth\n")
 

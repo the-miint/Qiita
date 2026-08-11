@@ -74,8 +74,7 @@ METADATA_VALUE_COLUMNS_SELECT = ", ".join(
 # The display payload for a row whose value is a missing-reason or a terminology
 # term (the reason name; the term's term_id, label, and alternate label), and
 # the two LEFT JOINs that supply it. Split because the two halves sit in
-# different clauses of the statement; both are consumed together by every read
-# that decodes values for a caller.
+# different clauses of the statement, and neither is usable without the other.
 METADATA_REF_PAYLOAD_SELECT = (
     "mvr.name AS missing_reason_name,"
     " tt.term_id AS terminology_term_id,"
