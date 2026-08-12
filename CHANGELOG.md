@@ -22,6 +22,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **The feature-table analytic is now shared, and breadth of coverage has a per-sample
+  scope.** The SQL that turns alignment rows into an OGU table moved out of the
+  compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side
+  recipe runs the same analytic rather than a second copy of it — the relation names, the
+  pre-woltka survivor join, and the full-genome-length denominator are all one definition
+  now. Text only; `qiita-common` gains no `duckdb` dependency. On top of that, coverage can
+  be measured **per `(sample, genome)`** instead of pooled over the whole cohort: pooled
+  keeps delegating to miint's `genome_coverage`, while per-sample reproduces that macro's own
+  method with one more `GROUP BY` key, over the same denominator, so one threshold means the
+  same thing either way. The scopes are asymmetric on purpose — pooling unions intervals, so
+  pooled breadth is always at least the best single sample's, and per-sample can only ever
+  remove rows. Behaviour is unchanged for the existing server-side job, which stays pooled.
+
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both
