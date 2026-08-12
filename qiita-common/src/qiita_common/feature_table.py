@@ -41,6 +41,11 @@ the resulting multi-mappers by design.
 The map's source must be keyed `(feature_idx, genome_idx)`; `map_table_sql` does
 the rename to the column names `genome_coverage` requires.
 
+**A caller that PUBLISHES the table stages two more** — the label relations — and
+relabels the counts through them, ending at `LABELLED_TABLE` (`LABELLED_SCHEMA`):
+our `*_idx` keys are gone, and the public handles are VARCHAR, which is what makes
+the result writable as BIOM at all. See the relabel section below.
+
 **The `source` argument of every staging builder is interpolated VERBATIM, and
 that is the caller's obligation to make safe.** A FROM-clause relation cannot be a
 bound parameter, so there is no version of this that binds instead. Pass only a
@@ -653,3 +658,243 @@ def check_gate_diagnostics(
         )
 
     return GateClearance(gate)
+
+
+# ---------------------------------------------------------------------------
+# The relabel to public identifiers
+# ---------------------------------------------------------------------------
+
+# The counts, materialized. Both the populated and the empty path land here, so the
+# relabel below — and every writer after it — reads ONE relation whose name and
+# shape do not depend on whether the cohort had any alignments. Client-side only:
+# the server-side job COPYs `woltka_ogu_select_sql()` straight out to Parquet and
+# relabels nothing, because its output stays inside the system.
+OGU_OUTPUT_TABLE = "ogu_output"
+
+# The two label relations, each `internal key -> public handle`.
+GENOME_LABEL_TABLE = "genome_label"
+SAMPLE_LABEL_TABLE = "sample_label"
+LABELLED_TABLE = "feature_table_labelled"
+
+# What a PUBLISHED table carries, name -> SQL type. Neither id is one of ours:
+# `sample_id` is the minted `export_id` and `feature_id` the genome's `source_id`,
+# both of which mean something to somebody outside this system — an `*_idx` does
+# not, and is not a handle we promise to keep.
+#
+# The VARCHAR types are why the relabel is load-bearing rather than cosmetic: BIOM
+# requires both id columns as VARCHAR while woltka hands back native BIGINTs, so
+# the order is relabel-then-write and there is no writable table before the join.
+LABELLED_SCHEMA = {
+    "sample_id": "VARCHAR",
+    "feature_id": "VARCHAR",
+    "value": "DOUBLE",
+}
+LABELLED_COLUMNS = tuple(LABELLED_SCHEMA)
+
+
+def ogu_output_table_sql(*, populated: bool) -> str:
+    """Materialize the counts into `OGU_OUTPUT_TABLE`.
+
+    `populated` picks the SELECT: the real `woltka_ogu` call, or the 0-row
+    short-circuit for an empty `OGU_INPUT_TABLE` (woltka rejects an all-NULL
+    `sample_id` source, so the caller cannot simply run it on nothing). Passing the
+    flag rather than the SELECT is what puts BOTH results in the same relation, so
+    an empty cohort travels the same relabel and the same writer as a populated one.
+
+    Materialized, unlike the server-side job's straight COPY, because the client
+    reads the counts twice — once to check the labels, once to apply them — and
+    re-running woltka for the second read would double the cost of the analytic.
+    """
+    select = woltka_ogu_select_sql() if populated else empty_ogu_select_sql()
+    return f"CREATE TABLE {OGU_OUTPUT_TABLE} AS {select}"
+
+
+def genome_label_table_sql(source: str) -> str:
+    """`genome_idx -> feature_id` from `source`, the genome map as the route serves
+    it (`(feature_idx, genome_idx, source, source_id)`).
+
+    **DISTINCT is load-bearing.** The map carries one row per (feature, genome)
+    PAIR, so a genome with N contigs appears N times; joining it un-deduplicated
+    multiplies that genome's every count by N. The result is a plausible table, not
+    an error, which is why the collapse happens here rather than being left to
+    whoever stages the map.
+
+    `source` rides along in the map but not in this relation: it exists so a
+    consumer can tell two same-`source_id` genomes apart, and the collision check
+    below is what acts on that — a published table names the genome by `source_id`
+    alone.
+    """
+    return (
+        f"CREATE TABLE {GENOME_LABEL_TABLE} AS "
+        f"SELECT DISTINCT genome_idx, source_id AS feature_id FROM {source}"
+    )
+
+
+def genome_map_relations_sql(source: str) -> tuple[str, ...]:
+    """Both relations the genome map feeds, from ONE source, in creation order: the
+    roll-up key (`MAP_TABLE`) and the public label (`GENOME_LABEL_TABLE`).
+
+    The route serves them in a single response and they must not disagree about which
+    genomes exist — a label set narrower than the roll-up set leaves counts with no
+    public handle, which `check_relabel_diagnostics` then refuses. Staging both here
+    makes them agree by construction instead. The two builders stay separately
+    callable for the server-side job, which rolls up but never relabels.
+    """
+    return (map_table_sql(source), genome_label_table_sql(source))
+
+
+def sample_label_table_sql(source: str) -> str:
+    """`prep_sample_idx -> sample_id` from `source`, the exported-identifier map as
+    the mint route returns it (`(prep_sample_idx, export_id, …)`).
+
+    One row per sample already, so no DISTINCT: a duplicate here would be a mint
+    that answered twice for one sample, which `check_relabel_diagnostics` refuses
+    rather than silently collapsing — the two rows might carry different handles.
+    """
+    return (
+        f"CREATE TABLE {SAMPLE_LABEL_TABLE} AS "
+        f"SELECT prep_sample_idx, export_id AS sample_id FROM {source}"
+    )
+
+
+def _labelled_select_sql() -> str:
+    """The counts with both labels attached — the ONE join definition the
+    diagnostics measure and the relabel writes, so what was checked is what lands.
+
+    LEFT, not INNER: a count whose genome or sample has no label must survive the
+    join as a NULL id for the diagnostics to see and refuse it. An INNER join would
+    drop it instead, shortening the published table by exactly the rows a caller had
+    no way to notice were missing.
+    """
+    return (
+        f"SELECT o.prep_sample_idx, o.genome_idx, s.sample_id, g.feature_id, o.value "
+        f"FROM {OGU_OUTPUT_TABLE} o "
+        f"LEFT JOIN {GENOME_LABEL_TABLE} g ON o.genome_idx = g.genome_idx "
+        f"LEFT JOIN {SAMPLE_LABEL_TABLE} s ON o.prep_sample_idx = s.prep_sample_idx"
+    )
+
+
+@dataclass(frozen=True)
+class LabelClearance:
+    """Evidence that `check_relabel_diagnostics` ran and passed, plus the number of
+    rows it cleared — which is the row count of the table about to be written, so a
+    caller can report the size without counting it again.
+
+    `labelled_table_sql` takes one of these for the same reason
+    `gated_alignment_table_sql` does: every failure the checks catch produces a
+    published table that looks right, so the check cannot be optional.
+    """
+
+    rows: int
+
+
+def relabel_diagnostics_sql() -> str:
+    """One row for `check_relabel_diagnostics`, over the labelled join.
+
+    The unjoined count comes from a scalar subquery because it is the one number the
+    joined relation cannot report: if the join fanned out, its own `count(*)` is
+    already the inflated figure.
+    """
+    return (
+        f"SELECT (SELECT count(*) FROM {OGU_OUTPUT_TABLE}) AS output_rows, "
+        f"count(*) AS labelled_rows, "
+        f"count(*) FILTER (WHERE feature_id IS NULL) AS unlabelled_genome_rows, "
+        f"count(*) FILTER (WHERE sample_id IS NULL) AS unlabelled_sample_rows, "
+        f"count(DISTINCT genome_idx) AS genomes, "
+        f"count(DISTINCT feature_id) AS feature_ids, "
+        f"count(DISTINCT prep_sample_idx) AS samples, "
+        f"count(DISTINCT sample_id) AS sample_ids "
+        f"FROM ({_labelled_select_sql()})"
+    )
+
+
+def check_relabel_diagnostics(
+    *,
+    output_rows: int,
+    labelled_rows: int,
+    unlabelled_genome_rows: int,
+    unlabelled_sample_rows: int,
+    genomes: int,
+    feature_ids: int,
+    samples: int,
+    sample_ids: int,
+) -> LabelClearance:
+    """Refuse every way the relabel can produce a WRONG published table instead of
+    an error, and return the `LabelClearance` `labelled_table_sql` requires. Takes
+    `relabel_diagnostics_sql()`'s row.
+
+    All three faults are silent in the output: an inflated count, a row named by a
+    NULL id, or two organisms merged under one handle. None of them raises anywhere
+    downstream, so this is the only place they can be caught.
+    """
+    if labelled_rows != output_rows:
+        # Phrased for either direction, though only one is reachable through the LEFT
+        # JOIN above: a label relation with two rows for one key inflates, and nothing
+        # drops rows. An INNER JOIN here would make the other direction possible.
+        raise ValueError(
+            f"the label join changed the table's size: {output_rows} counted rows "
+            f"became {labelled_rows}. A label relation holding more than one row for "
+            f"one key repeats every count for that key and inflates its value. "
+            f"`{GENOME_LABEL_TABLE}` is DISTINCT over the genome map's per-contig "
+            f"fan-out, so check the exported-identifier map for a repeated "
+            f"prep_sample, or the genome map for a genome carrying two source_ids."
+        )
+
+    # Both unlabelled checks run BEFORE the collision checks below, which compare
+    # `count(DISTINCT ...)` of an internal key against its label: NULLs are skipped
+    # by that aggregate, so unlabelled rows depress the label count and are
+    # indistinguishable from a collision. Reversing the order would report the wrong
+    # fault for the commoner mistake.
+    if unlabelled_genome_rows:
+        raise ValueError(
+            f"{unlabelled_genome_rows} of {output_rows} rows name a genome with no "
+            f"public handle, so the published table would carry a NULL feature_id. "
+            f"The genome map has to cover every genome the counts mention — the usual "
+            f"cause is a map fetched for a different reference than the alignment was "
+            f"run against."
+        )
+    if unlabelled_sample_rows:
+        raise ValueError(
+            f"{unlabelled_sample_rows} of {output_rows} rows name a sample with no "
+            f"public handle, so the published table would carry a NULL sample_id. The "
+            f"exported-identifier map has to cover the whole cohort the alignment "
+            f"slice was streamed for — mint it for the same prep_sample list."
+        )
+
+    if feature_ids < genomes:
+        raise ValueError(
+            f"{genomes} genomes in this table share only {feature_ids} distinct "
+            f"source_ids, so relabelling merges genomes that are not the same "
+            f"organism. `qiita.genome` is unique on the COMPOSITE (source, "
+            f"source_id), so two sources can each use one source_id — and upstream "
+            f"documents that a BIOM write SUMS duplicate (feature_id, sample_id) "
+            f"pairs, so the merge would never surface. Restrict the reference to one "
+            f"source, or relabel from a handle that is unique across the emitted "
+            f"genomes."
+        )
+    if sample_ids < samples:
+        raise ValueError(
+            f"{samples} samples in this table share only {sample_ids} distinct "
+            f"export_ids, so relabelling merges samples. An export_id is minted per "
+            f"processed sample and cannot repeat, so the exported-identifier map this "
+            f"was staged from did not come from the mint route."
+        )
+
+    return LabelClearance(rows=labelled_rows)
+
+
+def labelled_table_sql(*, clearance: LabelClearance) -> str:
+    """Relabel the counts into `LABELLED_TABLE`: `LABELLED_COLUMNS` and nothing else.
+
+    The projection is the enforcement. Both `*_idx` columns are joined ON and then
+    dropped, so no writer downstream can read one out of this relation even by
+    accident — which is the property that keeps our internal identifiers out of a
+    file somebody publishes.
+
+    **Takes a `LabelClearance`**, so it is unreachable without having run
+    `check_relabel_diagnostics`; see `LabelClearance`.
+    """
+    return (
+        f"CREATE TABLE {LABELLED_TABLE} AS "
+        f"SELECT {', '.join(LABELLED_COLUMNS)} FROM ({_labelled_select_sql()})"
+    )

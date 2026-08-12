@@ -47,6 +47,23 @@ duplicates further down are historical strata; leave them where they are.
   (which `string_agg` would have scored on the surviving mate alone), and an unpaired gate
   applied to paired data. The gate SQL is unreachable without having run those checks.
 
+- **A feature table can be relabelled to public identifiers.** The counts come out keyed by
+  `prep_sample_idx` and `genome_idx`, which mean nothing outside this system; the relabel
+  joins the genome map and the exported-identifier mint to name them by the genome's
+  `source_id` and the sample's minted `export_id` instead, and the relabelled relation carries
+  those two columns and the value — not the identifiers it joined on. That also makes the
+  table writable as BIOM at all, which requires both id columns as text. Four ways the
+  relabel could have published a wrong table are refused with an actionable message: a label
+  relation that repeats a key (which would inflate every count for it), a count whose genome
+  or sample has no handle (a NULL id in a published file), and two genomes or two samples
+  sharing one handle (which a BIOM write would silently sum into one row). The
+  `source_id`-collision refusal is scoped to the genomes a table actually emits, so a
+  collision elsewhere in the reference does not fail a build whose output is correct. An empty
+  cohort travels the same relabel as a populated one, so it cannot yield a differently-shaped
+  file. On the client side, the two maps are fetched, staged into DuckDB with explicit native
+  types, and released once copied; the genome map's roll-up key and public label are staged
+  from the one response so they cannot disagree about which genomes exist.
+
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both

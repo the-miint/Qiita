@@ -118,28 +118,37 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
         conn.execute(ft.genome_lengths_table_sql("_len_src"))
 
 
+def _ogu_input(conn, scope, threshold, *, alignment, mapping, lengths, gate) -> bool:
+    """Stage the inputs and build woltka's input for `scope` at `threshold`, in a
+    consumer's call order. Returns whether the input has any rows — the caller's cue
+    to run woltka or short-circuit, which is a decision both consumers make."""
+    _stage(
+        conn,
+        alignment=_ALIGNMENT if alignment is None else alignment,
+        mapping=_MAP if mapping is None else mapping,
+        lengths=_LENGTHS if lengths is None else lengths,
+        threshold=threshold,
+        gate=gate,
+    )
+    survivor_scope = scope if ft.coverage_filter_applies(threshold) else None
+    if survivor_scope is not None:
+        conn.execute(ft.coverage_alignments_view_sql())
+        conn.execute(ft.survivor_table_sql(survivor_scope), [threshold])
+    conn.execute(ft.ogu_input_table_sql(survivor_scope=survivor_scope))
+    return conn.execute(f"SELECT count(*) FROM {ft.OGU_INPUT_TABLE}").fetchone()[0] > 0
+
+
 def _table(
     scope, threshold, *, alignment=None, mapping=None, lengths=None, gate=None
 ) -> list[tuple]:
     """Run the whole analytic for `scope` at `threshold` and return the feature
-    table, sorted. Mirrors a consumer's call order precisely."""
+    table, sorted — keyed by our own identifiers, as the server-side consumer leaves
+    it."""
     with connect_with_miint_staged() as conn:
-        _stage(
-            conn,
-            alignment=_ALIGNMENT if alignment is None else alignment,
-            mapping=_MAP if mapping is None else mapping,
-            lengths=_LENGTHS if lengths is None else lengths,
-            threshold=threshold,
-            gate=gate,
+        populated = _ogu_input(
+            conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
-        survivor_scope = scope if ft.coverage_filter_applies(threshold) else None
-        if survivor_scope is not None:
-            conn.execute(ft.coverage_alignments_view_sql())
-            conn.execute(ft.survivor_table_sql(survivor_scope), [threshold])
-        conn.execute(ft.ogu_input_table_sql(survivor_scope=survivor_scope))
-
-        empty = conn.execute(f"SELECT count(*) FROM {ft.OGU_INPUT_TABLE}").fetchone()[0] == 0
-        select = ft.empty_ogu_select_sql() if empty else ft.woltka_ogu_select_sql()
+        select = ft.woltka_ogu_select_sql() if populated else ft.empty_ogu_select_sql()
         return conn.execute(f"SELECT * FROM ({select}) ORDER BY 1, 2").fetchall()
 
 
@@ -579,3 +588,224 @@ def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
         gate=ft.AlignmentGate(min_identity=0.5, min_query_coverage=0.95, paired=True),
     )
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# The relabel to public identifiers, against real miint
+#
+# The genome map as the route serves it: one row per (feature, genome) PAIR with the
+# genome's provenance, so G400's two contigs make it appear twice — which is what
+# `genome_label_table_sql`'s DISTINCT is for.
+# ---------------------------------------------------------------------------
+
+_SOURCE = "refseq"
+_SOURCE_IDS = {
+    100: "GCF_000000100",
+    200: "GCF_000000200",
+    300: "GCF_000000300",
+    400: "GCF_000000400",
+}
+# The mint's answer for the two samples the alignment fixture uses.
+_HANDLES = [(1, "QM1"), (2, "QM2")]
+
+
+def _genome_map(mapping, source_ids=None) -> list[tuple]:
+    """`mapping` widened with each genome's provenance, as the genome-map route
+    returns it. A genome absent from `source_ids` is dropped, which is how a test
+    stages a map that does not cover every genome the counts mention."""
+    ids = _SOURCE_IDS if source_ids is None else source_ids
+    return [(f, g, _SOURCE, ids[g]) for f, g in mapping if g in ids]
+
+
+def _stage_labels(conn, *, genome_map, handles) -> None:
+    """Stage both label relations from the two responses a client holds."""
+    conn.execute(
+        "CREATE TABLE _genome_map_src AS "
+        + _values(
+            genome_map,
+            "feature_idx, genome_idx, source, source_id",
+            "?::BIGINT, ?::BIGINT, ?::VARCHAR, ?::VARCHAR",
+        ),
+        [x for r in genome_map for x in r],
+    )
+    conn.execute(
+        "CREATE TABLE _mint_src AS "
+        + _values(handles, "prep_sample_idx, export_id", "?::BIGINT, ?::VARCHAR"),
+        [x for r in handles for x in r],
+    )
+    conn.execute(ft.genome_label_table_sql("_genome_map_src"))
+    conn.execute(ft.sample_label_table_sql("_mint_src"))
+
+
+def _relabel(conn) -> ft.LabelClearance:
+    """Drive the relabel protocol: diagnose, check, then write the public table.
+
+    The diagnostics row is passed BY NAME — the query's column names are the check's
+    parameter names, so a rename on either side fails loudly instead of silently
+    shifting one count into another's argument.
+    """
+    cursor = conn.execute(ft.relabel_diagnostics_sql())
+    names = [d[0] for d in cursor.description]
+    row = dict(zip(names, cursor.fetchone(), strict=True))
+    clearance = ft.check_relabel_diagnostics(**row)
+    conn.execute(ft.labelled_table_sql(clearance=clearance))
+    return clearance
+
+
+def _public_table(
+    scope,
+    threshold,
+    *,
+    alignment=None,
+    mapping=None,
+    lengths=None,
+    gate=None,
+    genome_map=None,
+    handles=None,
+) -> list[tuple]:
+    """Run the analytic AND the relabel, returning the PUBLIC table, sorted. Mirrors
+    the client-side consumer's call order precisely."""
+    with connect_with_miint_staged() as conn:
+        populated = _ogu_input(
+            conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
+        )
+        conn.execute(ft.ogu_output_table_sql(populated=populated))
+        _stage_labels(
+            conn,
+            genome_map=_genome_map(_MAP if mapping is None else mapping)
+            if genome_map is None
+            else genome_map,
+            handles=_HANDLES if handles is None else handles,
+        )
+        _relabel(conn)
+        return conn.execute(f"SELECT * FROM {ft.LABELLED_TABLE} ORDER BY 1, 2").fetchall()
+
+
+def test_the_public_table_carries_handles_instead_of_our_identifiers():
+    """Every row the analytic emits pooled at 1% (G300 alone fails the threshold),
+    named the way a published artifact must name them."""
+    assert _public_table(ft.CoverageScope.POOLED, 0.01) == [
+        ("QM1", "GCF_000000100", 1.0),
+        ("QM1", "GCF_000000200", 1.0),
+        ("QM1", "GCF_000000400", 2.0),
+        ("QM2", "GCF_000000200", 1.0),
+    ]
+
+
+def test_no_internal_identifier_survives_into_the_public_table():
+    """Asserted on the relation's own schema, not on the SQL: this is the property
+    that keeps `prep_sample_idx` and `genome_idx` out of a file somebody publishes,
+    and the writers downstream inherit it from this table alone.
+    """
+    with connect_with_miint_staged() as conn:
+        populated = _ogu_input(
+            conn,
+            ft.CoverageScope.POOLED,
+            0.01,
+            alignment=None,
+            mapping=None,
+            lengths=None,
+            gate=None,
+        )
+        conn.execute(ft.ogu_output_table_sql(populated=populated))
+        _stage_labels(conn, genome_map=_genome_map(_MAP), handles=_HANDLES)
+        _relabel(conn)
+        described = conn.execute(f"DESCRIBE {ft.LABELLED_TABLE}").fetchall()
+
+    assert [(r[0], r[1]) for r in described] == list(ft.LABELLED_SCHEMA.items())
+    assert not [name for name, *_ in described if "idx" in name]
+
+
+def test_a_multi_contig_genome_is_not_multiplied_by_the_relabel():
+    """G400's map rows are one per contig, so an un-DISTINCTed label join would repeat
+    its counts once per contig. Its value is 2.0 from two reads — the failure mode is
+    two rows of 2.0, or a 4.0, both of which read as a real number.
+    """
+    rows = _public_table(ft.CoverageScope.POOLED, 0.2)
+    assert rows == [
+        ("QM1", "GCF_000000100", 1.0),
+        ("QM1", "GCF_000000400", 2.0),
+    ]
+
+
+def test_an_emitted_source_id_collision_is_refused():
+    """Two genomes sharing a `source_id` relabel to one row of the published table,
+    and a BIOM write SUMS the pair without comment. `qiita.genome` is unique on the
+    COMPOSITE `(source, source_id)`, so this is a state the database permits.
+    """
+    colliding = dict(_SOURCE_IDS) | {400: _SOURCE_IDS[100]}
+    with pytest.raises(ValueError, match="source_id"):
+        _public_table(
+            ft.CoverageScope.POOLED, 0.2, genome_map=_genome_map(_MAP, source_ids=colliding)
+        )
+
+
+def test_a_collision_between_genomes_the_threshold_DROPPED_is_not_refused():
+    """The assertion is over the genomes this table actually emits, not over the whole
+    reference. G300 fails the 1% threshold, so its `source_id` colliding with G100's
+    cannot merge anything — refusing it would fail a build whose output is correct.
+    """
+    colliding = dict(_SOURCE_IDS) | {300: _SOURCE_IDS[100]}
+    assert _public_table(
+        ft.CoverageScope.POOLED, 0.01, genome_map=_genome_map(_MAP, source_ids=colliding)
+    ) == [
+        ("QM1", "GCF_000000100", 1.0),
+        ("QM1", "GCF_000000200", 1.0),
+        ("QM1", "GCF_000000400", 2.0),
+        ("QM2", "GCF_000000200", 1.0),
+    ]
+
+
+def test_a_genome_with_no_public_handle_is_refused():
+    """Staged deliberately from a map that omits G400 — which
+    `genome_map_relations_sql` exists to prevent, since the roll-up key and the label
+    then come from one response. This pins the backstop: the alternative is a
+    published row whose feature_id is NULL.
+    """
+    partial = {k: v for k, v in _SOURCE_IDS.items() if k != 400}
+    with pytest.raises(ValueError, match="genome"):
+        _public_table(
+            ft.CoverageScope.POOLED, 0.2, genome_map=_genome_map(_MAP, source_ids=partial)
+        )
+
+
+def test_a_sample_with_no_public_handle_is_refused():
+    """The reachable half of the pair: the mint is a separate route taking its own
+    cohort, so a caller can mint for fewer samples than they streamed."""
+    with pytest.raises(ValueError, match="sample"):
+        _public_table(ft.CoverageScope.POOLED, 0.01, handles=[(1, "QM1")])
+
+
+def test_a_repeated_handle_is_refused_rather_than_inflating_a_count():
+    """Two rows for one sample multiply that sample's every count. The mint cannot
+    answer twice for a sample, so this catches a map that did not come from it.
+    """
+    with pytest.raises(ValueError, match="changed the table's size"):
+        _public_table(ft.CoverageScope.POOLED, 0.01, handles=[(1, "QM1"), (1, "QM1"), (2, "QM2")])
+
+
+def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
+    """Nothing survives a 100% threshold, so the counts come from the 0-row
+    short-circuit — and must still land in the public table with the same schema a
+    populated cohort produces. This is the path a caller exercises least.
+    """
+    with connect_with_miint_staged() as conn:
+        populated = _ogu_input(
+            conn,
+            ft.CoverageScope.POOLED,
+            1.0,
+            alignment=None,
+            mapping=None,
+            lengths=None,
+            gate=None,
+        )
+        assert not populated
+        conn.execute(ft.ogu_output_table_sql(populated=populated))
+        _stage_labels(conn, genome_map=_genome_map(_MAP), handles=_HANDLES)
+        clearance = _relabel(conn)
+        described = [(r[0], r[1]) for r in conn.execute(f"DESCRIBE {ft.LABELLED_TABLE}").fetchall()]
+        rows = conn.execute(f"SELECT count(*) FROM {ft.LABELLED_TABLE}").fetchone()[0]
+
+    assert clearance.rows == 0
+    assert rows == 0
+    assert described == list(ft.LABELLED_SCHEMA.items())
