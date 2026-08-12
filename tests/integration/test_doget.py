@@ -5,6 +5,7 @@ pre-built binary and lets it own schema creation. Test rows are seeded via
 a short-lived DuckDB connection after the data plane is live.
 """
 
+import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
@@ -89,3 +90,56 @@ def test_doget_empty_result(data_plane, flight_client):
     )
     reader = flight_client.do_get(flight.Ticket(ticket_bytes))
     assert reader.read_all().num_rows == 0
+
+
+def test_doget_zstd_compression_round_trips_through_pyarrow(data_plane, flight_client):
+    """The whole chain, with the consumer every caller actually uses: a real
+    pyarrow client asks for compression via gRPC metadata, the data plane
+    zstd-compresses the IPC bodies, and pyarrow decodes them transparently.
+
+    The Rust tests prove the server stamps the codec; only this proves the
+    client can read what it produced. Compressed and uncompressed must return
+    identical data — compression is a transport concern and must never be
+    observable in the result.
+    """
+    from qiita_common.flight_constants import (
+        IPC_COMPRESSION_HEADER,
+        IPC_COMPRESSION_ZSTD,
+    )
+
+    ticket_bytes = _sign_ticket(
+        "reference_sequences",
+        {"feature_idx": SEED_FEATURE_IDXS},
+        data_plane["secret"],
+    )
+    plain = flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
+    compressed = flight_client.do_get(
+        flight.Ticket(ticket_bytes),
+        flight.FlightCallOptions(
+            headers=[(IPC_COMPRESSION_HEADER.encode(), IPC_COMPRESSION_ZSTD.encode())]
+        ),
+    ).read_all()
+
+    assert compressed.equals(plain), "compression changed the data the client sees"
+    assert sorted(compressed.column("feature_idx").to_pylist()) == SEED_FEATURE_IDXS
+
+
+def test_doget_unsupported_codec_is_rejected(data_plane, flight_client):
+    """A codec the server will not apply is an error, not a silent fall back to
+    uncompressed — a client that asked for compression, did not get it, and was
+    not told would draw the wrong conclusion about its own transfer."""
+    from qiita_common.flight_constants import IPC_COMPRESSION_HEADER
+
+    ticket_bytes = _sign_ticket(
+        "reference_sequences",
+        {"feature_idx": SEED_FEATURE_IDXS},
+        data_plane["secret"],
+    )
+    # InvalidArgument surfaces as ArrowInvalid, not FlightError. The assertion is
+    # on the message because that is the part a client acts on: it must name the
+    # rejected value and the accepted ones.
+    with pytest.raises(pa.ArrowInvalid, match=r'unsupported .*"lz4".*"zstd".*"none"'):
+        flight_client.do_get(
+            flight.Ticket(ticket_bytes),
+            flight.FlightCallOptions(headers=[(IPC_COMPRESSION_HEADER.encode(), b"lz4")]),
+        ).read_all()

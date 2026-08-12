@@ -19,6 +19,7 @@ from qiita_common.api_paths import (
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
 )
+from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.parquet import ROW_GROUP_SIZE_BYTES
 
 from qiita_control_plane.miint import connect_with_miint
@@ -350,12 +351,18 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # small offset/validity/fixed-width buffers, leaving the bulk sequence/quality
     # byte buffers zero-copy). The parquet path streams straight to a ParquetWriter
     # (no Acero), so it needs no realignment and keeps those bulk buffers zero-copy.
-    read_opts = (
-        flight.FlightCallOptions(
-            read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
-        )
-        if args.format == "fastq"
-        else None
+    #
+    # Built unconditionally so the two independent knobs — realignment (fastq
+    # only) and compression (`--compress`) — cannot drop each other. The earlier
+    # form returned `None` for parquet, which left no place to put a header.
+    # Empty headers plus `read_options=None` is equivalent to passing no options.
+    read_opts = flight.FlightCallOptions(
+        headers=ipc_compression_headers(args.compress),
+        read_options=(
+            ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
+            if args.format == "fastq"
+            else None
+        ),
     )
     # The fastq writer needs a miint DuckDB connection; open it once and reuse it
     # across all samples (each sample re-registers the `masked` view) rather than

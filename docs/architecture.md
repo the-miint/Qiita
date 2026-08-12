@@ -536,6 +536,46 @@ Client interfaces are the user-facing layer through which researchers and system
 - **DoPut**: upload data (stream RecordBatches to shared filesystem via FlightDescriptor, authorized by signed action token)
 - **DoAction**: register file (`ducklake_add_data_files`), delete by key, insert-from-processing-method (authorized by signed action token)
 
+### DoGet stream compression
+
+A DoGet client may ask for a zstd-compressed Arrow IPC body by sending the
+`qiita-ipc-compression: zstd` gRPC metadata header. **The default is
+uncompressed**, and an unrecognised value is rejected rather than ignored —
+a client that asked for compression and silently did not get it would draw the
+wrong conclusion about its own transfer. `zstd` is the only codec offered; LZ4
+measured at roughly half its ratio on every production shape.
+
+**Off by default is deliberate, and the reason is not obvious: compression makes
+a DoGet *slower* over a fast link.** Break-even is
+`bandwidth = encode_rate × (1 − 1/ratio)`, which measurement puts at ~4 Gbit/s —
+a 775 MiB alignment stream takes 0.65 s uncompressed over 10 GbE against 1.53 s
+with zstd, but 6.5 s against 2.9 s over 1 GbE. Every in-repo caller sits above
+that line (the control-plane runner reaches the data plane over loopback,
+compute jobs over the cluster fabric), so none of them sends the header. It is
+for clients on slow links, and `qiita-admin masked-read-export` exposes it as
+`--compress` because that is the DoGet whose payload is largest. It is not the
+only off-site DoGet — `qiita reference genome-export` (`cli/user/reference.py`)
+is a user-facing client and streams too; it does not opt in yet, and the flag is
+the pattern to copy when it should.
+
+The server cannot choose this itself: the deciding input is the *client's*
+bandwidth, and behind nginx the data plane cannot even see the client's address.
+
+**gRPC's own `grpc-accept-encoding` negotiation is not an alternative, and the
+reason is the client, not the protocol.** tonic can compress a whole gRPC
+message (`CompressionEncoding::Zstd`, behind its `zstd` feature), which would
+cover `data_body` — so on its face it is a candidate. What rules it out is that
+our client cannot ask for it: capturing the HTTP/2 HEADERS frame a pyarrow Flight
+client sends on a DoGet gives `grpc-accept-encoding: identity, deflate, gzip`
+from `grpc-c++/1.71.0 grpc-c/46.0.0`, with no zstd, so a server offering zstd at
+the transport layer would negotiate down to nothing every time. (Separately, the
+IPC codec is stamped per record-batch message by the writer, which is why the
+custom header lives at that layer rather than the transport's.)
+
+Header name constants: `IPC_COMPRESSION_HEADER` in
+`qiita-data-plane/src/flight_service.rs` and its twin in
+`qiita-common/src/qiita_common/flight_constants.py`.
+
 ## Auth & Data Access Flow
 
 See [`docs/auth.md`](auth.md) for the principal model, login flow, scopes, endpoints, and runbooks.
