@@ -7,7 +7,7 @@ feature table via duckdb-miint `woltka_ogu`, filtered to genomes meeting a
 breadth-of-coverage threshold POOLED over the whole cohort.
 
 **The analytic itself — its SQL, its relation names, and every rule that makes it
-correct — is `qiita_common.ogu_table`**, shared with the client-side feature-table
+correct — is `qiita_common.feature_table`**, shared with the client-side feature-table
 recipe so the two cannot disagree about it. This module is the server-side half:
 where the three inputs come from, and where the result goes.
 
@@ -32,12 +32,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
-from qiita_common import ogu_table
+from qiita_common import feature_table
 
 # The projection this job asks the data plane for. Owned by the shared analytic,
 # alongside the SQL that binds it, so the requested columns and the bound SELECT
 # stay one list.
-from qiita_common.ogu_table import ALIGNMENT_COLUMNS as _ALIGNMENT_COLUMNS
+from qiita_common.feature_table import ALIGNMENT_COLUMNS as _ALIGNMENT_COLUMNS
 from qiita_common.parquet import validate_parquet_path
 
 from ..data_plane_client import open_alignment_stream, open_reference_sequences_stream
@@ -96,7 +96,7 @@ def _write_ogu_table(
     coverage_threshold: float,
     out_path: Path,
 ) -> None:
-    """Run `qiita_common.ogu_table`'s analytic over the already-staged working tables
+    """Run `qiita_common.feature_table`'s analytic over the already-staged working tables
     and COPY the result to `out_path` as Parquet (v2 + zstd). That module documents
     every rule the SQL encodes; what this function decides is the one thing a caller
     must: **an empty `ogu_input` short-circuits** to a valid 0-row Parquet, because
@@ -105,14 +105,22 @@ def _write_ogu_table(
     """
     out_sql = validate_parquet_path(out_path)
 
-    filtered = ogu_table.coverage_filter_applies(coverage_threshold)
-    if filtered:
-        conn.execute(ogu_table.coverage_alignments_view_sql())
-        conn.execute(ogu_table.pooled_survivor_table_sql(), [coverage_threshold])
-    conn.execute(ogu_table.ogu_input_table_sql(filter_to_survivors=filtered))
+    # This job is pooled-only: breadth over the whole cohort is what its workflow
+    # `params:` describe, and the per-sample scope is the client-side recipe's.
+    scope = (
+        feature_table.CoverageScope.POOLED
+        if feature_table.coverage_filter_applies(coverage_threshold)
+        else None
+    )
+    if scope is not None:
+        conn.execute(feature_table.coverage_alignments_view_sql())
+        conn.execute(feature_table.survivor_table_sql(scope), [coverage_threshold])
+    conn.execute(feature_table.ogu_input_table_sql(survivor_scope=scope))
 
-    empty = conn.execute(f"SELECT count(*) FROM {ogu_table.OGU_INPUT_TABLE}").fetchone()[0] == 0
-    select_sql = ogu_table.empty_ogu_select_sql() if empty else ogu_table.woltka_ogu_select_sql()
+    n_rows = conn.execute(f"SELECT count(*) FROM {feature_table.OGU_INPUT_TABLE}").fetchone()[0]
+    select_sql = (
+        feature_table.woltka_ogu_select_sql() if n_rows else feature_table.empty_ogu_select_sql()
+    )
     conn.execute(f"COPY ({select_sql}) TO '{out_sql}' ({PARQUET_OPTS})")
 
 
@@ -133,22 +141,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # The feature -> genome map: the one Postgres-only input, read from the
             # resolver-staged Parquet. Inner-consistent BIGINT ids (int64 Parquet).
             map_sql = validate_parquet_path(inputs.genome_map_path)
-            conn.execute(ogu_table.map_table_sql(f"read_parquet('{map_sql}')"))
+            conn.execute(feature_table.map_table_sql(f"read_parquet('{map_sql}')"))
 
             # The lengths feed ONLY the coverage calc, so when that is skipped the
             # stream is skipped too — the point is to avoid the coverage calculation
             # entirely, not just its filter. Same predicate `_write_ogu_table` uses.
-            if ogu_table.coverage_filter_applies(inputs.coverage_threshold):
+            if feature_table.coverage_filter_applies(inputs.coverage_threshold):
                 async with open_reference_sequences_stream(
                     conn, reference_idx=inputs.reference_idx
                 ) as lengths_rel:
-                    conn.execute(ogu_table.genome_lengths_table_sql(lengths_rel))
+                    conn.execute(feature_table.genome_lengths_table_sql(lengths_rel))
 
             # The alignment slice, all cohort samples pooled.
             async with open_alignment_stream(
                 conn, work_ticket_idx=inputs.work_ticket_idx, columns=_ALIGNMENT_COLUMNS
             ) as alignment_rel:
-                conn.execute(ogu_table.alignment_table_sql(alignment_rel))
+                conn.execute(feature_table.alignment_table_sql(alignment_rel))
 
             _write_ogu_table(conn, coverage_threshold=inputs.coverage_threshold, out_path=out_path)
         success = True

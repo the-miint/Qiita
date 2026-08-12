@@ -1,4 +1,4 @@
-"""The OGU feature-table analytic, as SQL text.
+"""The feature-table analytic, as SQL text.
 
 Two consumers run this same analytic and must not disagree about it: the
 compute-orchestrator native job `estimate_feature_table` (server-side, reached
@@ -7,6 +7,17 @@ composing the analytic-export routes). They differ in everything *around* the
 analytic — where the three inputs come from, how the result is written — and in
 nothing about the analytic itself, so the SQL lives here and the streaming and I/O
 stay with each caller.
+
+Today the one table flavour is **OGU** (genome-keyed counts via miint's
+`woltka_ogu`); names carrying `ogu` denote that computation specifically, and the
+module is named for the general surface because taxonomy- and tree-derived tables
+join it later.
+
+**Breadth of coverage filters the table, at one of two scopes** (`CoverageScope`):
+pooled over the whole cohort, or per `(sample, genome)`. Pooled breadth is always
+≥ the best single sample's, since pooling unions intervals — so per-sample is
+strictly the stricter filter, and a genome can survive pooled while every one of
+its samples fails.
 
 **Plain SQL text; no duckdb import.** `qiita-common` has no duckdb dependency and
 must not gain one — it is the contract layer both Python services import. Callers
@@ -63,6 +74,27 @@ three arguments are UNQUOTED relation names resolved on the caller's connection;
 """
 
 from __future__ import annotations
+
+from enum import StrEnum
+
+
+class CoverageScope(StrEnum):
+    """The dimension breadth of coverage is measured over.
+
+    A plain `StrEnum` with no Postgres twin, deliberately: this is a per-request
+    analytic parameter chosen by the caller, never stored, so there is no column
+    for a database enum to guard. The values are the CLI's spelling.
+
+    * `POOLED` — one breadth per genome, over every sample in the cohort. A genome
+      that clears the threshold keeps its rows for **all** samples.
+    * `PER_SAMPLE` — one breadth per `(sample, genome)`. Strictly stricter: since
+      pooling unions intervals, pooled breadth ≥ any single sample's, so this can
+      only ever remove rows relative to `POOLED`, never add them.
+    """
+
+    POOLED = "pooled"
+    PER_SAMPLE = "per-sample"
+
 
 # The alignment columns the analytic binds — and, because they ride the DoGet
 # ticket, the only ones the data plane will stream. One list, used for both the
@@ -167,45 +199,99 @@ def genome_lengths_table_sql(source: str) -> str:
 
 
 def coverage_alignments_view_sql() -> str:
-    """The `alignments` argument for `genome_coverage`: the cohort's aligned
-    intervals, pooled across every sample — breadth is a cohort property.
+    """The aligned intervals both coverage scopes measure, as the `alignments`
+    argument `genome_coverage` takes.
 
-    NULL coordinates are excluded: they cannot contribute an interval and would
-    poison the merge. A VIEW, not a table — only the macro reads it, on this same
-    connection, so materializing it would duplicate the alignment slice in RAM.
+    Carries `prep_sample_idx` even though the macro names only
+    `(reference, position, stop_position)`: the macro reads
+    `query_table(alignments)` and projects the three columns by name, so the extra
+    one is tolerated (probed against the mirror build) and per-sample can group by
+    it. One view therefore serves both scopes instead of two near-identical ones.
+
+    NULL coordinates are excluded. `compress_intervals` — which both scopes reach,
+    the pooled one inside the macro — drops such rows silently rather than
+    erroring, so filtering here is what makes the exclusion visible to a reader
+    rather than implicit in an aggregate's behaviour.
+
+    A VIEW, not a table: only this connection reads it, so materializing would
+    duplicate the alignment slice in RAM.
     """
     return (
         f"CREATE VIEW {COVERAGE_ALIGNMENTS_VIEW} AS "
-        f"SELECT feature_idx AS reference, position, stop_position "
+        f"SELECT prep_sample_idx, feature_idx AS reference, position, stop_position "
         f"FROM {ALIGNMENT_TABLE} "
         f"WHERE position IS NOT NULL AND stop_position IS NOT NULL"
     )
 
 
-def pooled_survivor_table_sql() -> str:
-    """Genomes whose breadth of coverage, POOLED over the whole cohort, meets the
-    threshold. Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`.
+def survivor_table_sql(scope: CoverageScope) -> str:
+    """The survivor set for `scope`: what clears the breadth-of-coverage threshold.
+    Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`. The threshold is
+    a bound parameter — execute with `[coverage_threshold]`.
 
-    The threshold is a bound parameter — execute with `[coverage_threshold]`.
+    **The two scopes give `SURVIVOR_TABLE` different shapes** — `(genome_id)` for
+    pooled, `(prep_sample_idx, genome_id)` for per-sample — so the scope that built
+    it must be the scope handed to `ogu_input_table_sql`. Pass one value to both.
+
+    `POOLED` delegates to the `genome_coverage` macro. `PER_SAMPLE` cannot: the
+    macro has no sample key. It instead reproduces the macro's own method with one
+    more `GROUP BY` key — `compress_intervals` per contig, summed to the genome,
+    over the same full-length denominator and the same `CAST(... AS DOUBLE)`
+    division, so a single threshold means the same thing under either scope. This
+    is what upstream means by the per-sample dimension being "already expressible
+    today" (duckdb-miint#217); when `genome_coverage_per_sample` lands (#220) this
+    branch collapses to one call.
+
+    The per-contig merge before the genome roll-up is not incidental:
+    `compress_intervals` merges within one coordinate space, so grouping straight
+    to the genome would merge intervals from DIFFERENT contigs as though they
+    shared coordinates and understate every multi-contig genome.
     """
+    if scope is CoverageScope.POOLED:
+        return (
+            f"CREATE TABLE {SURVIVOR_TABLE} AS SELECT genome_id "
+            f"FROM genome_coverage("
+            f"{COVERAGE_ALIGNMENTS_VIEW}, {GENOME_LENGTHS_TABLE}, {MAP_TABLE}) "
+            f"WHERE proportion_covered >= ?"
+        )
     return (
-        f"CREATE TABLE {SURVIVOR_TABLE} AS SELECT genome_id "
-        f"FROM genome_coverage({COVERAGE_ALIGNMENTS_VIEW}, {GENOME_LENGTHS_TABLE}, {MAP_TABLE}) "
-        f"WHERE proportion_covered >= ?"
+        f"CREATE TABLE {SURVIVOR_TABLE} AS "
+        f"WITH per_contig AS ("
+        f"SELECT prep_sample_idx, reference, "
+        f"UNNEST(compress_intervals(position, stop_position)) AS ci "
+        f"FROM {COVERAGE_ALIGNMENTS_VIEW} GROUP BY prep_sample_idx, reference"
+        f"), per_contig_genome AS ("
+        f"SELECT p.prep_sample_idx, m.genome_id, "
+        f"SUM(p.ci.stop - p.ci.start) AS covered_internal "
+        f"FROM per_contig p JOIN {MAP_TABLE} m ON p.reference = m.contig_id "
+        f"GROUP BY p.prep_sample_idx, m.genome_id, p.reference"
+        f"), covered AS ("
+        f"SELECT prep_sample_idx, genome_id, SUM(covered_internal) AS covered "
+        f"FROM per_contig_genome GROUP BY prep_sample_idx, genome_id"
+        f") SELECT c.prep_sample_idx, c.genome_id FROM covered c "
+        f"JOIN {GENOME_LENGTHS_TABLE} l USING (genome_id) "
+        f"WHERE CAST(c.covered AS DOUBLE) / l.total_length >= ?"
     )
 
 
-def ogu_input_table_sql(*, filter_to_survivors: bool) -> str:
+def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
     """woltka's input: the alignment pre-mapped to genome level, so woltka counts
     at genome granularity. The map's INNER JOIN also drops alignments to features
     with no genome (a 16S record is not an OGU).
 
-    When a threshold applies, `filter_to_survivors=True` joins the survivor set
-    **here, before woltka**. That ordering is load-bearing: `woltka_ogu` splits a
-    multi-mapped read across its number of distinct `reference` values, so a read
-    hitting a surviving and a dropped genome must lose the dropped one first to
-    renormalize to 1.0 on the survivor. Filtering woltka's OUTPUT instead strands
-    it at 0.5 — a plausible number rather than an error.
+    `survivor_scope` is the scope whose survivor set to join, or **`None` when no
+    threshold applies** — at 0 every genome with any alignment qualifies, so there
+    is no set to build or join. It must be the same scope
+    `survivor_table_sql` was called with, since the two scopes shape
+    `SURVIVOR_TABLE` differently: pooled joins on the genome alone, per-sample on
+    `(sample, genome)`, which is the entire behavioural difference between them.
+
+    The survivor join happens **here, before woltka**, and that ordering is
+    load-bearing: `woltka_ogu` splits a multi-mapped read across its number of
+    distinct `reference` values, so a read hitting a surviving and a dropped genome
+    must lose the dropped one first to renormalize to 1.0 on the survivor.
+    Filtering woltka's OUTPUT instead strands it at 0.5 — a plausible number rather
+    than an error.
 
     A real non-temp TABLE: woltka resolves it on a separate connection.
     """
@@ -215,8 +301,10 @@ def ogu_input_table_sql(*, filter_to_survivors: bool) -> str:
         f"FROM {ALIGNMENT_TABLE} a "
         f"JOIN {MAP_TABLE} m ON a.feature_idx = m.contig_id"
     )
-    if filter_to_survivors:
+    if survivor_scope is not None:
         sql += f" JOIN {SURVIVOR_TABLE} s ON m.genome_id = s.genome_id"
+        if survivor_scope is CoverageScope.PER_SAMPLE:
+            sql += " AND a.prep_sample_idx = s.prep_sample_idx"
     return sql
 
 
