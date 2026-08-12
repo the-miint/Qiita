@@ -73,6 +73,12 @@ PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
 # genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
 # is per-reference. Param path, distinct 4-segment shape (no literal shadow).
 PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
+# The whole reference's feature_idx → genome lookup, the inverse direction of
+# GENOME_MEMBER: one entry per (feature, genome) pair with the genome's
+# provenance. Named `genome-map` rather than `/genome` because it is not a
+# listing of genomes — it is the join table a client rolls alignment rows up
+# through. Param path, 2 segments, no literal shadow.
+PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -84,6 +90,7 @@ URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
 URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
 URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
+URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
 
 # =============================================================================
 # /host-filter-profile/*
@@ -803,6 +810,21 @@ PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
 # Create a study-local prep_sample field definition (POST). The study-scoped
 # mint hangs off the /study router (the caller is authorized on the study).
 PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
+
+# =============================================================================
+# /exported-identifier — the public handle a published table carries per sample
+# =============================================================================
+# POST, and not only because it writes: the cohort has to ride the body, like
+# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
+# a study's worth of samples and routinely spans pools, neither of which a query
+# string can carry.
+
+PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
+PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_IDENTIFIER_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_IDENTIFIER_PREFIX}"
+URL_EXPORTED_IDENTIFIER = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
+
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"

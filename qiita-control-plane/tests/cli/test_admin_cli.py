@@ -1849,3 +1849,27 @@ def test_fanout_pump_posts_and_reports_fail_stop(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "FAIL-STOPPED" in err
     assert "released 0" in err
+
+
+def test_export_stem_is_the_pooled_composite():
+    """Pins the stem's exact shape. It embeds internal identifiers and predates the
+    rule against those leaving Qiita; this test is what makes an accidental change
+    to a system_admin-only filename convention visible."""
+    from qiita_control_plane.cli.admin.masked_export import _export_stem
+
+    sample = {"biosample_accession": "SAMN_A", "prep_sample_idx": 42}
+    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"
+
+
+def test_export_stem_ignores_an_ena_run_accession():
+    """The stem is the composite ALWAYS, never the run accession: preferring the
+    accession would silently rename every submitted sample's export file and route
+    around the `_SAFE_ACCESSION` charset check."""
+    from qiita_control_plane.cli.admin.masked_export import _export_stem
+
+    sample = {
+        "biosample_accession": "SAMN_A",
+        "prep_sample_idx": 42,
+        "ena_run_accession": "ERR1234567",
+    }
+    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"

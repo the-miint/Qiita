@@ -660,6 +660,54 @@ you know why:
   incomplete samples would tell a caller which samples are finished for an
   alignment they have no right to read at all.
 
+### Two maps that are REST reads, not Flight tickets
+
+Turning those alignment rows into a feature table needs two translations, and
+both are control-plane REST calls rather than signed Flight tickets — the one
+place bulk-shaped analytic data does not come off the data plane:
+
+| Call | Answers | Why not Flight |
+|---|---|---|
+| `GET /reference/{reference_idx}/genome-map` | `feature_idx` → `(genome_idx, source, source_id)` | `genome_idx` and the genome's provenance exist **only in Postgres**; no DuckLake table carries them, and `genome_idx` is not a filter column |
+| `POST /exported-identifier` | `(alignment_idx, prep_sample_idx)` → `export_id` | the identifier is *minted* here; it exists in Postgres only, and creating one is a write |
+
+That is the whole criterion: **a signed ticket can only name identifiers the
+data plane can resolve**, and neither call's columns exist out there. It is not a
+policy exception and it does not generalize — anything whose columns do live in
+the lake still goes through a ticket.
+
+**The exported identifier is the boundary where our identifiers stop.** A
+published table names its samples `QM<n>`, never `prep_sample_idx` — see the
+opaque-identifier rule in `CLAUDE.md`. No accession can do that job: a biosample
+sequenced repeatedly has several prep_samples, so its accession cannot say which
+sequencing a row came from, and an ENA run accession is NULL until submission,
+which may not have happened. `export_id` names a *processed* sample — the sample
+plus the processing it went through — because a feature table's rows are
+processing-specific, so the same sample under two alignments is two things. The
+map is the only artifact carrying both `export_id` and `prep_sample_idx`; that
+pairing is its entire purpose, and it is what must not be shipped onward.
+
+**Both ship JSON, and for the genome map that is a known limit rather than an
+oversight.** The genome map for a GG2-scale reference is millions of rows, so it
+**refuses with a 413**
+above its cap instead of truncating: a lookup table silently missing rows drops
+those features from the caller's roll-up, producing a *wrong* feature table
+rather than a partial one, and nobody checks a `truncated` flag on a map. The
+first real reference that trips that 413 is the trigger to build the streamed
+Parquet form (over the server-side cursor `export_member_genome` already uses) —
+which would be the control plane's first non-JSON response body, and is worth
+doing deliberately, with the held-connection cost measured, rather than
+pre-emptively.
+
+The genome map's row set is `export_member_genome`'s widened with the genome
+columns, deliberately: the compute side consumes that Parquet and the client
+consumes this map, so the two must not disagree about which features have
+genomes. The label map is the alignment mint's sibling by the same reasoning —
+same cohort shape, same `Tier.VIEWER` all-or-nothing gate, same refusal wording,
+same access-checked-first ordering. Two answers to "may this caller read this
+sample" is the drift that ends with one surface advertising what the other
+refuses.
+
 ## Auth & Data Access Flow
 
 See [`docs/auth.md`](auth.md) for the principal model, login flow, scopes, endpoints, and runbooks.

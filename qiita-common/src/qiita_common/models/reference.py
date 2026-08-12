@@ -544,3 +544,38 @@ class ReferenceGenomeMember(BaseModel):
 
     feature_idx: int
     accession: str | None = None
+
+
+class GenomeMapEntry(BaseModel):
+    """One (feature, genome) pair of a reference's genome map, with the genome's
+    provenance. Both `source` and `source_id` ship because `qiita.genome`'s
+    uniqueness is the composite `(source, source_id)` — `source_id` alone is
+    unique only within a source, so a consumer relabelling `genome_idx` to a
+    public id needs the pair to assert no collision."""
+
+    feature_idx: int
+    genome_idx: int
+    source: str
+    source_id: str
+
+
+class GenomeMapResponse(BaseModel):
+    """Returned by GET /reference/{reference_idx}/genome-map: the whole
+    reference's feature_idx → genome lookup, the translation the client-side
+    feature-table recipe joins its alignment rows against.
+
+    One entry per (feature, genome) pair, ordered by (feature_idx, genome_idx). A
+    feature shared across genomes (a plasmid) contributes one entry per genome, so
+    `count` is the number of PAIRS and exceeds the number of distinct features.
+    Features with no genome are absent — they cannot be rolled up.
+
+    Deliberately has no `truncated`, unlike every other capped read: this route
+    refuses over its cap with a 413 rather than truncating, because a silently
+    short lookup table yields a WRONG feature table rather than a partial one. A
+    200 is always the complete map, so the field could only ever be False — and a
+    boolean that never varies is one a caller checks instead of the status
+    code."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    entries: list[GenomeMapEntry]
+    count: Annotated[int, Field(ge=0)]

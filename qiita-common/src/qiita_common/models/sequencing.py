@@ -26,6 +26,7 @@ from qiita_common.models._base import (
     MetadataRequestModel,
     NonBlankText,
     PatchRequestModel,
+    PrepSampleCohort,
     ReadCounts,
 )
 from qiita_common.models.biosample import (
@@ -1127,6 +1128,71 @@ class MaskedReadExportSample(BaseModel):
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
     mask_state: MaskSampleState | None = None
+
+
+class ExportedIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier — mint (or recover) the public
+    handle for each processed sample in a cohort.
+
+    ``alignment_idx`` names the processing; together with each ``prep_sample_idx``
+    it identifies one processed sample, which is what an ``export_id`` stands for.
+    The pair is the request's shape rather than the URL's because the cohort has to
+    ride a body: it is a pool's or a study's worth of samples, past nginx's 8 KB
+    request-line cap in query params, and it routinely SPANS pools.
+
+    ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
+    the two bound the same thing — a cohort a scientist assembles — for the same
+    payload-size and disclosure-width reasons. Non-empty because a cohort with no
+    members has no answer to give; a caller that meant "all of them" has to say
+    which.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedIdentifier(BaseModel):
+    """One processed sample's public handle, and the accessions it does NOT
+    replace.
+
+    ``export_id`` (``QM<idx>``) is the identifier a published table carries. It is
+    minted by Postgres as a generated column, so nothing in Python composes it and
+    no caller can supply one.
+
+    ``prep_sample_idx`` is echoed back because this map's whole job is the
+    translation: the caller's alignment rows are keyed by it, so without it there
+    is nothing to join ``export_id`` to. It is an identifier the caller already
+    sent us, which is why returning it is not a leak — but it belongs in the map
+    only, never in the artifact the map is shipped beside.
+
+    The two accessions ride along because they are already public, and because
+    neither can do ``export_id``'s job: a biosample sequenced repeatedly has
+    several prep_samples, so its accession cannot say which sequencing a row came
+    from, and ``ena_run_accession`` is NULL until the data is submitted. Both are
+    nullable and purely informational — an unaccessioned sample still gets an
+    ``export_id``.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    export_id: str
+    biosample_accession: str | None = None
+    ena_run_accession: str | None = None
+
+
+class ExportedIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier: one entry per requested
+    prep_sample, ascending by prep_sample_idx.
+
+    Every requested sample is present or the whole request failed, so there is no
+    partial answer to signal and no `truncated` — the cohort is already bounded by
+    the request body's own cap.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
+    count: Annotated[int, Field(ge=0)]
 
 
 class MaskedReadExportManifest(BaseModel):

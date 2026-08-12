@@ -812,6 +812,15 @@ async def pool_alignment_seed(role_keyed_clients):
     prep_idxs = [ps for _, ps, _ in samples]
     bio_idxs = [bs for bs, _, _ in samples]
     ss_idxs = [ss for _, _, ss in samples]
+    # Before anything else: exported_identifier holds prep_sample under RESTRICT
+    # (a published handle must outlive the alignment it names, so it cannot ride a
+    # cascade), which would block the prep_sample delete below for any test that
+    # minted one. Keyed on prep_sample rather than alignment because a row whose
+    # alignment was purged has had its alignment_idx nulled.
+    await db.execute(
+        "DELETE FROM qiita.exported_identifier WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_idxs,
+    )
     await db.execute(
         "DELETE FROM qiita.alignment_sample WHERE alignment_idx = ANY($1::bigint[])",
         [align_1, align_2],

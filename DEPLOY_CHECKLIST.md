@@ -29,6 +29,13 @@ _None yet._
   on a large table, and a failed CONCURRENTLY build leaves an INVALID index that
   `make migrate` will not retry — drop it by hand and re-run if that happens.
   (#436)
+- `20260810000000_exported_identifier.sql` — plain `make migrate`, no out-of-band setup.
+  Creates the empty `qiita.exported_identifier` table plus its retire-on-detach trigger;
+  nothing to backfill and no extension needed. One behaviour change worth knowing before
+  you next purge an alignment: `DELETE`ing an `alignment_definition` that has published
+  identifiers no longer removes them — it detaches and auto-retires them, so
+  `qiita-admin`'s alignment purge still succeeds and a published `QM<n>` keeps resolving.
+  (#438)
 
 ### 4. Deploy
 

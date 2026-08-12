@@ -140,6 +140,8 @@ from qiita_common.models.reference import (
     VALID_STATUS_TRANSITIONS,
     FeatureHashEntry,
     FieldDataType,
+    GenomeMapEntry,
+    GenomeMapResponse,
     GenomeSource,
     Platform,
     PrepProtocolResponse,
@@ -173,6 +175,9 @@ from qiita_common.models.sample_field import (
 )
 from qiita_common.models.sequencing import (
     AlignmentDefinitionDeleteResponse,
+    ExportedIdentifier,
+    ExportedIdentifierRequest,
+    ExportedIdentifierResponse,
     MaskDefinition,
     MaskDefinitionDeleteResponse,
     MaskDefinitionListResponse,
@@ -370,6 +375,8 @@ __all__ = [
     # Reference.
     "FeatureHashEntry",
     "FieldDataType",
+    "GenomeMapEntry",
+    "GenomeMapResponse",
     "GenomeSource",
     "Platform",
     "PrepProtocolResponse",
@@ -551,6 +558,9 @@ __all__ = [
     "PoolReadMetrics",
     "PoolWorkTicketSummary",
     "ReadMaskedDoGetTicketRequest",
+    "ExportedIdentifier",
+    "ExportedIdentifierRequest",
+    "ExportedIdentifierResponse",
     "SampleQCReport",
     "SequenceRange",
     "SequenceRangeMintRequest",

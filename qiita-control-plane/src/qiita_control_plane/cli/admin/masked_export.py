@@ -191,7 +191,15 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
 
 def _export_stem(sample: dict, run_idx, pool_idx) -> str:
     """Per-sample output filename stem, single-sourced so the export loop and the
-    fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``."""
+    fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``.
+
+    **This composite embeds our internal identifiers and predates the rule against
+    letting them leave Qiita** (see CLAUDE.md). It survives because this command is
+    system_admin-only and changing the stem would silently rename every existing
+    export and route around the `_SAFE_ACCESSION` charset check above. Do not copy
+    the shape to a new surface: a published artifact names its samples with
+    `qiita.exported_identifier.export_id`.
+    """
     return f"{sample['biosample_accession']}.{run_idx}.{pool_idx}.{sample['prep_sample_idx']}"
 
 
