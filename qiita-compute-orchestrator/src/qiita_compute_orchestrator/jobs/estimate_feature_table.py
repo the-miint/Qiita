@@ -98,19 +98,14 @@ def _write_ogu_table(
 ) -> None:
     """Run `qiita_common.ogu_table`'s analytic over the already-staged working tables
     and COPY the result to `out_path` as Parquet (v2 + zstd). That module documents
-    every rule the SQL encodes; what this function decides is the two things a
-    caller must:
-
-    * **at `coverage_threshold == 0` the coverage calc is skipped entirely** — every
-      genome with any alignment trivially qualifies, so there is no survivor set to
-      build or join (and `execute` does not even stream the lengths);
-    * **an empty `ogu_input` short-circuits** to a valid 0-row Parquet, because
-      `woltka_ogu` rejects an all-NULL `sample_id` source and an empty result is a
-      legitimate compute-on-demand answer, not a failure.
+    every rule the SQL encodes; what this function decides is the one thing a caller
+    must: **an empty `ogu_input` short-circuits** to a valid 0-row Parquet, because
+    `woltka_ogu` rejects an all-NULL `sample_id` source and an empty result is a
+    legitimate compute-on-demand answer, not a failure.
     """
     out_sql = validate_parquet_path(out_path)
 
-    filtered = coverage_threshold > 0.0
+    filtered = ogu_table.coverage_filter_applies(coverage_threshold)
     if filtered:
         conn.execute(ogu_table.coverage_alignments_view_sql())
         conn.execute(ogu_table.pooled_survivor_table_sql(), [coverage_threshold])
@@ -140,10 +135,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             map_sql = validate_parquet_path(inputs.genome_map_path)
             conn.execute(ogu_table.map_table_sql(f"read_parquet('{map_sql}')"))
 
-            # The lengths feed ONLY the coverage calc, so at coverage_threshold == 0
-            # (where the calc is skipped) the stream is skipped too — the point is to
-            # avoid the coverage calculation entirely, not just its filter.
-            if inputs.coverage_threshold > 0.0:
+            # The lengths feed ONLY the coverage calc, so when that is skipped the
+            # stream is skipped too — the point is to avoid the coverage calculation
+            # entirely, not just its filter. Same predicate `_write_ogu_table` uses.
+            if ogu_table.coverage_filter_applies(inputs.coverage_threshold):
                 async with open_reference_sequences_stream(
                     conn, reference_idx=inputs.reference_idx
                 ) as lengths_rel:

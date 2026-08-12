@@ -135,8 +135,27 @@ def test_empty_result_schema_matches_the_woltka_projection():
         assert column in real, column
 
 
+def test_empty_result_casts_every_column_to_its_declared_type():
+    """The empty path is GENERATED from `OUTPUT_SCHEMA`, so the declared type is the
+    only place a type is written down. A hand-edited cast that disagreed with the
+    real path would surface as a physical type mismatch between an empty-cohort
+    export and a populated one — the empty path being the one exercised least.
+    """
+    sql = ot.empty_ogu_select_sql()
+    for name, sql_type in ot.OUTPUT_SCHEMA.items():
+        assert f"CAST(NULL AS {sql_type}) AS {name}" in sql
+
+
 def test_empty_result_selects_no_rows():
     assert "WHERE false" in ot.empty_ogu_select_sql()
+
+
+def test_coverage_filter_applies_only_above_zero():
+    """One predicate decides both the SQL branch and whether the caller streams the
+    reference lengths at all; a threshold of exactly 0 must take the skip path."""
+    assert not ot.coverage_filter_applies(0.0)
+    assert ot.coverage_filter_applies(1e-9)
+    assert ot.coverage_filter_applies(1.0)
 
 
 def test_alignment_columns_exclude_cigar():
@@ -156,22 +175,27 @@ def test_alignment_table_binds_exactly_the_declared_columns():
     assert "some_stream" in sql
 
 
-def test_builders_interpolate_the_source_relation_they_are_given():
-    """Each staging builder reads from the caller's relation — a registered stream,
-    a `read_parquet(...)` expression — because where the input comes from differs
-    per consumer while the projection does not."""
-    assert "my_relation" in ot.alignment_table_sql("my_relation")
-    assert "read_parquet('m.parquet')" in ot.map_table_sql("read_parquet('m.parquet')")
-    assert "my_lengths" in ot.genome_lengths_table_sql("my_lengths")
+def test_staging_builders_read_from_the_source_they_are_given():
+    """Each staging builder reads from the caller's relation — a registered stream, a
+    `read_parquet(...)` expression — because where the input comes from differs per
+    consumer while the projection does not. Asserted as `FROM <source>` so the source
+    has to land in the FROM clause rather than merely appear somewhere.
+    """
+    assert "FROM my_relation" in ot.alignment_table_sql("my_relation")
+    assert "FROM read_parquet('m.parquet')" in ot.map_table_sql("read_parquet('m.parquet')")
+    assert "FROM my_lengths l" in ot.genome_lengths_table_sql("my_lengths")
 
 
-def test_map_table_projects_the_column_names_genome_coverage_requires():
-    """`genome_coverage`'s `subject_genome_id` relation is `(contig_id, genome_id)`
-    and its `subject_total_length` is `(genome_id, total_length)`. Both consumers
-    stage the map from a source keyed `(feature_idx, genome_idx)`, so the rename
-    lives here rather than in each of them."""
+def test_map_table_renames_each_column_to_the_right_one():
+    """`genome_coverage`'s `subject_genome_id` relation is `(contig_id, genome_id)`.
+    Both consumers stage the map from a source keyed `(feature_idx, genome_idx)`, so
+    the rename lives here rather than in each of them.
+
+    Asserted as whole `X AS Y` fragments, not as four independent substrings: a
+    SWAPPED rename (`feature_idx AS genome_id, genome_idx AS contig_id`) contains
+    all four names and would satisfy a looser test, while silently corrupting every
+    join keyed on them — the length roll-up, the survivor join, and the OGU key.
+    """
     sql = ot.map_table_sql("src")
-    assert "contig_id" in sql
-    assert "genome_id" in sql
-    assert "feature_idx" in sql
-    assert "genome_idx" in sql
+    assert "feature_idx AS contig_id" in sql
+    assert "genome_idx AS genome_id" in sql

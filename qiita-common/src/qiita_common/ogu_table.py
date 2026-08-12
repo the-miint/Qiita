@@ -30,6 +30,16 @@ the resulting multi-mappers by design.
 The map's source must be keyed `(feature_idx, genome_idx)`; `map_table_sql` does
 the rename to the column names `genome_coverage` requires.
 
+**The `source` argument of every staging builder is interpolated VERBATIM, and
+that is the caller's obligation to make safe.** A FROM-clause relation cannot be a
+bound parameter, so there is no version of this that binds instead. Pass only a
+relation name you control (a registered stream relation, an internal table) or an
+expression built from an already-validated path — `parquet.validate_parquet_path`
+is what both current callers use. Never build one from unvalidated input: the
+client-side consumer runs on a user's machine with the user's own credentials, so
+a `source` assembled from user input executes as that user against their own
+catalog. Everything else in this module is either a fixed literal or a bound `?`.
+
 **Relation names here are part of the contract, not a caller's choice.**
 `woltka_ogu` takes its source relation as a *quoted string literal* and resolves it
 on a SEPARATE connection during bind/execute, so `OGU_INPUT_TABLE` is embedded in
@@ -76,10 +86,18 @@ ALIGNMENT_COLUMNS = (
     "stop_position",
 )
 
-# The analytic's output schema. Both the real path and the 0-row short-circuit
-# below must produce exactly this, or an empty cohort yields a differently-shaped
-# file than a populated one.
-OUTPUT_COLUMNS = ("prep_sample_idx", "genome_idx", "value")
+# The analytic's output schema, name -> SQL type. Both the real path and the 0-row
+# short-circuit must produce exactly this, or an empty cohort yields a
+# differently-shaped file than a populated one — and the empty path is the one a
+# caller exercises least and would notice last. `empty_ogu_select_sql` is
+# GENERATED from this so the two cannot drift by hand; the types are what woltka
+# returns for a BIGINT `reference` and `sample_id`.
+OUTPUT_SCHEMA = {
+    "prep_sample_idx": "BIGINT",
+    "genome_idx": "BIGINT",
+    "value": "DOUBLE",
+}
+OUTPUT_COLUMNS = tuple(OUTPUT_SCHEMA)
 
 ALIGNMENT_TABLE = "alignment_slice"
 MAP_TABLE = "contig_to_genome"
@@ -87,6 +105,20 @@ GENOME_LENGTHS_TABLE = "genome_lengths"
 COVERAGE_ALIGNMENTS_VIEW = "cov_alignments"
 SURVIVOR_TABLE = "survivor_genome"
 OGU_INPUT_TABLE = "ogu_input"
+
+
+def coverage_filter_applies(coverage_threshold: float) -> bool:
+    """Whether a breadth-of-coverage threshold filters anything.
+
+    At 0 every genome with any alignment trivially qualifies, so there is no
+    survivor set to build or join — and the caller must skip streaming the
+    reference lengths too, since the coverage calc is their only consumer. Both
+    of those decisions are this one predicate, which is why it is a function
+    rather than a comparison repeated at each site: an edit to the semantics that
+    reached only one of them would open the lengths stream for a calculation that
+    never runs, or worse, skip it for one that does.
+    """
+    return coverage_threshold > 0.0
 
 
 def alignment_table_sql(source: str) -> str:
@@ -214,8 +246,7 @@ def empty_ogu_select_sql() -> str:
     threshold — but `woltka_ogu` rejects an all-NULL `sample_id` source, so the
     caller short-circuits to this instead of calling woltka on nothing.
     """
-    return (
-        "SELECT CAST(NULL AS BIGINT) AS prep_sample_idx, "
-        "CAST(NULL AS BIGINT) AS genome_idx, "
-        "CAST(NULL AS DOUBLE) AS value WHERE false"
+    casts = ", ".join(
+        f"CAST(NULL AS {sql_type}) AS {name}" for name, sql_type in OUTPUT_SCHEMA.items()
     )
+    return f"SELECT {casts} WHERE false"
