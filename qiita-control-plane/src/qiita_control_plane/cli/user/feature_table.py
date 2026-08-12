@@ -138,13 +138,20 @@ def _relabel(con) -> ft.LabelClearance:
     return clearance
 
 
-# The bundle's filenames. Fixed rather than composed, because every handle that would
-# distinguish one run from another — the alignment, the cohort — is one of ours, and a
-# filename is something a user publishes. Runs are told apart by the directory the
-# caller chose.
+# The two table formats, and the one to reach for by default. They carry the same
+# numbers — the relabelled table is `(sample_id, feature_id, value)` either way — so
+# this is a choice of who reads the file next, never of what it contains: Parquet is
+# what the rest of this system and every dataframe tool read, BIOM is for the
+# microbiome tools that require it. One or the other, never both.
 TABLE_FORMATS = ("parquet", "biom")
-_TABLE_STEM = "feature-table"
-_IDENTIFIER_MAP_NAME = "exported-identifier.json"
+DEFAULT_TABLE_FORMAT = "parquet"
+
+# **The caller names the table**; the identifier map is derived from that name rather
+# than fixed, so the pair stays visibly together and two runs can share a directory.
+# What must not happen is qiita COMPOSING a name out of an alignment or a cohort —
+# those are our identifiers and a filename is something a user publishes. A name the
+# caller chose is theirs.
+_IDENTIFIER_MAP_SUFFIX = ".exported-identifier.json"
 
 # Written INTO the map as well as printed, because a warning that lives only in a
 # terminal is gone the moment the terminal is, and this file's whole hazard is that it
@@ -157,29 +164,51 @@ IDENTIFIER_MAP_NOTE = (
 )
 
 
-def _bundle_paths(output_dir: Path, fmt: str) -> list[Path]:
-    """The bundle's two files, in write order: the table, then the identifier map."""
+def _bundle_paths(table_path: Path, fmt: str) -> list[Path]:
+    """The two files `table_path` implies, in write order: the table itself, at exactly
+    the name the caller gave, and the identifier map beside it.
+
+    Refuses a `fmt` the writers do not have, and a `table_path` whose extension names
+    the OTHER format — a `.biom` holding Parquet bytes is a file that lies about itself
+    to everyone downstream, and it is the caller's name, so we cannot quietly rewrite
+    it.
+    """
     if fmt not in TABLE_FORMATS:
         raise ValueError(f"unsupported feature-table format: {fmt!r} (expected {TABLE_FORMATS})")
-    return [output_dir / f"{_TABLE_STEM}.{fmt}", output_dir / _IDENTIFIER_MAP_NAME]
+    suffix = table_path.suffix.lstrip(".").lower()
+    if suffix in TABLE_FORMATS and suffix != fmt:
+        raise ValueError(
+            f"{table_path.name} is named for {suffix} but the requested format is {fmt}; "
+            f"the two formats hold the same numbers, so pick either — a file whose "
+            f"extension contradicts its contents misleads every reader of it."
+        )
+    return [table_path, table_path.with_name(table_path.stem + _IDENTIFIER_MAP_SUFFIX)]
 
 
 def _write_bundle(
-    con, *, output_dir: Path, fmt: str, identifiers: list[dict[str, Any]]
+    con, *, table_path: Path, fmt: str, identifiers: list[dict[str, Any]]
 ) -> list[Path]:
-    """Write the bundle — the relabelled table plus the exported-identifier map — and
-    return the files written.
+    """Write the bundle — the relabelled table at `table_path`, plus the
+    exported-identifier map beside it — and return the files written.
 
-    **Both files or neither.** The table names its samples by `export_id` alone, so
-    without the map beside it a caller cannot join their own records back to it; half a
-    bundle is not a partial result but a useless one.
+    **Both files or neither**, and that is the table plus its map, not two copies of the
+    table: the two formats are the same numbers, so a run writes one of them. The map is
+    the other half because the table names its samples by `export_id` alone, so without
+    it a caller cannot join their own records back to the table; half a bundle is not a
+    partial result but a useless one.
 
     **An existing artifact is refused, before anything is written.** The two writers
     disagree about this on their own — the BIOM writer refuses to overwrite, the Parquet
     COPY replaces silently — so without one check here a second run would fail loudly in
     one format and quietly destroy a published file in the other.
     """
-    targets = _bundle_paths(output_dir, fmt)
+    targets = _bundle_paths(table_path, fmt)
+    parent = table_path.parent
+    if not parent.is_dir():
+        # Caught here rather than left to the writers: DuckDB's Parquet COPY and HDF5
+        # report a missing directory differently, and one of them badly.
+        raise FileNotFoundError(f"no such directory to write into: {parent}")
+
     existing = [p for p in targets if p.exists()]
     if existing:
         # A single survivor is the one shape a crash can leave (see
@@ -189,12 +218,11 @@ def _write_bundle(
         state = (
             "an earlier run did not finish, since a complete bundle is both files"
             if len(existing) < len(targets)
-            else "an earlier run wrote a bundle here"
+            else "an earlier run wrote this bundle"
         )
         raise FileExistsError(
-            f"refusing to overwrite {', '.join(p.name for p in existing)} in "
-            f"{output_dir}: {state}. Write to a different directory, or remove what "
-            f"is there if you are finished with it."
+            f"refusing to overwrite {', '.join(str(p) for p in existing)}: {state}. "
+            f"Choose another name, or remove what is there if you are finished with it."
         )
 
     pairs = [(p.with_name(p.name + ".partial"), p) for p in targets]

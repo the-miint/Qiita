@@ -203,16 +203,64 @@ def _labelled(conn, rows=(("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0))) -> 
 
 @pytest.mark.parametrize("fmt", ["parquet", "biom"])
 def test_the_bundle_is_the_table_AND_the_identifier_map(fmt, tmp_path):
-    """Two files, always. The table alone cannot be joined back to the caller's own
-    records — `export_id` is the only sample name it carries — so the map is part of
-    the deliverable rather than an option."""
+    """One table, in the format asked for, at exactly the name the caller gave — plus
+    the map, because the table alone cannot be joined back to the caller's own records
+    (`export_id` is the only sample name it carries). The two formats hold the same
+    numbers, so a run writes one of them, never both.
+    """
+    table = tmp_path / f"gut-study-ogu.{fmt}"
     with connect_with_miint() as conn:
         _labelled(conn)
-        written = ftc._write_bundle(conn, output_dir=tmp_path, fmt=fmt, identifiers=_IDENTIFIERS)
+        written = ftc._write_bundle(conn, table_path=table, fmt=fmt, identifiers=_IDENTIFIERS)
 
-    assert [p.name for p in written] == [f"feature-table.{fmt}", "exported-identifier.json"]
+    assert [p.name for p in written] == [
+        f"gut-study-ogu.{fmt}",
+        "gut-study-ogu.exported-identifier.json",
+    ]
     assert all(p.exists() for p in written)
     assert not list(tmp_path.glob("*.partial"))
+
+
+def test_two_runs_can_share_a_directory(tmp_path):
+    """What deriving the map's name from the table's buys: the pooled and per-sample
+    builds of one cohort live side by side instead of colliding on a fixed name."""
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        first = ftc._write_bundle(
+            conn, table_path=tmp_path / "pooled.parquet", fmt="parquet", identifiers=_IDENTIFIERS
+        )
+        second = ftc._write_bundle(
+            conn,
+            table_path=tmp_path / "per-sample.parquet",
+            fmt="parquet",
+            identifiers=_IDENTIFIERS,
+        )
+
+    assert sorted(p.name for p in first + second) == [
+        "per-sample.exported-identifier.json",
+        "per-sample.parquet",
+        "pooled.exported-identifier.json",
+        "pooled.parquet",
+    ]
+
+
+def test_a_name_that_contradicts_the_format_is_refused(tmp_path):
+    """A `.biom` holding Parquet bytes lies about itself to every reader downstream, and
+    the name is the caller's — so this is a refusal, not a silent rewrite of their
+    extension. A name with no format extension at all is theirs to choose and is left
+    alone.
+    """
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        with pytest.raises(ValueError, match="named for biom"):
+            ftc._write_bundle(
+                conn, table_path=tmp_path / "t.biom", fmt="parquet", identifiers=_IDENTIFIERS
+            )
+        written = ftc._write_bundle(
+            conn, table_path=tmp_path / "no-extension", fmt="parquet", identifiers=_IDENTIFIERS
+        )
+    assert written[0].name == "no-extension"
+    assert written[1].name == "no-extension.exported-identifier.json"
 
 
 def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_path):
@@ -223,7 +271,7 @@ def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_pat
     with connect_with_miint() as conn:
         _labelled(conn)
         _, map_path = ftc._write_bundle(
-            conn, output_dir=tmp_path, fmt="parquet", identifiers=_IDENTIFIERS
+            conn, table_path=tmp_path / "t.parquet", fmt="parquet", identifiers=_IDENTIFIERS
         )
 
     payload = json.loads(map_path.read_text())
@@ -238,7 +286,7 @@ def test_the_written_table_carries_only_public_columns(tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         table_path, _ = ftc._write_bundle(
-            conn, output_dir=tmp_path, fmt="parquet", identifiers=_IDENTIFIERS
+            conn, table_path=tmp_path / "t.parquet", fmt="parquet", identifiers=_IDENTIFIERS
         )
         described = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{table_path}')").fetchall()
         rows = conn.execute(f"SELECT * FROM read_parquet('{table_path}') ORDER BY 1").fetchall()
@@ -257,7 +305,7 @@ def test_a_failure_partway_through_leaves_NEITHER_file(tmp_path):
         with pytest.raises(TypeError):
             ftc._write_bundle(
                 conn,
-                output_dir=tmp_path,
+                table_path=tmp_path / "t.parquet",
                 fmt="parquet",
                 identifiers=[{"prep_sample_idx": {1, 2}, "export_id": "QM1"}],
             )
@@ -269,14 +317,28 @@ def test_an_existing_artifact_is_refused_before_anything_is_written(tmp_path):
     """The BIOM writer refuses to overwrite and the Parquet COPY replaces silently, so
     without this check the same second run would fail loudly in one format and quietly
     destroy a published file in the other."""
-    (tmp_path / "feature-table.parquet").write_text("earlier run")
+    table = tmp_path / "t.parquet"
+    table.write_text("earlier run")
     with connect_with_miint() as conn:
         _labelled(conn)
-        with pytest.raises(FileExistsError, match="feature-table.parquet"):
-            ftc._write_bundle(conn, output_dir=tmp_path, fmt="parquet", identifiers=_IDENTIFIERS)
+        with pytest.raises(FileExistsError, match="t.parquet"):
+            ftc._write_bundle(conn, table_path=table, fmt="parquet", identifiers=_IDENTIFIERS)
 
-    assert (tmp_path / "feature-table.parquet").read_text() == "earlier run"
-    assert not (tmp_path / "exported-identifier.json").exists()
+    assert table.read_text() == "earlier run"
+    assert not (tmp_path / "t.exported-identifier.json").exists()
+
+
+def test_a_lone_survivor_is_reported_as_an_unfinished_run(tmp_path):
+    """The one shape a kill between the two renames leaves, and on disk it is
+    indistinguishable from a finished run — so the refusal says which it is rather than
+    let a user delete the wrong thing."""
+    (tmp_path / "t.exported-identifier.json").write_text("{}")
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        with pytest.raises(FileExistsError, match="did not finish"):
+            ftc._write_bundle(
+                conn, table_path=tmp_path / "t.parquet", fmt="parquet", identifiers=_IDENTIFIERS
+            )
 
 
 def test_a_stale_partial_does_not_block_a_retry(tmp_path):
@@ -284,17 +346,42 @@ def test_a_stale_partial_does_not_block_a_retry(tmp_path):
     overwrite ANY existing target — including that one. Clearing our own partials first
     is what keeps the error a user sees about their own files, not ours.
     """
-    (tmp_path / "feature-table.biom.partial").write_text("interrupted")
+    (tmp_path / "t.biom.partial").write_text("interrupted")
     with connect_with_miint() as conn:
         _labelled(conn)
-        written = ftc._write_bundle(conn, output_dir=tmp_path, fmt="biom", identifiers=_IDENTIFIERS)
+        written = ftc._write_bundle(
+            conn, table_path=tmp_path / "t.biom", fmt="biom", identifiers=_IDENTIFIERS
+        )
         assert conn.execute(f"SELECT count(*) FROM read_biom('{written[0]}')").fetchone()[0] == 2
 
     assert not list(tmp_path.glob("*.partial"))
+
+
+def test_a_missing_output_directory_is_named(tmp_path):
+    """Rather than left to the writers: DuckDB's Parquet COPY and HDF5 report this
+    differently, and one of them badly."""
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        with pytest.raises(FileNotFoundError, match="no such directory"):
+            ftc._write_bundle(
+                conn,
+                table_path=tmp_path / "nope" / "t.parquet",
+                fmt="parquet",
+                identifiers=_IDENTIFIERS,
+            )
 
 
 def test_an_unsupported_format_is_refused(tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         with pytest.raises(ValueError, match="tsv"):
-            ftc._write_bundle(conn, output_dir=tmp_path, fmt="tsv", identifiers=_IDENTIFIERS)
+            ftc._write_bundle(
+                conn, table_path=tmp_path / "t.tsv", fmt="tsv", identifiers=_IDENTIFIERS
+            )
+
+
+def test_parquet_is_the_default_format():
+    """Both formats carry the same numbers, so the default is about who reads the file
+    next: Parquet is what the rest of this system and every dataframe tool read."""
+    assert ftc.DEFAULT_TABLE_FORMAT == "parquet"
+    assert ftc.DEFAULT_TABLE_FORMAT in ftc.TABLE_FORMATS

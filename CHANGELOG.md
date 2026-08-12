@@ -65,10 +65,14 @@ duplicates further down are historical strata; leave them where they are.
   from the one response so they cannot disagree about which genomes exist.
 
 - **A feature table can be written as Parquet or BIOM, bundled with the map needed to read
-  it.** The bundle is both files or neither: the table names its samples by their public
-  handle alone, so without the exported-identifier map beside it nobody can join it back to
-  their own records. An artifact already at either name is refused before anything is
-  written — the two writers disagree on their own about overwriting, one refusing and one
+  it.** One format per run — they hold the same numbers, so the choice is only about what
+  reads the file next, and Parquet is the default. **The caller names the table** and the
+  identifier map is named after it, so a pair stays visibly together and two builds of one
+  cohort can share a directory; a name whose extension contradicts the requested format is
+  refused rather than quietly rewritten. The bundle is both files or neither: the table names
+  its samples by their public handle alone, so without the exported-identifier map beside it
+  nobody can join it back to their own records. An artifact already at either name is refused
+  before anything is written — the two writers disagree on their own about overwriting, one refusing and one
   replacing silently, so a second run would otherwise destroy a published file in one format
   and fail in the other. The map carries, in the file rather than only in the terminal, the
   warning that it is the one artifact holding an internal identifier and must not be shipped
