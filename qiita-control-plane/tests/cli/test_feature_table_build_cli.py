@@ -147,7 +147,12 @@ def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None, geno
     _FakeFlightClient.instances = []
 
     monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
-    monkeypatch.setattr(ftc, "_fetch_pool_alignments", lambda *a, **k: _ALIGNMENTS_BODY)
+
+    def _alignments(*args, **kwargs):
+        rec["alignments_fetched"] = True
+        return _ALIGNMENTS_BODY
+
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", _alignments)
     monkeypatch.setattr(
         ftc,
         "_fetch_alignment_cohort",
@@ -303,6 +308,53 @@ def test_an_unpaired_gate_over_paired_reads_is_refused(monkeypatch, tmp_path, ca
     assert ftc._handle_feature_table_build(args, parser=None) == 1
     assert "paired" in capsys.readouterr().err
     assert not args.output.exists()
+
+
+def test_unpaired_gate_alone_is_refused_before_any_round_trip(monkeypatch, tmp_path, capsys):
+    """`--unpaired-gate` only says how to judge a gate, so on its own it silently does
+    nothing — the same shape as a gate with no threshold, which the shared module refuses
+    for the same reason. It needs nothing but the flags, so it is refused before the
+    first REST call rather than after two."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--unpaired-gate" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+    assert not _FakeFlightClient.instances
+
+
+def test_an_unreachable_control_plane_is_named_not_traced(monkeypatch, tmp_path, capsys):
+    """No HTTP response at all — the control plane is down, or --base-url is wrong. A
+    transport traceback tells a user nothing they can act on."""
+
+    def _refused(*args, **kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    _patched(monkeypatch)
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", _refused)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    assert "--base-url" in capsys.readouterr().err
+
+
+def test_a_flight_failure_is_named_not_traced(monkeypatch, tmp_path, capsys):
+    """The data plane's half of the recipe fails on its own terms — an expired ticket, a
+    dead instance — and must arrive as a message, not a gRPC traceback."""
+    import pyarrow.flight as flight
+
+    rec = _patched(monkeypatch)
+
+    def _dead_stream(self, ticket, *options):
+        rec["reached_flight"] = True
+        raise flight.FlightUnavailableError("data plane unavailable")
+
+    monkeypatch.setattr(_FakeFlightClient, "do_get", _dead_stream)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    assert rec["reached_flight"]
+    assert "flight error" in capsys.readouterr().err
+    assert all(client.closed for client in _FakeFlightClient.instances)
 
 
 def test_a_cohort_named_on_the_command_line_is_what_gets_signed(monkeypatch, tmp_path):

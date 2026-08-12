@@ -468,17 +468,19 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
     """The recipe, on an open connection: discover, stage, compute, relabel, write.
     Returns the files written and the published table's row count.
 
-    Ordered so that everything cheap and refusable happens before the two bulk streams:
-    a wrong `--alignment-idx`, an empty cohort, or an over-cap genome map all stop the
-    run before a byte of alignment data moves (an occupied output is refused earlier
-    still, by the handler).
+    Ordered so that everything cheap and refusable happens first: the gate needs nothing
+    but the flags, so it is built before any round trip at all, and a wrong
+    `--alignment-idx`, an empty cohort, or an over-cap genome map each stop the run before
+    a byte of alignment data moves (an occupied output is refused earlier still, by the
+    handler).
 
-    The Flight client lives only as long as the two streams: each is drained by the one
-    CREATE that materializes it, so nothing holds a gRPC connection open through the
-    compute or the write.
+    The Flight client lives only for the two streams and the tickets that authorize them:
+    each stream is drained by the one CREATE that materializes it, so nothing holds a gRPC
+    connection open through the compute, the relabel, or the write.
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
+    gate = _gate_from_args(args)
     reference_idx = _alignment_reference_idx(
         _fetch_pool_alignments(
             args.base_url,
@@ -489,7 +491,6 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         alignment_idx=args.alignment_idx,
     )
     cohort = _resolve_cohort(args.base_url, token, args)
-    gate = _gate_from_args(args)
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
     identifiers = _mint_exported_identifiers(
