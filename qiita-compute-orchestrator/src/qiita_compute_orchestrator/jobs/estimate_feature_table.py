@@ -33,11 +33,6 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 from qiita_common import feature_table
-
-# The projection this job asks the data plane for. Owned by the shared analytic,
-# alongside the SQL that binds it, so the requested columns and the bound SELECT
-# stay one list.
-from qiita_common.feature_table import ALIGNMENT_COLUMNS as _ALIGNMENT_COLUMNS
 from qiita_common.parquet import validate_parquet_path
 
 from ..data_plane_client import open_alignment_stream, open_reference_sequences_stream
@@ -97,26 +92,21 @@ def _write_ogu_table(
     out_path: Path,
 ) -> None:
     """Run `qiita_common.feature_table`'s analytic over the already-staged working tables
-    and COPY the result to `out_path` as Parquet (v2 + zstd). That module documents
-    every rule the SQL encodes; what this function decides is the one thing a caller
-    must: **an empty `ogu_input` short-circuits** to the 0-row form rather than
-    calling woltka, for the reason `feature_table.empty_ogu_select_sql` gives.
+    and COPY the result to `out_path` as Parquet (v2 + zstd). That module owns every rule
+    the SQL encodes AND the order the statements run in; what is left here is the one
+    thing the two consumers genuinely differ on — this one COPYs straight out, where the
+    client-side recipe materializes the counts so it can relabel them.
     """
     out_sql = validate_parquet_path(out_path)
 
-    # This job is pooled-only: breadth over the whole cohort is what its workflow
-    # `params:` describe, and the per-sample scope is the client-side recipe's.
-    scope = (
-        feature_table.CoverageScope.POOLED
-        if feature_table.coverage_filter_applies(coverage_threshold)
-        else None
-    )
-    if scope is not None:
-        conn.execute(feature_table.coverage_alignments_view_sql())
-        conn.execute(feature_table.survivor_table_sql(scope), [coverage_threshold])
-    conn.execute(feature_table.ogu_input_table_sql(survivor_scope=scope))
+    # Pooled-only: breadth over the whole cohort is what this job's workflow `params:`
+    # describe, and the per-sample scope is the client-side recipe's.
+    for sql, parameters in feature_table.ogu_input_statements(
+        scope=feature_table.CoverageScope.POOLED, coverage_threshold=coverage_threshold
+    ):
+        conn.execute(sql, parameters)
 
-    n_rows = conn.execute(f"SELECT count(*) FROM {feature_table.OGU_INPUT_TABLE}").fetchone()[0]
+    n_rows = conn.execute(feature_table.ogu_input_count_sql()).fetchone()[0]
     select_sql = (
         feature_table.woltka_ogu_select_sql() if n_rows else feature_table.empty_ogu_select_sql()
     )
@@ -153,7 +143,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # The alignment slice, all cohort samples pooled.
             async with open_alignment_stream(
-                conn, work_ticket_idx=inputs.work_ticket_idx, columns=_ALIGNMENT_COLUMNS
+                conn,
+                work_ticket_idx=inputs.work_ticket_idx,
+                columns=feature_table.ALIGNMENT_COLUMNS,
             ) as alignment_rel:
                 conn.execute(feature_table.alignment_table_sql(alignment_rel))
 

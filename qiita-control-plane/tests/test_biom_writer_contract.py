@@ -33,11 +33,11 @@ def _staged(conn, rows: list[tuple[str, str, float]]) -> None:
     `LABELLED_SCHEMA` — every one of those types is one the writer checks."""
     if not rows:
         casts = ", ".join(f"CAST(NULL AS {t}) AS {n}" for n, t in ft.LABELLED_SCHEMA.items())
-        conn.execute(f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT {casts} WHERE false")
+        conn.execute(f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT {casts} WHERE false")
         return
     values = ", ".join("(?::VARCHAR, ?::VARCHAR, ?::DOUBLE)" for _ in rows)
     conn.execute(
-        f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT * FROM (VALUES {values}) AS v({_TRIPLES})",
+        f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES {values}) AS v({_TRIPLES})",
         [x for r in rows for x in r],
     )
 
@@ -111,7 +111,7 @@ def test_the_parquet_copy_DOES_overwrite_silently(tmp_path):
         _staged(conn, [("QM1", "GCF_1", 1.0), ("QM2", "GCF_1", 2.0)])
         conn.execute("SET preserve_insertion_order=false")
         conn.execute(ft.parquet_copy_sql(target))
-        conn.execute(f"DELETE FROM {ft.LABELLED_TABLE} WHERE sample_id = 'QM2'")
+        conn.execute(f"DELETE FROM {ft.LABELLED_RELATION} WHERE sample_id = 'QM2'")
         conn.execute(ft.parquet_copy_sql(target))
         assert conn.execute(f"SELECT count(*) FROM read_parquet('{target}')").fetchone()[0] == 1
 
@@ -133,7 +133,7 @@ def test_an_unusable_identifier_is_refused_and_leaves_no_file(sample_id, expecte
     target = tmp_path / "unusable.biom"
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT * FROM (VALUES "
+            f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES "
             f"({sample_id}, 'GCF_1'::VARCHAR, 1.0::DOUBLE)) AS v({_TRIPLES})"
         )
         with pytest.raises(duckdb.InvalidInputException, match=expected):
@@ -149,7 +149,7 @@ def test_the_value_column_must_be_DOUBLE_exactly(sql_type, tmp_path):
     analytic that produced the numbers."""
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT 'QM1' AS sample_id, "
+            f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT 'QM1' AS sample_id, "
             f"'GCF_1' AS feature_id, 1::{sql_type} AS value"
         )
         with pytest.raises(duckdb.BinderException, match="'value' must be DOUBLE"):
@@ -161,7 +161,8 @@ def test_a_missing_required_column_names_itself(tmp_path):
     dropped one is a bind error rather than a partial file."""
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT 'QM1' AS sample_id, 1.0::DOUBLE AS value"
+            f"CREATE TABLE {ft.LABELLED_RELATION} AS "
+            f"SELECT 'QM1' AS sample_id, 1.0::DOUBLE AS value"
         )
         with pytest.raises(duckdb.BinderException, match="requires 'feature_id' column"):
             conn.execute(ft.biom_copy_sql(tmp_path / "missing.biom"))
@@ -175,7 +176,7 @@ def test_an_EXTRA_column_is_silently_ignored(tmp_path):
     target = tmp_path / "extra.biom"
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT * FROM (VALUES "
+            f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES "
             f"('QM1'::VARCHAR, 'GCF_1'::VARCHAR, 1.0::DOUBLE, 400::BIGINT)) "
             f"AS v({_TRIPLES}, genome_idx)"
         )
@@ -192,6 +193,6 @@ def test_an_unknown_copy_option_is_rejected_not_ignored(tmp_path):
         _staged(conn, [("QM1", "GCF_1", 1.0)])
         with pytest.raises(duckdb.BinderException, match="Unknown option"):
             conn.execute(
-                f"COPY {ft.LABELLED_TABLE} TO '{tmp_path / 'opt.biom'}' "
+                f"COPY {ft.LABELLED_RELATION} TO '{tmp_path / 'opt.biom'}' "
                 f"(FORMAT BIOM, ROW_GROUP_SIZE_BYTES '64MB')"
             )

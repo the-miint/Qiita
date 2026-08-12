@@ -35,7 +35,7 @@ _CREATE_BUILDERS = {
     "ogu_output_table_sql": lambda: ft.ogu_output_table_sql(populated=True),
     "genome_label_table_sql": lambda: ft.genome_label_table_sql("map_src"),
     "sample_label_table_sql": lambda: ft.sample_label_table_sql("mint_src"),
-    "labelled_table_sql": lambda: ft.labelled_table_sql(clearance=ft.LabelClearance(rows=10)),
+    "labelled_relation_sql": lambda: ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=10)),
 }
 
 
@@ -635,7 +635,7 @@ def test_the_labelled_table_projects_exactly_the_public_columns():
     """The projection is the enforcement: both `_idx` columns are joined ON and then
     dropped, so nothing downstream can read one out of this relation even by mistake.
     """
-    sql = ft.labelled_table_sql(clearance=_relabel_check())
+    sql = ft.labelled_relation_sql(clearance=_relabel_check())
     projection = sql.split(" FROM ", 1)[0]
     assert projection.endswith(", ".join(ft.LABELLED_COLUMNS))
     for internal in ("prep_sample_idx", "genome_idx"):
@@ -682,7 +682,7 @@ def test_the_diagnostics_and_the_relabel_read_THE_SAME_join():
     """
     joined = ft._labelled_select_sql()
     assert joined in ft.relabel_diagnostics_sql()
-    assert joined in ft.labelled_table_sql(clearance=_relabel_check())
+    assert joined in ft.labelled_relation_sql(clearance=_relabel_check())
 
 
 def test_the_labels_are_left_joined_so_a_missing_one_is_visible():
@@ -803,7 +803,7 @@ def test_the_relabel_sql_is_unreachable_without_a_clearance():
     catch are silent, so "check first" has to be a type error rather than a docstring.
     """
     with pytest.raises(TypeError):
-        ft.labelled_table_sql()
+        ft.labelled_relation_sql()
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +831,7 @@ def test_both_writers_copy_the_RELABELLED_relation(build, tmp_path):
     — the whole point of the relabel is that only one of these two relations may be
     written to a file a user publishes."""
     sql = build(tmp_path / "out")
-    assert f"COPY {ft.LABELLED_TABLE} TO " in sql
+    assert f"COPY {ft.LABELLED_RELATION} TO " in sql
     assert ft.OGU_OUTPUT_TABLE not in sql
 
 
@@ -868,3 +868,117 @@ def test_a_copy_target_that_cannot_be_interpolated_safely_is_refused(build, tmp_
     that interpolates."""
     with pytest.raises(ValueError):
         build(tmp_path / "the user's table.biom")
+
+
+# ---------------------------------------------------------------------------
+# The statement SEQUENCE — the part that is not text but order
+# ---------------------------------------------------------------------------
+
+
+def _sequence(scope, threshold) -> list[str]:
+    """`ogu_input_statements` as a list of first-words-plus-relation, for asserting on
+    order without pinning whole SQL strings."""
+    return [sql for sql, _ in ft.ogu_input_statements(scope=scope, coverage_threshold=threshold)]
+
+
+@pytest.mark.parametrize("scope", list(ft.CoverageScope))
+def test_the_sequence_builds_the_filter_before_woltkas_input(scope):
+    """The order the module owns rather than each consumer: the survivor set must exist
+    before `ogu_input` joins it, and the coverage view before the survivor set reads it.
+    A consumer that got this order wrong would fail loudly; one that dropped a step
+    would publish unfiltered genomes, which is why the order is not the caller's."""
+    sequence = _sequence(scope, 0.01)
+    positions = {
+        "view": next(i for i, s in enumerate(sequence) if s.startswith("CREATE VIEW")),
+        "survivor": next(
+            i
+            for i, s in enumerate(sequence)
+            if ft.survivor_table_name(scope) in s and "CREATE" in s
+        ),
+        "input": next(
+            i for i, s in enumerate(sequence) if ft.OGU_INPUT_TABLE in s and "CREATE" in s
+        ),
+    }
+    assert positions["view"] < positions["survivor"] < positions["input"]
+
+
+def test_an_unfiltered_sequence_has_no_coverage_step_at_all():
+    """At threshold 0 there is nothing to filter, so neither the view nor the survivor
+    set is built — and the caller must not have to know that, which is the whole point
+    of the scope-to-`None` conversion living here."""
+    sequence = _sequence(ft.CoverageScope.PER_SAMPLE, 0.0)
+    joined = " ".join(sequence)
+    assert ft.COVERAGE_ALIGNMENTS_VIEW not in joined
+    for scope in ft.CoverageScope:
+        assert ft.survivor_table_name(scope) not in joined, scope
+    assert any(ft.OGU_INPUT_TABLE in s and "CREATE" in s for s in sequence)
+
+
+@pytest.mark.parametrize("threshold", [0.0, 0.01])
+def test_the_sequence_releases_every_relation_it_finishes_with(threshold):
+    """The alignment slice, the coverage view, and the survivor set are all dead once
+    woltka's input exists — and dead for the whole rest of the run, through woltka, the
+    relabel, and the write. On a client that is several hundred MB held for nothing, and
+    DuckDB spills into whatever directory the user ran the CLI from."""
+    scope = ft.CoverageScope.POOLED
+    sequence = _sequence(scope, threshold)
+    dropped = {s.split()[-1] for s in sequence if s.startswith("DROP")}
+    expected = {ft.ALIGNMENT_TABLE}
+    if threshold:
+        expected |= {ft.COVERAGE_ALIGNMENTS_VIEW, ft.survivor_table_name(scope)}
+    assert dropped == expected
+    # Every DROP comes after the CREATE that made its contents redundant.
+    last_create = max(i for i, s in enumerate(sequence) if s.startswith("CREATE"))
+    assert all(i > last_create for i, s in enumerate(sequence) if s.startswith("DROP"))
+
+
+def test_the_view_is_dropped_before_the_table_it_reads():
+    """`cov_alignments` selects from the alignment slice. Dropping the slice first
+    leaves a dangling view — tolerated by DuckDB today, but not something to rely on."""
+    sequence = _sequence(ft.CoverageScope.POOLED, 0.01)
+    drops = [s for s in sequence if s.startswith("DROP")]
+    assert drops[0] == f"DROP VIEW {ft.COVERAGE_ALIGNMENTS_VIEW}"
+    assert f"DROP TABLE {ft.ALIGNMENT_TABLE}" in drops[1:]
+
+
+def test_woltkas_input_has_its_own_release():
+    """Separate from the sequence because the caller must read the row count between
+    the two — that count is what decides whether woltka runs at all."""
+    assert ft.drop_ogu_input_table_sql() == f"DROP TABLE {ft.OGU_INPUT_TABLE}"
+    assert ft.OGU_INPUT_TABLE in ft.ogu_input_count_sql()
+
+
+@pytest.mark.parametrize("bad", [-0.001, 1.001, -1.0, 2.0])
+def test_a_threshold_outside_zero_to_one_is_refused(bad):
+    """Both directions are silent rather than loud if unchecked: below 0 reads as "no
+    filter at all", above 1 drops every genome and yields an empty table that looks
+    like a result. Each consumer validates at its own boundary; this is the shared
+    backstop for the next one."""
+    with pytest.raises(ValueError, match="proportion"):
+        ft.coverage_filter_applies(bad)
+
+
+def test_the_labelled_relation_is_a_view():
+    """Its one reader is a COPY on the caller's own connection, so materializing would
+    hold a second full copy of the output alive exactly while the writer builds its
+    own — the same reason `cov_alignments` is a view."""
+    sql = ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=3))
+    assert sql.startswith(f"CREATE VIEW {ft.LABELLED_RELATION} ")
+
+
+def test_a_paired_gates_diagnostics_read_the_slice_once():
+    """The slice still holds `cigar`, so a second scan of it is the most expensive
+    avoidable thing in the gated path. Every count is additive over the placement
+    partitions, so one grouped pass answers all four."""
+    sql = ft.gate_diagnostics_sql(ft.AlignmentGate(min_identity=0.9, paired=True))
+    assert sql.count(ft.STREAMED_ALIGNMENT_TABLE) == 1
+    assert sql.count(f"GROUP BY {ft.PAIRED_PLACEMENT_PARTITION}") == 1
+
+
+def test_the_paired_diagnostics_coalesce_their_sums():
+    """`sum()` over zero groups is NULL, not 0 — so without these an empty slice would
+    report `total_rows` as NULL and silently stop `check_gate_diagnostics`' zero-row
+    early return from firing."""
+    sql = ft.gate_diagnostics_sql(ft.AlignmentGate(min_query_coverage=0.5, paired=True))
+    assert "coalesce(sum(rows_in_partition), 0) AS total_rows" in sql
+    assert "coalesce(sum(paired), 0) AS paired_rows" in sql

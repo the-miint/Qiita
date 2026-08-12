@@ -284,66 +284,40 @@ async def test_a_user_builds_a_publishable_feature_table(
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
+    # The flags every invocation below shares, so each verb reads as its own delta.
+    pool = [
+        "--sequencing-run-idx",
+        str(seed["run_idx"]),
+        "--sequenced-pool-idx",
+        str(seed["pool_idx"]),
+    ]
+    alignment = ["--alignment-idx", str(seed["alignment_idx"])]
+
+    def _run(*argv: str) -> int:
+        return cli.main(["--base-url", cp_server, *argv])
+
     def _build(*extra: str, output) -> int:
-        return cli.main(
-            [
-                "--base-url",
-                cp_server,
-                "feature-table",
-                "build",
-                "--sequencing-run-idx",
-                str(seed["run_idx"]),
-                "--sequenced-pool-idx",
-                str(seed["pool_idx"]),
-                "--alignment-idx",
-                str(seed["alignment_idx"]),
-                "--coverage-threshold",
-                _THRESHOLD,
-                "--output",
-                str(output),
-                "--data-plane-url",
-                dp_url,
-                *extra,
-            ]
+        return _run(
+            "feature-table",
+            "build",
+            *pool,
+            *alignment,
+            "--coverage-threshold",
+            _THRESHOLD,
+            "--output",
+            str(output),
+            "--data-plane-url",
+            dp_url,
+            *extra,
         )
 
     # --- Discovery: the two verbs a user reaches for first. ---
-    assert (
-        cli.main(
-            [
-                "--base-url",
-                cp_server,
-                "alignment",
-                "list",
-                "--sequencing-run-idx",
-                str(seed["run_idx"]),
-                "--sequenced-pool-idx",
-                str(seed["pool_idx"]),
-            ]
-        )
-        == 0
-    )
+    assert _run("alignment", "list", *pool) == 0
     listed = json.loads(capsys.readouterr().out)
     summary = next(a for a in listed["alignments"] if a["alignment_idx"] == seed["alignment_idx"])
     assert (summary["samples_completed"], summary["samples_total"]) == (2, 2)
 
-    assert (
-        cli.main(
-            [
-                "--base-url",
-                cp_server,
-                "alignment",
-                "cohort",
-                "--sequencing-run-idx",
-                str(seed["run_idx"]),
-                "--sequenced-pool-idx",
-                str(seed["pool_idx"]),
-                "--alignment-idx",
-                str(seed["alignment_idx"]),
-            ]
-        )
-        == 0
-    )
+    assert _run("alignment", "cohort", *pool, *alignment) == 0
     assert json.loads(capsys.readouterr().out)["prep_sample_idx"] == seed["prep_sample_idxs"]
 
     # --- Pooled, Parquet: the default build, over the discovered cohort. ---

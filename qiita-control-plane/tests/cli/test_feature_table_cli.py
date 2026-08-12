@@ -180,7 +180,7 @@ def test_the_relabel_driver_writes_the_public_table_and_reports_its_size():
             f"AS t({', '.join(ft.OUTPUT_COLUMNS)})"
         )
         clearance = ftc._relabel(conn)
-        rows = conn.execute(f"SELECT * FROM {ft.LABELLED_TABLE} ORDER BY 1").fetchall()
+        rows = conn.execute(f"SELECT * FROM {ft.LABELLED_RELATION} ORDER BY 1").fetchall()
 
     assert clearance.rows == 2
     assert rows == [("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0)]
@@ -195,7 +195,7 @@ def _labelled(conn, rows=(("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0))) -> 
     """Stage a relabelled table, as the relabel would leave it."""
     values = ", ".join("(?::VARCHAR, ?::VARCHAR, ?::DOUBLE)" for _ in rows)
     conn.execute(
-        f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT * FROM (VALUES {values}) "
+        f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES {values}) "
         f"AS v({', '.join(ft.LABELLED_COLUMNS)})",
         [x for r in rows for x in r],
     )

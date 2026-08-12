@@ -13,11 +13,9 @@ Today the one table flavour is **OGU** (genome-keyed counts via miint's
 module is named for the general surface because taxonomy- and tree-derived tables
 join it later.
 
-**Breadth of coverage filters the table, at one of two scopes** (`CoverageScope`):
-pooled over the whole cohort, or per `(sample, genome)`. Pooled breadth is always
-≥ the best single sample's, since pooling unions intervals — so per-sample is
-strictly the stricter filter, and a genome can survive pooled while every one of
-its samples fails.
+**Breadth of coverage filters the table, at one of two scopes** — pooled over the
+whole cohort, or per `(sample, genome)`. The two are not symmetric; `CoverageScope`
+says why.
 
 **Plain SQL text; no duckdb import.** `qiita-common` has no duckdb dependency and
 must not gain one — it is the contract layer both Python services import. Callers
@@ -42,10 +40,10 @@ The map's source must be keyed `(feature_idx, genome_idx)`; `map_table_sql` does
 the rename to the column names `genome_coverage` requires.
 
 **A caller that PUBLISHES the table stages two more** — the label relations — and
-relabels the counts through them, ending at `LABELLED_TABLE` (`LABELLED_SCHEMA`):
+relabels the counts through them, ending at `LABELLED_RELATION` (`LABELLED_SCHEMA`):
 our `*_idx` keys are gone, and the public handles are VARCHAR, which is what makes
 the result writable as BIOM at all. See the relabel section below, and the two
-writers after it — `LABELLED_TABLE` is the only relation here they will copy.
+writers after it — `LABELLED_RELATION` is the only relation here they will copy.
 
 **The `source` argument of every staging builder is interpolated VERBATIM, and
 that is the caller's obligation to make safe.** A FROM-clause relation cannot be a
@@ -62,10 +60,11 @@ catalog. Everything else in this module is either a fixed literal or a bound `?`
 on a SEPARATE connection during bind/execute, so `OGU_INPUT_TABLE` is embedded in
 the generated SQL: a caller that staged a differently-named table gets a bind error.
 That separate connection also cannot see TEMP tables, registered stream relations,
-or CTEs — hence every staging statement here creates a regular non-temp TABLE. The
-one exception is `COVERAGE_ALIGNMENTS_VIEW`, read only by the `genome_coverage`
-macro on the caller's own connection, so a VIEW there avoids duplicating the
-alignment slice in RAM.
+or CTEs — hence every staging statement here creates a regular non-temp TABLE.
+**Two relations are exceptions, both read only on the caller's own connection and
+both VIEWs for the same reason** — materializing would duplicate a large relation
+in RAM for one reader: `COVERAGE_ALIGNMENTS_VIEW` (read by the `genome_coverage`
+macro) and `LABELLED_RELATION` (read by one COPY).
 
 miint signatures (qiita-verified; see `docs/duckdb-miint.md`):
 
@@ -187,7 +186,17 @@ def coverage_filter_applies(coverage_threshold: float) -> bool:
     rather than a comparison repeated at each site: an edit to the semantics that
     reached only one of them would open the lengths stream for a calculation that
     never runs, or worse, skip it for one that does.
+
+    Refuses a threshold that is not a proportion, the same way `AlignmentGate`
+    refuses its own: each consumer validates at its boundary (a Pydantic field, an
+    argparse type), but out of range the two failures here are silent rather than
+    loud — a negative threshold reads as "no filter at all", and one above 1 drops
+    every genome and returns an empty table that looks like a result.
     """
+    if not 0.0 <= coverage_threshold <= 1.0:
+        raise ValueError(
+            f"coverage_threshold must be a proportion in [0, 1], got {coverage_threshold!r}"
+        )
     return coverage_threshold > 0.0
 
 
@@ -347,6 +356,54 @@ def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
     return sql
 
 
+def ogu_input_statements(
+    *, scope: CoverageScope, coverage_threshold: float
+) -> tuple[tuple[str, list[float]], ...]:
+    """Everything between the staged inputs and woltka's input relation, as ordered
+    `(sql, parameters)` pairs. Requires `ALIGNMENT_TABLE`, `MAP_TABLE`, and — when
+    the threshold filters — `GENOME_LENGTHS_TABLE`.
+
+    **The order and the scope-to-`None` conversion live here rather than in each
+    consumer**, for the reason the module exists at all: a consumer that dropped the
+    survivor join would not fail, it would publish a table with unfiltered genomes
+    in it. A missed CREATE is a bind error; a missed filter is a plausible wrong
+    answer. Same device as `GateClearance.statements`.
+
+    The trailing DROPs are not tidiness. The coverage view, the alignment slice, and
+    the survivor set are all dead once `OGU_INPUT_TABLE` exists, and they are dead
+    for the whole remaining run — woltka, the relabel, and the write. On a client
+    machine over a large cohort that is several hundred MB held for nothing, and
+    DuckDB's spill directory is wherever the user happened to run the CLI.
+    """
+    statements: list[tuple[str, list[float]]] = []
+    filtering = coverage_filter_applies(coverage_threshold)
+    if filtering:
+        statements.append((coverage_alignments_view_sql(), []))
+        statements.append((survivor_table_sql(scope), [coverage_threshold]))
+    statements.append((ogu_input_table_sql(survivor_scope=scope if filtering else None), []))
+    if filtering:
+        # The view first: it reads the slice.
+        statements.append((f"DROP VIEW {COVERAGE_ALIGNMENTS_VIEW}", []))
+    statements.append((f"DROP TABLE {ALIGNMENT_TABLE}", []))
+    if filtering:
+        statements.append((f"DROP TABLE {survivor_table_name(scope)}", []))
+    return tuple(statements)
+
+
+def ogu_input_count_sql() -> str:
+    """How many rows woltka would see — the caller's cue to run it or short-circuit
+    to `empty_ogu_select_sql`, which is a decision both consumers make and neither
+    should spell out by hand."""
+    return f"SELECT count(*) FROM {OGU_INPUT_TABLE}"
+
+
+def drop_ogu_input_table_sql() -> str:
+    """Release woltka's input once the counts exist. Dead from that point on, and
+    the largest relation still standing — see `ogu_input_statements` for why that
+    matters on a client."""
+    return f"DROP TABLE {OGU_INPUT_TABLE}"
+
+
 def woltka_ogu_select_sql() -> str:
     """The feature table itself: per-sample OGU counts over `OGU_INPUT_TABLE`.
 
@@ -457,7 +514,8 @@ class GateClearance:
     `gated_alignment_table_sql` takes one of these rather than a bare gate, which is
     what makes "diagnose before you gate" a constraint instead of a docstring: two of
     the gate's failure modes are silent, so a caller who skips the check gets a
-    plausible wrong answer, and the only way to obtain a clearance is to have checked.
+    plausible wrong answer, and a clearance is not something a caller can produce by
+    doing anything other than the check.
     """
 
     gate: AlignmentGate
@@ -497,9 +555,9 @@ def gate_alignment_columns(gate: AlignmentGate | None) -> tuple[str, ...]:
     """The projection to request from the alignment DoGet: `ALIGNMENT_COLUMNS`, plus
     whatever `gate` needs to read.
 
-    `cigar` rides only when something scores it — it is the wide column the signed
-    projection exists to leave out — and `mate_position` only when the gate pools,
-    since its sole use is keying the partition. Both are in the ticket's allowlist.
+    `cigar` rides only when something scores it (see `ALIGNMENT_COLUMNS` for what
+    that column costs) and `mate_position` only when the gate pools, since its sole
+    use is keying the partition. Both are in the ticket's allowlist.
     """
     if gate is None:
         return ALIGNMENT_COLUMNS
@@ -544,13 +602,12 @@ def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
     placement's mates and filters with `QUALIFY`, which applies after the window.
     """
     gate = clearance.gate
-    terms = _gate_terms(gate, "cigar")
-    clause = "WHERE"
-    if gate.paired:
-        pooled = f"string_agg(cigar, '') OVER (PARTITION BY {PAIRED_PLACEMENT_PARTITION})"
-        terms = _gate_terms(gate, pooled)
-        clause = "QUALIFY"
-    predicate = " AND ".join(sql for sql, _ in terms)
+    scored, clause = (
+        (f"string_agg(cigar, '') OVER (PARTITION BY {PAIRED_PLACEMENT_PARTITION})", "QUALIFY")
+        if gate.paired
+        else ("cigar", "WHERE")
+    )
+    predicate = " AND ".join(sql for sql, _ in _gate_terms(gate, scored))
     return (
         f"CREATE TABLE {ALIGNMENT_TABLE} AS "
         f"SELECT {', '.join(ALIGNMENT_COLUMNS)} FROM {STREAMED_ALIGNMENT_TABLE} "
@@ -559,10 +616,10 @@ def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
 
 
 def drop_streamed_alignment_table_sql() -> str:
-    """Release the streamed copy once the gate has been applied. It holds `cigar`,
-    the wide column (see `docs/architecture.md` for what that costs), and nothing
-    reads it again — on a client machine over a large cohort, keeping it roughly
-    doubles the analytic's peak memory for no benefit."""
+    """Release the streamed copy once the gate has been applied. Nothing reads it
+    again, and it holds `cigar` — so on a client machine over a large cohort, keeping
+    it roughly doubles the analytic's peak memory for no benefit. `ogu_input_statements`
+    releases the rest of the pipeline's dead relations for the same reason."""
     return f"DROP TABLE {STREAMED_ALIGNMENT_TABLE}"
 
 
@@ -571,30 +628,43 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
     `(total_rows, scorable_rows, unpoolable_partitions, paired_rows)`.
 
     Each count is computed only when it could matter — parsing every CIGAR, and
-    grouping every placement, are both real work over the whole slice.
+    grouping every placement, are both real work over the slice that still holds
+    `cigar`.
+
+    **A paired gate takes ONE grouped pass, not a plain pass plus a grouped
+    subquery.** Every count here is additive over the placement partitions, so
+    aggregating the groups again gives identical numbers for one read of the widest
+    relation in the pipeline instead of two — and `paired` is the common case. The
+    `coalesce`s are load-bearing rather than defensive: `sum()` over zero groups is
+    NULL, which would turn the empty slice's `total_rows` into NULL and silently
+    stop `check_gate_diagnostics`' `== 0` early return from firing.
     """
     scorable = "count(cigar_sequence_identity(cigar))" if gate.min_identity is not None else "NULL"
-    unpoolable = "0"
-    if gate.paired:
-        # A partition that cannot be a single placement's mates, in the three ways it
-        # can fail. `count(col)` skips NULLs, which is what makes each detectable:
-        #   1. a row is present but carries no CIGAR   -> string_agg scores short;
-        #   2. a row claims a mapped mate that is not in the slice at all -> the
-        #      partition holds one row and looks complete, so (1) cannot see it;
-        #   3. more than two rows share the key -> not one placement, so the
-        #      concatenation spans unrelated alignments.
-        unpoolable = (
-            f"(SELECT count(*) FROM (SELECT 1 FROM {STREAMED_ALIGNMENT_TABLE} "
-            f"GROUP BY {PAIRED_PLACEMENT_PARTITION} HAVING "
-            f"count(*) <> count(cigar) "
-            f"OR (count(mate_position) > 0 AND count(*) = 1) "
-            f"OR count(*) > 2))"
+    paired_rows = f"count(*) FILTER (WHERE flags & {SAM_FLAG_PAIRED} <> 0)"
+    if not gate.paired:
+        return (
+            f"SELECT count(*) AS total_rows, {scorable} AS scorable_rows, "
+            f"0 AS unpoolable_partitions, {paired_rows} AS paired_rows "
+            f"FROM {STREAMED_ALIGNMENT_TABLE}"
         )
+    # A partition that cannot be a single placement's mates, in the three ways it
+    # can fail. `count(col)` skips NULLs, which is what makes each detectable:
+    #   1. a row is present but carries no CIGAR   -> string_agg scores short;
+    #   2. a row claims a mapped mate that is not in the slice at all -> the
+    #      partition holds one row and looks complete, so (1) cannot see it;
+    #   3. more than two rows share the key -> not one placement, so the
+    #      concatenation spans unrelated alignments.
     return (
-        f"SELECT count(*) AS total_rows, {scorable} AS scorable_rows, "
-        f"{unpoolable} AS unpoolable_partitions, "
-        f"count(*) FILTER (WHERE flags & {SAM_FLAG_PAIRED} <> 0) AS paired_rows "
-        f"FROM {STREAMED_ALIGNMENT_TABLE}"
+        f"WITH placement AS (SELECT count(*) AS rows_in_partition, "
+        f"count(cigar) AS with_cigar, count(mate_position) AS with_mate, "
+        f"{scorable} AS scorable, {paired_rows} AS paired "
+        f"FROM {STREAMED_ALIGNMENT_TABLE} GROUP BY {PAIRED_PLACEMENT_PARTITION}) "
+        f"SELECT coalesce(sum(rows_in_partition), 0) AS total_rows, "
+        f"sum(scorable) AS scorable_rows, "
+        f"count(*) FILTER (WHERE rows_in_partition <> with_cigar "
+        f"OR (with_mate > 0 AND rows_in_partition = 1) "
+        f"OR rows_in_partition > 2) AS unpoolable_partitions, "
+        f"coalesce(sum(paired), 0) AS paired_rows FROM placement"
     )
 
 
@@ -681,7 +751,14 @@ OGU_OUTPUT_TABLE = "ogu_output"
 # The two label relations, each `internal key -> public handle`.
 GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
-LABELLED_TABLE = "feature_table_labelled"
+
+# The published shape — a VIEW, not a table, and the second exception to the
+# non-temp-TABLE rule above (`COVERAGE_ALIGNMENTS_VIEW` is the first, for the same
+# reason): only the caller's own connection reads it, and its one reader is a COPY.
+# Materializing would hold a second full copy of the output — two VARCHARs and a
+# DOUBLE per row, tens of millions of rows at cohort scale — alive at exactly the
+# moment the BIOM writer is building its sparse matrix.
+LABELLED_RELATION = "feature_table_labelled"
 
 # What a PUBLISHED table carries, name -> SQL type. Neither id is one of ours:
 # `sample_id` is the minted `export_id` and `feature_id` the genome's `source_id`,
@@ -703,10 +780,9 @@ def ogu_output_table_sql(*, populated: bool) -> str:
     """Materialize the counts into `OGU_OUTPUT_TABLE`.
 
     `populated` picks the SELECT: the real `woltka_ogu` call, or the 0-row
-    short-circuit for an empty `OGU_INPUT_TABLE` (woltka rejects an all-NULL
-    `sample_id` source, so the caller cannot simply run it on nothing). Passing the
-    flag rather than the SELECT is what puts BOTH results in the same relation, so
-    an empty cohort travels the same relabel and the same writer as a populated one.
+    short-circuit `empty_ogu_select_sql` exists for. Passing the flag rather than the
+    SELECT is what puts BOTH results in the same relation, so an empty cohort travels
+    the same relabel and the same writer as a populated one.
 
     Materialized, unlike the server-side job's straight COPY, because the client
     reads the counts twice — once to check the labels, once to apply them — and
@@ -787,7 +863,7 @@ class LabelClearance:
     rows it cleared — which is the row count of the table about to be written, so a
     caller can report the size without counting it again.
 
-    `labelled_table_sql` takes one of these for the same reason
+    `labelled_relation_sql` takes one of these for the same reason
     `gated_alignment_table_sql` does: every failure the checks catch produces a
     published table that looks right, so the check cannot be optional.
     """
@@ -827,7 +903,7 @@ def check_relabel_diagnostics(
     sample_ids: int,
 ) -> LabelClearance:
     """Refuse every way the relabel can produce a WRONG published table instead of
-    an error, and return the `LabelClearance` `labelled_table_sql` requires. Takes
+    an error, and return the `LabelClearance` `labelled_relation_sql` requires. Takes
     `relabel_diagnostics_sql()`'s row.
 
     All three faults are silent in the output: an inflated count, a row named by a
@@ -890,19 +966,19 @@ def check_relabel_diagnostics(
     return LabelClearance(rows=labelled_rows)
 
 
-def labelled_table_sql(*, clearance: LabelClearance) -> str:
-    """Relabel the counts into `LABELLED_TABLE`: `LABELLED_COLUMNS` and nothing else.
+def labelled_relation_sql(*, clearance: LabelClearance) -> str:
+    """Relabel the counts into `LABELLED_RELATION`: `LABELLED_COLUMNS` and nothing else.
 
     The projection is the enforcement. Both `*_idx` columns are joined ON and then
     dropped, so no writer downstream can read one out of this relation even by
     accident — which is the property that keeps our internal identifiers out of a
     file somebody publishes.
 
-    **Takes a `LabelClearance`**, so it is unreachable without having run
-    `check_relabel_diagnostics`; see `LabelClearance`.
+    **Takes a `LabelClearance`**, so it cannot be reached by accident without having
+    run `check_relabel_diagnostics`; see `LabelClearance`.
     """
     return (
-        f"CREATE TABLE {LABELLED_TABLE} AS "
+        f"CREATE VIEW {LABELLED_RELATION} AS "
         f"SELECT {', '.join(LABELLED_COLUMNS)} FROM ({_labelled_select_sql()})"
     )
 
@@ -929,7 +1005,7 @@ def parquet_copy_sql(path: Path) -> str:
     false` on the writing connection — DuckDB errors at bind time otherwise — which is
     the caller's to set (see `parquet.py`).
     """
-    return f"COPY {LABELLED_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+    return f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
 
 
 def biom_copy_sql(path: Path) -> str:
@@ -937,7 +1013,7 @@ def biom_copy_sql(path: Path) -> str:
 
     The writer requires exactly `LABELLED_SCHEMA` — `feature_id`/`sample_id` VARCHAR
     and `value` DOUBLE, looked up BY NAME — and **silently ignores any other column**,
-    so it is `labelled_table_sql`'s projection, not this writer, that keeps our
+    so it is `labelled_relation_sql`'s projection, not this writer, that keeps our
     identifiers out of the file. Behaviours it does enforce, and two it applies
     without asking, are recorded in `docs/duckdb-miint.md` and pinned by the
     control-plane's BIOM contract test; the one that shapes callers most is that it
@@ -949,6 +1025,6 @@ def biom_copy_sql(path: Path) -> str:
     internal identifier, which must not ride a published file.
     """
     return (
-        f"COPY {LABELLED_TABLE} TO '{validate_parquet_path(path)}' "
+        f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' "
         f"(FORMAT BIOM, COMPRESSION 'gzip', GENERATED_BY '{BIOM_GENERATED_BY}')"
     )

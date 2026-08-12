@@ -52,7 +52,16 @@ _ALIGNMENT = [
 
 def _values(rows: list[tuple], columns: str, casts: str) -> str:
     """A VALUES relation with explicit casts — the id columns must reach miint as
-    native BIGINT (and `flags` as USMALLINT), never widened by inference."""
+    native BIGINT (and `flags` as USMALLINT), never widened by inference.
+
+    An empty `rows` still yields a correctly-TYPED 0-row relation: `VALUES` with no
+    tuples is a parse error, so the empty case selects one casted row and filters it
+    away. An empty input is a legitimate result in this analytic, so the scaffolding has
+    to be able to express it.
+    """
+    if not rows:
+        nulls = ", ".join(cast.replace("?", "NULL") for cast in casts.split(", "))
+        return f"SELECT * FROM (SELECT {nulls}) AS t({columns}) WHERE false"
     tuples = ", ".join(f"({casts})" for _ in rows)
     return f"SELECT * FROM (VALUES {tuples}) AS t({columns})"
 
@@ -118,28 +127,23 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
         conn.execute(ft.genome_lengths_table_sql("_len_src"))
 
 
-def _ogu_input(conn, scope, threshold, *, alignment, mapping, lengths, gate) -> bool:
-    """Stage the inputs and build woltka's input for `scope` at `threshold`, in a
-    consumer's call order. Returns whether the input has any rows — the caller's cue
-    to run woltka or short-circuit, which is a decision both consumers make."""
+def _ogu_input(
+    conn, scope, threshold, *, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, gate=None
+) -> bool:
+    """Stage the inputs and build woltka's input for `scope` at `threshold`, driving the
+    SHARED statement sequence — the same one both consumers run, rather than a third
+    hand-written copy of it. Returns whether the input has any rows, the caller's cue to
+    run woltka or short-circuit."""
     _stage(
-        conn,
-        alignment=_ALIGNMENT if alignment is None else alignment,
-        mapping=_MAP if mapping is None else mapping,
-        lengths=_LENGTHS if lengths is None else lengths,
-        threshold=threshold,
-        gate=gate,
+        conn, alignment=alignment, mapping=mapping, lengths=lengths, threshold=threshold, gate=gate
     )
-    survivor_scope = scope if ft.coverage_filter_applies(threshold) else None
-    if survivor_scope is not None:
-        conn.execute(ft.coverage_alignments_view_sql())
-        conn.execute(ft.survivor_table_sql(survivor_scope), [threshold])
-    conn.execute(ft.ogu_input_table_sql(survivor_scope=survivor_scope))
-    return conn.execute(f"SELECT count(*) FROM {ft.OGU_INPUT_TABLE}").fetchone()[0] > 0
+    for sql, parameters in ft.ogu_input_statements(scope=scope, coverage_threshold=threshold):
+        conn.execute(sql, parameters)
+    return conn.execute(ft.ogu_input_count_sql()).fetchone()[0] > 0
 
 
 def _table(
-    scope, threshold, *, alignment=None, mapping=None, lengths=None, gate=None
+    scope, threshold, *, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, gate=None
 ) -> list[tuple]:
     """Run the whole analytic for `scope` at `threshold` and return the feature
     table, sorted — keyed by our own identifiers, as the server-side consumer leaves
@@ -571,6 +575,50 @@ def test_a_paired_gate_over_single_end_data_is_allowed():
     assert rows == [(1, 100, 1.0)]
 
 
+def test_a_gated_EMPTY_slice_clears_instead_of_erroring():
+    """The paired diagnostics aggregate over placement partitions, and `sum()` over zero
+    groups is NULL rather than 0 — so an empty slice would report a NULL `total_rows` and
+    silently skip the zero-row early return, reaching the checks with nothing to judge.
+    An empty slice is a legitimate result here (a cohort whose reads all failed
+    upstream), so it has to clear the gate and produce an empty table.
+    """
+    assert (
+        _table(
+            ft.CoverageScope.POOLED,
+            0.0,
+            alignment=[],
+            mapping=[(10, 100)],
+            lengths=[(10, 1000)],
+            gate=ft.AlignmentGate(min_identity=0.9, paired=True),
+        )
+        == []
+    )
+
+
+def test_the_analytic_releases_the_relations_it_finishes_with():
+    """The memory claim, checked rather than asserted in prose: after woltka's input is
+    built, the alignment slice and the coverage machinery are gone — and after the counts
+    are materialized, so is woltka's input. On a large cohort these are the biggest
+    relations in the pipeline, and they would otherwise live until the connection closes.
+    """
+    scope = ft.CoverageScope.POOLED
+    with connect_with_miint_staged() as conn:
+        populated = _ogu_input(conn, scope, 0.01)
+        surviving = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+        assert ft.OGU_INPUT_TABLE in surviving
+        assert not surviving & {
+            ft.ALIGNMENT_TABLE,
+            ft.COVERAGE_ALIGNMENTS_VIEW,
+            ft.survivor_table_name(scope),
+        }
+
+        conn.execute(ft.ogu_output_table_sql(populated=populated))
+        conn.execute(ft.drop_ogu_input_table_sql())
+        after = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+    assert ft.OGU_OUTPUT_TABLE in after
+    assert ft.OGU_INPUT_TABLE not in after
+
+
 def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
     """The minimap2-shaped configuration — pooled, identity AND coverage — which no
     other test exercises. The mates pool to identity 1.0 and coverage 0.93, so a 0.95
@@ -646,9 +694,8 @@ def _relabel(conn) -> ft.LabelClearance:
     """
     cursor = conn.execute(ft.relabel_diagnostics_sql())
     names = [d[0] for d in cursor.description]
-    row = dict(zip(names, cursor.fetchone(), strict=True))
-    clearance = ft.check_relabel_diagnostics(**row)
-    conn.execute(ft.labelled_table_sql(clearance=clearance))
+    clearance = ft.check_relabel_diagnostics(**dict(zip(names, cursor.fetchone(), strict=True)))
+    conn.execute(ft.labelled_relation_sql(clearance=clearance))
     return clearance
 
 
@@ -656,15 +703,20 @@ def _public_table(
     scope,
     threshold,
     *,
-    alignment=None,
-    mapping=None,
-    lengths=None,
+    alignment=_ALIGNMENT,
+    mapping=_MAP,
+    lengths=_LENGTHS,
     gate=None,
     genome_map=None,
-    handles=None,
+    handles=_HANDLES,
 ) -> list[tuple]:
     """Run the analytic AND the relabel, returning the PUBLIC table, sorted. Mirrors
-    the client-side consumer's call order precisely."""
+    the client-side consumer's call order precisely.
+
+    `genome_map` defaults to the one derived from `mapping`, which is the invariant the
+    client-side stager enforces by construction (both label relations from one response);
+    a test that wants them to DISAGREE passes it explicitly.
+    """
     with connect_with_miint_staged() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
@@ -672,13 +724,11 @@ def _public_table(
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(
             conn,
-            genome_map=_genome_map(_MAP if mapping is None else mapping)
-            if genome_map is None
-            else genome_map,
-            handles=_HANDLES if handles is None else handles,
+            genome_map=_genome_map(mapping) if genome_map is None else genome_map,
+            handles=handles,
         )
         _relabel(conn)
-        return conn.execute(f"SELECT * FROM {ft.LABELLED_TABLE} ORDER BY 1, 2").fetchall()
+        return conn.execute(f"SELECT * FROM {ft.LABELLED_RELATION} ORDER BY 1, 2").fetchall()
 
 
 def test_the_public_table_carries_handles_instead_of_our_identifiers():
@@ -698,19 +748,11 @@ def test_no_internal_identifier_survives_into_the_public_table():
     and the writers downstream inherit it from this table alone.
     """
     with connect_with_miint_staged() as conn:
-        populated = _ogu_input(
-            conn,
-            ft.CoverageScope.POOLED,
-            0.01,
-            alignment=None,
-            mapping=None,
-            lengths=None,
-            gate=None,
-        )
+        populated = _ogu_input(conn, ft.CoverageScope.POOLED, 0.01)
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, genome_map=_genome_map(_MAP), handles=_HANDLES)
         _relabel(conn)
-        described = conn.execute(f"DESCRIBE {ft.LABELLED_TABLE}").fetchall()
+        described = conn.execute(f"DESCRIBE {ft.LABELLED_RELATION}").fetchall()
 
     assert [(r[0], r[1]) for r in described] == list(ft.LABELLED_SCHEMA.items())
     assert not [name for name, *_ in described if "idx" in name]
@@ -790,21 +832,15 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
     populated cohort produces. This is the path a caller exercises least.
     """
     with connect_with_miint_staged() as conn:
-        populated = _ogu_input(
-            conn,
-            ft.CoverageScope.POOLED,
-            1.0,
-            alignment=None,
-            mapping=None,
-            lengths=None,
-            gate=None,
-        )
+        populated = _ogu_input(conn, ft.CoverageScope.POOLED, 1.0)
         assert not populated
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, genome_map=_genome_map(_MAP), handles=_HANDLES)
         clearance = _relabel(conn)
-        described = [(r[0], r[1]) for r in conn.execute(f"DESCRIBE {ft.LABELLED_TABLE}").fetchall()]
-        rows = conn.execute(f"SELECT count(*) FROM {ft.LABELLED_TABLE}").fetchone()[0]
+        described = [
+            (r[0], r[1]) for r in conn.execute(f"DESCRIBE {ft.LABELLED_RELATION}").fetchall()
+        ]
+        rows = conn.execute(f"SELECT count(*) FROM {ft.LABELLED_RELATION}").fetchone()[0]
 
     assert clearance.rows == 0
     assert rows == 0

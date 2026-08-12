@@ -142,22 +142,18 @@ def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    source = pa.table(
-        {
-            "feature_idx": pa.array([e["feature_idx"] for e in entries], pa.int64()),
-            "genome_idx": pa.array([e["genome_idx"] for e in entries], pa.int64()),
-            "source_id": pa.array([e["source_id"] for e in entries], pa.string()),
-        }
+    # `from_pylist` with an explicit schema keeps the declared types AND reads the
+    # entries once — a column-at-a-time comprehension walks a quarter-million dicts
+    # three times. It also drops `source` for free, by selecting on the schema.
+    source = pa.Table.from_pylist(
+        entries,
+        schema=pa.schema(
+            [("feature_idx", pa.int64()), ("genome_idx", pa.int64()), ("source_id", pa.string())]
+        ),
     )
-    con.register(_GENOME_MAP_SOURCE, source)
-    try:
+    with _registered(con, _GENOME_MAP_SOURCE, source):
         for sql in ft.genome_map_relations_sql(_GENOME_MAP_SOURCE):
             con.execute(sql)
-    finally:
-        # Released as soon as the CREATEs have copied it: at the route's cap this is
-        # a quarter-million pairs, and holding the arrow table as well as the two
-        # relations doubles that for nothing.
-        con.unregister(_GENOME_MAP_SOURCE)
 
 
 def _stage_exported_identifiers(con, identifiers: list[dict[str, Any]]) -> None:
@@ -169,22 +165,34 @@ def _stage_exported_identifiers(con, identifiers: list[dict[str, Any]]) -> None:
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    source = pa.table(
-        {
-            "prep_sample_idx": pa.array([i["prep_sample_idx"] for i in identifiers], pa.int64()),
-            "export_id": pa.array([i["export_id"] for i in identifiers], pa.string()),
-        }
+    source = pa.Table.from_pylist(
+        identifiers,
+        schema=pa.schema([("prep_sample_idx", pa.int64()), ("export_id", pa.string())]),
     )
-    con.register(_MINT_SOURCE, source)
-    try:
+    with _registered(con, _MINT_SOURCE, source):
         con.execute(ft.sample_label_table_sql(_MINT_SOURCE))
+
+
+@contextlib.contextmanager
+def _registered(con, relation: str, obj) -> Iterator[str]:
+    """Register an Arrow object on `con` as `relation` for the block's duration, and
+    release it however the block ends.
+
+    One lifecycle for all three staged inputs — `con.register` takes an Arrow table as
+    happily as a stream reader. The release matters most for what it frees soonest: at
+    the genome-map route's cap the registered table is a quarter-million pairs, and
+    holding it alongside the two relations copied out of it doubles that for nothing.
+    """
+    con.register(relation, obj)
+    try:
+        yield relation
     finally:
-        con.unregister(_MINT_SOURCE)
+        con.unregister(relation)
 
 
 @contextlib.contextmanager
 def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterator[str]:
-    """Register a DoGet stream on `con` as `relation` for the block's duration.
+    """`_registered` over a Flight DoGet stream.
 
     DuckDB pulls the Arrow stream lazily as the query scans `relation`, so the rows are
     never buffered in Python — the reason each caller below runs exactly one
@@ -198,12 +206,23 @@ def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Itera
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    reader = flight_client.do_get(flight.Ticket(ticket)).to_reader()
-    con.register(relation, reader)
-    try:
+    with _registered(con, relation, flight_client.do_get(flight.Ticket(ticket)).to_reader()):
         yield relation
-    finally:
-        con.unregister(relation)
+
+
+def _cleared(con, diagnostics_sql: str, check, *args):
+    """Run a `*_diagnostics_sql` and hand its single row to the matching `check_*`,
+    returning the clearance that check produces.
+
+    **The row is passed BY NAME** — the query's column names are the check's parameter
+    names — so a rename on either side is a `TypeError` here rather than one count
+    silently arriving as another's argument. Both checks in this recipe pair the same
+    way, hence one helper: two hand-written `zip`s is two chances to unpack positionally,
+    which is exactly the failure the by-name form exists to prevent.
+    """
+    cursor = con.execute(diagnostics_sql)
+    names = [column[0] for column in cursor.description]
+    return check(*args, **dict(zip(names, cursor.fetchone(), strict=True)))
 
 
 def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGate | None) -> None:
@@ -211,13 +230,9 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
     one. Everything downstream reads that one relation either way, so a gate cannot be
     half-applied.
 
-    The gated path materializes the UNGATED slice first: the checks below have to see
-    the rows the gate would drop, and a Flight stream cannot be scanned twice. The
-    diagnostics therefore run after the stream is released, off the materialized copy.
-
-    The diagnostics row is passed to the check **by name** — the query's column names
-    are the check's parameter names — so a rename on either side is a `TypeError` here
-    rather than one count silently arriving as another's argument.
+    The gated path materializes the UNGATED slice first: the checks have to see the rows
+    the gate would drop, and a Flight stream cannot be scanned twice. The diagnostics
+    therefore run after the stream is released, off the materialized copy.
     """
     with _staged_stream(con, flight_client, ticket, relation=_ALIGNMENT_STREAM) as source:
         con.execute(
@@ -227,9 +242,7 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
         )
     if gate is None:
         return
-    cursor = con.execute(ft.gate_diagnostics_sql(gate))
-    names = [column[0] for column in cursor.description]
-    clearance = ft.check_gate_diagnostics(gate, **dict(zip(names, cursor.fetchone(), strict=True)))
+    clearance = _cleared(con, ft.gate_diagnostics_sql(gate), ft.check_gate_diagnostics, gate)
     # The clearance carries the rest of the protocol in order — apply the gate, then
     # release the streamed copy that holds `cigar`.
     for sql, parameters in clearance.statements:
@@ -248,34 +261,28 @@ def _build_ogu_output(con, *, scope: ft.CoverageScope, coverage_threshold: float
     `OGU_OUTPUT_TABLE`. Requires `ALIGNMENT_TABLE` and `MAP_TABLE`, plus
     `GENOME_LENGTHS_TABLE` when the threshold filters anything.
 
-    The server-side job's `_write_ogu_table` is the same sequence over the same
-    builders, differing only in being pooled-only and COPYing straight out; the shared
-    module is what keeps the two from disagreeing about the analytic itself.
+    Both the statement order and the empty-input short-circuit come from the shared
+    module, so this driver and the server-side job's `_write_ogu_table` cannot disagree
+    about the analytic — only about how the result is written.
     """
-    survivor_scope = scope if ft.coverage_filter_applies(coverage_threshold) else None
-    if survivor_scope is not None:
-        con.execute(ft.coverage_alignments_view_sql())
-        con.execute(ft.survivor_table_sql(survivor_scope), [coverage_threshold])
-    con.execute(ft.ogu_input_table_sql(survivor_scope=survivor_scope))
-    # woltka rejects an all-NULL sample_id source, so an empty input short-circuits —
-    # into the same relation, so the empty cohort travels the same relabel and writer.
-    rows = con.execute(f"SELECT count(*) FROM {ft.OGU_INPUT_TABLE}").fetchone()[0]
+    for sql, parameters in ft.ogu_input_statements(
+        scope=scope, coverage_threshold=coverage_threshold
+    ):
+        con.execute(sql, parameters)
+    rows = con.execute(ft.ogu_input_count_sql()).fetchone()[0]
     con.execute(ft.ogu_output_table_sql(populated=bool(rows)))
+    con.execute(ft.drop_ogu_input_table_sql())
 
 
 def _relabel(con) -> ft.LabelClearance:
     """Attach the public handles to the counts, refusing anything that would publish a
-    wrong table, and write `LABELLED_TABLE`. Returns the clearance, whose `rows` is the
+    wrong table, and write `LABELLED_RELATION`. Returns the clearance, whose `rows` is the
     size of the table now written.
 
-    The diagnostics row is passed to the check **by name** — the query's column names
-    are the check's parameter names — so a rename on either side is a `TypeError` here
-    rather than one count silently arriving as another's argument.
+    Returns the clearance, whose `rows` is the size of the relation now defined.
     """
-    cursor = con.execute(ft.relabel_diagnostics_sql())
-    names = [column[0] for column in cursor.description]
-    clearance = ft.check_relabel_diagnostics(**dict(zip(names, cursor.fetchone(), strict=True)))
-    con.execute(ft.labelled_table_sql(clearance=clearance))
+    clearance = _cleared(con, ft.relabel_diagnostics_sql(), ft.check_relabel_diagnostics)
+    con.execute(ft.labelled_relation_sql(clearance=clearance))
     return clearance
 
 
@@ -305,29 +312,14 @@ IDENTIFIER_MAP_NOTE = (
 )
 
 
-def _bundle_paths(table_path: Path, fmt: str) -> list[Path]:
-    """The two files `table_path` implies, in write order: the table itself, at exactly
-    the name the caller gave, and the identifier map beside it.
+def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
+    """The two paths a bundle occupies, in write order — the table at exactly the name
+    the caller gave, and the identifier map beside it — checked to be writable and
+    unoccupied.
 
     Refuses a `fmt` the writers do not have, and a `table_path` whose extension names
-    the OTHER format — a `.biom` holding Parquet bytes is a file that lies about itself
-    to everyone downstream, and it is the caller's name, so we cannot quietly rewrite
-    it.
-    """
-    if fmt not in TABLE_FORMATS:
-        raise ValueError(f"unsupported feature-table format: {fmt!r} (expected {TABLE_FORMATS})")
-    suffix = table_path.suffix.lstrip(".").lower()
-    if suffix in TABLE_FORMATS and suffix != fmt:
-        raise ValueError(
-            f"{table_path.name} is named for {suffix} but the requested format is {fmt}; "
-            f"the two formats hold the same numbers, so pick either — a file whose "
-            f"extension contradicts its contents misleads every reader of it."
-        )
-    return [table_path, table_path.with_name(table_path.stem + _IDENTIFIER_MAP_SUFFIX)]
-
-
-def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
-    """The two paths a bundle would occupy, checked to be writable and unoccupied.
+    the OTHER format: a `.biom` holding Parquet bytes lies about itself to everyone
+    downstream, and the name is the caller's, so it is not ours to quietly rewrite.
 
     **An existing artifact is refused, before anything is written.** The two writers
     disagree about this on their own — the BIOM writer refuses to overwrite, the Parquet
@@ -339,7 +331,16 @@ def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
     discovering the collision after all that wastes the run. `_write_bundle` calls it
     again at the write itself, which is the check that actually guards the files.
     """
-    targets = _bundle_paths(table_path, fmt)
+    if fmt not in TABLE_FORMATS:
+        raise ValueError(f"unsupported feature-table format: {fmt!r} (expected {TABLE_FORMATS})")
+    suffix = table_path.suffix.lstrip(".").lower()
+    if suffix in TABLE_FORMATS and suffix != fmt:
+        raise ValueError(
+            f"{table_path.name} is named for {suffix} but the requested format is {fmt}; "
+            f"the two formats hold the same numbers, so pick either — a file whose "
+            f"extension contradicts its contents misleads every reader of it."
+        )
+    targets = [table_path, table_path.with_name(table_path.stem + _IDENTIFIER_MAP_SUFFIX)]
     parent = table_path.parent
     if not parent.is_dir():
         # Caught here rather than left to the writers: DuckDB's Parquet COPY and HDF5
@@ -393,17 +394,16 @@ def _write_bundle(
             con.execute(ft.parquet_copy_sql(table_partial))
         else:
             con.execute(ft.biom_copy_sql(table_partial))
-        map_partial.write_text(
-            json.dumps(
-                {
-                    "note": IDENTIFIER_MAP_NOTE,
-                    "count": len(identifiers),
-                    "identifiers": identifiers,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
+        payload = {
+            "note": IDENTIFIER_MAP_NOTE,
+            "count": len(identifiers),
+            "identifiers": identifiers,
+        }
+        # Straight into the file: `json.dumps` would build the whole document as a
+        # string first, and at cohort scale that document is tens of megabytes.
+        with map_partial.open("w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
 
     # No `mode`: the two files land side by side and one of them is meant to be
     # published, so a restrictive mode would be wrong for it. The map's hazard is
@@ -482,7 +482,8 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
 
     The Flight client lives only for the two streams and the tickets that authorize them:
     each stream is drained by the one CREATE that materializes it, so nothing holds a gRPC
-    connection open through the compute, the relabel, or the write.
+    connection open through the compute, the relabel, or the write. `FlightClient` is its
+    own context manager, so that lifetime is the `with` block.
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
@@ -504,7 +505,17 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
     )
     _stage_exported_identifiers(con, identifiers)
 
-    with contextlib.closing(flight.FlightClient(args.data_plane_url)) as flight_client:
+    with flight.FlightClient(args.data_plane_url) as flight_client:
+        # Lengths first, though the alignment is the interesting stream: this one is a
+        # whole-reference read that costs a ticket mint and a small aggregate, so a
+        # failure in it should not come after a cohort's worth of alignment rows have
+        # already crossed the wire. Same order as the server-side job.
+        if ft.coverage_filter_applies(args.coverage_threshold):
+            _stage_lengths(
+                con,
+                flight_client,
+                _create_lengths_doget_ticket(args.base_url, token, reference_idx=reference_idx),
+            )
         _stage_alignment(
             con,
             flight_client,
@@ -517,12 +528,6 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
             ),
             gate=gate,
         )
-        if ft.coverage_filter_applies(args.coverage_threshold):
-            _stage_lengths(
-                con,
-                flight_client,
-                _create_lengths_doget_ticket(args.base_url, token, reference_idx=reference_idx),
-            )
     _build_ogu_output(
         con,
         scope=ft.CoverageScope(args.coverage_scope),
@@ -558,13 +563,12 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    con = None
     try:
         # Before anything else: a name already occupied, or a directory that is not
         # there, is not worth streaming a cohort and a whole reference to discover.
         _bundle_targets(args.output, args.format)
-        con = connect_with_miint()
-        written, rows = _run_build(args, token, con)
+        with contextlib.closing(connect_with_miint()) as con:
+            written, rows = _run_build(args, token, con)
     except _common.httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
@@ -584,9 +588,6 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         # that says what to do about it, so print it and stop.
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    finally:
-        if con is not None:
-            con.close()
 
     table_path, map_path = written
     print(f"wrote {rows} row(s) to {table_path} ({args.format})")

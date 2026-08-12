@@ -120,6 +120,16 @@ class _FakeFlightClient:
     def close(self):
         self.closed = True
 
+    # `flight.FlightClient` is itself a context manager and the handler uses it as one,
+    # so the fake has to be too — otherwise the test would pass against a handler that
+    # leaked the real client.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
 
 def _namespace(tmp_path, **overrides) -> argparse.Namespace:
     fields = {
@@ -140,9 +150,10 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
     return argparse.Namespace(**(fields | overrides))
 
 
-def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None, genome_map=None):
+def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None):
     """Patch the four REST seams, both ticket mints, and the Flight client; return the
-    recorder every assertion below reads."""
+    recorder every assertion below reads. A test that wants a seam to RAISE re-patches
+    it itself afterwards, rather than this growing a parameter per failure mode."""
     rec: dict = {"lengths_minted": 0}
     _FakeFlightClient.instances = []
 
@@ -158,14 +169,11 @@ def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None, geno
         "_fetch_alignment_cohort",
         lambda *a, **k: {"prep_sample_idx": [1, 2] if cohort is None else cohort},
     )
-    if genome_map is None:
-        monkeypatch.setattr(
-            ftc,
-            "_fetch_genome_map",
-            lambda *a, **k: _MAP_ENTRIES if map_entries is None else map_entries,
-        )
-    else:
-        monkeypatch.setattr(ftc, "_fetch_genome_map", genome_map)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_genome_map",
+        lambda *a, **k: _MAP_ENTRIES if map_entries is None else map_entries,
+    )
 
     def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx):
         rec["minted_cohort"] = prep_sample_idx
@@ -404,7 +412,8 @@ def test_a_genome_map_over_the_cap_stops_the_build_with_the_size(monkeypatch, tm
             detail, request=request, response=httpx.Response(413, text=detail, request=request)
         )
 
-    _patched(monkeypatch, genome_map=_too_big)
+    _patched(monkeypatch)
+    monkeypatch.setattr(ftc, "_fetch_genome_map", _too_big)
     assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
     err = capsys.readouterr().err
     assert "413" in err
@@ -480,29 +489,37 @@ def test_the_data_plane_url_reaches_the_flight_client(monkeypatch, tmp_path):
     assert _FakeFlightClient.instances[0].url == "grpc+tls://qiita.example.com:443"
 
 
+# The flags a valid `build` needs, so each parser test states only its own delta
+# instead of re-spelling thirteen argv elements. A `None` value drops the flag.
+_BUILD_FLAGS = {
+    "--sequencing-run-idx": "4",
+    "--sequenced-pool-idx": "5",
+    "--alignment-idx": "3",
+    "--coverage-threshold": "0.01",
+    "--output": "/tmp/ft/gut.parquet",
+    "--data-plane-url": "grpc://dp:50051",
+}
+
+
+def _build_argv(**overrides) -> list[str]:
+    """`feature-table build` argv from `_BUILD_FLAGS`, with `--flag-name` written as
+    `flag_name=`. A value of `None` omits the flag; a list repeats it."""
+    flags = _BUILD_FLAGS | {f"--{name.replace('_', '-')}": v for name, v in overrides.items()}
+    argv = ["feature-table", "build"]
+    for flag, value in flags.items():
+        if value is None:
+            continue
+        for one in value if isinstance(value, list) else [value]:
+            argv += [flag, one]
+    return argv
+
+
 def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
     from pathlib import Path
 
     from qiita_control_plane.cli.user._parser import _build_parser
 
-    args = _build_parser().parse_args(
-        [
-            "feature-table",
-            "build",
-            "--sequencing-run-idx",
-            "4",
-            "--sequenced-pool-idx",
-            "5",
-            "--alignment-idx",
-            "3",
-            "--coverage-threshold",
-            "0.01",
-            "--output",
-            "/tmp/ft/gut.parquet",
-            "--data-plane-url",
-            "grpc://dp:50051",
-        ]
-    )
+    args = _build_parser().parse_args(_build_argv())
     assert args.handler is ftc._handle_feature_table_build
     assert args.output == Path("/tmp/ft/gut.parquet")
     assert args.format == ftc.DEFAULT_TABLE_FORMAT == "parquet"
@@ -517,32 +534,14 @@ def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
     from qiita_control_plane.cli.user._parser import _build_parser
 
     args = _build_parser().parse_args(
-        [
-            "feature-table",
-            "build",
-            "--sequencing-run-idx",
-            "4",
-            "--sequenced-pool-idx",
-            "5",
-            "--alignment-idx",
-            "3",
-            "--prep-sample-idx",
-            "1",
-            "--prep-sample-idx",
-            "2",
-            "--coverage-scope",
-            "per-sample",
-            "--coverage-threshold",
-            "0",
-            "--min-identity",
-            "0.95",
-            "--format",
-            "biom",
-            "--output",
-            "/tmp/ft/gut.biom",
-            "--data-plane-url",
-            "grpc://dp:50051",
-        ]
+        _build_argv(
+            prep_sample_idx=["1", "2"],
+            coverage_scope="per-sample",
+            coverage_threshold="0",
+            min_identity="0.95",
+            format="biom",
+            output="/tmp/ft/gut.biom",
+        )
     )
     assert args.prep_sample_idx == [1, 2]
     assert args.coverage_scope == ft.CoverageScope.PER_SAMPLE.value
@@ -551,36 +550,13 @@ def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
 
 
 @pytest.mark.parametrize(
-    "missing",
-    ["--alignment-idx", "--coverage-threshold", "--output", "--data-plane-url"],
+    "missing", ["alignment_idx", "coverage_threshold", "output", "data_plane_url"]
 )
 def test_parser_rejects_a_build_missing_any_required_flag(missing):
     from qiita_control_plane.cli.user._parser import _build_parser
 
-    argv = [
-        "feature-table",
-        "build",
-        "--sequencing-run-idx",
-        "4",
-        "--sequenced-pool-idx",
-        "5",
-        "--alignment-idx",
-        "3",
-        "--coverage-threshold",
-        "0.01",
-        "--output",
-        "/tmp/ft/gut.parquet",
-        "--data-plane-url",
-        "grpc://dp:50051",
-    ]
-    trimmed = argv[:2] + [
-        part
-        for flag, value in zip(argv[2::2], argv[3::2], strict=True)
-        if flag != missing
-        for part in (flag, value)
-    ]
     with pytest.raises(SystemExit):
-        _build_parser().parse_args(trimmed)
+        _build_parser().parse_args(_build_argv(**{missing: None}))
 
 
 @pytest.mark.parametrize("value", ["1.5", "-0.1", "not-a-number"])
@@ -590,21 +566,4 @@ def test_parser_rejects_a_threshold_that_is_not_a_proportion(value):
     from qiita_control_plane.cli.user._parser import _build_parser
 
     with pytest.raises(SystemExit):
-        _build_parser().parse_args(
-            [
-                "feature-table",
-                "build",
-                "--sequencing-run-idx",
-                "4",
-                "--sequenced-pool-idx",
-                "5",
-                "--alignment-idx",
-                "3",
-                "--coverage-threshold",
-                value,
-                "--output",
-                "/tmp/ft/gut.parquet",
-                "--data-plane-url",
-                "grpc://dp:50051",
-            ]
-        )
+        _build_parser().parse_args(_build_argv(coverage_threshold=value))
