@@ -43,8 +43,9 @@ def test_survivor_join_is_in_the_ogu_input_statement_not_after_woltka():
     consumers' real-miint suites.
     """
     for scope in ft.CoverageScope:
-        assert ft.SURVIVOR_TABLE in ft.ogu_input_table_sql(survivor_scope=scope), scope
-    assert ft.SURVIVOR_TABLE not in ft.woltka_ogu_select_sql()
+        assert ft.survivor_table_name(scope) in ft.ogu_input_table_sql(survivor_scope=scope), scope
+    for scope in ft.CoverageScope:
+        assert ft.survivor_table_name(scope) not in ft.woltka_ogu_select_sql(), scope
 
 
 def test_ogu_input_omits_the_survivor_join_when_unfiltered():
@@ -52,7 +53,8 @@ def test_ogu_input_omits_the_survivor_join_when_unfiltered():
     qualifies, and the coverage calc is skipped entirely. `None` is how that is
     said, so the unfiltered case cannot be confused with a scope."""
     sql = ft.ogu_input_table_sql(survivor_scope=None)
-    assert ft.SURVIVOR_TABLE not in sql
+    for scope in ft.CoverageScope:
+        assert ft.survivor_table_name(scope) not in sql, scope
     assert ft.MAP_TABLE in sql  # the map join is unconditional
 
 
@@ -81,13 +83,35 @@ def test_only_the_per_sample_scope_keys_the_survivor_join_on_the_sample():
 
 
 def test_survivor_table_shape_matches_its_scope():
-    """The two scopes' survivor sets have different shapes under ONE table name, so
-    the scope that built it must be the scope that joins it — pooled emits genomes,
-    per-sample emits (sample, genome) pairs."""
+    """Pooled emits genomes; per-sample emits (sample, genome) pairs."""
     pooled = ft.survivor_table_sql(ft.CoverageScope.POOLED)
     per_sample = ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE)
     assert "prep_sample_idx" not in pooled
     assert "prep_sample_idx" in per_sample
+
+
+def test_each_scope_builds_and_joins_a_DIFFERENTLY_NAMED_survivor_relation():
+    """The scopes' survivor sets have different shapes, so the name carries the scope
+    — that is what makes a build/join mismatch a bind error instead of a wrong
+    number.
+
+    The dangerous direction is a per-sample set joined on the genome alone: valid
+    SQL that fans each alignment row out once per sample the genome survived in.
+    Distinct names remove it, so this asserts the names differ AND that each
+    statement only ever mentions its own.
+    """
+    pooled_name = ft.survivor_table_name(ft.CoverageScope.POOLED)
+    per_sample_name = ft.survivor_table_name(ft.CoverageScope.PER_SAMPLE)
+    assert pooled_name != per_sample_name
+
+    for scope, own, other in (
+        (ft.CoverageScope.POOLED, pooled_name, per_sample_name),
+        (ft.CoverageScope.PER_SAMPLE, per_sample_name, pooled_name),
+    ):
+        build = ft.survivor_table_sql(scope)
+        join = ft.ogu_input_table_sql(survivor_scope=scope)
+        assert own in build and own in join, scope
+        assert other not in build and other not in join, scope
 
 
 def test_pooled_scope_uses_the_macro_and_per_sample_hand_rolls_it():
@@ -259,7 +283,7 @@ def test_alignment_table_binds_exactly_the_declared_columns():
 def test_staging_builders_read_from_the_source_they_are_given():
     """Each staging builder reads from the caller's relation — a registered stream, a
     `read_parquet(...)` expression — because where the input comes from differs per
-    consumer while the projection does nft. Asserted as `FROM <source>` so the source
+    consumer while the projection does not. Asserted as `FROM <source>` so the source
     has to land in the FROM clause rather than merely appear somewhere.
     """
     assert "FROM my_relation" in ft.alignment_table_sql("my_relation")

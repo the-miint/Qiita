@@ -16,8 +16,8 @@ Three inputs, three sources:
 * the **alignment slice** streams from the data plane over Arrow Flight
   (`open_alignment_stream`, minted by `work_ticket_idx`) — no disk;
 * the **per-feature lengths** stream from the data plane's `reference_sequences`
-  (`open_reference_sequences_stream`, whole-reference so unaligned contigs are in
-  the coverage denominator) — no disk;
+  (`open_reference_sequences_stream`) — no disk. **Whole-reference**, for the reason
+  `feature_table.genome_lengths_table_sql` gives;
 * the **feature -> genome map** is the one Postgres-only input, staged as a small
   workspace Parquet by the CP runner resolver (`runner/_feature_table.py`) and
   read here via `read_parquet`.
@@ -99,9 +99,8 @@ def _write_ogu_table(
     """Run `qiita_common.feature_table`'s analytic over the already-staged working tables
     and COPY the result to `out_path` as Parquet (v2 + zstd). That module documents
     every rule the SQL encodes; what this function decides is the one thing a caller
-    must: **an empty `ogu_input` short-circuits** to a valid 0-row Parquet, because
-    `woltka_ogu` rejects an all-NULL `sample_id` source and an empty result is a
-    legitimate compute-on-demand answer, not a failure.
+    must: **an empty `ogu_input` short-circuits** to the 0-row form rather than
+    calling woltka, for the reason `feature_table.empty_ogu_select_sql` gives.
     """
     out_sql = validate_parquet_path(out_path)
 

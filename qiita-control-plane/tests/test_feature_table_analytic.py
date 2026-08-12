@@ -19,6 +19,7 @@ one-directional.
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 from qiita_common import feature_table as ft
 
@@ -129,13 +130,47 @@ def test_per_sample_drops_the_pair_no_single_sample_covers():
     ]
 
 
-def test_a_genome_every_sample_covers_is_identical_under_both_scopes():
-    """A scope switch must not disturb genomes each sample covers well on its own —
-    otherwise the discriminator above could be passing for the wrong reason (e.g. a
-    scope that drops everything)."""
-    pooled = [r for r in _table(ft.CoverageScope.POOLED, 0.01) if r[1] in (100, 400)]
-    per_sample = [r for r in _table(ft.CoverageScope.PER_SAMPLE, 0.01) if r[1] in (100, 400)]
-    assert pooled == per_sample == [(1, 100, 1.0), (1, 400, 2.0)]
+@pytest.mark.parametrize("threshold", [0.005, 0.01, 0.10, 0.30])
+def test_the_two_scopes_agree_exactly_on_a_single_sample_cohort(threshold):
+    """**The property the whole scope axis rests on.** With one sample in the cohort
+    there is nothing to pool, so "breadth over the cohort" and "breadth in this
+    sample" are the same question and the two scopes must return byte-identical
+    tables — at every threshold.
+
+    Pooled computes this inside miint's `genome_coverage`; per-sample reimplements
+    the macro's method in our own SQL. Anything that makes the two disagree — a
+    different denominator, a lost INNER JOIN, a missing DOUBLE cast, a different
+    per-contig grouping — shows up here as a divergence, on a fixture that exercises
+    a plain genome (G100), an unaligned-contig denominator (G300) and a multi-contig
+    sum (G400) at once. Several narrower tests would each catch *some* of that; only
+    this one states the general rule.
+
+    Swept across thresholds because a divergence may only be visible where one scope
+    lands on the far side of the cut from the other.
+    """
+    single_sample = [row for row in _ALIGNMENT if row[0] == 1]
+    pooled = _table(ft.CoverageScope.POOLED, threshold, alignment=single_sample)
+    per_sample = _table(ft.CoverageScope.PER_SAMPLE, threshold, alignment=single_sample)
+    assert pooled == per_sample
+    assert pooled, "fixture should not be empty at this threshold"
+
+
+def test_joining_the_wrong_scopes_survivor_set_is_a_bind_error():
+    """The scopes' survivor relations are named per scope, so building one and
+    joining the other names a relation that does not exist.
+
+    Without that, one direction is silently wrong rather than loud: a per-sample set
+    joined on the genome alone fans every alignment row out once per sample the
+    genome survived in, inflating its counts. This asserts the mismatch cannot get
+    that far.
+    """
+    with connect_with_miint_staged() as conn:
+        _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.01)
+        conn.execute(ft.coverage_alignments_view_sql())
+        conn.execute(ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE), [0.01])
+
+        with pytest.raises(duckdb.Error, match=ft.survivor_table_name(ft.CoverageScope.POOLED)):
+            conn.execute(ft.ogu_input_table_sql(survivor_scope=ft.CoverageScope.POOLED))
 
 
 @pytest.mark.parametrize("scope", list(ft.CoverageScope))

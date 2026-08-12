@@ -135,8 +135,29 @@ ALIGNMENT_TABLE = "alignment_slice"
 MAP_TABLE = "contig_to_genome"
 GENOME_LENGTHS_TABLE = "genome_lengths"
 COVERAGE_ALIGNMENTS_VIEW = "cov_alignments"
-SURVIVOR_TABLE = "survivor_genome"
 OGU_INPUT_TABLE = "ogu_input"
+
+# ONE SURVIVOR RELATION PER SCOPE, because the two have different shapes:
+# `(genome_id)` for pooled, `(prep_sample_idx, genome_id)` for per-sample. The
+# names differ so that building one scope's set and joining the other's is a bind
+# error in BOTH directions.
+#
+# Under a single shared name only one direction fails loudly. The other — a
+# per-sample set joined on the genome alone — is valid SQL and silently wrong: an
+# alignment row fans out once per sample the genome survived in, inflating every
+# count for that genome regardless of which sample the read came from. A caller
+# choosing the scope from a runtime flag is exactly the shape that gets this wrong,
+# so the relation name carries the scope rather than a docstring asking nicely.
+_SURVIVOR_TABLES = {
+    CoverageScope.POOLED: "survivor_genome_pooled",
+    CoverageScope.PER_SAMPLE: "survivor_genome_per_sample",
+}
+
+
+def survivor_table_name(scope: CoverageScope) -> str:
+    """The relation `survivor_table_sql(scope)` creates and `ogu_input_table_sql`
+    joins for that same scope."""
+    return _SURVIVOR_TABLES[scope]
 
 
 def coverage_filter_applies(coverage_threshold: float) -> bool:
@@ -229,9 +250,9 @@ def survivor_table_sql(scope: CoverageScope) -> str:
     Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`. The threshold is
     a bound parameter — execute with `[coverage_threshold]`.
 
-    **The two scopes give `SURVIVOR_TABLE` different shapes** — `(genome_id)` for
-    pooled, `(prep_sample_idx, genome_id)` for per-sample — so the scope that built
-    it must be the scope handed to `ogu_input_table_sql`. Pass one value to both.
+    Creates `survivor_table_name(scope)`, whose shape differs per scope —
+    `(genome_id)` for pooled, `(prep_sample_idx, genome_id)` for per-sample. That is
+    why the name carries the scope: see `_SURVIVOR_TABLES`.
 
     `POOLED` delegates to the `genome_coverage` macro. `PER_SAMPLE` cannot: the
     macro has no sample key. It instead reproduces the macro's own method with one
@@ -249,13 +270,13 @@ def survivor_table_sql(scope: CoverageScope) -> str:
     """
     if scope is CoverageScope.POOLED:
         return (
-            f"CREATE TABLE {SURVIVOR_TABLE} AS SELECT genome_id "
+            f"CREATE TABLE {survivor_table_name(scope)} AS SELECT genome_id "
             f"FROM genome_coverage("
             f"{COVERAGE_ALIGNMENTS_VIEW}, {GENOME_LENGTHS_TABLE}, {MAP_TABLE}) "
             f"WHERE proportion_covered >= ?"
         )
     return (
-        f"CREATE TABLE {SURVIVOR_TABLE} AS "
+        f"CREATE TABLE {survivor_table_name(scope)} AS "
         f"WITH per_contig AS ("
         f"SELECT prep_sample_idx, reference, "
         f"UNNEST(compress_intervals(position, stop_position)) AS ci "
@@ -281,10 +302,11 @@ def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
 
     `survivor_scope` is the scope whose survivor set to join, or **`None` when no
     threshold applies** — at 0 every genome with any alignment qualifies, so there
-    is no set to build or join. It must be the same scope
-    `survivor_table_sql` was called with, since the two scopes shape
-    `SURVIVOR_TABLE` differently: pooled joins on the genome alone, per-sample on
-    `(sample, genome)`, which is the entire behavioural difference between them.
+    is no set to build or join. It must be the same scope `survivor_table_sql` was
+    called with — pooled joins on the genome alone, per-sample on `(sample, genome)`,
+    which is the entire behavioural difference between the scopes. A mismatch names a
+    relation that was never created, so it is a bind error rather than a wrong
+    number (see `_SURVIVOR_TABLES`).
 
     The survivor join happens **here, before woltka**, and that ordering is
     load-bearing: `woltka_ogu` splits a multi-mapped read across its number of
@@ -302,7 +324,7 @@ def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
         f"JOIN {MAP_TABLE} m ON a.feature_idx = m.contig_id"
     )
     if survivor_scope is not None:
-        sql += f" JOIN {SURVIVOR_TABLE} s ON m.genome_id = s.genome_id"
+        sql += f" JOIN {survivor_table_name(survivor_scope)} s ON m.genome_id = s.genome_id"
         if survivor_scope is CoverageScope.PER_SAMPLE:
             sql += " AND a.prep_sample_idx = s.prep_sample_idx"
     return sql
