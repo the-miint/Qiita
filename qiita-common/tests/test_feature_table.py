@@ -16,6 +16,8 @@ answer rule rather than a crash, so it gets an assertion that names it.
 
 from __future__ import annotations
 
+import pytest
+
 from qiita_common import feature_table as ft
 
 # Every builder that emits a CREATE, with a representative call. Used by the
@@ -304,3 +306,202 @@ def test_map_table_renames_each_column_to_the_right_one():
     sql = ft.map_table_sql("src")
     assert "feature_idx AS contig_id" in sql
     assert "genome_idx AS genome_id" in sql
+
+
+# ---------------------------------------------------------------------------
+# The CIGAR identity / query-coverage gate
+# ---------------------------------------------------------------------------
+
+
+def test_gate_requires_at_least_one_threshold():
+    """A gate with neither threshold filters nothing while still costing the `cigar`
+    column on the wire — so it is a mistake, not a no-op, and is refused."""
+    with pytest.raises(ValueError, match="threshold"):
+        ft.AlignmentGate()
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.1])
+def test_gate_rejects_a_threshold_outside_zero_to_one(bad):
+    """Both scorers return a proportion, so a threshold outside [0, 1] can only be a
+    units mistake (a percentage, say) — and one above 1 would drop every row."""
+    with pytest.raises(ValueError):
+        ft.AlignmentGate(min_identity=bad)
+    with pytest.raises(ValueError):
+        ft.AlignmentGate(min_query_coverage=bad)
+
+
+def test_only_a_gate_adds_cigar_to_the_projection():
+    """`cigar` is the wide column the signed projection exists to leave out, so it
+    rides ONLY when something reads it. The base list stays cigar-free — a permanent
+    addition there would defeat the projection for every ungated caller."""
+    assert "cigar" not in ft.ALIGNMENT_COLUMNS
+    assert ft.gate_alignment_columns(None) == ft.ALIGNMENT_COLUMNS
+    assert "cigar" in ft.gate_alignment_columns(ft.AlignmentGate(min_identity=0.9))
+
+
+def test_only_a_paired_gate_asks_for_mate_position():
+    """`mate_position` exists only to key the pooled partition, so an unpaired gate
+    must not pay for it."""
+    unpaired = ft.gate_alignment_columns(ft.AlignmentGate(min_identity=0.9))
+    paired = ft.gate_alignment_columns(ft.AlignmentGate(min_identity=0.9, paired=True))
+    assert "mate_position" not in unpaired
+    assert "mate_position" in paired
+
+
+def test_the_gated_relation_drops_cigar_again():
+    """`cigar` is read by the gate and by nothing downstream, so the gated relation
+    projects exactly `ALIGNMENT_COLUMNS` — the wide column stops there instead of
+    propagating into the coverage view and woltka's input."""
+    sql = ft.gated_alignment_table_sql(gate=ft.AlignmentGate(min_identity=0.9))
+    projection = sql.split(" FROM ")[0]
+    assert "cigar" not in projection
+    for column in ft.ALIGNMENT_COLUMNS:
+        assert column in projection, column
+
+
+def test_an_unpaired_gate_filters_per_row_and_a_paired_gate_pools():
+    """A single-end record has no mate to pool with, so it is judged on its own CIGAR
+    by a plain WHERE — the pooled window over a one-row partition returns the same
+    answer at the cost of a full blocking sort of every alignment."""
+    unpaired = ft.gated_alignment_table_sql(gate=ft.AlignmentGate(min_identity=0.9))
+    paired = ft.gated_alignment_table_sql(gate=ft.AlignmentGate(min_identity=0.9, paired=True))
+    assert "WHERE" in unpaired and "QUALIFY" not in unpaired
+    assert "string_agg" not in unpaired
+    assert "QUALIFY" in paired and "string_agg(cigar, '')" in paired
+
+
+def test_the_pooled_partition_keys_on_the_placement_not_just_the_read():
+    """Pooling by read alone would merge a read's DISTINCT placements — two different
+    features, or two positions on one feature — into a single CIGAR and score that
+    concatenation, which is nobody's intended semantics.
+
+    The key is the placement: the read, the feature, and the mate-symmetric
+    coordinate pair. Mates store their own and their partner's coordinates in
+    SWAPPED order, so LEAST/GREATEST give both mates the same key. An unpaired row
+    has a NULL `mate_position` and both collapse to `position`, making it its own
+    single-row partition.
+    """
+    sql = ft.gated_alignment_table_sql(gate=ft.AlignmentGate(min_identity=0.9, paired=True))
+    partition = sql.split("PARTITION BY")[1]
+    assert "sequence_idx" in partition
+    assert "feature_idx" in partition
+    assert "LEAST(position, mate_position)" in partition
+    assert "GREATEST(position, mate_position)" in partition
+
+
+def test_the_pooled_aggregate_has_no_order_by():
+    """Deliberate: both CIGAR scorers are permutation-invariant, so which mate
+    concatenates first cannot matter, and an ORDER BY would buy a sort inside every
+    partition for nothing. If a build ever made a scorer position-dependent this gate
+    would go nondeterministic — the same pair kept on one run and dropped the next —
+    so the invariance is pinned in the orchestrator's suite, not assumed here.
+    """
+    sql = ft.gated_alignment_table_sql(gate=ft.AlignmentGate(min_identity=0.9, paired=True))
+    pooled = sql[sql.index("string_agg") : sql.index("PARTITION BY")]
+    assert "ORDER BY" not in pooled
+
+
+def test_gate_thresholds_are_bound_parameters_in_predicate_order():
+    """Two thresholds means two `?`, and a caller binding them in the wrong order
+    would swap identity for coverage silently. The parameter list is built from the
+    same ordered terms as the SQL, so it cannot disagree."""
+    gate = ft.AlignmentGate(min_identity=0.95, min_query_coverage=0.8)
+    sql = ft.gated_alignment_table_sql(gate=gate)
+    assert sql.count("?") == 2
+    assert sql.index("cigar_sequence_identity") < sql.index("cigar_query_coverage")
+    assert ft.gate_parameters(gate) == [0.95, 0.8]
+
+
+def test_a_query_coverage_only_gate_never_mentions_identity():
+    """The two thresholds are independent. Asking only about coverage must not drag
+    in an identity predicate — which matters because identity needs an eqx CIGAR and
+    coverage does not."""
+    sql = ft.gated_alignment_table_sql(gate=ft.AlignmentGate(min_query_coverage=0.9))
+    assert "cigar_query_coverage" in sql
+    assert "cigar_sequence_identity" not in sql
+    assert ft.gate_parameters(ft.AlignmentGate(min_query_coverage=0.9)) == [0.9]
+
+
+def test_diagnostics_count_scorable_rows_only_when_identity_is_gated():
+    """Counting scorable rows means parsing every CIGAR, which is worth paying for
+    only when an unscorable one would actually drop the row."""
+    with_identity = ft.gate_diagnostics_sql(ft.AlignmentGate(min_identity=0.9))
+    without = ft.gate_diagnostics_sql(ft.AlignmentGate(min_query_coverage=0.9))
+    assert "cigar_sequence_identity" in with_identity
+    assert "cigar_sequence_identity" not in without
+
+
+def test_diagnostics_count_split_partitions_only_for_a_paired_gate():
+    """A partition with a missing mate CIGAR is only a hazard when the gate pools."""
+    paired = ft.gate_diagnostics_sql(ft.AlignmentGate(min_identity=0.9, paired=True))
+    unpaired = ft.gate_diagnostics_sql(ft.AlignmentGate(min_identity=0.9))
+    assert "GROUP BY" in paired
+    assert "GROUP BY" not in unpaired
+
+
+def test_check_refuses_a_slice_whose_every_cigar_is_unscorable():
+    """`cigar_sequence_identity` is NULL on a CIGAR without `=`/`X` ops, and
+    `NULL >= threshold` is NULL, so the gate would silently drop EVERY row and
+    hand back an empty feature table that looks like a legitimate result.
+    """
+    with pytest.raises(ValueError, match="eqx|identity"):
+        ft.check_gate_diagnostics(
+            ft.AlignmentGate(min_identity=0.9),
+            total_rows=1000,
+            scorable_rows=0,
+            degraded_partitions=0,
+        )
+
+
+def test_check_ignores_unscorable_rows_when_identity_is_not_gated():
+    """Coverage is derivable from any CIGAR, so an unscorable-identity slice is fine
+    for a coverage-only gate — refusing it would block a legitimate request."""
+    ft.check_gate_diagnostics(
+        ft.AlignmentGate(min_query_coverage=0.9),
+        total_rows=1000,
+        scorable_rows=0,
+        degraded_partitions=0,
+    )
+
+
+def test_check_refuses_a_pooled_partition_missing_a_mate_cigar():
+    """`string_agg` SKIPS NULLs, so a pair with one unmapped mate is scored on the
+    other mate alone and silently judged as if it were a whole placement."""
+    with pytest.raises(ValueError, match="mate"):
+        ft.check_gate_diagnostics(
+            ft.AlignmentGate(min_identity=0.9, paired=True),
+            total_rows=1000,
+            scorable_rows=1000,
+            degraded_partitions=3,
+        )
+
+
+def test_check_ignores_split_partitions_for_an_unpaired_gate():
+    """An unpaired gate never pools, so a NULL CIGAR just fails the predicate for its
+    own row — no other row is affected."""
+    ft.check_gate_diagnostics(
+        ft.AlignmentGate(min_identity=0.9),
+        total_rows=1000,
+        scorable_rows=900,
+        degraded_partitions=7,
+    )
+
+
+def test_check_passes_a_clean_slice():
+    ft.check_gate_diagnostics(
+        ft.AlignmentGate(min_identity=0.9, min_query_coverage=0.8, paired=True),
+        total_rows=1000,
+        scorable_rows=1000,
+        degraded_partitions=0,
+    )
+
+
+def test_check_passes_an_empty_slice():
+    """An empty slice is a legitimate result elsewhere in this analytic, so the
+    all-unscorable check must not fire on 0 rows (0 of 0 is not evidence)."""
+    ft.check_gate_diagnostics(
+        ft.AlignmentGate(min_identity=0.9, paired=True),
+        total_rows=0,
+        scorable_rows=0,
+        degraded_partitions=0,
+    )

@@ -57,17 +57,33 @@ def _values(rows: list[tuple], columns: str, casts: str) -> str:
     return f"SELECT * FROM (VALUES {tuples}) AS t({columns})"
 
 
-def _stage(conn, *, alignment, mapping, lengths, threshold):
+def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
     """Stage the three inputs exactly as a consumer does, through the shared
-    builders, from raw VALUES source relations."""
+    builders, from raw VALUES source relations.
+
+    Alignment rows are 6-tuples, or 8-tuples carrying `(cigar, mate_position)` when a
+    gate reads them; short rows are padded with NULLs.
+
+    The alignment source is then **narrowed to `gate_alignment_columns(gate)`**, as
+    the real DoGet does — a source wide enough to satisfy a SELECT the analytic never
+    asked for would hide exactly the projection drift the signed column list exists
+    to prevent, so an over-reaching builder fails to bind here instead.
+    """
+    padded = [tuple(r) + (None,) * (8 - len(r)) for r in alignment]
     conn.execute(
         "CREATE TABLE _align_src AS "
         + _values(
-            alignment,
-            'prep_sample_idx, sequence_idx, feature_idx, flags, "position", stop_position',
-            "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT",
+            padded,
+            'prep_sample_idx, sequence_idx, feature_idx, flags, "position", stop_position,'
+            " cigar, mate_position",
+            "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT,"
+            " ?::VARCHAR, ?::BIGINT",
         ),
-        [x for r in alignment for x in r],
+        [x for r in padded for x in r],
+    )
+    conn.execute(
+        f"CREATE VIEW _align_projected AS "
+        f"SELECT {', '.join(ft.gate_alignment_columns(gate))} FROM _align_src"
     )
     conn.execute(
         "CREATE TABLE _map_src AS "
@@ -79,13 +95,24 @@ def _stage(conn, *, alignment, mapping, lengths, threshold):
         + _values(lengths, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
         [x for r in lengths for x in r],
     )
-    conn.execute(ft.alignment_table_sql("_align_src"))
+    if gate is None:
+        conn.execute(ft.alignment_table_sql("_align_projected"))
+    else:
+        conn.execute(ft.streamed_alignment_table_sql("_align_projected", gate=gate))
+        total, scorable, degraded = conn.execute(ft.gate_diagnostics_sql(gate)).fetchone()
+        ft.check_gate_diagnostics(
+            gate, total_rows=total, scorable_rows=scorable, degraded_partitions=degraded
+        )
+        conn.execute(ft.gated_alignment_table_sql(gate=gate), ft.gate_parameters(gate))
+        conn.execute(f"DROP TABLE {ft.STREAMED_ALIGNMENT_TABLE}")
     conn.execute(ft.map_table_sql("_map_src"))
     if ft.coverage_filter_applies(threshold):
         conn.execute(ft.genome_lengths_table_sql("_len_src"))
 
 
-def _table(scope, threshold, *, alignment=None, mapping=None, lengths=None) -> list[tuple]:
+def _table(
+    scope, threshold, *, alignment=None, mapping=None, lengths=None, gate=None
+) -> list[tuple]:
     """Run the whole analytic for `scope` at `threshold` and return the feature
     table, sorted. Mirrors a consumer's call order precisely."""
     with connect_with_miint_staged() as conn:
@@ -95,6 +122,7 @@ def _table(scope, threshold, *, alignment=None, mapping=None, lengths=None) -> l
             mapping=_MAP if mapping is None else mapping,
             lengths=_LENGTHS if lengths is None else lengths,
             threshold=threshold,
+            gate=gate,
         )
         survivor_scope = scope if ft.coverage_filter_applies(threshold) else None
         if survivor_scope is not None:
@@ -271,3 +299,197 @@ def test_empty_and_populated_paths_agree_on_column_types():
 
     assert real == empty
     assert real == [(name, sql_type) for name, sql_type in ft.OUTPUT_SCHEMA.items()]
+
+
+# ---------------------------------------------------------------------------
+# The CIGAR identity / query-coverage gate, against real miint
+#
+# CIGAR vocabulary used below (probed on the mirror build):
+#   '150='      identity 1.00, qcov 1.00   — a clean end-to-end hit
+#   '75=75X'    identity 0.50, qcov 1.00   — half the columns mismatch
+#   '150M'      identity NULL, qcov 1.00   — non-eqx: identity is not derivable
+#   '10S140M'   identity NULL, qcov 0.93   — non-eqx AND soft-clipped
+# ---------------------------------------------------------------------------
+
+_GATE = ft.AlignmentGate(min_identity=0.9)
+
+
+def test_the_gate_drops_a_low_identity_alignment():
+    """Two reads on one genome, one clean and one at 50% identity. Only the clean read
+    is counted — the gate removes the other before woltka ever sees it."""
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        alignment=[
+            (1, 1, 10, 0, 0, 150, "150=", None),
+            (1, 2, 10, 0, 150, 300, "75=75X", None),
+        ],
+        mapping=[(10, 100)],
+        lengths=[(10, 1000)],
+        gate=_GATE,
+    )
+    assert rows == [(1, 100, 1.0)]
+
+
+def test_the_gate_filters_coverage_as_well_as_counts():
+    """A gated-out alignment must not contribute covered bases either.
+
+    G200's only alignment is a 50%-identity hit spanning 60% of the genome. Ungated
+    it clears a 10% breadth threshold; gated there is nothing left to cover with, so
+    the genome disappears. If the gate only filtered woltka's input and not the
+    coverage view, G200 would survive the threshold and still be counted.
+    """
+    fixture = dict(
+        alignment=[
+            (1, 1, 10, 0, 0, 500, "150=", None),  # G100, clean
+            (1, 2, 20, 0, 0, 600, "75=75X", None),  # G200, fails the gate
+        ],
+        mapping=[(10, 100), (20, 200)],
+        lengths=[(10, 1000), (20, 1000)],
+    )
+    ungated = _table(ft.CoverageScope.POOLED, 0.10, **fixture)
+    gated = _table(ft.CoverageScope.POOLED, 0.10, **fixture, gate=_GATE)
+    assert {r[1] for r in ungated} == {100, 200}
+    assert {r[1] for r in gated} == {100}
+
+
+def test_a_paired_placement_is_kept_or_dropped_as_a_unit():
+    """Pooling judges a placement, not a mate. One mate at 1.00 and one at 0.50 pool
+    to 0.75 — below a 0.9 gate — so BOTH rows go. Scored per row instead, the clean
+    mate would survive and the read would be counted on a half-placement.
+    """
+    paired = ft.AlignmentGate(min_identity=0.9, paired=True)
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        # One placement of read 1 on feature 10: mates at 100 and 200, coordinates
+        # stored in swapped order as a real aligner emits them.
+        alignment=[
+            (1, 1, 10, 0, 100, 250, "150=", 200),
+            (1, 1, 10, 0, 200, 350, "75=75X", 100),
+        ],
+        mapping=[(10, 100)],
+        lengths=[(10, 1000)],
+        gate=paired,
+    )
+    assert rows == []
+
+
+def test_a_paired_placement_that_pools_above_the_floor_is_kept_whole():
+    """The other side of the same rule: two mates that pool to 1.0 both survive, and
+    the read is counted once."""
+    paired = ft.AlignmentGate(min_identity=0.9, paired=True)
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        alignment=[
+            (1, 1, 10, 0, 100, 250, "150=", 200),
+            (1, 1, 10, 0, 200, 350, "150=", 100),
+        ],
+        mapping=[(10, 100)],
+        lengths=[(10, 1000)],
+        gate=paired,
+    )
+    assert rows == [(1, 100, 1.0)]
+
+
+def test_a_reads_distinct_placements_are_judged_separately():
+    """`feature_idx` is in the partition key, so a read placed on two features is two
+    placements — one may pass and the other fail.
+
+    Pooling by read alone would concatenate all four CIGARs into one score and decide
+    both placements together, which is the bug the key exists to prevent: here the
+    pooled-by-read identity would be 0.75 and BOTH genomes would vanish.
+    """
+    paired = ft.AlignmentGate(min_identity=0.9, paired=True)
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        alignment=[
+            (1, 1, 10, 0, 100, 250, "150=", 200),  # placement A on feature 10: clean
+            (1, 1, 10, 0, 200, 350, "150=", 100),
+            (1, 1, 20, 0, 100, 250, "75=75X", 200),  # placement B on feature 20: fails
+            (1, 1, 20, 0, 200, 350, "75=75X", 100),
+        ],
+        mapping=[(10, 100), (20, 200)],
+        lengths=[(10, 1000), (20, 1000)],
+        gate=paired,
+    )
+    # Placement A survives alone, so the read is whole on G100 — not split 0.5/0.5.
+    assert rows == [(1, 100, 1.0)]
+
+
+def test_an_all_non_eqx_slice_is_refused_rather_than_silently_emptied():
+    """Every CIGAR is `150M`, so `cigar_sequence_identity` is NULL throughout and the
+    gate would drop every row, returning an empty table that looks like a real
+    result. The diagnostics catch it first and say what to do."""
+    with pytest.raises(ValueError, match="eqx"):
+        _table(
+            ft.CoverageScope.POOLED,
+            0.0,
+            alignment=[(1, 1, 10, 0, 0, 150, "150M", None)],
+            mapping=[(10, 100)],
+            lengths=[(10, 1000)],
+            gate=_GATE,
+        )
+
+
+def test_a_query_coverage_gate_works_on_a_non_eqx_cigar():
+    """The refinement that makes the refusal above survivable: coverage is derivable
+    from ANY CIGAR. The same `150M` slice an identity gate cannot judge passes a
+    coverage gate, and a soft-clipped `10S140M` at 0.93 fails a 0.95 floor.
+    """
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        alignment=[
+            (1, 1, 10, 0, 0, 150, "150M", None),  # qcov 1.00 -> kept
+            (1, 2, 10, 0, 150, 300, "10S140M", None),  # qcov 0.93 -> dropped
+        ],
+        mapping=[(10, 100)],
+        lengths=[(10, 1000)],
+        gate=ft.AlignmentGate(min_query_coverage=0.95),
+    )
+    assert rows == [(1, 100, 1.0)]
+
+
+def test_a_pair_missing_a_mate_cigar_is_refused_under_the_paired_gate():
+    """`string_agg` skips NULLs, so this placement would be scored on its surviving
+    mate alone — 1.0 from a half-placement — and silently kept. Refused instead, with
+    the unpaired gate offered as the way through."""
+    paired = ft.AlignmentGate(min_identity=0.9, paired=True)
+    with pytest.raises(ValueError, match="mate"):
+        _table(
+            ft.CoverageScope.POOLED,
+            0.0,
+            alignment=[
+                (1, 1, 10, 0, 100, 250, "150=", 200),
+                (1, 1, 10, 0, 200, 350, None, 100),  # unmapped mate: no CIGAR
+            ],
+            mapping=[(10, 100)],
+            lengths=[(10, 1000)],
+            gate=paired,
+        )
+
+
+def test_cigar_does_not_reach_the_gated_relation():
+    """The wide column stops at the gate. Downstream reads `ALIGNMENT_TABLE`, which
+    carries exactly `ALIGNMENT_COLUMNS` — so the coverage view and woltka's input
+    never pay for it, and the streamed copy that held it is dropped."""
+    with connect_with_miint_staged() as conn:
+        _stage(
+            conn,
+            alignment=[(1, 1, 10, 0, 0, 150, "150=", None)],
+            mapping=[(10, 100)],
+            lengths=[(10, 1000)],
+            threshold=0.0,
+            gate=_GATE,
+        )
+        columns = [r[0] for r in conn.execute(f"DESCRIBE {ft.ALIGNMENT_TABLE}").fetchall()]
+        assert columns == list(ft.ALIGNMENT_COLUMNS)
+        assert "cigar" not in columns
+        staged = conn.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?",
+            [ft.STREAMED_ALIGNMENT_TABLE],
+        ).fetchone()[0]
+        assert staged == 0, "the streamed copy holding cigar should be dropped"
