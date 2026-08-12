@@ -371,20 +371,30 @@ def empty_ogu_select_sql() -> str:
 # The CIGAR identity / query-coverage gate
 # ---------------------------------------------------------------------------
 
-# The pooled partition: one PLACEMENT, not one read. Pooling by read alone would
-# concatenate a read's distinct placements — different features, or different
-# positions on one feature — and score that concatenation, which is nobody's
-# intended semantics. Mates store their own and their partner's coordinates in
-# SWAPPED order, so LEAST/GREATEST give both mates of a placement the same key; an
-# unpaired row has a NULL `mate_position` and both collapse to `position`, making it
-# its own single-row partition. Copied from the orchestrator's `align_sharded`,
-# where the key is verified against real aligner output.
-_POOLED_PARTITION = (
+# One PLACEMENT of a read, as a GROUP BY / PARTITION BY key over alignment rows.
+#
+# Pooling by read alone would concatenate a read's distinct placements — different
+# features, or different positions on one feature — and score that concatenation,
+# which is nobody's intended semantics. Mates store their own and their partner's
+# coordinates in SWAPPED order, so LEAST/GREATEST give both mates of one placement
+# the same key; an unpaired row has a NULL `mate_position` and both collapse to
+# `position`, making it its own single-row partition.
+#
+# Verified against real aligner output in the orchestrator's `align_sharded`, which
+# imports it from here — one definition, because a change to it that reached only
+# one copy would silently rescore every paired placement in the other.
+PAIRED_PLACEMENT_PARTITION = (
     "sequence_idx, feature_idx, LEAST(position, mate_position), GREATEST(position, mate_position)"
 )
 
+# SAM FLAG 0x1: "template having multiple segments in sequencing" — i.e. the read is
+# part of a pair. Set on both mates regardless of whether either mapped, which is
+# what makes it a reliable answer to "is this slice paired data?" even when a mate's
+# row never arrived.
+SAM_FLAG_PAIRED = 0x1
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, kw_only=True)
 class AlignmentGate:
     """Thresholds an alignment must clear to be counted, and how to judge a pair.
 
@@ -396,9 +406,14 @@ class AlignmentGate:
     cannot judge at all.
 
     `paired` pools a placement's two mates and judges them as a unit, so a pair is
-    kept or dropped together and a mate is never orphaned. Leave it false for
-    single-end data: an unpaired row's pooled partition is one row, which gives the
-    same answer as a per-row predicate at the cost of a full blocking sort.
+    kept or dropped together and a mate is never orphaned.
+
+    **`paired=True` is correct for single-end rows too** — their partition is one row,
+    which scores the same as a per-row predicate — so this flag is a performance
+    choice, not a correctness one: pooling costs a full blocking sort of the slice.
+    Getting it wrong in the cheap direction is a silent correctness loss, so
+    `check_gate_diagnostics` refuses an unpaired gate over a slice that contains
+    paired reads rather than trusting the caller to have known.
     """
 
     min_identity: float | None = None
@@ -421,6 +436,32 @@ class AlignmentGate:
                 raise ValueError(
                     f"AlignmentGate.{name} must be a proportion in [0, 1], got {value!r}"
                 )
+
+
+@dataclass(frozen=True)
+class GateClearance:
+    """Evidence that `check_gate_diagnostics` ran and passed for `gate`.
+
+    `gated_alignment_table_sql` takes one of these rather than a bare gate, which is
+    what makes "diagnose before you gate" a constraint instead of a docstring: two of
+    the gate's failure modes are silent, so a caller who skips the check gets a
+    plausible wrong answer, and the only way to obtain a clearance is to have checked.
+    """
+
+    gate: AlignmentGate
+
+    @property
+    def statements(self) -> tuple[tuple[str, list[float]], ...]:
+        """The remaining `(sql, parameters)` pairs, in the order they must run: apply
+        the gate, then release the streamed copy that holds `cigar`.
+
+        Iterating this is the whole rest of the protocol, so a caller cannot bind the
+        wrong parameters to the predicate or forget the cleanup.
+        """
+        return (
+            (gated_alignment_table_sql(clearance=self), gate_parameters(self.gate)),
+            (drop_streamed_alignment_table_sql(), []),
+        )
 
 
 def _gate_terms(gate: AlignmentGate, cigar_expr: str) -> list[tuple[str, float]]:
@@ -468,28 +509,33 @@ def streamed_alignment_table_sql(source: str, *, gate: AlignmentGate) -> str:
     )
 
 
-def gated_alignment_table_sql(*, gate: AlignmentGate) -> str:
-    """Apply `gate` to `STREAMED_ALIGNMENT_TABLE`, producing `ALIGNMENT_TABLE` — the
-    same relation the ungated path creates, so **everything downstream is identical
-    and a gate cannot be half-applied**: there is one relation name to read, and it
-    is either gated or not.
+def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
+    """Apply the cleared gate to `STREAMED_ALIGNMENT_TABLE`, producing
+    `ALIGNMENT_TABLE` — the same relation the ungated path creates, so **everything
+    downstream is identical and a gate cannot be half-applied**: there is one
+    relation name to read, and it is either gated or not. In particular the gate
+    filters the coverage calculation as well as the counts, which is the point: an
+    alignment that fails it is not a placement, so it must not contribute covered
+    bases either.
 
-    Execute with `gate_parameters(gate)`. Run `check_gate_diagnostics` FIRST; two of
-    this predicate's failure modes are silent.
+    **Takes a `GateClearance`, not a gate**, so it is unreachable without having run
+    `check_gate_diagnostics` — two of this predicate's failure modes are silent, and
+    a docstring asking the caller to check first is not a constraint. Prefer
+    `clearance.statements`, which pairs this with its parameters and the cleanup
+    below in the order they must run.
 
     Projects exactly `ALIGNMENT_COLUMNS`, so `cigar` stops here instead of
     propagating into the coverage view and woltka's input. A real TABLE, not a view,
-    so the CIGARs are parsed once rather than on every downstream scan — after which
-    the caller should `DROP TABLE` the streamed relation, since it holds the wide
-    column (see `docs/architecture.md` for what that costs).
+    so the CIGARs are parsed once rather than on every downstream scan.
 
     An unpaired gate filters per row with `WHERE`. A paired one pools each
     placement's mates and filters with `QUALIFY`, which applies after the window.
     """
+    gate = clearance.gate
     terms = _gate_terms(gate, "cigar")
     clause = "WHERE"
     if gate.paired:
-        pooled = f"string_agg(cigar, '') OVER (PARTITION BY {_POOLED_PARTITION})"
+        pooled = f"string_agg(cigar, '') OVER (PARTITION BY {PAIRED_PLACEMENT_PARTITION})"
         terms = _gate_terms(gate, pooled)
         clause = "QUALIFY"
     predicate = " AND ".join(sql for sql, _ in terms)
@@ -500,26 +546,43 @@ def gated_alignment_table_sql(*, gate: AlignmentGate) -> str:
     )
 
 
+def drop_streamed_alignment_table_sql() -> str:
+    """Release the streamed copy once the gate has been applied. It holds `cigar`,
+    the wide column (see `docs/architecture.md` for what that costs), and nothing
+    reads it again — on a client machine over a large cohort, keeping it roughly
+    doubles the analytic's peak memory for no benefit."""
+    return f"DROP TABLE {STREAMED_ALIGNMENT_TABLE}"
+
+
 def gate_diagnostics_sql(gate: AlignmentGate) -> str:
-    """One row of `(total_rows, scorable_rows, degraded_partitions)` over
-    `STREAMED_ALIGNMENT_TABLE`, for `check_gate_diagnostics`.
+    """One row for `check_gate_diagnostics`, over `STREAMED_ALIGNMENT_TABLE`:
+    `(total_rows, scorable_rows, unpoolable_partitions, paired_rows)`.
 
     Each count is computed only when it could matter — parsing every CIGAR, and
     grouping every placement, are both real work over the whole slice.
     """
     scorable = "count(cigar_sequence_identity(cigar))" if gate.min_identity is not None else "NULL"
-    degraded = "0"
+    unpoolable = "0"
     if gate.paired:
-        # A placement whose mates do not all carry a CIGAR. `count(col)` skips NULLs,
-        # so a group where it disagrees with `count(*)` is one `string_agg` would
-        # silently score short.
-        degraded = (
+        # A partition that cannot be a single placement's mates, in the three ways it
+        # can fail. `count(col)` skips NULLs, which is what makes each detectable:
+        #   1. a row is present but carries no CIGAR   -> string_agg scores short;
+        #   2. a row claims a mapped mate that is not in the slice at all -> the
+        #      partition holds one row and looks complete, so (1) cannot see it;
+        #   3. more than two rows share the key -> not one placement, so the
+        #      concatenation spans unrelated alignments.
+        unpoolable = (
             f"(SELECT count(*) FROM (SELECT 1 FROM {STREAMED_ALIGNMENT_TABLE} "
-            f"GROUP BY {_POOLED_PARTITION} HAVING count(*) <> count(cigar)))"
+            f"GROUP BY {PAIRED_PLACEMENT_PARTITION} HAVING "
+            f"count(*) <> count(cigar) "
+            f"OR (count(mate_position) > 0 AND count(*) = 1) "
+            f"OR count(*) > 2))"
         )
     return (
         f"SELECT count(*) AS total_rows, {scorable} AS scorable_rows, "
-        f"{degraded} AS degraded_partitions FROM {STREAMED_ALIGNMENT_TABLE}"
+        f"{unpoolable} AS unpoolable_partitions, "
+        f"count(*) FILTER (WHERE flags & {SAM_FLAG_PAIRED} <> 0) AS paired_rows "
+        f"FROM {STREAMED_ALIGNMENT_TABLE}"
     )
 
 
@@ -528,41 +591,65 @@ def check_gate_diagnostics(
     *,
     total_rows: int,
     scorable_rows: int | None,
-    degraded_partitions: int,
-) -> None:
-    """Refuse the two gate failures that would otherwise produce a plausible wrong
-    answer instead of an error. Takes `gate_diagnostics_sql`'s row.
+    unpoolable_partitions: int,
+    paired_rows: int,
+) -> GateClearance:
+    """Refuse every gate failure that would otherwise produce a plausible wrong
+    answer instead of an error, and return the `GateClearance` that
+    `gated_alignment_table_sql` requires. Takes `gate_diagnostics_sql(gate)`'s row.
 
     Both consumers must refuse identically, which is why the judgement lives here
     rather than in each of them.
 
     **Partially-unscorable slices are NOT refused.** A CIGAR that cannot be scored
-    fails its own row's predicate and affects no other row, so dropping it is the
+    fails its own row\'s predicate and affects no other row, so dropping it is the
     gate working; a caller that wants to tell the user how many rows went that way
     can compare `scorable_rows` against `total_rows` itself.
     """
     if total_rows == 0:
         # 0 of 0 unscorable is not evidence of anything, and an empty slice is a
         # legitimate result elsewhere in this analytic.
-        return
+        return GateClearance(gate)
 
-    if gate.min_identity is not None and scorable_rows == 0:
+    if gate.min_identity is not None:
+        if scorable_rows is None:
+            raise ValueError(
+                "check_gate_diagnostics: scorable_rows is NULL while min_identity is "
+                "set. The row must come from gate_diagnostics_sql(the SAME gate), "
+                "which only emits NULL there when identity is not being gated."
+            )
+        if scorable_rows == 0:
+            raise ValueError(
+                f"None of the {total_rows} alignment rows can be scored for sequence "
+                f"identity: `cigar_sequence_identity` needs a CIGAR carrying `=`/`X` "
+                f"ops (an 'eqx' CIGAR) and returns NULL otherwise, and "
+                f"`NULL >= threshold` drops the row — so this gate would silently "
+                f"discard EVERY row and return an empty feature table that looks like "
+                f"a real result. Either re-align with eqx CIGARs, drop the identity "
+                f"threshold, or gate on query coverage instead, which any CIGAR "
+                f"supports."
+            )
+
+    if not gate.paired and paired_rows:
         raise ValueError(
-            f"None of the {total_rows} alignment rows can be scored for sequence "
-            f"identity: `cigar_sequence_identity` needs a CIGAR carrying `=`/`X` ops "
-            f"(an 'eqx' CIGAR) and returns NULL otherwise, and `NULL >= threshold` "
-            f"drops the row — so this gate would silently discard EVERY row and "
-            f"return an empty feature table that looks like a real result. Either "
-            f"re-align with eqx CIGARs, drop the identity threshold, or gate on "
-            f"query coverage instead, which any CIGAR supports."
+            f"{paired_rows} of {total_rows} alignment rows are paired (SAM FLAG "
+            f"0x{SAM_FLAG_PAIRED:x}), but this gate scores each row on its own CIGAR. "
+            f"That judges a placement's mates independently and orphans one when they "
+            f"disagree, which is the guarantee the pooled form exists to give. Pass "
+            f"`paired=True`; it is also correct for single-end rows, whose partition is "
+            f"a single row, and costs only a sort."
         )
 
-    if gate.paired and degraded_partitions:
+    if gate.paired and unpoolable_partitions:
         raise ValueError(
-            f"{degraded_partitions} paired placements have a mate with no CIGAR. The "
-            f"pooled gate concatenates a placement's mates with `string_agg`, which "
-            f"SKIPS NULLs, so each of these would be judged on its surviving mate "
-            f"alone and scored as though it were a whole placement. Use the unpaired "
-            f"gate, which scores every row on its own CIGAR, or restrict the cohort "
-            f"to alignments whose mates both mapped."
+            f"{unpoolable_partitions} pooled partitions are not a single paired "
+            f"placement: a mate row carries no CIGAR, or claims a mapped mate absent "
+            f"from this slice, or more than two rows share the placement key. "
+            f"`string_agg` skips NULLs and concatenates whatever it is given, so each "
+            f"of these would be scored on part of a placement — or on unrelated "
+            f"alignments — and silently kept or dropped on that basis. Restrict the "
+            f"cohort to alignments whose mates both mapped, or use the unpaired gate, "
+            f"which scores every row on its own CIGAR."
         )
+
+    return GateClearance(gate)

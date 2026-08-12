@@ -99,12 +99,20 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
         conn.execute(ft.alignment_table_sql("_align_projected"))
     else:
         conn.execute(ft.streamed_alignment_table_sql("_align_projected", gate=gate))
-        total, scorable, degraded = conn.execute(ft.gate_diagnostics_sql(gate)).fetchone()
-        ft.check_gate_diagnostics(
-            gate, total_rows=total, scorable_rows=scorable, degraded_partitions=degraded
+        total, scorable, unpoolable, paired_rows = conn.execute(
+            ft.gate_diagnostics_sql(gate)
+        ).fetchone()
+        clearance = ft.check_gate_diagnostics(
+            gate,
+            total_rows=total,
+            scorable_rows=scorable,
+            unpoolable_partitions=unpoolable,
+            paired_rows=paired_rows,
         )
-        conn.execute(ft.gated_alignment_table_sql(gate=gate), ft.gate_parameters(gate))
-        conn.execute(f"DROP TABLE {ft.STREAMED_ALIGNMENT_TABLE}")
+        # The clearance carries the rest of the protocol in order — the gate and the
+        # release of the streamed copy holding `cigar`.
+        for sql, params in clearance.statements:
+            conn.execute(sql, params)
     conn.execute(ft.map_table_sql("_map_src"))
     if ft.coverage_filter_applies(threshold):
         conn.execute(ft.genome_lengths_table_sql("_len_src"))
@@ -365,8 +373,8 @@ def test_a_paired_placement_is_kept_or_dropped_as_a_unit():
         # One placement of read 1 on feature 10: mates at 100 and 200, coordinates
         # stored in swapped order as a real aligner emits them.
         alignment=[
-            (1, 1, 10, 0, 100, 250, "150=", 200),
-            (1, 1, 10, 0, 200, 350, "75=75X", 100),
+            (1, 1, 10, 99, 100, 250, "150=", 200),
+            (1, 1, 10, 147, 200, 350, "75=75X", 100),
         ],
         mapping=[(10, 100)],
         lengths=[(10, 1000)],
@@ -383,14 +391,16 @@ def test_a_paired_placement_that_pools_above_the_floor_is_kept_whole():
         ft.CoverageScope.POOLED,
         0.0,
         alignment=[
-            (1, 1, 10, 0, 100, 250, "150=", 200),
-            (1, 1, 10, 0, 200, 350, "150=", 100),
+            (1, 1, 10, 99, 100, 250, "150=", 200),
+            (1, 1, 10, 147, 200, 350, "150=", 100),
         ],
         mapping=[(10, 100)],
         lengths=[(10, 1000)],
         gate=paired,
     )
-    assert rows == [(1, 100, 1.0)]
+    # 2.0, not 1.0: woltka counts per SEGMENT, and these flags mark the two rows as
+    # first/second in the template. See the `flags` note in docs/duckdb-miint.md.
+    assert rows == [(1, 100, 2.0)]
 
 
 def test_a_reads_distinct_placements_are_judged_separately():
@@ -406,17 +416,18 @@ def test_a_reads_distinct_placements_are_judged_separately():
         ft.CoverageScope.POOLED,
         0.0,
         alignment=[
-            (1, 1, 10, 0, 100, 250, "150=", 200),  # placement A on feature 10: clean
-            (1, 1, 10, 0, 200, 350, "150=", 100),
-            (1, 1, 20, 0, 100, 250, "75=75X", 200),  # placement B on feature 20: fails
-            (1, 1, 20, 0, 200, 350, "75=75X", 100),
+            (1, 1, 10, 99, 100, 250, "150=", 200),  # placement A on feature 10: clean
+            (1, 1, 10, 147, 200, 350, "150=", 100),
+            (1, 1, 20, 99, 100, 250, "75=75X", 200),  # placement B on feature 20: fails
+            (1, 1, 20, 147, 200, 350, "75=75X", 100),
         ],
         mapping=[(10, 100), (20, 200)],
         lengths=[(10, 1000), (20, 1000)],
         gate=paired,
     )
-    # Placement A survives alone, so the read is whole on G100 — not split 0.5/0.5.
-    assert rows == [(1, 100, 1.0)]
+    # Placement A survives alone, so its two segments land wholly on G100 — not
+    # split 0.5/0.5 across G100 and G200.
+    assert rows == [(1, 100, 2.0)]
 
 
 def test_an_all_non_eqx_slice_is_refused_rather_than_silently_emptied():
@@ -463,8 +474,8 @@ def test_a_pair_missing_a_mate_cigar_is_refused_under_the_paired_gate():
             ft.CoverageScope.POOLED,
             0.0,
             alignment=[
-                (1, 1, 10, 0, 100, 250, "150=", 200),
-                (1, 1, 10, 0, 200, 350, None, 100),  # unmapped mate: no CIGAR
+                (1, 1, 10, 99, 100, 250, "150=", 200),
+                (1, 1, 10, 147, 200, 350, None, 100),  # mate row present, no CIGAR
             ],
             mapping=[(10, 100)],
             lengths=[(10, 1000)],
@@ -493,3 +504,78 @@ def test_cigar_does_not_reach_the_gated_relation():
             [ft.STREAMED_ALIGNMENT_TABLE],
         ).fetchone()[0]
         assert staged == 0, "the streamed copy holding cigar should be dropped"
+
+
+def test_a_placement_whose_mate_row_is_absent_is_refused():
+    """The half of the missing-mate hazard that a NULL-CIGAR check cannot see.
+
+    Here the second mate's row is not in the slice AT ALL — the surviving row still
+    claims a mapped mate via `mate_position`, but its partition holds one row, so
+    `count(*) = count(cigar)` and the partition looks complete. `string_agg` would
+    score that single mate as though it were the whole placement.
+
+    A client streaming arbitrary alignment rows has no protection here: the
+    orchestrator's aligner runs under `no_discordant`/`no_mixed`, so it never emits a
+    lone mate, but an externally-produced alignment can.
+    """
+    paired = ft.AlignmentGate(min_identity=0.9, paired=True)
+    with pytest.raises(ValueError, match="placement"):
+        _table(
+            ft.CoverageScope.POOLED,
+            0.0,
+            alignment=[(1, 1, 10, 99, 100, 250, "150=", 200)],  # mate at 200 never arrives
+            mapping=[(10, 100)],
+            lengths=[(10, 1000)],
+            gate=paired,
+        )
+
+
+def test_an_unpaired_gate_over_paired_data_is_refused():
+    """Scoring each mate on its own CIGAR judges a placement's halves independently
+    and orphans one when they disagree. The refusal is what makes `paired` safe to get
+    wrong: it cannot be silently wrong in the cheap direction."""
+    with pytest.raises(ValueError, match="paired"):
+        _table(
+            ft.CoverageScope.POOLED,
+            0.0,
+            alignment=[
+                (1, 1, 10, 99, 100, 250, "150=", 200),
+                (1, 1, 10, 147, 200, 350, "150=", 100),
+            ],
+            mapping=[(10, 100)],
+            lengths=[(10, 1000)],
+            gate=ft.AlignmentGate(min_identity=0.9),  # NOT paired
+        )
+
+
+def test_a_paired_gate_over_single_end_data_is_allowed():
+    """The asymmetry that makes `paired=True` the safe choice when a caller cannot
+    tell: pooling single-end rows is correct, each being its own one-row partition."""
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        alignment=[(1, 1, 10, 0, 0, 150, "150=", None)],  # flags 0: not paired
+        mapping=[(10, 100)],
+        lengths=[(10, 1000)],
+        gate=ft.AlignmentGate(min_identity=0.9, paired=True),
+    )
+    assert rows == [(1, 100, 1.0)]
+
+
+def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
+    """The minimap2-shaped configuration — pooled, identity AND coverage — which no
+    other test exercises. The mates pool to identity 1.0 and coverage 0.93, so a 0.95
+    coverage floor drops the whole placement even though its identity is perfect.
+    """
+    rows = _table(
+        ft.CoverageScope.POOLED,
+        0.0,
+        alignment=[
+            (1, 1, 10, 99, 100, 250, "150=", 200),
+            (1, 1, 10, 147, 200, 350, "10S140M", 100),
+        ],
+        mapping=[(10, 100)],
+        lengths=[(10, 1000)],
+        gate=ft.AlignmentGate(min_identity=0.5, min_query_coverage=0.95, paired=True),
+    )
+    assert rows == []

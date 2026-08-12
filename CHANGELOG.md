@@ -35,6 +35,18 @@ duplicates further down are historical strata; leave them where they are.
   pooled breadth is always at least the best single sample's, and per-sample can only ever
   remove rows. Behaviour is unchanged for the existing server-side job, which stays pooled.
 
+- **Alignments can be gated on CIGAR sequence identity and query coverage.** A gate filters
+  the breadth calculation as well as the counts — an alignment that fails it is not a
+  placement, so it must not contribute covered bases — and `cigar` rides the signed projection
+  only when a gate reads it. Paired data is judged a placement at a time, so mates are kept or
+  dropped together rather than orphaned, using the same placement key the orchestrator's
+  aligner uses (now shared, one definition, instead of a second copy). Three ways the gate
+  could have quietly produced a wrong answer are refused with an actionable message instead:
+  a slice whose CIGARs cannot be scored for identity at all (which would have dropped every
+  row and returned an empty table), a paired placement whose mate is missing or unscorable
+  (which `string_agg` would have scored on the surviving mate alone), and an unpaired gate
+  applied to paired data. The gate SQL is unreachable without having run those checks.
+
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both
