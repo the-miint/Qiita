@@ -34,6 +34,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
         }
     ),
     SystemRole.WET_LAB_ADMIN: frozenset(
@@ -48,6 +51,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
             # Upload slots — needed to drive reference data ingest via the
             # qiita-admin CLI, whose reference-add audience includes
             # wet_lab_admin.
@@ -89,6 +95,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ALIGNMENT_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,

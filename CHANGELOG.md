@@ -255,6 +255,36 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **A scientist can pull their own alignment data.**
+  `POST /alignment/{alignment_idx}/ticket/doget` signs a Flight DoGet ticket for
+  a cohort the caller names, closing the gap between "my samples were aligned"
+  and "I can read the alignment" — until now the only mint was
+  service-account-only and read its cohort from a work ticket. Guarded by a new
+  `alignment:doget` scope, on every role ceiling and deliberately off
+  `SERVICE_ACCOUNT_SCOPE_CEILING`. For a plain user the boundary is per-study —
+  `Tier.VIEWER` on every study each `prep_sample_idx` is still linked to — while
+  `wet_lab_admin` and above bypass that check as they do every other resource
+  gate, so for them the role is the boundary.
+  Validation runs 404 (no such alignment) → 403 (access) → 422 (cohort
+  completeness) → sign, and that order is load-bearing — reversed, the 422 would
+  tell a caller which samples are finished for an alignment they cannot read. A
+  partially-readable cohort is refused rather than narrowed: coverage filtering
+  makes a feature table cohort-dependent, so a trimmed cohort answers a
+  different scientific question under the name of the one that was asked.
+  Rationale in `docs/architecture.md` and `docs/auth.md`. (#436)
+- **Two reads answer "what has been aligned for this pool, and what may I
+  mint?"** `GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment` lists the
+  alignments over a pool with their config and completion counts;
+  `.../alignment/{alignment_idx}/cohort` resolves the prep_samples that are both
+  readable and `completed`. Both **narrow** to the caller's slice rather than
+  403ing a pool that spans studies they only partly hold — a pool spans studies,
+  so rejecting it would make it undiscoverable to someone who legitimately owns
+  part of it, and narrowing is safe on a listing where no scientific result
+  depends on it. Counts are caller-scoped for the same reason: showing the
+  pool's real numbers to someone who may read half of them would set them up for
+  a 403 from the all-or-nothing mint. Open to role `user`, unlike the
+  wet_lab_admin-gated pool-completion rollup beside them.
+  (#436)
 - **A Flight DoGet ticket can carry a signed column list, and the alignment
   surface now requires one (#435).** The consumer names the columns it wants, the
   control plane validates them against a per-table allowlist at mint time (422
@@ -887,6 +917,18 @@ duplicates further down are historical strata; leave them where they are.
   [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
   per invocation — index load is 98.4% of classify wall clock); removal of our
   workaround tracked at #403.
+- **`qiita.alignment_sample` is now indexed by `prep_sample_idx`.** Its primary
+  key is `(alignment_idx, prep_sample_idx)`, which serves every consumer that
+  leads with a known alignment — but the new pool-alignment discovery read asks
+  the opposite question ("which alignments touch THESE samples?") with no
+  `alignment_idx` predicate, and a composite btree cannot be used on its
+  non-leading column. That sequential-scanned an unboundedly-growing table (one
+  row per alignment config × sample, across every reference, aligner and rerun)
+  from a route open to any authenticated user. Added
+  `(prep_sample_idx, alignment_idx)`, built `CONCURRENTLY`, turning that
+  sequential scan into an index scan. Not index-only — the query counts
+  `state = 'completed'`, which is off the index — see the migration for why
+  `INCLUDE (state)` was not taken. (#436)
 - **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
   is now a scoped table macro instead of a view (#433).** DuckDB derives a transitive
   predicate across a join equality for `col = const` but **not** for

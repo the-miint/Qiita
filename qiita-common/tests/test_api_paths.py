@@ -223,6 +223,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_POOL_ALIGN_PLAN",
     ),
     (
+        "URL_SEQUENCED_POOL_ALIGNMENT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGNMENT",
+    ),
+    (
+        "URL_SEQUENCED_POOL_ALIGNMENT_COHORT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGNMENT_COHORT",
+    ),
+    (
         "URL_SEQUENCED_SAMPLE_EXCEPTIONS",
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_SAMPLE_EXCEPTIONS",
@@ -345,6 +355,7 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ),
     # /alignment (Flight DoGet ticket for the alignment sink)
     ("URL_ALIGNMENT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_DOGET"),
+    ("URL_ALIGNMENT_COHORT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_COHORT_DOGET"),
 ]
 
 

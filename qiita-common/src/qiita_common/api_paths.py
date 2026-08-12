@@ -416,18 +416,33 @@ URL_ALIGNMENT_DEFINITION_BY_IDX = (
 # /alignment/* — Flight DoGet ticket for the alignment sink (feature-table OGU)
 # =============================================================================
 # Signs a DoGet ticket scoped to a single alignment run + its explicit
-# prep_sample_idx cohort on the data plane's `alignment` table. POST is
-# service-account-only (Scope.TICKET_DOGET) — the compute job mints it at
-# runtime. The body carries only work_ticket_idx; the route reads alignment_idx
-# and the cohort from that ticket's action_context (keeping the sample list
-# CP-side, off the wire). Distinct prefix from /alignment-definition (the
-# alignment identity CRUD).
+# prep_sample_idx cohort on the data plane's `alignment` table. Distinct prefix
+# from /alignment-definition (the alignment identity CRUD).
+#
+# TWO mint paths, differing in where the cohort comes from and therefore in how
+# it is authorized:
+#
+#   PATH_ALIGNMENT_DOGET         service-account-only (Scope.TICKET_DOGET). The
+#                                compute job mints it at runtime; the body
+#                                carries only work_ticket_idx and the route
+#                                reads alignment_idx + the cohort from that
+#                                ticket's action_context, already validated by
+#                                the runner resolver at submit (and kept CP-side,
+#                                off the wire).
+#   PATH_ALIGNMENT_COHORT_DOGET  human-callable (Scope.ALIGNMENT_DOGET). The
+#                                caller names the alignment in the path and the
+#                                cohort in the body, so the route authorizes
+#                                every sample per-study before signing. Both are
+#                                POSTs under /alignment but never ambiguous:
+#                                one has a path parameter, the other does not.
 
 PATH_ALIGNMENT_PREFIX = "/alignment"
 PATH_ALIGNMENT_DOGET = "/ticket/doget"
+PATH_ALIGNMENT_COHORT_DOGET = "/{alignment_idx}/ticket/doget"
 
 URL_ALIGNMENT_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_PREFIX}"
 URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
+URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
@@ -618,6 +633,18 @@ PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
 PATH_SEQUENCED_POOL_ALIGN_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
 )
+# GET the alignments over this pool's samples: per alignment_idx, its config
+# params and completed/total sample counts. Counts are scoped to the samples the
+# CALLER may read, so they agree with what the alignment DoGet mint will sign.
+PATH_SEQUENCED_POOL_ALIGNMENT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment"
+)
+# GET the cohort to mint an alignment DoGet ticket for: the pool's prep_samples
+# that are BOTH readable by the caller and 'completed' for this alignment. The
+# list this returns is a valid mint body by construction.
+PATH_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment/{alignment_idx}/cohort"
+)
 # GET the pool's exception drill-down: only the anomalous non-retired
 # sequenced_samples — no usable reads (unprocessed or zero survived), missing any
 # of the four submission accessions, or a genuinely-failed read-mask ticket (failed
@@ -653,6 +680,10 @@ URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
 URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_POOL_ALIGNMENT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT}"
+URL_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT_COHORT}"
+)
 URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
 URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"

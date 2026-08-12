@@ -52,6 +52,7 @@ async def human_admin_session(postgres_pool):
     drive routes that require human + admin authority (POST /references,
     POST /admin/*, PATCH /users/me).
     """
+    from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
     from qiita_control_plane.auth.token import mint_api_token
 
     display_name = "test-human-admin"
@@ -100,8 +101,6 @@ async def human_admin_session(postgres_pool):
     # never drift from ROLE_IMPLIED_SCOPES (e.g. a newly-added admin scope
     # silently 403ing future admin-route tests). test_human_admin_fixture_
     # scopes_equal_ceiling locks the equality in.
-    from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
-
     plaintext, _ = await mint_api_token(
         postgres_pool,
         principal_idx=idx,
@@ -122,6 +121,7 @@ async def wet_lab_admin_session(postgres_pool):
     PAT carrying the wet_lab_admin scope ceiling. Used for tests that need
     a caller authorized to act on behalf of another user (e.g., importing
     a biosample where body.owner_idx names a different principal)."""
+    from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
     from qiita_control_plane.auth.token import mint_api_token
 
     display_name = "test-wet-lab-admin"
@@ -168,19 +168,10 @@ async def wet_lab_admin_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-wet-lab-admin",
-        scopes=[
-            Scope.SELF_PROFILE,
-            Scope.SELF_TOKEN,
-            Scope.REFERENCE_READ,
-            Scope.REFERENCE_WRITE,
-            Scope.BIOSAMPLE_READ,
-            Scope.BIOSAMPLE_WRITE,
-            Scope.PREP_SAMPLE_READ,
-            Scope.PREP_SAMPLE_WRITE,
-            Scope.STUDY_READ,
-            Scope.STUDY_WRITE,
-            Scope.TICKET_DOPUT,
-        ],
+        # Derived from the real ceiling, same rationale as the two fixtures
+        # above; the hand-listed form here was byte-identical to
+        # ROLE_IMPLIED_SCOPES[WET_LAB_ADMIN] until ALIGNMENT_DOGET was added.
+        scopes=list(ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]),
     )
     return {
         "principal_idx": idx,
@@ -195,6 +186,7 @@ async def regular_user_session(postgres_pool):
     """A session-scoped 'user'-role human with a complete profile and a
     PAT scoped to the user ceiling. Used for negative-case tests that
     need a non-admin caller (e.g., 403 on admin endpoints)."""
+    from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
     from qiita_control_plane.auth.token import mint_api_token
 
     display_name = "test-regular-user"
@@ -224,20 +216,12 @@ async def regular_user_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-user",
-        # Mirrors ROLE_IMPLIED_SCOPES[USER] in auth/scopes.py — keep in
-        # lockstep so the session-fixture user can exercise every route
-        # the USER ceiling admits.
-        scopes=[
-            Scope.SELF_PROFILE,
-            Scope.SELF_TOKEN,
-            Scope.REFERENCE_READ,
-            Scope.BIOSAMPLE_READ,
-            Scope.BIOSAMPLE_WRITE,
-            Scope.PREP_SAMPLE_READ,
-            Scope.PREP_SAMPLE_WRITE,
-            Scope.STUDY_READ,
-            Scope.STUDY_WRITE,
-        ],
+        # Derived from the real USER ceiling rather than hand-listed, for the
+        # same reason the admin fixture above derives its own: a hand-listed
+        # copy silently drifts, and the failure it produces is a 403 on a
+        # brand-new route that looks like a bug in the route. It was
+        # hand-listed and did exactly that when ALIGNMENT_DOGET was added.
+        scopes=list(ROLE_IMPLIED_SCOPES[SystemRole.USER]),
     )
     return {
         "principal_idx": idx,

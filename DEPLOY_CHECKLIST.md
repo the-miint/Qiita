@@ -23,7 +23,12 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `20260806120000_alignment_sample_prep_sample_idx.sql` — plain `make migrate`, no
+  out-of-band setup. Builds `CREATE INDEX CONCURRENTLY` on `qiita.alignment_sample`, so it
+  does **not** lock the table and is safe to run while services are up; it may take a while
+  on a large table, and a failed CONCURRENTLY build leaves an INVALID index that
+  `make migrate` will not retry — drop it by hand and re-run if that happens.
+  (#436)
 
 ### 4. Deploy
 
@@ -39,6 +44,15 @@ _None yet._
 
 ### Notes (no host action)
 
+- **A user whose PAT predates this deploy cannot use the new alignment mint
+  until they re-mint it.** A new scope `alignment:doget` is added to all three
+  role ceilings, so callers on the OIDC path pick it up automatically (that path
+  returns the role's full ceiling per request). The token path returns the
+  token's **own** stored scope set, so an existing PAT does not — the holder
+  runs `qiita login` (or `POST /auth/pat`) once. The 403 says so itself: the
+  stale-token hint fires precisely when a scope is in the caller's live ceiling
+  but absent from their token. Nothing to do on the host.
+  (#436)
 - **A feature-table (`estimate_feature_table`) job that is already running when
   the data plane restarts will fail with `InvalidArgument: alignment_visible
   requires an explicit projection column list`.** The alignment DoGet now

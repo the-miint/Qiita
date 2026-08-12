@@ -454,7 +454,7 @@ The `align` workflow (`workflows/align/1.0.0.yaml`, `target_kind: block`) wires 
 - **Identity + growth foundation.** `mint_alignment_definition` dedups on the canonical JSON of `{reference_idx, aligner, mask_idx, shard_ids}`, where `shard_ids` is the reference's current `DISTINCT reference_membership.shard_id`. Baking the shard-set into the hash is the growth hook (a grown reference → a different shard-set → a NEW `alignment_idx` over only its new shards); the deferred growth-run fan-out reuses prior rows by UNION. The initial `write_shard_assignment` is clear-first and runs once at reference-add — the append-only-safe invariant the growth milestone builds on.
 - **Fan-out.** `align_planner.plan_and_submit_alignments` (mirroring `block_planner`) enumerates the pool's samples, is TOLD the `mask_idx` to align under (the caller supplies it — a nonexistent `mask_idx` is a 404; align no longer re-derives the mask config server-side), selects those whose `mask_sample` gate is `completed` under it, asserts the reference is ACTIVE + sharded via `_resolve_sharded_align_indexes`, mints one `alignment_idx` over `{reference_idx, aligner, mask_idx, shard_ids}`, tiles into blocks (reusing `tile_partition`), and creates one block `work_ticket` per block carrying `mask_idx` + `alignment_idx` + an `action_context` of `{align_reference_idx, aligner, alignment_idx, align_mask_idx}`. The submit route is `POST …/sequenced-pool/{P}/align-plan` (`prep_sample:write` + `wet_lab_admin`). The runner resolves `router_index_path` (= `router_paths[0]`) + `shard_directory` from `action_context` (the shard-aware resolver) before the loop and threads `aligner` + `alignment_idx` into `align_sharded` via `params:`.
 - **Sink + accounting.** The align workflow's action tail is `delete-alignment-block` → `register-files` → `reconcile-alignment-block`. `delete-alignment-block` (the `delete_alignment_block` DoAction) makes a block re-run idempotent — it deletes this block's exact footprint (`(alignment_idx, prep_sample_idx, sequence_idx ∈ member range)`, feature_idx-agnostic) before register re-writes it. `register-files` loads `alignment.parquet` into the `alignment` table. `reconcile-alignment-block` flips the per-`(alignment_idx, prep_sample)` `alignment_sample` gate `completed` once every covering block finishes — **with NO row-count assertion** (unlike read-mask reconcile): alignment rows are not 1:1 with reads (cross-shard + PE multiplicity), so completion is "every covering block done", not "row count == read count". Re-submitting a `completed` sample is refused (disallow-without-delete) until its rows are purged via `DELETE /alignment-definition/{alignment_idx}` (the `delete_alignment` DoAction + the cascading `alignment_sample` gate; system_admin-only `alignment_definition:delete`).
-- **No per-row `shard_id`.** A feature is in exactly one shard, so shard is derivable from `feature_idx` via `reference_membership.shard_id` — consistent with the carry-`feature_idx`-not-`reference_idx` design. The `alignment` table is a **sink** this milestone (NOT in the data plane's `ALLOWED_TABLES`); the Flight read-side is deferred until a downstream consumer needs it.
+- **No per-row `shard_id`.** A feature is in exactly one shard, so shard is derivable from `feature_idx` via `reference_membership.shard_id` — consistent with the carry-`feature_idx`-not-`reference_idx` design. The raw `alignment` table is written but never read over Flight — it is deliberately NOT in the data plane's `ALLOWED_TABLES`. Reads go through the exclusion-aware `alignment_visible` view instead; see "DoGet column projection" and "Two mint paths for the alignment DoGet" below for how that surface is projected and who may mint a ticket against it.
 
 The align output carries `feature_idx` but **not** `reference_idx` (reference scoping is a query-time join against `reference_membership`; see "Identifier ownership"). A **forward constraint** still shapes the deferred growth work: growing a reference and aligning prior reads against only the NEW shards leans toward the per-shard identity the `shard_ids`-in-hash `alignment_idx` already anticipates.
 
@@ -624,6 +624,41 @@ Allowlist constants: `ALIGNMENT_PROJECTION_COLUMNS` in
 hand-copies (neither language can import the other) pinned by parity tests, and
 the Rust one is additionally checked against the live `alignment_visible`
 schema.
+
+### Two mint paths for the alignment DoGet
+
+`alignment_visible` is the one Flight surface with two ticket-minting routes, and
+they differ in **where the cohort comes from**, which is what forces two
+authorization models:
+
+| Route | Caller | Cohort source | Authorization |
+|---|---|---|---|
+| `POST /alignment/ticket/doget` | service account, `ticket:doget` | the work ticket's `action_context` | scope only — the runner resolver already validated the cohort at submit |
+| `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check |
+
+The second exists because a scientist pulling their own data has no runner
+upstream to have validated anything. It is also the only place that validation
+can happen: **the signed cohort is the authorization boundary.** The data plane
+verifies the signature and serves exactly the identifiers the ticket names — it
+holds no notion of studies, users, or tiers, by the same design that makes it
+Intentionally "dumb" in the component map above. There is no second line of
+defence behind the mint, so a control-plane bug that signs an unauthorized
+`prep_sample_idx` is a data leak, not a caught error.
+
+Two consequences worth stating, because both look like over-engineering until
+you know why:
+
+- **The human mint refuses a partially-readable cohort rather than narrowing
+  it.** Coverage filtering makes a feature table cohort-dependent, so a quietly
+  trimmed cohort answers a different scientific question under the name of the
+  one that was asked — and the bundle manifest would record a cohort the caller
+  never requested. The paired *discovery* reads
+  (`GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment[/{idx}/cohort]`) do
+  narrow, because a listing carries no scientific result; between them, you
+  discover exactly the cohort you are then allowed to mint.
+- **Access is checked before completeness.** Reversed, the 422 naming the
+  incomplete samples would tell a caller which samples are finished for an
+  alignment they have no right to read at all.
 
 ## Auth & Data Access Flow
 
