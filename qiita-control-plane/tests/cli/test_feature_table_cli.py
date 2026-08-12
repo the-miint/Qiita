@@ -10,6 +10,8 @@ a wrong column type or a lost row would surface as a confusing bind error two st
 later.
 """
 
+import json
+
 import duckdb
 import httpx
 import pytest
@@ -17,7 +19,7 @@ from qiita_common import feature_table as ft
 from qiita_common.api_paths import URL_EXPORTED_IDENTIFIER, URL_REFERENCE_GENOME_MAP
 
 from qiita_control_plane.cli.user import feature_table as ftc
-from qiita_control_plane.miint import connect_with_miint_staged
+from qiita_control_plane.miint import connect_with_miint
 
 _ENTRIES = [
     # G400's two contigs: the per-(feature, genome) fan-out the label relation
@@ -100,7 +102,7 @@ def test_an_invalid_cohort_is_refused_before_the_round_trip(monkeypatch):
 
 def _staged(entries=None, identifiers=None):
     """Stage both responses into a miint connection and describe what landed."""
-    conn = connect_with_miint_staged()
+    conn = connect_with_miint()
     ftc._stage_genome_map(conn, _ENTRIES if entries is None else entries)
     ftc._stage_exported_identifiers(conn, _IDENTIFIERS if identifiers is None else identifiers)
     return conn
@@ -182,3 +184,117 @@ def test_the_relabel_driver_writes_the_public_table_and_reports_its_size():
 
     assert clearance.rows == 2
     assert rows == [("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0)]
+
+
+# ---------------------------------------------------------------------------
+# The bundle
+# ---------------------------------------------------------------------------
+
+
+def _labelled(conn, rows=(("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0))) -> None:
+    """Stage a relabelled table, as the relabel would leave it."""
+    values = ", ".join("(?::VARCHAR, ?::VARCHAR, ?::DOUBLE)" for _ in rows)
+    conn.execute(
+        f"CREATE TABLE {ft.LABELLED_TABLE} AS SELECT * FROM (VALUES {values}) "
+        f"AS v({', '.join(ft.LABELLED_COLUMNS)})",
+        [x for r in rows for x in r],
+    )
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "biom"])
+def test_the_bundle_is_the_table_AND_the_identifier_map(fmt, tmp_path):
+    """Two files, always. The table alone cannot be joined back to the caller's own
+    records — `export_id` is the only sample name it carries — so the map is part of
+    the deliverable rather than an option."""
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        written = ftc._write_bundle(conn, output_dir=tmp_path, fmt=fmt, identifiers=_IDENTIFIERS)
+
+    assert [p.name for p in written] == [f"feature-table.{fmt}", "exported-identifier.json"]
+    assert all(p.exists() for p in written)
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_path):
+    """The map is the one artifact holding `prep_sample_idx` beside `export_id`, which
+    is exactly what makes it useful and what makes publishing it a leak. The warning
+    rides the file, not just the terminal: a file outlives its scrollback.
+    """
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        _, map_path = ftc._write_bundle(
+            conn, output_dir=tmp_path, fmt="parquet", identifiers=_IDENTIFIERS
+        )
+
+    payload = json.loads(map_path.read_text())
+    assert payload["identifiers"] == _IDENTIFIERS
+    assert payload["count"] == len(_IDENTIFIERS)
+    assert "prep_sample_idx" in payload["note"]
+    assert payload["note"] == ftc.IDENTIFIER_MAP_NOTE
+
+
+def test_the_written_table_carries_only_public_columns(tmp_path):
+    """Read back rather than trusted: this is the file a user publishes."""
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        table_path, _ = ftc._write_bundle(
+            conn, output_dir=tmp_path, fmt="parquet", identifiers=_IDENTIFIERS
+        )
+        described = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{table_path}')").fetchall()
+        rows = conn.execute(f"SELECT * FROM read_parquet('{table_path}') ORDER BY 1").fetchall()
+
+    assert [(r[0], r[1]) for r in described] == list(ft.LABELLED_SCHEMA.items())
+    assert rows == [("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0)]
+
+
+def test_a_failure_partway_through_leaves_NEITHER_file(tmp_path):
+    """All-or-nothing across the pair. The table is written first, so a map that fails
+    to serialize must take the committed table back with it — half a bundle is a table
+    nobody can join, published beside a missing map.
+    """
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        with pytest.raises(TypeError):
+            ftc._write_bundle(
+                conn,
+                output_dir=tmp_path,
+                fmt="parquet",
+                identifiers=[{"prep_sample_idx": {1, 2}, "export_id": "QM1"}],
+            )
+
+    assert not list(tmp_path.iterdir())
+
+
+def test_an_existing_artifact_is_refused_before_anything_is_written(tmp_path):
+    """The BIOM writer refuses to overwrite and the Parquet COPY replaces silently, so
+    without this check the same second run would fail loudly in one format and quietly
+    destroy a published file in the other."""
+    (tmp_path / "feature-table.parquet").write_text("earlier run")
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        with pytest.raises(FileExistsError, match="feature-table.parquet"):
+            ftc._write_bundle(conn, output_dir=tmp_path, fmt="parquet", identifiers=_IDENTIFIERS)
+
+    assert (tmp_path / "feature-table.parquet").read_text() == "earlier run"
+    assert not (tmp_path / "exported-identifier.json").exists()
+
+
+def test_a_stale_partial_does_not_block_a_retry(tmp_path):
+    """A killed run can leave a `.partial` behind, and the BIOM writer refuses to
+    overwrite ANY existing target — including that one. Clearing our own partials first
+    is what keeps the error a user sees about their own files, not ours.
+    """
+    (tmp_path / "feature-table.biom.partial").write_text("interrupted")
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        written = ftc._write_bundle(conn, output_dir=tmp_path, fmt="biom", identifiers=_IDENTIFIERS)
+        assert conn.execute(f"SELECT count(*) FROM read_biom('{written[0]}')").fetchone()[0] == 2
+
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_an_unsupported_format_is_refused(tmp_path):
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        with pytest.raises(ValueError, match="tsv"):
+            ftc._write_bundle(conn, output_dir=tmp_path, fmt="tsv", identifiers=_IDENTIFIERS)

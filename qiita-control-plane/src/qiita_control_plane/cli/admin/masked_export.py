@@ -5,10 +5,8 @@ Split out of the former single-file ``cli.admin`` module; behavior unchanged.
 
 import argparse
 import base64
-import contextlib
 import itertools
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -46,32 +44,11 @@ _READ_MASKED_COLUMNS = "read_id, sequence1, qual1, sequence2, qual2"
 
 
 def _commit_partials(copy_fn, pairs: list[tuple[Path, Path]]) -> None:
-    """Run `copy_fn` (which COPYs the masked rows into each pair's `.partial`),
-    then move each partial into place. Each partial is chmod 0600 *before* the
-    rename — the reads are privacy-masked sequence data, so the file is never
-    visible at its final name under a looser umask, even for an instant.
-
-    All-or-nothing across the pair: on any failure (COPY error, or a rename/chmod
-    failing partway through a paired R1+R2 commit) every partial AND every
-    already-committed final is removed, so a retry never finds a half-written
-    file or a lone R1 without its R2. The partial paths are known up front so a
-    failure *inside* the COPY (which may have already created some partials) is
-    cleaned up too."""
-    committed: list[Path] = []
-    try:
-        copy_fn()
-        for partial, final in pairs:
-            partial.chmod(0o600)
-            os.replace(partial, final)
-            committed.append(final)
-    except BaseException:
-        for partial, _ in pairs:
-            with contextlib.suppress(FileNotFoundError):
-                partial.unlink()
-        for final in committed:
-            with contextlib.suppress(FileNotFoundError):
-                final.unlink()
-        raise
+    """`_common.commit_partials` at mode 0600: these reads are privacy-masked sequence
+    data, so each partial is chmod'd *before* its rename and the file is never visible
+    at its final name under a looser umask, even for an instant. The all-or-nothing
+    commit itself is shared — see there."""
+    _common.commit_partials(copy_fn, pairs, mode=0o600)
 
 
 def _peek_paired(reader):

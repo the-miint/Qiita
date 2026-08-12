@@ -64,6 +64,20 @@ duplicates further down are historical strata; leave them where they are.
   types, and released once copied; the genome map's roll-up key and public label are staged
   from the one response so they cannot disagree about which genomes exist.
 
+- **A feature table can be written as Parquet or BIOM, bundled with the map needed to read
+  it.** The bundle is both files or neither: the table names its samples by their public
+  handle alone, so without the exported-identifier map beside it nobody can join it back to
+  their own records. An artifact already at either name is refused before anything is
+  written — the two writers disagree on their own about overwriting, one refusing and one
+  replacing silently, so a second run would otherwise destroy a published file in one format
+  and fail in the other. The map carries, in the file rather than only in the terminal, the
+  warning that it is the one artifact holding an internal identifier and must not be shipped
+  onward. BIOM is a new surface for this repo, so what miint's writer does with our data is
+  now pinned by its own contract test and documented: it sums duplicate entries silently,
+  drops zeros, refuses NULL and empty identifiers, requires `value` as DOUBLE exactly, and
+  **ignores any extra column** — so it is the relabel's projection, not the writer, that
+  keeps our identifiers out of a published file.
+
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both
@@ -1600,6 +1614,15 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **The all-or-nothing multi-file commit is now shared by both CLIs' exports.** The
+  masked-read export's commit — write partials, then rename each into place, and on any
+  failure remove every partial *and* every already-committed file — moved to the shared CLI
+  helpers so the feature-table bundle uses the same one rather than a second copy. The
+  privacy chmod stays with the masked-read export, the only caller whose bytes need it. The
+  rollback of an already-committed file now has direct tests, which no caller's own suite
+  reached, and the one gap it cannot close — a kill between two renames — is written down
+  where the guarantee is stated.
 
 - **One `cap_rows` helper behind every capped list route (#427).** The
   fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each

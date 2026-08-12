@@ -44,7 +44,8 @@ the rename to the column names `genome_coverage` requires.
 **A caller that PUBLISHES the table stages two more** — the label relations — and
 relabels the counts through them, ending at `LABELLED_TABLE` (`LABELLED_SCHEMA`):
 our `*_idx` keys are gone, and the public handles are VARCHAR, which is what makes
-the result writable as BIOM at all. See the relabel section below.
+the result writable as BIOM at all. See the relabel section below, and the two
+writers after it — `LABELLED_TABLE` is the only relation here they will copy.
 
 **The `source` argument of every staging builder is interpolated VERBATIM, and
 that is the caller's obligation to make safe.** A FROM-clause relation cannot be a
@@ -82,6 +83,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
+
+# `validate_parquet_path` is named for its first caller but checks a COPY *target* —
+# a path safe to interpolate into a SQL string literal, which cannot be bound — so it
+# is what both writers below use, BIOM included.
+from .parquet import PARQUET_OPTS, validate_parquet_path
 
 
 class CoverageScope(StrEnum):
@@ -897,4 +904,51 @@ def labelled_table_sql(*, clearance: LabelClearance) -> str:
     return (
         f"CREATE TABLE {LABELLED_TABLE} AS "
         f"SELECT {', '.join(LABELLED_COLUMNS)} FROM ({_labelled_select_sql()})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Writing the relabelled table out
+# ---------------------------------------------------------------------------
+
+# BIOM's `generated-by` attribute. The writer's own default is `miint`, which names
+# the library rather than the system that produced the file. The system and no
+# version, deliberately: a version here would have to be kept honest against four
+# components and a pinned extension build, and nothing reads it. **So the file
+# carries no provenance beyond this name today** — reproducing a table needs the
+# reference, the cohort, the coverage scope and threshold, and any gate, none of
+# which the bundle records yet.
+BIOM_GENERATED_BY = "qiita"
+
+
+def parquet_copy_sql(path: Path) -> str:
+    """COPY the relabelled table to Parquet, with the canonical options every qiita
+    Parquet artifact shares.
+
+    `PARQUET_OPTS`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
+    false` on the writing connection — DuckDB errors at bind time otherwise — which is
+    the caller's to set (see `parquet.py`).
+    """
+    return f"COPY {LABELLED_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+
+
+def biom_copy_sql(path: Path) -> str:
+    """COPY the relabelled table to a BIOM 2.1 (HDF5) file.
+
+    The writer requires exactly `LABELLED_SCHEMA` — `feature_id`/`sample_id` VARCHAR
+    and `value` DOUBLE, looked up BY NAME — and **silently ignores any other column**,
+    so it is `labelled_table_sql`'s projection, not this writer, that keeps our
+    identifiers out of the file. Behaviours it does enforce, and two it applies
+    without asking, are recorded in `docs/duckdb-miint.md` and pinned by the
+    control-plane's BIOM contract test; the one that shapes callers most is that it
+    **refuses to overwrite an existing file**, unlike the Parquet COPY.
+
+    `COMPRESSION` is passed explicitly even though gzip is also the writer's default,
+    so a published artifact's encoding does not change under us if that default does.
+    `ID` is left alone: the only distinctive handle for this table today is an
+    internal identifier, which must not ride a published file.
+    """
+    return (
+        f"COPY {LABELLED_TABLE} TO '{validate_parquet_path(path)}' "
+        f"(FORMAT BIOM, COMPRESSION 'gzip', GENERATED_BY '{BIOM_GENERATED_BY}')"
     )

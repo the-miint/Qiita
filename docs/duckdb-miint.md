@@ -270,6 +270,18 @@ grep -oE 'CIEquals\((option\.first|key), "[a-z_0-9]+"\)' src/copy_sam.cpp \
 - A row with `sequence2` set into a **single** output path errors; paired output needs either the **`{ORIENTATION}`** placeholder in the path (split files) or **`INTERLEAVE true`** (one interleaved file).
 - `{ORIENTATION}` expands to exactly **`R1`** / **`R2`**, so `TO '<stem>.{ORIENTATION}.fastq'` yields `<stem>.R1.fastq` + `<stem>.R2.fastq`.
 
+**`FORMAT BIOM` writer — qiita-verified 2026-08-12** (probes + `qiita-control-plane/tests/test_biom_writer_contract.py`, build `2b2841e`; consumed by the client-side feature-table recipe, which writes the relabelled table a user publishes). Writes a **BIOM 2.1 HDF5** file. Every row below has a test, because three of these are decisions the writer makes silently on the caller's behalf:
+- **Required columns, BY NAME:** `feature_id` VARCHAR, `sample_id` VARCHAR, `value` **DOUBLE**. A missing one is a `BinderException` naming it; column *order* is irrelevant. `value` must be DOUBLE **exactly** — `FLOAT`, `DECIMAL` and `BIGINT` are all refused, so an unquoted decimal literal (which types as DECIMAL) fails to bind.
+- **Any OTHER column is silently ignored.** A relation still carrying an internal identifier writes a perfectly valid BIOM with that column dropped on the floor — so the writer is *not* a guard against leaking one, and the caller's projection is.
+- **Duplicate `(feature_id, sample_id)` pairs are SUMMED**, with nothing in the file recording it (`src/BIOMTable.cpp`'s `compress_coo`). Two features relabelled to one public id therefore merge into one row of the published table, invisibly — which is why the recipe refuses that collision before writing.
+- **Zero values are dropped** (BIOM is sparse), so a BIOM and a Parquet of the same relation can legitimately differ in row count.
+- **NULL or empty-string ids are refused** (`InvalidInputException`), and the failed write leaves **no file behind**.
+- **It refuses to overwrite an existing file** — `IOException: Cannot overwrite existing file '…'. Delete it first…` — unlike the Parquet COPY, which replaces silently. This applies to any target, including a `.partial` sibling left by a killed process, so an atomic-write caller must clear its own partials or every retry fails on one.
+- **An empty relation writes a valid, readable file** (0 rows back through `read_biom`), so a legitimately empty result needs no special case.
+- Options are `COMPRESSION` (`'gzip'`/`'gz'`/`'none'`, default gzip), `GENERATED_BY` (default `miint` — the library, not the caller), and `ID` (default the literal `No Table ID`). Unknown options are rejected, not ignored.
+- **gzip can make a small table BIGGER**: 200 non-zero entries measured 37 808 bytes gzipped against 30 336 uncompressed (per-dataset HDF5 deflate overhead). It is still the right default at real table sizes.
+- `read_biom(path)` reads it back as `(sample_id, feature_id, value)` — the same triple, one row per non-zero entry — which is the only round trip available from SQL.
+
 ## Internals worth knowing before extending qiita usage
 
 These are not just curiosities — they constrain how qiita's data-plane and orchestrator code may call miint.

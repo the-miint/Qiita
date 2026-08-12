@@ -2,8 +2,9 @@
 
 The analytic itself is `qiita_common.feature_table`, shared with the server-side
 compute job; this module is the half that only a client has: fetching the two
-identifier maps over REST, staging every input into the user's own DuckDB, and
-relabelling the result to public handles before anything is written.
+identifier maps over REST, staging every input into the user's own DuckDB,
+relabelling the result to public handles, and writing the bundle — the table plus
+the map needed to read it — as one all-or-nothing commit.
 
 Nothing here reaches the database. The three data inputs arrive as Flight streams
 (the alignment slice and the reference lengths) or as REST reads (the genome map),
@@ -13,6 +14,8 @@ token, on the caller's own machine.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from qiita_common import feature_table as ft
@@ -133,3 +136,98 @@ def _relabel(con) -> ft.LabelClearance:
     clearance = ft.check_relabel_diagnostics(**dict(zip(names, cursor.fetchone(), strict=True)))
     con.execute(ft.labelled_table_sql(clearance=clearance))
     return clearance
+
+
+# The bundle's filenames. Fixed rather than composed, because every handle that would
+# distinguish one run from another — the alignment, the cohort — is one of ours, and a
+# filename is something a user publishes. Runs are told apart by the directory the
+# caller chose.
+TABLE_FORMATS = ("parquet", "biom")
+_TABLE_STEM = "feature-table"
+_IDENTIFIER_MAP_NAME = "exported-identifier.json"
+
+# Written INTO the map as well as printed, because a warning that lives only in a
+# terminal is gone the moment the terminal is, and this file's whole hazard is that it
+# looks like part of the deliverable.
+IDENTIFIER_MAP_NOTE = (
+    "This file is the only artifact in this bundle carrying prep_sample_idx, Qiita's"
+    " internal sample identifier, beside the public export_id. It is your join key back"
+    " to your own records — keep it, and do not publish it or ship it alongside the"
+    " feature table."
+)
+
+
+def _bundle_paths(output_dir: Path, fmt: str) -> list[Path]:
+    """The bundle's two files, in write order: the table, then the identifier map."""
+    if fmt not in TABLE_FORMATS:
+        raise ValueError(f"unsupported feature-table format: {fmt!r} (expected {TABLE_FORMATS})")
+    return [output_dir / f"{_TABLE_STEM}.{fmt}", output_dir / _IDENTIFIER_MAP_NAME]
+
+
+def _write_bundle(
+    con, *, output_dir: Path, fmt: str, identifiers: list[dict[str, Any]]
+) -> list[Path]:
+    """Write the bundle — the relabelled table plus the exported-identifier map — and
+    return the files written.
+
+    **Both files or neither.** The table names its samples by `export_id` alone, so
+    without the map beside it a caller cannot join their own records back to it; half a
+    bundle is not a partial result but a useless one.
+
+    **An existing artifact is refused, before anything is written.** The two writers
+    disagree about this on their own — the BIOM writer refuses to overwrite, the Parquet
+    COPY replaces silently — so without one check here a second run would fail loudly in
+    one format and quietly destroy a published file in the other.
+    """
+    targets = _bundle_paths(output_dir, fmt)
+    existing = [p for p in targets if p.exists()]
+    if existing:
+        # A single survivor is the one shape a crash can leave (see
+        # `_common.commit_partials`), and it reads identically to a finished run on
+        # disk — so say which case this is rather than let a user guess before
+        # deleting something.
+        state = (
+            "an earlier run did not finish, since a complete bundle is both files"
+            if len(existing) < len(targets)
+            else "an earlier run wrote a bundle here"
+        )
+        raise FileExistsError(
+            f"refusing to overwrite {', '.join(p.name for p in existing)} in "
+            f"{output_dir}: {state}. Write to a different directory, or remove what "
+            f"is there if you are finished with it."
+        )
+
+    pairs = [(p.with_name(p.name + ".partial"), p) for p in targets]
+    for partial, _ in pairs:
+        # Our own leftovers from a killed run. The BIOM writer refuses to overwrite ANY
+        # existing target, partials included, so clearing them is what keeps a retry's
+        # error about the user's files rather than ours.
+        partial.unlink(missing_ok=True)
+    table_partial, map_partial = (partial for partial, _ in pairs)
+
+    def write() -> None:
+        if fmt == "parquet":
+            # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires this; DuckDB errors at bind
+            # time without it (see qiita_common.parquet).
+            con.execute("SET preserve_insertion_order=false")
+            con.execute(ft.parquet_copy_sql(table_partial))
+        else:
+            con.execute(ft.biom_copy_sql(table_partial))
+        map_partial.write_text(
+            json.dumps(
+                {
+                    "note": IDENTIFIER_MAP_NOTE,
+                    "count": len(identifiers),
+                    "identifiers": identifiers,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+    # No `mode`: the two files land side by side and one of them is meant to be
+    # published, so a restrictive mode would be wrong for it. The map's hazard is
+    # being shipped onward, which is what the note in it addresses — not being
+    # readable on the machine of the user whose own data it describes.
+    _common.commit_partials(write, pairs)
+    return targets
