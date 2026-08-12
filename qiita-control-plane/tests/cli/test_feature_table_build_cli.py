@@ -1,0 +1,558 @@
+"""The `qiita feature-table build` handler, driven end to end with the two REST maps
+and both Flight streams faked — real miint, real analytic, real writers.
+
+The pieces this wires are pinned elsewhere: the analytic against real miint in
+`tests/test_feature_table_analytic.py`, the maps / relabel / bundle in
+`tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviours in
+`tests/test_biom_writer_contract.py`. **What is only testable here is the wiring**:
+which columns ride the ticket, which scope reaches the survivor set, whether the
+lengths stream is opened at all, and that every refusal the recipe can make comes
+out as a message and a non-zero exit rather than a traceback or a half-written file.
+
+The fakes stop exactly at the two boundaries a client cannot reach in a unit test —
+HTTP and Flight. Everything past them is the real thing, so the table asserted at
+the bottom is the file a user would publish.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import httpx
+import pyarrow as pa
+import pytest
+from qiita_common import feature_table as ft
+
+from qiita_control_plane.cli.user import feature_table as ftc
+from qiita_control_plane.miint import connect_with_miint
+
+# One 1000 bp genome fully covered in sample 1, and one 10 000 bp genome each sample
+# covers 0.6% of — extending halves, so 1.2% pooled. At a 1% threshold that genome
+# survives pooled and fails per-sample, which is the only asymmetry the two scopes
+# have (pooling unions intervals, so pooled breadth is never the smaller one).
+_MAP_ENTRIES = [
+    {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+    {"feature_idx": 20, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
+]
+_LENGTHS = [(10, 1000), (20, 10000)]
+# (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position, cigar)
+_ALIGNMENT = [
+    (1, 1, 10, 0, 0, 500, "500="),
+    (1, 2, 20, 0, 0, 60, "30=30X"),  # identity 0.5 — the row a gate at 0.9 drops
+    (2, 3, 20, 0, 60, 120, "60="),
+]
+_IDENTIFIERS = [
+    {"prep_sample_idx": 1, "export_id": "QM1", "biosample_accession": "SAMN1"},
+    {"prep_sample_idx": 2, "export_id": "QM2", "biosample_accession": None},
+]
+_PARAMS = {"reference_idx": 9, "aligner": "minimap2", "mask_idx": 2, "shard_ids": [0]}
+_ALIGNMENTS_BODY = {
+    "alignments": [
+        {"alignment_idx": 3, "params": _PARAMS, "samples_completed": 2, "samples_total": 2}
+    ]
+}
+
+_ALIGNMENT_TICKET = b"alignment-ticket"
+_LENGTHS_TICKET = b"lengths-ticket"
+
+_ALIGNMENT_TYPES = {
+    "prep_sample_idx": pa.int64(),
+    "sequence_idx": pa.int64(),
+    "feature_idx": pa.int64(),
+    "flags": pa.uint16(),
+    "position": pa.int64(),
+    "stop_position": pa.int64(),
+    "cigar": pa.string(),
+    "mate_position": pa.int64(),
+}
+
+
+def _alignment_reader(columns: list[str], rows: list[tuple]) -> pa.RecordBatchReader:
+    """The alignment slice as the data plane would stream it: **exactly the projected
+    columns**, in the ticket's order. A wider stream would hide the projection drift
+    the signed column list exists to prevent, so the fake honours it."""
+    padded = [tuple(r) + (None,) * (8 - len(r)) for r in rows]
+    named = dict(zip(_ALIGNMENT_TYPES, zip(*padded, strict=True), strict=True))
+    table = pa.table(
+        {name: pa.array(list(named[name]), _ALIGNMENT_TYPES[name]) for name in columns}
+    )
+    return table.to_reader()
+
+
+def _lengths_reader() -> pa.RecordBatchReader:
+    """`reference_sequences` as the whole-reference ticket streams it — `sequence_hash`
+    rides along unused, which is what the analytic's projection has to tolerate."""
+    return pa.table(
+        {
+            "feature_idx": pa.array([f for f, _ in _LENGTHS], pa.int64()),
+            "sequence_hash": pa.array([None] * len(_LENGTHS), pa.string()),
+            "sequence_length_bp": pa.array([n for _, n in _LENGTHS], pa.int64()),
+        }
+    ).to_reader()
+
+
+class _FakeStream:
+    def __init__(self, reader):
+        self._reader = reader
+
+    def to_reader(self):
+        return self._reader
+
+
+class _FakeFlightClient:
+    """Routes each DoGet by the ticket bytes it was signed for, so a handler that
+    streamed the lengths ticket where the alignment belongs fails here rather than
+    producing a confusing bind error."""
+
+    instances: list[_FakeFlightClient] = []
+
+    def __init__(self, url, readers):
+        self.url = url
+        self._readers = readers
+        self.tickets: list[bytes] = []
+        self.closed = False
+        _FakeFlightClient.instances.append(self)
+
+    def do_get(self, ticket, *options):
+        self.tickets.append(ticket.ticket)
+        return _FakeStream(self._readers[ticket.ticket]())
+
+    def close(self):
+        self.closed = True
+
+
+def _namespace(tmp_path, **overrides) -> argparse.Namespace:
+    fields = {
+        "base_url": "http://cp",
+        "data_plane_url": "grpc://dp:50051",
+        "sequencing_run_idx": 4,
+        "sequenced_pool_idx": 5,
+        "alignment_idx": 3,
+        "prep_sample_idx": None,
+        "coverage_scope": ft.CoverageScope.POOLED.value,
+        "coverage_threshold": 0.01,
+        "min_identity": None,
+        "min_query_coverage": None,
+        "unpaired_gate": False,
+        "format": ftc.DEFAULT_TABLE_FORMAT,
+        "output": tmp_path / "table.parquet",
+    }
+    return argparse.Namespace(**(fields | overrides))
+
+
+def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None, genome_map=None):
+    """Patch the four REST seams, both ticket mints, and the Flight client; return the
+    recorder every assertion below reads."""
+    rec: dict = {"lengths_minted": 0}
+    _FakeFlightClient.instances = []
+
+    monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", lambda *a, **k: _ALIGNMENTS_BODY)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_alignment_cohort",
+        lambda *a, **k: {"prep_sample_idx": [1, 2] if cohort is None else cohort},
+    )
+    if genome_map is None:
+        monkeypatch.setattr(
+            ftc,
+            "_fetch_genome_map",
+            lambda *a, **k: _MAP_ENTRIES if map_entries is None else map_entries,
+        )
+    else:
+        monkeypatch.setattr(ftc, "_fetch_genome_map", genome_map)
+
+    def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx):
+        rec["minted_cohort"] = prep_sample_idx
+        return [i for i in _IDENTIFIERS if i["prep_sample_idx"] in prep_sample_idx]
+
+    monkeypatch.setattr(ftc, "_mint_exported_identifiers", _mint_ids)
+
+    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+        rec["columns"] = list(columns)
+        rec["ticket_cohort"] = list(prep_sample_idx)
+        return _ALIGNMENT_TICKET
+
+    def _lengths_ticket(base_url, token, *, reference_idx):
+        rec["lengths_minted"] += 1
+        rec["reference_idx"] = reference_idx
+        return _LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
+    monkeypatch.setattr(ftc, "_create_lengths_doget_ticket", _lengths_ticket)
+
+    rows = _ALIGNMENT if alignment is None else alignment
+    readers = {
+        # The signed cohort IS the scope on the real data plane — it serves exactly the
+        # prep_samples the ticket carries — so the fake filters by it too. Streaming
+        # rows outside the cohort would otherwise look like a passing build here and a
+        # relabel refusal in production.
+        _ALIGNMENT_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in rows if r[0] in rec["ticket_cohort"]]
+        ),
+        _LENGTHS_TICKET: _lengths_reader,
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def _table_rows(path, *, fmt="parquet") -> list[tuple]:
+    reader = "read_parquet" if fmt == "parquet" else "read_biom"
+    with connect_with_miint() as conn:
+        return sorted(conn.execute(f"SELECT * FROM {reader}('{path}')").fetchall())
+
+
+def test_a_pooled_build_writes_the_public_table_and_its_map(monkeypatch, tmp_path, capsys):
+    """The whole recipe, from an alignment_idx to a file a user publishes: public
+    handles on both axes, and the identifier map beside it with the warning that it is
+    the one artifact not to ship."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ]
+    assert (tmp_path / "table.exported-identifier.json").is_file()
+    out = capsys.readouterr().out
+    assert ftc.IDENTIFIER_MAP_NOTE in out
+    assert str(args.output) in out
+    # The reference came from the alignment's own params, never from a flag.
+    assert rec["reference_idx"] == 9
+    assert all(client.closed for client in _FakeFlightClient.instances)
+
+
+def test_the_per_sample_scope_reaches_the_survivor_set(monkeypatch, tmp_path):
+    """The one thing a wrong wiring here would hide: `--coverage-scope` silently
+    ignored still produces a plausible table, just the pooled one. G200 clears 1%
+    only when the two samples' intervals are unioned, so its absence is the proof the
+    flag arrived."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_scope=ft.CoverageScope.PER_SAMPLE.value)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+
+
+def test_a_zero_threshold_never_opens_the_lengths_stream(monkeypatch, tmp_path):
+    """At 0 every genome with any alignment qualifies, so there is no coverage
+    calculation — and the lengths stream is its only consumer. Observed at the
+    boundary rather than in the output, because a wasted whole-reference stream
+    produces exactly the same table."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["lengths_minted"] == 0
+    assert _FakeFlightClient.instances[0].tickets == [_ALIGNMENT_TICKET]
+    # Every genome survives, including the one a 1% threshold drops per-sample.
+    assert len(_table_rows(args.output)) == 3
+
+
+def test_an_ungated_build_leaves_cigar_off_the_wire(monkeypatch, tmp_path):
+    """`cigar` is ~96% of an alignment row and the analytic never reads it, so the
+    default projection must not carry it — that is what the signed column list is
+    for."""
+    rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    assert rec["columns"] == list(ft.ALIGNMENT_COLUMNS)
+    assert "cigar" not in rec["columns"]
+
+
+def test_a_gate_requests_its_columns_and_filters_the_table(monkeypatch, tmp_path):
+    """A gate pays for `cigar` and `mate_position` on the wire and must be seen to
+    change the result: dropping sample 1's 60 bp of G200 takes that genome under 1%
+    pooled, so the gate reaches the coverage filter and not just the counts."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, min_identity=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["columns"] == [*ft.ALIGNMENT_COLUMNS, "cigar", "mate_position"]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+
+
+def test_the_gate_pools_mates_by_default(monkeypatch, tmp_path):
+    """`paired=True` is correct for single-end rows too (their partition is one row),
+    and getting it wrong in the cheap direction is a silent correctness loss — so the
+    default is the safe one, and `mate_position` riding the projection above is what
+    that costs."""
+    rec = _patched(monkeypatch)
+    ftc._handle_feature_table_build(_namespace(tmp_path, min_query_coverage=0.5), parser=None)
+    assert "mate_position" in rec["columns"]
+
+    rec = _patched(monkeypatch)
+    unpaired = _namespace(
+        tmp_path, min_query_coverage=0.5, unpaired_gate=True, output=tmp_path / "b.parquet"
+    )
+    ftc._handle_feature_table_build(unpaired, parser=None)
+    assert "mate_position" not in rec["columns"]
+
+
+def test_an_unpaired_gate_over_paired_reads_is_refused(monkeypatch, tmp_path, capsys):
+    """The escape hatch exists (a slice whose mates did not both map cannot be pooled),
+    so it can also be reached by mistake — and judging a placement's mates
+    independently orphans one of them without any error. The refusal has to arrive as
+    a message and a non-zero exit."""
+    paired = [(1, 1, 10, 1, 0, 500, "500="), (1, 1, 10, 1, 500, 1000, "500=", 0)]
+    _patched(monkeypatch, alignment=paired)
+    args = _namespace(tmp_path, min_identity=0.9, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "paired" in capsys.readouterr().err
+    assert not args.output.exists()
+
+
+def test_a_cohort_named_on_the_command_line_is_what_gets_signed(monkeypatch, tmp_path):
+    """The explicit list has to reach BOTH the ticket and the mint, not just one of
+    them. And narrowing it is not a filter on the same answer: dropping sample 2 takes
+    G200's pooled breadth from 1.2% to 0.6%, so the genome leaves the table — which is
+    why the cohort is part of the scientific question rather than a convenience.
+    """
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, prep_sample_idx=[1])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["ticket_cohort"] == [1]
+    assert rec["minted_cohort"] == [1]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+
+
+def test_an_omitted_cohort_resolves_to_the_pools_mintable_set(monkeypatch, tmp_path):
+    """The cohort route returns what is both readable by the caller and completed for
+    this alignment — a valid mint body by construction — so the common case needs no
+    sample list at all."""
+    rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    assert rec["ticket_cohort"] == [1, 2]
+
+
+def test_an_empty_resolved_cohort_says_so_before_minting_anything(monkeypatch, tmp_path, capsys):
+    """Empty is a legitimate answer from the cohort route ('nothing here you may
+    mint'), but it is not a table: both mints reject an empty cohort, and a 422 from
+    the far end would name a body the user never wrote."""
+    _patched(monkeypatch, cohort=[])
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "no prep_sample" in err
+    assert not _FakeFlightClient.instances
+
+
+def test_a_genome_map_over_the_cap_stops_the_build_with_the_size(monkeypatch, tmp_path, capsys):
+    """The route refuses over its cap rather than truncating, because a lookup table
+    silently missing rows yields a WRONG table. The 413 and the real size it names
+    have to reach the user."""
+    detail = "Genome map for reference 9 has 400000 entries, over the 250000 maximum"
+
+    def _too_big(*args, **kwargs):
+        request = httpx.Request("GET", "http://cp/genome-map")
+        raise httpx.HTTPStatusError(
+            detail, request=request, response=httpx.Response(413, text=detail, request=request)
+        )
+
+    _patched(monkeypatch, genome_map=_too_big)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "413" in err
+    assert "400000" in err
+
+
+def test_an_existing_output_is_refused_before_any_streaming(monkeypatch, tmp_path, capsys):
+    """The recipe streams a cohort's alignment and a whole reference before it has
+    anything to write, so discovering the collision at the end would waste all of it —
+    and the file it would collide with may be one somebody published."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+    args.output.write_text("an earlier run")
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert args.output.read_text() == "an earlier run"
+    assert not _FakeFlightClient.instances
+
+
+def test_two_genomes_under_one_source_id_stop_the_build(monkeypatch, tmp_path, capsys):
+    """`qiita.genome` is unique on the COMPOSITE (source, source_id), so two sources can
+    each use one source_id — and a BIOM write SUMS duplicate (feature_id, sample_id)
+    pairs, so merging two organisms under one handle would never surface in the file.
+    The refusal is the analytic's; what this pins is that it exits non-zero with the
+    message and leaves nothing behind.
+
+    A genome with no label at all is NOT reachable here, by construction: both the
+    roll-up key and the label relation are staged from the one genome-map response, and
+    the roll-up's INNER JOIN drops any alignment whose feature the map does not carry.
+    """
+    colliding = [
+        {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_1"},
+        {"feature_idx": 20, "genome_idx": 200, "source": "genbank", "source_id": "GCF_1"},
+    ]
+    _patched(monkeypatch, map_entries=colliding)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "merges genomes" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+
+
+def test_biom_is_written_when_asked_for(monkeypatch, tmp_path):
+    """The other format, read back through miint's own reader: the same numbers, so
+    the choice is only about who opens the file next."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, format="biom", output=tmp_path / "table.biom")
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output, fmt="biom") == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ]
+
+
+def test_an_empty_cohort_result_still_writes_a_readable_table(monkeypatch, tmp_path):
+    """Every genome dropped by the threshold is a legitimate answer, and it must be a
+    real file rather than an error or an absent one — the path a caller exercises least
+    and would notice last."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=1.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output) == []
+
+
+def test_the_data_plane_url_reaches_the_flight_client(monkeypatch, tmp_path):
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, data_plane_url="grpc+tls://qiita.example.com:443")
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _FakeFlightClient.instances[0].url == "grpc+tls://qiita.example.com:443"
+
+
+def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
+    from pathlib import Path
+
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "feature-table",
+            "build",
+            "--sequencing-run-idx",
+            "4",
+            "--sequenced-pool-idx",
+            "5",
+            "--alignment-idx",
+            "3",
+            "--coverage-threshold",
+            "0.01",
+            "--output",
+            "/tmp/ft/gut.parquet",
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert args.handler is ftc._handle_feature_table_build
+    assert args.output == Path("/tmp/ft/gut.parquet")
+    assert args.format == ftc.DEFAULT_TABLE_FORMAT == "parquet"
+    assert args.coverage_scope == ft.CoverageScope.POOLED.value
+    assert args.coverage_threshold == 0.01
+    assert args.prep_sample_idx is None  # omitted -> resolved from the pool
+    assert args.min_identity is None and args.min_query_coverage is None
+    assert args.unpaired_gate is False
+
+
+def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "feature-table",
+            "build",
+            "--sequencing-run-idx",
+            "4",
+            "--sequenced-pool-idx",
+            "5",
+            "--alignment-idx",
+            "3",
+            "--prep-sample-idx",
+            "1",
+            "--prep-sample-idx",
+            "2",
+            "--coverage-scope",
+            "per-sample",
+            "--coverage-threshold",
+            "0",
+            "--min-identity",
+            "0.95",
+            "--format",
+            "biom",
+            "--output",
+            "/tmp/ft/gut.biom",
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert args.prep_sample_idx == [1, 2]
+    assert args.coverage_scope == ft.CoverageScope.PER_SAMPLE.value
+    assert args.min_identity == 0.95
+    assert args.format == "biom"
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["--alignment-idx", "--coverage-threshold", "--output", "--data-plane-url"],
+)
+def test_parser_rejects_a_build_missing_any_required_flag(missing):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    argv = [
+        "feature-table",
+        "build",
+        "--sequencing-run-idx",
+        "4",
+        "--sequenced-pool-idx",
+        "5",
+        "--alignment-idx",
+        "3",
+        "--coverage-threshold",
+        "0.01",
+        "--output",
+        "/tmp/ft/gut.parquet",
+        "--data-plane-url",
+        "grpc://dp:50051",
+    ]
+    trimmed = argv[:2] + [
+        part
+        for flag, value in zip(argv[2::2], argv[3::2], strict=True)
+        if flag != missing
+        for part in (flag, value)
+    ]
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(trimmed)
+
+
+@pytest.mark.parametrize("value", ["1.5", "-0.1", "not-a-number"])
+def test_parser_rejects_a_threshold_that_is_not_a_proportion(value):
+    """The thresholds are proportions in [0, 1] and a bad one is a usage error, caught
+    at parse time rather than after a cohort's worth of streaming."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "feature-table",
+                "build",
+                "--sequencing-run-idx",
+                "4",
+                "--sequenced-pool-idx",
+                "5",
+                "--alignment-idx",
+                "3",
+                "--coverage-threshold",
+                value,
+                "--output",
+                "/tmp/ft/gut.parquet",
+                "--data-plane-url",
+                "grpc://dp:50051",
+            ]
+        )

@@ -22,6 +22,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_BY_IDX,
     PATH_STUDY_PREFIX,
 )
+from qiita_common.feature_table import CoverageScope
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -38,9 +39,17 @@ from qiita_common.models import (
 
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
-from ._helpers import _handle_patch, _handle_read, _handle_study_field_create, _lane_arg
+from ._helpers import (
+    _handle_patch,
+    _handle_read,
+    _handle_study_field_create,
+    _lane_arg,
+    _proportion_arg,
+)
+from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
+from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
 from .mask import _handle_mask_list, _handle_mask_samples, _handle_mask_show
 from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
@@ -675,6 +684,142 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only samples on this sequenced_pool",
     )
     p_mask_samples.set_defaults(handler=_handle_mask_samples)
+
+    # `alignment list` / `cohort` — the discovery a user needs before building a
+    # feature table: an --alignment-idx is otherwise unobtainable, and the cohort is
+    # part of the scientific question (coverage is measured over it), so it is worth
+    # seeing before it is built over. Both are pool-scoped and reader-scoped.
+    p_alignment = sub.add_parser("alignment", help="Alignment discovery (read-only)")
+    p_alignment_sub = p_alignment.add_subparsers(dest="alignment_cmd", required=True)
+    p_alignment_list = p_alignment_sub.add_parser(
+        "list",
+        help=(
+            "List the alignments over a sequenced pool, each with the config params it"
+            " ran under and its completed / total sample counts"
+        ),
+    )
+    p_alignment_list.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_alignment_list.add_argument("--sequenced-pool-idx", type=int, required=True)
+    p_alignment_list.set_defaults(handler=_handle_alignment_list)
+
+    p_alignment_cohort = p_alignment_sub.add_parser(
+        "cohort",
+        help=(
+            "List the pool's prep_samples that are both readable by you and completed"
+            " for one alignment — the set `feature-table build` uses by default"
+        ),
+    )
+    p_alignment_cohort.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_alignment_cohort.add_argument("--sequenced-pool-idx", type=int, required=True)
+    p_alignment_cohort.add_argument("--alignment-idx", type=int, required=True)
+    p_alignment_cohort.set_defaults(handler=_handle_alignment_cohort)
+
+    # `feature-table build` — the client-side recipe: two REST maps, two Flight
+    # streams, the analytic, and the relabel to public handles, all on the caller's
+    # own machine. There is deliberately no --reference-idx: the alignment records
+    # the reference it ran against.
+    p_feature_table = sub.add_parser(
+        "feature-table", help="Build a feature table from an alignment (client-side)"
+    )
+    p_feature_table_sub = p_feature_table.add_subparsers(dest="feature_table_cmd", required=True)
+    p_ft_build = p_feature_table_sub.add_parser(
+        "build",
+        help=(
+            "Build a genome-keyed (OGU) feature table from an alignment and write it"
+            " with the exported-identifier map needed to read it"
+        ),
+    )
+    p_ft_build.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_ft_build.add_argument("--sequenced-pool-idx", type=int, required=True)
+    p_ft_build.add_argument(
+        "--alignment-idx",
+        type=int,
+        required=True,
+        help="From `qiita alignment list`; its params say which reference it used.",
+    )
+    p_ft_build.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        action="append",
+        help=(
+            "Restrict the cohort to these samples; repeat for several. Omit to use the"
+            " pool's whole mintable cohort for this alignment (`qiita alignment cohort`)."
+            " The cohort changes the table — breadth of coverage is measured over it."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--coverage-scope",
+        choices=tuple(s.value for s in CoverageScope),
+        default=CoverageScope.POOLED.value,
+        help=(
+            "Whether breadth of coverage is measured over the whole cohort (pooled,"
+            " default) or per (sample, genome). Per-sample is strictly stricter."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--coverage-threshold",
+        type=_proportion_arg,
+        required=True,
+        help=(
+            "Minimum breadth of coverage a genome must clear to appear, as a proportion"
+            " of its FULL length (0.01 is the usual choice; 0 keeps every genome with"
+            " any alignment and skips the coverage calculation entirely)."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--min-identity",
+        type=_proportion_arg,
+        help=(
+            "Drop alignments below this CIGAR-derived sequence identity. Needs an"
+            " eqx (=/X) CIGAR — the build refuses rather than silently drop every row"
+            " if none can be scored."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--min-query-coverage",
+        type=_proportion_arg,
+        help=(
+            "Drop alignments covering less than this proportion of the read. Works on"
+            " any CIGAR, unlike --min-identity."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--unpaired-gate",
+        action="store_true",
+        help=(
+            "Score each alignment row on its own CIGAR instead of pooling a placement's"
+            " mates. Only for a slice whose mates did not both map, which cannot be"
+            " pooled; pooling is the default and is correct for single-end data too."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--format",
+        choices=TABLE_FORMATS,
+        default=DEFAULT_TABLE_FORMAT,
+        help=(
+            f"Table format ({DEFAULT_TABLE_FORMAT} by default). Both carry the same"
+            " numbers, so this is a choice of what reads the file next: parquet for"
+            " dataframe tooling, biom for the microbiome tools that require it."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help=(
+            "Where to write the table. The exported-identifier map is written beside it"
+            " as <stem>.exported-identifier.json. Neither is overwritten if it exists."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--data-plane-url",
+        required=True,
+        help=(
+            "gRPC URL of the data plane the alignment and reference lengths stream from"
+            " (e.g. grpc+tls://qiita.example.com:443, or grpc://<host>:50051 on-host)."
+        ),
+    )
+    p_ft_build.set_defaults(handler=_handle_feature_table_build)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)

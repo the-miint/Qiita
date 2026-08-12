@@ -82,6 +82,26 @@ duplicates further down are historical strata; leave them where they are.
   **ignores any extra column** — so it is the relabel's projection, not the writer, that
   keeps our identifiers out of a published file.
 
+- **`qiita feature-table build` — a feature table, computed on your own machine.** The first
+  CLI surface for any of the analytic-export routes, and the first thing that composes them:
+  the alignment slice and the reference lengths arrive as Flight streams, the genome map and
+  the public sample handles as REST reads, and the analytic, the relabel, and the write all
+  run locally under the caller's own token. Nothing is computed server-side and nothing is
+  persisted. `qiita alignment list` and `qiita alignment cohort` are the discovery half —
+  which alignments ran over a pool, and which of its samples you may build a table from —
+  since an `--alignment-idx` was otherwise unobtainable without a psql shell. Both scope
+  their answer to what the caller may read, which is what makes them agree with the ticket
+  mint. **There is no `--reference-idx`:** the alignment records the reference it ran
+  against, so a caller cannot name a different one and fetch the wrong genome map. The
+  cohort defaults to the pool's full mintable set and can be narrowed sample by sample —
+  which changes the table rather than filtering it, since breadth of coverage is measured
+  over the cohort. A CIGAR gate is opt-in per threshold, pools a placement's mates unless
+  told otherwise (correct for single-end data too, and the cheap alternative loses
+  correctness silently), and pays for the wide `cigar` column on the wire only when it is
+  asked for. Everything cheap and refusable happens before the two bulk streams: a wrong
+  alignment, an empty cohort, an over-cap genome map, or an output name already in use all
+  stop the run before a byte of alignment data moves.
+
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both
