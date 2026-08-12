@@ -189,6 +189,16 @@ def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Itera
     DuckDB pulls the Arrow stream lazily as the query scans `relation`, so the rows are
     never buffered in Python — the reason each caller below runs exactly one
     materializing CREATE inside the block and lets the relation go.
+
+    **DuckDB's scan of the registered stream logs one Arrow "input buffer was poorly
+    aligned" warning per projected column, and no read option here removes it.** Measured
+    on the end-to-end test: 12 warnings with no `ensure_alignment`, 12 with
+    `Alignment.At64Byte`, 15 with `Alignment.DataTypeSpecific` (the setting the reference
+    genome export passes for its own Acero-based FASTA writer). Traced to this function by
+    marker: every warning falls inside the alignment projection, none inside the lengths
+    one, and none inside any miint call. So it is an Arrow/DuckDB interaction
+    (apache/arrow#37195), not something the client can fix by asking more politely — and
+    the option is left off rather than carried as a fix that measurably is not one.
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
