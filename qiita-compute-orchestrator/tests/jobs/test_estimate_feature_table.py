@@ -97,9 +97,15 @@ def _write_map_parquet(path: Path, rows: list[tuple[int, int]]) -> Path:
 
 def _fake_alignment_stream(parquet: Path, captured: dict):
     @asynccontextmanager
-    async def fake(conn, *, work_ticket_idx, relation="alignment"):
+    async def fake(conn, *, work_ticket_idx, columns, relation="alignment"):
         captured["work_ticket_idx"] = work_ticket_idx
-        conn.register(relation, pq.read_table(str(parquet)).to_reader())
+        captured["columns"] = list(columns)
+        # PROJECT, exactly as the real DoGet does — the data plane streams the
+        # signed columns and nothing else. A fixture wide enough to satisfy a
+        # SELECT the job never asked for would hide precisely the drift this
+        # projection exists to prevent, so `.select()` raises here instead.
+        table = pq.read_table(str(parquet)).select(list(columns))
+        conn.register(relation, table.to_reader())
         try:
             yield relation
         finally:
@@ -192,6 +198,7 @@ def test_execute_streams_scopes_writes_and_schema(tmp_path, monkeypatch):
 
     assert captured["work_ticket_idx"] == 42
     assert captured["reference_idx"] == 7
+    assert captured["columns"] == list(m._ALIGNMENT_COLUMNS)
 
     out_path = out["ogu_table"]
     assert out_path == tmp_path / "ws" / "ogu_table.parquet"
@@ -480,3 +487,34 @@ def test_smoke_full_ogu_table(tmp_path, monkeypatch):
         (2, 200, 1.0),  # (i)  retained, sample 2
         # absent: G300 (dropped 0.5%), G600 (dropped 0.67% via unaligned length)
     ]
+
+
+def test_job_asks_for_exactly_the_columns_it_binds(tmp_path, monkeypatch):
+    """The requested projection and the bound SELECT list are ONE list.
+
+    They used to be two hand-written copies in different components — the data
+    plane's hardcoded projection and this job's CREATE TABLE — with no way for
+    either to see the other. Now the job owns the list and the data plane serves
+    what it signed, so the only thing left to pin is that the job does not
+    reintroduce the split by hardcoding a second copy in its SQL.
+
+    The stream fake projects to the requested columns (see `_fake_alignment_stream`),
+    so a SELECT naming anything the job did not ask for fails to bind — which
+    makes every other test in this module a check on this property too.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    _, captured = _run(
+        m,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        alignment=[(1, 1, 20, 0, 0, 50)],
+        lengths=[(20, 100)],
+        mapping=[(20, 200)],
+        threshold=0.01,
+    )
+
+    assert captured["columns"] == list(m._ALIGNMENT_COLUMNS)
+    # This recipe never reads `cigar`, and leaving it out is most of what the
+    # projection buys — the one regression a future edit is likeliest to add.
+    assert "cigar" not in captured["columns"]

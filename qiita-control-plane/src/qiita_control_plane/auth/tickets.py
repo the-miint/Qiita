@@ -31,6 +31,44 @@ from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
 # shared constants so the signer and the scope rule cannot drift.
 _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 
+# Columns each table may have signed into a ticket's projection list, mirroring
+# the data plane's per-table allowlist (ALIGNMENT_PROJECTION_COLUMNS in
+# flight_service.rs). Neither language can import the other, so the two are kept
+# honest by a test that parses the Rust source — see tests/auth/test_auth.py.
+#
+# A table absent from this mapping takes no projection at all: the data plane
+# streams every column and rejects a list outright. Only the alignment surface
+# is listed; why it and nothing else is in `docs/architecture.md`.
+_PROJECTION_COLUMNS: dict[str, frozenset[str]] = {
+    "alignment_visible": frozenset(
+        {
+            "alignment_idx",
+            "prep_sample_idx",
+            "sequence_idx",
+            "feature_idx",
+            "mate_feature_idx",
+            "flags",
+            "position",
+            "stop_position",
+            "mapq",
+            "cigar",
+            "mate_position",
+            "template_length",
+            "tag_as",
+            "tag_xs",
+            "tag_ys",
+            "tag_xn",
+            "tag_xm",
+            "tag_xo",
+            "tag_xg",
+            "tag_nm",
+            "tag_yt",
+            "tag_md",
+            "tag_sa",
+        }
+    ),
+}
+
 TICKET_VERSION = 2
 DEFAULT_TTL_SECONDS = 300
 SIGNATURE_SIZE = 64  # Ed25519
@@ -75,6 +113,7 @@ def sign_ticket(
     filter: dict[str, Any],
     secret: bytes,
     members: list[dict[str, int]] | None = None,
+    columns: list[str] | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     expiry_epoch: int | None = None,
 ) -> bytes:
@@ -94,8 +133,19 @@ def sign_ticket(
       filter plus members); ``read_block`` carries members alone, so an empty
       ``filter`` is legitimate there and only there.
 
-    ``members`` is omitted from the payload entirely when absent, so every
-    existing ticket signs byte-identical bytes (the data plane defaults the field).
+    ``columns`` is the orthogonal, *projection* scope: it narrows what each
+    returned row carries rather than which rows are returned. It is **required
+    for, and only accepted for**, the tables in ``_PROJECTION_COLUMNS`` — the
+    data plane refuses a projectable table's ticket that omits the list, so
+    signing one here would only defer the failure to a client already holding a
+    signed ticket. Validating it here rather than at the route is the same choice
+    ``members`` makes above — this is the one place every ticket passes through,
+    so a future caller cannot mint an unvalidated projection by forgetting a
+    route-level guard.
+
+    Both ``members`` and ``columns`` are omitted from the payload entirely when
+    absent, so every existing ticket signs byte-identical bytes (the data plane
+    defaults each field).
     """
     if filter and any(not value for value in filter.values()):
         raise ValueError("sign_ticket rejects a filter with an empty value list")
@@ -119,9 +169,44 @@ def sign_ticket(
             "sign_ticket requires a scope: a non-empty filter, a non-empty "
             "members selector, or both"
         )
+    if columns is None and table in _PROJECTION_COLUMNS:
+        # A projectable table REQUIRES its list, because the data plane refuses a
+        # ticket for one that arrives without it. Signing anyway would mint a 201
+        # ticket that can only ever fail at DoGet — the failure arrives one hop
+        # later, at a client holding a signed ticket, instead of here where the
+        # caller can see what it got wrong. Both halves of the mirrored rule
+        # belong at the same boundary.
+        raise ValueError(
+            f"sign_ticket: table {table!r} requires a projection column list "
+            f"(the data plane rejects a ticket for it without one)"
+        )
+    if columns is not None:
+        allowed = _PROJECTION_COLUMNS.get(table)
+        if allowed is None:
+            raise ValueError(
+                f"sign_ticket: table {table!r} takes no projection column list "
+                f"(only {sorted(_PROJECTION_COLUMNS)} are projectable)"
+            )
+        if not columns:
+            # Distinct from "no columns at all", and this is the ONLY layer that
+            # can tell them apart: the data plane's `#[serde(default)]` renders
+            # an omitted field as an empty list, so on the wire the two are one
+            # value. A caller that computed a projection and got nothing has a
+            # bug, and must not silently receive every column instead.
+            raise ValueError("sign_ticket rejects an empty projection column list")
+        unknown = sorted(set(columns) - allowed)
+        if unknown:
+            raise ValueError(f"sign_ticket: unknown projection column(s) {unknown} for {table!r}")
+        if len(set(columns)) != len(columns):
+            # Two identically-named Arrow fields, which consumers collapse or
+            # reject inconsistently — refuse rather than pick for them.
+            raise ValueError(f"sign_ticket: duplicate projection column(s) in {columns}")
+
     payload: dict[str, Any] = {"filter": filter, "table": table}
     if members:
         payload["members"] = members
+    if columns:
+        payload["columns"] = columns
     return _sign_payload(
         payload,
         secret,

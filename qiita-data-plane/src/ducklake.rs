@@ -420,9 +420,11 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
 /// stamps feature_idx). Exposed via Flight DoGet (in flight_service::ALLOWED_TABLES)
 /// for the feature-table (OGU) consumer: reads are always scoped to a single
-/// alignment_idx + an explicit prep_sample_idx set and projected to the
-/// coverage/OGU columns (see ALIGNMENT_DOGET_PROJECTION); an unscoped read is
-/// refused. This is host-depleted derived data, not raw human reads.
+/// alignment_idx + an explicit prep_sample_idx set, and projected to the columns
+/// the ticket signed — required on this surface, and drawn from the allowlist
+/// `flight_service::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
+/// below. An unscoped or unprojected read is refused. This is host-depleted
+/// derived data, not raw human reads.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.alignment (
