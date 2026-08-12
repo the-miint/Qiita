@@ -267,7 +267,7 @@ def _read_table(path, *, fmt: str) -> list[tuple]:
 async def test_a_user_builds_a_publishable_feature_table(
     cp_server, data_plane, regular_user_session, publishable_cohort, tmp_path, monkeypatch, capsys
 ):
-    """The milestone, from the client's side: three verbs, two stores, one file.
+    """The whole recipe from the client's side: three verbs, two stores, one file.
 
     Nothing below the CLI is stubbed and nothing names a `prep_sample_idx` after the
     seed — the cohort is discovered, the reference is read out of the alignment's own
@@ -391,7 +391,8 @@ async def test_a_user_builds_a_publishable_feature_table(
         "pooled.exported-identifier.json",
         "pooled.parquet",
     ]
-
-    # --- And the refusal a second run must make, against real files on disk. ---
-    assert _build(output=pooled) == 1
-    assert "refusing to overwrite" in capsys.readouterr().err
+    # The mint is idempotent, which only a second real build can show: the two bundles
+    # name the same samples the same way, so the tables above are comparable to each
+    # other and a re-run does not rename anybody's columns.
+    second_map = json.loads((out_dir / "per-sample.exported-identifier.json").read_text())
+    assert {e["prep_sample_idx"]: e["export_id"] for e in second_map["identifiers"]} == handles

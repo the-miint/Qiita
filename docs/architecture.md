@@ -711,68 +711,55 @@ refuses.
 ### The client-side feature table
 
 `qiita feature-table build` composes the primitives above into a genome-keyed (OGU)
-feature table **on the caller's own machine**. Nothing is computed server-side and
-nothing is persisted: the control plane authorizes, mints identifiers, and signs
-tickets; the data plane streams rows; the analytic, the relabel, and the write happen
-in the client's own DuckDB with the caller's own credentials.
+feature table **on the caller's own machine**. The division is the point: the control
+plane authorizes, mints public identifiers, and signs tickets; the data plane streams
+rows; the analytic, the relabel, and the write run in the client's own DuckDB under the
+caller's own credentials. **The table itself is computed nowhere else and stored
+nowhere** — it is a derived artifact on the caller's disk, not a resource this system
+holds. (The `export_id`s naming its samples *are* persisted, in Postgres, because they
+are promises: see the map section above.)
 
 ```
 alignment slice  ──Flight DoGet (projected)──┐
 reference lengths ─Flight DoGet (whole ref)──┤
 genome map ────────REST─────────────────────>├──> coverage filter ──> woltka_ogu
-exported identifiers ─REST (mint)───────────>┘         │                  │
-                                                       └──> relabel ──> Parquet | BIOM
+exported identifiers ─REST (mint)───────────>┘                            │
+                                                          relabel <───────┘
+                                                             └──> Parquet | BIOM
 ```
 
 **The analytic is SQL text in `qiita_common.feature_table`, shared with the
 compute-orchestrator's `estimate_feature_table` job.** Two consumers run the same
-analytic and must not disagree about it; they differ only in where the inputs come
-from and how the result is written. `qiita-common` has no `duckdb` dependency and
-must not gain one, so the module owns no connection and no streaming — each caller
-executes the statements itself. The relation names are part of that contract:
-`woltka_ogu` resolves its source relation on a *separate* connection, which cannot
-see temp tables or registered streams, so every staged relation is a regular table.
+analytic and must not disagree about it; they differ only in where the inputs come from
+and how the result is written — which is why the module owns no connection and no
+streaming, and why `qiita-common` has no `duckdb` dependency to let it. That module's
+docstrings are the single copy of *why* each step is shaped as it is; this section is
+the map, not a second copy. What a reader of the pipeline needs to know is that four of
+its properties are load-bearing rather than stylistic, and each is enforced and
+explained at exactly one place:
 
-Three orderings in that pipeline are load-bearing, each because the wrong order
-produces a plausible number rather than an error:
+| Property | Enforced at |
+|---|---|
+| the coverage survivor set joins **before** woltka, not after its output | `ogu_input_table_sql` |
+| a CIGAR gate filters the coverage calculation as well as the counts | `gated_alignment_table_sql` |
+| the relabel precedes the write and is what makes BIOM writable at all | `LABELLED_SCHEMA`, `labelled_table_sql` |
+| the coverage scope rides the *relation name*, so a scope mismatch is a bind error | `_SURVIVOR_TABLES` |
 
-- **The coverage survivor set joins *before* woltka**, not after. `woltka_ogu` splits
-  a multi-mapped read across its distinct references, so a read hitting a surviving
-  and a dropped genome must lose the dropped one first to renormalize onto the
-  survivor. Filtering woltka's output instead strands it at half a count.
-- **A CIGAR gate applies before the coverage calculation**, because an alignment that
-  fails the gate is not a placement and must not contribute covered bases either.
-- **The relabel happens before the write, and is not cosmetic.** BIOM requires both id
-  columns as VARCHAR while woltka returns native integers, so there is no writable
-  table before the join.
+Two consequences worth stating here, because neither is visible from any single site:
 
-**Breadth of coverage is measured at one of two scopes** — pooled over the cohort, or
-per `(sample, genome)`. The two are asymmetric: pooling unions intervals, so pooled
-breadth is always at least the best single sample's, and the per-sample scope can only
-ever remove rows. The scope therefore rides the *relation name*, so building one
-scope's survivor set and joining the other's is a bind error rather than a silent
-fan-out. Because coverage is measured over the cohort, **narrowing the cohort changes
-the table rather than filtering it** — the cohort is part of the scientific question.
+- **Narrowing the cohort changes the table rather than filtering it.** Breadth of
+  coverage is measured over the cohort, so the cohort is part of the scientific
+  question — which is also why the ticket mint is all-or-nothing rather than narrowing
+  to what the caller may read.
+- **Every check in the recipe exists because its failure mode is a table that looks
+  right**, not one that errors. The SQL that would publish such a table is unreachable
+  without the check having run: the builders take a clearance object only the check
+  produces, so "diagnose before you act" is a type constraint rather than a convention.
 
-**The client refuses rather than publishes anything doubtful.** Every check the recipe
-makes exists because its failure mode is a table that looks right: a gate whose CIGARs
-cannot be scored at all (which would drop every row and return an empty table), a
-paired placement scored on one surviving mate, a map fetched for the wrong reference,
-two genomes merged under one `source_id` — which a BIOM write would silently sum. The
-SQL that would publish such a table is unreachable without the check having run: the
-builders take a clearance object that only the check can produce.
-
-**The output is one table plus the exported-identifier map, all-or-nothing.** One
-format per run (they hold the same numbers), the caller names the file, and the map is
-named after it. Half a bundle is not a partial result but a useless one — the table
-names its samples by `export_id` alone, so without the map nobody can join it back to
-their own records. The map is also the one artifact carrying `prep_sample_idx`, and it
-says so in the file rather than only in the terminal.
-
-Client half: `qiita_control_plane.cli.user.feature_table` (plus
-`cli.user.alignment` for the discovery reads that produce an `alignment_idx`). The
-reference is read out of the alignment's own `params`, never taken as a flag, so a
-caller cannot fetch the map for a different reference than the alignment used.
+Client half: `qiita_control_plane.cli.user.feature_table`, with `cli.user.alignment` for
+the discovery reads that yield an `alignment_idx`. The reference is read out of the
+alignment's own `params` rather than taken as a flag, so a caller cannot fetch the
+genome map for a different reference than the alignment used.
 
 ## Auth & Data Access Flow
 
