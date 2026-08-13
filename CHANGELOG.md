@@ -778,6 +778,27 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **The documented `phylogeny_tip_feature` table never existed.** Eleven sites across
+  `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, two table inventories, an
+  ingestion step, a worked clade-scoped query — described a Postgres junction table mapping
+  `(reference_idx, node_index) → feature_idx`, contradicting the migration that deliberately
+  did not build one. A phylogeny tip carries `feature_idx` as a **column on its own DuckLake
+  row**; clade queries stay inside that one table instead of crossing to Postgres. The
+  architecture doc also now records why phylogeny has no exclusion-aware `_visible` view (a
+  row-wise anti-join would orphan internal parents and malform the tree, so a consumer shears
+  to its keep-set instead). Alongside it, `CLAUDE.md` claimed `feature_idx` is "stored as
+  Postgres `uuid`" — it is a BIGINT identity, and the uuid is the separate `sequence_hash`, so
+  the claim was an invitation to write `feature_idx::uuid`.
+
+- **`shear_tree` and the Newick writer are now documented from a probe rather than assumed.**
+  `docs/duckdb-miint.md` had no `shear_tree` entry at all and the architecture doc recorded its
+  presence in the pinned miint mirror as unverified. It is present, and the entry now carries
+  its real signature, the separate-connection relation resolution, the float branch-length
+  summation, and both distinct failure messages. The load-bearing find is in the writer:
+  **`COPY … (FORMAT NEWICK)` turns on jplace-style `{N}` edge annotations by default whenever an
+  `edge_id` column is present**, so passing a sheared tree straight through — as upstream's own
+  example does — writes a file plain-Newick parsers may reject.
+
 - **A study link retired mid-request answers 404 instead of 500 (#386).** The
   study-scoped metadata write for a biosample or sequenced-sample checks the
   caller's study link before writing, and the database re-checks it at the write
