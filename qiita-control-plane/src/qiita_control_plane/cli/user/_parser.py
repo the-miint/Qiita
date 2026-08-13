@@ -829,8 +829,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help=(
-            "Where to write the table. The exported-identifier map is written beside it"
-            " as <stem>.exported-identifier.json. Neither is overwritten if it exists."
+            "Where to write the table. The rest of the bundle is named after it —"
+            " <stem>.exported-identifier.json and <stem>.manifest.json always, plus"
+            " whatever --taxonomy and --tree add. None is overwritten if it exists,"
+            " and a failure part-way leaves none of them behind."
         ),
     )
     p_ft_build.add_argument(

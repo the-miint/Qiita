@@ -882,6 +882,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A duckdb failure during a feature-table build reached the user as a traceback.** The
+  analytic runs on the caller's own machine, which makes duckdb's own failures both the
+  likeliest thing to go wrong on a large reference — the peak is a whole tree, and the shear
+  is single-threaded and allocation-bound — and the hardest to place, since an out-of-memory
+  or a spill with nowhere to go says nothing about whose memory ran out. Now a message that
+  says the analytic failed here, alongside the transport and refusal messages that were
+  already handled.
+
 - **The roll-up's coverage report understated the share it could not carry.** It counted the
   rows of a join to the genome map, and a feature belonging to several genomes — which
   `feature_genome` allows on purpose, since identical bytes are one feature and a plasmid two

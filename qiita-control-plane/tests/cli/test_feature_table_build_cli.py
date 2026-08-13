@@ -960,6 +960,29 @@ def test_a_published_genome_with_two_tips_stops_the_build(monkeypatch, tmp_path,
     assert not list(tmp_path.iterdir())
 
 
+def test_a_duckdb_failure_is_named_not_traced(monkeypatch, tmp_path, capsys):
+    """The analytic runs on the caller's own machine, so duckdb's own failures are the
+    ones a user is most likely to hit and least able to place: an out-of-memory shearing
+    a six-figure tree says nothing about whose memory ran out.
+
+    Raised at the shear because that is the recipe's peak, but the handler's clause is
+    what is under test — any duckdb call in the recipe has the same exposure.
+    """
+    import duckdb
+
+    def _oom(_con):
+        raise duckdb.OutOfMemoryException("failed to allocate block of 256MB")
+
+    _patched(monkeypatch)
+    monkeypatch.setattr(ftc, "_shear_tree", _oom)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path, tree=True), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "on this machine" in err
+    assert "256MB" in err
+    assert not list(tmp_path.iterdir())
+
+
 def test_a_build_without_shear_tree_stops_before_any_round_trip(monkeypatch, tmp_path, capsys):
     """The probe's placement is the point: `shear_tree` is absent from builds a user's
     extension cache may still hold, and discovering that after a whole reference has been

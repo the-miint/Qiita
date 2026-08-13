@@ -36,6 +36,14 @@ _None yet._
   identifiers no longer removes them — it detaches and auto-retires them, so
   `qiita-admin`'s alignment purge still succeeds and a published `QM<n>` keeps resolving.
   (#438)
+- `20260813000000_exported_feature.sql` and `20260813000001_exported_processing.sql` —
+  plain `make migrate`, no out-of-band setup. Two more empty mint tables
+  (`qiita.exported_feature`, `qiita.exported_processing`), each with the same
+  retire-on-detach trigger as above. The behaviour note on the previous line now applies
+  on three more delete paths: deleting a **genome**, a **reference**, or an
+  `alignment_definition` that has published handles detaches and auto-retires them rather
+  than failing or removing them, and the retirement records which identifier was severed.
+  (#m5-feature-table)
 
 ### 4. Deploy
 
@@ -78,6 +86,14 @@ _None yet._
   direction is silent: an old DP has no `deny_unknown_fields` on its ticket
   payload, so it drops what it does not understand rather than refusing (fixed
   going forward — this build refuses). (#435)
+- **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
+  `qiita feature-table build` requires it.** Additive, so an older client ignores it and
+  nothing on the host changes. The direction that bites is the other one: the new CLI
+  recomputes that digest and refuses to build against a server too old to report one, by
+  design — a client cannot vouch for params it has no way to check. Anyone pointing this
+  build's CLI at an older deployment gets that refusal, not a wrong table. Two new mint
+  routes (`POST /exported-feature`, `POST /exported-processing`) ship alongside it under
+  the scopes their siblings already use — no new scope, so no PAT re-mint. (#m5-feature-table)
 
 ---
 

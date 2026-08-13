@@ -989,6 +989,7 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
     connection is per-attempt, since a staging CREATE that failed part-way leaves
     relations behind that a retry would collide with.
     """
+    import duckdb  # noqa: PLC0415
     import pyarrow.flight as flight  # noqa: PLC0415
 
     from ...miint import connect_with_miint  # noqa: PLC0415
@@ -1021,6 +1022,14 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
+        return 1
+    except duckdb.Error as exc:
+        # The analytic runs HERE, so duckdb's own failures are the ones a user is least
+        # able to place: the recipe's peak is a whole reference's tree, `shear_tree` is
+        # single-threaded and allocation-bound, and an out-of-memory or a spill with
+        # nowhere to go says nothing about whose machine ran out. Named separately from
+        # the refusals below because it is not one — nothing here chose to stop.
+        print(f"error: the analytic failed on this machine: {exc}", file=sys.stderr)
         return 1
     except (ValueError, OSError, RuntimeError) as exc:
         # Every refusal the recipe makes, plus the bundle's own file checks
