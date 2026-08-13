@@ -656,6 +656,7 @@ _FEATURE_HANDLES = {
     200: "GCF_000000200",
     300: "GCF_000000300",
     400: "GCF_000000400",
+    500: "GCF_000000500",
 }
 # The exported-identifier mint's answer for the two samples the alignment fixture uses.
 _HANDLES = [(1, "QM1"), (2, "QM2")]
@@ -916,11 +917,13 @@ def _shear(conn) -> ft.TreeClearance:
 
 
 @contextlib.contextmanager
-def _labelled(*, mapping=_MAP, threshold=0.01):
+def _labelled(*, mapping=_MAP, lengths=_LENGTHS, threshold=0.01):
     """A connection carrying everything the shear needs: the roll-up done, the labels
     minted from its own output, and the relabel run — the client's order exactly."""
     with connect_with_miint_staged() as conn:
-        populated = _ogu_input(conn, ft.CoverageScope.POOLED, threshold, mapping=mapping)
+        populated = _ogu_input(
+            conn, ft.CoverageScope.POOLED, threshold, mapping=mapping, lengths=lengths
+        )
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, feature_handles=_published_handles(conn), handles=_HANDLES)
         _relabel(conn)
@@ -1079,3 +1082,32 @@ def test_the_rollup_report_counts_a_shared_features_alignment_row_once():
     assert coverage.unmapped_rows == 1
     assert coverage.unmapped_features == 1
     assert "1 of 7" in ft.rollup_coverage_warning(coverage)
+
+
+def test_a_tip_shared_with_an_UNPUBLISHED_genome_still_shears_cleanly(tmp_path):
+    """The other half of the shared-feature case, and the one that reads as ambiguous
+    without being so. Contig 40 belongs to G400 (published) and to G500, which also owns a
+    1 Mb contig nothing aligned to and so fails the coverage threshold. The tip must simply
+    be named G400's handle: the map is the whole reference's, but only PUBLISHED membership
+    may rename a tip.
+
+    Coverage filtering dropping some but not all of a shared feature's genomes is the
+    ordinary case, so this is the axis that matters — and it is the one the fan-out bug
+    broke, refusing the build over a genome the table never mentions.
+    """
+    shared_with_unpublished = [*_MAP, (40, 500), (99, 500)]
+    lengths = [*_LENGTHS, (99, 1_000_000)]
+    with _labelled(mapping=shared_with_unpublished, lengths=lengths) as conn:
+        published = {
+            name
+            for (name,) in conn.execute(
+                f"SELECT feature_id FROM {ft.GENOME_LABEL_TABLE}"
+            ).fetchall()
+        }
+        _stage_phylogeny(conn, tmp_path)
+        clearance = _shear(conn)
+        rows = _sheared(conn)
+
+    assert "GCF_000000500" not in published, "G500 must be unpublished for this to test anything"
+    assert clearance.tips == 3
+    assert {name for _, name, _, _, _, is_tip in rows if is_tip} == published

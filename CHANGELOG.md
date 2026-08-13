@@ -94,8 +94,11 @@ duplicates further down are historical strata; leave them where they are.
   published file. Four things are refused rather than approximated, each of them otherwise a
   tree somebody would join to the table anyway: a reference with no phylogeny, a published row
   with no tip, a row owning more than one tip (a contig-level tree, which the shear would
-  happily emit with duplicate tip labels), and a tip belonging to more than one genome (a
-  shared plasmid cannot be one genome-named tip). A build asking for a tree also checks the
+  happily emit with duplicate tip labels), and a tip belonging to more than one **published**
+  genome (a plasmid published under two organisms cannot be one genome-named tip — whereas one
+  merely *present* under a second genome the table never mentions shears cleanly). Publishing
+  no rows at all is not one of these: an empty cohort gets an empty tree, the way it already
+  gets an empty table. A build asking for a tree also checks the
   loaded miint build has `shear_tree` before doing any work, because a plain `INSTALL` never
   refreshes an extension already cached and the raw failure is a bare `Catalog Error`.
 

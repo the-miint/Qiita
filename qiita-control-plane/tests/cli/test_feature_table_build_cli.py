@@ -951,3 +951,22 @@ def test_a_build_without_shear_tree_stops_before_any_round_trip(monkeypatch, tmp
     assert "shear_tree" in capsys.readouterr().err
     assert "alignments_fetched" not in rec
     assert not list(tmp_path.iterdir())
+
+
+def test_an_empty_cohort_still_writes_a_readable_tree(monkeypatch, tmp_path):
+    """Every genome dropped by the threshold is a legitimate answer, and the bundle stays
+    whole: an empty table, an empty sidecar, an empty tree. `shear_tree` raises rather
+    than shearing a tree to nothing, so the empty case cannot go through it — and reaching
+    it left a raw `InvalidInputException` escaping as a traceback, past every `except` the
+    handler has."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=1.0, taxonomy=True, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output) == []
+    assert _tree_rows(tmp_path / "table.tree.parquet") == []
+    with connect_with_miint() as conn:
+        described = conn.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{tmp_path / 'table.tree.parquet'}')"
+        ).fetchall()
+    assert [(r[0], r[1]) for r in described] == list(ft.TREE_SCHEMA.items())

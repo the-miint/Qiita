@@ -1092,23 +1092,39 @@ def test_the_shear_input_names_tips_from_the_published_labels():
     published handles and the tree cannot disagree about which tip is which."""
     published, keep_set = ft.shear_input_statements()
     assert f"CREATE VIEW {ft.SHEAR_INPUT_RELATION} AS" in published
-    assert "CASE WHEN p.is_tip THEN g.feature_id ELSE p.name END AS name" in published
-    assert f"LEFT JOIN {ft.MAP_TABLE} m ON m.contig_id = p.feature_idx" in published
-    assert f"LEFT JOIN {ft.GENOME_LABEL_TABLE} g ON g.genome_idx = m.genome_id" in published
+    assert "CASE WHEN p.is_tip THEN pub.feature_id ELSE p.name END AS name" in published
     assert keep_set == (
         f"CREATE VIEW {ft.SHEAR_KEEP_SET_RELATION} AS "
         f"SELECT feature_id AS name FROM {ft.GENOME_LABEL_TABLE}"
     )
 
 
-def test_an_unpublished_tip_is_left_nameless_rather_than_keeping_its_own():
-    """A LEFT JOIN, so an unpublished tip's name is NULL — which never matches the
-    keep-set (so it is sheared away) and cannot collide with a published handle. Its
-    original name is a reference-internal FASTA header, and a published artifact should
-    not carry one by accident."""
+def test_the_tip_rename_reads_PUBLISHED_membership_and_not_the_whole_map():
+    """The whole reference's map fans a tip out once per genome its feature belongs to —
+    published or not — and the node-count check then refuses the build over a genome the
+    table never mentions. Both consumers of the restriction build it the same way, which is
+    why it is one function.
+    """
     published, _ = ft.shear_input_statements()
-    assert "LEFT JOIN" in published
-    assert "INNER JOIN" not in published
+    assert f"({ft.published_membership_sql()}) pub ON pub.feature_idx = p.feature_idx" in published
+    # `MAP_TABLE` reaches the view only THROUGH that restriction, never on its own.
+    assert f"JOIN {ft.MAP_TABLE} m ON m.contig_id" not in published
+    assert ft.published_membership_sql() in ft.taxonomy_sidecar_sql()
+
+
+def test_published_membership_is_an_inner_join_so_an_unpublished_genome_drops_out():
+    sql = ft.published_membership_sql()
+    assert f"FROM {ft.MAP_TABLE} m JOIN {ft.GENOME_LABEL_TABLE} l" in sql
+    assert "LEFT JOIN" not in sql
+
+
+def test_an_unpublished_tip_is_left_nameless_rather_than_keeping_its_own():
+    """A LEFT JOIN onto the tree, so a tip with no published genome gets a NULL name —
+    which never matches the keep-set (so it is sheared away) and cannot collide with a
+    published handle. Its original name is a reference-internal FASTA header, and a
+    published artifact should not carry one by accident."""
+    published, _ = ft.shear_input_statements()
+    assert f"FROM {ft.PHYLOGENY_TABLE} p LEFT JOIN" in published
 
 
 def test_the_shear_collapses_and_refuses_a_missing_tip():
@@ -1208,3 +1224,15 @@ def test_check_refuses_a_reference_whose_taxonomy_repeats_a_feature():
     for one feature can carry different lineages."""
     with pytest.raises(ValueError, match="more than one row"):
         _taxonomy_check(repeated_features=1)
+
+
+def test_a_cleared_keep_set_of_no_tips_builds_the_tree_without_the_shear():
+    """Publishing no rows is a legitimate result — every genome dropped by the threshold —
+    and the table written beside this one is a real, empty file. `shear_tree` cannot say
+    it: a tree sheared to nothing raises. Same short-circuit, and same one-relation-name
+    discipline, as `ogu_output_table_sql`'s empty path."""
+    sql = ft.sheared_tree_table_sql(clearance=ft.TreeClearance(tips=0))
+    assert "shear_tree" not in sql
+    assert sql.endswith("WHERE false")
+    for name, sql_type in ft.TREE_SCHEMA.items():
+        assert f"CAST(NULL AS {sql_type}) AS {name}" in sql

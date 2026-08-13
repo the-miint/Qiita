@@ -561,6 +561,11 @@ def _write_bundle(
     artifact naming rows the table does not contain is worse than no artifact. Half a
     bundle is not a partial result but a useless one.
     """
+    unknown = set(clearances) - {c.name for c in _COMPANIONS}
+    if unknown:
+        # Silently writing nothing is the one outcome a bundle must not have: the member
+        # would be absent from a bundle whose whole promise is all-of-its-files.
+        raise ValueError(f"no bundle companion is named {sorted(unknown)}")
     companions = tuple(c for c in _COMPANIONS if c.name in clearances)
     targets = _bundle_targets(table_path, fmt, companions=companions)
     pairs = [(p.with_name(p.name + ".partial"), p) for p in targets]

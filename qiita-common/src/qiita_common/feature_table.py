@@ -821,6 +821,30 @@ def genome_label_table_sql(source: str) -> str:
     )
 
 
+def published_membership_sql() -> str:
+    """The feature→genome map restricted to the genomes the table PUBLISHED, as a relation
+    expression yielding `(feature_idx, genome_idx, feature_id)`.
+
+    **`MAP_TABLE` is the whole reference's map** — one row per `(feature, genome)` pair,
+    and `feature_genome` is many-to-many, so a feature two organisms share appears once per
+    genome. `GENOME_LABEL_TABLE` holds only the genomes the roll-up emitted. Restricting
+    one by the other is load-bearing in two different ways, which is why it is named here
+    once instead of spelled at each site:
+
+    * for the taxonomy sidecar it makes the reduction exactly as wide as the table, and
+      cheap — a reference's whole taxonomy is reduced only for the genomes that survived;
+    * for the tree it is what stops an UNPUBLISHED co-genome from fanning a tip into two
+      nodes. Unrestricted, a feature published under one genome and merely *present* under
+      another produces two rows for one tip, which reads as an ambiguity the published
+      artifact does not have — and coverage filtering drops some but not all of a shared
+      feature's genomes routinely, so that is the common case rather than a corner.
+    """
+    return (
+        f"SELECT m.contig_id AS feature_idx, m.genome_id AS genome_idx, l.feature_id "
+        f"FROM {MAP_TABLE} m JOIN {GENOME_LABEL_TABLE} l ON l.genome_idx = m.genome_id"
+    )
+
+
 def sample_label_table_sql(source: str) -> str:
     """`prep_sample_idx -> sample_id` from `source`, the exported-identifier map as
     the mint route returns it (`(prep_sample_idx, export_id, …)`).
@@ -1033,19 +1057,12 @@ def taxonomy_sidecar_sql() -> str:
     """Define `TAXONOMY_SIDECAR_RELATION`: one row per PUBLISHED row of the table, named
     the same way, carrying its genome's ranks with the source prefixes restored.
 
-    Scoped to `GENOME_LABEL_TABLE` on both sides, which is what makes the sidecar
-    exactly as wide as the table: the label relation holds the genomes the roll-up
-    emitted, so restricting the reduction's member set to them is both the correct
-    row set and the cheap one — a reference's whole taxonomy is reduced only for the
-    genomes that survived.
+    Scoped to `GENOME_LABEL_TABLE` on both sides, which is what makes the sidecar exactly
+    as wide as the table — see `published_membership_sql` for the member set and why the
+    restriction matters.
     """
-    published_members = (
-        f"(SELECT m.contig_id AS feature_idx, m.genome_id AS genome_idx"
-        f"   FROM {MAP_TABLE} m"
-        f"   JOIN {GENOME_LABEL_TABLE} l ON l.genome_idx = m.genome_id)"
-    )
     reduction = genome_representative_taxonomy_select_sql(
-        member_genome=published_members, taxonomy=TAXONOMY_TABLE
+        member_genome=f"({published_membership_sql()})", taxonomy=TAXONOMY_TABLE
     )
     return (
         f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
@@ -1261,12 +1278,24 @@ SHEAR_KEEP_SET_RELATION = "phylogeny_keep_set"
 # The sheared tree, materialized — see `sheared_tree_table_sql`.
 TREE_TABLE = "sheared_tree"
 
-# What the published tree carries: `shear_tree`'s own output columns, in its order.
+# What the published tree carries: `shear_tree`'s own output columns, in its order and
+# with the types it returns (measured — see `docs/duckdb-miint.md`).
 # `node_index`/`parent_index` are the SHEAR's 0-based reindexing rather than anything of
 # ours, and they are how a tree expresses its shape; `edge_id` is the reference's own
 # jplace edge id, the only handle back to its placements. No `feature_idx` — a tip is
 # named with the handle its row in the table carries.
-TREE_COLUMNS = ("node_index", "name", "branch_length", "edge_id", "parent_index", "is_tip")
+#
+# The types are written out only because the empty path below has to produce them without
+# the shear; the populated path takes them from `shear_tree`.
+TREE_SCHEMA = {
+    "node_index": "BIGINT",
+    "name": "VARCHAR",
+    "branch_length": "DOUBLE",
+    "edge_id": "BIGINT",
+    "parent_index": "BIGINT",
+    "is_tip": "BOOLEAN",
+}
+TREE_COLUMNS = tuple(TREE_SCHEMA)
 
 
 def phylogeny_table_sql(source: str) -> str:
@@ -1288,16 +1317,20 @@ def shear_input_statements() -> tuple[str, ...]:
     Keeping its own name instead would put a reference-internal FASTA header into a
     published file, and could collide with a handle.
 
+    **The membership it renames from is the PUBLISHED one** (`published_membership_sql`),
+    not the whole reference's map: joining the map unrestricted fans a tip out once per
+    genome the feature belongs to, published or not, so a tip would be refused as ambiguous
+    on the strength of a genome this table never mentions.
+
     The keep-set is `GENOME_LABEL_TABLE` itself, so the tips asked for are exactly the
     rows the table publishes.
     """
     published_names = (
         f"CREATE VIEW {SHEAR_INPUT_RELATION} AS "
         f"SELECT p.node_index, p.parent_index, p.branch_length, p.edge_id, p.is_tip, "
-        f"CASE WHEN p.is_tip THEN g.feature_id ELSE p.name END AS name "
+        f"CASE WHEN p.is_tip THEN pub.feature_id ELSE p.name END AS name "
         f"FROM {PHYLOGENY_TABLE} p "
-        f"LEFT JOIN {MAP_TABLE} m ON m.contig_id = p.feature_idx "
-        f"LEFT JOIN {GENOME_LABEL_TABLE} g ON g.genome_idx = m.genome_id"
+        f"LEFT JOIN ({published_membership_sql()}) pub ON pub.feature_idx = p.feature_idx"
     )
     keep_set = (
         f"CREATE VIEW {SHEAR_KEEP_SET_RELATION} AS "
@@ -1343,10 +1376,21 @@ def sheared_tree_table_sql(*, clearance: TreeClearance) -> str:
     shear's own error lists every missing name. Left false so a disagreement between what
     was checked and what is sheared fails loudly instead of quietly shearing to a subset.
 
+    **A cleared keep-set of zero tips short-circuits**, the way `ogu_output_table_sql`
+    does for an empty analytic and for the same reason: publishing no rows is a legitimate
+    result here — every genome dropped by the coverage threshold — and the table written
+    beside this is a real, empty file rather than an error. `shear_tree` cannot express it
+    (a tree cannot be sheared to nothing, so it raises), so the empty tree is built
+    directly. One relation name either way, so the writer cannot tell the difference.
+
     Materialized, so the whole-reference tree can be dropped before the write. Takes a
     `TreeClearance` for the reason `gated_alignment_table_sql` takes a `GateClearance`.
     """
-    _ = clearance
+    if not clearance.tips:
+        casts = ", ".join(
+            f"CAST(NULL AS {sql_type}) AS {name}" for name, sql_type in TREE_SCHEMA.items()
+        )
+        return f"CREATE TABLE {TREE_TABLE} AS SELECT {casts} WHERE false"
     return (
         f"CREATE TABLE {TREE_TABLE} AS SELECT {', '.join(TREE_COLUMNS)} "
         f"FROM shear_tree('{SHEAR_INPUT_RELATION}', '{SHEAR_KEEP_SET_RELATION}', "
@@ -1448,6 +1492,12 @@ def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
     ours to dodge (it annotates every branch whenever an `edge_id` column is present; see
     `docs/duckdb-miint.md`). `edge_id` is worth carrying: the shear preserves the
     surviving edge's original id, which is the handle back to the reference's placements.
+
+    **A consumer joining this to the table must filter `is_tip`.** Only tips are named from
+    the mint; a surviving internal node keeps the reference's own Newick label, and nothing
+    makes those labels disjoint from published handles — so an unfiltered
+    `name = feature_id` join can match an internal node. (The opposite direction is closed:
+    an unpublished tip is nameless, see `shear_input_statements`.)
 
     **Takes a `TreeClearance`**, so it cannot be reached without the check; see that
     dataclass.
