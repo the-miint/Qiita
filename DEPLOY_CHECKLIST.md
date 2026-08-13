@@ -44,6 +44,12 @@ _None yet._
   Idempotent; a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT
   covered (dbmate applies a migration once) — the bucket-6 re-run below closes that edge.
   (#444)
+- `20260812010000_mask_lifecycle.sql` — plain `make migrate`, no out-of-band setup and no
+  backfill: `DEFAULT 'active'` covers every existing `qiita.mask_definition` row and no
+  `mask_sample` row changes state. Adds the lifecycle columns to both tables, widens
+  `mask_sample.state` to admit `'invalidated'`, and re-states `qiita.mint_mask_definition`
+  (same 7-argument signature, so it replaces in place) to refuse a deprecated config.
+  (#445)
 
 ### 4. Deploy
 
@@ -89,6 +95,17 @@ _None yet._
   — those actions mint their mask and put nothing in `action_context`, so there is no value to
   copy. Separately, a mask a completed assembly reads is now correctly reported as
   `skipped_shared` instead of being deleted. (#444)
+- **A PAT minted before this deploy cannot use the new mask-lifecycle routes.** The new
+  `mask_definition:lifecycle` scope is added to the system_admin ceiling, so callers on the
+  OIDC path pick it up automatically; a PAT carries its own stored scope set, so its holder
+  runs `qiita login` (or `POST /auth/pat`) once. Same shape as the `alignment:doget` note
+  below, and the 403 says so itself. Nothing to do on the host. (#445)
+- **Nothing is deprecated by this deploy — it ships the mechanism only.** Deciding which
+  masks are void, and which runs to withdraw, waits on the upstream `rype_classify` fix
+  (`duckdb-miint#222`): until it lands a re-run reproduces the same defect. One behaviour
+  change lands immediately though: `POST /mask-definition` now answers 409 (not 201) when a
+  config has been deprecated, and pool alignment answers 409 for a deprecated mask. Neither
+  can fire until someone deprecates something. (#445)
 - **A user whose PAT predates this deploy cannot use the new alignment mint
   until they re-mint it.** A new scope `alignment:doget` is added to all three
   role ceilings, so callers on the OIDC path pick it up automatically (that path

@@ -732,9 +732,11 @@ async def create_masked_read_export_ticket(
                 "reason": (
                     "the sample is not masked-complete under this mask_idx "
                     f"(mask_sample.state={mask_state!r}). Either no read-mask has "
-                    "completed for this (prep_sample, mask_idx), or a covering block is "
-                    "still in flight — the read_masked pass-set would be absent or "
-                    "partial. Refusing to export; retry once masking is completed."
+                    "completed for this (prep_sample, mask_idx), a covering block is "
+                    "still in flight, or the run was withdrawn as untrustworthy "
+                    "('invalidated'). The read_masked pass-set would be absent, "
+                    "partial, or unfit. Refusing to export; a withdrawn run is not "
+                    "retryable — re-mask under a corrected config."
                 ),
                 "prep_sample_idx": body.prep_sample_idx,
                 "mask_idx": body.mask_idx,

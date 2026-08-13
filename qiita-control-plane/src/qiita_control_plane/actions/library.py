@@ -48,6 +48,7 @@ from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
 from ..repositories.assembly import insert_assembly_membership_rows
 from ..repositories.block import (
+    MaskSampleInvalidated,
     fetch_block_members,
     finalize_alignment_sample,
     finalize_mask_sample,
@@ -2265,6 +2266,12 @@ async def reconcile_block(
                 # Already finalized (idempotent re-run, or a concurrent block
                 # finalizer won this sample's race) — nothing to do.
                 continue
+            if state == "invalidated":
+                # The pair was withdrawn. Skipped BEFORE _finalize_sample_metrics,
+                # which writes this sample's counts onto sequenced_sample: those
+                # counts would describe a pass-set no consumer may read. The
+                # withdrawal stands until someone restores the pair.
+                raise MaskSampleInvalidated(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
             if await has_incomplete_covering_block(
                 conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
             ):
