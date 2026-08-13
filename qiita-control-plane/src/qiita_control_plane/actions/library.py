@@ -43,6 +43,7 @@ from qiita_common.models import (
     read_mask_reason_sql_list,
 )
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
+from qiita_common.taxonomy import genome_lineage_select_sql
 
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
@@ -1048,21 +1049,6 @@ async def write_shard_assignment(
     return total_updated
 
 
-# Taxonomy rank columns, coarsest→finest, in the lineage sort-key order. `class`
-# and `order` are quoted — `order` is a SQL keyword and `class` is reserved in
-# some dialects; DuckDB stores the reference_taxonomy columns under these exact
-# (lowercase, prefix-stripped) names (see the data plane's qiita_lake schema).
-_TAXONOMY_RANK_COLUMNS = (
-    "domain",
-    "phylum",
-    '"class"',
-    '"order"',
-    "family",
-    "genus",
-    "species",
-    "strain",
-)
-
 # The shard planner streams taxonomy through the exclusion-aware VIEW, never the
 # raw base table, so a curated exclusion can't be bypassed. Accepted consequence:
 # an excluded feature loses its taxonomy row (its LEFT JOIN in _genome_lineages
@@ -1136,27 +1122,15 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
 
 def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
     """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
-    relations to one LineageItem per genome. The lineage is the semicolon-joined
-    rank string of the genome's lowest-feature_idx *classified* member (via
-    `arg_min` under a `FILTER (WHERE lineage <> '')`, the per-member lineage
-    computed once in a CTE), so the representative is deterministic regardless of
-    scan order and skips members whose taxonomy is
-    absent. That FILTER matters under exclusion: a genome is one organism, so its
-    contigs share one lineage; blocking the lowest contig (its LEFT JOIN then
-    misses) must not drag the healthy siblings to the unclassified shard. When NO
-    member is classified (all ranks NULL, or every taxonomy row missing), the
-    filtered aggregate is empty → NULL → the `lineage or ''` fallback yields ''
-    (unclassified, which sorts first in the tiler)."""
-    ranks = ", ".join(f"t.{col}" for col in _TAXONOMY_RANK_COLUMNS)
+    relations to one LineageItem per genome, using the shared reduction in
+    `qiita_common.taxonomy` — which is the single definition of *which* member speaks
+    for a genome, and says why there.
+
+    The only thing left here is the tiler's own convention: a genome with no
+    classified member reduces to NULL, and the tiler wants `''` (unclassified, which
+    sorts first). Nothing else about the reduction lives in this module."""
     rows = con.execute(
-        f"WITH member_lineage AS ("
-        f"  SELECT mg.genome_idx, mg.feature_idx, concat_ws(';', {ranks}) AS lineage"
-        f"    FROM member_genome mg"
-        f"    LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
-        f")"
-        f" SELECT genome_idx, arg_min(lineage, feature_idx) FILTER (WHERE lineage <> '') AS lineage"
-        f"  FROM member_lineage"
-        f" GROUP BY genome_idx"
+        genome_lineage_select_sql(member_genome="member_genome", taxonomy="taxonomy")
     ).fetchall()
     return [LineageItem(item_id=genome_idx, lineage=lineage or "") for genome_idx, lineage in rows]
 
