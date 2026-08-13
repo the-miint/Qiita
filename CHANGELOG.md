@@ -80,6 +80,25 @@ duplicates further down are historical strata; leave them where they are.
   join regardless. The per-genome reduction behind it is now shared with the shard planner,
   so a genome that tiles under one lineage publishes those same ranks.
 
+- **A feature table can now ship the reference's tree, sheared to the rows it publishes.**
+  `qiita feature-table build --tree` writes the phylogeny pruned to the published keep-set,
+  as a node table (`node_index, name, branch_length, edge_id, parent_index, is_tip`) whose tip
+  names are the table's own `feature_id`s. Pruned ancestors have their branch lengths **summed
+  onto the surviving edge**, so a tip-to-tip distance in the shipped tree is the distance in
+  the whole one. Parquet rather than Newick, so the file needs no convention to read and the
+  Newick writer's edge-id default is the consumer's decision instead of ours; `edge_id` rides
+  along because it is the handle back to the reference's placements. The tips are renamed
+  *before* the shear rather than translated after, which is what makes one vocabulary
+  structural — the keep-set and the tree cannot disagree about which tip is which — and it
+  leaves an unpublished tip nameless, so a reference-internal FASTA header cannot reach a
+  published file. Four things are refused rather than approximated, each of them otherwise a
+  tree somebody would join to the table anyway: a reference with no phylogeny, a published row
+  with no tip, a row owning more than one tip (a contig-level tree, which the shear would
+  happily emit with duplicate tip labels), and a tip belonging to more than one genome (a
+  shared plasmid cannot be one genome-named tip). A build asking for a tree also checks the
+  loaded miint build has `shear_tree` before doing any work, because a plain `INSTALL` never
+  refreshes an extension already cached and the raw failure is a bare `Catalog Error`.
+
 - **The build now reports what it could not roll up.** The genome map's INNER JOIN silently
   drops alignments to features with no genome, and for some references that is most of what
   was streamed. A build that cannot carry everything says the share and why — a
@@ -841,6 +860,22 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **The roll-up's coverage report understated the share it could not carry.** It counted the
+  rows of a join to the genome map, and a feature belonging to several genomes — which
+  `feature_genome` allows on purpose, since identical bytes are one feature and a plasmid two
+  organisms carry belongs to both — fans that feature's alignment row out once per genome. Only
+  the denominator inflated, so a build reporting "1 of 4 (25.0%)" was really dropping 1 of 3
+  (33.3%). Counted directly now, the way the relabel's own diagnostics already did.
+
+- **The per-genome taxonomy reduction could return two rows for one genome.** Picking a
+  representative member and joining its row back matches twice if the caller's relations hold a
+  duplicate at the winning position, where the aggregate this replaced could not multiply at
+  all. The sidecar's row-count check would have caught it; the shard planner, the other consumer,
+  has none — and two items sharing one id tile one genome into two shards. One row per genome is
+  now a property of the SQL. A reference whose taxonomy genuinely repeats a feature is refused
+  instead, measured on the streamed rows: two rows for one feature can disagree, and choosing
+  between two lineages silently is not ours to do.
 
 - **An alignment config whose stored form would stop matching its own digest is now refused at
   the mint.** Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
