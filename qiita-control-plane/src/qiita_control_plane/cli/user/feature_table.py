@@ -20,6 +20,7 @@ import contextlib
 import json
 import sys
 from collections.abc import Callable, Iterator
+from importlib import metadata
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -31,6 +32,9 @@ from qiita_common.api_paths import (
     PATH_EXPORTED_FEATURE_ROOT,
     PATH_EXPORTED_IDENTIFIER_PREFIX,
     PATH_EXPORTED_IDENTIFIER_ROOT,
+    PATH_EXPORTED_PROCESSING_PREFIX,
+    PATH_EXPORTED_PROCESSING_ROOT,
+    PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
     PATH_REFERENCE_GENOME_MAP,
     PATH_REFERENCE_PREFIX,
@@ -40,10 +44,16 @@ from qiita_common.models import (
     MAX_EXPORTED_FEATURE_ENTITIES,
     ExportedFeatureRequest,
     ExportedIdentifierRequest,
+    ExportedProcessingRequest,
 )
 
 from .. import _common
-from .alignment import _alignment_reference_idx, _fetch_alignment_cohort, _fetch_pool_alignments
+from .alignment import (
+    _alignment_reference_idx,
+    _alignment_summary,
+    _fetch_alignment_cohort,
+    _fetch_pool_alignments,
+)
 
 # The registered arrow relations each REST response is staged through. Local to
 # this module: the shared builders read them once to CREATE the contract's
@@ -130,6 +140,34 @@ def _mint_exported_features(
         body = ExportedFeatureRequest(genome_idx=batch).model_dump()
         entries.extend(_common.call("POST", base_url, token, path, json=body)["identifiers"])
     return entries
+
+
+def _mint_exported_processing(
+    base_url: str, token: str, *, alignment_idx: int, prep_sample_idx: list[int]
+) -> str:
+    """Mint (or recover) the public handle for the processing this table was built from —
+    what the manifest cites instead of an `alignment_idx`.
+
+    The cohort authorizes and is not part of the handle, so two callers publishing
+    different cohorts of one alignment cite the same handle; that is what lets a reader
+    see two bundles share a processing.
+    """
+    body = ExportedProcessingRequest(
+        alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+    ).model_dump()
+    path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+    return _common.call("POST", base_url, token, path, json=body)["export_processing_id"]
+
+
+def _fetch_reference(base_url: str, token: str, *, reference_idx: int) -> dict[str, Any]:
+    """The reference row, for the name and version a manifest names it by.
+
+    A `reference_idx` is ours and means nothing outside this system; `(name, version)` is
+    what somebody reproducing the table would go looking for. Resolved here rather than
+    carried through, since the recipe already knows the idx and nothing else needs it.
+    """
+    path = f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX.format(reference_idx=reference_idx)}"
+    return _common.call("GET", base_url, token, path)
 
 
 def _create_alignment_doget_ticket(
@@ -435,6 +473,16 @@ DEFAULT_TABLE_FORMAT = "parquet"
 # caller chose is theirs.
 _IDENTIFIER_MAP_SUFFIX = ".exported-identifier.json"
 
+# Derived the same way, and NOT optional — see `_manifest_payload`.
+_MANIFEST_SUFFIX = ".manifest.json"
+
+MANIFEST_NOTE = (
+    "This file records what produced the table beside it. Coverage filtering makes a"
+    " feature table a function of the whole cohort it was built over, not only of the"
+    " samples in it, so the same processing over a different cohort yields a different"
+    " table — which is why this record is part of the bundle rather than optional."
+)
+
 
 class _Companion(NamedTuple):
     """An optional bundle member: the flag that asks for one, the suffix it lands at, and
@@ -458,6 +506,92 @@ _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
 )
+
+
+def _tool_versions(con) -> dict[str, str]:
+    """What computed this table, as three versions worth recording.
+
+    The miint build is the one that matters most and is the one nothing else would
+    capture: every bioinformatics primitive is compiled INTO the extension, so two
+    clients on different builds can produce different numbers from identical input. It is
+    read from the catalog rather than assumed, because the client path INSTALLs into a
+    cache that never refreshes (see `require_miint_function`) — what is loaded is the only
+    honest answer. `install_path` is deliberately not recorded: it is a path on this
+    machine, and a published file should not describe the machine that made it.
+
+    The alignment's OWN aligner version is not here and cannot be: it ran server-side,
+    under whatever build that host had. `params_hash` is what identifies that processing.
+    """
+    duckdb_version = con.execute("SELECT version()").fetchone()[0]
+    miint_version = con.execute(
+        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'miint'"
+    ).fetchone()
+    return {
+        "duckdb": duckdb_version,
+        "miint": miint_version[0] if miint_version else "unknown",
+        "qiita_cli": metadata.version("qiita-control-plane"),
+    }
+
+
+def _manifest_payload(
+    *,
+    args: argparse.Namespace,
+    summary: dict[str, Any],
+    reference: dict[str, Any],
+    export_processing_id: str,
+    identifiers: list[dict[str, Any]],
+    rows: int,
+    files: list[Path],
+    tools: dict[str, str],
+) -> dict[str, Any]:
+    """The bundle's record of what produced the table — the one artifact here that is
+    always written, because without it the table is not reproducible.
+
+    **Every identifier in it is public.** The processing is its minted handle and its
+    content-derived `params_hash`, never `alignment_idx`; the reference is its name and
+    version, never `reference_idx`; the cohort is `export_id`s, never `prep_sample_idx`.
+    `params` is not copied verbatim for exactly that reason — the blob carries
+    `reference_idx`, `mask_idx` and `shard_ids` — so `aligner` is lifted out of it and the
+    rest is represented by the digest, which is what identifies the config anyway.
+
+    `files` are basenames: the bundle's members relative to wherever it lands, since an
+    absolute path describes the machine that built it.
+
+    No build timestamp, deliberately. Nothing here would use one, and leaving it out makes
+    the manifest a pure function of its inputs — so two bundles built the same way are
+    byte-identical and can be diffed to show it.
+    """
+    gate = _gate_from_args(args)
+    return {
+        "note": MANIFEST_NOTE,
+        "processing": {
+            "export_processing_id": export_processing_id,
+            "params_hash": summary["params_hash"],
+            "aligner": summary.get("params", {}).get("aligner"),
+            "reference": {
+                "name": reference["name"],
+                "version": reference["version"],
+                "kind": reference["kind"],
+            },
+        },
+        "table": {
+            "format": args.format,
+            "rows": rows,
+            "coverage_scope": args.coverage_scope,
+            "coverage_threshold": args.coverage_threshold,
+            "gate": None
+            if gate is None
+            else {
+                "min_identity": gate.min_identity,
+                "min_query_coverage": gate.min_query_coverage,
+                "mates_pooled": gate.paired,
+            },
+            # Sorted, so the record does not depend on the order the mint answered in.
+            "cohort": sorted(identifier["export_id"] for identifier in identifiers),
+        },
+        "tools": tools,
+        "files": [path.name for path in files],
+    }
 
 
 def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ...]:
@@ -512,6 +646,7 @@ def _bundle_targets(
     targets = [
         table_path,
         table_path.with_name(table_path.stem + _IDENTIFIER_MAP_SUFFIX),
+        table_path.with_name(table_path.stem + _MANIFEST_SUFFIX),
         *(table_path.with_name(table_path.stem + c.suffix) for c in companions),
     ]
     parent = table_path.parent
@@ -544,22 +679,28 @@ def _write_bundle(
     table_path: Path,
     fmt: str,
     identifiers: list[dict[str, Any]],
+    manifest: Callable[[list[Path]], dict[str, Any]],
     clearances: dict[str, Any],
 ) -> list[Path]:
-    """Write the bundle — the relabelled table at `table_path`, the exported-identifier
-    map beside it, and one file per companion in `clearances` — and return the files
-    written.
+    """Write the bundle — the relabelled table at `table_path`, the exported-identifier map
+    and the manifest beside it, and one file per companion in `clearances` — and return the
+    files written.
 
     `clearances` is keyed by companion name, and holding the clearance is what makes a
     member writable: each companion's COPY takes one, so a file cannot be written without
     the check that says it describes the table beside it.
 
+    `manifest` is a function OF the bundle's file list rather than a finished document,
+    because the manifest records that list and only this function knows it. Deriving the
+    list twice — once to write, once to describe — is how the two come to disagree.
+
     **All of them or none**, and that is the table plus its companions, not two copies
     of the table: the two formats are the same numbers, so a run writes one of them. The
     map is a companion because the table names its samples by `export_id` alone, so
-    without it a caller cannot join their own records back; the others are because an
-    artifact naming rows the table does not contain is worse than no artifact. Half a
-    bundle is not a partial result but a useless one.
+    without it a caller cannot join their own records back; the manifest because coverage
+    filtering makes the table a function of its cohort, so without it the table cannot be
+    reproduced; the rest because an artifact naming rows the table does not contain is
+    worse than no artifact. Half a bundle is not a partial result but a useless one.
     """
     unknown = set(clearances) - {c.name for c in _COMPANIONS}
     if unknown:
@@ -574,7 +715,9 @@ def _write_bundle(
         # existing target, partials included, so clearing them is what keeps a retry's
         # error about the user's files rather than ours.
         partial.unlink(missing_ok=True)
-    table_partial, map_partial, *companion_partials = (partial for partial, _ in pairs)
+    table_partial, map_partial, manifest_partial, *companion_partials = (
+        partial for partial, _ in pairs
+    )
 
     def write() -> None:
         # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires this; DuckDB errors at bind time
@@ -593,9 +736,19 @@ def _write_bundle(
         }
         # Straight into the file: `json.dumps` would build the whole document as a
         # string first, and at cohort scale that document is tens of megabytes.
-        with map_partial.open("w") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.write("\n")
+        #
+        # `ensure_ascii=False` with an explicit encoding, because both documents lead with
+        # a note meant to be READ: escaped as `\\u2014`, the dashes in it interrupt the one
+        # sentence a user opening the file needs. The encoding is named rather than left to
+        # the locale's — that is what makes writing those characters safe on a machine
+        # whose default is not UTF-8.
+        for partial, document in (
+            (map_partial, payload),
+            (manifest_partial, manifest(targets)),
+        ):
+            with partial.open("w", encoding="utf-8") as handle:
+                json.dump(document, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
         for companion, partial in zip(companions, companion_partials, strict=True):
             con.execute(companion.copy_sql(partial, clearance=clearances[companion.name]))
 
@@ -687,7 +840,10 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         # user's extension cache may still hold, and the raw failure arrives after a whole
         # reference has been streamed.
         require_miint_function(con, "shear_tree", needed_for="--tree")
-    reference_idx = _alignment_reference_idx(
+    # ONE verified summary, read several times: the reference the table is relabelled
+    # through, the digest the manifest cites, the aligner it names. Verifying it once and
+    # reading it is what keeps those three from being three separate acts of trust.
+    summary = _alignment_summary(
         _fetch_pool_alignments(
             args.base_url,
             token,
@@ -696,6 +852,7 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         ),
         alignment_idx=args.alignment_idx,
     )
+    reference_idx = _alignment_reference_idx(summary)
     cohort = _resolve_cohort(args.base_url, token, args)
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
@@ -765,11 +922,30 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         clearances["taxonomy"] = _build_taxonomy_sidecar(con)
     if args.tree:
         clearances["tree"] = _shear_tree(con)
+
+    # The manifest's two round trips happen here, after everything that could refuse: the
+    # processing mint is a WRITE, and minting a public handle for a build that then fails
+    # would leave a permanent name for a bundle nobody has.
+    export_processing_id = _mint_exported_processing(
+        args.base_url, token, alignment_idx=args.alignment_idx, prep_sample_idx=cohort
+    )
+    reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
+    tools = _tool_versions(con)
     written = _write_bundle(
         con,
         table_path=args.output,
         fmt=args.format,
         identifiers=identifiers,
+        manifest=lambda files: _manifest_payload(
+            args=args,
+            summary=summary,
+            reference=reference,
+            export_processing_id=export_processing_id,
+            identifiers=identifiers,
+            rows=clearance.rows,
+            files=files,
+            tools=tools,
+        ),
         clearances=clearances,
     )
     return written, clearance.rows
@@ -831,9 +1007,12 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    table_path, map_path, *companions = written
+    # The three fixed members are named for what they are; the optional ones vary, so
+    # they are listed rather than enumerated here.
+    table_path, map_path, manifest_path, *companions = written
     print(f"wrote {rows} row(s) to {table_path} ({args.format})")
     print(f"and the map needed to read it: {map_path}")
+    print(f"and the record of what produced it: {manifest_path}")
     for companion in companions:
         print(f"and {companion}")
     print(IDENTIFIER_MAP_NOTE)

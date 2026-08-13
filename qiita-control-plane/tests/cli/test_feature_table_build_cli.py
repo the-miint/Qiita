@@ -17,6 +17,7 @@ the bottom is the file a user would publish.
 from __future__ import annotations
 
 import argparse
+import json
 
 import httpx
 import pyarrow as pa
@@ -291,6 +292,28 @@ def _patched(
         ]
 
     monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
+
+    def _mint_processing(base_url, token, *, alignment_idx, prep_sample_idx):
+        """The processing mint. `prep_sample_idx` authorizes and is not part of the
+        handle, so the fake records it to prove the cohort is what gets sent."""
+        rec["processing_cohort"] = list(prep_sample_idx)
+        return "QP7"
+
+    monkeypatch.setattr(ftc, "_mint_exported_processing", _mint_processing)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_reference",
+        lambda *a, **k: {
+            "reference_idx": 9,
+            "name": "gg2",
+            "version": "2022.10",
+            "kind": "sequence_reference",
+            "status": "active",
+            "is_host": False,
+            "created_by_idx": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    )
 
     def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
         rec["columns"] = list(columns)
@@ -766,6 +789,7 @@ def test_no_sidecar_is_written_without_the_flag(monkeypatch, tmp_path):
     assert rec["taxonomy_minted"] == 0
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "table.exported-identifier.json",
+        "table.manifest.json",
         "table.parquet",
     ]
 
@@ -889,6 +913,7 @@ def test_both_companions_land_beside_the_table_when_both_are_asked_for(monkeypat
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "table.exported-identifier.json",
+        "table.manifest.json",
         "table.parquet",
         "table.taxonomy.parquet",
         "table.tree.parquet",
@@ -970,3 +995,158 @@ def test_an_empty_cohort_still_writes_a_readable_tree(monkeypatch, tmp_path):
             f"DESCRIBE SELECT * FROM read_parquet('{tmp_path / 'table.tree.parquet'}')"
         ).fetchall()
     assert [(r[0], r[1]) for r in described] == list(ft.TREE_SCHEMA.items())
+
+
+# ---------------------------------------------------------------------------
+# The bundle manifest
+# ---------------------------------------------------------------------------
+
+
+def _manifest(tmp_path) -> dict:
+    return json.loads((tmp_path / "table.manifest.json").read_text())
+
+
+def _walk(node, *, keys: set, strings: set) -> None:
+    """Every key and every string value anywhere in the document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            keys.add(key)
+            _walk(value, keys=keys, strings=strings)
+    elif isinstance(node, list):
+        for item in node:
+            _walk(item, keys=keys, strings=strings)
+    elif isinstance(node, str):
+        strings.add(node)
+
+
+def test_the_manifest_records_the_processing_by_its_public_handle(monkeypatch, tmp_path):
+    """The whole reason the handle exists: a manifest has to say what produced the table,
+    and `alignment_idx` is ours. The digest rides alongside because it identifies the
+    config by content, which is what somebody reproducing the table actually needs."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    manifest = _manifest(tmp_path)
+
+    assert manifest["processing"]["export_processing_id"] == "QP7"
+    assert manifest["processing"]["params_hash"] == canonical_params_hash(_PARAMS).hex()
+    assert manifest["processing"]["aligner"] == "minimap2"
+    # The reference by name and version, resolved rather than carried as an idx.
+    assert manifest["processing"]["reference"] == {
+        "name": "gg2",
+        "version": "2022.10",
+        "kind": "sequence_reference",
+    }
+    # The cohort authorizes the mint and is not part of the handle.
+    assert rec["processing_cohort"] == [1, 2]
+
+
+def test_the_manifest_names_the_cohort_and_the_table_it_describes(monkeypatch, tmp_path):
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    table = _manifest(tmp_path)["table"]
+
+    assert table["cohort"] == ["QM1", "QM2"]
+    assert table["rows"] == len(_table_rows(args.output))
+    assert table["format"] == "parquet"
+    assert table["coverage_scope"] == ft.CoverageScope.POOLED.value
+    assert table["coverage_threshold"] == 0.01
+    assert table["gate"] is None
+    assert rec["minted_cohort"] == [1, 2]
+
+
+def test_the_manifest_records_the_gate_that_filtered_the_table(monkeypatch, tmp_path):
+    """A gate changes which rows exist, so a record of the table that omitted it would
+    describe a different table."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, min_identity=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["gate"] == {
+        "min_identity": 0.9,
+        "min_query_coverage": None,
+        "mates_pooled": True,
+    }
+
+
+def test_the_manifest_lists_every_file_in_the_bundle_including_itself(monkeypatch, tmp_path):
+    """Basenames, so the record does not describe the machine that built it — and the
+    list is derived from the same targets the writer uses, not a second guess at them."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["files"] == [
+        "table.parquet",
+        "table.exported-identifier.json",
+        "table.manifest.json",
+        "table.taxonomy.parquet",
+        "table.tree.parquet",
+    ]
+    assert sorted(_manifest(tmp_path)["files"]) == sorted(p.name for p in tmp_path.iterdir())
+
+
+def test_the_manifest_records_what_computed_the_table(monkeypatch, tmp_path):
+    """The miint build especially: every bioinformatics primitive is compiled INTO the
+    extension, so two clients on different builds can get different numbers from the same
+    input. Read from the catalog, since the client's cache never refreshes itself."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    tools = _manifest(tmp_path)["tools"]
+
+    assert set(tools) == {"duckdb", "miint", "qiita_cli"}
+    with connect_with_miint() as conn:
+        expected = conn.execute(
+            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'miint'"
+        ).fetchone()[0]
+    assert tools["miint"] == expected
+    assert tools["duckdb"] and tools["qiita_cli"]
+    # A path on this machine is not something a published file should carry.
+    assert not [value for value in tools.values() if "/" in value]
+
+
+def test_no_internal_identifier_appears_anywhere_in_the_manifest(monkeypatch, tmp_path):
+    """The property the two mints exist to make possible, asserted over the whole
+    document rather than field by field — a future field cannot quietly reintroduce one."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True, tree=True, min_identity=0.5)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    keys: set[str] = set()
+    strings: set[str] = set()
+    _walk(_manifest(tmp_path), keys=keys, strings=strings)
+
+    assert not [key for key in keys if "idx" in key]
+    assert not [value for value in strings if "idx" in value]
+    # `shard_ids` and `mask_idx` ride the params blob, which is why the manifest lifts
+    # `aligner` out of it rather than copying it whole.
+    assert "shard_ids" not in keys
+    assert "params" not in keys
+
+
+def test_a_params_hash_mismatch_stops_the_build_before_anything_is_written(
+    monkeypatch, tmp_path, capsys
+):
+    """The manifest cites the digest as its reproducibility key, so publishing one the
+    client never verified would publish a claim it cannot support."""
+    rec = _patched(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_pool_alignments",
+        lambda *a, **k: {
+            "alignments": [
+                {"alignment_idx": 3, "params": _PARAMS, "params_hash": "00" * 32},
+            ]
+        },
+    )
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "params_hash" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+    assert "minted_cohort" not in rec, "nothing should be minted for a build that cannot run"

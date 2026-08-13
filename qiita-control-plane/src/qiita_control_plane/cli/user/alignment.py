@@ -108,20 +108,25 @@ def _alignment_summary(alignments: dict, *, alignment_idx: int) -> dict:
     )
 
 
-def _alignment_reference_idx(alignments: dict, *, alignment_idx: int) -> int:
+def _alignment_reference_idx(summary: dict) -> int:
     """The reference an alignment ran against, read out of its own `params`.
 
     This is why `feature-table build` has no `--reference-idx` to get wrong. A
     user-supplied one that disagreed would fetch the genome map for a different
     reference, every `feature_idx` would miss it, and the relabel would then refuse on
     unlabelled genomes — loud, but a mistake the surface need not permit at all.
+
+    Takes a **summary `_alignment_summary` returned**, not the pool listing, because a
+    build reads several things off one alignment — the reference, the digest a manifest
+    cites, the aligner it names — and each of them must come from the same verified
+    blob rather than from a fresh lookup that re-verifies it.
     """
-    params = _alignment_summary(alignments, alignment_idx=alignment_idx).get("params", {})
+    params = summary.get("params", {})
     reference_idx = params.get("reference_idx")
     if reference_idx is None:
         raise ValueError(
-            f"alignment {alignment_idx} records no reference_idx in its params "
-            f"({sorted(params)}), so there is no genome map to relabel its counts "
+            f"alignment {summary.get('alignment_idx')} records no reference_idx in its "
+            f"params ({sorted(params)}), so there is no genome map to relabel its counts "
             f"through."
         )
     return reference_idx

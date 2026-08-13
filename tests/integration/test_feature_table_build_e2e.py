@@ -362,7 +362,9 @@ async def test_a_user_builds_a_publishable_feature_table(
     assert sorted(p.name for p in out_dir.iterdir()) == [
         "per-sample.biom",
         "per-sample.exported-identifier.json",
+        "per-sample.manifest.json",
         "pooled.exported-identifier.json",
+        "pooled.manifest.json",
         "pooled.parquet",
     ]
     # The mint is idempotent, which only a second real build can show: the two bundles
@@ -370,3 +372,25 @@ async def test_a_user_builds_a_publishable_feature_table(
     # other and a re-run does not rename anybody's columns.
     second_map = json.loads((out_dir / "per-sample.exported-identifier.json").read_text())
     assert {e["prep_sample_idx"]: e["export_id"] for e in second_map["identifiers"]} == handles
+
+    # --- The manifest, against the real mint and the real reference row. ---
+    manifests = [
+        json.loads((out_dir / f"{stem}.manifest.json").read_text())
+        for stem in ("pooled", "per-sample")
+    ]
+    for manifest in manifests:
+        # Public handle, resolved reference, and the digest the client verified before
+        # reading anything off `params` — none of it an identifier of ours.
+        assert manifest["processing"]["export_processing_id"].startswith("QP")
+        assert manifest["processing"]["reference"]["name"]
+        assert len(manifest["processing"]["params_hash"]) == 64
+        assert sorted(manifest["table"]["cohort"]) == sorted(handles.values())
+        assert "idx" not in json.dumps(manifest)
+    # The processing handle is a property of the PROCESSING, not of the cohort or the
+    # scope — so two bundles built from one alignment cite the same one, which is how a
+    # reader sees they share it. The scopes differ, and must.
+    assert (
+        manifests[0]["processing"]["export_processing_id"]
+        == manifests[1]["processing"]["export_processing_id"]
+    )
+    assert [m["table"]["coverage_scope"] for m in manifests] == ["pooled", "per-sample"]

@@ -80,6 +80,24 @@ duplicates further down are historical strata; leave them where they are.
   join regardless. The per-genome reduction behind it is now shared with the shard planner,
   so a genome that tiles under one lineage publishes those same ranks.
 
+- **Every feature-table bundle now carries a manifest, and it is not optional.** Coverage
+  filtering makes a table a function of the whole cohort it was built over rather than only of
+  the samples in it, so the same processing over a different cohort yields a different table —
+  a table without this record cannot be reproduced. `<stem>.manifest.json` names the processing
+  by its minted public handle **and** by the content-derived `params_hash` the client verified
+  before reading anything off `params`; the reference by name and version; the aligner, coverage
+  scope and threshold, and the gate if there was one; the cohort as `export_id`s; the published
+  row count; the bundle's own file list; and the versions of duckdb, the loaded miint build and
+  this CLI. The miint build is read from the catalog rather than assumed, because every
+  bioinformatics primitive is compiled into the extension, so two clients on different builds
+  can produce different numbers from identical input.
+  **No internal identifier appears anywhere in it** — that is what the two mints were for.
+  `params` is not copied verbatim for the same reason (it carries `reference_idx`, `mask_idx`
+  and `shard_ids`), so `aligner` is lifted out and the digest stands for the rest. There is no
+  build timestamp, deliberately: nothing would use one, and leaving it out makes the manifest a
+  pure function of its inputs, so two bundles built the same way are byte-identical and can be
+  diffed to show it.
+
 - **A feature table can now ship the reference's tree, sheared to the rows it publishes.**
   `qiita feature-table build --tree` writes the phylogeny pruned to the published keep-set,
   as a node table (`node_index, name, branch_length, edge_id, parent_index, is_tip`) whose tip

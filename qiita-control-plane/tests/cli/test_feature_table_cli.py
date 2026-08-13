@@ -52,6 +52,14 @@ _IDENTIFIERS = [
 ]
 
 
+def _manifest_stub(files):
+    """Stands in for the manifest payload. This module owns the bundle's file behaviour —
+    arity, refusals, all-or-nothing — and the manifest's CONTENT is asserted where the
+    whole recipe runs (`test_feature_table_build_cli.py`). It still has to be a real
+    document, so the file written here is the real thing."""
+    return {"files": [path.name for path in files]}
+
+
 def _fake_request(captured, *, status=200, json_body=None, text=""):
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["method"] = method
@@ -240,12 +248,18 @@ def test_the_bundle_is_the_table_AND_the_identifier_map(fmt, tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         written = ftc._write_bundle(
-            conn, table_path=table, fmt=fmt, identifiers=_IDENTIFIERS, clearances={}
+            conn,
+            table_path=table,
+            fmt=fmt,
+            identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
+            clearances={},
         )
 
     assert [p.name for p in written] == [
         f"gut-study-ogu.{fmt}",
         "gut-study-ogu.exported-identifier.json",
+        "gut-study-ogu.manifest.json",
     ]
     assert all(p.exists() for p in written)
     assert not list(tmp_path.glob("*.partial"))
@@ -261,6 +275,7 @@ def test_two_runs_can_share_a_directory(tmp_path):
             table_path=tmp_path / "pooled.parquet",
             fmt="parquet",
             identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
             clearances={},
         )
         second = ftc._write_bundle(
@@ -268,13 +283,16 @@ def test_two_runs_can_share_a_directory(tmp_path):
             table_path=tmp_path / "per-sample.parquet",
             fmt="parquet",
             identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
             clearances={},
         )
 
     assert sorted(p.name for p in first + second) == [
         "per-sample.exported-identifier.json",
+        "per-sample.manifest.json",
         "per-sample.parquet",
         "pooled.exported-identifier.json",
+        "pooled.manifest.json",
         "pooled.parquet",
     ]
 
@@ -293,6 +311,7 @@ def test_a_name_that_contradicts_the_format_is_refused(tmp_path):
                 table_path=tmp_path / "t.biom",
                 fmt="parquet",
                 identifiers=_IDENTIFIERS,
+                manifest=_manifest_stub,
                 clearances={},
             )
         written = ftc._write_bundle(
@@ -300,6 +319,7 @@ def test_a_name_that_contradicts_the_format_is_refused(tmp_path):
             table_path=tmp_path / "no-extension",
             fmt="parquet",
             identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
             clearances={},
         )
     assert written[0].name == "no-extension"
@@ -313,11 +333,12 @@ def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_pat
     """
     with connect_with_miint() as conn:
         _labelled(conn)
-        _, map_path = ftc._write_bundle(
+        _, map_path, *_ = ftc._write_bundle(
             conn,
             table_path=tmp_path / "t.parquet",
             fmt="parquet",
             identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
             clearances={},
         )
 
@@ -332,11 +353,12 @@ def test_the_written_table_carries_only_public_columns(tmp_path):
     """Read back rather than trusted: this is the file a user publishes."""
     with connect_with_miint() as conn:
         _labelled(conn)
-        table_path, _ = ftc._write_bundle(
+        table_path, *_ = ftc._write_bundle(
             conn,
             table_path=tmp_path / "t.parquet",
             fmt="parquet",
             identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
             clearances={},
         )
         described = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{table_path}')").fetchall()
@@ -361,6 +383,7 @@ def test_a_failure_partway_through_leaves_NEITHER_file(tmp_path):
                 # A set is not JSON-serializable, so the map's write raises after the
                 # table has already been committed.
                 identifiers=[{"prep_sample_idx": {1, 2}, "export_id": "QM1"}],
+                manifest=_manifest_stub,
                 clearances={},
             )
 
@@ -377,7 +400,12 @@ def test_an_existing_artifact_is_refused_before_anything_is_written(tmp_path):
         _labelled(conn)
         with pytest.raises(FileExistsError, match="t.parquet"):
             ftc._write_bundle(
-                conn, table_path=table, fmt="parquet", identifiers=_IDENTIFIERS, clearances={}
+                conn,
+                table_path=table,
+                fmt="parquet",
+                identifiers=_IDENTIFIERS,
+                manifest=_manifest_stub,
+                clearances={},
             )
 
     assert table.read_text() == "earlier run"
@@ -397,6 +425,7 @@ def test_a_lone_survivor_is_reported_as_an_unfinished_run(tmp_path):
                 table_path=tmp_path / "t.parquet",
                 fmt="parquet",
                 identifiers=_IDENTIFIERS,
+                manifest=_manifest_stub,
                 clearances={},
             )
 
@@ -414,6 +443,7 @@ def test_a_stale_partial_does_not_block_a_retry(tmp_path):
             table_path=tmp_path / "t.biom",
             fmt="biom",
             identifiers=_IDENTIFIERS,
+            manifest=_manifest_stub,
             clearances={},
         )
         assert conn.execute(f"SELECT count(*) FROM read_biom('{written[0]}')").fetchone()[0] == 2
@@ -432,6 +462,7 @@ def test_a_missing_output_directory_is_named(tmp_path):
                 table_path=tmp_path / "nope" / "t.parquet",
                 fmt="parquet",
                 identifiers=_IDENTIFIERS,
+                manifest=_manifest_stub,
                 clearances={},
             )
 
@@ -445,6 +476,7 @@ def test_an_unsupported_format_is_refused(tmp_path):
                 table_path=tmp_path / "t.tsv",
                 fmt="tsv",
                 identifiers=_IDENTIFIERS,
+                manifest=_manifest_stub,
                 clearances={},
             )
 
@@ -463,11 +495,13 @@ def test_only_the_companions_asked_for_are_part_of_the_bundle(tmp_path):
     assert [p.name for p in ftc._bundle_targets(table, "parquet")] == [
         "t.parquet",
         "t.exported-identifier.json",
+        "t.manifest.json",
     ]
     both = ftc._requested_companions(taxonomy=True, tree=True)
     assert [p.name for p in ftc._bundle_targets(table, "parquet", companions=both)] == [
         "t.parquet",
         "t.exported-identifier.json",
+        "t.manifest.json",
         "t.taxonomy.parquet",
         "t.tree.parquet",
     ]
@@ -485,3 +519,25 @@ def test_an_occupied_companion_path_is_refused_like_any_other_bundle_member(tmp_
             "parquet",
             companions=ftc._requested_companions(taxonomy=False, tree=True),
         )
+
+
+def test_the_notes_a_user_reads_are_written_as_written(tmp_path):
+    """Both JSON members lead with a note meant to be read by whoever opens the file, and
+    `json.dump` escapes non-ASCII by default — so the dashes in those sentences would
+    arrive as `\\u2014`. Asserted on the BYTES, since that is where the escaping happens."""
+    with connect_with_miint() as conn:
+        _labelled(conn)
+        table, map_path, manifest_path = ftc._write_bundle(
+            conn,
+            table_path=tmp_path / "t.parquet",
+            fmt="parquet",
+            identifiers=_IDENTIFIERS,
+            manifest=lambda files: {"note": "an em dash — like this"},
+            clearances={},
+        )
+
+    for path in (map_path, manifest_path):
+        text = path.read_text(encoding="utf-8")
+        assert "\\u" not in text
+        assert "—" in text
+    assert table.exists()

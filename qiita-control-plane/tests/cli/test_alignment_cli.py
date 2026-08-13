@@ -93,7 +93,8 @@ def test_fetch_alignment_cohort_gets_the_route_and_keeps_the_whole_body(monkeypa
 def test_the_reference_comes_from_the_alignments_own_params():
     """Why the build has no `--reference-idx`: the alignment records the reference it
     ran against, so a caller cannot name a different one."""
-    assert al._alignment_reference_idx(_ALIGNMENTS, alignment_idx=3) == 9
+    summary = al._alignment_summary(_ALIGNMENTS, alignment_idx=3)
+    assert al._alignment_reference_idx(summary) == 9
 
 
 def test_an_alignment_absent_from_the_pool_says_what_that_means():
@@ -101,7 +102,7 @@ def test_an_alignment_absent_from_the_pool_says_what_that_means():
     'not found' covers both a typo and a permission boundary — and the message has to
     name the second, since the first is what a user will assume."""
     with pytest.raises(ValueError, match="alignment 99"):
-        al._alignment_reference_idx(_ALIGNMENTS, alignment_idx=99)
+        al._alignment_summary(_ALIGNMENTS, alignment_idx=99)
 
 
 def test_params_that_do_not_hash_to_the_reported_digest_are_refused():
@@ -113,7 +114,7 @@ def test_params_that_do_not_hash_to_the_reported_digest_are_refused():
     """
     body = {"alignments": [{"alignment_idx": 3, "params": _PARAMS, "params_hash": "00" * 32}]}
     with pytest.raises(ValueError, match="params_hash"):
-        al._alignment_reference_idx(body, alignment_idx=3)
+        al._alignment_summary(body, alignment_idx=3)
 
 
 def test_an_alignment_reporting_no_params_hash_is_refused():
@@ -122,7 +123,7 @@ def test_an_alignment_reporting_no_params_hash_is_refused():
     proceeding is how an unverifiable manifest gets published."""
     body = {"alignments": [{"alignment_idx": 3, "params": _PARAMS}]}
     with pytest.raises(ValueError, match="params_hash"):
-        al._alignment_reference_idx(body, alignment_idx=3)
+        al._alignment_summary(body, alignment_idx=3)
 
 
 def test_params_without_a_reference_is_refused_rather_than_defaulted():
@@ -141,7 +142,7 @@ def test_params_without_a_reference_is_refused_rather_than_defaulted():
         ]
     }
     with pytest.raises(ValueError, match="reference_idx"):
-        al._alignment_reference_idx(body, alignment_idx=3)
+        al._alignment_reference_idx(al._alignment_summary(body, alignment_idx=3))
 
 
 def test_the_list_handler_prints_the_route_body(monkeypatch, capsys):
