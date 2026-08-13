@@ -723,6 +723,22 @@ duplicates further down are historical strata; leave them where they are.
   list, which includes `long-read-assembly`, and the refusal message and dry-run banner
   name that list rather than the candidate one.
 
+- **Deleting a reference whose feature an assembly also claims no longer 500s (#443).**
+  Assembled contigs and reference sequences are minted through the same
+  `mint_features` path on the same canonical hash, so a contig whose bytes match a
+  reference sequence collapses to one `feature_idx`. The orphan-feature computation
+  in `delete_reference_cascade` counted only `reference_membership` and
+  `reference_annotation` claims, so such a feature looked orphaned and the
+  `DELETE FROM qiita.feature` hit `qiita.assembly_membership`'s NO ACTION foreign
+  key — a `ForeignKeyViolationError` that aborted the whole cascade as an unmapped
+  500. `qiita.assembly_membership` now counts as a claim that keeps a feature, so the
+  delete succeeds and the shared feature survives exactly as one claimed by a second
+  reference does. The data plane's `delete_reference` orphan filter is unchanged, so
+  the two stores now GC on deliberately different rules: the lake still drops the
+  `reference_sequences` copy of a feature no REFERENCE claims, and the assembly's own
+  bytes in `assembled_sequence` / `assembled_sequence_chunks` carry it from there,
+  keyed by the retained `qiita.feature` row.
+
 - **A study link retired mid-request answers 404 instead of 500 (#386).** The
   study-scoped metadata write for a biosample or sequenced-sample checks the
   caller's study link before writing, and the database re-checks it at the write

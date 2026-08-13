@@ -2138,10 +2138,12 @@ fn delete_reference(
     // features; omitting it on the right would delete a sequence another reference
     // still annotates.
     //
-    // This set MUST match the Postgres-side orphan computation in
+    // These two claim sets MUST match the Postgres-side orphan computation in
     // qiita_control_plane.actions.reference.delete_reference_cascade — the two
     // stores GC the same features independently, so a change to one query must
-    // change the other or sequences/features desync across stores.
+    // change the other or sequences/features desync across stores. That query
+    // carries one further term this filter omits (`qiita.assembly_membership`);
+    // its comment holds the rationale for the asymmetry.
     let orphan_filter = "feature_idx IN (
             (SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx = ?
              UNION
