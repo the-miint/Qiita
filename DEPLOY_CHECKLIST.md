@@ -30,7 +30,7 @@ _None yet._
   applies on three more delete paths: deleting a **genome**, a **reference**, or an
   `alignment_definition` that has published handles detaches and auto-retires them rather
   than failing or removing them, and the retirement records which identifier was severed.
-  (#m5-feature-table)
+  (#448)
 
 ### 4. Deploy
 
@@ -53,7 +53,7 @@ _None yet._
   design — a client cannot vouch for params it has no way to check. Anyone pointing this
   build's CLI at an older deployment gets that refusal, not a wrong table. Two new mint
   routes (`POST /exported-feature`, `POST /exported-processing`) ship alongside it under
-  the scopes their siblings already use — no new scope, so no PAT re-mint. (#m5-feature-table)
+  the scopes their siblings already use — no new scope, so no PAT re-mint. (#448)
 
 ---
 

@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **A published feature table's rows can now be labelled without our identifiers.**
+- **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
   `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
   and its sheared tree can all label a row the same way, which is what lets them be used
@@ -47,7 +47,7 @@ duplicates further down are historical strata; leave them where they are.
   different sequences. The cost is accepted: re-loading a reference gives its features minted
   handles instead of the accessions they had.
 
-- **A published bundle can now say what produced it, without naming an `alignment_idx`.**
+- **A published bundle can now say what produced it, without naming an `alignment_idx` (#448).**
   `POST /exported-processing` mints `QP<n>` for a processing — the third axis alongside
   `/exported-identifier` (a table's columns) and `/exported-feature` (its rows). Coverage
   filtering makes a feature table a function of the cohort it was built over rather than of the
@@ -67,7 +67,7 @@ duplicates further down are historical strata; leave them where they are.
   intact" from an assumption into a checked fact — everything the build derives, starting with
   which reference the whole table is relabelled through, is read off those params.
 
-- **A feature table can now ship its taxonomy, keyed the same way as its rows.**
+- **A feature table can now ship its taxonomy, keyed the same way as its rows (#448).**
   `qiita feature-table build --taxonomy` writes a third bundle member: one row per published
   row, carrying the same `feature_id` and the eight ranks with their `d__`/`p__` prefixes
   restored, so the two files join on one column. Parquet with eight columns rather than a
@@ -80,7 +80,7 @@ duplicates further down are historical strata; leave them where they are.
   join regardless. The per-genome reduction behind it is now shared with the shard planner,
   so a genome that tiles under one lineage publishes those same ranks.
 
-- **Every feature-table bundle now carries a manifest, and it is not optional.** Coverage
+- **Every feature-table bundle now carries a manifest, and it is not optional (#448).** Coverage
   filtering makes a table a function of the whole cohort it was built over rather than only of
   the samples in it, so the same processing over a different cohort yields a different table —
   a table without this record cannot be reproduced. `<stem>.manifest.json` names the processing
@@ -98,7 +98,7 @@ duplicates further down are historical strata; leave them where they are.
   pure function of its inputs, so two bundles built the same way are byte-identical and can be
   diffed to show it.
 
-- **A feature table can now ship the reference's tree, sheared to the rows it publishes.**
+- **A feature table can now ship the reference's tree, sheared to the rows it publishes (#448).**
   `qiita feature-table build --tree` writes the phylogeny pruned to the published keep-set,
   as a node table (`node_index, name, branch_length, edge_id, parent_index, is_tip`) whose tip
   names are the table's own `feature_id`s. Pruned ancestors have their branch lengths **summed
@@ -120,14 +120,14 @@ duplicates further down are historical strata; leave them where they are.
   loaded miint build has `shear_tree` before doing any work, because a plain `INSTALL` never
   refreshes an extension already cached and the raw failure is a bare `Catalog Error`.
 
-- **The build now reports what it could not roll up.** The genome map's INNER JOIN silently
+- **The build now reports what it could not roll up (#448).** The genome map's INNER JOIN silently
   drops alignments to features with no genome, and for some references that is most of what
   was streamed. A build that cannot carry everything says the share and why — a
   feature-rooted table is not built yet — rather than leaving a table that is quietly a
   fraction of the data.
 
 - **The feature-table analytic is now shared, and breadth of coverage has a per-sample
-  scope.** The SQL that turns alignment rows into an OGU table moved out of the
+  scope (#448).** The SQL that turns alignment rows into an OGU table moved out of the
   compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side
   recipe runs the same analytic rather than a second copy of it — the relation names, the
   pre-woltka survivor join, and the full-genome-length denominator are all one definition
@@ -139,7 +139,7 @@ duplicates further down are historical strata; leave them where they are.
   pooled breadth is always at least the best single sample's, and per-sample can only ever
   remove rows. Behaviour is unchanged for the existing server-side job, which stays pooled.
 
-- **Alignments can be gated on CIGAR sequence identity and query coverage.** A gate filters
+- **Alignments can be gated on CIGAR sequence identity and query coverage (#448).** A gate filters
   the breadth calculation as well as the counts — an alignment that fails it is not a
   placement, so it must not contribute covered bases — and `cigar` rides the signed projection
   only when a gate reads it. Paired data is judged a placement at a time, so mates are kept or
@@ -151,7 +151,7 @@ duplicates further down are historical strata; leave them where they are.
   (which `string_agg` would have scored on the surviving mate alone), and an unpaired gate
   applied to paired data. The gate SQL is unreachable without having run those checks.
 
-- **A feature table can be relabelled to public identifiers.** The counts come out keyed by
+- **A feature table can be relabelled to public identifiers (#448).** The counts come out keyed by
   `prep_sample_idx` and `genome_idx`, which mean nothing outside this system; the relabel
   joins the genome map and the exported-identifier mint to name them by the genome's
   `source_id` and the sample's minted `export_id` instead, and the relabelled relation carries
@@ -169,7 +169,7 @@ duplicates further down are historical strata; leave them where they are.
   from the one response so they cannot disagree about which genomes exist.
 
 - **A feature table can be written as Parquet or BIOM, bundled with the map needed to read
-  it.** One format per run — they hold the same numbers, so the choice is only about what
+  it (#448).** One format per run — they hold the same numbers, so the choice is only about what
   reads the file next, and Parquet is the default. **The caller names the table** and the
   identifier map is named after it, so a pair stays visibly together and two builds of one
   cohort can share a directory; a name whose extension contradicts the requested format is
@@ -186,7 +186,7 @@ duplicates further down are historical strata; leave them where they are.
   **ignores any extra column** — so it is the relabel's projection, not the writer, that
   keeps our identifiers out of a published file.
 
-- **`qiita feature-table build` — a feature table, computed on your own machine.** The first
+- **`qiita feature-table build` — a feature table, computed on your own machine (#448).** The first
   CLI surface for any of the analytic-export routes, and the first thing that composes them:
   the alignment slice and the reference lengths arrive as Flight streams, the genome map and
   the public sample handles as REST reads, and the analytic, the relabel, and the write all
@@ -907,7 +907,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
-- **The gate every alignment-cohort route runs is now one function, not three copies.**
+- **The gate every alignment-cohort route runs is now one function, not three copies (#448).**
   `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST
   /exported-processing` all check that the alignment exists, then that the caller may read
   the whole cohort, then that the cohort is completed — and that *order* is a disclosure
@@ -917,7 +917,7 @@ duplicates further down are historical strata; leave them where they are.
   beside it, and the routes differ only in the clause that completes their 422.
 
 - **Reference ingest's rank-prefix check and its column projection are now generated from
-  the shared rank tuples.** They were spelled out, eight clauses each, in the job — which
+  the shared rank tuples (#448).** They were spelled out, eight clauses each, in the job — which
   was harmless until the published taxonomy sidecar started *restoring* those prefixes by
   position from the same tuples. A drift between the two would have silently relabelled
   ranks in a file people join, and nothing would have caught it; now a change to the tuple
@@ -926,7 +926,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **A blocked contig's tip could be published in a sheared tree, under its genome's public
-  name.** The alignment and the taxonomy reach this recipe through exclusion-aware views, so a
+  name (#448).** The alignment and the taxonomy reach this recipe through exclusion-aware views, so a
   curator's blocklist already governs the table and its sidecar; the phylogeny deliberately has
   no such view — a row-wise anti-join would orphan a tip's internal parents and malform the tree
   — and the tree consumer is expected to apply the blocklist to its own keep-set instead. It was
@@ -937,7 +937,7 @@ duplicates further down are historical strata; leave them where they are.
   refused as ambiguous; a genome left with no usable tip is refused, naming it, since its only
   position in the tree comes from sequence the blocklist rejects.
 
-- **A duckdb failure during a feature-table build reached the user as a traceback.** The
+- **A duckdb failure during a feature-table build reached the user as a traceback (#448).** The
   analytic runs on the caller's own machine, which makes duckdb's own failures both the
   likeliest thing to go wrong on a large reference — the peak is a whole tree, and the shear
   is single-threaded and allocation-bound — and the hardest to place, since an out-of-memory
@@ -945,14 +945,14 @@ duplicates further down are historical strata; leave them where they are.
   says the analytic failed here, alongside the transport and refusal messages that were
   already handled.
 
-- **The roll-up's coverage report understated the share it could not carry.** It counted the
+- **The roll-up's coverage report understated the share it could not carry (#448).** It counted the
   rows of a join to the genome map, and a feature belonging to several genomes — which
   `feature_genome` allows on purpose, since identical bytes are one feature and a plasmid two
   organisms carry belongs to both — fans that feature's alignment row out once per genome. Only
   the denominator inflated, so a build reporting "1 of 4 (25.0%)" was really dropping 1 of 3
   (33.3%). Counted directly now, the way the relabel's own diagnostics already did.
 
-- **The per-genome taxonomy reduction could return two rows for one genome.** Picking a
+- **The per-genome taxonomy reduction could return two rows for one genome (#448).** Picking a
   representative member and joining its row back matches twice if the caller's relations hold a
   duplicate at the winning position, where the aggregate this replaced could not multiply at
   all. The sidecar's row-count check would have caught it; the shard planner, the other consumer,
@@ -962,7 +962,7 @@ duplicates further down are historical strata; leave them where they are.
   between two lineages silently is not ours to do.
 
 - **An alignment config whose stored form would stop matching its own digest is now refused at
-  the mint.** Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
+  the mint (#448).** Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
   so `1.5e30` returns as an integer literal that Python re-reads as an `int`, and `-0.0` returns
   as `0.0`. Either way the config read back no longer hashes to the `params_hash` stored beside
   it — permanently, for that `alignment_idx`. Nothing hits this today (no alignment config
@@ -971,7 +971,7 @@ duplicates further down are historical strata; leave them where they are.
   the blob and refuses a config that would not survive, so the failure lands on whoever adds the
   value. A small-magnitude float like `1.23e-05` does round-trip and is still allowed.
 
-- **The documented `phylogeny_tip_feature` table never existed.** Sites across
+- **The documented `phylogeny_tip_feature` table never existed (#448).** Sites across
   `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, three table inventories, an
   ingestion step, a worked clade-scoped query — described a Postgres junction table mapping
   `(reference_idx, node_index) → feature_idx`, contradicting the migration that deliberately
@@ -983,7 +983,7 @@ duplicates further down are historical strata; leave them where they are.
   Postgres `uuid`" — it is a BIGINT identity, and the uuid is the separate `sequence_hash`, so
   the claim was an invitation to write `feature_idx::uuid`.
 
-- **`shear_tree` and the Newick writer are now documented from a probe rather than assumed.**
+- **`shear_tree` and the Newick writer are now documented from a probe rather than assumed (#448).**
   `docs/duckdb-miint.md` had no `shear_tree` entry at all and the architecture doc recorded its
   presence in the pinned miint mirror as unverified. It is present, and the entry now carries
   its real signature, the separate-connection relation resolution, the float branch-length
@@ -1893,7 +1893,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
-- **The all-or-nothing multi-file commit is now shared by both CLIs' exports.** The
+- **The all-or-nothing multi-file commit is now shared by both CLIs' exports (#448).** The
   masked-read export's commit — write partials, then rename each into place, and on any
   failure remove every partial *and* every already-committed file — moved to the shared CLI
   helpers so the feature-table bundle uses the same one rather than a second copy. The
