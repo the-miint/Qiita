@@ -54,7 +54,11 @@ duplicates further down are historical strata; leave them where they are.
   samples in it, so a record of the processing is what makes the table reproducible at all, and
   the only handle for it was internal. Unlike the feature mint this one is entirely minted with
   no accession half: a processing is something we performed, so no outside authority has a name
-  for it.
+  for it. The request carries the **cohort** as well as the alignment, and takes
+  `/exported-identifier`'s gate step for step over that pair — the cohort authorizes and is not
+  part of the handle, so two callers publishing different slices of one processing still cite it
+  identically. Minting is a write, and without that gate any human could collect a handle for
+  every processing in the system, including ones over data they cannot read.
   `GET …/sequenced-pool/{pool}/alignment` now also reports each definition's **`params_hash`**
   (hex) — the digest the control plane deduplicates on. It is the server's own answer to "was
   this the same processing", so it is what a manifest cites for reproducibility, and it is
@@ -818,6 +822,16 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **An alignment config whose stored form would stop matching its own digest is now refused at
+  the mint.** Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
+  so `1.5e30` returns as an integer literal that Python re-reads as an `int`, and `-0.0` returns
+  as `0.0`. Either way the config read back no longer hashes to the `params_hash` stored beside
+  it — permanently, for that `alignment_idx`. Nothing hits this today (no alignment config
+  carries a float), but now that the digest is published and re-verified by clients, such a row
+  would refuse every build over it with nothing to point at. The mint asks Postgres to normalize
+  the blob and refuses a config that would not survive, so the failure lands on whoever adds the
+  value. A small-magnitude float like `1.23e-05` does round-trip and is still allowed.
 
 - **The documented `phylogeny_tip_feature` table never existed.** Sites across
   `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, three table inventories, an
