@@ -94,7 +94,9 @@ def _alignment_summary(alignments: dict, *, alignment_idx: int) -> dict:
                 f"alignment {alignment_idx} reports params_hash {reported!r} but its "
                 f"params hash to {computed!r}. The config this table would be built "
                 f"from is not the one the server recorded, so nothing derived from it "
-                f"can be published."
+                f"can be published. Report this rather than working around it — the "
+                f"server refuses to store a config whose digest could drift this way, "
+                f"so a mismatch here means something upstream of that check changed."
             )
         return summary
     present = sorted(s["alignment_idx"] for s in alignments.get("alignments", []))

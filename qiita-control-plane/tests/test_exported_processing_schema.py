@@ -145,11 +145,17 @@ async def test_an_identifier_outlives_the_processing_it_names(postgres_pool, pro
     assert after["export_processing_id"] == row["export_processing_id"]
 
 
-async def test_a_retired_handle_still_occupies_the_namespace(postgres_pool, probe):
-    """Unlike `exported_feature`, whose namespace index is partial for the genome
-    kind so a re-loaded genome can reclaim its accession. Nothing to reclaim here —
-    the handle is ours and per-row — so the index is total and a citation to QP7
-    resolves forever."""
+async def test_retiring_a_row_does_not_change_its_published_handle(postgres_pool, probe):
+    """A STORED generated column is recomputed whenever its inputs change, so what
+    this pins is that the handle depends on `idx` alone and not on anything mutable:
+    tie it to `retired` and a citation would silently change meaning the day the row
+    was retired.
+
+    It deliberately does NOT test the unique index on the handle. That index cannot
+    fail — `'QP' || idx` is injective in a PRIMARY KEY — so it is defence against a
+    future change to the generated expression, not a live constraint, and a test
+    pretending otherwise would be a test that cannot fail.
+    """
     row = await _insert(postgres_pool, probe)
     await postgres_pool.execute(
         "UPDATE qiita.exported_processing"

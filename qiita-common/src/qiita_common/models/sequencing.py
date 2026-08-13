@@ -1208,15 +1208,23 @@ class ExportedProcessingRequest(BaseModel):
     """Body for POST /api/v1/exported-processing — mint (or recover) the public
     handle for the processing a bundle was built from.
 
-    One field, and still a body rather than a path segment, so the route matches its
-    two siblings: all three mint a public name, all three POST against their own
-    prefix, and the one that takes a scalar today is the one most likely to take a
-    different processing kind tomorrow.
+    ``alignment_idx`` is what the handle names. ``prep_sample_idx`` is not part of
+    that name at all: it is **how the caller proves they may have it**. Minting is a
+    write, and a route that wrote on behalf of data the caller cannot read would let
+    anyone walk the `alignment_idx` range and collect a handle for every processing in
+    the system. So the cohort rides the body and takes exactly the gate
+    ``/exported-identifier`` takes for the same pair — a caller who could not build
+    the table has no manifest to write.
+
+    Identical in shape to ``ExportedIdentifierRequest``, deliberately: two routes over
+    one `(processing, cohort)` pair that authorized it differently would be two
+    answers to "may I read this data".
     """
 
     model_config = ConfigDict(extra="forbid")
 
     alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
 
 
 class ExportedProcessingResponse(BaseModel):

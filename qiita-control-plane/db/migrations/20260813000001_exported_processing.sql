@@ -114,6 +114,12 @@ CREATE UNIQUE INDEX exported_processing_live_processing
 
 -- The published handle is the lookup key for anyone resolving a citation. TOTAL,
 -- for the reason the header gives: nothing here is reclaimable.
+--
+-- Honest about what it buys: with the handle generated as 'QP' || idx, uniqueness is
+-- already implied by the PRIMARY KEY, so this index cannot currently be violated. It
+-- is here to serve the lookup and to keep the guarantee attached to the published
+-- column rather than inferred from the expression — so a later change to how the
+-- handle is composed cannot quietly make two rows share one.
 CREATE UNIQUE INDEX exported_processing_export_processing_id_unique
     ON qiita.exported_processing (export_processing_id);
 

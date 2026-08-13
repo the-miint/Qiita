@@ -5,13 +5,14 @@ manifest cites for the processing it was built from. A control-plane route for t
 same reason as its two siblings: the handle lives only in Postgres and minting one
 is a write.
 
-There is no cohort authorization, and the asymmetry with `/exported-identifier` is
-deliberate. That route names *samples*, which are study-scoped and carry per-study
-access tiers. This one names a processing, which is not study-scoped, and the only
-thing it discloses is whether an `alignment_idx` exists — precisely what
-`/exported-identifier` already discloses at its own first step, under the same
-scope, before it looks at a cohort at all. A second answer to that question is how
-one surface comes to advertise what another refuses.
+Authorization is `/exported-identifier`'s, step for step, over the same
+`(alignment_idx, cohort)` pair — and that is the point rather than convenience. A
+processing is not study-scoped, so it is tempting to conclude there is nothing here
+to authorize; but minting is a **write**, and a route that wrote on behalf of data
+the caller cannot read would hand any human a handle for every processing in the
+system, one `alignment_idx` at a time. The cohort is what closes that: it is not part
+of the handle's identity, it is how a caller shows they could have built the table
+this manifest would describe.
 """
 
 import asyncpg
@@ -23,11 +24,13 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import ExportedProcessingRequest, ExportedProcessingResponse
 
-from ..auth.guards import require_human, require_scope
+from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
 from ..repositories.alignment_definition import alignment_definition_exists
+from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.exported_processing import ProcessingVanishedError, mint_exported_processing
+from ._helpers import authorize_prep_sample_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_PROCESSING_PREFIX, tags=["exported-processing"])
 
@@ -55,9 +58,32 @@ async def mint_exported_processing_handle(
 
     **Idempotent.** Re-requesting a processing returns the handle it already has, so
     two bundles built from one processing cite it identically.
+
+    `prep_sample_idx` authorizes; it does not appear in the answer. The validation
+    order below is `/exported-identifier`'s, in the same order and through the same
+    three helpers, and that route's docstring is the single copy of why the order is
+    what it is. The one difference: it is the *cohort* that must be readable and
+    completed, and the handle that comes back names only the processing — so two
+    callers publishing different cohorts of one alignment cite the same handle, which
+    is what lets a reader see they share a processing.
     """
     if not await alignment_definition_exists(pool, body.alignment_idx):
         raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
+
+    cohort = await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=COHORT_MIN_TIER
+    )
+
+    incomplete = await list_incomplete_alignment_samples(pool, body.alignment_idx, cohort)
+    if incomplete:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{len(incomplete)} prep_sample(s) not completed for alignment"
+                f" {body.alignment_idx} (e.g. {first_few(incomplete)}); a manifest"
+                " describes processed data, so there is nothing yet to describe"
+            ),
+        )
 
     try:
         row = await mint_exported_processing(
