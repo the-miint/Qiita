@@ -1275,6 +1275,17 @@ PHYLOGENY_COLUMNS = (
 SHEAR_INPUT_RELATION = "phylogeny_published_names"
 SHEAR_KEEP_SET_RELATION = "phylogeny_keep_set"
 
+# The reference's curated blocklist, resolved to feature_idx — the exclusion set the
+# data plane's own contract names for a tree consumer, `tips WHERE feature_idx NOT IN
+# reference_exclusion` (`qiita-data-plane/src/ducklake.rs`, `ensure_exclusion_tables`).
+#
+# **The tree is the one artifact here that has to apply it itself.** The alignment and
+# the taxonomy arrive through exclusion-aware views, so a blocked feature is already gone
+# from the table and the sidecar; the phylogeny stream deliberately has no such view,
+# because anti-joining a tip's row would orphan its internal parents. So a blocked contig
+# reaches this recipe with its tip intact, and nothing else would drop it.
+BLOCKED_FEATURE_TABLE = "blocked_feature"
+
 # The sheared tree, materialized — see `sheared_tree_table_sql`.
 TREE_TABLE = "sheared_tree"
 
@@ -1303,6 +1314,17 @@ def phylogeny_table_sql(source: str) -> str:
     return f"CREATE TABLE {PHYLOGENY_TABLE} AS SELECT {', '.join(PHYLOGENY_COLUMNS)} FROM {source}"
 
 
+def blocked_feature_table_sql(source: str) -> str:
+    """Stage the reference's blocked features into `BLOCKED_FEATURE_TABLE` — see that
+    constant for why the tree needs them and nothing else here does.
+
+    DISTINCT because this relation is joined to, and a repeat would fan a tip out. The
+    route answers one row per blocked feature today; a lookup table that quietly
+    multiplies its caller's rows is not a property worth depending on.
+    """
+    return f"CREATE TABLE {BLOCKED_FEATURE_TABLE} AS SELECT DISTINCT feature_idx FROM {source}"
+
+
 def shear_input_statements() -> tuple[str, ...]:
     """Define the shear's two arguments: the tree with its tips renamed to the handles
     the table publishes, and the keep-set of those handles.
@@ -1317,6 +1339,14 @@ def shear_input_statements() -> tuple[str, ...]:
     Keeping its own name instead would put a reference-internal FASTA header into a
     published file, and could collide with a handle.
 
+    **A tip whose feature is BLOCKED gets a NULL name for the same reason**, which is how
+    this recipe honours the exclusion contract the phylogeny defers to — see
+    `BLOCKED_FEATURE_TABLE`. Naming it, not dropping its row: the count has to stay equal
+    to the tree's, since a difference is what reports a tip belonging to two genomes. It
+    also means a genome with a second, unblocked tip publishes THAT one rather than being
+    refused as ambiguous; a genome left with none is caught by `check_tree_diagnostics`,
+    which is the honest outcome — the tree has no position for it that a curator accepts.
+
     **The membership it renames from is the PUBLISHED one** (`published_membership_sql`),
     not the whole reference's map: joining the map unrestricted fans a tip out once per
     genome the feature belongs to, published or not, so a tip would be refused as ambiguous
@@ -1328,9 +1358,11 @@ def shear_input_statements() -> tuple[str, ...]:
     published_names = (
         f"CREATE VIEW {SHEAR_INPUT_RELATION} AS "
         f"SELECT p.node_index, p.parent_index, p.branch_length, p.edge_id, p.is_tip, "
-        f"CASE WHEN p.is_tip THEN pub.feature_id ELSE p.name END AS name "
+        f"CASE WHEN NOT p.is_tip THEN p.name "
+        f"     WHEN b.feature_idx IS NULL THEN pub.feature_id END AS name "
         f"FROM {PHYLOGENY_TABLE} p "
-        f"LEFT JOIN ({published_membership_sql()}) pub ON pub.feature_idx = p.feature_idx"
+        f"LEFT JOIN ({published_membership_sql()}) pub ON pub.feature_idx = p.feature_idx "
+        f"LEFT JOIN {BLOCKED_FEATURE_TABLE} b ON b.feature_idx = p.feature_idx"
     )
     keep_set = (
         f"CREATE VIEW {SHEAR_KEEP_SET_RELATION} AS "
@@ -1407,6 +1439,7 @@ def drop_phylogeny_statements() -> tuple[str, ...]:
         f"DROP VIEW {SHEAR_INPUT_RELATION}",
         f"DROP VIEW {SHEAR_KEEP_SET_RELATION}",
         f"DROP TABLE {PHYLOGENY_TABLE}",
+        f"DROP TABLE {BLOCKED_FEATURE_TABLE}",
     )
 
 
@@ -1417,8 +1450,17 @@ def tree_diagnostics_sql() -> str:
     return (
         f"WITH tip AS ("
         f"SELECT node_index, name FROM {SHEAR_INPUT_RELATION} WHERE is_tip), "
+        # The handles whose tip the rename dropped as blocked. Read off the STAGED tree
+        # rather than the view, because the view is where the name was taken away — by
+        # the time a row reaches `tip` there is nothing left to say it was ever blocked.
+        f"blocked_handle AS ("
+        f"SELECT DISTINCT pub.feature_id AS name FROM {PHYLOGENY_TABLE} p "
+        f"JOIN ({published_membership_sql()}) pub ON pub.feature_idx = p.feature_idx "
+        f"JOIN {BLOCKED_FEATURE_TABLE} b ON b.feature_idx = p.feature_idx "
+        f"WHERE p.is_tip), "
         f"per_handle AS ("
-        f"SELECT k.name, count(t.node_index) AS tips "
+        f"SELECT k.name, count(t.node_index) AS tips, "
+        f"k.name IN (SELECT name FROM blocked_handle) AS had_blocked_tip "
         f"FROM {SHEAR_KEEP_SET_RELATION} k LEFT JOIN tip t ON t.name = k.name "
         f"GROUP BY k.name) "
         f"SELECT (SELECT count(*) FROM {PHYLOGENY_TABLE}) AS tree_nodes, "
@@ -1426,8 +1468,10 @@ def tree_diagnostics_sql() -> str:
         f"count(*) AS published_rows, "
         f"count(*) FILTER (WHERE tips = 0) AS rows_with_no_tip, "
         f"count(*) FILTER (WHERE tips > 1) AS rows_with_many_tips, "
+        f"count(*) FILTER (WHERE tips = 0 AND had_blocked_tip) AS rows_with_blocked_tip, "
         f"min(name) FILTER (WHERE tips = 0) AS untreed_example, "
-        f"min(name) FILTER (WHERE tips > 1) AS multi_tip_example "
+        f"min(name) FILTER (WHERE tips > 1) AS multi_tip_example, "
+        f"min(name) FILTER (WHERE tips = 0 AND had_blocked_tip) AS blocked_tip_example "
         f"FROM per_handle"
     )
 
@@ -1439,8 +1483,10 @@ def check_tree_diagnostics(
     published_rows: int,
     rows_with_no_tip: int,
     rows_with_many_tips: int,
+    rows_with_blocked_tip: int,
     untreed_example: str | None,
     multi_tip_example: str | None,
+    blocked_tip_example: str | None,
 ) -> TreeClearance:
     """Refuse a tree that cannot honestly be published beside this table, and return the
     clearance `sheared_tree_table_sql` requires.
@@ -1473,6 +1519,17 @@ def check_tree_diagnostics(
             f"reference's tree, {multi_tip_example} among them, so the tree is not "
             f"genome-level for this reference. The shear would keep BOTH tips under the "
             f"one handle, giving a tree with duplicate tip names."
+        )
+    if rows_with_blocked_tip:
+        # Before the untreed refusal below, which counts these rows too: both describe
+        # the same genome, and only this one says why the tip went away.
+        raise ValueError(
+            f"{rows_with_blocked_tip} published row(s) have no tip in this reference's "
+            f"tree that a curator accepts, {blocked_tip_example} among them: every tip "
+            f"they own is on a blocked feature. The genome still publishes because "
+            f"another of its contigs aligned, but its only position in the tree comes "
+            f"from sequence the blocklist rejects, so the tree cannot honestly carry it. "
+            f"The table and the taxonomy sidecar are unaffected — re-run without --tree."
         )
     if rows_with_no_tip:
         raise ValueError(

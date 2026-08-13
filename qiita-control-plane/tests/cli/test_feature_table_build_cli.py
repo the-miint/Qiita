@@ -239,8 +239,9 @@ def _patched(
     feature_handles=None,
     taxonomy_rows=None,
     phylogeny_rows=None,
+    blocked_features=(),
 ):
-    """Patch the five REST seams, both ticket mints, and the Flight client; return the
+    """Patch the REST seams, both ticket mints, and the Flight client; return the
     recorder every assertion below reads. A test that wants a seam to RAISE re-patches
     it itself afterwards, rather than this growing a parameter per failure mode."""
     rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0, "phylogeny_minted": 0}
@@ -263,6 +264,12 @@ def _patched(
         "_fetch_genome_map",
         lambda *a, **k: _MAP_ENTRIES if map_entries is None else map_entries,
     )
+
+    def _exclusion(*args, **kwargs):
+        rec["exclusion_fetched"] = True
+        return [{"feature_idx": f} for f in blocked_features]
+
+    monkeypatch.setattr(ftc, "_fetch_reference_exclusion", _exclusion)
 
     def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx):
         rec["minted_cohort"] = prep_sample_idx
@@ -892,6 +899,27 @@ def test_the_tree_is_sheared_to_the_published_rows_and_keeps_their_distances(mon
     assert tips == pytest.approx({"GCF_100": 0.3, "GCF_200": 0.3})
     # Two tips and the new root, which the shear leaves unnamed — `inner` is gone.
     assert [name for name, _, is_tip in rows if not is_tip] == [""]
+
+
+def test_a_published_genome_whose_only_tip_is_blocked_stops_the_build(
+    monkeypatch, tmp_path, capsys
+):
+    """The exclusion contract the phylogeny defers to, applied. Feature 10 is G100's only
+    tip; blocking it leaves the genome published — nothing blocked its counts — with no
+    position in the tree that a curator accepts.
+
+    The blocklist is a REST read of its own because the phylogeny stream cannot carry it:
+    unlike the alignment and the taxonomy, it has no exclusion-aware view.
+    """
+    rec = _patched(monkeypatch, blocked_features=[10])
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert rec["exclusion_fetched"]
+    err = capsys.readouterr().err
+    assert "GCF_100" in err
+    assert "blocked" in err
+    assert not list(tmp_path.iterdir())
 
 
 def test_no_tree_is_written_or_streamed_without_the_flag(monkeypatch, tmp_path):

@@ -36,6 +36,7 @@ from qiita_common.api_paths import (
     PATH_EXPORTED_PROCESSING_ROOT,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
+    PATH_REFERENCE_EXCLUSION_BY_IDX,
     PATH_REFERENCE_GENOME_MAP,
     PATH_REFERENCE_PREFIX,
 )
@@ -62,6 +63,7 @@ from .alignment import (
 _GENOME_MAP_SOURCE = "genome_map_response"
 _MINT_SOURCE = "exported_identifier_response"
 _EXPORTED_FEATURE_SOURCE = "exported_feature_response"
+_EXCLUSION_SOURCE = "reference_exclusion_response"
 
 # The relations each Flight stream is registered as, for the duration of the one
 # CREATE that drains it (see `_staged_stream`).
@@ -99,6 +101,23 @@ def _fetch_genome_map(base_url: str, token: str, *, reference_idx: int) -> list[
     """
     path = f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP.format(reference_idx=reference_idx)}"
     return _common.call("GET", base_url, token, path)["entries"]
+
+
+def _fetch_reference_exclusion(
+    base_url: str, token: str, *, reference_idx: int
+) -> list[dict[str, Any]]:
+    """GET the curated blocklist as it applies to this reference: one entry per blocked
+    feature that the reference actually holds.
+
+    Only the tree needs it — see `ft.BLOCKED_FEATURE_TABLE`. Uncapped, and deliberately
+    not treated as if it were: a blocklist is hand-curated, so it is small by
+    construction, and the route already scopes it to one reference.
+    """
+    path = (
+        f"{PATH_REFERENCE_PREFIX}"
+        f"{PATH_REFERENCE_EXCLUSION_BY_IDX.format(reference_idx=reference_idx)}"
+    )
+    return _common.call("GET", base_url, token, path)
 
 
 def _mint_exported_identifiers(
@@ -244,6 +263,19 @@ def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
     )
     with _registered(con, _GENOME_MAP_SOURCE, source):
         con.execute(ft.map_table_sql(_GENOME_MAP_SOURCE))
+
+
+def _stage_blocked_features(con, entries: list[dict[str, Any]]) -> None:
+    """Stage the reference's blocklist into `BLOCKED_FEATURE_TABLE`.
+
+    `feature_idx` only. The listing also reports why each was blocked and by whom, which
+    is what makes it readable for a curator and is not something a shear needs.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+
+    source = pa.Table.from_pylist(entries, schema=pa.schema([("feature_idx", pa.int64())]))
+    with _registered(con, _EXCLUSION_SOURCE, source):
+        con.execute(ft.blocked_feature_table_sql(_EXCLUSION_SOURCE))
 
 
 def _stage_exported_features(con, entries: list[dict[str, Any]]) -> None:
@@ -905,6 +937,12 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
                 ),
             )
         if args.tree:
+            # The blocklist is a REST read, but it is fetched here so the two halves of
+            # the tree's input arrive together: the stream carries a blocked tip and this
+            # is the only thing that says so.
+            _stage_blocked_features(
+                con, _fetch_reference_exclusion(args.base_url, token, reference_idx=reference_idx)
+            )
             _stage_phylogeny(
                 con,
                 flight_client,

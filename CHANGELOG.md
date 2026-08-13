@@ -882,6 +882,18 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A blocked contig's tip could be published in a sheared tree, under its genome's public
+  name.** The alignment and the taxonomy reach this recipe through exclusion-aware views, so a
+  curator's blocklist already governs the table and its sidecar; the phylogeny deliberately has
+  no such view — a row-wise anti-join would orphan a tip's internal parents and malform the tree
+  — and the tree consumer is expected to apply the blocklist to its own keep-set instead. It was
+  not. A genome that publishes on the strength of one contig, with a curator's block on the
+  contig its tip is wired to, got that blocked tip's position written into the published tree.
+  The build now reads the reference's blocklist and names a tip only when it is both published
+  and unblocked. A genome with a second, unblocked tip publishes that one instead of being
+  refused as ambiguous; a genome left with no usable tip is refused, naming it, since its only
+  position in the tree comes from sequence the blocklist rejects.
+
 - **A duckdb failure during a feature-table build reached the user as a traceback.** The
   analytic runs on the caller's own machine, which makes duckdb's own failures both the
   likeliest thing to go wrong on a large reference — the peak is a whole tree, and the shear

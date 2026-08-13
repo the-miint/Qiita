@@ -1092,7 +1092,8 @@ def test_the_shear_input_names_tips_from_the_published_labels():
     published handles and the tree cannot disagree about which tip is which."""
     published, keep_set = ft.shear_input_statements()
     assert f"CREATE VIEW {ft.SHEAR_INPUT_RELATION} AS" in published
-    assert "CASE WHEN p.is_tip THEN pub.feature_id ELSE p.name END AS name" in published
+    assert "WHEN NOT p.is_tip THEN p.name" in published
+    assert "WHEN b.feature_idx IS NULL THEN pub.feature_id" in published
     assert keep_set == (
         f"CREATE VIEW {ft.SHEAR_KEEP_SET_RELATION} AS "
         f"SELECT feature_id AS name FROM {ft.GENOME_LABEL_TABLE}"
@@ -1159,6 +1160,7 @@ def test_the_clearance_shears_then_releases_the_whole_reference_tree():
         f"DROP VIEW {ft.SHEAR_INPUT_RELATION}",
         f"DROP VIEW {ft.SHEAR_KEEP_SET_RELATION}",
         f"DROP TABLE {ft.PHYLOGENY_TABLE}",
+        f"DROP TABLE {ft.BLOCKED_FEATURE_TABLE}",
     )
 
 
@@ -1177,8 +1179,10 @@ def _tree_check(**overrides):
         "published_rows": 4,
         "rows_with_no_tip": 0,
         "rows_with_many_tips": 0,
+        "rows_with_blocked_tip": 0,
         "untreed_example": None,
         "multi_tip_example": None,
+        "blocked_tip_example": None,
     } | overrides
     return ft.check_tree_diagnostics(**row)
 
@@ -1210,6 +1214,26 @@ def test_check_refuses_a_genome_owning_more_than_one_tip():
     """Which the shear would accept, keeping BOTH tips under one published handle."""
     with pytest.raises(ValueError, match="GCF_MULTI"):
         _tree_check(rows_with_many_tips=1, multi_tip_example="GCF_MULTI")
+
+
+def test_check_refuses_a_published_row_whose_only_tip_is_blocked():
+    """A genome-level tree carries one tip per genome, so a curator who blocks the contig
+    that tip is wired to leaves the genome with no honest position — and the genome still
+    publishes, on the strength of a sibling contig nothing blocked."""
+    with pytest.raises(ValueError, match="GCF_BLOCKED"):
+        _tree_check(rows_with_blocked_tip=1, blocked_tip_example="GCF_BLOCKED")
+
+
+def test_a_blocked_tip_is_refused_before_a_missing_one():
+    """Both counts describe the same genome when its only tip is blocked and therefore
+    unnamed. The blocked message is the one that says WHY, so it has to win."""
+    with pytest.raises(ValueError, match="blocked"):
+        _tree_check(
+            rows_with_no_tip=1,
+            untreed_example="GCF_BLOCKED",
+            rows_with_blocked_tip=1,
+            blocked_tip_example="GCF_BLOCKED",
+        )
 
 
 def test_the_tree_copy_takes_a_clearance_and_the_shared_parquet_options(tmp_path):

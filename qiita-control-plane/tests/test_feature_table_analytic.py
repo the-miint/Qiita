@@ -883,10 +883,20 @@ def _published_handles(conn) -> list[tuple]:
     return [(genome_idx, _FEATURE_HANDLES[genome_idx]) for (genome_idx,) in rows]
 
 
-def _stage_phylogeny(conn, tmp_path, *, newick=_TREE, tip_features=_TIP_FEATURES) -> None:
+def _stage_phylogeny(
+    conn, tmp_path, *, newick=_TREE, tip_features=_TIP_FEATURES, blocked=()
+) -> None:
     """Stage a tree in the lake's shape: `read_newick` plus `is_tip`, with `feature_idx`
     resolved from the tip's name by a LEFT JOIN — which is how ingest writes it, so an
-    unmatched tip keeps its row with a NULL `feature_idx`."""
+    unmatched tip keeps its row with a NULL `feature_idx`.
+
+    `blocked` is the reference's curated blocklist, staged alongside because the shear
+    reads both — usually empty, which is the state a reference with no exclusions is in.
+    """
+    conn.execute("CREATE TABLE _exclusion (feature_idx BIGINT)")
+    for feature_idx in blocked:
+        conn.execute("INSERT INTO _exclusion VALUES (?)", [feature_idx])
+    conn.execute(ft.blocked_feature_table_sql("_exclusion"))
     path = tmp_path / "reference.nwk"
     path.write_text(newick + "\n")
     conn.execute(
@@ -996,6 +1006,35 @@ def test_a_genome_owning_two_tips_is_refused_by_its_handle(tmp_path):
         _stage_phylogeny(conn, tmp_path, newick=tree, tip_features=tips)
         with pytest.raises(ValueError, match="GCF_000000400"):
             _shear(conn)
+
+
+def test_a_genome_whose_ONLY_tip_is_blocked_is_refused_by_its_handle(tmp_path):
+    """The curator blocked c40, the one tip G400 has. G400 still publishes — c41 aligned
+    and nothing blocked it — so the table is fine and only the tree is not: its single
+    position for that organism comes from sequence the blocklist rejects."""
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path, blocked=[40])
+        with pytest.raises(ValueError, match="GCF_000000400") as excinfo:
+            _shear(conn)
+    assert "blocked" in str(excinfo.value)
+
+
+def test_a_genome_keeps_its_UNBLOCKED_tip_when_a_sibling_contig_is_blocked(tmp_path):
+    """The case the blocklist actually exists for, and the reason a blocked tip is unnamed
+    rather than merely counted: G400 has a tip per contig, and blocking c40 leaves exactly
+    one — so the tree publishes c41's position instead of being refused as ambiguous."""
+    tree = "((c40:0.2,c41:0.3)G400:0.1,(c10:0.4,c20:0.5)inner:0.2);"
+    tips = [("c10", 10), ("c20", 20), ("c40", 40), ("c41", 41)]
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path, newick=tree, tip_features=tips, blocked=[40])
+        clearance = _shear(conn)
+        rows = _sheared(conn)
+
+    assert clearance.tips == 3
+    # c41's own branch, not c40's and not a sum: G400's surviving tip is a sibling of the
+    # blocked one, so nothing collapsed onto it.
+    by_name = {name: branch for _, name, branch, *_ in rows if name}
+    assert by_name["GCF_000000400"] == pytest.approx(0.3 + 0.1)
 
 
 def test_a_published_row_with_no_tip_in_the_tree_is_refused(tmp_path):

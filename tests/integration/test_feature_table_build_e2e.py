@@ -29,10 +29,11 @@ The fixture makes every load-bearing rule of the analytic visible in the OUTPUT:
     contig is blocked by a curated exclusion and carries a different lineage, so
     what C publishes says which contig spoke for it.
 
-The tree is the third artifact and the only one whose shape is not row-wise: it
-carries one tip per published genome, and shearing it to the survivors leaves an
-ancestor with a single child, whose branch length must be added to the surviving
-one rather than dropped.
+The tree is the third artifact and the only one whose shape is not row-wise. It is
+contig-level here, so C has a tip per contig — and only the exclusion decides which
+of the two speaks for it, because the phylogeny is the one stream with no
+exclusion-aware view. Shearing to the survivors leaves each ancestor with a single
+child, whose branch length must be added to the surviving one rather than dropped.
 
 Requires real miint (native BIGINT ids through `woltka_ogu`) and the built
 data-plane debug binary, like every other test in this directory.
@@ -68,11 +69,9 @@ _THRESHOLD = "0.01"
 # publish C as unclassified.
 _CONTIGS = {"A": ("A",), "B": ("B",), "C": ("C.blocked", "C")}
 
-# Every contig's length in bp. Lengths are the coverage DENOMINATOR and it is the full
-# GENOME length — which is what makes B's 5 covered bases 0.5% rather than something
-# that survives, and what puts C's blocked contig in C's denominator: an exclusion is a
-# read-time mask over the alignment and the taxonomy, not a claim that the sequence is
-# not there.
+# Every contig's length in bp. The denominator is the full GENOME length — see
+# `genome_lengths_table_sql` — which is what makes B's 5 covered bases 0.5% rather than
+# something that survives, and what puts C's blocked contig in C's 1100.
 _LENGTHS = {"A": 10000, "B": 1000, "C.blocked": 100, "C": 1000}
 
 # Lineages as ingest stores them — prefixes stripped, an absent rank NULL. The sidecar
@@ -101,15 +100,18 @@ _LINEAGE_C_BLOCKED = (
 )
 
 # The reference's own tree, as ingest would have written it: tips named by FASTA header,
-# and a jplace edge id per branch. No tip for C's blocked contig — a genome-level tree
-# has one tip per genome, and a second tip mapping to C would be refused as ambiguous.
+# and a jplace edge id per branch. A contig-level tree, so genome C has a tip per contig
+# — including the blocked one, which is the shape that makes the blocklist do work here.
 #
-#   ((contig-A:0.25, contig-B:0.5)inner:0.125, contig-C:0.75);
+#   ((contig-A:0.25, contig-B:0.5)inner:0.125,
+#    (contig-C.blocked:0.0625, contig-C:0.75)cnode:0.03125);
 #
-# Shearing to {A, C} drops B's tip, leaving `inner` with one child. Both branch lengths
-# are exact binary fractions, so their sum is exact too.
-_BRANCH_A, _BRANCH_B, _BRANCH_C, _BRANCH_INNER = 0.25, 0.5, 0.75, 0.125
-_EDGE_A, _EDGE_C = 11, 14
+# Shearing to {A, C} drops B's tip (unpublished) and C.blocked's (blocked), leaving each
+# internal node with one child. Every branch length is an exact binary fraction, so both
+# collapsed sums are exact too.
+_BRANCH_A, _BRANCH_B, _BRANCH_C = 0.25, 0.5, 0.75
+_BRANCH_C_BLOCKED, _BRANCH_INNER, _BRANCH_CNODE = 0.0625, 0.125, 0.03125
+_EDGE_A, _EDGE_C = 11, 15
 
 
 def _rank_literals(lineage: tuple[str, ...]) -> str:
@@ -190,6 +192,18 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
                 reference_idx,
                 features[contig],
             )
+
+    # The curator's block, in BOTH stores, because the recipe reads both: Postgres is
+    # authoritative and is what the tree's own exclusion read answers from, and the lake
+    # mirror is what the exclusion-aware views anti-join. `sync_reference_exclusion` is
+    # what keeps them equal in production; seeding one without the other would model a
+    # state that cannot occur.
+    await db.execute(
+        "INSERT INTO qiita.reference_exclusion (feature_idx, reason, excluded_by_idx)"
+        " VALUES ($1, 'contaminant contig, seeded by the feature-table build test', $2)",
+        features["C.blocked"],
+        owner,
+    )
 
     samples: list[tuple[int, int, int]] = []
     run_idx = pool_idx = None
@@ -283,10 +297,13 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
             f" ({reference_idx}, 0, 'contig-A', {_BRANCH_A}, {_EDGE_A}, 2, true,"
             f"  {features['A']}),"
             f" ({reference_idx}, 1, 'contig-B', {_BRANCH_B}, 12, 2, true, {features['B']}),"
-            f" ({reference_idx}, 2, 'inner', {_BRANCH_INNER}, 13, 4, false, NULL),"
-            f" ({reference_idx}, 3, 'contig-C', {_BRANCH_C}, {_EDGE_C}, 4, true,"
+            f" ({reference_idx}, 2, 'inner', {_BRANCH_INNER}, 13, 6, false, NULL),"
+            f" ({reference_idx}, 3, 'contig-C.blocked', {_BRANCH_C_BLOCKED}, 14, 5, true,"
+            f"  {features['C.blocked']}),"
+            f" ({reference_idx}, 4, 'contig-C', {_BRANCH_C}, {_EDGE_C}, 5, true,"
             f"  {features['C']}),"
-            f" ({reference_idx}, 4, '', NULL, 15, NULL, false, NULL)"
+            f" ({reference_idx}, 5, 'cnode', {_BRANCH_CNODE}, 16, 6, false, NULL),"
+            f" ({reference_idx}, 6, '', NULL, 17, NULL, false, NULL)"
         )
         lake.execute(
             "INSERT INTO qiita_lake.alignment"
@@ -338,6 +355,10 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
         "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_sample_idxs
     )
     await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs)
+    await db.execute(
+        "DELETE FROM qiita.reference_exclusion WHERE feature_idx = ANY($1::bigint[])",
+        list(features.values()),
+    )
     await db.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
     )
@@ -485,11 +506,16 @@ async def test_a_user_builds_a_publishable_feature_table(
     tree = _read_artifact(tree_path)
     tips = {row[1]: row for row in tree if row[5]}
     assert set(tips) == {src["A"], src["C"]}
-    # `inner` lost B's tip and so has a single child; collapse removes it and adds its
-    # branch to A's, so a distance read off the published tree is the distance the whole
-    # reference tree carried. Both are exact binary fractions, hence an exact ==.
+    # Each internal node lost one of its two tips and so collapses, its branch adding to
+    # the survivor's — so a distance read off the published tree is the distance the whole
+    # reference tree carried. All exact binary fractions, hence an exact ==.
+    #
+    # The two tips went for DIFFERENT reasons, which is the point: B's genome is not in
+    # the table, while C.blocked's is — C publishes, on the strength of a sibling contig.
+    # Its tip is gone because a curator blocked that contig, and the blocklist reaches
+    # this file through a REST read of its own; the phylogeny stream cannot carry it.
     assert tips[src["A"]][2] == _BRANCH_A + _BRANCH_INNER
-    assert tips[src["C"]][2] == _BRANCH_C
+    assert tips[src["C"]][2] == _BRANCH_C + _BRANCH_CNODE
     # A surviving edge keeps its OWN jplace id — the handle back to the reference's
     # placements, and why the tree ships as a node table rather than as Newick.
     assert (tips[src["A"]][3], tips[src["C"]][3]) == (_EDGE_A, _EDGE_C)
