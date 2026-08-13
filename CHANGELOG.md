@@ -698,6 +698,31 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A workflow that consumes a read mask now records it on `work_ticket.mask_idx` (#444).**
+  The column was introduced for the minting path (`read-mask`, `fastq-to-parquet`), where
+  the runner persists the mask it minted. `long-read-assembly` consumes an existing mask's
+  `read_masked` pass-set instead, taking `mask_idx` from `action_context`, and never wrote
+  it to the ticket — so every assembly ticket read NULL while depending on a mask. The
+  shared-mask guard in `qiita-admin mask purge-failed` keys on that column, so a mask a
+  completed assembly reads looked unreferenced and was eligible for deletion; the
+  dependency survived only in `action_context` JSONB and `qiita.processing.params`, which
+  no guard reads. The runner now persists the consumed `mask_idx` before staging the reads
+  — the staging resolver's other terminal exit is `NO_DATA` (an empty pass-set), which is
+  not a failure, so persisting afterwards would leave exactly those tickets NULL in a state
+  the guard still protects. A context naming a mask that does not exist is now rejected by
+  name rather than by foreign-key violation. A migration backfills existing tickets from
+  `action_context->>'mask_idx'`, joining on text so no untrusted value is ever cast, and
+  skipping rows whose named mask no longer exists (which `ON DELETE SET NULL` would have
+  left NULL anyway). The `work_ticket.mask_idx` column comment now describes both minting
+  and consuming.
+
+  `purge-failed`'s mask-idx coverage gate — which refuses `--execute` while any non-failed
+  ticket has a NULL `mask_idx`, since the guard would be blind to it — was scoped to the
+  run's candidate actions, so selecting one with `--action` also narrowed what counted as a
+  blind spot while the guard itself reads tickets of every action. It now uses its own
+  list, which includes `long-read-assembly`, and the refusal message and dry-run banner
+  name that list rather than the candidate one.
+
 - **Deleting a reference whose feature an assembly also claims no longer 500s (#443).**
   Assembled contigs and reference sequences are minted through the same
   `mint_features` path on the same canonical hash, so a contig whose bytes match a
