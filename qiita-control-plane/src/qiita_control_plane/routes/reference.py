@@ -103,6 +103,7 @@ from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     expected_shard_index_types,
 )
+from ._helpers import REFERENCE_NOT_FOUND_DETAIL, require_reference_exists
 
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
 
@@ -117,8 +118,6 @@ _REFERENCE_RETURNING = REFERENCE_RETURNING
 _DEFAULT_LIST_LIMIT = 1000
 _MAX_LIST_LIMIT = 5000
 
-_MSG_REFERENCE_NOT_FOUND = "Reference not found"
-
 # Hard cap on the genome map, and the one place in the codebase where exceeding a
 # cap is a refusal rather than a truncation — see get_reference_genome_map. Sized
 # from a response-body budget rather than by borrowing another route's number: an
@@ -127,16 +126,6 @@ _MSG_REFERENCE_NOT_FOUND = "Reference not found"
 # roll up today. The reference that first trips it is the signal to build the
 # streamed form, not to raise this.
 _GENOME_MAP_HARD_CAP = 250_000
-
-
-async def _require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> None:
-    """404 unless the reference exists. The reference-scoped reads all need this
-    so a typo'd idx is distinguishable from a genuinely empty answer."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
 
 
 @router.post(PATH_REFERENCE_ROOT, status_code=201)
@@ -224,7 +213,7 @@ async def get_reference_index(
     visibility / admin). Scoped to reference:read — unlike the anonymous-OK
     reference metadata GETs — because fs_path exposes internal filesystem
     layout; reference:read is held by every human role and service account."""
-    await _require_reference_exists(pool, reference_idx)
+    await require_reference_exists(pool, reference_idx)
     rows = await pool.fetch(
         "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
         " shard_id"
@@ -264,7 +253,7 @@ async def get_reference_shard_index_status(
     whose sharding fanned out zero shards — reads all-zero / empty (a valid
     "nothing sharded here" answer, not an error). Scoped to reference:read like
     the /index listing: it exposes build progress, not payload."""
-    await _require_reference_exists(pool, reference_idx)
+    await require_reference_exists(pool, reference_idx)
 
     # N = the shards the planner assigned (COUNT(DISTINCT shard_id) over the
     # non-NULL membership rows — the same derivation finalize_shard uses; there
@@ -385,7 +374,7 @@ async def get_reference_genome_map(
     silently missing rows drops those features from the caller's roll-up,
     producing a WRONG feature table rather than a partial one. So a 200 is always
     the complete map, which is why the response carries no `truncated`."""
-    await _require_reference_exists(pool, reference_idx)
+    await require_reference_exists(pool, reference_idx)
     # Over-fetch by one to detect the overflow; only the refusal path pays for
     # counting the true size, which is what tells a caller whether they are barely
     # over or hopelessly over.
@@ -420,7 +409,7 @@ async def get_reference(
         reference_idx,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     return ReferenceResponse(**dict(row))
 
 
@@ -434,7 +423,7 @@ async def update_reference_status(
     try:
         return await transition_reference_status(pool, reference_idx, body.status)
     except ReferenceNotFound:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     except IllegalStatusTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -652,7 +641,7 @@ async def list_reference_exclusions(
     `get_reference_shard_index_status`) so a typo'd idx is distinguishable from a
     genuinely clean reference — an existing reference with no blocked features
     yields `[]`."""
-    await _require_reference_exists(pool, reference_idx)
+    await require_reference_exists(pool, reference_idx)
     rows = await list_for_reference(pool, reference_idx)
     return [ReferenceExclusionListItem.model_validate(dict(r)) for r in rows]
 
@@ -690,7 +679,7 @@ async def delete_reference(
     try:
         await assert_reference_deletable(pool, reference_idx, force=force)
     except ReferenceNotFound:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     except ReferenceDeleteBlocked as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -737,7 +726,7 @@ async def delete_reference(
         try:
             await assert_reference_deletable(conn, reference_idx, force=True)
         except ReferenceNotFound:
-            raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+            raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
         except ReferenceDeleteBlocked as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         counts = await delete_reference_cascade(conn, reference_idx)
@@ -848,7 +837,7 @@ async def create_doget_ticket(
         reference_idx,
     )
     if status is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     if status not in _STREAMABLE_STATUSES:
         raise HTTPException(
             status_code=409,

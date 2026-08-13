@@ -53,6 +53,21 @@ from ..repositories._sample_helpers import (
     write_sample_metadata,
 )
 
+REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
+
+
+async def require_reference_exists(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, reference_idx: int
+) -> None:
+    """404 unless the reference exists. Every reference-scoped route needs this so a
+    typo'd idx is distinguishable from a genuinely empty answer — or, on a route that
+    resolves the reference's contents, from contents that are genuinely absent."""
+    exists = await pool_or_conn.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
+
 
 def first_few(idxs: list[int], limit: int = 5) -> str:
     """Render at most `limit` identifiers, eliding the rest with an ellipsis.

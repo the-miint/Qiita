@@ -34,7 +34,7 @@ from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
 from ..repositories.exported_feature import IncompleteMintError, mint_exported_features
-from ._helpers import first_few
+from ._helpers import first_few, require_reference_exists
 
 router = APIRouter(prefix=PATH_EXPORTED_FEATURE_PREFIX, tags=["exported-feature"])
 
@@ -77,7 +77,14 @@ async def mint_exported_feature_map(
     member of the named reference and therefore has no accession from it. Those are
     reported together as a 422, because a map missing an entity would publish a table
     with an unnamed row.
+
+    A `reference_idx` that does not exist is a 404 instead, checked up front the way
+    `/exported-identifier` checks its alignment: every feature would otherwise be
+    reported as "not in reference 99", which sends the caller to audit a membership
+    table that was never the problem.
     """
+    if body.reference_idx is not None:
+        await require_reference_exists(pool, body.reference_idx)
     try:
         rows = await mint_exported_features(
             pool,

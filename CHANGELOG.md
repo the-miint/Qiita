@@ -37,7 +37,15 @@ duplicates further down are historical strata; leave them where they are.
   giving the loser a minted handle — while still reporting the accession it wanted, so nobody
   has to guess why one label changed shape. That arbitration cannot live client-side: a caller
   sees the entities of one artifact, never the accession someone else published last week. Nor
-  can it live in the generated column, which sees only its own row.
+  can it live in the generated column, which sees only its own row. Where two entities in one
+  request want the same accession, the lower identifier keeps it.
+  An identifier is retired rather than deleted when the thing it named goes away, and what
+  happens to its string then depends on the kind: a **genome** releases its accession, because
+  the source's name for an organism means the same thing when the genome is re-loaded; a
+  **feature** reserves its accession forever, because a FASTA header names nothing outside the
+  load that emitted it and releasing it would let one published label come to name two
+  different sequences. The cost is accepted: re-loading a reference gives its features minted
+  handles instead of the accessions they had.
 
 - **The feature-table analytic is now shared, and breadth of coverage has a per-sample
   scope.** The SQL that turns alignment rows into an OGU table moved out of the

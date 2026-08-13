@@ -6,7 +6,8 @@ guarantees. These cover what the route promises on top of it:
 * an accession is published as-is wherever one exists, because a reader can resolve
   `GCF_…` and cannot resolve anything we mint;
 * a **collision is not an error** — the loser gets a `QF` handle and the response
-  says which accession it wanted, so the fallback is visible rather than silent;
+  says which accession it wanted, so the fallback is visible rather than silent, for
+  both kinds and whatever order the caller listed them in;
 * both kinds in one request, ordered genomes-then-features;
 * the mint is idempotent, which is the contract for anything published;
 * an entity that cannot be named at all is a 422, all-or-nothing.
@@ -59,12 +60,18 @@ async def test_a_genome_is_labelled_with_its_accession(role_keyed_clients):
         await db.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
 
 
-async def test_a_collided_accession_falls_back_instead_of_failing(role_keyed_clients):
+async def test_a_collided_genome_accession_falls_back_instead_of_failing(role_keyed_clients):
     """Two genomes can share a `source_id` under different `source`s, because
     `qiita.genome`'s uniqueness is the composite. The second one to be published
     cannot have the string, and the request must still succeed — the response says
     what it wanted and that it lost, so nobody has to guess why the label changed
-    shape."""
+    shape.
+
+    The request lists the entities in DESCENDING idx order on purpose. The winner is
+    the lower idx either way, which is only true because the mint's INSERT orders by
+    it; listing them ascending would pass against an unordered INSERT too, and pin
+    nothing.
+    """
     db = role_keyed_clients["pool"]
     shared = f"GCF_{uuid.uuid4().hex[:12]}"
     first = await db.fetchval(
@@ -75,9 +82,10 @@ async def test_a_collided_accession_falls_back_instead_of_failing(role_keyed_cli
         "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
         shared,
     )
+    assert first < second
     try:
         resp = await role_keyed_clients["user"].post(
-            URL_EXPORTED_FEATURE, json={"genome_idx": [first, second]}
+            URL_EXPORTED_FEATURE, json={"genome_idx": [second, first]}
         )
         assert resp.status_code == 201, resp.text
         entries = {e["genome_idx"]: e for e in resp.json()["identifiers"]}
@@ -94,6 +102,43 @@ async def test_a_collided_accession_falls_back_instead_of_failing(role_keyed_cli
         await db.execute(
             "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])", [first, second]
         )
+
+
+async def test_a_collided_feature_accession_falls_back_instead_of_failing(role_keyed_clients):
+    """The likelier collision of the two, and the one with no constraint behind it at
+    all: `reference_membership.accession` is a FASTA header, and real assemblies
+    routinely emit `contig_1` / `NODE_1` / `scaffold_1`, so one reference can name two
+    features the same thing.
+
+    Listed in descending idx order, for the reason the genome twin above gives.
+    """
+    db = role_keyed_clients["pool"]
+    reference_idx = await seed_bare_reference(db, label="expfeat-route-dup-header")
+    first = await seed_bare_feature(db)
+    second = await seed_bare_feature(db)
+    header = f"contig_{uuid.uuid4().hex[:8]}"
+    for feature_idx in (first, second):
+        await seed_reference_membership(
+            db, reference_idx=reference_idx, feature_idx=feature_idx, accession=header
+        )
+    assert first < second
+    try:
+        resp = await role_keyed_clients["user"].post(
+            URL_EXPORTED_FEATURE,
+            json={"reference_idx": reference_idx, "feature_idx": [second, first]},
+        )
+        assert resp.status_code == 201, resp.text
+        entries = {e["feature_idx"]: e for e in resp.json()["identifiers"]}
+        assert entries[first]["export_feature_id"] == header
+        assert entries[first]["accession_published"] is True
+
+        loser = entries[second]
+        assert loser["export_feature_id"].startswith("QF")
+        assert loser["accession"] == header
+        assert loser["accession_published"] is False
+    finally:
+        await _drop_identifiers(db, feature_idxs=[first, second])
+        await cleanup_reference_graph(db, reference_idx=reference_idx, feature_idxs=[first, second])
 
 
 async def test_a_feature_is_labelled_with_the_accession_of_its_reference(role_keyed_clients):
@@ -234,6 +279,34 @@ async def test_a_feature_outside_the_named_reference_is_refused(role_keyed_clien
         await cleanup_reference_graph(
             db, reference_idx=reference_idx, feature_idxs=[member, stranger]
         )
+
+
+async def test_an_unknown_reference_is_a_404_not_a_membership_complaint(role_keyed_clients):
+    """ "N feature_idx not in reference 99" would send the caller to audit a membership
+    table when the reference itself is the typo."""
+    db = role_keyed_clients["pool"]
+    absent = await db.fetchval("SELECT coalesce(max(reference_idx), 0) + 1000 FROM qiita.reference")
+    resp = await role_keyed_clients["user"].post(
+        URL_EXPORTED_FEATURE, json={"reference_idx": absent, "feature_idx": [1]}
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_a_repeated_entity_is_one_entity(role_keyed_clients):
+    """Deduped in the request, so the cap counts entities rather than list entries."""
+    db = role_keyed_clients["pool"]
+    genome_idx, source_id = await seed_genome(db)
+    try:
+        resp = await role_keyed_clients["user"].post(
+            URL_EXPORTED_FEATURE, json={"genome_idx": [genome_idx, genome_idx, genome_idx]}
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["count"] == 1
+        assert body["identifiers"][0]["export_feature_id"] == source_id
+    finally:
+        await _drop_identifiers(db, genome_idxs=[genome_idx])
+        await db.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
 
 
 async def test_an_empty_request_is_refused(role_keyed_clients):

@@ -620,6 +620,13 @@ class ExportedFeatureRequest(BaseModel):
     def _coherent_entity_set(self) -> ExportedFeatureRequest:
         if not self.genome_idx and not self.feature_idx:
             raise ValueError("name at least one genome_idx or feature_idx")
+        # Dedup before the cap, and in input order. A repeated entity is one entity:
+        # the mint is idempotent, so leaving duplicates in would spend the cap on
+        # work Postgres then collapses anyway, and would refuse a request that names
+        # nothing like 10 000 distinct things. `Field(max_length=…)` above still
+        # bounds the raw payload, which is the other thing the cap is for.
+        self.genome_idx = list(dict.fromkeys(self.genome_idx))
+        self.feature_idx = list(dict.fromkeys(self.feature_idx))
         total = len(self.genome_idx) + len(self.feature_idx)
         if total > MAX_EXPORTED_FEATURE_ENTITIES:
             raise ValueError(
