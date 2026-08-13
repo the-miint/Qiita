@@ -23,24 +23,11 @@ _None yet._
 
 ### 3. Migrations
 
-- `20260806120000_alignment_sample_prep_sample_idx.sql` — plain `make migrate`, no
-  out-of-band setup. Builds `CREATE INDEX CONCURRENTLY` on `qiita.alignment_sample`, so it
-  does **not** lock the table and is safe to run while services are up; it may take a while
-  on a large table, and a failed CONCURRENTLY build leaves an INVALID index that
-  `make migrate` will not retry — drop it by hand and re-run if that happens.
-  (#436)
-- `20260810000000_exported_identifier.sql` — plain `make migrate`, no out-of-band setup.
-  Creates the empty `qiita.exported_identifier` table plus its retire-on-detach trigger;
-  nothing to backfill and no extension needed. One behaviour change worth knowing before
-  you next purge an alignment: `DELETE`ing an `alignment_definition` that has published
-  identifiers no longer removes them — it detaches and auto-retires them, so
-  `qiita-admin`'s alignment purge still succeeds and a published `QM<n>` keeps resolving.
-  (#438)
 - `20260813000000_exported_feature.sql` and `20260813000001_exported_processing.sql` —
-  plain `make migrate`, no out-of-band setup. Two more empty mint tables
+  plain `make migrate`, no out-of-band setup. Two empty mint tables
   (`qiita.exported_feature`, `qiita.exported_processing`), each with the same
-  retire-on-detach trigger as above. The behaviour note on the previous line now applies
-  on three more delete paths: deleting a **genome**, a **reference**, or an
+  retire-on-detach trigger `qiita.exported_identifier` already carries. That behaviour now
+  applies on three more delete paths: deleting a **genome**, a **reference**, or an
   `alignment_definition` that has published handles detaches and auto-retires them rather
   than failing or removing them, and the retirement records which identifier was severed.
   (#m5-feature-table)
@@ -59,33 +46,6 @@ _None yet._
 
 ### Notes (no host action)
 
-- **A user whose PAT predates this deploy cannot use the new alignment mint
-  until they re-mint it.** A new scope `alignment:doget` is added to all three
-  role ceilings, so callers on the OIDC path pick it up automatically (that path
-  returns the role's full ceiling per request). The token path returns the
-  token's **own** stored scope set, so an existing PAT does not — the holder
-  runs `qiita login` (or `POST /auth/pat`) once. The 403 says so itself: the
-  stale-token hint fires precisely when a scope is in the caller's live ceiling
-  but absent from their token. Nothing to do on the host.
-  (#436)
-- **A feature-table (`estimate_feature_table`) job that is already running when
-  the data plane restarts will fail with `InvalidArgument: alignment_visible
-  requires an explicit projection column list`.** The alignment DoGet now
-  requires the column list to be signed into the ticket, and a job launched from
-  the pre-deploy orchestrator code does not send one. No host configuration
-  changes and no rollback: if a job was in flight, resubmit that ticket and it
-  picks up the new code. This is expected, not a regression. (#435)
-- **`activate.sh` restarts the control plane BEFORE the data plane, so for a few
-  seconds a new CP signs `columns` an old DP ignores.** Harmless on this deploy
-  and only on this deploy: the old data plane applies its retired hardcoded
-  six-column projection, which is exactly the list the one consumer
-  (`estimate_feature_table`) asks for, so the stream is the same either way. The
-  next change to a consumer's column set does not have that luck — it must
-  restart the data plane first, or a ticket minted in the window streams the old
-  six columns while the consumer binds something else. Recorded because the
-  direction is silent: an old DP has no `deny_unknown_fields` on its ticket
-  payload, so it drops what it does not understand rather than refusing (fixed
-  going forward — this build refuses). (#435)
 - **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
   `qiita feature-table build` requires it.** Additive, so an older client ignores it and
   nothing on the host changes. The direction that bites is the other one: the new CLI

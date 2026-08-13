@@ -107,6 +107,14 @@ class Scope(StrEnum):
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     # Mirrors REFERENCE_DELETE.
     MASK_DEFINITION_DELETE = "mask_definition:delete"
+    # Mask LIFECYCLE: deprecate a config so it can no longer be minted against, and
+    # withdraw individual runs of a sound config. Separate from
+    # MASK_DEFINITION_DELETE because the two are opposites — deletion destroys the
+    # record of what filtered published data, deprecation preserves it and adds the
+    # judgement. Separate from the minting capability (READ_MASKED_DOGET) because a
+    # service account that mints masks must not be able to void them. system_admin
+    # only, in ROLE_IMPLIED_SCOPES.
+    MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"
     # Full purge of an alignment (the alignment_definition row + its DuckLake
     # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
     # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion

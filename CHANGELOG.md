@@ -205,6 +205,31 @@ duplicates further down are historical strata; leave them where they are.
   asked for. Everything cheap and refusable happens before the two bulk streams: a wrong
   alignment, an empty cohort, an over-cap genome map, or an output name already in use all
   stop the run before a byte of alignment data moves.
+- **Mask lifecycle: a config can be deprecated, and an individual run withdrawn (#445).**
+  A mask's `params_hash` covers the resolved thresholds, not the code that applies them
+  (`filter_version` is the workflow YAML version, not the miint build), so a config whose
+  scoring turned out wrong re-resolved to the same `mask_idx` and masked new data with the
+  same defect. There was nowhere to say so: `qiita.mask_definition` had no lifecycle column,
+  and `mask_sample.state` was a two-value completion gate.
+
+  Two markers, because they answer different questions. `mask_definition.status` =
+  `'deprecated'` says the CONFIG is void — `qiita.mint_mask_definition` refuses to return the
+  row (SQLSTATE 23514, surfaced as a 409 by `POST /mask-definition`) and align planning
+  refuses it, which is what stops new bad data. `mask_sample.state` = `'invalidated'` says a
+  RUN of a sound config is not trustworthy: one measured incident had 26 prep-samples under
+  one mask of which 7 classified wrongly, so deprecating the mask would have voided 19 sound
+  results to flag 7. Both carry who/when/why, enforced by a biconditional CHECK.
+
+  Invalidation is a `state` VALUE rather than a column beside `state` so every masked-read
+  consumer refuses it without being edited — the gate contract is that a consumer proceeds
+  only on `'completed'`, so a third value is refused by construction. Neither marker deletes:
+  the GET routes keep listing deprecated masks (with an optional `?status=` filter) so what
+  filtered published data stays answerable, and `samples_invalidated` is tallied separately
+  from `samples_pending` rather than folded in.
+
+  New: `PATCH /mask-definition/{idx}/status`, `PATCH /mask-definition/{idx}/sample-status`
+  (bulk, since the judgement is made per cohort), the `mask_definition:lifecycle` scope at
+  the system_admin ceiling, and `MaskDefinitionStatus`.
 
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
@@ -966,6 +991,46 @@ duplicates further down are historical strata; leave them where they are.
   **`COPY … (FORMAT NEWICK)` turns on jplace-style `{N}` edge annotations by default whenever an
   `edge_id` column is present**, so passing a sheared tree straight through — as upstream's own
   example does — writes a file plain-Newick parsers may reject.
+- **A workflow that consumes a read mask now records it on `work_ticket.mask_idx` (#444).**
+  The column was introduced for the minting path (`read-mask`, `fastq-to-parquet`), where
+  the runner persists the mask it minted. `long-read-assembly` consumes an existing mask's
+  `read_masked` pass-set instead, taking `mask_idx` from `action_context`, and never wrote
+  it to the ticket — so every assembly ticket read NULL while depending on a mask. The
+  shared-mask guard in `qiita-admin mask purge-failed` keys on that column, so a mask a
+  completed assembly reads looked unreferenced and was eligible for deletion; the
+  dependency survived only in `action_context` JSONB and `qiita.processing.params`, which
+  no guard reads. The runner now persists the consumed `mask_idx` before staging the reads
+  — the staging resolver's other terminal exit is `NO_DATA` (an empty pass-set), which is
+  not a failure, so persisting afterwards would leave exactly those tickets NULL in a state
+  the guard still protects. A context naming a mask that does not exist is now rejected by
+  name rather than by foreign-key violation. A migration backfills existing tickets from
+  `action_context->>'mask_idx'`, joining on text so no untrusted value is ever cast, and
+  skipping rows whose named mask no longer exists (which `ON DELETE SET NULL` would have
+  left NULL anyway). The `work_ticket.mask_idx` column comment now describes both minting
+  and consuming.
+
+  `purge-failed`'s mask-idx coverage gate — which refuses `--execute` while any non-failed
+  ticket has a NULL `mask_idx`, since the guard would be blind to it — was scoped to the
+  run's candidate actions, so selecting one with `--action` also narrowed what counted as a
+  blind spot while the guard itself reads tickets of every action. It now uses its own
+  list, which includes `long-read-assembly`, and the refusal message and dry-run banner
+  name that list rather than the candidate one.
+
+- **Deleting a reference whose feature an assembly also claims no longer 500s (#443).**
+  Assembled contigs and reference sequences are minted through the same
+  `mint_features` path on the same canonical hash, so a contig whose bytes match a
+  reference sequence collapses to one `feature_idx`. The orphan-feature computation
+  in `delete_reference_cascade` counted only `reference_membership` and
+  `reference_annotation` claims, so such a feature looked orphaned and the
+  `DELETE FROM qiita.feature` hit `qiita.assembly_membership`'s NO ACTION foreign
+  key — a `ForeignKeyViolationError` that aborted the whole cascade as an unmapped
+  500. `qiita.assembly_membership` now counts as a claim that keeps a feature, so the
+  delete succeeds and the shared feature survives exactly as one claimed by a second
+  reference does. The data plane's `delete_reference` orphan filter is unchanged, so
+  the two stores now GC on deliberately different rules: the lake still drops the
+  `reference_sequences` copy of a feature no REFERENCE claims, and the assembly's own
+  bytes in `assembled_sequence` / `assembled_sequence_chunks` carry it from there,
+  keyed by the retained `qiita.feature` row.
 
 - **A study link retired mid-request answers 404 instead of 500 (#386).** The
   study-scoped metadata write for a biosample or sequenced-sample checks the

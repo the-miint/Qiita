@@ -397,10 +397,22 @@ PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
 PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
 PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
 PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.
+PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not per
+# sample. Distinct from the route above: config lifecycle and run lifecycle are
+# different questions (see qiita_common.models.MaskDefinitionStatus).
+PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
 URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_PREP_SAMPLE}"
+URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
+URL_MASK_DEFINITION_SAMPLE_STATUS = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
 
 # =============================================================================
 # /alignment-definition/* — control-plane sharded-alignment config identity

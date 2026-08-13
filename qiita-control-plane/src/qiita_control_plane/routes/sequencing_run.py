@@ -131,6 +131,7 @@ from ..repositories.alignment_definition import (
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
 )
+from ..repositories.mask_definition import MaskDefinitionDeprecated
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
@@ -1010,6 +1011,11 @@ async def submit_block_mask_plan(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+    except MaskDefinitionDeprecated as exc:
+        # The config this plan would mint against is void. 409, not the
+        # unmapped 500 an unhandled raise gives: the request is well-formed
+        # and would have succeeded before the deprecation.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail) from exc
     except block_planner.BlockMaskResubmitError as exc:
         # A sample already gated for the resolved mask would be re-masked
         # (completed → read_mask double-write) or wedged (pending → duplicate
@@ -1118,6 +1124,11 @@ async def submit_align_plan(
     except align_planner.AlignMaskNotFound as exc:
         # The named mask_idx does not exist (a client-supplied identifier).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except align_planner.AlignMaskDeprecated as exc:
+        # The mask exists but its config is void, so new results must not be built
+        # on it. 409, not 404: the request is well-formed and would have succeeded
+        # before the deprecation.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except align_planner.AlignReferenceNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except align_planner.AlignUnsupportedPlatform as exc:

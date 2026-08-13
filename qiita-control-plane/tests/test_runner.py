@@ -22,6 +22,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
@@ -5587,3 +5588,173 @@ async def test_skipped_gated_step_leaves_the_earlier_binding_standing(
     )
     assert calls == ["first", "consumer"]
     assert by_name["consumer"]["shared_out"] == first_out
+
+
+# =============================================================================
+# Consumed-mask traceability: a workflow that ASSEMBLES a mask's pass-set
+# =============================================================================
+
+
+async def _seed_assembly_ticket(pool, tmp_path):
+    """A prep_sample-scoped ticket for a one-step action consuming
+    `masked_reads_fastq` — the binding `_workflow_needs_staged_masked_reads` keys
+    on, which is all the pre-loop path needs. Returns the ids plus a teardown."""
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+        seed_user_principal,
+    )
+
+    principal_idx = await seed_user_principal(
+        pool, prefix="mask-consume", suffix=uuid.uuid4().hex[:8]
+    )
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    mask_idx = await pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+        principal_idx,
+    )
+    action_id = LONG_READ_ASSEMBLY_ACTION_ID
+    version = f"runner-test-{uuid.uuid4()}"
+    steps = [
+        {
+            "kind": "step",
+            "name": "assemble",
+            "step_type": "singleton",
+            "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/assemble.sh",
+            "inputs": ["masked_reads_fastq"],
+            "outputs": ["contigs"],
+            "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+        }
+    ]
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        [],
+        json.dumps({"service": False, "human_roles": ["user"]}),
+        json.dumps({}),
+        json.dumps(steps),
+    )
+    work_ticket_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps({"mask_idx": mask_idx}),
+    )
+
+    async def _teardown():
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        await pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
+        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+
+    return work_ticket_idx, mask_idx, _teardown
+
+
+@pytest.mark.parametrize(
+    ("resolver_outcome", "expected_state"),
+    [("reads", "completed"), ("no_data", "no_data")],
+    ids=["completed", "no_data"],
+)
+async def test_masked_reads_workflow_persists_the_consumed_mask_onto_the_ticket(
+    postgres_pool, monkeypatch, tmp_path, resolver_outcome, expected_state
+):
+    """A workflow that CONSUMES a mask records it on `work_ticket.mask_idx` — see
+    the shared-mask guard in `qiita_control_plane.cli.admin.mask` for what reads it.
+
+    Both terminal outcomes of the staging resolver are covered, because only one of
+    them is at risk: an empty pass-set is a NO_DATA, which is TERMINAL and NOT
+    failed, so a ticket that ends there is one the guard still protects. Persisting
+    after the resolver would leave exactly those tickets NULL forever — and NO_DATA
+    is a routine outcome for an aggressively filtered sample, not a corner.
+    """
+    from qiita_control_plane.runner import _workflow
+
+    work_ticket_idx, mask_idx, teardown = await _seed_assembly_ticket(postgres_pool, tmp_path)
+
+    fastq = tmp_path / "masked_reads.fastq.gz"
+    fastq.parent.mkdir(parents=True, exist_ok=True)
+    fastq.touch()
+
+    async def _fake_resolve(pool, scope_target, mask, **kwargs):
+        assert mask == mask_idx
+        if resolver_outcome == "no_data":
+            raise StepNoData(reason=f"no reads pass mask_idx {mask} — nothing to assemble")
+        return {"masked_reads_fastq": fastq}
+
+    monkeypatch.setattr(_workflow, "_resolve_staged_masked_reads", _fake_resolve)
+
+    backend = FakeBackendClient()
+    backend.outputs_for["assemble"] = {"contigs": tmp_path / "contigs.fasta"}
+
+    try:
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+
+        row = await postgres_pool.fetchrow(
+            "SELECT state, mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == expected_state
+        assert row["mask_idx"] == mask_idx
+    finally:
+        await teardown()
+
+
+async def test_masked_reads_workflow_rejects_a_mask_that_does_not_exist(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """A context naming no mask fails with that as the reason, not with the
+    ForeignKeyViolationError the persist would otherwise raise."""
+    from qiita_control_plane.runner import _workflow
+
+    work_ticket_idx, mask_idx, teardown = await _seed_assembly_ticket(postgres_pool, tmp_path)
+    try:
+        gone = mask_idx + 10_000
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET action_context = $2::jsonb WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+            json.dumps({"mask_idx": gone}),
+        )
+
+        async def _unreached(*a, **k):
+            raise AssertionError("resolver must not run for a mask that does not exist")
+
+        monkeypatch.setattr(_workflow, "_resolve_staged_masked_reads", _unreached)
+
+        with pytest.raises(BackendFailure) as ei:
+            await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        assert f"mask_idx {gone}" in str(ei.value)
+
+        row = await postgres_pool.fetchrow(
+            "SELECT state, mask_idx, failure_reason FROM qiita.work_ticket"
+            " WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == "failed"
+        assert row["mask_idx"] is None
+        assert f"mask_idx {gone}" in row["failure_reason"]
+        assert "does not exist" in row["failure_reason"]
+    finally:
+        await teardown()

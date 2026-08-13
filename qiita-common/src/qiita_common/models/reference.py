@@ -395,13 +395,18 @@ class ReferenceDeleteResponse(BaseModel):
     """Summary of a full reference purge across Postgres, DuckLake, and disk.
 
     Counts are the Postgres rows removed by the cascade; `orphan_feature_count`
-    is the subset of this reference's features that no other reference still
-    claimed (and so were deleted from `qiita.feature` and the DuckLake
-    sequence tables). `artifacts_removed` reflects the orchestrator cleanup.
+    is the subset of this reference's features that nothing else still claimed,
+    and so were deleted from `qiita.feature`. `artifacts_removed` reflects the
+    orchestrator cleanup.
 
     A reference claims a feature in two ways, and `orphan_feature_count` spans
     both: as a MEMBER (`membership_deleted`) and as an ANNOTATED INTERVAL
-    (`annotation_deleted`).
+    (`annotation_deleted`). An assembly claims one too — a contig whose bytes match
+    a reference sequence carries the same `feature_idx` — and such a feature is
+    retained, so it is outside this count. The DuckLake sequence tables are purged
+    on the narrower rule of no surviving REFERENCE claim, so a feature retained for
+    an assembly still loses its `reference_sequences` rows (its contig bytes live in
+    `assembled_sequence`); this count does not report that.
 
     `annotation_term_deleted` counts ORPHANED terms — a term is global, shared across
     every reference that cites it, so it goes only once no surviving annotation

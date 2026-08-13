@@ -7,6 +7,7 @@ rows) per pool item. Also carries the sequence-range allocator and the mask
 definition (read-filtering config identity) models.
 """
 
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -854,18 +855,26 @@ class SequenceRange(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-MaskSampleState = Literal["pending", "completed"]
+MaskSampleState = Literal["pending", "completed", "invalidated"]
 """A sample's per-`(mask_idx, prep_sample)` masking state.
 
 Mirrors the `qiita.mask_sample.state` TEXT/CHECK column (NOT a Postgres ENUM —
 see the `mask_sample` migration for why the gate stays out of the enum-parity
 discipline). `'completed'` means the read_mask is whole; `'pending'` means it is
-not. The canonical statement of the gate contract lives on
+not; `'invalidated'` means it was whole and has since been withdrawn, because the
+run that produced it is not trustworthy. The canonical statement of the gate
+contract lives on
 `qiita_control_plane.repositories.block.fetch_mask_sample_state`.
 
 Consumers of masked reads act only on `'completed'`. Absence of a state is not
 `'pass'`: `MaskedReadExportSample.mask_state` is `None` when no gate row exists,
 and the DoGet ticket route 409s that case the same as `'pending'`.
+
+`'invalidated'` is per-RUN, and deliberately not the same judgement as
+`MaskDefinitionStatus.DEPRECATED`, which is per-CONFIG: a sound config can
+produce an untrustworthy run (a job that OOM-escalated into a larger Arrow batch,
+say), and voiding the config to flag one such run would void every sound run
+beside it.
 """
 
 MaskStateSource = Literal["mask_sample", "work_ticket"]
@@ -883,6 +892,27 @@ nobody ever tried to mask. These rows are what the ticket supplies.
 A ticket that has not started is not among them: the mask is written onto the
 ticket inside the run, so a queued ticket carries no mask to be found by.
 """
+
+
+class MaskDefinitionStatus(StrEnum):
+    """Lifecycle of a read-filtering CONFIG (`qiita.mask_definition.status`).
+
+    Mirrors a TEXT + CHECK column, NOT a Postgres `CREATE TYPE ... AS ENUM` — per
+    the enum-parity carve-out in CLAUDE.md it therefore has no `ENUM_PAIRS` entry
+    and is out of scope for the parity test. Keep this set and the CHECK list in
+    the `mask_lifecycle` migration in sync by hand.
+
+    `DEPRECATED` says the configuration itself is void: `qiita.mint_mask_definition`
+    refuses to return the row, so no new data can be masked under it. It says
+    nothing about any individual run — a run of a sound config is withdrawn with
+    `MaskSampleState` `'invalidated'` instead.
+
+    Deprecation never deletes: the GET routes keep listing deprecated masks so
+    "what filter produced this published submission?" stays answerable.
+    """
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
 
 
 class MaskDefinitionMintRequest(BaseModel):
@@ -927,6 +957,15 @@ class MaskDefinition(BaseModel):
     filter_version: str
     params: dict[str, Any]
     created_at: AwareDatetime
+    # Lifecycle. A deprecated mask is still returned by every read route — the
+    # record of what filtered published data outlives the judgement that the
+    # filter was wrong. The three provenance fields are set exactly when
+    # `status` is DEPRECATED (a CHECK enforces the biconditional).
+    status: MaskDefinitionStatus
+    deprecated_at: AwareDatetime | None = None
+    deprecated_by_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    deprecation_reason: str | None = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
 class MaskDefinitionSummary(MaskDefinition):
@@ -942,11 +981,15 @@ class MaskDefinitionSummary(MaskDefinition):
     `samples_completed` are masked and durable — the set a masked-read pull or an
     assembly submission can act on. `samples_pending` are not whole: a covering
     block still in flight on the block path, a ticket not yet completed on the
-    per-sample one.
+    per-sample one. `samples_invalidated` finished and were withdrawn.
     """
 
     samples_completed: Annotated[int, Field(ge=0)]
     samples_pending: Annotated[int, Field(ge=0)]
+    # Runs withdrawn after the fact. Counted separately rather than folded into
+    # either bucket above: an invalidated run is neither usable nor still coming,
+    # and rolling it into `samples_pending` would read as "wait for it".
+    samples_invalidated: Annotated[int, Field(ge=0)]
 
 
 class MaskDefinitionListResponse(BaseModel):
@@ -968,8 +1011,9 @@ class MaskDefinitionListResponse(BaseModel):
 class MaskPrepSample(BaseModel):
     """One sample in a mask's per-sample roster.
 
-    `mask_state` answers "is this sample's read_mask whole?" — `'completed'` if
-    so, `'pending'` if not. `source` names where that came from:
+    `mask_state` answers "may this sample's read_mask be read?" — `'completed'` if
+    so; `'pending'` if it is not whole yet, `'invalidated'` if it was whole and has
+    since been withdrawn. `source` names where that came from:
 
       * `'mask_sample'` — the gate row, which both masking paths write.
         `work_ticket_state` is None; the gate is a rollup, so no single ticket
@@ -1004,6 +1048,89 @@ class MaskPrepSampleListResponse(BaseModel):
     count: Annotated[int, Field(ge=0)]
     truncated: bool = False
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class MaskDefinitionStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/mask-definition/{mask_idx}/status.
+
+    Deprecating requires a `reason`: a bare `status` change leaves whoever later
+    finds a deprecated mask behind published data with no way to tell whether the
+    filter was wrong or the mask was merely superseded. `superseded_by` names the
+    replacement when a re-mint under corrected code produced one; it is accepted
+    only alongside DEPRECATED, matching the CHECK on the column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: MaskDefinitionStatus
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_deprecate(self) -> MaskDefinitionStatusUpdate:
+        if self.status is MaskDefinitionStatus.DEPRECATED:
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("reason is required when status is 'deprecated'")
+        else:
+            if self.reason is not None:
+                raise ValueError("reason is only accepted when status is 'deprecated'")
+            if self.superseded_by is not None:
+                raise ValueError("superseded_by is only accepted when status is 'deprecated'")
+        return self
+
+
+class MaskSampleStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
+
+    Withdraws (or restores) specific runs of one mask. Bulk because that is the
+    unit the judgement is made in — "these N samples of this mask ran with a
+    defect" — and applying it one call per sample leaves a partially-withdrawn
+    mask for someone to reason about.
+
+    `state` accepts only the two settable values. `'pending'` is the masking
+    pipeline's to write and is not reachable here: a run that finished cannot
+    become unfinished.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
+    state: Literal["completed", "invalidated"]
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
+        if self.state == "invalidated":
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("reason is required when state is 'invalidated'")
+        elif self.reason is not None:
+            raise ValueError("reason is only accepted when state is 'invalidated'")
+        if len(set(self.prep_sample_idx)) != len(self.prep_sample_idx):
+            raise ValueError("prep_sample_idx must not repeat")
+        return self
+
+
+class MaskSampleStatusUpdateResponse(BaseModel):
+    """Returned by PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
+
+    `updated` are the pairs whose state changed. `unchanged` already held the
+    requested state (the call is idempotent, so re-running a withdrawal is not an
+    error). `not_found` had no gate row under this mask at all — reported rather
+    than silently skipped, because a caller naming a sample that was never masked
+    under this mask has almost certainly named the wrong mask.
+
+    `skipped_pending` were left `'pending'`: the masking pipeline flips that value
+    to `'completed'` when the run lands, so a withdrawal written over it would be
+    undone without anyone being told, and there is no pass-set to withdraw yet.
+    Re-issue for those samples once they complete.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    state: Literal["completed", "invalidated"]
+    updated: list[int]
+    unchanged: list[int]
+    not_found: list[int]
+    skipped_pending: list[int] = []
 
 
 class MaskDefinitionDeleteResponse(BaseModel):

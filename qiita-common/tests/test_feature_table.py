@@ -1055,9 +1055,7 @@ def test_the_rollup_coverage_report_refuses_nothing():
     table that is quietly a fraction of what the caller streamed."""
     coverage = ft.RollupCoverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
     assert not coverage.complete
-    assert ft.RollupCoverage(
-        alignment_rows=100, unmapped_rows=0, unmapped_features=0
-    ).complete
+    assert ft.RollupCoverage(alignment_rows=100, unmapped_rows=0, unmapped_features=0).complete
 
 
 def test_the_rollup_warning_names_the_share_and_what_is_missing():
