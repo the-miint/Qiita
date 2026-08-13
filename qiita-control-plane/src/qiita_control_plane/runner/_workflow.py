@@ -26,6 +26,7 @@ from qiita_common.models import (
 
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.mask_definition import fetch_mask_definition_by_idx
 from ._base import (
     _STEP_POLL_INTERVAL_SECONDS,
     WorkflowAborted,
@@ -378,16 +379,31 @@ async def run_workflow(
                     "a workflow that assembles masked reads must be prep_sample-"
                     f"scoped; got {scope_target['kind']!r}"
                 )
-            mask_idx = bound.get(MASK_IDX_BINDING)
-            if mask_idx is None:
+            if bound.get(MASK_IDX_BINDING) is None:
                 raise _submission_bad_input(
                     "a masked-reads workflow requires `mask_idx` in action_context"
                 )
+            mask_idx = int(bound[MASK_IDX_BINDING])
+            # Persist the CONSUMED mask onto the ticket, the same column the minting
+            # path writes — see the shared-mask guard in
+            # qiita_control_plane.cli.admin.mask for what reads it.
+            #
+            # BEFORE the resolver, because the resolver has a terminal exit that is
+            # not a failure: a sample with no passing reads raises StepNoData, which
+            # lands the ticket in NO_DATA. Persisting afterwards would leave that
+            # ticket NULL forever in a state the guard still protects. Existence is
+            # checked here rather than left to the FK so a context naming no mask
+            # says so instead of raising ForeignKeyViolationError.
+            if await fetch_mask_definition_by_idx(pool, mask_idx) is None:
+                raise _submission_bad_input(
+                    f"action_context names mask_idx {mask_idx}, which does not exist"
+                )
+            await _persist_mask_idx(pool, work_ticket_idx, mask_idx)
             bound.update(
                 await _resolve_staged_masked_reads(
                     pool,
                     scope_target,
-                    int(mask_idx),
+                    mask_idx,
                     data_plane_url=data_plane_url,
                     signing_key=signing_key,
                     workspace=workspace,

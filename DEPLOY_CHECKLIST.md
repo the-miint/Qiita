@@ -36,6 +36,14 @@ _None yet._
   identifiers no longer removes them — it detaches and auto-retires them, so
   `qiita-admin`'s alignment purge still succeeds and a published `QM<n>` keeps resolving.
   (#438)
+- `20260812000000_backfill_work_ticket_mask_idx.sql` — plain `make migrate`, no out-of-band
+  setup. A data backfill plus a re-stated column `COMMENT`; no table or type change. Sets
+  `qiita.work_ticket.mask_idx` from `action_context->>'mask_idx'` for tickets that name a mask
+  in their context but not in the column — every `long-read-assembly` ticket, which consumes a
+  mask rather than minting one. Rows whose named mask no longer exists are skipped.
+  Idempotent; a no-op on a fresh DB. A ticket completing in the migrate→restart window is NOT
+  covered (dbmate applies a migration once) — the bucket-6 re-run below closes that edge.
+  (#444)
 - `20260812010000_mask_lifecycle.sql` — plain `make migrate`, no out-of-band setup and no
   backfill: `DEFAULT 'active'` covers every existing `qiita.mask_definition` row and no
   `mask_sample` row changes state. Adds the lifecycle columns to both tables, widens
@@ -49,14 +57,44 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **The mask-idx coverage gate reads what you expect.** This is the gate's own predicate —
+  the same three action_ids `qiita-admin mask purge-failed` refuses `--execute` over — broken
+  out by action and state so a non-zero total is attributable. Assembly rows should be gone
+  after bucket 3 + the bucket-6 re-run; see the Notes bullet for the two states that can leave
+  a non-zero count legitimately. (#444)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "SELECT action_id, state, count(*) FROM qiita.work_ticket WHERE action_id IN ('\''read-mask'\'', '\''fastq-to-parquet'\'', '\''long-read-assembly'\'') AND state <> '\''failed'\'' AND mask_idx IS NULL GROUP BY 1, 2 ORDER BY 1, 2;"'
+  ```
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- **Re-run the idempotent `work_ticket.mask_idx` backfill** to close the migrate→restart
+  deploy-window: a `long-read-assembly` ticket that completed after `make migrate` (bucket 3)
+  but before the restart ran under old code that did not persist the consumed mask, so its
+  column is NULL and the shared-mask guard is blind to it. dbmate will not re-apply the
+  migration, so run its `UPDATE` by hand (the `COMMENT` in the same block is already
+  applied). Idempotent, and it does NOT burn the rollback path (it only fills a NULL column
+  from the ticket's own context). (#444)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "UPDATE qiita.work_ticket wt SET mask_idx = md.mask_idx FROM qiita.mask_definition md WHERE wt.mask_idx IS NULL AND wt.action_context ->> '\''mask_idx'\'' = md.mask_idx::text;"'
+  ```
 
 ### Notes (no host action)
 
+- **`qiita-admin mask purge-failed --execute` can now refuse where it previously ran.** Its
+  mask-idx coverage gate was scoped to the run's candidate actions, so `--action read-mask`
+  also narrowed what counted as a blind spot; it now uses its own list, which includes
+  `long-read-assembly`. The refusal names the condition (`mask_idx IS NULL`) and the wider
+  action list, and nothing destructive has run at that point. Two things leave the count
+  non-zero without anything being wrong, so read the bucket-5 breakdown before treating a
+  refusal as a defect: an **in-flight** ticket (`pending`/`queued`, and `processing` up to the
+  runner's pre-loop write) has not reached its `mask_idx` write yet, and any **pre-existing**
+  `read-mask`/`fastq-to-parquet` ticket with a NULL `mask_idx` is out of the backfill's reach
+  — those actions mint their mask and put nothing in `action_context`, so there is no value to
+  copy. Separately, a mask a completed assembly reads is now correctly reported as
+  `skipped_shared` instead of being deleted. (#444)
 - **A PAT minted before this deploy cannot use the new mask-lifecycle routes.** The new
   `mask_definition:lifecycle` scope is added to the system_admin ceiling, so callers on the
   OIDC path pick it up automatically; a PAT carries its own stored scope set, so its holder
