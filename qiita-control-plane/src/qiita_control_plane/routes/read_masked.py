@@ -58,6 +58,8 @@ from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_PREFIX,
     PATH_MASK_DEFINITION_PREP_SAMPLE,
     PATH_MASK_DEFINITION_ROOT,
+    PATH_MASK_DEFINITION_SAMPLE_STATUS,
+    PATH_MASK_DEFINITION_STATUS,
     PATH_READ_MASKED_DOGET,
     PATH_READ_MASKED_PREFIX,
 )
@@ -68,9 +70,13 @@ from qiita_common.models import (
     MaskDefinitionDeleteResponse,
     MaskDefinitionListResponse,
     MaskDefinitionMintRequest,
+    MaskDefinitionStatus,
+    MaskDefinitionStatusUpdate,
     MaskDefinitionSummary,
     MaskPrepSample,
     MaskPrepSampleListResponse,
+    MaskSampleStatusUpdate,
+    MaskSampleStatusUpdateResponse,
     ReadMaskedDoGetTicketRequest,
 )
 
@@ -87,10 +93,14 @@ from ..deps import (
 )
 from ..repositories.block import fetch_mask_sample_state
 from ..repositories.mask_definition import (
+    MaskDefinitionDeprecated,
+    MaskDefinitionNotFound,
     fetch_mask_definition_by_idx,
     fetch_mask_prep_samples,
     list_mask_definitions,
     mint_mask_definition,
+    set_mask_sample_states,
+    transition_mask_definition_status,
 )
 from ._helpers import cap_rows
 
@@ -131,6 +141,11 @@ def _mask_record_fields(row: asyncpg.Record) -> dict:
         "filter_version": row["filter_version"],
         "params": params,
         "created_at": row["created_at"],
+        "status": row["status"],
+        "deprecated_at": row["deprecated_at"],
+        "deprecated_by_idx": row["deprecated_by_idx"],
+        "deprecation_reason": row["deprecation_reason"],
+        "superseded_by": row["superseded_by"],
     }
 
 
@@ -167,6 +182,11 @@ async def mint_mask_definition_route(
                 params=body.params,
                 principal_idx=sa.principal_idx,
             )
+        except MaskDefinitionDeprecated as exc:
+            # The config is void: minting would put new data behind a filter we no
+            # longer stand behind. 409 rather than 400 — the request is well-formed
+            # and would have succeeded before the mask was deprecated.
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
         except asyncpg.ForeignKeyViolationError:
             raise HTTPException(status_code=400, detail="invalid principal for mask mint")
         except asyncpg.InvalidParameterValueError:
@@ -204,6 +224,14 @@ async def list_mask_definitions_route(
         gt=0,
         description="Only masks this prep_sample is masked under.",
     ),
+    status: MaskDefinitionStatus | None = Query(
+        default=None,
+        description=(
+            "Only masks with this config lifecycle status. Omitted, BOTH are"
+            " listed — a deprecated mask stays discoverable so what filtered"
+            " published data remains answerable."
+        ),
+    ),
 ) -> MaskDefinitionListResponse:
     """List read-filtering masks, newest first, each with its sample tally.
 
@@ -222,6 +250,7 @@ async def list_mask_definitions_route(
             pool,
             sequenced_pool_idx=sequenced_pool_idx,
             prep_sample_idx=prep_sample_idx,
+            status=status,
             visible_to_principal_idx=_narrowing_principal_idx(caller),
             limit=_MASK_LIST_HARD_CAP + 1,
         ),
@@ -232,6 +261,7 @@ async def list_mask_definitions_route(
             **_mask_record_fields(row),
             samples_completed=row["samples_completed"],
             samples_pending=row["samples_pending"],
+            samples_invalidated=row["samples_invalidated"],
         )
         for row in rows
     ]
@@ -381,6 +411,90 @@ async def delete_mask_definition_route(
     return MaskDefinitionDeleteResponse(mask_idx=mask_idx, rows_deleted=rows_deleted)
 
 
+@mask_definition_router.patch(PATH_MASK_DEFINITION_STATUS)
+async def update_mask_definition_status_route(
+    mask_idx: Annotated[int, Field(gt=0)],
+    body: MaskDefinitionStatusUpdate,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_LIFECYCLE)),
+) -> MaskDefinition:
+    """Deprecate a read-filtering CONFIG, or return it to active.
+
+    Deprecating stops the mask being minted against, so no NEW data can be masked
+    under it. It changes nothing about data already masked: the mask keeps its
+    rows, its GET keeps answering, and the per-sample runs keep whatever state they
+    held. Withdrawing individual runs is the sample-status route below; the two are
+    different judgements.
+
+    Deletion is the other tool and the wrong one here: `read_masked` is a
+    query-time macro, so dropping read_mask removes the record of the filtering
+    decision while leaving the raw reads Flight-reachable.
+
+    system_admin only (`mask_definition:lifecycle`).
+    """
+    try:
+        row = await transition_mask_definition_status(
+            pool,
+            mask_idx=mask_idx,
+            status=body.status,
+            reason=body.reason,
+            superseded_by=body.superseded_by,
+            principal_idx=caller.principal_idx,
+        )
+    except MaskDefinitionNotFound:
+        raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"superseded_by names no mask_definition: {body.superseded_by}",
+        ) from exc
+    except asyncpg.CheckViolationError as exc:
+        # Reachable for superseded_by = mask_idx, which the wire model cannot see
+        # (it does not know the path parameter).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _mask_record_to_response(row)
+
+
+@mask_definition_router.patch(PATH_MASK_DEFINITION_SAMPLE_STATUS)
+async def update_mask_sample_status_route(
+    mask_idx: Annotated[int, Field(gt=0)],
+    body: MaskSampleStatusUpdate,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_LIFECYCLE)),
+) -> MaskSampleStatusUpdateResponse:
+    """Withdraw (or restore) specific RUNS of one mask.
+
+    A sound config can produce an untrustworthy run — the measured case being a
+    job that OOM-escalated into a larger Arrow batch — so this is the granularity
+    the judgement is actually made at. An invalidated `(mask, sample)` stops being
+    consumable immediately: every masked-read consumer proceeds only on
+    `'completed'`, so a third state is refused by construction rather than by a
+    check each of them had to remember.
+
+    Bulk, because the judgement is made per cohort. Idempotent, and the response
+    separates what changed from what already held the state, what has no gate row
+    under this mask, and what is still `'pending'` (left alone — the masking
+    pipeline owns that value and would overwrite a withdrawal).
+
+    system_admin only (`mask_definition:lifecycle`).
+    """
+    if await fetch_mask_definition_by_idx(pool, mask_idx) is None:
+        raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    async with tx() as conn:
+        outcome = await set_mask_sample_states(
+            conn,
+            mask_idx=mask_idx,
+            prep_sample_idxs=body.prep_sample_idx,
+            state=body.state,
+            reason=body.reason,
+            principal_idx=caller.principal_idx,
+        )
+    return MaskSampleStatusUpdateResponse(mask_idx=mask_idx, state=body.state, **outcome)
+
+
 @read_masked_router.post(PATH_READ_MASKED_DOGET, status_code=201)
 async def create_read_masked_doget_ticket(
     body: ReadMaskedDoGetTicketRequest,
@@ -430,9 +544,11 @@ async def create_read_masked_doget_ticket(
                 "reason": (
                     "the sample is not masked-complete under this mask_idx "
                     f"(mask_sample.state={mask_state!r}). Either no read-mask has "
-                    "completed for this (prep_sample, mask_idx), or a covering block is "
-                    "still in flight — the read_masked pass-set would be absent or "
-                    "partial. Refusing to sign a ticket; retry once masking is completed."
+                    "completed for this (prep_sample, mask_idx), a covering block is "
+                    "still in flight, or the run was withdrawn as untrustworthy "
+                    "('invalidated'). The read_masked pass-set would be absent, "
+                    "partial, or unfit. Refusing to sign a ticket; a withdrawn run is not "
+                    "retryable — re-mask under a corrected config."
                 ),
                 "prep_sample_idx": body.prep_sample_idx,
                 "mask_idx": body.mask_idx,

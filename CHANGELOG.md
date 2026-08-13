@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Mask lifecycle: a config can be deprecated, and an individual run withdrawn (#445).**
+  A mask's `params_hash` covers the resolved thresholds, not the code that applies them
+  (`filter_version` is the workflow YAML version, not the miint build), so a config whose
+  scoring turned out wrong re-resolved to the same `mask_idx` and masked new data with the
+  same defect. There was nowhere to say so: `qiita.mask_definition` had no lifecycle column,
+  and `mask_sample.state` was a two-value completion gate.
+
+  Two markers, because they answer different questions. `mask_definition.status` =
+  `'deprecated'` says the CONFIG is void — `qiita.mint_mask_definition` refuses to return the
+  row (SQLSTATE 23514, surfaced as a 409 by `POST /mask-definition`) and align planning
+  refuses it, which is what stops new bad data. `mask_sample.state` = `'invalidated'` says a
+  RUN of a sound config is not trustworthy: one measured incident had 26 prep-samples under
+  one mask of which 7 classified wrongly, so deprecating the mask would have voided 19 sound
+  results to flag 7. Both carry who/when/why, enforced by a biconditional CHECK.
+
+  Invalidation is a `state` VALUE rather than a column beside `state` so every masked-read
+  consumer refuses it without being edited — the gate contract is that a consumer proceeds
+  only on `'completed'`, so a third value is refused by construction. Neither marker deletes:
+  the GET routes keep listing deprecated masks (with an optional `?status=` filter) so what
+  filtered published data stays answerable, and `samples_invalidated` is tallied separately
+  from `samples_pending` rather than folded in.
+
+  New: `PATCH /mask-definition/{idx}/status`, `PATCH /mask-definition/{idx}/sample-status`
+  (bulk, since the judgement is made per cohort), the `mask_definition:lifecycle` scope at
+  the system_admin ceiling, and `MaskDefinitionStatus`.
+
 - **The two maps that turn alignment rows into a feature table (#438).** A client can now
   mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
   `feature_idx`, and a published table needs genomes and public sample names. Both
