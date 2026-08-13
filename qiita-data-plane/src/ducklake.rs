@@ -478,10 +478,11 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// deliberately NOT viewed here — `reference_phylogeny` is not row-independent
 /// (a node carries parent/child structure; `feature_idx` is on tips only), so a
 /// row-wise anti-join would orphan internal parents and malform the tree. The
-/// contract instead is that a tree consumer shears the tree to the keep-set
-/// (`tips WHERE feature_idx NOT IN reference_exclusion`) with miint's
-/// `shear_tree`; there is no production tree consumer today, so no phylogeny view
-/// is built.
+/// contract instead is that a tree consumer shears the tree to its keep-set with
+/// miint's `shear_tree`, so no phylogeny view is built. The consumer today is the
+/// client-side `qiita feature-table build --tree`, and it shears to the genomes
+/// its table PUBLISHES — a stricter set than "not excluded", since a genome every
+/// feature of which is blocked has no surviving alignment to publish at all.
 ///
 /// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), for the same reason the
 /// `read_masked` macro is `CREATE OR REPLACE`: the
