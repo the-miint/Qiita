@@ -778,8 +778,8 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **The documented `phylogeny_tip_feature` table never existed.** Eleven sites across
-  `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, two table inventories, an
+- **The documented `phylogeny_tip_feature` table never existed.** Sites across
+  `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, three table inventories, an
   ingestion step, a worked clade-scoped query — described a Postgres junction table mapping
   `(reference_idx, node_index) → feature_idx`, contradicting the migration that deliberately
   did not build one. A phylogeny tip carries `feature_idx` as a **column on its own DuckLake
