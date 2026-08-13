@@ -1115,7 +1115,7 @@ def test_the_rollup_report_counts_a_shared_features_alignment_row_once():
         _stage(conn, alignment=alignment, mapping=shared_map, lengths=_LENGTHS, threshold=0.01)
         cursor = conn.execute(ft.rollup_coverage_diagnostics_sql())
         names = [d[0] for d in cursor.description]
-        coverage = ft.check_rollup_coverage(**dict(zip(names, cursor.fetchone(), strict=True)))
+        coverage = ft.RollupCoverage(**dict(zip(names, cursor.fetchone(), strict=True)))
 
     assert coverage.alignment_rows == len(alignment)
     assert coverage.unmapped_rows == 1

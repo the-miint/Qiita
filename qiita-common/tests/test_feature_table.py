@@ -1053,16 +1053,16 @@ def test_the_rollup_coverage_report_refuses_nothing():
     """A feature with no genome is not an error: a 16S record is not an OGU, and there
     is no genome-rooted row to emit for it. It is REPORTED because the alternative is a
     table that is quietly a fraction of what the caller streamed."""
-    coverage = ft.check_rollup_coverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
+    coverage = ft.RollupCoverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
     assert not coverage.complete
-    assert ft.check_rollup_coverage(
+    assert ft.RollupCoverage(
         alignment_rows=100, unmapped_rows=0, unmapped_features=0
     ).complete
 
 
 def test_the_rollup_warning_names_the_share_and_what_is_missing():
     warning = ft.rollup_coverage_warning(
-        ft.check_rollup_coverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
+        ft.RollupCoverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
     )
     assert "40 of 100" in warning
     assert "40.0%" in warning
@@ -1085,6 +1085,15 @@ def test_the_staged_tree_keeps_the_shear_shape_plus_the_join_key():
     # Not `reference_idx`: the ticket is already scoped to one reference, so a whole
     # tree's worth of a constant column is pure cost.
     assert "reference_idx" not in sql
+
+
+def test_the_staged_tree_drops_a_tips_own_name():
+    """Nothing downstream reads it — every tip is renamed from the mint, and an
+    unpublished one is left nameless — and at GG2 the tip labels are the bulk of a 407 MB
+    Newick. Dropping them at the door also makes "no reference-internal name reaches a
+    published file" structural rather than one CASE downstream."""
+    sql = ft.phylogeny_table_sql("phylo_stream")
+    assert "CASE WHEN is_tip THEN NULL ELSE name END AS name" in sql
 
 
 def test_the_shear_input_names_tips_from_the_published_labels():

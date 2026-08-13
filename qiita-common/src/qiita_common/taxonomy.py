@@ -18,6 +18,15 @@ siblings to unclassified would relocate a whole genome on the strength of one
 curation decision.
 """
 
+# The data-plane relation both consumers stream, and it is the exclusion-aware VIEW
+# rather than the raw base table — a curated exclusion must not be bypassable by asking
+# for taxonomy directly. The accepted consequence is that a blocked feature has no row at
+# all, which is precisely why the representative below is the lowest CLASSIFIED member
+# and not the lowest: blocking one contig of a multi-contig genome must not relocate the
+# whole organism. A genome every member of which is blocked does come back unclassified,
+# and that is moot — none of its features reaches a feature table or a lineage either.
+TAXONOMY_SOURCE_TABLE = "reference_taxonomy_visible"
+
 # Coarsest → finest. This is simultaneously the DuckLake `reference_taxonomy` column
 # order, the order a lineage string concatenates in, and the order `RANK_PREFIXES`
 # pairs with, so the three cannot be reordered independently.
@@ -33,11 +42,11 @@ RANK_COLUMNS = (
 )
 
 # The prefix each rank carries in a source lineage, paired with RANK_COLUMNS by
-# index. Restoring these is faithful rather than invented: reference ingest
-# *enforces* this exact sequence by rank position and then strips exactly three
-# characters when writing the columns, so the prefix is a function of position and
-# putting it back recovers what was dropped. See the reference-load job's rank
-# validation for the enforcement.
+# index. Restoring these is faithful rather than invented, and the link is enforced
+# rather than asserted: the reference-load job builds BOTH its rank-order check and
+# its column projection from these two tuples, then strips exactly three characters
+# when it writes. So the prefix is a function of position, putting it back recovers
+# what was dropped, and a change here changes what ingest accepts.
 RANK_PREFIXES = ("d__", "p__", "c__", "o__", "f__", "g__", "s__", "t__")
 
 # `class` and `order` are SQL keywords, so every reference to them as a column has to

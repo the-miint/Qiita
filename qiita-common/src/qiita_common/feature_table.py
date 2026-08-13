@@ -1026,8 +1026,11 @@ BIOM_GENERATED_BY = "qiita"
 # cannot be scanned twice.
 TAXONOMY_TABLE = "reference_taxonomy"
 
-# The published sidecar — a VIEW, for the reason `LABELLED_RELATION` is one: its only
-# reader is a COPY, and materializing would hold a second copy of it for nothing.
+# The published sidecar — a VIEW, for the reason `LABELLED_RELATION` is one: nothing
+# reads it except the checks and the COPY, and materializing would hold a second copy of
+# the reduction's output for that. It IS evaluated twice, once per reader, which is the
+# price of not holding it; the reduction runs over one row per published genome, so that
+# trade is the opposite of the tree's, where the relation is the whole reference.
 TAXONOMY_SIDECAR_RELATION = "feature_taxonomy"
 
 # What the sidecar carries: the SAME `feature_id` the table's rows are named with, and
@@ -1036,8 +1039,11 @@ TAXONOMY_SIDECAR_RELATION = "feature_taxonomy"
 #
 # No `genome_idx`, and no lineage string. The string form would be lossy in a way the
 # columns are not — see `qiita_common.taxonomy.genome_lineage_select_sql`.
-TAXONOMY_SIDECAR_SCHEMA = {"feature_id": "VARCHAR"} | {rank: "VARCHAR" for rank in RANK_COLUMNS}
-TAXONOMY_SIDECAR_COLUMNS = tuple(TAXONOMY_SIDECAR_SCHEMA)
+# Names only, unlike `TREE_SCHEMA` and `LABELLED_SCHEMA`: those carry types because a
+# builder writes `CAST(NULL AS …)` from them for an empty result. The sidecar has no such
+# path — it is as wide as the table, and an empty table's sidecar is an empty COPY of a
+# relation that already has the right types.
+TAXONOMY_SIDECAR_COLUMNS = ("feature_id", *RANK_COLUMNS)
 
 
 def taxonomy_table_sql(source: str) -> str:
@@ -1197,35 +1203,30 @@ class RollupCoverage:
 
 
 def rollup_coverage_diagnostics_sql() -> str:
-    """One row for `check_rollup_coverage`: how many staged alignment rows have no
-    genome to roll up to.
+    """One row for `RollupCoverage`: how many staged alignment rows have no genome to
+    roll up to.
 
-    `alignment_rows` is a scalar subquery, not this join's own `count(*)`, for the
-    reason `relabel_diagnostics_sql` counts its rows the same way: the map holds one row
-    per `(feature, genome)` pair and a feature may belong to several genomes, so the
-    join fans a shared feature's alignment row out once per genome. `unmapped_rows` is
-    unaffected (a row with no genome joins to exactly one NULL), so counting the joined
-    result would inflate only the denominator and report a share that is too low.
+    **Grouped to features before joining the map**, which is the difference between
+    touching the largest relation in this recipe once and touching it three times. The
+    obvious form — join the slice to the map row by row — reads the slice for its own
+    `count(*)`, reads it again for the join, and then needs a `count(DISTINCT feature_idx)`
+    on top; here the group-by has one entry per feature (a six-figure hash table against a
+    slice that can run to nine figures), the map is deduplicated to the key it is probed
+    on, and the distinct feature count falls out as `count(*)`.
+
+    That shape also removes the fan-out the row-wise join has, rather than compensating
+    for it: the map holds one row per `(feature, genome)` pair, so a feature belonging to
+    several genomes multiplies its rows — which inflated only the denominator, and
+    reported a share that was too low.
     """
     return (
-        f"SELECT (SELECT count(*) FROM {ALIGNMENT_TABLE}) AS alignment_rows, "
-        f"count(*) FILTER (WHERE m.genome_id IS NULL) AS unmapped_rows, "
-        f"count(DISTINCT a.feature_idx) FILTER (WHERE m.genome_id IS NULL) "
-        f"    AS unmapped_features "
-        f"FROM {ALIGNMENT_TABLE} a "
-        f"LEFT JOIN {MAP_TABLE} m ON m.contig_id = a.feature_idx"
-    )
-
-
-def check_rollup_coverage(
-    *, alignment_rows: int, unmapped_rows: int, unmapped_features: int
-) -> RollupCoverage:
-    """Report what the roll-up will drop. Named `check_*` to pair with `_cleared`, but
-    it refuses nothing — see `RollupCoverage` for why a drop is not an error."""
-    return RollupCoverage(
-        alignment_rows=alignment_rows,
-        unmapped_rows=unmapped_rows,
-        unmapped_features=unmapped_features,
+        f"WITH per_feature AS ("
+        f"SELECT feature_idx, count(*) AS rows FROM {ALIGNMENT_TABLE} GROUP BY feature_idx), "
+        f"mapped AS (SELECT DISTINCT contig_id FROM {MAP_TABLE}) "
+        f"SELECT coalesce(sum(f.rows), 0) AS alignment_rows, "
+        f"coalesce(sum(f.rows) FILTER (WHERE m.contig_id IS NULL), 0) AS unmapped_rows, "
+        f"count(*) FILTER (WHERE m.contig_id IS NULL) AS unmapped_features "
+        f"FROM per_feature f LEFT JOIN mapped m ON m.contig_id = f.feature_idx"
     )
 
 
@@ -1255,10 +1256,10 @@ def rollup_coverage_warning(coverage: RollupCoverage) -> str:
 # argument and a local relation is a trap.
 PHYLOGENY_TABLE = "phylogeny_nodes"
 
-# What we stage of it: `read_newick`'s shape, plus `is_tip` and the tip's `feature_idx`.
-# `name` matters because the shear matches tips BY NAME; `feature_idx` is what resolves a
-# tip to the genome whose row the table published. `reference_idx` is not staged — the
-# ticket is already scoped to one reference, so it is a whole tree's worth of a constant.
+# The columns of the stream we read. `name` matters for INTERNAL nodes, which keep
+# theirs; `feature_idx` is what resolves a tip to the genome whose row the table
+# published. `reference_idx` is not read — the ticket is already scoped to one reference,
+# so it is a whole tree's worth of a constant.
 PHYLOGENY_COLUMNS = (
     "node_index",
     "parent_index",
@@ -1310,8 +1311,20 @@ TREE_COLUMNS = tuple(TREE_SCHEMA)
 
 
 def phylogeny_table_sql(source: str) -> str:
-    """Materialize the streamed phylogeny into `PHYLOGENY_TABLE`."""
-    return f"CREATE TABLE {PHYLOGENY_TABLE} AS SELECT {', '.join(PHYLOGENY_COLUMNS)} FROM {source}"
+    """Materialize the streamed phylogeny into `PHYLOGENY_TABLE`.
+
+    **A tip's own name is dropped on the way in.** Nothing downstream reads it — the
+    shear renames every tip from the mint, and an unpublished one is left nameless — and
+    on a reference the size of GG2 the tip labels ARE the tree: half its ~660k nodes, and
+    the bulk of 407 MB of Newick, held for the length of the run for nothing. It also
+    makes the promise that no reference-internal FASTA header can reach a published file
+    structural rather than a property of one CASE expression downstream.
+    """
+    projection = ", ".join(
+        "CASE WHEN is_tip THEN NULL ELSE name END AS name" if column == "name" else column
+        for column in PHYLOGENY_COLUMNS
+    )
+    return f"CREATE TABLE {PHYLOGENY_TABLE} AS SELECT {projection} FROM {source}"
 
 
 def blocked_feature_table_sql(source: str) -> str:

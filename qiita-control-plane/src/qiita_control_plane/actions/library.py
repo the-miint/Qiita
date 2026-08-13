@@ -43,7 +43,7 @@ from qiita_common.models import (
     read_mask_reason_sql_list,
 )
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
-from qiita_common.taxonomy import genome_lineage_select_sql
+from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
@@ -1049,17 +1049,10 @@ async def write_shard_assignment(
     return total_updated
 
 
-# The shard planner streams taxonomy through the exclusion-aware VIEW, never the
-# raw base table, so a curated exclusion can't be bypassed. Accepted consequence:
-# an excluded feature loses its taxonomy row (its LEFT JOIN in _genome_lineages
-# misses). A genome keeps its real lineage as long as >=1 of its members survives
-# classified — the arg_min FILTER picks the lowest classified member, so blocking
-# one contig of a multi-contig genome does not relocate the whole genome to the
-# unclassified shard. Only a genome whose every member is excluded sorts as
-# unclassified, and that is moot (its features never surface post-exclusion in any
-# feature table or lineage). Reads go through _visible; register-files still writes
-# the raw base.
-_REFERENCE_TAXONOMY_TABLE = "reference_taxonomy_visible"
+# Reads go through the exclusion-aware view; register-files still writes the raw
+# base. `qiita_common.taxonomy` carries why, alongside the reduction that depends
+# on it.
+_REFERENCE_TAXONOMY_TABLE = TAXONOMY_SOURCE_TABLE
 
 
 def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_path: Path) -> Path:

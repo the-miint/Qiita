@@ -26,6 +26,8 @@ pytestmark = pytest.mark.db
 
 @pytest.fixture
 def seeded(pool_alignment_seed):
+    """A local abbreviation, nothing more — every test here names it several times
+    inside a request body, and the full name pushes those past the line limit."""
     return pool_alignment_seed
 
 

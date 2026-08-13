@@ -880,6 +880,24 @@ duplicates further down are historical strata; leave them where they are.
     `attributes` MAP is kept alongside the normalized terms, so a system we do not
     yet parse stays recoverable without a re-ingest.
 
+### Changed
+
+- **The gate every alignment-cohort route runs is now one function, not three copies.**
+  `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST
+  /exported-processing` all check that the alignment exists, then that the caller may read
+  the whole cohort, then that the cohort is completed — and that *order* is a disclosure
+  decision: reversed, the completeness refusal would list samples of an alignment the caller
+  has no right to read. Three routes hand-writing a security-relevant sequence is three
+  chances for one to be reordered alone, so it is now written once, with the reasoning
+  beside it, and the routes differ only in the clause that completes their 422.
+
+- **Reference ingest's rank-prefix check and its column projection are now generated from
+  the shared rank tuples.** They were spelled out, eight clauses each, in the job — which
+  was harmless until the published taxonomy sidecar started *restoring* those prefixes by
+  position from the same tuples. A drift between the two would have silently relabelled
+  ranks in a file people join, and nothing would have caught it; now a change to the tuple
+  changes what ingest accepts.
+
 ### Fixed
 
 - **A blocked contig's tip could be published in a sheared tree, under its genome's public

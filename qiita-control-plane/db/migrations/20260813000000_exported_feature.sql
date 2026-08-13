@@ -87,7 +87,7 @@ CREATE TABLE qiita.exported_feature (
     -- that supplies a value, so it cannot be forged by a caller and cannot be
     -- edited after publication. There is deliberately no code path that composes
     -- this string.
-    export_feature_id   TEXT GENERATED ALWAYS AS (
+    export_feature_id   VARCHAR GENERATED ALWAYS AS (
         CASE WHEN accession_published THEN accession ELSE 'QF' || idx END
     ) STORED,
 

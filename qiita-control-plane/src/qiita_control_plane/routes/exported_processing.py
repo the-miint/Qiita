@@ -24,13 +24,11 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import ExportedProcessingRequest, ExportedProcessingResponse
 
-from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
+from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
-from ..repositories.alignment_definition import alignment_definition_exists
-from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.exported_processing import ProcessingVanishedError, mint_exported_processing
-from ._helpers import authorize_prep_sample_cohort, first_few
+from ._helpers import authorize_completed_alignment_cohort
 
 router = APIRouter(prefix=PATH_EXPORTED_PROCESSING_PREFIX, tags=["exported-processing"])
 
@@ -67,23 +65,13 @@ async def mint_exported_processing_handle(
     callers publishing different cohorts of one alignment cite the same handle, which
     is what lets a reader see they share a processing.
     """
-    if not await alignment_definition_exists(pool, body.alignment_idx):
-        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
-
-    cohort = await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=COHORT_MIN_TIER
+    await authorize_completed_alignment_cohort(
+        pool,
+        caller=caller,
+        alignment_idx=body.alignment_idx,
+        prep_sample_idx=body.prep_sample_idx,
+        nothing_to="; a manifest describes processed data, so there is nothing yet to describe",
     )
-
-    incomplete = await list_incomplete_alignment_samples(pool, body.alignment_idx, cohort)
-    if incomplete:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{len(incomplete)} prep_sample(s) not completed for alignment"
-                f" {body.alignment_idx} (e.g. {first_few(incomplete)}); a manifest"
-                " describes processed data, so there is nothing yet to describe"
-            ),
-        )
 
     try:
         row = await mint_exported_processing(

@@ -47,6 +47,7 @@ from qiita_common.models import (
     ExportedIdentifierRequest,
     ExportedProcessingRequest,
 )
+from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 from .. import _common
 from .alignment import (
@@ -77,11 +78,9 @@ _PHYLOGENY_STREAM = "reference_phylogeny_stream"
 # genome length, so contigs with no alignment in the cohort are needed too.
 _SEQUENCES_TABLE = "reference_sequences"
 
-# The exclusion-aware VIEW, never the base table: a curated exclusion must not be
-# bypassable by a client that asks for taxonomy directly. An excluded feature therefore
-# has no taxonomy row, which the per-genome reduction already handles — a genome keeps
-# its lineage as long as one classified member survives.
-_TAXONOMY_TABLE = "reference_taxonomy_visible"
+# The exclusion-aware VIEW, never the base table. `qiita_common.taxonomy` carries why,
+# beside the reduction that depends on it.
+_TAXONOMY_TABLE = TAXONOMY_SOURCE_TABLE
 
 # The tree, which has NO exclusion-aware view on purpose: a row-wise anti-join would
 # orphan the internal parents of an excluded tip and malform the tree, so the contract is
@@ -239,30 +238,45 @@ def _create_reference_doget_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
-    """Stage the genome-map response into the roll-up key, `MAP_TABLE`.
+def _stage_response(
+    con, entries: list[dict[str, Any]], *, relation: str, columns: list, table_sql
+) -> None:
+    """Stage a REST response into the relation `table_sql` builds from it.
 
-    The arrow schema is written out rather than inferred: miint's functions take native
-    BIGINT id columns, and an empty map (a 16S reference has no genome-bearing features)
-    would otherwise stage NULL-typed columns that fail the first join.
+    **The arrow schema is written out rather than inferred**, and it is what selects the
+    columns: miint's functions take native BIGINT id columns, and an empty response — a
+    16S reference has no genome-bearing features, an unblocked reference no exclusions —
+    would otherwise stage NULL-typed columns that fail the first join. `from_pylist` with
+    an explicit schema also reads the entries once, where a column-at-a-time
+    comprehension walks a quarter-million dicts once per column, and drops the columns
+    nobody staged for free.
 
-    Neither `source` nor `source_id` is staged. The map's job here is the roll-up key;
-    what a published row is NAMED comes from the exported-feature mint, which is the
-    only authority on whether a genome's accession is unique in the published
-    namespace.
+    Each caller below says which columns those are and why the rest are left behind; that
+    choice is the only thing they differ in.
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    # `from_pylist` with an explicit schema keeps the declared types AND reads the
-    # entries once — a column-at-a-time comprehension walks a quarter-million dicts
-    # three times. It also drops the accession columns for free, by selecting on the
-    # schema.
-    source = pa.Table.from_pylist(
+    source = pa.Table.from_pylist(entries, schema=pa.schema(columns))
+    with _registered(con, relation, source):
+        con.execute(table_sql(relation))
+
+
+def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
+    """Stage the genome-map response into the roll-up key, `MAP_TABLE`.
+
+    Neither `source` nor `source_id` is staged. The map's job here is the roll-up key;
+    what a published row is NAMED comes from the exported-feature mint, which is the
+    only authority on whether a genome's accession is unique in the published namespace.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+
+    _stage_response(
+        con,
         entries,
-        schema=pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())]),
+        relation=_GENOME_MAP_SOURCE,
+        columns=[("feature_idx", pa.int64()), ("genome_idx", pa.int64())],
+        table_sql=ft.map_table_sql,
     )
-    with _registered(con, _GENOME_MAP_SOURCE, source):
-        con.execute(ft.map_table_sql(_GENOME_MAP_SOURCE))
 
 
 def _stage_blocked_features(con, entries: list[dict[str, Any]]) -> None:
@@ -273,9 +287,13 @@ def _stage_blocked_features(con, entries: list[dict[str, Any]]) -> None:
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    source = pa.Table.from_pylist(entries, schema=pa.schema([("feature_idx", pa.int64())]))
-    with _registered(con, _EXCLUSION_SOURCE, source):
-        con.execute(ft.blocked_feature_table_sql(_EXCLUSION_SOURCE))
+    _stage_response(
+        con,
+        entries,
+        relation=_EXCLUSION_SOURCE,
+        columns=[("feature_idx", pa.int64())],
+        table_sql=ft.blocked_feature_table_sql,
+    )
 
 
 def _stage_exported_features(con, entries: list[dict[str, Any]]) -> None:
@@ -287,12 +305,13 @@ def _stage_exported_features(con, entries: list[dict[str, Any]]) -> None:
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    source = pa.Table.from_pylist(
+    _stage_response(
+        con,
         entries,
-        schema=pa.schema([("genome_idx", pa.int64()), ("export_feature_id", pa.string())]),
+        relation=_EXPORTED_FEATURE_SOURCE,
+        columns=[("genome_idx", pa.int64()), ("export_feature_id", pa.string())],
+        table_sql=ft.genome_label_table_sql,
     )
-    with _registered(con, _EXPORTED_FEATURE_SOURCE, source):
-        con.execute(ft.genome_label_table_sql(_EXPORTED_FEATURE_SOURCE))
 
 
 def _stage_exported_identifiers(con, identifiers: list[dict[str, Any]]) -> None:
@@ -304,12 +323,13 @@ def _stage_exported_identifiers(con, identifiers: list[dict[str, Any]]) -> None:
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    source = pa.Table.from_pylist(
+    _stage_response(
+        con,
         identifiers,
-        schema=pa.schema([("prep_sample_idx", pa.int64()), ("export_id", pa.string())]),
+        relation=_MINT_SOURCE,
+        columns=[("prep_sample_idx", pa.int64()), ("export_id", pa.string())],
+        table_sql=ft.sample_label_table_sql,
     )
-    with _registered(con, _MINT_SOURCE, source):
-        con.execute(ft.sample_label_table_sql(_MINT_SOURCE))
 
 
 @contextlib.contextmanager
@@ -349,15 +369,16 @@ def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Itera
         yield relation
 
 
-def _stage_taxonomy(con, flight_client, ticket: bytes) -> None:
-    """Stream the reference's per-feature taxonomy into `TAXONOMY_TABLE`.
+def _stage_from_stream(con, flight_client, ticket: bytes, *, relation: str, table_sql) -> None:
+    """Drain a Flight DoGet into the relation `table_sql` builds from it.
 
-    Staged INSIDE the Flight window even though the sidecar cannot be built until after
-    it closes: the stream is independent of which genomes survive, and reopening a
-    client later would break the invariant that the client lives only for the streams.
+    **Every reference-side stream is staged INSIDE the Flight window**, even the two
+    whose results cannot be built until long after it closes: none of them depends on
+    which genomes survive, and reopening a client later would break the invariant that
+    the client lives only for the streams.
     """
-    with _staged_stream(con, flight_client, ticket, relation=_TAXONOMY_STREAM) as source:
-        con.execute(ft.taxonomy_table_sql(source))
+    with _staged_stream(con, flight_client, ticket, relation=relation) as source:
+        con.execute(table_sql(source))
 
 
 def _build_taxonomy_sidecar(con) -> ft.TaxonomyClearance:
@@ -368,19 +389,6 @@ def _build_taxonomy_sidecar(con) -> ft.TaxonomyClearance:
     """
     con.execute(ft.taxonomy_sidecar_sql())
     return _cleared(con, ft.taxonomy_diagnostics_sql(), ft.check_taxonomy_diagnostics)
-
-
-def _stage_phylogeny(con, flight_client, ticket: bytes) -> None:
-    """Stream the reference's phylogeny into `PHYLOGENY_TABLE`.
-
-    Staged inside the Flight window and sheared long after it closes, for the reason
-    `_stage_taxonomy` gives — the stream does not depend on which genomes survive. This is
-    the one relation held across the analytic that is worth noticing: a whole reference's
-    tree is the largest thing here, which is why the shear's clearance drops it the moment
-    it has a result.
-    """
-    with _staged_stream(con, flight_client, ticket, relation=_PHYLOGENY_STREAM) as source:
-        con.execute(ft.phylogeny_table_sql(source))
 
 
 def _shear_tree(con) -> ft.TreeClearance:
@@ -436,13 +444,6 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
     # release the streamed copy that holds `cigar`.
     for sql, parameters in clearance.statements:
         con.execute(sql, parameters)
-
-
-def _stage_lengths(con, flight_client, ticket: bytes) -> None:
-    """Stream the reference's per-feature lengths and roll them up to the per-genome
-    denominators the coverage filter divides by. Requires `MAP_TABLE`."""
-    with _staged_stream(con, flight_client, ticket, relation=_LENGTHS_STREAM) as source:
-        con.execute(ft.genome_lengths_table_sql(source))
 
 
 def _build_ogu_output(con, *, scope: ft.CoverageScope, coverage_threshold: float) -> None:
@@ -871,24 +872,25 @@ def _resolve_cohort(base_url: str, token: str, args: argparse.Namespace) -> list
     return cohort
 
 
-def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], int]:
+def _run_build(
+    args: argparse.Namespace, token: str, con, *, gate: ft.AlignmentGate | None
+) -> tuple[list[Path], int]:
     """The recipe, on an open connection: discover, stage, compute, relabel, write.
     Returns the files written and the published table's row count.
 
-    Ordered so that everything cheap and refusable happens first: the gate needs nothing
-    but the flags, so it is built before any round trip at all, and a wrong
+    Ordered so that everything cheap and refusable happens first: a wrong
     `--alignment-idx`, an empty cohort, or an over-cap genome map each stop the run before
-    a byte of alignment data moves (an occupied output is refused earlier still, by the
-    handler).
+    a byte of alignment data moves. The two refusals that need nothing but the flags — the
+    gate's own coherence and an occupied output — are made by the handler, before this is
+    called at all, so neither costs a connection.
 
-    The Flight client lives only for the two streams and the tickets that authorize them:
+    The Flight client lives only for the streams and the tickets that authorize them:
     each stream is drained by the one CREATE that materializes it, so nothing holds a gRPC
     connection open through the compute, the relabel, or the write. `FlightClient` is its
     own context manager, so that lifetime is the `with` block.
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    gate = _gate_from_args(args)
     if args.tree:
         # Before the round trips, not at the shear: `shear_tree` is absent from builds a
         # user's extension cache may still hold, and the raw failure arrives after a whole
@@ -920,35 +922,28 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         # whole-reference read that costs a ticket mint and a small aggregate, so a
         # failure in it should not come after a cohort's worth of alignment rows have
         # already crossed the wire. Same order as the server-side job.
-        if ft.coverage_filter_applies(args.coverage_threshold):
-            _stage_lengths(
+        def _reference_stream(*, table: str, relation: str, table_sql) -> None:
+            _stage_from_stream(
                 con,
                 flight_client,
                 _create_reference_doget_ticket(
-                    args.base_url, token, reference_idx=reference_idx, table=_SEQUENCES_TABLE
+                    args.base_url, token, reference_idx=reference_idx, table=table
                 ),
+                relation=relation,
+                table_sql=table_sql,
+            )
+
+        if ft.coverage_filter_applies(args.coverage_threshold):
+            _reference_stream(
+                table=_SEQUENCES_TABLE,
+                relation=_LENGTHS_STREAM,
+                table_sql=ft.genome_lengths_table_sql,
             )
         if args.taxonomy:
-            _stage_taxonomy(
-                con,
-                flight_client,
-                _create_reference_doget_ticket(
-                    args.base_url, token, reference_idx=reference_idx, table=_TAXONOMY_TABLE
-                ),
-            )
-        if args.tree:
-            # The blocklist is a REST read, but it is fetched here so the two halves of
-            # the tree's input arrive together: the stream carries a blocked tip and this
-            # is the only thing that says so.
-            _stage_blocked_features(
-                con, _fetch_reference_exclusion(args.base_url, token, reference_idx=reference_idx)
-            )
-            _stage_phylogeny(
-                con,
-                flight_client,
-                _create_reference_doget_ticket(
-                    args.base_url, token, reference_idx=reference_idx, table=_PHYLOGENY_TABLE
-                ),
+            _reference_stream(
+                table=_TAXONOMY_TABLE,
+                relation=_TAXONOMY_STREAM,
+                table_sql=ft.taxonomy_table_sql,
             )
         _stage_alignment(
             con,
@@ -962,7 +957,24 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
             ),
             gate=gate,
         )
-    coverage = _cleared(con, ft.rollup_coverage_diagnostics_sql(), ft.check_rollup_coverage)
+        if args.tree:
+            # LAST in the window, after the stream that can refuse: a whole reference's
+            # tree is the largest relation this recipe holds, and it is held from here
+            # until the shear — so every megabyte of it staged before a gate that might
+            # fail the build is a megabyte spent for nothing.
+            #
+            # The blocklist is a REST read, fetched here so the tree's two halves arrive
+            # together: the stream carries a blocked tip and this is the only thing that
+            # says so.
+            _stage_blocked_features(
+                con, _fetch_reference_exclusion(args.base_url, token, reference_idx=reference_idx)
+            )
+            _reference_stream(
+                table=_PHYLOGENY_TABLE,
+                relation=_PHYLOGENY_STREAM,
+                table_sql=ft.phylogeny_table_sql,
+            )
+    coverage = _cleared(con, ft.rollup_coverage_diagnostics_sql(), ft.RollupCoverage)
     if not coverage.complete:
         print(ft.rollup_coverage_warning(coverage), file=sys.stderr)
     _build_ogu_output(
@@ -1039,15 +1051,19 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         return 1
 
     try:
-        # Before anything else: a name already occupied, or a directory that is not
-        # there, is not worth streaming a cohort and a whole reference to discover.
+        # Before anything else, and before the connection: the two refusals that need
+        # nothing but the flags. An incoherent gate, a name already occupied, or a
+        # directory that is not there is not worth an extension INSTALL to discover —
+        # `connect_with_miint` downloads a cold cache from the mirror — let alone a
+        # cohort and a whole reference.
+        gate = _gate_from_args(args)
         _bundle_targets(
             args.output,
             args.format,
             companions=_requested_companions(taxonomy=args.taxonomy, tree=args.tree),
         )
         with contextlib.closing(connect_with_miint()) as con:
-            written, rows = _run_build(args, token, con)
+            written, rows = _run_build(args, token, con, gate=gate)
     except _common.httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
