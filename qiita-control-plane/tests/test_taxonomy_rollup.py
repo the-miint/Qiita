@@ -132,3 +132,41 @@ def test_a_rank_that_is_present_below_a_missing_one_is_not_promoted(con):
     assert by_rank["domain"] == "d__Bacteria"
     assert by_rank["phylum"] is None
     assert by_rank["family"] == "f__Listeriaceae"
+
+
+def test_a_duplicated_member_row_still_reduces_to_exactly_one_row(con):
+    """The reduction picks a representative member and joins that member's row back, so
+    a duplicate at the winning position matches twice. One row per genome has to be a
+    property of the SQL: the sidecar's row-count check would catch a second row, but the
+    shard planner — the other consumer — has none, and two items sharing one id tile a
+    genome into two shards.
+    """
+    _seed(con, [(1, 1), (1, 1)], [(1, "Zeta", "Zp", None, None, None, None, None, None)])
+    assert _reduce(con) == [(1, "Zeta", "Zp", None, None, None, None, None, None)]
+
+    con.execute("DELETE FROM member_genome")
+    con.execute("DELETE FROM taxonomy")
+    duplicated = (7, "Alpha", None, None, None, None, None, None, None)
+    _seed(con, [(7, 2)], [duplicated, duplicated])
+    assert _reduce(con) == [(2, "Alpha", None, None, None, None, None, None, None)]
+
+
+def test_the_representatives_ranks_all_come_from_the_one_member(con):
+    """Feature 1 is the lowest classified member and reports no phylum; feature 5 does.
+    The genome's phylum must be NULL — an eight-`arg_min` reduction returns Firmicutes
+    here, because `arg_min` ignores rows whose argument is NULL, and that is a rank
+    promoted across a gap.
+    """
+    _seed(
+        con,
+        [(1, 1), (5, 1)],
+        [
+            (1, "Bacteria", None, "Bacilli", None, None, None, None, None),
+            (5, "Bacteria", "Firmicutes", None, None, None, None, None, None),
+        ],
+    )
+    (row,) = _reduce(con)
+    by_rank = dict(zip(RANK_COLUMNS, row[1:], strict=True))
+    assert by_rank["domain"] == "Bacteria"
+    assert by_rank["phylum"] is None
+    assert by_rank["class"] == "Bacilli"

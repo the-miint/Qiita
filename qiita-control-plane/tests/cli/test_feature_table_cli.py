@@ -239,7 +239,9 @@ def test_the_bundle_is_the_table_AND_the_identifier_map(fmt, tmp_path):
     table = tmp_path / f"gut-study-ogu.{fmt}"
     with connect_with_miint() as conn:
         _labelled(conn)
-        written = ftc._write_bundle(conn, table_path=table, fmt=fmt, identifiers=_IDENTIFIERS)
+        written = ftc._write_bundle(
+            conn, table_path=table, fmt=fmt, identifiers=_IDENTIFIERS, clearances={}
+        )
 
     assert [p.name for p in written] == [
         f"gut-study-ogu.{fmt}",
@@ -255,13 +257,18 @@ def test_two_runs_can_share_a_directory(tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         first = ftc._write_bundle(
-            conn, table_path=tmp_path / "pooled.parquet", fmt="parquet", identifiers=_IDENTIFIERS
+            conn,
+            table_path=tmp_path / "pooled.parquet",
+            fmt="parquet",
+            identifiers=_IDENTIFIERS,
+            clearances={},
         )
         second = ftc._write_bundle(
             conn,
             table_path=tmp_path / "per-sample.parquet",
             fmt="parquet",
             identifiers=_IDENTIFIERS,
+            clearances={},
         )
 
     assert sorted(p.name for p in first + second) == [
@@ -282,10 +289,18 @@ def test_a_name_that_contradicts_the_format_is_refused(tmp_path):
         _labelled(conn)
         with pytest.raises(ValueError, match="named for biom"):
             ftc._write_bundle(
-                conn, table_path=tmp_path / "t.biom", fmt="parquet", identifiers=_IDENTIFIERS
+                conn,
+                table_path=tmp_path / "t.biom",
+                fmt="parquet",
+                identifiers=_IDENTIFIERS,
+                clearances={},
             )
         written = ftc._write_bundle(
-            conn, table_path=tmp_path / "no-extension", fmt="parquet", identifiers=_IDENTIFIERS
+            conn,
+            table_path=tmp_path / "no-extension",
+            fmt="parquet",
+            identifiers=_IDENTIFIERS,
+            clearances={},
         )
     assert written[0].name == "no-extension"
     assert written[1].name == "no-extension.exported-identifier.json"
@@ -299,7 +314,11 @@ def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_pat
     with connect_with_miint() as conn:
         _labelled(conn)
         _, map_path = ftc._write_bundle(
-            conn, table_path=tmp_path / "t.parquet", fmt="parquet", identifiers=_IDENTIFIERS
+            conn,
+            table_path=tmp_path / "t.parquet",
+            fmt="parquet",
+            identifiers=_IDENTIFIERS,
+            clearances={},
         )
 
     payload = json.loads(map_path.read_text())
@@ -314,7 +333,11 @@ def test_the_written_table_carries_only_public_columns(tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         table_path, _ = ftc._write_bundle(
-            conn, table_path=tmp_path / "t.parquet", fmt="parquet", identifiers=_IDENTIFIERS
+            conn,
+            table_path=tmp_path / "t.parquet",
+            fmt="parquet",
+            identifiers=_IDENTIFIERS,
+            clearances={},
         )
         described = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{table_path}')").fetchall()
         rows = conn.execute(f"SELECT * FROM read_parquet('{table_path}') ORDER BY 1").fetchall()
@@ -335,7 +358,10 @@ def test_a_failure_partway_through_leaves_NEITHER_file(tmp_path):
                 conn,
                 table_path=tmp_path / "t.parquet",
                 fmt="parquet",
+                # A set is not JSON-serializable, so the map's write raises after the
+                # table has already been committed.
                 identifiers=[{"prep_sample_idx": {1, 2}, "export_id": "QM1"}],
+                clearances={},
             )
 
     assert not list(tmp_path.iterdir())
@@ -350,7 +376,9 @@ def test_an_existing_artifact_is_refused_before_anything_is_written(tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         with pytest.raises(FileExistsError, match="t.parquet"):
-            ftc._write_bundle(conn, table_path=table, fmt="parquet", identifiers=_IDENTIFIERS)
+            ftc._write_bundle(
+                conn, table_path=table, fmt="parquet", identifiers=_IDENTIFIERS, clearances={}
+            )
 
     assert table.read_text() == "earlier run"
     assert not (tmp_path / "t.exported-identifier.json").exists()
@@ -365,7 +393,11 @@ def test_a_lone_survivor_is_reported_as_an_unfinished_run(tmp_path):
         _labelled(conn)
         with pytest.raises(FileExistsError, match="did not finish"):
             ftc._write_bundle(
-                conn, table_path=tmp_path / "t.parquet", fmt="parquet", identifiers=_IDENTIFIERS
+                conn,
+                table_path=tmp_path / "t.parquet",
+                fmt="parquet",
+                identifiers=_IDENTIFIERS,
+                clearances={},
             )
 
 
@@ -378,7 +410,11 @@ def test_a_stale_partial_does_not_block_a_retry(tmp_path):
     with connect_with_miint() as conn:
         _labelled(conn)
         written = ftc._write_bundle(
-            conn, table_path=tmp_path / "t.biom", fmt="biom", identifiers=_IDENTIFIERS
+            conn,
+            table_path=tmp_path / "t.biom",
+            fmt="biom",
+            identifiers=_IDENTIFIERS,
+            clearances={},
         )
         assert conn.execute(f"SELECT count(*) FROM read_biom('{written[0]}')").fetchone()[0] == 2
 
@@ -396,6 +432,7 @@ def test_a_missing_output_directory_is_named(tmp_path):
                 table_path=tmp_path / "nope" / "t.parquet",
                 fmt="parquet",
                 identifiers=_IDENTIFIERS,
+                clearances={},
             )
 
 
@@ -404,7 +441,11 @@ def test_an_unsupported_format_is_refused(tmp_path):
         _labelled(conn)
         with pytest.raises(ValueError, match="tsv"):
             ftc._write_bundle(
-                conn, table_path=tmp_path / "t.tsv", fmt="tsv", identifiers=_IDENTIFIERS
+                conn,
+                table_path=tmp_path / "t.tsv",
+                fmt="tsv",
+                identifiers=_IDENTIFIERS,
+                clearances={},
             )
 
 
@@ -413,3 +454,34 @@ def test_parquet_is_the_default_format():
     next: Parquet is what the rest of this system and every dataframe tool read."""
     assert ftc.DEFAULT_TABLE_FORMAT == "parquet"
     assert ftc.DEFAULT_TABLE_FORMAT in ftc.TABLE_FORMATS
+
+
+def test_only_the_companions_asked_for_are_part_of_the_bundle(tmp_path):
+    """The flags decide the bundle's shape before anything is computed, which is what lets
+    the handler refuse an occupied name without streaming a reference first."""
+    table = tmp_path / "t.parquet"
+    assert [p.name for p in ftc._bundle_targets(table, "parquet")] == [
+        "t.parquet",
+        "t.exported-identifier.json",
+    ]
+    both = ftc._requested_companions(taxonomy=True, tree=True)
+    assert [p.name for p in ftc._bundle_targets(table, "parquet", companions=both)] == [
+        "t.parquet",
+        "t.exported-identifier.json",
+        "t.taxonomy.parquet",
+        "t.tree.parquet",
+    ]
+    tree_only = ftc._requested_companions(taxonomy=False, tree=True)
+    assert [c.name for c in tree_only] == ["tree"]
+
+
+def test_an_occupied_companion_path_is_refused_like_any_other_bundle_member(tmp_path):
+    """A companion is not a nice-to-have that can be skipped: the bundle is all of its
+    files, so an existing sidecar refuses the run rather than being quietly replaced."""
+    (tmp_path / "t.tree.parquet").write_text("an earlier run")
+    with pytest.raises(FileExistsError, match="t.tree.parquet"):
+        ftc._bundle_targets(
+            tmp_path / "t.parquet",
+            "parquet",
+            companions=ftc._requested_companions(taxonomy=False, tree=True),
+        )

@@ -19,6 +19,8 @@ one-directional.
 
 from __future__ import annotations
 
+import contextlib
+
 import duckdb
 import pytest
 from qiita_common import feature_table as ft
@@ -850,3 +852,230 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
     assert clearance.rows == 0
     assert rows == 0
     assert described == list(ft.LABELLED_SCHEMA.items())
+
+
+# ---------------------------------------------------------------------------
+# The sheared tree, against real miint
+#
+# The tree fixture is genome-level, as a publishable one must be: one tip per
+# published genome, with G300's contig present but unpublished (it fails the 1%
+# threshold) so the NULL-name path is exercised, and `inner1` collapsible so a
+# surviving branch length is a SUM rather than a copy.
+#
+#   (((c10:0.2, c30:0.5)inner1:0.1, c20:0.3)inner2:0.05, c40:0.4);
+#
+# Shearing to {G100, G200, G400} drops c30, leaving inner1 with one child — so
+# c10's branch becomes 0.2 + 0.1.
+# ---------------------------------------------------------------------------
+
+_TREE = "(((c10:0.2,c30:0.5)inner1:0.1,c20:0.3)inner2:0.05,c40:0.4);"
+_TIP_FEATURES = [("c10", 10), ("c20", 20), ("c30", 30), ("c40", 40)]
+
+
+def _published_handles(conn) -> list[tuple]:
+    """The exported-feature mint's response for the genomes the roll-up EMITTED, which is
+    what the client mints from — not every genome in the map. G300 fails the 1% threshold
+    and so is not published, and must not be in the keep-set either."""
+    rows = conn.execute(
+        f"SELECT DISTINCT genome_idx FROM {ft.OGU_OUTPUT_TABLE} ORDER BY genome_idx"
+    ).fetchall()
+    return [(genome_idx, _FEATURE_HANDLES[genome_idx]) for (genome_idx,) in rows]
+
+
+def _stage_phylogeny(conn, tmp_path, *, newick=_TREE, tip_features=_TIP_FEATURES) -> None:
+    """Stage a tree in the lake's shape: `read_newick` plus `is_tip`, with `feature_idx`
+    resolved from the tip's name by a LEFT JOIN — which is how ingest writes it, so an
+    unmatched tip keeps its row with a NULL `feature_idx`."""
+    path = tmp_path / "reference.nwk"
+    path.write_text(newick + "\n")
+    conn.execute(
+        "CREATE TABLE _tip_feature AS "
+        + _values(tip_features, "name, feature_idx", "?::VARCHAR, ?::BIGINT"),
+        [x for r in tip_features for x in r],
+    )
+    conn.execute(
+        f"CREATE TABLE _phylo_src AS "
+        f"SELECT n.node_index, n.parent_index, n.name, n.branch_length, n.edge_id, "
+        f"n.is_tip, f.feature_idx "
+        f"FROM read_newick('{path}') n LEFT JOIN _tip_feature f ON f.name = n.name"
+    )
+    conn.execute(ft.phylogeny_table_sql("_phylo_src"))
+
+
+def _shear(conn) -> ft.TreeClearance:
+    """Drive the shear protocol as the client does: define the two arguments, diagnose,
+    check, then run what the clearance carries."""
+    for sql in ft.shear_input_statements():
+        conn.execute(sql)
+    cursor = conn.execute(ft.tree_diagnostics_sql())
+    names = [d[0] for d in cursor.description]
+    clearance = ft.check_tree_diagnostics(**dict(zip(names, cursor.fetchone(), strict=True)))
+    for sql in clearance.statements:
+        conn.execute(sql)
+    return clearance
+
+
+@contextlib.contextmanager
+def _labelled(*, mapping=_MAP, threshold=0.01):
+    """A connection carrying everything the shear needs: the roll-up done, the labels
+    minted from its own output, and the relabel run — the client's order exactly."""
+    with connect_with_miint_staged() as conn:
+        populated = _ogu_input(conn, ft.CoverageScope.POOLED, threshold, mapping=mapping)
+        conn.execute(ft.ogu_output_table_sql(populated=populated))
+        _stage_labels(conn, feature_handles=_published_handles(conn), handles=_HANDLES)
+        _relabel(conn)
+        yield conn
+
+
+def _sheared(conn) -> list[tuple]:
+    return conn.execute(f"SELECT * FROM {ft.TREE_TABLE} ORDER BY node_index").fetchall()
+
+
+def test_the_sheared_tree_sums_the_branch_length_of_a_collapsed_ancestor(tmp_path):
+    """The property that makes a sheared tree usable: `inner1` loses c30 and so has one
+    child, collapse removes it, and c10's surviving branch is 0.2 + 0.1 — the whole tree's
+    distance, not the pruned one's. A float sum, hence approximately."""
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path)
+        clearance = _shear(conn)
+        rows = _sheared(conn)
+
+    assert clearance.tips == 3
+    by_name = {name: branch for _, name, branch, *_ in rows}
+    assert by_name["GCF_000000100"] == pytest.approx(0.3)
+    assert by_name["GCF_000000200"] == pytest.approx(0.3)
+    assert by_name["GCF_000000400"] == pytest.approx(0.4)
+    # inner2 survives (it keeps two children) and the root is renamed to nothing by the
+    # shear; neither is a tip.
+    assert sum(1 for row in rows if row[5]) == 3
+
+
+def test_an_unpublished_tip_is_sheared_away_rather_than_published_by_its_own_name(tmp_path):
+    """c30's genome fails the coverage threshold, so it has no handle. Its tip must
+    vanish, and its reference-internal name `c30` must not reach the artifact."""
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path)
+        _shear(conn)
+        rows = _sheared(conn)
+
+    names = {name for _, name, *_ in rows}
+    assert "c30" not in names
+    assert {name for _, name, _, _, _, is_tip in rows if is_tip} == {
+        "GCF_000000100",
+        "GCF_000000200",
+        "GCF_000000400",
+    }
+
+
+def test_the_shear_releases_the_whole_reference_tree(tmp_path):
+    """It is the largest relation in the recipe, and the write is still to come."""
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path)
+        _shear(conn)
+        live = {
+            name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+        }
+        views = {
+            name for (name,) in conn.execute("SELECT view_name FROM duckdb_views()").fetchall()
+        }
+
+    assert ft.TREE_TABLE in live
+    assert ft.PHYLOGENY_TABLE not in live
+    assert not {ft.SHEAR_INPUT_RELATION, ft.SHEAR_KEEP_SET_RELATION} & views
+
+
+def test_a_genome_owning_two_tips_is_refused_by_its_handle(tmp_path):
+    """A contig-level tree for a multi-contig genome. The shear would accept it and keep
+    both tips under one handle — a tree with duplicate tip names."""
+    tree = "((c40:0.2,c41:0.3)G400:0.1,(c10:0.4,c20:0.5)inner:0.2);"
+    tips = [("c10", 10), ("c20", 20), ("c40", 40), ("c41", 41)]
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path, newick=tree, tip_features=tips)
+        with pytest.raises(ValueError, match="GCF_000000400"):
+            _shear(conn)
+
+
+def test_a_published_row_with_no_tip_in_the_tree_is_refused(tmp_path):
+    """A tree that covers only some of what the table publishes reads as though the rest
+    were left out of the analysis."""
+    tree = "((c10:0.2,c30:0.5)inner1:0.1,c40:0.4);"
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path, newick=tree)
+        with pytest.raises(ValueError, match="GCF_000000200"):
+            _shear(conn)
+
+
+def test_a_tip_shared_by_two_published_genomes_is_refused(tmp_path):
+    """`feature_genome` is many-to-many on purpose — identical bytes are one
+    `feature_idx`, so a plasmid two organisms carry belongs to both — and renaming such a
+    tip by genome duplicates the node. The shear's own error names a node id; this names
+    the reason."""
+    shared = [*_MAP, (10, 200)]
+    with _labelled(mapping=shared) as conn:
+        _stage_phylogeny(conn, tmp_path)
+        with pytest.raises(ValueError, match="more than one genome"):
+            _shear(conn)
+
+
+def test_a_reference_with_no_phylogeny_is_refused(tmp_path):
+    """An absent tree is an EMPTY stream, not an error, so the recipe has to notice. The
+    shear's own message would name our staged relation instead."""
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path, tip_features=[])
+        conn.execute(f"DELETE FROM {ft.PHYLOGENY_TABLE}")
+        with pytest.raises(ValueError, match="no phylogeny"):
+            _shear(conn)
+
+
+def test_the_written_tree_carries_only_published_names_and_no_identifier_of_ours(tmp_path):
+    """Asserted on the FILE, which is what somebody publishes: every tip label is one of
+    the table's own `feature_id`s, and no column is one of ours."""
+    with _labelled() as conn:
+        _stage_phylogeny(conn, tmp_path)
+        clearance = _shear(conn)
+        conn.execute("SET preserve_insertion_order=false")
+        conn.execute(ft.tree_copy_sql(tmp_path / "t.tree.parquet", clearance=clearance))
+        published = {
+            name
+            for (name,) in conn.execute(
+                f"SELECT feature_id FROM {ft.GENOME_LABEL_TABLE}"
+            ).fetchall()
+        }
+        written = duckdb.connect(":memory:")
+        columns = [
+            row[0]
+            for row in written.execute(
+                f"DESCRIBE SELECT * FROM '{tmp_path}/t.tree.parquet'"
+            ).fetchall()
+        ]
+        tips = {
+            name
+            for (name,) in written.execute(
+                f"SELECT name FROM '{tmp_path}/t.tree.parquet' WHERE is_tip"
+            ).fetchall()
+        }
+        written.close()
+
+    assert columns == list(ft.TREE_COLUMNS)
+    assert not [name for name in columns if "idx" in name]
+    assert tips == published
+
+
+def test_the_rollup_report_counts_a_shared_features_alignment_row_once():
+    """The map holds one row per `(feature, genome)` pair and a feature may belong to
+    several genomes, so the diagnostics' join fans a shared feature's alignment row out
+    once per genome. Counting the joined rows inflates only the denominator — the share
+    the caller is shown then reads lower than the truth."""
+    shared_map = [*_MAP, (10, 500)]
+    unmapped_row = (1, 7, 77, 0, 0, 100)
+    alignment = [*_ALIGNMENT, unmapped_row]
+    with connect_with_miint_staged() as conn:
+        _stage(conn, alignment=alignment, mapping=shared_map, lengths=_LENGTHS, threshold=0.01)
+        cursor = conn.execute(ft.rollup_coverage_diagnostics_sql())
+        names = [d[0] for d in cursor.description]
+        coverage = ft.check_rollup_coverage(**dict(zip(names, cursor.fetchone(), strict=True)))
+
+    assert coverage.alignment_rows == len(alignment)
+    assert coverage.unmapped_rows == 1
+    assert coverage.unmapped_features == 1
+    assert "1 of 7" in ft.rollup_coverage_warning(coverage)

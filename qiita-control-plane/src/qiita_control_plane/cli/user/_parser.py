@@ -777,6 +777,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ft_build.add_argument(
+        "--tree",
+        action="store_true",
+        help=(
+            "Also write <table-stem>.tree.parquet: the reference's phylogeny sheared to"
+            " the rows this table publishes, as a node table (node_index, name,"
+            " branch_length, edge_id, parent_index, is_tip) whose tip names are the"
+            " table's own feature_ids. Branch lengths are preserved across pruned"
+            " ancestors. Refused, rather than approximated, if the reference has no tree"
+            " or its tips are not one-to-one with the published rows."
+        ),
+    )
+    p_ft_build.add_argument(
         "--min-identity",
         type=_proportion_arg,
         help=(

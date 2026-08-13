@@ -172,6 +172,35 @@ def require_staged_extension_directory(*, service: str) -> str:
     return ext_dir
 
 
+def require_miint_function(con, name: str, *, needed_for: str) -> None:
+    """Raise unless `name` is registered in the miint build LOADed on `con`.
+
+    For client-side callers reaching for a function newer than the build a user's cache
+    may hold. `connect_with_miint()` runs a plain `INSTALL`, which is a no-op on a warm
+    cache and **never refreshes it** (see `miint_install_sql`), so a cache filled before
+    the function landed keeps working for everything else and fails on this one with a
+    bare `Catalog Error: … does not exist` — which points at our code rather than at the
+    cache. The remedy is per-directory, so the message names the directory in force.
+
+    Existence only. Invoking a table function needs real inputs, and registration is what
+    distinguishes "this build is too old" from every other failure. Cheap enough to call
+    on a request path — one catalog scan — but meant for the top of a command, before the
+    work it would waste.
+    """
+    registered = con.execute(
+        "SELECT count(*) FROM duckdb_functions() WHERE function_name = ?", [name]
+    ).fetchone()[0]
+    if registered:
+        return
+    ext_dir = os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR) or "~/.duckdb/extensions"
+    raise RuntimeError(
+        f"the miint build in use has no {name}(), which {needed_for} needs. A plain "
+        f"INSTALL never refreshes an extension already present, so a cache filled before "
+        f"{name} landed keeps serving the old build. Delete it and re-run: "
+        f"rm -rf {ext_dir}"
+    )
+
+
 def miint_job_env() -> dict[str, str]:
     """The miint env vars a remote (SLURM) job MUST carry to LOAD the
     deploy-staged extension AND reach the GPL-boundary host. Both the

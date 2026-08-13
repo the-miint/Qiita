@@ -64,6 +64,22 @@ _ALIGNMENTS_BODY = {
 _ALIGNMENT_TICKET = b"alignment-ticket"
 _LENGTHS_TICKET = b"lengths-ticket"
 _TAXONOMY_TICKET = b"taxonomy-ticket"
+_PHYLOGENY_TICKET = b"phylogeny-ticket"
+
+# `((c10:0.2,c30:0.5)inner:0.1,c20:0.3);` in the lake's shape, node indices and all, as
+# `read_newick` assigns them at ingest. Written out rather than parsed so the fixture does
+# not depend on that indexing — and shaped so shearing it does real work: feature 30 has no
+# genome in the map, so its tip is unpublished and drops, leaving `inner` with one child.
+# The collapse must then hand c10 a branch of 0.2 + 0.1.
+#
+# (node_index, name, branch_length, parent_index, is_tip, feature_idx)
+_PHYLOGENY = [
+    (0, "c10", 0.2, 2, True, 10),
+    (1, "c30", 0.5, 2, True, 30),
+    (2, "inner", 0.1, 4, False, None),
+    (3, "c20", 0.3, 4, True, 20),
+    (4, "", None, None, False, None),
+]
 
 # The reference's per-feature taxonomy as the data plane streams it. Feature 10 (G100)
 # is classified to genus; feature 20 (G200) has a row with every rank NULL, which is how
@@ -134,6 +150,24 @@ def _taxonomy_reader(rows) -> pa.RecordBatchReader:
     return pa.table(columns).to_reader()
 
 
+def _phylogeny_reader(rows) -> pa.RecordBatchReader:
+    """`reference_phylogeny` as the whole-reference ticket streams it. `reference_idx` and
+    `edge_id` ride along — the first is dropped by our projection, the second is carried
+    into the published tree because it is the handle back to the reference's placements."""
+    return pa.table(
+        {
+            "reference_idx": pa.array([9] * len(rows), pa.int64()),
+            "node_index": pa.array([r[0] for r in rows], pa.int64()),
+            "name": pa.array([r[1] for r in rows], pa.string()),
+            "branch_length": pa.array([r[2] for r in rows], pa.float64()),
+            "edge_id": pa.array([None] * len(rows), pa.int64()),
+            "parent_index": pa.array([r[3] for r in rows], pa.int64()),
+            "is_tip": pa.array([r[4] for r in rows], pa.bool_()),
+            "feature_idx": pa.array([r[5] for r in rows], pa.int64()),
+        }
+    ).to_reader()
+
+
 class _FakeStream:
     def __init__(self, reader):
         self._reader = reader
@@ -189,6 +223,7 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "unpaired_gate": False,
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
+        "tree": False,
         "output": tmp_path / "table.parquet",
     }
     return argparse.Namespace(**(fields | overrides))
@@ -202,11 +237,12 @@ def _patched(
     cohort=None,
     feature_handles=None,
     taxonomy_rows=None,
+    phylogeny_rows=None,
 ):
     """Patch the five REST seams, both ticket mints, and the Flight client; return the
     recorder every assertion below reads. A test that wants a seam to RAISE re-patches
     it itself afterwards, rather than this growing a parameter per failure mode."""
-    rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0}
+    rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0, "phylogeny_minted": 0}
     _FakeFlightClient.instances = []
 
     monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
@@ -268,6 +304,9 @@ def _patched(
         if table == ftc._TAXONOMY_TABLE:
             rec["taxonomy_minted"] += 1
             return _TAXONOMY_TICKET
+        if table == ftc._PHYLOGENY_TABLE:
+            rec["phylogeny_minted"] += 1
+            return _PHYLOGENY_TICKET
         rec["lengths_minted"] += 1
         return _LENGTHS_TICKET
 
@@ -286,6 +325,9 @@ def _patched(
         _LENGTHS_TICKET: _lengths_reader,
         _TAXONOMY_TICKET: lambda: _taxonomy_reader(
             _TAXONOMY if taxonomy_rows is None else taxonomy_rows
+        ),
+        _PHYLOGENY_TICKET: lambda: _phylogeny_reader(
+            _PHYLOGENY if phylogeny_rows is None else phylogeny_rows
         ),
     }
     monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
@@ -757,10 +799,13 @@ def test_a_blocked_lowest_contig_does_not_unclassify_its_genome(monkeypatch, tmp
     assert rows == [("GCF_100", "d__Bacteria"), ("GCF_200", "d__Archaea")]
 
 
-def test_a_sidecar_that_does_not_match_the_table_is_refused(monkeypatch, tmp_path, capsys):
-    """Provoked by a taxonomy stream carrying TWO rows for one feature, which the
-    reference's own ingest forbids. A duplicated sidecar row multiplies the table's rows
-    under any join, and reads as real data.
+def test_a_reference_whose_taxonomy_repeats_a_feature_is_refused(monkeypatch, tmp_path, capsys):
+    """Two rows for one feature, which the reference's own ingest forbids — and here they
+    disagree, one calling feature 10 Bacteria and the other Archaea.
+
+    The reduction resolves a repeat to one row per genome, so nothing downstream can see
+    it: the sidecar would be the right SHAPE and carry whichever lineage the scan reached.
+    That is why the repeat is measured on the streamed taxonomy instead.
     """
     _patched(
         monkeypatch,
@@ -773,7 +818,7 @@ def test_a_sidecar_that_does_not_match_the_table_is_refused(monkeypatch, tmp_pat
     args = _namespace(tmp_path, taxonomy=True)
 
     assert ftc._handle_feature_table_build(args, parser=None) == 1
-    assert "taxonomy" in capsys.readouterr().err
+    assert "more than one row" in capsys.readouterr().err
     assert not list(tmp_path.iterdir()), "no half-bundle survives a refused sidecar"
 
 
@@ -794,3 +839,115 @@ def test_alignments_to_features_with_no_genome_are_reported(monkeypatch, tmp_pat
     err = capsys.readouterr().err
     assert "no genome in this reference" in err
     assert "2 of 3 alignment rows" in err
+
+
+# ---------------------------------------------------------------------------
+# The sheared tree
+# ---------------------------------------------------------------------------
+
+
+def _tree_rows(path) -> list[tuple]:
+    with connect_with_miint() as conn:
+        return conn.execute(
+            f"SELECT name, branch_length, is_tip FROM read_parquet('{path}') ORDER BY node_index"
+        ).fetchall()
+
+
+def test_the_tree_is_sheared_to_the_published_rows_and_keeps_their_distances(monkeypatch, tmp_path):
+    """The whole point of shearing rather than filtering: c30 drops because feature 30 has
+    no genome, `inner` is left with one child and collapses, and c10's branch becomes
+    0.2 + 0.1 — the distance it had in the whole tree. Tips are named the way the table's
+    rows are, so the two files join on one column."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    rows = _tree_rows(tmp_path / "table.tree.parquet")
+
+    tips = {name: branch for name, branch, is_tip in rows if is_tip}
+    assert tips == pytest.approx({"GCF_100": 0.3, "GCF_200": 0.3})
+    # Two tips and the new root, which the shear leaves unnamed — `inner` is gone.
+    assert [name for name, _, is_tip in rows if not is_tip] == [""]
+
+
+def test_no_tree_is_written_or_streamed_without_the_flag(monkeypatch, tmp_path):
+    """A whole reference's tree is the largest stream in this recipe, so the flag has to
+    gate the ticket mint too, not just the file."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["phylogeny_minted"] == 0
+    assert not (tmp_path / "table.tree.parquet").exists()
+
+
+def test_both_companions_land_beside_the_table_when_both_are_asked_for(monkeypatch, tmp_path):
+    """Four files, and the same `feature_id` vocabulary across all three that carry one."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "table.exported-identifier.json",
+        "table.parquet",
+        "table.taxonomy.parquet",
+        "table.tree.parquet",
+    ]
+    published = {feature_id for _, feature_id, _ in _table_rows(tmp_path / "table.parquet")}
+    tips = {name for name, _, is_tip in _tree_rows(tmp_path / "table.tree.parquet") if is_tip}
+    assert tips == published
+
+
+def test_a_reference_with_no_tree_stops_the_build_rather_than_writing_a_bundle(
+    monkeypatch, tmp_path, capsys
+):
+    """An absent phylogeny is an empty stream, not an error — the recipe has to notice."""
+    _patched(monkeypatch, phylogeny_rows=[])
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "no phylogeny" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_published_genome_with_two_tips_stops_the_build(monkeypatch, tmp_path, capsys):
+    """A contig-level tree for a genome the table publishes as one row. The shear would
+    accept it and emit both tips under the one handle."""
+    both_contigs_of_g100 = [
+        (0, "c10", 0.2, 2, True, 10),
+        (1, "c11", 0.5, 2, True, 11),
+        (2, "inner", 0.1, 4, False, None),
+        (3, "c20", 0.3, 4, True, 20),
+        (4, "", None, None, False, None),
+    ]
+    _patched(
+        monkeypatch,
+        map_entries=[
+            *_MAP_ENTRIES,
+            {"feature_idx": 11, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+        ],
+        phylogeny_rows=both_contigs_of_g100,
+    )
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "GCF_100" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_build_without_shear_tree_stops_before_any_round_trip(monkeypatch, tmp_path, capsys):
+    """The probe's placement is the point: `shear_tree` is absent from builds a user's
+    extension cache may still hold, and discovering that after a whole reference has been
+    streamed wastes the run."""
+    rec = _patched(monkeypatch)
+
+    def _absent(con, name, *, needed_for):
+        raise RuntimeError(f"the miint build in use has no {name}(), which {needed_for} needs")
+
+    monkeypatch.setattr(ftc, "require_miint_function", _absent)
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "shear_tree" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+    assert not list(tmp_path.iterdir())

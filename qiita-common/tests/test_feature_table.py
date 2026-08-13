@@ -1015,6 +1015,7 @@ def test_the_sidecar_projection_quotes_the_keyword_ranks(tmp_path):
 def _taxonomy_check(**overrides):
     row = {
         "published_rows": 10,
+        "repeated_features": 0,
         "taxonomy_rows": 10,
         "taxonomy_feature_ids": 10,
         "unnamed_rows": 0,
@@ -1066,3 +1067,144 @@ def test_the_rollup_warning_names_the_share_and_what_is_missing():
     assert "40 of 100" in warning
     assert "40.0%" in warning
     assert "7 features" in warning
+
+
+# ---------------------------------------------------------------------------
+# The sheared tree
+# ---------------------------------------------------------------------------
+
+
+def test_the_staged_tree_keeps_the_shear_shape_plus_the_join_key():
+    """`name` is staged because the shear matches tips BY NAME; `feature_idx` because
+    that is what resolves a tip to the genome the table published."""
+    sql = ft.phylogeny_table_sql("phylo_stream")
+    assert sql.startswith(f"CREATE TABLE {ft.PHYLOGENY_TABLE} AS SELECT ")
+    assert "FROM phylo_stream" in sql
+    for column in ("node_index", "parent_index", "name", "branch_length", "edge_id", "feature_idx"):
+        assert column in sql
+    # Not `reference_idx`: the ticket is already scoped to one reference, so a whole
+    # tree's worth of a constant column is pure cost.
+    assert "reference_idx" not in sql
+
+
+def test_the_shear_input_names_tips_from_the_published_labels():
+    """The tree the shear reads speaks the table's vocabulary, so a keep-set of
+    published handles and the tree cannot disagree about which tip is which."""
+    published, keep_set = ft.shear_input_statements()
+    assert f"CREATE VIEW {ft.SHEAR_INPUT_RELATION} AS" in published
+    assert "CASE WHEN p.is_tip THEN g.feature_id ELSE p.name END AS name" in published
+    assert f"LEFT JOIN {ft.MAP_TABLE} m ON m.contig_id = p.feature_idx" in published
+    assert f"LEFT JOIN {ft.GENOME_LABEL_TABLE} g ON g.genome_idx = m.genome_id" in published
+    assert keep_set == (
+        f"CREATE VIEW {ft.SHEAR_KEEP_SET_RELATION} AS "
+        f"SELECT feature_id AS name FROM {ft.GENOME_LABEL_TABLE}"
+    )
+
+
+def test_an_unpublished_tip_is_left_nameless_rather_than_keeping_its_own():
+    """A LEFT JOIN, so an unpublished tip's name is NULL — which never matches the
+    keep-set (so it is sheared away) and cannot collide with a published handle. Its
+    original name is a reference-internal FASTA header, and a published artifact should
+    not carry one by accident."""
+    published, _ = ft.shear_input_statements()
+    assert "LEFT JOIN" in published
+    assert "INNER JOIN" not in published
+
+
+def test_the_shear_collapses_and_refuses_a_missing_tip():
+    sql = ft.sheared_tree_table_sql(clearance=ft.TreeClearance(tips=4))
+    assert f"CREATE TABLE {ft.TREE_TABLE} AS SELECT " in sql
+    assert f"shear_tree('{ft.SHEAR_INPUT_RELATION}', '{ft.SHEAR_KEEP_SET_RELATION}'" in sql
+    assert "collapse := true" in sql
+    assert "ignore_missing := false" in sql
+
+
+def test_the_published_tree_carries_no_identifier_of_ours():
+    """`node_index`/`parent_index` are the SHEAR's own 0-based reindexing and are how a
+    tree expresses its shape; `edge_id` is the reference's jplace edge id. What must not
+    appear is `feature_idx` — a tip is named by the handle its table row carries."""
+    assert ft.TREE_COLUMNS == (
+        "node_index",
+        "name",
+        "branch_length",
+        "edge_id",
+        "parent_index",
+        "is_tip",
+    )
+    assert "feature_idx" not in ft.sheared_tree_table_sql(clearance=ft.TreeClearance(tips=2))
+
+
+def test_the_clearance_shears_then_releases_the_whole_reference_tree():
+    """In that order, and the views before the table they read: the staged tree is the
+    largest relation in this recipe, and nothing reads it after the shear."""
+    statements = ft.TreeClearance(tips=3).statements
+    assert statements[0] == ft.sheared_tree_table_sql(clearance=ft.TreeClearance(tips=3))
+    assert statements[1:] == (
+        f"DROP VIEW {ft.SHEAR_INPUT_RELATION}",
+        f"DROP VIEW {ft.SHEAR_KEEP_SET_RELATION}",
+        f"DROP TABLE {ft.PHYLOGENY_TABLE}",
+    )
+
+
+def test_the_tree_diagnostics_measure_the_relations_the_shear_reads():
+    """Not a second copy of the join: what was checked has to be what gets sheared."""
+    sql = ft.tree_diagnostics_sql()
+    assert ft.SHEAR_INPUT_RELATION in sql
+    assert ft.SHEAR_KEEP_SET_RELATION in sql
+    assert ft.PHYLOGENY_TABLE in sql
+
+
+def _tree_check(**overrides):
+    row = {
+        "tree_nodes": 9,
+        "shear_nodes": 9,
+        "published_rows": 4,
+        "rows_with_no_tip": 0,
+        "rows_with_many_tips": 0,
+        "untreed_example": None,
+        "multi_tip_example": None,
+    } | overrides
+    return ft.check_tree_diagnostics(**row)
+
+
+def test_a_clean_tree_clears_with_its_tip_count():
+    assert _tree_check().tips == 4
+
+
+def test_check_refuses_a_reference_with_no_phylogeny():
+    """Detected rather than left to the shear, whose own message names our staged
+    relation instead of saying the reference has no tree."""
+    with pytest.raises(ValueError, match="no phylogeny"):
+        _tree_check(tree_nodes=0, shear_nodes=0, rows_with_no_tip=4, untreed_example="GCF_1")
+
+
+def test_check_refuses_a_tip_shared_by_more_than_one_genome():
+    """The shape a shared plasmid produces: one feature under two genomes, so naming
+    tips by genome duplicates the node."""
+    with pytest.raises(ValueError, match="more than one genome"):
+        _tree_check(shear_nodes=11)
+
+
+def test_check_refuses_a_published_row_the_tree_has_no_tip_for():
+    with pytest.raises(ValueError, match="GCF_ABSENT"):
+        _tree_check(rows_with_no_tip=2, untreed_example="GCF_ABSENT")
+
+
+def test_check_refuses_a_genome_owning_more_than_one_tip():
+    """Which the shear would accept, keeping BOTH tips under one published handle."""
+    with pytest.raises(ValueError, match="GCF_MULTI"):
+        _tree_check(rows_with_many_tips=1, multi_tip_example="GCF_MULTI")
+
+
+def test_the_tree_copy_takes_a_clearance_and_the_shared_parquet_options(tmp_path):
+    sql = ft.tree_copy_sql(tmp_path / "t.tree.parquet", clearance=ft.TreeClearance(tips=4))
+    assert PARQUET_OPTS in sql
+    assert ft.TREE_TABLE in sql
+
+
+def test_check_refuses_a_reference_whose_taxonomy_repeats_a_feature():
+    """Measured on the STREAMED taxonomy, not the sidecar: the reduction resolves a repeat
+    to one row, so by the time the sidecar exists the repeat is invisible — and two rows
+    for one feature can carry different lineages."""
+    with pytest.raises(ValueError, match="more than one row"):
+        _taxonomy_check(repeated_features=1)

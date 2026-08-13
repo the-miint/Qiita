@@ -19,6 +19,7 @@ from qiita_common.duckdb_miint import (
     miint_install_sql,
     miint_job_env,
     miint_load_sql,
+    require_miint_function,
     require_staged_extension_directory,
 )
 
@@ -146,3 +147,51 @@ def test_extension_directory_var_is_the_one_job_env_requires():
     """The named constant IS the job-env requirement, not a second spelling of
     it — the drift this constant exists to prevent."""
     assert MIINT_EXTENSION_DIRECTORY_VAR in MIINT_REQUIRED_JOB_VARS
+
+
+class _Catalog:
+    """The narrowest stand-in for a connection with miint LOADed: `duckdb_functions()`
+    holds `registered`. `qiita-common` has no duckdb dependency and must not gain one, so
+    the probe's behaviour is pinned against a stub and its use against a real build is
+    covered where duckdb already is (the control plane's client-side recipe)."""
+
+    def __init__(self, registered: set[str]) -> None:
+        self.registered = registered
+        self.asked: list[str] = []
+
+    def execute(self, sql: str, parameters: list[str]):
+        assert "duckdb_functions()" in sql
+        (name,) = parameters
+        self.asked.append(name)
+        self.result = (1 if name in self.registered else 0,)
+        return self
+
+    def fetchone(self):
+        return self.result
+
+
+def test_require_miint_function_passes_when_the_build_has_it():
+    con = _Catalog({"shear_tree"})
+    assert require_miint_function(con, "shear_tree", needed_for="a sheared tree") is None
+    assert con.asked == ["shear_tree"]
+
+
+def test_require_miint_function_names_the_cache_to_clear(monkeypatch, tmp_path):
+    """The failure this converts is a bare `Catalog Error` pointing at our code, because
+    a plain INSTALL never refreshes a build already in the cache. So the message has to
+    name the directory in force — which is per-caller, not one path."""
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", str(tmp_path))
+    with pytest.raises(RuntimeError) as excinfo:
+        require_miint_function(_Catalog(set()), "shear_tree", needed_for="a sheared tree")
+    message = str(excinfo.value)
+    assert "shear_tree" in message
+    assert "a sheared tree" in message
+    assert str(tmp_path) in message
+
+
+def test_require_miint_function_falls_back_to_the_default_cache(monkeypatch):
+    """With no extension directory set — the client CLI's own case — DuckDB resolves
+    under $HOME, so that is the path to name."""
+    monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
+    with pytest.raises(RuntimeError, match=r"\.duckdb/extensions"):
+        require_miint_function(_Catalog(set()), "shear_tree", needed_for="a sheared tree")

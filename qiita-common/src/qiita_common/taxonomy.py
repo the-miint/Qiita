@@ -65,10 +65,15 @@ def prefixed_rank_columns_sql(*, alias: str = "") -> str:
     """The eight rank columns with their source prefixes restored, aliased back to
     their own names — `domain` becomes `'d__' || domain AS domain`.
 
-    NULL survives as NULL (an absent rank is not `'d__'`), while an EMPTY rank
-    becomes the bare prefix, which is what it was before ingest stripped it: a
-    lineage may carry `p__` with nothing after it, and that is a different statement
-    from "no phylum was reported".
+    **NULL survives as NULL** — an absent rank must not become a bare `'p__'`, which
+    reads as "reported, and empty".
+
+    An empty rank becomes the bare prefix, which is what it was before ingest stripped
+    three characters. That case does not arise from the one writer of
+    `reference_taxonomy` today: ingest nullifies a blank rank as it strips it
+    (`NULLIF(substr(...), '')` in the `reference_load` job), so a lineage carrying
+    `p__` with nothing after it is stored as NULL, not `''`. The branch is kept because
+    it costs nothing and the NULL half of the same `CASE` is the load-bearing one.
     """
     prefix = f"{alias}." if alias else ""
     return ", ".join(
@@ -96,6 +101,24 @@ def genome_representative_taxonomy_select_sql(*, member_genome: str, taxonomy: s
     The LEFT JOIN to `taxonomy` is deliberate in both places it appears: a feature
     with no taxonomy row is a *member* that cannot speak for the genome, not a
     member that disappears.
+
+    **Why pick the member and join its row back, rather than eight
+    `arg_min(rank, feature_idx)`s?** Because `arg_min` ignores rows whose *argument*
+    is NULL: measured, a genome whose lowest classified member has no phylum but a
+    higher member does gets that higher member's phylum, which promotes a rank across
+    a gap — the one failure the column form exists to prevent. Eight aggregates would
+    also each be free to answer from a different row. One member is chosen, then all
+    eight of its ranks are read from that row.
+
+    The `QUALIFY` is what keeps "one row per genome" a property of this SQL rather
+    than a borrowed invariant. The join back multiplies if the caller's relations hold
+    a duplicate at the winning `(genome_idx, feature_idx)` — `feature_genome`'s
+    PRIMARY KEY and ingest's 1-1 taxonomy write make that unreachable today, but the
+    aggregate this replaced could not multiply at all, and one of the two consumers
+    (the shard planner) has no downstream row-count check to catch it: two
+    `LineageItem`s sharing an `item_id` would tile one genome into two shards.
+    Duplicates being equal in practice, any one of them is the answer; what matters is
+    that it is one.
     """
     ranks = rank_columns_sql(alias="t")
     lineage = f"concat_ws(';', {ranks})"
@@ -111,6 +134,7 @@ def genome_representative_taxonomy_select_sql(*, member_genome: str, taxonomy: s
         f"    FROM representative r"
         f"    LEFT JOIN member_rank m"
         f"      ON m.genome_idx = r.genome_idx AND m.feature_idx = r.feature_idx"
+        f"    QUALIFY row_number() OVER (PARTITION BY r.genome_idx) = 1"
     )
 
 

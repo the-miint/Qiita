@@ -1073,6 +1073,8 @@ def taxonomy_diagnostics_sql() -> str:
     must match."""
     return (
         f"SELECT (SELECT count(*) FROM {GENOME_LABEL_TABLE}) AS published_rows, "
+        f"(SELECT count(*) - count(DISTINCT feature_idx) FROM {TAXONOMY_TABLE}) "
+        f"    AS repeated_features, "
         f"count(*) AS taxonomy_rows, "
         f"count(DISTINCT feature_id) AS taxonomy_feature_ids, "
         f"count(*) FILTER (WHERE feature_id IS NULL) AS unnamed_rows "
@@ -1083,6 +1085,7 @@ def taxonomy_diagnostics_sql() -> str:
 def check_taxonomy_diagnostics(
     *,
     published_rows: int,
+    repeated_features: int,
     taxonomy_rows: int,
     taxonomy_feature_ids: int,
     unnamed_rows: int,
@@ -1095,6 +1098,17 @@ def check_taxonomy_diagnostics(
     to nothing. An unclassified genome is NOT one of these — it is present with NULL
     ranks, which is a different statement and a legitimate one.
     """
+    if repeated_features:
+        # Checked on the STREAMED taxonomy rather than on the sidecar, because the
+        # reduction resolves a repeat to one row and so cannot show it downstream — see
+        # `genome_representative_taxonomy_select_sql`. Two rows for one feature need not
+        # agree, and arbitrating between two lineages is not ours to do quietly.
+        raise ValueError(
+            f"this reference's taxonomy holds more than one row for {repeated_features} "
+            f"feature(s), which ingest writes one-to-one, so the reference is malformed. "
+            f"Two rows for one feature can disagree, and choosing between them silently "
+            f"would publish an arbitrary lineage."
+        )
     if unnamed_rows:
         raise ValueError(
             f"{unnamed_rows} taxonomy rows carry no feature_id, so nothing could join "
@@ -1167,9 +1181,17 @@ class RollupCoverage:
 
 def rollup_coverage_diagnostics_sql() -> str:
     """One row for `check_rollup_coverage`: how many staged alignment rows have no
-    genome to roll up to."""
+    genome to roll up to.
+
+    `alignment_rows` is a scalar subquery, not this join's own `count(*)`, for the
+    reason `relabel_diagnostics_sql` counts its rows the same way: the map holds one row
+    per `(feature, genome)` pair and a feature may belong to several genomes, so the
+    join fans a shared feature's alignment row out once per genome. `unmapped_rows` is
+    unaffected (a row with no genome joins to exactly one NULL), so counting the joined
+    result would inflate only the denominator and report a share that is too low.
+    """
     return (
-        f"SELECT count(*) AS alignment_rows, "
+        f"SELECT (SELECT count(*) FROM {ALIGNMENT_TABLE}) AS alignment_rows, "
         f"count(*) FILTER (WHERE m.genome_id IS NULL) AS unmapped_rows, "
         f"count(DISTINCT a.feature_idx) FILTER (WHERE m.genome_id IS NULL) "
         f"    AS unmapped_features "
@@ -1200,6 +1222,238 @@ def rollup_coverage_warning(coverage: RollupCoverage) -> str:
         f"feature-rooted table is not built yet; until it is, this is the whole of what "
         f"a genome-keyed table can say about this alignment."
     )
+
+
+# ---------------------------------------------------------------------------
+# The sheared tree
+# ---------------------------------------------------------------------------
+
+# The reference's phylogeny as streamed from the lake. A real TABLE for two reasons:
+# `shear_tree` resolves its arguments on its own connection, which cannot see a
+# registered stream; and this is the largest relation in the recipe — GG2's backbone is
+# ~660k nodes — so the shear's clearance drops it the moment the shear is done.
+#
+# Deliberately NOT named for the lake table it comes from, unlike `TAXONOMY_TABLE`: the
+# lake's is `reference_phylogeny` exactly, and one name meaning both a caller's ticket
+# argument and a local relation is a trap.
+PHYLOGENY_TABLE = "phylogeny_nodes"
+
+# What we stage of it: `read_newick`'s shape, plus `is_tip` and the tip's `feature_idx`.
+# `name` matters because the shear matches tips BY NAME; `feature_idx` is what resolves a
+# tip to the genome whose row the table published. `reference_idx` is not staged — the
+# ticket is already scoped to one reference, so it is a whole tree's worth of a constant.
+PHYLOGENY_COLUMNS = (
+    "node_index",
+    "parent_index",
+    "name",
+    "branch_length",
+    "edge_id",
+    "is_tip",
+    "feature_idx",
+)
+
+# The shear's two arguments, both VIEWs: `shear_tree` takes relation NAMES and resolves
+# them on its own connection, where a VIEW is as visible as a TABLE, so materializing
+# either would copy the biggest relation here for nothing.
+SHEAR_INPUT_RELATION = "phylogeny_published_names"
+SHEAR_KEEP_SET_RELATION = "phylogeny_keep_set"
+
+# The sheared tree, materialized — see `sheared_tree_table_sql`.
+TREE_TABLE = "sheared_tree"
+
+# What the published tree carries: `shear_tree`'s own output columns, in its order.
+# `node_index`/`parent_index` are the SHEAR's 0-based reindexing rather than anything of
+# ours, and they are how a tree expresses its shape; `edge_id` is the reference's own
+# jplace edge id, the only handle back to its placements. No `feature_idx` — a tip is
+# named with the handle its row in the table carries.
+TREE_COLUMNS = ("node_index", "name", "branch_length", "edge_id", "parent_index", "is_tip")
+
+
+def phylogeny_table_sql(source: str) -> str:
+    """Materialize the streamed phylogeny into `PHYLOGENY_TABLE`."""
+    return f"CREATE TABLE {PHYLOGENY_TABLE} AS SELECT {', '.join(PHYLOGENY_COLUMNS)} FROM {source}"
+
+
+def shear_input_statements() -> tuple[str, ...]:
+    """Define the shear's two arguments: the tree with its tips renamed to the handles
+    the table publishes, and the keep-set of those handles.
+
+    **The tree is renamed rather than the shear's output translated afterwards**, which
+    is what makes one vocabulary structural: the shear matches by name, so a keep-set of
+    published handles and a tree that speaks them cannot disagree about which tip is
+    which, and the sheared output needs no second pass to name.
+
+    A tip whose feature has no published genome gets a NULL name — measured: `shear_tree`
+    ignores NULL-named tips, so it is sheared away like any tip outside the keep-set.
+    Keeping its own name instead would put a reference-internal FASTA header into a
+    published file, and could collide with a handle.
+
+    The keep-set is `GENOME_LABEL_TABLE` itself, so the tips asked for are exactly the
+    rows the table publishes.
+    """
+    published_names = (
+        f"CREATE VIEW {SHEAR_INPUT_RELATION} AS "
+        f"SELECT p.node_index, p.parent_index, p.branch_length, p.edge_id, p.is_tip, "
+        f"CASE WHEN p.is_tip THEN g.feature_id ELSE p.name END AS name "
+        f"FROM {PHYLOGENY_TABLE} p "
+        f"LEFT JOIN {MAP_TABLE} m ON m.contig_id = p.feature_idx "
+        f"LEFT JOIN {GENOME_LABEL_TABLE} g ON g.genome_idx = m.genome_id"
+    )
+    keep_set = (
+        f"CREATE VIEW {SHEAR_KEEP_SET_RELATION} AS "
+        f"SELECT feature_id AS name FROM {GENOME_LABEL_TABLE}"
+    )
+    return (published_names, keep_set)
+
+
+@dataclass(frozen=True)
+class TreeClearance:
+    """Evidence that `check_tree_diagnostics` ran and passed, plus the number of tips the
+    sheared tree will carry — which is the published row count, so a caller can report
+    the size without counting it again.
+
+    Takes the same role `GateClearance` does: every fault the checks catch produces a
+    tree somebody would join to the table anyway.
+    """
+
+    tips: int
+
+    @property
+    def statements(self) -> tuple[str, ...]:
+        """The rest of the protocol in order: shear, then release the whole-reference
+        tree and the two views over it.
+
+        Iterating this is what keeps the release from being forgotten — the staged tree
+        is the largest relation in the recipe and nothing reads it after the shear. The
+        views go first because they read the table.
+        """
+        return (sheared_tree_table_sql(clearance=self), *drop_phylogeny_statements())
+
+
+def sheared_tree_table_sql(*, clearance: TreeClearance) -> str:
+    """Shear the tree down to the published keep-set, into `TREE_TABLE`.
+
+    `collapse := true` is miint's default and is passed explicitly because it is
+    load-bearing: it removes the single-child ancestors pruning leaves behind and **sums
+    their branch lengths onto the surviving edge**, so a tip-to-tip distance in the
+    sheared tree is that distance in the whole one.
+
+    `ignore_missing := false` is a backstop, not the guard — `check_tree_diagnostics` has
+    already refused a published row the tree has no tip for, and with a count where the
+    shear's own error lists every missing name. Left false so a disagreement between what
+    was checked and what is sheared fails loudly instead of quietly shearing to a subset.
+
+    Materialized, so the whole-reference tree can be dropped before the write. Takes a
+    `TreeClearance` for the reason `gated_alignment_table_sql` takes a `GateClearance`.
+    """
+    _ = clearance
+    return (
+        f"CREATE TABLE {TREE_TABLE} AS SELECT {', '.join(TREE_COLUMNS)} "
+        f"FROM shear_tree('{SHEAR_INPUT_RELATION}', '{SHEAR_KEEP_SET_RELATION}', "
+        f"collapse := true, ignore_missing := false)"
+    )
+
+
+def drop_phylogeny_statements() -> tuple[str, ...]:
+    """Release the whole-reference tree and the two views over it, once the shear has
+    materialized its result. Same reason `drop_streamed_alignment_table_sql` exists: on a
+    client machine this is the peak, and holding a reference's whole tree through the
+    write buys nothing."""
+    return (
+        f"DROP VIEW {SHEAR_INPUT_RELATION}",
+        f"DROP VIEW {SHEAR_KEEP_SET_RELATION}",
+        f"DROP TABLE {PHYLOGENY_TABLE}",
+    )
+
+
+def tree_diagnostics_sql() -> str:
+    """One row for `check_tree_diagnostics`, measured over the two relations the shear
+    itself reads rather than over a second copy of their join — so what was checked is
+    what gets sheared."""
+    return (
+        f"WITH tip AS ("
+        f"SELECT node_index, name FROM {SHEAR_INPUT_RELATION} WHERE is_tip), "
+        f"per_handle AS ("
+        f"SELECT k.name, count(t.node_index) AS tips "
+        f"FROM {SHEAR_KEEP_SET_RELATION} k LEFT JOIN tip t ON t.name = k.name "
+        f"GROUP BY k.name) "
+        f"SELECT (SELECT count(*) FROM {PHYLOGENY_TABLE}) AS tree_nodes, "
+        f"(SELECT count(*) FROM {SHEAR_INPUT_RELATION}) AS shear_nodes, "
+        f"count(*) AS published_rows, "
+        f"count(*) FILTER (WHERE tips = 0) AS rows_with_no_tip, "
+        f"count(*) FILTER (WHERE tips > 1) AS rows_with_many_tips, "
+        f"min(name) FILTER (WHERE tips = 0) AS untreed_example, "
+        f"min(name) FILTER (WHERE tips > 1) AS multi_tip_example "
+        f"FROM per_handle"
+    )
+
+
+def check_tree_diagnostics(
+    *,
+    tree_nodes: int,
+    shear_nodes: int,
+    published_rows: int,
+    rows_with_no_tip: int,
+    rows_with_many_tips: int,
+    untreed_example: str | None,
+    multi_tip_example: str | None,
+) -> TreeClearance:
+    """Refuse a tree that cannot honestly be published beside this table, and return the
+    clearance `sheared_tree_table_sql` requires.
+
+    The shear catches two of these itself, and it is the *message* that differs: its
+    errors name our staged relation and, for missing tips, list every name — unusable at
+    a six-figure published set. The third it does not catch at all.
+    """
+    if not tree_nodes:
+        raise ValueError(
+            "this reference has no phylogeny, so there is no tree to shear. The table "
+            "and the taxonomy sidecar do not depend on one — re-run without --tree."
+        )
+    if shear_nodes != tree_nodes:
+        # Renaming tips by genome multiplies a node whose feature belongs to more than
+        # one genome, which `feature_genome` allows on purpose (identical bytes share one
+        # feature_idx, so a plasmid two organisms carry resolves to one feature under
+        # both). The shear rejects the result — `Duplicate node_id: N` — so this refusal
+        # buys the reason rather than the failure.
+        raise ValueError(
+            f"the reference's tree has {tree_nodes} nodes but naming its tips by genome "
+            f"produces {shear_nodes}, so {shear_nodes - tree_nodes} tip(s) belong to more "
+            f"than one genome — a feature two genomes share cannot be one genome-named "
+            f"tip. A genome-keyed tree is not publishable for this reference; the table "
+            f"and the taxonomy sidecar are unaffected, so re-run without --tree."
+        )
+    if rows_with_many_tips:
+        raise ValueError(
+            f"{rows_with_many_tips} published row(s) own more than one tip in this "
+            f"reference's tree, {multi_tip_example} among them, so the tree is not "
+            f"genome-level for this reference. The shear would keep BOTH tips under the "
+            f"one handle, giving a tree with duplicate tip names."
+        )
+    if rows_with_no_tip:
+        raise ValueError(
+            f"{rows_with_no_tip} of {published_rows} published row(s) have no tip in this "
+            f"reference's tree, {untreed_example} among them. A tree missing tips the "
+            f"table publishes reads as though those rows were left out of the analysis."
+        )
+    return TreeClearance(tips=published_rows)
+
+
+def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
+    """COPY the sheared tree to Parquet, with the options every qiita Parquet artifact
+    shares.
+
+    **Parquet, not Newick.** We ship the node table and let a consumer that wants Newick
+    convert it — which also keeps `COPY … (FORMAT NEWICK)`'s edge-id default from being
+    ours to dodge (it annotates every branch whenever an `edge_id` column is present; see
+    `docs/duckdb-miint.md`). `edge_id` is worth carrying: the shear preserves the
+    surviving edge's original id, which is the handle back to the reference's placements.
+
+    **Takes a `TreeClearance`**, so it cannot be reached without the check; see that
+    dataclass.
+    """
+    _ = clearance
+    return f"COPY {TREE_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
 
 
 def parquet_copy_sql(path: Path) -> str:
