@@ -22,6 +22,23 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A published feature table's rows can now be labelled without our identifiers.**
+  `POST /exported-feature` mints the public handle for a feature-axis entity, the way
+  `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
+  and its sheared tree can all label a row the same way, which is what lets them be used
+  together. It is deliberately a **hybrid**: a real accession wins wherever one exists
+  (`genome.source_id` for a genome, `reference_membership.accession` for a feature, which is
+  why that kind is keyed on the `(reference, feature)` pair — identical bytes can be named
+  differently in two references), and a minted `QF<n>` is the fallback for an entity with no
+  accession. An accession is something a reader can actually resolve; replacing
+  `GCF_000006605` with a handle of ours would make the artifact worse.
+  **A collision is not an error.** Two genomes can share a `source_id` under different
+  `source`s, so the published namespace is a UNIQUE index and the mint resolves a clash by
+  giving the loser a minted handle — while still reporting the accession it wanted, so nobody
+  has to guess why one label changed shape. That arbitration cannot live client-side: a caller
+  sees the entities of one artifact, never the accession someone else published last week. Nor
+  can it live in the generated column, which sees only its own row.
+
 - **The feature-table analytic is now shared, and breadth of coverage has a per-sample
   scope.** The SQL that turns alignment rows into an OGU table moved out of the
   compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side

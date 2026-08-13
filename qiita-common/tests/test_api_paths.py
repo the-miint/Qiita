@@ -327,6 +327,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_EXPORTED_IDENTIFIER_PREFIX",
         "PATH_EXPORTED_IDENTIFIER_ROOT",
     ),
+    # /exported-feature
+    (
+        "URL_EXPORTED_FEATURE",
+        "PATH_EXPORTED_FEATURE_PREFIX",
+        "PATH_EXPORTED_FEATURE_ROOT",
+    ),
     # /prep-sample
     (
         "URL_PREP_SAMPLE_STUDY_LIST",

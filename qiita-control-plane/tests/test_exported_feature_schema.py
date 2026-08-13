@@ -1,0 +1,484 @@
+"""Schema-level invariants for `qiita.exported_feature`.
+
+The route tests cover who may mint and what comes back. These cover the
+guarantees that live in the database itself, because they are the ones a caller
+cannot reach and a future migration could quietly drop:
+
+* `export_feature_id` is authored by Postgres and unwritable, so a public
+  identifier cannot be forged and cannot be edited after publication.
+* It resolves to the **accession** when one won, and to a minted `QF<idx>` handle
+  otherwise — the two halves of one namespace.
+* That namespace is **UNIQUE across both kinds**. This is the constraint the mint's
+  fallback exists to satisfy: a client cannot see another caller's rows, so only
+  the database can tell an accession it is already using.
+* Exactly one kind on a live row, and a feature-kind row names its reference —
+  a feature's accession belongs to the `(reference, feature)` membership, so a
+  feature identifier without a reference would be naming nothing in particular.
+* An identifier OUTLIVES the entity it names: deleting a reference detaches and
+  retires it rather than deleting it, which is what makes the FKs' `ON DELETE SET
+  NULL` satisfy the checks at all.
+"""
+
+import uuid
+
+import asyncpg
+import pytest
+
+from qiita_control_plane.testing.db_seeds import (
+    cleanup_reference_graph,
+    seed_bare_feature,
+    seed_bare_reference,
+    seed_genome,
+    seed_reference_membership,
+    seed_user_principal,
+)
+
+pytestmark = pytest.mark.db
+
+
+async def _principal(postgres_pool):
+    return await seed_user_principal(
+        postgres_pool, prefix="expfeat-schema", suffix=str(uuid.uuid4())[:8]
+    )
+
+
+async def _insert_genome_row(postgres_pool, *, genome_idx, accession, published, created_by_idx):
+    return await postgres_pool.fetchrow(
+        "INSERT INTO qiita.exported_feature"
+        "       (genome_idx, accession, accession_published, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx, export_feature_id",
+        genome_idx,
+        accession,
+        published,
+        created_by_idx,
+    )
+
+
+async def _insert_feature_row(
+    postgres_pool, *, reference_idx, feature_idx, accession, published, created_by_idx
+):
+    return await postgres_pool.fetchrow(
+        "INSERT INTO qiita.exported_feature"
+        "       (reference_idx, feature_idx, accession, accession_published, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5) RETURNING idx, export_feature_id",
+        reference_idx,
+        feature_idx,
+        accession,
+        published,
+        created_by_idx,
+    )
+
+
+async def _cleanup(postgres_pool, *, reference_idx=None, feature_idxs=(), genome_idxs=()):
+    await postgres_pool.execute(
+        "DELETE FROM qiita.exported_feature"
+        " WHERE genome_idx = ANY($1::bigint[]) OR feature_idx = ANY($2::bigint[])",
+        list(genome_idxs),
+        list(feature_idxs),
+    )
+    if reference_idx is not None:
+        await cleanup_reference_graph(
+            postgres_pool,
+            reference_idx=reference_idx,
+            feature_idxs=feature_idxs,
+            genome_idxs=genome_idxs,
+        )
+
+
+async def test_a_genome_publishes_its_accession(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        row = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        assert row["export_feature_id"] == source_id
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
+
+
+async def test_an_entity_with_no_accession_falls_back_to_a_minted_handle(postgres_pool):
+    """The `QF` half of the namespace. A feature loaded before
+    `reference_membership.accession` existed, or through a non-FASTA path, has no
+    accession at all — and still has to be nameable.
+    """
+    principal_idx = await _principal(postgres_pool)
+    reference_idx = await seed_bare_reference(postgres_pool, label="expfeat-noacc")
+    feature_idx = await seed_bare_feature(postgres_pool)
+    await seed_reference_membership(
+        postgres_pool, reference_idx=reference_idx, feature_idx=feature_idx, accession=None
+    )
+    try:
+        row = await _insert_feature_row(
+            postgres_pool,
+            reference_idx=reference_idx,
+            feature_idx=feature_idx,
+            accession=None,
+            published=False,
+            created_by_idx=principal_idx,
+        )
+        assert row["export_feature_id"] == f"QF{row['idx']}"
+    finally:
+        await _cleanup(postgres_pool, reference_idx=reference_idx, feature_idxs=[feature_idx])
+
+
+async def test_a_collided_accession_is_kept_as_provenance_while_the_handle_is_minted(
+    postgres_pool,
+):
+    """The fallback must stay distinguishable from "there was no accession".
+
+    Someone will ask why their table says `QF77` instead of `GCF_…`; the row has to
+    be able to answer.
+    """
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        row = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=False,
+            created_by_idx=principal_idx,
+        )
+        assert row["export_feature_id"] == f"QF{row['idx']}"
+        stored = await postgres_pool.fetchrow(
+            "SELECT accession, accession_published FROM qiita.exported_feature WHERE idx = $1",
+            row["idx"],
+        )
+        assert stored["accession"] == source_id
+        assert stored["accession_published"] is False
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
+
+
+async def test_export_feature_id_cannot_be_supplied_by_a_caller(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        with pytest.raises(asyncpg.PostgresError) as exc:
+            await postgres_pool.execute(
+                "INSERT INTO qiita.exported_feature"
+                "       (genome_idx, accession, accession_published, created_by_idx,"
+                "        export_feature_id)"
+                " VALUES ($1, $2, true, $3, 'FORGED')",
+                genome_idx,
+                source_id,
+                principal_idx,
+            )
+        assert "export_feature_id" in str(exc.value)
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
+
+
+async def test_two_entities_cannot_publish_the_same_identifier(postgres_pool):
+    """`UNIQUE (export_feature_id)` across BOTH kinds, which is the whole reason the
+    mint needs a fallback: a genome and a feature can carry the same accession
+    string, and `UNIQUE (source, source_id)` on `qiita.genome` is composite so two
+    genomes can too.
+    """
+    principal_idx = await _principal(postgres_pool)
+    shared = f"GCF_{uuid.uuid4().hex[:12]}"
+    first_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.genome (source, source_id) VALUES ('refseq', $1) RETURNING genome_idx",
+        shared,
+    )
+    second_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
+        shared,
+    )
+    try:
+        await _insert_genome_row(
+            postgres_pool,
+            genome_idx=first_idx,
+            accession=shared,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await _insert_genome_row(
+                postgres_pool,
+                genome_idx=second_idx,
+                accession=shared,
+                published=True,
+                created_by_idx=principal_idx,
+            )
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[first_idx, second_idx])
+
+
+async def test_exactly_one_kind_on_a_live_row(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    reference_idx = await seed_bare_reference(postgres_pool, label="expfeat-onekind")
+    feature_idx = await seed_bare_feature(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "INSERT INTO qiita.exported_feature"
+                "       (genome_idx, reference_idx, feature_idx, accession_published,"
+                "        created_by_idx)"
+                " VALUES ($1, $2, $3, false, $4)",
+                genome_idx,
+                reference_idx,
+                feature_idx,
+                principal_idx,
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "INSERT INTO qiita.exported_feature (accession_published, created_by_idx)"
+                " VALUES (false, $1)",
+                principal_idx,
+            )
+    finally:
+        await _cleanup(
+            postgres_pool,
+            reference_idx=reference_idx,
+            feature_idxs=[feature_idx],
+            genome_idxs=[genome_idx],
+        )
+
+
+async def test_a_feature_row_must_name_the_reference_that_accessioned_it(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    reference_idx = await seed_bare_reference(postgres_pool, label="expfeat-pair")
+    feature_idx = await seed_bare_feature(postgres_pool)
+    try:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "INSERT INTO qiita.exported_feature"
+                "       (feature_idx, accession_published, created_by_idx)"
+                " VALUES ($1, false, $2)",
+                feature_idx,
+                principal_idx,
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "INSERT INTO qiita.exported_feature"
+                "       (reference_idx, accession_published, created_by_idx)"
+                " VALUES ($1, false, $2)",
+                reference_idx,
+                principal_idx,
+            )
+    finally:
+        await _cleanup(postgres_pool, reference_idx=reference_idx, feature_idxs=[feature_idx])
+
+
+async def test_publishing_an_accession_requires_having_one(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, _ = await seed_genome(postgres_pool)
+    try:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await _insert_genome_row(
+                postgres_pool,
+                genome_idx=genome_idx,
+                accession=None,
+                published=True,
+                created_by_idx=principal_idx,
+            )
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
+
+
+async def test_one_live_identifier_per_genome(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await _insert_genome_row(
+                postgres_pool,
+                genome_idx=genome_idx,
+                accession=source_id,
+                published=False,
+                created_by_idx=principal_idx,
+            )
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
+
+
+async def test_one_live_identifier_per_reference_feature(postgres_pool):
+    """Per KIND, and scoped to the reference: the same feature in two references is
+    two published entities, because the accession that names it is the membership's.
+    """
+    principal_idx = await _principal(postgres_pool)
+    first_ref = await seed_bare_reference(postgres_pool, label="expfeat-live-a")
+    second_ref = await seed_bare_reference(postgres_pool, label="expfeat-live-b")
+    feature_idx = await seed_bare_feature(postgres_pool)
+    for reference_idx in (first_ref, second_ref):
+        await seed_reference_membership(
+            postgres_pool, reference_idx=reference_idx, feature_idx=feature_idx, accession=None
+        )
+    try:
+        await _insert_feature_row(
+            postgres_pool,
+            reference_idx=first_ref,
+            feature_idx=feature_idx,
+            accession=None,
+            published=False,
+            created_by_idx=principal_idx,
+        )
+        await _insert_feature_row(
+            postgres_pool,
+            reference_idx=second_ref,
+            feature_idx=feature_idx,
+            accession=None,
+            published=False,
+            created_by_idx=principal_idx,
+        )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await _insert_feature_row(
+                postgres_pool,
+                reference_idx=first_ref,
+                feature_idx=feature_idx,
+                accession=None,
+                published=False,
+                created_by_idx=principal_idx,
+            )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_feature WHERE feature_idx = $1", feature_idx
+        )
+        await cleanup_reference_graph(
+            postgres_pool, reference_idx=first_ref, feature_idxs=[feature_idx]
+        )
+        await cleanup_reference_graph(postgres_pool, reference_idx=second_ref)
+
+
+async def test_a_retired_row_does_not_block_a_fresh_identifier(postgres_pool):
+    """And the fresh one gets the ACCESSION back, not a minted handle.
+
+    Both unique indexes have to be partial for this. The common retirement here is
+    automatic — deleting a reference detaches every identifier it accessioned — so a
+    total index on the published namespace would hand a re-loaded genome a `QF<n>`
+    purely because a reference was once deleted, which is the outcome the hybrid
+    exists to avoid.
+    """
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        first = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        await postgres_pool.execute(
+            "UPDATE qiita.exported_feature"
+            "   SET retired = true, retired_at = now(), retire_reason = 'published in error'"
+            " WHERE idx = $1",
+            first["idx"],
+        )
+        second = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        assert second["idx"] != first["idx"]
+        assert second["export_feature_id"] == source_id
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
+
+
+async def test_an_identifier_outlives_the_genome_it_names(postgres_pool):
+    """A published identifier is never deleted. The reference-delete path hard-DELETEs
+    `qiita.genome` rows, so without the detach-and-retire trigger either that delete
+    fails or a citation stops resolving.
+    """
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        row = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+        after = await postgres_pool.fetchrow(
+            "SELECT genome_idx, retired, retired_at, retire_reason, export_feature_id"
+            "  FROM qiita.exported_feature WHERE idx = $1",
+            row["idx"],
+        )
+        assert after is not None, "the identifier was deleted with the genome"
+        assert after["genome_idx"] is None
+        assert after["retired"] is True
+        assert after["retired_at"] is not None
+        assert str(genome_idx) in after["retire_reason"]
+        assert after["export_feature_id"] == source_id
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_feature WHERE accession = $1", source_id
+        )
+
+
+async def test_an_identifier_outlives_the_reference_that_accessioned_it(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    reference_idx = await seed_bare_reference(postgres_pool, label="expfeat-outlive")
+    feature_idx = await seed_bare_feature(postgres_pool)
+    accession = f"G{uuid.uuid4().hex[:10]}"
+    await seed_reference_membership(
+        postgres_pool, reference_idx=reference_idx, feature_idx=feature_idx, accession=accession
+    )
+    try:
+        row = await _insert_feature_row(
+            postgres_pool,
+            reference_idx=reference_idx,
+            feature_idx=feature_idx,
+            accession=accession,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        await cleanup_reference_graph(
+            postgres_pool, reference_idx=reference_idx, feature_idxs=[feature_idx]
+        )
+        after = await postgres_pool.fetchrow(
+            "SELECT reference_idx, feature_idx, retired, export_feature_id"
+            "  FROM qiita.exported_feature WHERE idx = $1",
+            row["idx"],
+        )
+        assert after is not None, "the identifier was deleted with the reference"
+        assert after["retired"] is True
+        assert after["feature_idx"] is None
+        assert after["export_feature_id"] == accession
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_feature WHERE accession = $1", accession
+        )
+
+
+async def test_retirement_columns_cannot_disagree(postgres_pool):
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        row = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "UPDATE qiita.exported_feature SET retired = true WHERE idx = $1", row["idx"]
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "UPDATE qiita.exported_feature SET retire_reason = 'no' WHERE idx = $1",
+                row["idx"],
+            )
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
