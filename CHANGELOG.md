@@ -67,6 +67,25 @@ duplicates further down are historical strata; leave them where they are.
   intact" from an assumption into a checked fact — everything the build derives, starting with
   which reference the whole table is relabelled through, is read off those params.
 
+- **A feature table can now ship its taxonomy, keyed the same way as its rows.**
+  `qiita feature-table build --taxonomy` writes a third bundle member: one row per published
+  row, carrying the same `feature_id` and the eight ranks with their `d__`/`p__` prefixes
+  restored, so the two files join on one column. Parquet with eight columns rather than a
+  lineage string, because `concat_ws` skips NULLs — a lineage missing a middle rank silently
+  promotes every rank below it, so `d__Bacteria;f__Listeriaceae` reads as though the phylum
+  were Listeriaceae. An unclassified genome appears with NULL ranks rather than being left
+  out: a row missing from the sidecar reads as unclassified anyway, and nothing would
+  distinguish the two. A sidecar that does not describe the table beside it — short,
+  duplicated, or unnamed — is refused, since each of those is silent in a file people will
+  join regardless. The per-genome reduction behind it is now shared with the shard planner,
+  so a genome that tiles under one lineage publishes those same ranks.
+
+- **The build now reports what it could not roll up.** The genome map's INNER JOIN silently
+  drops alignments to features with no genome, and for some references that is most of what
+  was streamed. A build that cannot carry everything says the share and why — a
+  feature-rooted table is not built yet — rather than leaving a table that is quietly a
+  fraction of the data.
+
 - **The feature-table analytic is now shared, and breadth of coverage has a per-sample
   scope.** The SQL that turns alignment rows into an OGU table moved out of the
   compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side
