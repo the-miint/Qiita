@@ -22,11 +22,29 @@ from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.miint import connect_with_miint
 
 _ENTRIES = [
-    # G400's two contigs: the per-(feature, genome) fan-out the label relation
-    # collapses and the roll-up key must keep.
+    # G400's two contigs: the per-(feature, genome) fan-out the roll-up key must keep.
+    # `source` / `source_id` ride the response and are deliberately not staged — what a
+    # row is NAMED comes from the exported-feature mint, not from this map.
     {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
     {"feature_idx": 40, "genome_idx": 400, "source": "refseq", "source_id": "GCF_400"},
     {"feature_idx": 41, "genome_idx": 400, "source": "refseq", "source_id": "GCF_400"},
+]
+# The exported-feature mint's answer for the two genomes above. The accession wins in
+# both cases here; `accession`/`accession_published` ride the response so a caller can
+# tell a `QF<n>` fallback from an entity that never had an accession.
+_FEATURES = [
+    {
+        "genome_idx": 100,
+        "export_feature_id": "GCF_100",
+        "accession": "GCF_100",
+        "accession_published": True,
+    },
+    {
+        "genome_idx": 400,
+        "export_feature_id": "GCF_400",
+        "accession": "GCF_400",
+        "accession_published": True,
+    },
 ]
 _IDENTIFIERS = [
     {"prep_sample_idx": 1, "export_id": "QM1", "biosample_accession": "SAMN1"},
@@ -100,11 +118,12 @@ def test_an_invalid_cohort_is_refused_before_the_round_trip(monkeypatch):
         ftc._mint_exported_identifiers("http://cp", "qk_tok", alignment_idx=3, prep_sample_idx=[])
 
 
-def _staged(entries=None, identifiers=None):
-    """Stage both responses into a miint connection and describe what landed."""
+def _staged(entries=None, identifiers=None, features=None):
+    """Stage all three responses into a miint connection and describe what landed."""
     conn = connect_with_miint()
     ftc._stage_genome_map(conn, _ENTRIES if entries is None else entries)
     ftc._stage_exported_identifiers(conn, _IDENTIFIERS if identifiers is None else identifiers)
+    ftc._stage_exported_features(conn, _FEATURES if features is None else features)
     return conn
 
 
@@ -128,9 +147,10 @@ def test_the_staged_maps_carry_native_integer_keys_and_varchar_handles():
         }
 
 
-def test_the_roll_up_key_keeps_the_fan_out_and_the_label_collapses_it():
-    """One response, two relations with deliberately different cardinalities: the
-    roll-up needs a row per contig, the label exactly one per genome."""
+def test_the_roll_up_key_keeps_the_fan_out_the_label_never_had():
+    """Two relations with deliberately different cardinalities, now from two different
+    responses: the roll-up needs a row per contig, and the mint answers once per
+    genome so the label has nothing to collapse."""
     with _staged() as conn:
         pairs = conn.execute(f"SELECT count(*) FROM {ft.MAP_TABLE}").fetchone()[0]
         labels = conn.execute(f"SELECT count(*) FROM {ft.GENOME_LABEL_TABLE}").fetchone()[0]
@@ -142,8 +162,12 @@ def test_an_empty_genome_map_still_stages_typed_relations():
     """A 16S reference has no genome-bearing features, so an empty map is a legitimate
     200. Inferring the arrow types from the rows would give NULL-typed columns here and
     fail the first join with a type error instead of yielding an empty table."""
-    with _staged(entries=[]) as conn:
+    with _staged(entries=[], features=[]) as conn:
         assert _described(conn, ft.MAP_TABLE) == {"contig_id": "BIGINT", "genome_id": "BIGINT"}
+        assert _described(conn, ft.GENOME_LABEL_TABLE) == {
+            "genome_idx": "BIGINT",
+            "feature_id": "VARCHAR",
+        }
         assert conn.execute(f"SELECT count(*) FROM {ft.GENOME_LABEL_TABLE}").fetchone()[0] == 0
 
 
@@ -152,7 +176,11 @@ def test_the_staged_sources_do_not_outlive_the_staging():
     250 000-pair map is worth not holding twice on a laptop — so their names are gone
     afterwards and only the contract's relations remain."""
     with _staged() as conn:
-        for source in (ftc._GENOME_MAP_SOURCE, ftc._MINT_SOURCE):
+        for source in (
+            ftc._GENOME_MAP_SOURCE,
+            ftc._MINT_SOURCE,
+            ftc._EXPORTED_FEATURE_SOURCE,
+        ):
             with pytest.raises(duckdb.CatalogException):
                 conn.execute(f"SELECT count(*) FROM {source}")
 

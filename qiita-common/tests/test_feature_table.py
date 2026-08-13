@@ -33,7 +33,7 @@ _CREATE_BUILDERS = {
     "survivor_table_sql(per-sample)": lambda: ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE),
     "ogu_input_table_sql": lambda: ft.ogu_input_table_sql(survivor_scope=ft.CoverageScope.POOLED),
     "ogu_output_table_sql": lambda: ft.ogu_output_table_sql(populated=True),
-    "genome_label_table_sql": lambda: ft.genome_label_table_sql("map_src"),
+    "genome_label_table_sql": lambda: ft.genome_label_table_sql("mint_src"),
     "sample_label_table_sql": lambda: ft.sample_label_table_sql("mint_src"),
     "labelled_relation_sql": lambda: ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=10)),
 }
@@ -613,8 +613,8 @@ def _relabel_check(
 def test_the_public_schema_carries_no_internal_identifier():
     """The whole point of the relabel. `prep_sample_idx` and `genome_idx` are ours —
     they mean nothing outside this system and are not handles we promise to keep — so
-    a published table names its rows with the minted `export_id` and the genome's
-    `source_id` instead. Asserted on the schema rather than on one builder's text
+    a published table names its columns with the minted `export_id` and its rows with
+    the minted `export_feature_id`. Asserted on the schema rather than on one builder's text
     because this is the property every writer downstream inherits.
     """
     assert set(ft.LABELLED_SCHEMA) & set(ft.OUTPUT_SCHEMA) == {"value"}
@@ -642,31 +642,18 @@ def test_the_labelled_table_projects_exactly_the_public_columns():
         assert internal not in projection, internal
 
 
-def test_the_genome_label_table_collapses_the_maps_per_contig_fan_out():
-    """The genome map has one row per (feature, genome) PAIR, so a genome with N
-    contigs appears N times. Joining it to the counts un-deduplicated multiplies
-    every one of that genome's values by N — a plausible table, not an error — so the
-    label relation is DISTINCT by construction.
-    """
-    sql = ft.genome_label_table_sql("map_src")
-    assert "SELECT DISTINCT" in sql
-    assert "source_id AS feature_id" in sql
-    assert "FROM map_src" in sql
+def test_the_genome_label_table_renames_the_minted_handle():
+    """From the mint's response, not from the genome map's `source_id`. The map cannot
+    answer what a row is NAMED: whether a genome's accession is unique across
+    everything already published is a database fact, and the mint is what holds it.
 
-
-def test_the_map_and_the_genome_labels_are_staged_from_ONE_source():
-    """The route serves the roll-up key and the public label in one response, and a
-    label set narrower than the roll-up set leaves counts unlabelled. Staging both
-    from one source is what makes them agree by construction rather than by the
-    caller passing the same relation twice.
+    No DISTINCT, unlike the map-fed version this replaced — the mint answers once per
+    genome, so a duplicate is a fault to refuse rather than a fan-out to collapse.
     """
-    statements = ft.genome_map_relations_sql("genome_map_src")
-    assert statements == (
-        ft.map_table_sql("genome_map_src"),
-        ft.genome_label_table_sql("genome_map_src"),
-    )
-    for sql in statements:
-        assert "FROM genome_map_src" in sql
+    sql = ft.genome_label_table_sql("mint_src")
+    assert "DISTINCT" not in sql
+    assert "export_feature_id AS feature_id" in sql
+    assert "FROM mint_src" in sql
 
 
 def test_the_sample_label_table_renames_the_minted_handle():
@@ -739,13 +726,13 @@ def test_check_refuses_an_unlabelled_sample():
         _relabel_check(unlabelled_sample_rows=3)
 
 
-def test_check_refuses_a_source_id_collision():
-    """`qiita.genome`'s uniqueness is the COMPOSITE `(source, source_id)`, so two
-    genomes from different sources can share a `source_id`. Relabelling both to it
-    merges two organisms into one row of the published table — and BIOM SUMS
-    duplicate `(feature_id, sample_id)` pairs, so the merge is silent.
+def test_check_refuses_a_feature_id_collision():
+    """The mint's published namespace is UNIQUE across live rows, so this cannot happen
+    server-side — the same posture as the `export_id` case below. The check stays
+    because it costs one comparison and the failure is invisible: BIOM SUMS duplicate
+    `(feature_id, sample_id)` pairs, so two organisms would quietly become one row.
     """
-    with pytest.raises(ValueError, match="source_id"):
+    with pytest.raises(ValueError, match="export_feature_id"):
         _relabel_check(genomes=10, feature_ids=9)
 
 

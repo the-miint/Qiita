@@ -641,47 +641,48 @@ def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
 # ---------------------------------------------------------------------------
 # The relabel to public identifiers, against real miint
 #
-# The genome map as the route serves it: one row per (feature, genome) PAIR with the
-# genome's provenance, so G400's two contigs make it appear twice — which is what
-# `genome_label_table_sql`'s DISTINCT is for.
+# BOTH label relations come from a mint: one handle per published sample, one per
+# published genome. Neither is derived from the genome map — the map is the roll-up
+# key, and what a row is NAMED is a question only the mint can answer.
 # ---------------------------------------------------------------------------
 
-_SOURCE = "refseq"
-_SOURCE_IDS = {
+# The exported-feature mint's answer per genome. Accessions here because that is the
+# usual case — the mint publishes a genome's real accession wherever it is unique
+# across the published namespace, and a `QF<n>` handle only where it is not.
+_FEATURE_HANDLES = {
     100: "GCF_000000100",
     200: "GCF_000000200",
     300: "GCF_000000300",
     400: "GCF_000000400",
 }
-# The mint's answer for the two samples the alignment fixture uses.
+# The exported-identifier mint's answer for the two samples the alignment fixture uses.
 _HANDLES = [(1, "QM1"), (2, "QM2")]
 
 
-def _genome_map(mapping, source_ids=None) -> list[tuple]:
-    """`mapping` widened with each genome's provenance, as the genome-map route
-    returns it. A genome absent from `source_ids` is dropped, which is how a test
-    stages a map that does not cover every genome the counts mention."""
-    ids = _SOURCE_IDS if source_ids is None else source_ids
-    return [(f, g, _SOURCE, ids[g]) for f, g in mapping if g in ids]
+def _feature_handles(mapping, handles=None) -> list[tuple]:
+    """The exported-feature mint's response for the genomes in `mapping`, one row per
+    genome. A genome absent from `handles` is dropped, which is how a test stages a
+    mint that does not cover every genome the counts mention."""
+    resolved = _FEATURE_HANDLES if handles is None else handles
+    genomes = sorted({g for _, g in mapping} & set(resolved))
+    return [(g, resolved[g]) for g in genomes]
 
 
-def _stage_labels(conn, *, genome_map, handles) -> None:
-    """Stage both label relations from the two responses a client holds."""
+def _stage_labels(conn, *, feature_handles, handles) -> None:
+    """Stage both label relations from the two mint responses a client holds."""
     conn.execute(
-        "CREATE TABLE _genome_map_src AS "
+        "CREATE TABLE _exported_feature_src AS "
         + _values(
-            genome_map,
-            "feature_idx, genome_idx, source, source_id",
-            "?::BIGINT, ?::BIGINT, ?::VARCHAR, ?::VARCHAR",
+            feature_handles, "genome_idx, export_feature_id", "?::BIGINT, ?::VARCHAR"
         ),
-        [x for r in genome_map for x in r],
+        [x for r in feature_handles for x in r],
     )
     conn.execute(
         "CREATE TABLE _mint_src AS "
         + _values(handles, "prep_sample_idx, export_id", "?::BIGINT, ?::VARCHAR"),
         [x for r in handles for x in r],
     )
-    conn.execute(ft.genome_label_table_sql("_genome_map_src"))
+    conn.execute(ft.genome_label_table_sql("_exported_feature_src"))
     conn.execute(ft.sample_label_table_sql("_mint_src"))
 
 
@@ -707,15 +708,15 @@ def _public_table(
     mapping=_MAP,
     lengths=_LENGTHS,
     gate=None,
-    genome_map=None,
+    feature_handles=None,
     handles=_HANDLES,
 ) -> list[tuple]:
     """Run the analytic AND the relabel, returning the PUBLIC table, sorted. Mirrors
     the client-side consumer's call order precisely.
 
-    `genome_map` defaults to the one derived from `mapping`, which is the invariant the
-    client-side stager enforces by construction (both label relations from one response);
-    a test that wants them to DISAGREE passes it explicitly.
+    `feature_handles` defaults to a mint response covering every genome in `mapping`,
+    which is what the client achieves by minting FROM the roll-up's own output; a test
+    that wants the two to DISAGREE passes it explicitly.
     """
     with connect_with_miint_staged() as conn:
         populated = _ogu_input(
@@ -724,7 +725,9 @@ def _public_table(
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(
             conn,
-            genome_map=_genome_map(mapping) if genome_map is None else genome_map,
+            feature_handles=(
+                _feature_handles(mapping) if feature_handles is None else feature_handles
+            ),
             handles=handles,
         )
         _relabel(conn)
@@ -750,7 +753,7 @@ def test_no_internal_identifier_survives_into_the_public_table():
     with connect_with_miint_staged() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 0.01)
         conn.execute(ft.ogu_output_table_sql(populated=populated))
-        _stage_labels(conn, genome_map=_genome_map(_MAP), handles=_HANDLES)
+        _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
         _relabel(conn)
         described = conn.execute(f"DESCRIBE {ft.LABELLED_RELATION}").fetchall()
 
@@ -759,9 +762,10 @@ def test_no_internal_identifier_survives_into_the_public_table():
 
 
 def test_a_multi_contig_genome_is_not_multiplied_by_the_relabel():
-    """G400's map rows are one per contig, so an un-DISTINCTed label join would repeat
-    its counts once per contig. Its value is 2.0 from two reads — the failure mode is
-    two rows of 2.0, or a 4.0, both of which read as a real number.
+    """G400 has two contigs, so it appears twice in the roll-up KEY. The label relation
+    is per-genome, so nothing can repeat its counts — this pins that the two shapes
+    still meet correctly. Its value is 2.0 from two reads; the failure mode is two rows
+    of 2.0, or a 4.0, both of which read as a real number.
     """
     rows = _public_table(ft.CoverageScope.POOLED, 0.2)
     assert rows == [
@@ -770,15 +774,19 @@ def test_a_multi_contig_genome_is_not_multiplied_by_the_relabel():
     ]
 
 
-def test_an_emitted_source_id_collision_is_refused():
-    """Two genomes sharing a `source_id` relabel to one row of the published table,
-    and a BIOM write SUMS the pair without comment. `qiita.genome` is unique on the
-    COMPOSITE `(source, source_id)`, so this is a state the database permits.
+def test_an_emitted_handle_collision_is_refused():
+    """Two genomes sharing one handle relabel to one row of the published table, and a
+    BIOM write SUMS the pair without comment.
+
+    The mint's published namespace is UNIQUE across live rows, so this is no longer a
+    state the server can produce — a genome whose accession is taken gets a `QF<n>`
+    instead. The check stays as a backstop against a label relation staged from
+    anywhere else, because the failure it catches is invisible in the output.
     """
-    colliding = dict(_SOURCE_IDS) | {400: _SOURCE_IDS[100]}
-    with pytest.raises(ValueError, match="source_id"):
+    colliding = dict(_FEATURE_HANDLES) | {400: _FEATURE_HANDLES[100]}
+    with pytest.raises(ValueError, match="export_feature_id"):
         _public_table(
-            ft.CoverageScope.POOLED, 0.2, genome_map=_genome_map(_MAP, source_ids=colliding)
+            ft.CoverageScope.POOLED, 0.2, feature_handles=_feature_handles(_MAP, colliding)
         )
 
 
@@ -787,9 +795,9 @@ def test_a_collision_between_genomes_the_threshold_DROPPED_is_not_refused():
     reference. G300 fails the 1% threshold, so its `source_id` colliding with G100's
     cannot merge anything — refusing it would fail a build whose output is correct.
     """
-    colliding = dict(_SOURCE_IDS) | {300: _SOURCE_IDS[100]}
+    colliding = dict(_FEATURE_HANDLES) | {300: _FEATURE_HANDLES[100]}
     assert _public_table(
-        ft.CoverageScope.POOLED, 0.01, genome_map=_genome_map(_MAP, source_ids=colliding)
+        ft.CoverageScope.POOLED, 0.01, feature_handles=_feature_handles(_MAP, colliding)
     ) == [
         ("QM1", "GCF_000000100", 1.0),
         ("QM1", "GCF_000000200", 1.0),
@@ -799,15 +807,16 @@ def test_a_collision_between_genomes_the_threshold_DROPPED_is_not_refused():
 
 
 def test_a_genome_with_no_public_handle_is_refused():
-    """Staged deliberately from a map that omits G400 — which
-    `genome_map_relations_sql` exists to prevent, since the roll-up key and the label
-    then come from one response. This pins the backstop: the alternative is a
-    published row whose feature_id is NULL.
+    """Staged deliberately from a mint response that omits G400.
+
+    The client mints FROM the roll-up's own output, so this should be unreachable
+    there; it is the backstop for a mint resolved against some other genome set — the
+    alternative being a published row whose feature_id is NULL.
     """
-    partial = {k: v for k, v in _SOURCE_IDS.items() if k != 400}
+    partial = {k: v for k, v in _FEATURE_HANDLES.items() if k != 400}
     with pytest.raises(ValueError, match="genome"):
         _public_table(
-            ft.CoverageScope.POOLED, 0.2, genome_map=_genome_map(_MAP, source_ids=partial)
+            ft.CoverageScope.POOLED, 0.2, feature_handles=_feature_handles(_MAP, partial)
         )
 
 
@@ -835,7 +844,7 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 1.0)
         assert not populated
         conn.execute(ft.ogu_output_table_sql(populated=populated))
-        _stage_labels(conn, genome_map=_genome_map(_MAP), handles=_HANDLES)
+        _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
         clearance = _relabel(conn)
         described = [
             (r[0], r[1]) for r in conn.execute(f"DESCRIBE {ft.LABELLED_RELATION}").fetchall()

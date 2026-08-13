@@ -136,6 +136,7 @@ from qiita_common.models.reference import (
     INDEX_TYPE_BOWTIE2,
     INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_RYPE_ROUTER,
+    MAX_EXPORTED_FEATURE_ENTITIES,
     READ_MASK_BUCKET,
     VALID_STATUS_TRANSITIONS,
     ExportedFeature,
@@ -380,6 +381,7 @@ __all__ = [
     # Reference.
     "FeatureHashEntry",
     "FieldDataType",
+    "MAX_EXPORTED_FEATURE_ENTITIES",
     "ExportedFeature",
     "ExportedFeatureRequest",
     "ExportedFeatureResponse",

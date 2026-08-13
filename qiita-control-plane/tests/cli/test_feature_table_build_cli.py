@@ -159,8 +159,10 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
     return argparse.Namespace(**(fields | overrides))
 
 
-def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None):
-    """Patch the four REST seams, both ticket mints, and the Flight client; return the
+def _patched(
+    monkeypatch, *, alignment=None, map_entries=None, cohort=None, feature_handles=None
+):
+    """Patch the five REST seams, both ticket mints, and the Flight client; return the
     recorder every assertion below reads. A test that wants a seam to RAISE re-patches
     it itself afterwards, rather than this growing a parameter per failure mode."""
     rec: dict = {"lengths_minted": 0}
@@ -189,6 +191,29 @@ def _patched(monkeypatch, *, alignment=None, map_entries=None, cohort=None):
         return [i for i in _IDENTIFIERS if i["prep_sample_idx"] in prep_sample_idx]
 
     monkeypatch.setattr(ftc, "_mint_exported_identifiers", _mint_ids)
+
+    def _mint_features(base_url, token, *, genome_idx):
+        """Stands in for the exported-feature mint. Answers with each genome's own
+        accession, which is what the real mint does whenever that accession is unique
+        in the published namespace — `feature_handles` overrides it for the tests that
+        need a handle the accession would not produce."""
+        rec["minted_genomes"] = list(genome_idx)
+        resolved = (
+            {e["genome_idx"]: e["source_id"] for e in (map_entries or _MAP_ENTRIES)}
+            if feature_handles is None
+            else feature_handles
+        )
+        return [
+            {
+                "genome_idx": g,
+                "export_feature_id": resolved[g],
+                "accession": resolved[g],
+                "accession_published": True,
+            }
+            for g in genome_idx
+        ]
+
+    monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
 
     def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
         rec["columns"] = list(columns)
@@ -443,27 +468,44 @@ def test_an_existing_output_is_refused_before_any_streaming(monkeypatch, tmp_pat
     assert not _FakeFlightClient.instances
 
 
-def test_two_genomes_under_one_source_id_stop_the_build(monkeypatch, tmp_path, capsys):
-    """`qiita.genome` is unique on the COMPOSITE (source, source_id), so two sources can
-    each use one source_id — and a BIOM write SUMS duplicate (feature_id, sample_id)
-    pairs, so merging two organisms under one handle would never surface in the file.
-    The refusal is the analytic's; what this pins is that it exits non-zero with the
-    message and leaves nothing behind.
+def test_a_mint_answering_one_handle_for_two_genomes_stops_the_build(
+    monkeypatch, tmp_path, capsys
+):
+    """A BIOM write SUMS duplicate (feature_id, sample_id) pairs, so merging two
+    organisms under one handle would never surface in the file.
 
-    A genome with no label at all is NOT reachable here, by construction: both the
-    roll-up key and the label relation are staged from the one genome-map response, and
-    the roll-up's INNER JOIN drops any alignment whose feature the map does not carry.
+    The published namespace is UNIQUE across the mint's live rows, so the server cannot
+    answer this way — a genome whose accession is taken gets a `QF<n>`. What this pins
+    is the client-side backstop: it exits non-zero with the message and leaves nothing
+    behind.
+
+    A genome with no label at all is not reachable either: the mint is asked for the
+    roll-up's OWN output, so the label set covers the counts by construction.
     """
-    colliding = [
-        {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_1"},
-        {"feature_idx": 20, "genome_idx": 200, "source": "genbank", "source_id": "GCF_1"},
-    ]
-    _patched(monkeypatch, map_entries=colliding)
+    _patched(monkeypatch, feature_handles={100: "GCF_1", 200: "GCF_1"})
     args = _namespace(tmp_path)
 
     assert ftc._handle_feature_table_build(args, parser=None) == 1
     assert "merges genomes" in capsys.readouterr().err
     assert not list(tmp_path.iterdir())
+
+
+def test_the_row_labels_are_minted_only_for_the_genomes_actually_published(
+    monkeypatch, tmp_path
+):
+    """A public handle is a durable act, so the mint is asked for the genomes the
+    roll-up EMITTED — not for every genome in the reference. Minting the reference's
+    whole set because a table mentioned it would leave permanent public identifiers for
+    rows nobody published; for GG2's backbone that is a six-figure number of them.
+
+    At this threshold G200 (0.012 breadth) fails and G100 (0.5) survives, so the map
+    covers two genomes and exactly one is minted for.
+    """
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.02)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["minted_genomes"] == [100]
 
 
 def test_biom_is_written_when_asked_for(monkeypatch, tmp_path):

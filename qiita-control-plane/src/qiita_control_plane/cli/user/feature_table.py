@@ -27,13 +27,19 @@ from qiita_common import feature_table as ft
 from qiita_common.api_paths import (
     PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_PREFIX,
+    PATH_EXPORTED_FEATURE_PREFIX,
+    PATH_EXPORTED_FEATURE_ROOT,
     PATH_EXPORTED_IDENTIFIER_PREFIX,
     PATH_EXPORTED_IDENTIFIER_ROOT,
     PATH_REFERENCE_DOGET,
     PATH_REFERENCE_GENOME_MAP,
     PATH_REFERENCE_PREFIX,
 )
-from qiita_common.models import ExportedIdentifierRequest
+from qiita_common.models import (
+    MAX_EXPORTED_FEATURE_ENTITIES,
+    ExportedFeatureRequest,
+    ExportedIdentifierRequest,
+)
 
 from .. import _common
 from .alignment import _alignment_reference_idx, _fetch_alignment_cohort, _fetch_pool_alignments
@@ -44,6 +50,7 @@ from .alignment import _alignment_reference_idx, _fetch_alignment_cohort, _fetch
 # see `_stage_genome_map`).
 _GENOME_MAP_SOURCE = "genome_map_response"
 _MINT_SOURCE = "exported_identifier_response"
+_EXPORTED_FEATURE_SOURCE = "exported_feature_response"
 
 # The relations each Flight stream is registered as, for the duration of the one
 # CREATE that drains it (see `_staged_stream`).
@@ -84,6 +91,31 @@ def _mint_exported_identifiers(
     ).model_dump()
     path = f"{PATH_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
     return _common.call("POST", base_url, token, path, json=body)["identifiers"]
+
+
+def _mint_exported_features(
+    base_url: str, token: str, *, genome_idx: list[int]
+) -> list[dict[str, Any]]:
+    """Mint (or recover) the public handle of each genome the table will publish.
+
+    **Batched, because the reference is not the unit here.** The route caps one request
+    at `MAX_EXPORTED_FEATURE_ENTITIES`, and a whole-reference genome set runs well past
+    it — GG2's backbone alone is a six-figure count. Minting is idempotent server-side,
+    which is what makes splitting one logical mint across N requests safe: a batch that
+    fails can be retried, and a batch already minted returns the handles it minted
+    before.
+
+    Sorted so the same genome set always produces the same request bytes, and so a
+    failure names a batch a reader can locate rather than an arbitrary slice.
+    """
+    ordered = sorted(genome_idx)
+    entries: list[dict[str, Any]] = []
+    path = f"{PATH_EXPORTED_FEATURE_PREFIX}{PATH_EXPORTED_FEATURE_ROOT}"
+    for start in range(0, len(ordered), MAX_EXPORTED_FEATURE_ENTITIES):
+        batch = ordered[start : start + MAX_EXPORTED_FEATURE_ENTITIES]
+        body = ExportedFeatureRequest(genome_idx=batch).model_dump()
+        entries.extend(_common.call("POST", base_url, token, path, json=body)["identifiers"])
+    return entries
 
 
 def _create_alignment_doget_ticket(
@@ -128,32 +160,46 @@ def _create_lengths_doget_ticket(base_url: str, token: str, *, reference_idx: in
 
 
 def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
-    """Stage the genome-map response into both relations it feeds — the roll-up key and
-    the public label — from the one response, so they cannot disagree about which
-    genomes exist.
+    """Stage the genome-map response into the roll-up key, `MAP_TABLE`.
 
     The arrow schema is written out rather than inferred: miint's functions take native
     BIGINT id columns, and an empty map (a 16S reference has no genome-bearing features)
     would otherwise stage NULL-typed columns that fail the first join.
 
-    The response's `source` is not staged. It exists so a consumer can tell two
-    same-`source_id` genomes apart, and `check_relabel_diagnostics` is what acts on
-    that — by refusing; a published table names the genome by `source_id` alone.
+    Neither `source` nor `source_id` is staged. The map's job here is the roll-up key;
+    what a published row is NAMED comes from the exported-feature mint, which is the
+    only authority on whether a genome's accession is unique in the published
+    namespace.
     """
     import pyarrow as pa  # noqa: PLC0415
 
     # `from_pylist` with an explicit schema keeps the declared types AND reads the
     # entries once — a column-at-a-time comprehension walks a quarter-million dicts
-    # three times. It also drops `source` for free, by selecting on the schema.
+    # three times. It also drops the accession columns for free, by selecting on the
+    # schema.
     source = pa.Table.from_pylist(
         entries,
-        schema=pa.schema(
-            [("feature_idx", pa.int64()), ("genome_idx", pa.int64()), ("source_id", pa.string())]
-        ),
+        schema=pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())]),
     )
     with _registered(con, _GENOME_MAP_SOURCE, source):
-        for sql in ft.genome_map_relations_sql(_GENOME_MAP_SOURCE):
-            con.execute(sql)
+        con.execute(ft.map_table_sql(_GENOME_MAP_SOURCE))
+
+
+def _stage_exported_features(con, entries: list[dict[str, Any]]) -> None:
+    """Stage the exported-feature mint's response into the genome-label relation.
+
+    `genome_idx` and `export_feature_id` only. The response also reports the accession
+    each genome *wanted* and whether it won, which is how a caller learns why a label
+    is a `QF<n>` — useful to read, and not what a published row is named with.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+
+    source = pa.Table.from_pylist(
+        entries,
+        schema=pa.schema([("genome_idx", pa.int64()), ("export_feature_id", pa.string())]),
+    )
+    with _registered(con, _EXPORTED_FEATURE_SOURCE, source):
+        con.execute(ft.genome_label_table_sql(_EXPORTED_FEATURE_SOURCE))
 
 
 def _stage_exported_identifiers(con, identifiers: list[dict[str, Any]]) -> None:
@@ -272,6 +318,21 @@ def _build_ogu_output(con, *, scope: ft.CoverageScope, coverage_threshold: float
     rows = con.execute(ft.ogu_input_count_sql()).fetchone()[0]
     con.execute(ft.ogu_output_table_sql(populated=bool(rows)))
     con.execute(ft.drop_ogu_input_table_sql())
+
+
+def _published_genome_idxs(con) -> list[int]:
+    """The genomes the roll-up actually emitted, ascending.
+
+    Read AFTER the coverage filter, not from the genome map, and that is the whole
+    point: a reference's genome set is the wrong unit to mint public handles for. A
+    handle is a durable public act, and minting one for every genome in GG2's backbone
+    because a table mentioned the reference would leave six figures of permanent
+    identifiers for rows nobody published.
+    """
+    rows = con.execute(
+        f"SELECT DISTINCT genome_idx FROM {ft.OGU_OUTPUT_TABLE} ORDER BY genome_idx"
+    ).fetchall()
+    return [genome_idx for (genome_idx,) in rows]
 
 
 def _relabel(con) -> ft.LabelClearance:
@@ -532,6 +593,14 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         con,
         scope=ft.CoverageScope(args.coverage_scope),
         coverage_threshold=args.coverage_threshold,
+    )
+    # The row labels are minted here rather than beside the sample labels above,
+    # because only now is the published genome set known — see `_published_genome_idxs`.
+    _stage_exported_features(
+        con,
+        _mint_exported_features(
+            args.base_url, token, genome_idx=_published_genome_idxs(con)
+        ),
     )
     clearance = _relabel(con)
     written = _write_bundle(con, table_path=args.output, fmt=args.format, identifiers=identifiers)

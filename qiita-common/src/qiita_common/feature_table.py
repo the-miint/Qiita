@@ -760,10 +760,10 @@ SAMPLE_LABEL_TABLE = "sample_label"
 # moment the BIOM writer is building its sparse matrix.
 LABELLED_RELATION = "feature_table_labelled"
 
-# What a PUBLISHED table carries, name -> SQL type. Neither id is one of ours:
-# `sample_id` is the minted `export_id` and `feature_id` the genome's `source_id`,
-# both of which mean something to somebody outside this system — an `*_idx` does
-# not, and is not a handle we promise to keep.
+# What a PUBLISHED table carries, name -> SQL type. Neither id is one of ours: both
+# come from a mint whose job is to hand out a handle that means something outside this
+# system — `export_id` per processed sample, `export_feature_id` per row. An `*_idx`
+# means nothing out there and is not a handle we promise to keep.
 #
 # The VARCHAR types are why the relabel is load-bearing rather than cosmetic: BIOM
 # requires both id columns as VARCHAR while woltka hands back native BIGINTs, so
@@ -793,37 +793,25 @@ def ogu_output_table_sql(*, populated: bool) -> str:
 
 
 def genome_label_table_sql(source: str) -> str:
-    """`genome_idx -> feature_id` from `source`, the genome map as the route serves
-    it (`(feature_idx, genome_idx, source, source_id)`).
+    """`genome_idx -> feature_id` from `source`, the exported-feature mint's response
+    as the route returns it (`(genome_idx, export_feature_id, …)`).
 
-    **DISTINCT is load-bearing.** The map carries one row per (feature, genome)
-    PAIR, so a genome with N contigs appears N times; joining it un-deduplicated
-    multiplies that genome's every count by N. The result is a plausible table, not
-    an error, which is why the collapse happens here rather than being left to
-    whoever stages the map.
+    One row per genome already, so no DISTINCT: a duplicate here would be a mint that
+    answered twice for one genome, which `check_relabel_diagnostics` refuses rather
+    than silently collapsing — the two rows might carry different handles. Same shape
+    and same reasoning as `sample_label_table_sql`.
 
-    `source` rides along in the map but not in this relation: it exists so a
-    consumer can tell two same-`source_id` genomes apart, and the collision check
-    below is what acts on that — a published table names the genome by `source_id`
-    alone.
+    **The handle is not always the genome's accession**, which is why this reads a
+    minted column and not `genome.source_id`: the mint publishes the accession
+    wherever one exists and is unique across the published namespace, and a `QF<n>`
+    handle where it is not. The uniqueness that makes a published label name one thing
+    is a database constraint on that mint, not something a client can assert about a
+    map it was handed.
     """
     return (
         f"CREATE TABLE {GENOME_LABEL_TABLE} AS "
-        f"SELECT DISTINCT genome_idx, source_id AS feature_id FROM {source}"
+        f"SELECT genome_idx, export_feature_id AS feature_id FROM {source}"
     )
-
-
-def genome_map_relations_sql(source: str) -> tuple[str, ...]:
-    """Both relations the genome map feeds, from ONE source, in creation order: the
-    roll-up key (`MAP_TABLE`) and the public label (`GENOME_LABEL_TABLE`).
-
-    The route serves them in a single response and they must not disagree about which
-    genomes exist — a label set narrower than the roll-up set leaves counts with no
-    public handle, which `check_relabel_diagnostics` then refuses. Staging both here
-    makes them agree by construction instead. The two builders stay separately
-    callable for the server-side job, which rolls up but never relabels.
-    """
-    return (map_table_sql(source), genome_label_table_sql(source))
 
 
 def sample_label_table_sql(source: str) -> str:
@@ -917,10 +905,10 @@ def check_relabel_diagnostics(
         raise ValueError(
             f"the label join changed the table's size: {output_rows} counted rows "
             f"became {labelled_rows}. A label relation holding more than one row for "
-            f"one key repeats every count for that key and inflates its value. "
-            f"`{GENOME_LABEL_TABLE}` is DISTINCT over the genome map's per-contig "
-            f"fan-out, so check the exported-identifier map for a repeated "
-            f"prep_sample, or the genome map for a genome carrying two source_ids."
+            f"one key repeats every count for that key and inflates its value. Both "
+            f"label relations are staged from a mint that answers once per entity, so "
+            f"check whichever response was staged for a repeated genome_idx or "
+            f"prep_sample_idx."
         )
 
     # Both unlabelled checks run BEFORE the collision checks below, which compare
@@ -932,9 +920,9 @@ def check_relabel_diagnostics(
         raise ValueError(
             f"{unlabelled_genome_rows} of {output_rows} rows name a genome with no "
             f"public handle, so the published table would carry a NULL feature_id. "
-            f"The genome map has to cover every genome the counts mention — the usual "
-            f"cause is a map fetched for a different reference than the alignment was "
-            f"run against."
+            f"The exported-feature mint has to cover every genome the counts mention — "
+            f"mint it for the genomes the roll-up actually emitted, not for a set "
+            f"resolved before the coverage filter ran."
         )
     if unlabelled_sample_rows:
         raise ValueError(
@@ -947,13 +935,13 @@ def check_relabel_diagnostics(
     if feature_ids < genomes:
         raise ValueError(
             f"{genomes} genomes in this table share only {feature_ids} distinct "
-            f"source_ids, so relabelling merges genomes that are not the same "
-            f"organism. `qiita.genome` is unique on the COMPOSITE (source, "
-            f"source_id), so two sources can each use one source_id — and upstream "
-            f"documents that a BIOM write SUMS duplicate (feature_id, sample_id) "
-            f"pairs, so the merge would never surface. Restrict the reference to one "
-            f"source, or relabel from a handle that is unique across the emitted "
-            f"genomes."
+            f"export_feature_ids, so relabelling merges genomes that are not the same "
+            f"organism. The mint's published namespace is UNIQUE across live rows, so "
+            f"this cannot happen server-side — but the check costs one comparison and "
+            f"the failure it guards is invisible: upstream documents that a BIOM write "
+            f"SUMS duplicate (feature_id, sample_id) pairs, so two organisms would "
+            f"quietly become one row. A response staged from anywhere other than the "
+            f"mint route is the thing to suspect."
         )
     if sample_ids < samples:
         raise ValueError(
