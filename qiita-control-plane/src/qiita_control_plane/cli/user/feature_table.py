@@ -476,6 +476,10 @@ _IDENTIFIER_MAP_SUFFIX = ".exported-identifier.json"
 # Derived the same way, and NOT optional — see `_manifest_payload`.
 _MANIFEST_SUFFIX = ".manifest.json"
 
+# What a version the manifest could not resolve reads as. Spelled once so the two places
+# that can fall back cannot disagree about the word.
+_UNKNOWN_VERSION = "unknown"
+
 MANIFEST_NOTE = (
     "This file records what produced the table beside it. Coverage filtering makes a"
     " feature table a function of the whole cohort it was built over, not only of the"
@@ -521,21 +525,34 @@ def _tool_versions(con) -> dict[str, str]:
 
     The alignment's OWN aligner version is not here and cannot be: it ran server-side,
     under whatever build that host had. `params_hash` is what identifies that processing.
+
+    **An unreadable version is `"unknown"`, never a refusal.** These describe the build,
+    not the data: a run whose table, sidecars and digests are all correct must not be
+    thrown away because a version string could not be resolved. `PackageNotFoundError` is
+    the one that actually happens — a from-source run with no installed distribution —
+    and `landing.py` guards the same call the same way for the same reason.
     """
     duckdb_version = con.execute("SELECT version()").fetchone()[0]
-    miint_version = con.execute(
+    # Both halves matter: no row at all, and a row whose version is NULL. Testing the
+    # tuple alone would let `(None,)` through as a JSON null.
+    miint_row = con.execute(
         "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'miint'"
     ).fetchone()
+    try:
+        cli_version = metadata.version("qiita-control-plane")
+    except metadata.PackageNotFoundError:
+        cli_version = _UNKNOWN_VERSION
     return {
         "duckdb": duckdb_version,
-        "miint": miint_version[0] if miint_version else "unknown",
-        "qiita_cli": metadata.version("qiita-control-plane"),
+        "miint": miint_row[0] if miint_row and miint_row[0] else _UNKNOWN_VERSION,
+        "qiita_cli": cli_version,
     }
 
 
 def _manifest_payload(
     *,
     args: argparse.Namespace,
+    gate: ft.AlignmentGate | None,
     summary: dict[str, Any],
     reference: dict[str, Any],
     export_processing_id: str,
@@ -560,8 +577,12 @@ def _manifest_payload(
     No build timestamp, deliberately. Nothing here would use one, and leaving it out makes
     the manifest a pure function of its inputs — so two bundles built the same way are
     byte-identical and can be diffed to show it.
+
+    **`gate` is passed in, not rebuilt from `args`.** Deriving it a second time would agree
+    today — `_gate_from_args` is pure and nothing mutates the namespace — but a record of
+    which rows were kept has to be the gate that kept them, and "two derivations that
+    happen to agree" is the shape that has already produced defects on this branch.
     """
-    gate = _gate_from_args(args)
     return {
         "note": MANIFEST_NOTE,
         "processing": {
@@ -742,10 +763,11 @@ def _write_bundle(
         # sentence a user opening the file needs. The encoding is named rather than left to
         # the locale's — that is what makes writing those characters safe on a machine
         # whose default is not UTF-8.
-        for partial, document in (
-            (map_partial, payload),
-            (manifest_partial, manifest(targets)),
-        ):
+        # Built before the loop rather than inside its tuple literal, where it would be
+        # called before the first iteration regardless of where it is written — harmless
+        # while the callable is pure, and a trap the moment one is not.
+        manifest_document = manifest(targets)
+        for partial, document in ((map_partial, payload), (manifest_partial, manifest_document)):
             with partial.open("w", encoding="utf-8") as handle:
                 json.dump(document, handle, indent=2, ensure_ascii=False)
                 handle.write("\n")
@@ -938,6 +960,7 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
         identifiers=identifiers,
         manifest=lambda files: _manifest_payload(
             args=args,
+            gate=gate,
             summary=summary,
             reference=reference,
             export_processing_id=export_processing_id,

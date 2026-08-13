@@ -1149,4 +1149,57 @@ def test_a_params_hash_mismatch_stops_the_build_before_anything_is_written(
     assert ftc._handle_feature_table_build(args, parser=None) == 1
     assert "params_hash" in capsys.readouterr().err
     assert not list(tmp_path.iterdir())
+    # Both mints, named separately. The processing handle is the one this test's premise
+    # is about, and asserting only the identifier mint would prove it just transitively —
+    # via an ordering inside `_run_build` that nothing here checks.
+    assert "processing_cohort" not in rec, "no public handle for a processing we cannot vouch for"
     assert "minted_cohort" not in rec, "nothing should be minted for a build that cannot run"
+
+
+def test_a_version_the_manifest_cannot_resolve_is_recorded_as_unknown(monkeypatch, tmp_path):
+    """These describe the build, not the data. A run whose table, digests and sidecars are
+    all correct must not be thrown away because a version string could not be read — and
+    `PackageNotFoundError` is the one that happens, on a from-source run with no installed
+    distribution. It is also an ImportError, which no `except` in the handler catches, so
+    unguarded it would be a traceback rather than a build.
+    """
+    _patched(monkeypatch)
+
+    def _absent(name):
+        raise ftc.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(ftc.metadata, "version", _absent)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    tools = _manifest(tmp_path)["tools"]
+    assert tools["qiita_cli"] == "unknown"
+    # The two it could still read are unaffected.
+    assert tools["duckdb"] and tools["duckdb"] != "unknown"
+    assert tools["miint"] != "unknown"
+
+
+class _VersionCatalog:
+    """A connection stub answering the two version queries. `duckdb_extensions()` cannot be
+    made to yield a NULL version through a real install, so the guard for that row is
+    pinned here instead of by inspection."""
+
+    def __init__(self, miint_row):
+        self._miint_row = miint_row
+
+    def execute(self, sql):
+        self._row = ("v1.5.4",) if "SELECT version()" in sql else self._miint_row
+        return self
+
+    def fetchone(self):
+        return self._row
+
+
+@pytest.mark.parametrize("miint_row", [None, (None,)], ids=["no-row", "null-version"])
+def test_an_unresolvable_miint_version_is_a_string_not_a_json_null(miint_row):
+    """A row that is present but carries no version is a non-empty tuple, so testing the
+    tuple alone would return None and write `"miint": null` — breaking the declared
+    `dict[str, str]` while looking like a working fallback."""
+    tools = ftc._tool_versions(_VersionCatalog(miint_row))
+    assert tools["miint"] == "unknown"
+    assert all(isinstance(value, str) for value in tools.values())
