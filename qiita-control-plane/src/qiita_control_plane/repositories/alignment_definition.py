@@ -181,7 +181,8 @@ async def list_alignments_over_prep_samples(
         "   WHERE prep_sample_idx = ANY($1::bigint[])"
         "   GROUP BY alignment_idx"
         ")"
-        " SELECT c.alignment_idx, ad.params, c.samples_completed, c.samples_total"
+        " SELECT c.alignment_idx, ad.params, ad.params_hash,"
+        "        c.samples_completed, c.samples_total"
         "   FROM counted c"
         "   JOIN qiita.alignment_definition ad ON ad.alignment_idx = c.alignment_idx"
         "  ORDER BY c.alignment_idx",

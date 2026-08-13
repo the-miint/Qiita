@@ -17,6 +17,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_POOL_ALIGNMENT,
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
 )
+from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.cli.user import alignment as al
 
@@ -25,7 +26,16 @@ _ALIGNMENTS = {
     "sequencing_run_idx": 4,
     "sequenced_pool_idx": 5,
     "alignments": [
-        {"alignment_idx": 3, "params": _PARAMS, "samples_completed": 2, "samples_total": 2}
+        {
+            "alignment_idx": 3,
+            "params": _PARAMS,
+            # The real digest, not a placeholder — the client verifies it, so a
+            # fixture with a made-up hash would test the refusal instead of the
+            # happy path.
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "samples_completed": 2,
+            "samples_total": 2,
+        }
     ],
 }
 
@@ -94,10 +104,42 @@ def test_an_alignment_absent_from_the_pool_says_what_that_means():
         al._alignment_reference_idx(_ALIGNMENTS, alignment_idx=99)
 
 
+def test_params_that_do_not_hash_to_the_reported_digest_are_refused():
+    """The params round trip through JSON, and everything the build derives — the
+    reference, and later the manifest's record of how the table was made — is read
+    off them. Recomputing the server's own dedup digest turns "the params arrived
+    intact" from an assumption into a checked fact, and it is checked on the path the
+    build takes rather than in a helper nobody calls.
+    """
+    body = {"alignments": [{"alignment_idx": 3, "params": _PARAMS, "params_hash": "00" * 32}]}
+    with pytest.raises(ValueError, match="params_hash"):
+        al._alignment_reference_idx(body, alignment_idx=3)
+
+
+def test_an_alignment_reporting_no_params_hash_is_refused():
+    """Rather than skipping the check when the field is absent. A server too old to
+    report one is a server whose params this client cannot vouch for, and quietly
+    proceeding is how an unverifiable manifest gets published."""
+    body = {"alignments": [{"alignment_idx": 3, "params": _PARAMS}]}
+    with pytest.raises(ValueError, match="params_hash"):
+        al._alignment_reference_idx(body, alignment_idx=3)
+
+
 def test_params_without_a_reference_is_refused_rather_than_defaulted():
     """A `params` blob this old or this different is not something to guess around: the
     reference decides which genome map the whole table is relabelled through."""
-    body = {"alignments": [{"alignment_idx": 3, "params": {"aligner": "minimap2"}}]}
+    # A genuine digest for these params, so the integrity check passes and this test
+    # reaches the refusal it is about.
+    params = {"aligner": "minimap2"}
+    body = {
+        "alignments": [
+            {
+                "alignment_idx": 3,
+                "params": params,
+                "params_hash": canonical_params_hash(params).hex(),
+            }
+        ]
+    }
     with pytest.raises(ValueError, match="reference_idx"):
         al._alignment_reference_idx(body, alignment_idx=3)
 

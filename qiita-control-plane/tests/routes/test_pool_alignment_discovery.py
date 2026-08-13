@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_POOL_ALIGNMENT,
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
 )
+from qiita_common.hashing import canonical_params_hash
 
 pytestmark = pytest.mark.db
 
@@ -73,6 +74,65 @@ async def test_pool_alignment_list_counts_only_the_callers_readable_samples(ctx,
     assert by_idx[seeded["align_1"]]["samples_completed"] == 1
     assert by_idx[seeded["align_1"]]["samples_total"] == 2
     assert by_idx[seeded["align_1"]]["params"]["aligner"] == "minimap2"
+
+
+async def test_pool_alignment_list_reports_a_params_hash_the_caller_can_recompute(ctx, seeded):
+    """The digest the server dedups the definition on, so a client can prove the
+    `params` it received are the ones that were hashed.
+
+    Recomputing it here is the whole point rather than a restatement: a manifest
+    published beside a table cites `params_hash` as the reproducibility key, and a
+    client that copies a hash it never checked against the params it actually read
+    would publish a claim it cannot support. This is also the test that fails if
+    `canonical_params_hash` and the server's stored digest ever stop agreeing.
+    """
+    resp = await ctx["user"].get(_list_url(seeded))
+    assert resp.status_code == 200, resp.text
+    summary = next(a for a in resp.json()["alignments"] if a["alignment_idx"] == seeded["align_1"])
+
+    assert summary["params_hash"] == canonical_params_hash(summary["params"]).hex()
+    assert len(summary["params_hash"]) == 64, "SHA-256, rendered hex"
+
+
+async def test_pool_alignment_list_reports_the_stored_digest_not_a_recomputed_one(ctx, seeded):
+    """The field has to be the digest the server DEDUPS on, and for a well-formed
+    definition that is indistinguishable from hashing `params` on the way out — so
+    this seeds a definition whose stored hash deliberately does not match its params.
+
+    That state is not enforced against: `params_hash` is computed control-plane-side,
+    so a bug, a hand-edit, or a migration could put the two out of step. A route that
+    recomputed would paper over exactly that, and the client's recompute-and-refuse
+    check would become a comparison of a value with itself. The whole reason to
+    publish this digest in a manifest is that it is the system's own answer to "was
+    this the same processing".
+    """
+    db = ctx["pool"]
+    sentinel = bytes(range(32))
+    alignment_idx = await db.fetchval(
+        "SELECT (qiita.mint_alignment_definition($1, $2, $3)).alignment_idx",
+        sentinel,
+        '{"reference_idx": 1, "aligner": "minimap2", "drifted": true}',
+        seeded["owner_idx"],
+    )
+    await db.execute(
+        "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        alignment_idx,
+        seeded["ps_a"],
+    )
+    try:
+        resp = await ctx["user"].get(_list_url(seeded))
+        assert resp.status_code == 200, resp.text
+        summary = next(a for a in resp.json()["alignments"] if a["alignment_idx"] == alignment_idx)
+        assert summary["params_hash"] == sentinel.hex()
+        assert summary["params_hash"] != canonical_params_hash(summary["params"]).hex()
+    finally:
+        await db.execute(
+            "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", alignment_idx
+        )
+        await db.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
 
 
 async def test_pool_alignment_list_omits_an_alignment_the_caller_can_see_no_sample_of(ctx, seeded):

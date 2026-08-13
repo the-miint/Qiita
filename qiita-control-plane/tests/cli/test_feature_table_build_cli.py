@@ -22,6 +22,7 @@ import httpx
 import pyarrow as pa
 import pytest
 from qiita_common import feature_table as ft
+from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.miint import connect_with_miint
@@ -48,7 +49,15 @@ _IDENTIFIERS = [
 _PARAMS = {"reference_idx": 9, "aligner": "minimap2", "mask_idx": 2, "shard_ids": [0]}
 _ALIGNMENTS_BODY = {
     "alignments": [
-        {"alignment_idx": 3, "params": _PARAMS, "samples_completed": 2, "samples_total": 2}
+        {
+            "alignment_idx": 3,
+            "params": _PARAMS,
+            # The real digest: the build verifies it before reading anything off
+            # `params`, so a placeholder here would refuse every test in this module.
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "samples_completed": 2,
+            "samples_total": 2,
+        }
     ]
 }
 

@@ -695,6 +695,9 @@ async def list_sequenced_pool_alignments(
                 params=json.loads(row["params"])
                 if isinstance(row["params"], str)
                 else row["params"],
+                # Hex, not raw bytes: this is a string a client compares against its
+                # own `canonical_params_hash(params).hex()` and a manifest publishes.
+                params_hash=row["params_hash"].hex(),
                 samples_completed=row["samples_completed"],
                 samples_total=row["samples_total"],
             )

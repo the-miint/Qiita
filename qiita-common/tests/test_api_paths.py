@@ -333,6 +333,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_EXPORTED_FEATURE_PREFIX",
         "PATH_EXPORTED_FEATURE_ROOT",
     ),
+    # /exported-processing
+    (
+        "URL_EXPORTED_PROCESSING",
+        "PATH_EXPORTED_PROCESSING_PREFIX",
+        "PATH_EXPORTED_PROCESSING_ROOT",
+    ),
     # /prep-sample
     (
         "URL_PREP_SAMPLE_STUDY_LIST",

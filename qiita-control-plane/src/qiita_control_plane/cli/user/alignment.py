@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_ALIGNMENT_COHORT,
     PATH_SEQUENCING_RUN_PREFIX,
 )
+from qiita_common.hashing import canonical_params_hash
 
 from .. import _common
 
@@ -59,6 +60,52 @@ def _fetch_alignment_cohort(
     return _common.call("GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}")
 
 
+def _alignment_summary(alignments: dict, *, alignment_idx: int) -> dict:
+    """One alignment's summary out of the pool listing, with its `params` verified
+    against the digest the server reported for them.
+
+    **The verification is the reason this is a function rather than a dict lookup.**
+    Everything downstream is read off `params` — which reference the whole table is
+    relabelled through, and the record a published manifest makes of how the table was
+    produced — but `params` arrive as JSON, and a client that trusted them without
+    checking would derive all of that from whatever survived the round trip.
+    Recomputing the server's own dedup digest costs one hash and turns that into a
+    checked fact. A manifest also cites the digest as its reproducibility key, so
+    copying one we never verified would publish a claim we cannot support.
+
+    An absent `params_hash` is refused rather than skipped: a server too old to report
+    one is a server whose params this client cannot vouch for.
+    """
+    for summary in alignments.get("alignments", []):
+        if summary["alignment_idx"] != alignment_idx:
+            continue
+        params = summary.get("params", {})
+        reported = summary.get("params_hash")
+        computed = canonical_params_hash(params).hex()
+        if reported is None:
+            raise ValueError(
+                f"alignment {alignment_idx} reports no params_hash, so its params cannot "
+                f"be checked against what the server recorded. That field is required "
+                f"here; a server too old to send one is a server this client cannot "
+                f"vouch for."
+            )
+        if reported != computed:
+            raise ValueError(
+                f"alignment {alignment_idx} reports params_hash {reported!r} but its "
+                f"params hash to {computed!r}. The config this table would be built "
+                f"from is not the one the server recorded, so nothing derived from it "
+                f"can be published."
+            )
+        return summary
+    present = sorted(s["alignment_idx"] for s in alignments.get("alignments", []))
+    raise ValueError(
+        f"alignment {alignment_idx} is not among this pool's alignments ({present}). An "
+        f"alignment you can read no sample of is absent from that list entirely, so this "
+        f"is either a wrong --alignment-idx or one over data you have no access to; "
+        f"`qiita alignment list` shows the ones you can use."
+    )
+
+
 def _alignment_reference_idx(alignments: dict, *, alignment_idx: int) -> int:
     """The reference an alignment ran against, read out of its own `params`.
 
@@ -67,24 +114,15 @@ def _alignment_reference_idx(alignments: dict, *, alignment_idx: int) -> int:
     reference, every `feature_idx` would miss it, and the relabel would then refuse on
     unlabelled genomes — loud, but a mistake the surface need not permit at all.
     """
-    for summary in alignments.get("alignments", []):
-        if summary["alignment_idx"] != alignment_idx:
-            continue
-        reference_idx = summary.get("params", {}).get("reference_idx")
-        if reference_idx is None:
-            raise ValueError(
-                f"alignment {alignment_idx} records no reference_idx in its params "
-                f"({sorted(summary.get('params', {}))}), so there is no genome map to "
-                f"relabel its counts through."
-            )
-        return reference_idx
-    present = sorted(s["alignment_idx"] for s in alignments.get("alignments", []))
-    raise ValueError(
-        f"alignment {alignment_idx} is not among this pool's alignments ({present}). An "
-        f"alignment you can read no sample of is absent from that list entirely, so this "
-        f"is either a wrong --alignment-idx or one over data you have no access to; "
-        f"`qiita alignment list` shows the ones you can use."
-    )
+    params = _alignment_summary(alignments, alignment_idx=alignment_idx).get("params", {})
+    reference_idx = params.get("reference_idx")
+    if reference_idx is None:
+        raise ValueError(
+            f"alignment {alignment_idx} records no reference_idx in its params "
+            f"({sorted(params)}), so there is no genome map to relabel its counts "
+            f"through."
+        )
+    return reference_idx
 
 
 def _handle_alignment_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

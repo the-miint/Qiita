@@ -47,6 +47,22 @@ duplicates further down are historical strata; leave them where they are.
   different sequences. The cost is accepted: re-loading a reference gives its features minted
   handles instead of the accessions they had.
 
+- **A published bundle can now say what produced it, without naming an `alignment_idx`.**
+  `POST /exported-processing` mints `QP<n>` for a processing — the third axis alongside
+  `/exported-identifier` (a table's columns) and `/exported-feature` (its rows). Coverage
+  filtering makes a feature table a function of the cohort it was built over rather than of the
+  samples in it, so a record of the processing is what makes the table reproducible at all, and
+  the only handle for it was internal. Unlike the feature mint this one is entirely minted with
+  no accession half: a processing is something we performed, so no outside authority has a name
+  for it.
+  `GET …/sequenced-pool/{pool}/alignment` now also reports each definition's **`params_hash`**
+  (hex) — the digest the control plane deduplicates on. It is the server's own answer to "was
+  this the same processing", so it is what a manifest cites for reproducibility, and it is
+  reported from storage rather than recomputed on the way out. The CLI **recomputes it from the
+  `params` beside it and refuses to build on a mismatch**, which turns "the config arrived
+  intact" from an assumption into a checked fact — everything the build derives, starting with
+  which reference the whole table is relabelled through, is read off those params.
+
 - **The feature-table analytic is now shared, and breadth of coverage has a per-sample
   scope.** The SQL that turns alignment rows into an OGU table moved out of the
   compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side
