@@ -88,6 +88,13 @@ from pathlib import Path
 # a path safe to interpolate into a SQL string literal, which cannot be bound — so it
 # is what both writers below use, BIOM included.
 from .parquet import PARQUET_OPTS, validate_parquet_path
+from .taxonomy import (
+    QUOTED_RANK_COLUMNS,
+    RANK_COLUMNS,
+    genome_representative_taxonomy_select_sql,
+    prefixed_rank_columns_sql,
+    rank_columns_sql,
+)
 
 
 class CoverageScope(StrEnum):
@@ -983,6 +990,216 @@ def labelled_relation_sql(*, clearance: LabelClearance) -> str:
 # reference, the cohort, the coverage scope and threshold, and any gate, none of
 # which the bundle records yet.
 BIOM_GENERATED_BY = "qiita"
+
+
+# ---------------------------------------------------------------------------
+# The taxonomy sidecar
+# ---------------------------------------------------------------------------
+
+# The reference's per-feature taxonomy, as streamed from the data plane's
+# exclusion-aware view. A real TABLE: the reduction below reads it twice (once to pick
+# each genome's representative, once to take that member's ranks), and a Flight stream
+# cannot be scanned twice.
+TAXONOMY_TABLE = "reference_taxonomy"
+
+# The published sidecar — a VIEW, for the reason `LABELLED_RELATION` is one: its only
+# reader is a COPY, and materializing would hold a second copy of it for nothing.
+TAXONOMY_SIDECAR_RELATION = "feature_taxonomy"
+
+# What the sidecar carries: the SAME `feature_id` the table's rows are named with, and
+# the eight ranks. One file joinable to the other on one column, which is the whole
+# reason both are labelled from one mint.
+#
+# No `genome_idx`, and no lineage string. The string form would be lossy in a way the
+# columns are not — see `qiita_common.taxonomy.genome_lineage_select_sql`.
+TAXONOMY_SIDECAR_SCHEMA = {"feature_id": "VARCHAR"} | {rank: "VARCHAR" for rank in RANK_COLUMNS}
+TAXONOMY_SIDECAR_COLUMNS = tuple(TAXONOMY_SIDECAR_SCHEMA)
+
+
+def taxonomy_table_sql(source: str) -> str:
+    """Materialize the streamed per-feature taxonomy into `TAXONOMY_TABLE`.
+
+    `source` is the caller's stream relation. Projected to `feature_idx` plus the eight
+    ranks: the stream also carries `reference_idx` and `ncbi_taxon_id` (always NULL
+    today), and holding a whole reference's worth of columns nothing reads is the kind
+    of cost that only shows up at GG2 scale.
+    """
+    return (
+        f"CREATE TABLE {TAXONOMY_TABLE} AS SELECT feature_idx, {rank_columns_sql()} FROM {source}"
+    )
+
+
+def taxonomy_sidecar_sql() -> str:
+    """Define `TAXONOMY_SIDECAR_RELATION`: one row per PUBLISHED row of the table, named
+    the same way, carrying its genome's ranks with the source prefixes restored.
+
+    Scoped to `GENOME_LABEL_TABLE` on both sides, which is what makes the sidecar
+    exactly as wide as the table: the label relation holds the genomes the roll-up
+    emitted, so restricting the reduction's member set to them is both the correct
+    row set and the cheap one — a reference's whole taxonomy is reduced only for the
+    genomes that survived.
+    """
+    published_members = (
+        f"(SELECT m.contig_id AS feature_idx, m.genome_id AS genome_idx"
+        f"   FROM {MAP_TABLE} m"
+        f"   JOIN {GENOME_LABEL_TABLE} l ON l.genome_idx = m.genome_id)"
+    )
+    reduction = genome_representative_taxonomy_select_sql(
+        member_genome=published_members, taxonomy=TAXONOMY_TABLE
+    )
+    return (
+        f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
+        f"SELECT g.feature_id, {prefixed_rank_columns_sql(alias='r')} "
+        f"FROM ({reduction}) r "
+        f"JOIN {GENOME_LABEL_TABLE} g ON g.genome_idx = r.genome_idx"
+    )
+
+
+@dataclass(frozen=True)
+class TaxonomyClearance:
+    """Evidence that `check_taxonomy_diagnostics` ran and passed, plus the sidecar's row
+    count so a caller can report the size without counting it again.
+
+    `taxonomy_copy_sql` takes one for the same reason `labelled_relation_sql` takes a
+    `LabelClearance`: a sidecar that does not line up with the table it accompanies is
+    a file people will join anyway.
+    """
+
+    rows: int
+
+
+def taxonomy_diagnostics_sql() -> str:
+    """One row for `check_taxonomy_diagnostics`, over the sidecar and the label set it
+    must match."""
+    return (
+        f"SELECT (SELECT count(*) FROM {GENOME_LABEL_TABLE}) AS published_rows, "
+        f"count(*) AS taxonomy_rows, "
+        f"count(DISTINCT feature_id) AS taxonomy_feature_ids, "
+        f"count(*) FILTER (WHERE feature_id IS NULL) AS unnamed_rows "
+        f"FROM {TAXONOMY_SIDECAR_RELATION}"
+    )
+
+
+def check_taxonomy_diagnostics(
+    *,
+    published_rows: int,
+    taxonomy_rows: int,
+    taxonomy_feature_ids: int,
+    unnamed_rows: int,
+) -> TaxonomyClearance:
+    """Refuse a sidecar that does not describe the table beside it, and return the
+    clearance `taxonomy_copy_sql` requires.
+
+    Every fault here is silent in the file: a short sidecar reads as "those rows are
+    unclassified", a duplicated one double-counts under any join, and a NULL name joins
+    to nothing. An unclassified genome is NOT one of these — it is present with NULL
+    ranks, which is a different statement and a legitimate one.
+    """
+    if unnamed_rows:
+        raise ValueError(
+            f"{unnamed_rows} taxonomy rows carry no feature_id, so nothing could join "
+            f"them to the table. The sidecar is named from the same label relation the "
+            f"table is, so this means that relation gained a NULL handle."
+        )
+    if taxonomy_rows != published_rows:
+        raise ValueError(
+            f"the taxonomy sidecar describes {taxonomy_rows} rows but the table "
+            f"publishes {published_rows}. A sidecar shorter than its table reads as "
+            f"though the missing rows were unclassified — an unclassified genome is "
+            f"present here with NULL ranks — and a longer one describes rows nobody "
+            f"can find."
+        )
+    if taxonomy_feature_ids != taxonomy_rows:
+        raise ValueError(
+            f"{taxonomy_rows} taxonomy rows carry only {taxonomy_feature_ids} distinct "
+            f"feature_ids, so joining the sidecar to the table would multiply the rows "
+            f"it duplicates. Each published row has exactly one representative member, "
+            f"so a repeat means the reference's taxonomy holds more than one row for "
+            f"one feature."
+        )
+    return TaxonomyClearance(rows=taxonomy_rows)
+
+
+def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
+    """COPY the sidecar to Parquet, with the options every qiita Parquet artifact
+    shares. Parquet and not TSV: the ranks are eight nullable strings, and a TSV cannot
+    tell an empty rank from an absent one without a convention every reader has to be
+    told about.
+
+    **Takes a `TaxonomyClearance`**, so it cannot be reached without having run
+    `check_taxonomy_diagnostics`; see that dataclass.
+    """
+    _ = clearance
+    # Quoted, because two of the eight ranks are SQL keywords. The Parquet column names
+    # are the unquoted ones — `TAXONOMY_SIDECAR_COLUMNS` — since quoting is how the
+    # identifier is written, not part of it.
+    projection = ", ".join(("feature_id", *QUOTED_RANK_COLUMNS))
+    return (
+        f"COPY (SELECT {projection} FROM {TAXONOMY_SIDECAR_RELATION}) "
+        f"TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# What the roll-up leaves behind
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RollupCoverage:
+    """How much of the streamed alignment the roll-up could carry to genome level.
+
+    Not a refusal. `ogu_input_table_sql`'s INNER JOIN to the map drops alignments to
+    features with no genome, and for some references that is most of them — a 16S
+    record is not an OGU and there is no genome-rooted row to emit for it. The count is
+    reported because the alternative is a table that is quietly a fraction of the data
+    the caller streamed, and nothing else in the recipe would ever mention it.
+    """
+
+    alignment_rows: int
+    unmapped_rows: int
+    unmapped_features: int
+
+    @property
+    def complete(self) -> bool:
+        return self.unmapped_rows == 0
+
+
+def rollup_coverage_diagnostics_sql() -> str:
+    """One row for `check_rollup_coverage`: how many staged alignment rows have no
+    genome to roll up to."""
+    return (
+        f"SELECT count(*) AS alignment_rows, "
+        f"count(*) FILTER (WHERE m.genome_id IS NULL) AS unmapped_rows, "
+        f"count(DISTINCT a.feature_idx) FILTER (WHERE m.genome_id IS NULL) "
+        f"    AS unmapped_features "
+        f"FROM {ALIGNMENT_TABLE} a "
+        f"LEFT JOIN {MAP_TABLE} m ON m.contig_id = a.feature_idx"
+    )
+
+
+def check_rollup_coverage(
+    *, alignment_rows: int, unmapped_rows: int, unmapped_features: int
+) -> RollupCoverage:
+    """Report what the roll-up will drop. Named `check_*` to pair with `_cleared`, but
+    it refuses nothing — see `RollupCoverage` for why a drop is not an error."""
+    return RollupCoverage(
+        alignment_rows=alignment_rows,
+        unmapped_rows=unmapped_rows,
+        unmapped_features=unmapped_features,
+    )
+
+
+def rollup_coverage_warning(coverage: RollupCoverage) -> str:
+    """The one wording for "your table does not cover all of what you streamed"."""
+    share = 100.0 * coverage.unmapped_rows / coverage.alignment_rows
+    return (
+        f"note: {coverage.unmapped_rows} of {coverage.alignment_rows} alignment rows "
+        f"({share:.1f}%) are to {coverage.unmapped_features} features with no genome in "
+        f"this reference, so they cannot be rolled up and are not in this table. A "
+        f"feature-rooted table is not built yet; until it is, this is the whole of what "
+        f"a genome-keyed table can say about this alignment."
+    )
 
 
 def parquet_copy_sql(path: Path) -> str:

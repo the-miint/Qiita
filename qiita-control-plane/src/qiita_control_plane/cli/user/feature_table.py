@@ -56,11 +56,18 @@ _EXPORTED_FEATURE_SOURCE = "exported_feature_response"
 # CREATE that drains it (see `_staged_stream`).
 _ALIGNMENT_STREAM = "alignment_stream"
 _LENGTHS_STREAM = "reference_lengths_stream"
+_TAXONOMY_STREAM = "reference_taxonomy_stream"
 
 # The data-plane table the per-feature lengths come from. Whole-reference, for the
 # reason `ft.genome_lengths_table_sql` gives: the coverage denominator is the FULL
 # genome length, so contigs with no alignment in the cohort are needed too.
 _SEQUENCES_TABLE = "reference_sequences"
+
+# The exclusion-aware VIEW, never the base table: a curated exclusion must not be
+# bypassable by a client that asks for taxonomy directly. An excluded feature therefore
+# has no taxonomy row, which the per-genome reduction already handles — a genome keeps
+# its lineage as long as one classified member survives.
+_TAXONOMY_TABLE = "reference_taxonomy_visible"
 
 
 def _fetch_genome_map(base_url: str, token: str, *, reference_idx: int) -> list[dict[str, Any]]:
@@ -149,13 +156,22 @@ def _create_alignment_doget_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-def _create_lengths_doget_ticket(base_url: str, token: str, *, reference_idx: int) -> bytes:
-    """Mint a WHOLE-reference `reference_sequences` DoGet ticket — every contig's
-    length, including contigs nothing aligned to. `feature_idx` is omitted rather than
-    passed empty, which is how that route spells whole-reference.
+def _create_reference_doget_ticket(
+    base_url: str, token: str, *, reference_idx: int, table: str
+) -> bytes:
+    """Mint a WHOLE-reference DoGet ticket for one of the reference's lake tables.
+
+    Whole-reference in both uses: `feature_idx` is omitted rather than passed empty,
+    which is how that route spells it. For lengths that is required — the coverage
+    denominator is the full genome, so contigs nothing aligned to are needed too; for
+    taxonomy it is simply cheaper than naming a reference's worth of features in a
+    request body.
+
+    Parameterized by `table` rather than one helper per table: the route already signs
+    every reference table this recipe reads, and the two calls differ in nothing else.
     """
     path = f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET.format(reference_idx=reference_idx)}"
-    resp = _common.call("POST", base_url, token, path, json={"table": _SEQUENCES_TABLE})
+    resp = _common.call("POST", base_url, token, path, json={"table": table})
     return base64.b64decode(resp["ticket"])
 
 
@@ -254,6 +270,27 @@ def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Itera
 
     with _registered(con, relation, flight_client.do_get(flight.Ticket(ticket)).to_reader()):
         yield relation
+
+
+def _stage_taxonomy(con, flight_client, ticket: bytes) -> None:
+    """Stream the reference's per-feature taxonomy into `TAXONOMY_TABLE`.
+
+    Staged INSIDE the Flight window even though the sidecar cannot be built until after
+    it closes: the stream is independent of which genomes survive, and reopening a
+    client later would break the invariant that the client lives only for the streams.
+    """
+    with _staged_stream(con, flight_client, ticket, relation=_TAXONOMY_STREAM) as source:
+        con.execute(ft.taxonomy_table_sql(source))
+
+
+def _build_taxonomy_sidecar(con) -> ft.TaxonomyClearance:
+    """Define the sidecar and refuse one that does not describe the table beside it.
+
+    Runs after the row labels are minted, because it is named from them — the sidecar
+    and the table carry the same `feature_id` or they cannot be used together.
+    """
+    con.execute(ft.taxonomy_sidecar_sql())
+    return _cleared(con, ft.taxonomy_diagnostics_sql(), ft.check_taxonomy_diagnostics)
 
 
 def _cleared(con, diagnostics_sql: str, check, *args):
@@ -362,6 +399,11 @@ DEFAULT_TABLE_FORMAT = "parquet"
 # caller chose is theirs.
 _IDENTIFIER_MAP_SUFFIX = ".exported-identifier.json"
 
+# Derived from the caller's name for the same reason, and named for what it holds
+# rather than for the reference it came from: a reference name is not ours to compose
+# into a filename either.
+_TAXONOMY_SUFFIX = ".taxonomy.parquet"
+
 # Written INTO the map as well as printed, because a warning that lives only in a
 # terminal is gone the moment the terminal is, and this file's whole hazard is that it
 # looks like part of the deliverable.
@@ -373,10 +415,10 @@ IDENTIFIER_MAP_NOTE = (
 )
 
 
-def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
-    """The two paths a bundle occupies, in write order — the table at exactly the name
-    the caller gave, and the identifier map beside it — checked to be writable and
-    unoccupied.
+def _bundle_targets(table_path: Path, fmt: str, *, taxonomy: bool = False) -> list[Path]:
+    """The paths a bundle occupies, in write order — the table at exactly the name the
+    caller gave, the identifier map beside it, and the taxonomy sidecar when asked for —
+    checked to be writable and unoccupied.
 
     Refuses a `fmt` the writers do not have, and a `table_path` whose extension names
     the OTHER format: a `.biom` holding Parquet bytes lies about itself to everyone
@@ -402,6 +444,8 @@ def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
             f"extension contradicts its contents misleads every reader of it."
         )
     targets = [table_path, table_path.with_name(table_path.stem + _IDENTIFIER_MAP_SUFFIX)]
+    if taxonomy:
+        targets.append(table_path.with_name(table_path.stem + _TAXONOMY_SUFFIX))
     parent = table_path.parent
     if not parent.is_dir():
         # Caught here rather than left to the writers: DuckDB's Parquet COPY and HDF5
@@ -415,7 +459,7 @@ def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
         # disk — so say which case this is rather than let a user guess before
         # deleting something.
         state = (
-            "an earlier run did not finish, since a complete bundle is both files"
+            "an earlier run did not finish, since a complete bundle is all of its files"
             if len(existing) < len(targets)
             else "an earlier run wrote this bundle"
         )
@@ -427,25 +471,33 @@ def _bundle_targets(table_path: Path, fmt: str) -> list[Path]:
 
 
 def _write_bundle(
-    con, *, table_path: Path, fmt: str, identifiers: list[dict[str, Any]]
+    con,
+    *,
+    table_path: Path,
+    fmt: str,
+    identifiers: list[dict[str, Any]],
+    taxonomy: ft.TaxonomyClearance | None = None,
 ) -> list[Path]:
-    """Write the bundle — the relabelled table at `table_path`, plus the
-    exported-identifier map beside it — and return the files written.
+    """Write the bundle — the relabelled table at `table_path`, the exported-identifier
+    map beside it, and the taxonomy sidecar when one was built — and return the files
+    written.
 
-    **Both files or neither**, and that is the table plus its map, not two copies of the
-    table: the two formats are the same numbers, so a run writes one of them. The map is
-    the other half because the table names its samples by `export_id` alone, so without
-    it a caller cannot join their own records back to the table; half a bundle is not a
-    partial result but a useless one.
+    **All of them or none**, and that is the table plus its companions, not two copies
+    of the table: the two formats are the same numbers, so a run writes one of them. The
+    map is a companion because the table names its samples by `export_id` alone, so
+    without it a caller cannot join their own records back; the sidecar is one because a
+    taxonomy naming rows the table does not contain is worse than no taxonomy. Half a
+    bundle is not a partial result but a useless one.
     """
-    targets = _bundle_targets(table_path, fmt)
+    targets = _bundle_targets(table_path, fmt, taxonomy=taxonomy is not None)
     pairs = [(p.with_name(p.name + ".partial"), p) for p in targets]
     for partial, _ in pairs:
         # Our own leftovers from a killed run. The BIOM writer refuses to overwrite ANY
         # existing target, partials included, so clearing them is what keeps a retry's
         # error about the user's files rather than ours.
         partial.unlink(missing_ok=True)
-    table_partial, map_partial = (partial for partial, _ in pairs)
+    table_partial, map_partial = (partial for partial, _ in pairs[:2])
+    taxonomy_partial = pairs[2][0] if taxonomy is not None else None
 
     def write() -> None:
         if fmt == "parquet":
@@ -465,6 +517,9 @@ def _write_bundle(
         with map_partial.open("w") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
+        if taxonomy_partial is not None:
+            con.execute("SET preserve_insertion_order=false")
+            con.execute(ft.taxonomy_copy_sql(taxonomy_partial, clearance=taxonomy))
 
     # No `mode`: the two files land side by side and one of them is meant to be
     # published, so a restrictive mode would be wrong for it. The map's hazard is
@@ -575,7 +630,17 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
             _stage_lengths(
                 con,
                 flight_client,
-                _create_lengths_doget_ticket(args.base_url, token, reference_idx=reference_idx),
+                _create_reference_doget_ticket(
+                    args.base_url, token, reference_idx=reference_idx, table=_SEQUENCES_TABLE
+                ),
+            )
+        if args.taxonomy:
+            _stage_taxonomy(
+                con,
+                flight_client,
+                _create_reference_doget_ticket(
+                    args.base_url, token, reference_idx=reference_idx, table=_TAXONOMY_TABLE
+                ),
             )
         _stage_alignment(
             con,
@@ -589,6 +654,9 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
             ),
             gate=gate,
         )
+    coverage = _cleared(con, ft.rollup_coverage_diagnostics_sql(), ft.check_rollup_coverage)
+    if not coverage.complete:
+        print(ft.rollup_coverage_warning(coverage), file=sys.stderr)
     _build_ogu_output(
         con,
         scope=ft.CoverageScope(args.coverage_scope),
@@ -598,12 +666,17 @@ def _run_build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], i
     # because only now is the published genome set known — see `_published_genome_idxs`.
     _stage_exported_features(
         con,
-        _mint_exported_features(
-            args.base_url, token, genome_idx=_published_genome_idxs(con)
-        ),
+        _mint_exported_features(args.base_url, token, genome_idx=_published_genome_idxs(con)),
     )
     clearance = _relabel(con)
-    written = _write_bundle(con, table_path=args.output, fmt=args.format, identifiers=identifiers)
+    taxonomy = _build_taxonomy_sidecar(con) if args.taxonomy else None
+    written = _write_bundle(
+        con,
+        table_path=args.output,
+        fmt=args.format,
+        identifiers=identifiers,
+        taxonomy=taxonomy,
+    )
     return written, clearance.rows
 
 
@@ -635,7 +708,7 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
     try:
         # Before anything else: a name already occupied, or a directory that is not
         # there, is not worth streaming a cohort and a whole reference to discover.
-        _bundle_targets(args.output, args.format)
+        _bundle_targets(args.output, args.format, taxonomy=args.taxonomy)
         with contextlib.closing(connect_with_miint()) as con:
             written, rows = _run_build(args, token, con)
     except _common.httpx.HTTPStatusError as exc:
@@ -658,8 +731,10 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    table_path, map_path = written
+    table_path, map_path, *companions = written
     print(f"wrote {rows} row(s) to {table_path} ({args.format})")
     print(f"and the map needed to read it: {map_path}")
+    for companion in companions:
+        print(f"and {companion}")
     print(IDENTIFIER_MAP_NOTE)
     return 0

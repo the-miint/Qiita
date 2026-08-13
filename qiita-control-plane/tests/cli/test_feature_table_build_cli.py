@@ -63,6 +63,25 @@ _ALIGNMENTS_BODY = {
 
 _ALIGNMENT_TICKET = b"alignment-ticket"
 _LENGTHS_TICKET = b"lengths-ticket"
+_TAXONOMY_TICKET = b"taxonomy-ticket"
+
+# The reference's per-feature taxonomy as the data plane streams it. Feature 10 (G100)
+# is classified to genus; feature 20 (G200) has a row with every rank NULL, which is how
+# ingest records an unclassified feature — a MISSING row is what an exclusion produces.
+_TAXONOMY = [
+    (
+        10,
+        "Bacteria",
+        "Bacillota",
+        "Bacilli",
+        "Lactobacillales",
+        "Listeriaceae",
+        "Listeria",
+        "",
+        None,
+    ),
+    (20, None, None, None, None, None, None, None, None),
+]
 
 _ALIGNMENT_TYPES = {
     "prep_sample_idx": pa.int64(),
@@ -98,6 +117,21 @@ def _lengths_reader() -> pa.RecordBatchReader:
             "sequence_length_bp": pa.array([n for _, n in _LENGTHS], pa.int64()),
         }
     ).to_reader()
+
+
+def _taxonomy_reader(rows) -> pa.RecordBatchReader:
+    """`reference_taxonomy_visible` as the whole-reference ticket streams it —
+    `reference_idx` and `ncbi_taxon_id` ride along and the analytic's projection drops
+    them, which is what makes the sidecar's column list ours rather than the lake's."""
+    ranks = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
+    columns = {
+        "reference_idx": pa.array([9] * len(rows), pa.int64()),
+        "feature_idx": pa.array([r[0] for r in rows], pa.int64()),
+    }
+    for i, rank in enumerate(ranks, start=1):
+        columns[rank] = pa.array([r[i] for r in rows], pa.string())
+    columns["ncbi_taxon_id"] = pa.array([None] * len(rows), pa.int64())
+    return pa.table(columns).to_reader()
 
 
 class _FakeStream:
@@ -154,18 +188,25 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "min_query_coverage": None,
         "unpaired_gate": False,
         "format": ftc.DEFAULT_TABLE_FORMAT,
+        "taxonomy": False,
         "output": tmp_path / "table.parquet",
     }
     return argparse.Namespace(**(fields | overrides))
 
 
 def _patched(
-    monkeypatch, *, alignment=None, map_entries=None, cohort=None, feature_handles=None
+    monkeypatch,
+    *,
+    alignment=None,
+    map_entries=None,
+    cohort=None,
+    feature_handles=None,
+    taxonomy_rows=None,
 ):
     """Patch the five REST seams, both ticket mints, and the Flight client; return the
     recorder every assertion below reads. A test that wants a seam to RAISE re-patches
     it itself afterwards, rather than this growing a parameter per failure mode."""
-    rec: dict = {"lengths_minted": 0}
+    rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0}
     _FakeFlightClient.instances = []
 
     monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
@@ -220,13 +261,18 @@ def _patched(
         rec["ticket_cohort"] = list(prep_sample_idx)
         return _ALIGNMENT_TICKET
 
-    def _lengths_ticket(base_url, token, *, reference_idx):
-        rec["lengths_minted"] += 1
+    def _reference_ticket(base_url, token, *, reference_idx, table):
+        """One helper signs every reference table now, so the fake dispatches on the
+        table name the same way the route does."""
         rec["reference_idx"] = reference_idx
+        if table == ftc._TAXONOMY_TABLE:
+            rec["taxonomy_minted"] += 1
+            return _TAXONOMY_TICKET
+        rec["lengths_minted"] += 1
         return _LENGTHS_TICKET
 
     monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
-    monkeypatch.setattr(ftc, "_create_lengths_doget_ticket", _lengths_ticket)
+    monkeypatch.setattr(ftc, "_create_reference_doget_ticket", _reference_ticket)
 
     rows = _ALIGNMENT if alignment is None else alignment
     readers = {
@@ -238,6 +284,9 @@ def _patched(
             rec["columns"], [r for r in rows if r[0] in rec["ticket_cohort"]]
         ),
         _LENGTHS_TICKET: _lengths_reader,
+        _TAXONOMY_TICKET: lambda: _taxonomy_reader(
+            _TAXONOMY if taxonomy_rows is None else taxonomy_rows
+        ),
     }
     monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
     return rec
@@ -468,9 +517,7 @@ def test_an_existing_output_is_refused_before_any_streaming(monkeypatch, tmp_pat
     assert not _FakeFlightClient.instances
 
 
-def test_a_mint_answering_one_handle_for_two_genomes_stops_the_build(
-    monkeypatch, tmp_path, capsys
-):
+def test_a_mint_answering_one_handle_for_two_genomes_stops_the_build(monkeypatch, tmp_path, capsys):
     """A BIOM write SUMS duplicate (feature_id, sample_id) pairs, so merging two
     organisms under one handle would never surface in the file.
 
@@ -490,9 +537,7 @@ def test_a_mint_answering_one_handle_for_two_genomes_stops_the_build(
     assert not list(tmp_path.iterdir())
 
 
-def test_the_row_labels_are_minted_only_for_the_genomes_actually_published(
-    monkeypatch, tmp_path
-):
+def test_the_row_labels_are_minted_only_for_the_genomes_actually_published(monkeypatch, tmp_path):
     """A public handle is a durable act, so the mint is asked for the genomes the
     roll-up EMITTED — not for every genome in the reference. Minting the reference's
     whole set because a table mentioned it would leave permanent public identifiers for
@@ -618,3 +663,134 @@ def test_parser_rejects_a_threshold_that_is_not_a_proportion(value):
 
     with pytest.raises(SystemExit):
         _build_parser().parse_args(_build_argv(coverage_threshold=value))
+
+
+# ---------------------------------------------------------------------------
+# The taxonomy sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_the_taxonomy_sidecar_names_exactly_the_tables_rows(monkeypatch, tmp_path, capsys):
+    """The point of both files coming from one mint: they join on one column.
+
+    G100 is classified to genus and reports a blank species; G200's taxonomy row is all
+    NULL, which is how ingest records an unclassified feature — it appears with NULL
+    ranks rather than being left out, because a row missing from the sidecar reads as
+    though it were unclassified anyway and there would be no way to tell.
+    """
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    sidecar = tmp_path / "table.taxonomy.parquet"
+    assert sidecar.exists()
+    assert str(sidecar) in capsys.readouterr().out
+
+    with connect_with_miint() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM read_parquet('{sidecar}') ORDER BY feature_id"
+        ).fetchall()
+        columns = [
+            r[0]
+            for r in conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{sidecar}')").fetchall()
+        ]
+
+    assert columns == list(ft.TAXONOMY_SIDECAR_COLUMNS)
+    assert rows == [
+        (
+            "GCF_100",
+            "d__Bacteria",
+            "p__Bacillota",
+            "c__Bacilli",
+            "o__Lactobacillales",
+            "f__Listeriaceae",
+            "g__Listeria",
+            "s__",
+            None,
+        ),
+        ("GCF_200", None, None, None, None, None, None, None, None),
+    ]
+    # The join key is the table's own, not a second vocabulary.
+    assert {r[0] for r in rows} == {r[1] for r in _table_rows(args.output)}
+
+
+def test_no_sidecar_is_written_without_the_flag(monkeypatch, tmp_path):
+    """And no taxonomy ticket is minted either — a whole reference's taxonomy is not
+    something to stream for a caller who did not ask for it."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["taxonomy_minted"] == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "table.exported-identifier.json",
+        "table.parquet",
+    ]
+
+
+def test_a_blocked_lowest_contig_does_not_unclassify_its_genome(monkeypatch, tmp_path):
+    """The exclusion case, end to end. G200's two contigs: the lower one is excluded so
+    the stream carries no row for it, and the higher one is classified. The genome must
+    publish the surviving member's lineage rather than tiling as unclassified.
+    """
+    _patched(
+        monkeypatch,
+        map_entries=[
+            {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+            {"feature_idx": 20, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
+            {"feature_idx": 21, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
+        ],
+        # No row for feature 20 at all — that is what an exclusion looks like here.
+        taxonomy_rows=[
+            (10, "Bacteria", None, None, None, None, None, None, None),
+            (21, "Archaea", None, None, None, None, None, None, None),
+        ],
+    )
+    args = _namespace(tmp_path, taxonomy=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    with connect_with_miint() as conn:
+        rows = conn.execute(
+            f"SELECT feature_id, domain FROM read_parquet("
+            f"'{tmp_path / 'table.taxonomy.parquet'}') ORDER BY feature_id"
+        ).fetchall()
+    assert rows == [("GCF_100", "d__Bacteria"), ("GCF_200", "d__Archaea")]
+
+
+def test_a_sidecar_that_does_not_match_the_table_is_refused(monkeypatch, tmp_path, capsys):
+    """Provoked by a taxonomy stream carrying TWO rows for one feature, which the
+    reference's own ingest forbids. A duplicated sidecar row multiplies the table's rows
+    under any join, and reads as real data.
+    """
+    _patched(
+        monkeypatch,
+        taxonomy_rows=[
+            (10, "Bacteria", None, None, None, None, None, None, None),
+            (10, "Archaea", None, None, None, None, None, None, None),
+            (20, None, None, None, None, None, None, None, None),
+        ],
+    )
+    args = _namespace(tmp_path, taxonomy=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "taxonomy" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir()), "no half-bundle survives a refused sidecar"
+
+
+def test_alignments_to_features_with_no_genome_are_reported(monkeypatch, tmp_path, capsys):
+    """The roll-up's INNER JOIN to the map drops them silently, and for some references
+    that is most of the data streamed. Nothing else in the recipe would ever mention it,
+    so a table that is a fraction of the alignment says so.
+    """
+    _patched(
+        monkeypatch,
+        map_entries=[
+            {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+        ],
+    )
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    err = capsys.readouterr().err
+    assert "no genome in this reference" in err
+    assert "2 of 3 alignment rows" in err

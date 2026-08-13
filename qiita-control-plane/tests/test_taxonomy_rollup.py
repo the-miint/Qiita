@@ -38,9 +38,7 @@ def _seed(con, member_genome_rows, taxonomy_rows):
     if member_genome_rows:
         con.executemany("INSERT INTO member_genome VALUES (?, ?)", member_genome_rows)
     if taxonomy_rows:
-        con.executemany(
-            "INSERT INTO taxonomy VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", taxonomy_rows
-        )
+        con.executemany("INSERT INTO taxonomy VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", taxonomy_rows)
 
 
 def _reduce(con, *, prefixed=False):

@@ -672,9 +672,7 @@ def _stage_labels(conn, *, feature_handles, handles) -> None:
     """Stage both label relations from the two mint responses a client holds."""
     conn.execute(
         "CREATE TABLE _exported_feature_src AS "
-        + _values(
-            feature_handles, "genome_idx, export_feature_id", "?::BIGINT, ?::VARCHAR"
-        ),
+        + _values(feature_handles, "genome_idx, export_feature_id", "?::BIGINT, ?::VARCHAR"),
         [x for r in feature_handles for x in r],
     )
     conn.execute(
@@ -815,9 +813,7 @@ def test_a_genome_with_no_public_handle_is_refused():
     """
     partial = {k: v for k, v in _FEATURE_HANDLES.items() if k != 400}
     with pytest.raises(ValueError, match="genome"):
-        _public_table(
-            ft.CoverageScope.POOLED, 0.2, feature_handles=_feature_handles(_MAP, partial)
-        )
+        _public_table(ft.CoverageScope.POOLED, 0.2, feature_handles=_feature_handles(_MAP, partial))
 
 
 def test_a_sample_with_no_public_handle_is_refused():

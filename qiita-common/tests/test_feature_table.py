@@ -20,6 +20,7 @@ import pytest
 
 from qiita_common import feature_table as ft
 from qiita_common.parquet import PARQUET_OPTS
+from qiita_common.taxonomy import RANK_COLUMNS
 
 # Every builder that emits a CREATE, with a representative call. Used by the
 # sweeps below so a newly-added builder is covered by default rather than by
@@ -36,6 +37,8 @@ _CREATE_BUILDERS = {
     "genome_label_table_sql": lambda: ft.genome_label_table_sql("mint_src"),
     "sample_label_table_sql": lambda: ft.sample_label_table_sql("mint_src"),
     "labelled_relation_sql": lambda: ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=10)),
+    "taxonomy_table_sql": lambda: ft.taxonomy_table_sql("taxonomy_stream"),
+    "taxonomy_sidecar_sql": ft.taxonomy_sidecar_sql,
 }
 
 
@@ -969,3 +972,97 @@ def test_the_paired_diagnostics_coalesce_their_sums():
     sql = ft.gate_diagnostics_sql(ft.AlignmentGate(min_query_coverage=0.5, paired=True))
     assert "coalesce(sum(rows_in_partition), 0) AS total_rows" in sql
     assert "coalesce(sum(paired), 0) AS paired_rows" in sql
+
+
+# ---------------------------------------------------------------------------
+# The taxonomy sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_the_sidecar_carries_the_tables_own_join_key_and_no_lineage_string():
+    """One published vocabulary across both files, so they join on one column — and
+    eight rank columns rather than a joined string, which `concat_ws` would make lossy
+    at exactly the rank a reader cares about."""
+    assert ft.TAXONOMY_SIDECAR_COLUMNS[0] == "feature_id"
+    assert set(ft.TAXONOMY_SIDECAR_COLUMNS[1:]) == set(RANK_COLUMNS)
+    assert "lineage" not in ft.TAXONOMY_SIDECAR_COLUMNS
+    assert not [name for name in ft.TAXONOMY_SIDECAR_COLUMNS if name.endswith("_idx")]
+
+
+def test_the_sidecar_is_scoped_to_the_published_genomes_on_both_sides():
+    """Both the row set and the cost: reducing a whole reference's taxonomy when only
+    the survivors are published would be wrong AND expensive."""
+    sql = ft.taxonomy_sidecar_sql()
+    assert sql.count(ft.GENOME_LABEL_TABLE) == 2
+    assert ft.MAP_TABLE in sql
+    assert ft.TAXONOMY_TABLE in sql
+
+
+def test_the_sidecar_restores_the_prefixes():
+    sql = ft.taxonomy_sidecar_sql()
+    assert "'d__' ||" in sql
+    assert "'t__' ||" in sql
+
+
+def test_the_sidecar_projection_quotes_the_keyword_ranks(tmp_path):
+    """`class` and `order` are SQL keywords, and the sidecar names its columns for the
+    ranks — so the COPY has to quote them while the Parquet column names stay bare."""
+    sql = ft.taxonomy_copy_sql(tmp_path / "t.parquet", clearance=ft.TaxonomyClearance(rows=3))
+    assert '"class"' in sql
+    assert '"order"' in sql
+
+
+def _taxonomy_check(**overrides):
+    row = {
+        "published_rows": 10,
+        "taxonomy_rows": 10,
+        "taxonomy_feature_ids": 10,
+        "unnamed_rows": 0,
+    } | overrides
+    return ft.check_taxonomy_diagnostics(**row)
+
+
+def test_a_clean_sidecar_clears_with_its_row_count():
+    assert _taxonomy_check().rows == 10
+
+
+def test_check_refuses_a_sidecar_shorter_than_its_table():
+    """Which reads as though the missing rows were unclassified — and an unclassified
+    genome is present here with NULL ranks, so the two would be indistinguishable."""
+    with pytest.raises(ValueError, match="publishes 10"):
+        _taxonomy_check(taxonomy_rows=9)
+
+
+def test_check_refuses_a_duplicated_sidecar_row():
+    with pytest.raises(ValueError, match="distinct"):
+        _taxonomy_check(taxonomy_feature_ids=9)
+
+
+def test_check_refuses_an_unnamed_sidecar_row():
+    with pytest.raises(ValueError, match="no feature_id"):
+        _taxonomy_check(unnamed_rows=1)
+
+
+# ---------------------------------------------------------------------------
+# What the roll-up leaves behind
+# ---------------------------------------------------------------------------
+
+
+def test_the_rollup_coverage_report_refuses_nothing():
+    """A feature with no genome is not an error: a 16S record is not an OGU, and there
+    is no genome-rooted row to emit for it. It is REPORTED because the alternative is a
+    table that is quietly a fraction of what the caller streamed."""
+    coverage = ft.check_rollup_coverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
+    assert not coverage.complete
+    assert ft.check_rollup_coverage(
+        alignment_rows=100, unmapped_rows=0, unmapped_features=0
+    ).complete
+
+
+def test_the_rollup_warning_names_the_share_and_what_is_missing():
+    warning = ft.rollup_coverage_warning(
+        ft.check_rollup_coverage(alignment_rows=100, unmapped_rows=40, unmapped_features=7)
+    )
+    assert "40 of 100" in warning
+    assert "40.0%" in warning
+    assert "7 features" in warning

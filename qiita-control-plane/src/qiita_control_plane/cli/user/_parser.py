@@ -767,6 +767,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ft_build.add_argument(
+        "--taxonomy",
+        action="store_true",
+        help=(
+            "Also write <table-stem>.taxonomy.parquet: one row per published row,"
+            " carrying the same feature_id and the eight ranks with their d__/p__"
+            " prefixes. An unclassified genome appears with NULL ranks rather than"
+            " being left out."
+        ),
+    )
+    p_ft_build.add_argument(
         "--min-identity",
         type=_proportion_arg,
         help=(
