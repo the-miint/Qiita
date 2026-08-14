@@ -1011,24 +1011,6 @@ def test_a_duckdb_failure_is_named_not_traced(monkeypatch, tmp_path, capsys):
     assert not list(tmp_path.iterdir())
 
 
-def test_a_build_without_shear_tree_stops_before_any_round_trip(monkeypatch, tmp_path, capsys):
-    """The probe's placement is the point: `shear_tree` is absent from builds a user's
-    extension cache may still hold, and discovering that after a whole reference has been
-    streamed wastes the run."""
-    rec = _patched(monkeypatch)
-
-    def _absent(con, name, *, needed_for):
-        raise RuntimeError(f"the miint build in use has no {name}(), which {needed_for} needs")
-
-    monkeypatch.setattr(ftc, "require_miint_function", _absent)
-    args = _namespace(tmp_path, tree=True)
-
-    assert ftc._handle_feature_table_build(args, parser=None) == 1
-    assert "shear_tree" in capsys.readouterr().err
-    assert "alignments_fetched" not in rec
-    assert not list(tmp_path.iterdir())
-
-
 def test_an_empty_cohort_still_writes_a_readable_tree(monkeypatch, tmp_path):
     """Every genome dropped by the threshold is a legitimate answer, and the bundle stays
     whole: an empty table, an empty sidecar, an empty tree. `shear_tree` raises rather

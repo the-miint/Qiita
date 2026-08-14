@@ -9,15 +9,20 @@
 -- same way or they cannot be used together, so there is exactly one authority for
 -- what that label is, and it is this table.
 --
--- Unlike the sample axis, an accession usually EXISTS here, and the rule in
--- CLAUDE.md prefers a real accession over a handle we mint. So this is a hybrid:
+-- Unlike the sample axis, an accession CAN exist here — and where one does, the rule
+-- in CLAUDE.md prefers it over a handle we mint. It is not the common case in
+-- general: a genome imported from a public source has one, while a feature Qiita
+-- observed itself (a full-length 16S seen in a sample, an assembled contig, an
+-- amplicon sequence variant) names nothing outside the load that produced it. So
+-- this is a hybrid, and BOTH halves are load-bearing:
 --
 --   * a genome carries qiita.genome.source_id, globally unique per source;
 --   * a feature carries qiita.reference_membership.accession — the FASTA-header
 --     read_id THAT reference used to name it, which is why the feature kind is
 --     keyed on (reference_idx, feature_idx) and not on feature_idx alone. The same
 --     bytes are one content-hashed feature_idx and can be named differently in two
---     references;
+--     references. Nullable, and legitimately so for anything not loaded from a
+--     public source;
 --   * anything with no accession, and anything whose accession is already
 --     published by a DIFFERENT entity, falls back to a minted 'QF<idx>'.
 --

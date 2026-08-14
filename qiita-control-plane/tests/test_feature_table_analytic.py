@@ -1,7 +1,7 @@
 """Behavioural tests for `qiita_common.feature_table` against REAL duckdb-miint.
 
-`qiita-common` has no duckdb dependency, so its own tests can only assert on SQL
-text; the analytic's behaviour is pinned here and in the orchestrator's
+The builders return SQL text and open no connection, so `qiita-common`'s own tests
+assert on strings; the analytic's behaviour is pinned here and in the orchestrator's
 `test_estimate_feature_table.py`. This module is the client-side half's home and
 carries the properties that suite cannot: **the per-sample coverage scope**, which
 no server-side caller uses.

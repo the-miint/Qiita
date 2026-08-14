@@ -1,9 +1,9 @@
 """Tests for `qiita_common.feature_table` — the shared SQL of the feature-table
 analytic.
 
-These are **string-level** tests, deliberately. `qiita-common` has no duckdb
-dependency (the module returns SQL text and never opens a connection), so the
-analytic's *behaviour* is pinned where it runs, against real miint:
+These are **string-level** tests, deliberately: the module returns SQL text and never
+opens a connection, so there is nothing here to execute. The analytic's *behaviour* is
+pinned where it runs, against real miint:
 `qiita-compute-orchestrator/tests/jobs/test_estimate_feature_table.py` for the
 server-side job, and the control-plane tier for the client-side recipe.
 
@@ -841,7 +841,7 @@ def test_the_biom_writer_names_qiita_as_the_generator(tmp_path):
     assert "FORMAT BIOM" in sql
     assert "COMPRESSION 'gzip'" in sql
     assert f"GENERATED_BY '{ft.BIOM_GENERATED_BY}'" in sql
-    assert ft.BIOM_GENERATED_BY == "qiita"
+    assert ft.BIOM_GENERATED_BY == "qiita-miint"
 
 
 def test_the_biom_writer_sets_no_table_id(tmp_path):

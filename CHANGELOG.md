@@ -116,9 +116,7 @@ duplicates further down are historical strata; leave them where they are.
   genome (a plasmid published under two organisms cannot be one genome-named tip — whereas one
   merely *present* under a second genome the table never mentions shears cleanly). Publishing
   no rows at all is not one of these: an empty cohort gets an empty tree, the way it already
-  gets an empty table. A build asking for a tree also checks the
-  loaded miint build has `shear_tree` before doing any work, because a plain `INSTALL` never
-  refreshes an extension already cached and the raw failure is a bare `Catalog Error`.
+  gets an empty table.
 
 - **The build now reports what it could not roll up (#448).** The genome map's INNER JOIN silently
   drops alignments to features with no genome, and for some references that is most of what
@@ -906,6 +904,16 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Changed
+
+- **A feature-table build now reads its reference before it streams anything (#448).** The
+  reference's name and version are only needed by the manifest, written last, so the read that
+  fetches them ran last too — which meant a reference this alignment names but the caller cannot
+  read was discovered *after* a whole cohort had crossed the wire. It is the cheapest thing in the
+  build that can refuse, so it now runs first. The processing mint stays last, deliberately: it is
+  a write, and a public handle minted for a build that then fails names a bundle nobody has.
+
+- **A BIOM file written by a feature-table build now names `qiita-miint` as its generator
+  (#448).** `qiita` named the project rather than the system that produced the file.
 
 - **The gate every alignment-cohort route runs is now one function, not three copies (#448).**
   `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST

@@ -40,7 +40,6 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_GENOME_MAP,
     PATH_REFERENCE_PREFIX,
 )
-from qiita_common.duckdb_miint import require_miint_function
 from qiita_common.models import (
     MAX_EXPORTED_FEATURE_ENTITIES,
     ExportedFeatureRequest,
@@ -552,7 +551,7 @@ def _tool_versions(con) -> dict[str, str]:
     capture: every bioinformatics primitive is compiled INTO the extension, so two
     clients on different builds can produce different numbers from identical input. It is
     read from the catalog rather than assumed, because the client path INSTALLs into a
-    cache that never refreshes (see `require_miint_function`) — what is loaded is the only
+    cache that never refreshes (see `miint_install_sql`) — what is loaded is the only
     honest answer. `install_path` is deliberately not recorded: it is a path on this
     machine, and a published file should not describe the machine that made it.
 
@@ -891,11 +890,6 @@ def _run_build(
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    if args.tree:
-        # Before the round trips, not at the shear: `shear_tree` is absent from builds a
-        # user's extension cache may still hold, and the raw failure arrives after a whole
-        # reference has been streamed.
-        require_miint_function(con, "shear_tree", needed_for="--tree")
     # ONE verified summary, read several times: the reference the table is relabelled
     # through, the digest the manifest cites, the aligner it names. Verifying it once and
     # reading it is what keeps those three from being three separate acts of trust.
@@ -909,6 +903,12 @@ def _run_build(
         alignment_idx=args.alignment_idx,
     )
     reference_idx = _alignment_reference_idx(summary)
+    # Read the reference BEFORE anything bulk, though only the manifest consumes it. It
+    # is the cheapest thing here that can refuse — it 404s on a reference this alignment
+    # names but the caller cannot read, which is exactly what every reference DoGet ticket
+    # below would then fail on. Fetching it last meant discovering that after a whole
+    # cohort had crossed the wire.
+    reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
     cohort = _resolve_cohort(args.base_url, token, args)
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
@@ -995,13 +995,13 @@ def _run_build(
     if args.tree:
         clearances["tree"] = _shear_tree(con)
 
-    # The manifest's two round trips happen here, after everything that could refuse: the
-    # processing mint is a WRITE, and minting a public handle for a build that then fails
-    # would leave a permanent name for a bundle nobody has.
+    # LAST of the round trips, after everything that could refuse, because it is a WRITE:
+    # minting a public handle for a build that then fails would leave a permanent name for
+    # a bundle nobody has. The manifest's other input, the reference, is a read and is
+    # fetched up front instead — see there.
     export_processing_id = _mint_exported_processing(
         args.base_url, token, alignment_idx=args.alignment_idx, prep_sample_idx=cohort
     )
-    reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
     tools = _tool_versions(con)
     written = _write_bundle(
         con,

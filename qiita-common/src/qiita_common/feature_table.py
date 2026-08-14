@@ -17,10 +17,11 @@ join it later.
 whole cohort, or per `(sample, genome)`. The two are not symmetric; `CoverageScope`
 says why.
 
-**Plain SQL text; no duckdb import.** `qiita-common` has no duckdb dependency and
-must not gain one — it is the contract layer both Python services import. Callers
-execute these statements on a connection that has miint loaded. (Same shape as
-`chunking.py`'s expression builders and `parquet.py`'s option strings.)
+**Plain SQL text, so this module needs no connection of its own.** Callers execute
+these statements on a connection that has miint loaded. (Same shape as `chunking.py`'s
+expression builders and `parquet.py`'s option strings.) That is a choice about where
+the I/O lives, not a prohibition: miint is core to all of qiita and both services that
+import this one already depend on duckdb.
 
 **The OGU key is `genome_idx`.** Counts and coverage both roll
 `feature_idx → genome_idx` through the map, so a multi-contig genome is handled
@@ -756,6 +757,15 @@ def check_gate_diagnostics(
 OGU_OUTPUT_TABLE = "ogu_output"
 
 # The two label relations, each `internal key -> public handle`.
+#
+# **The row axis is a genome only because this table flavour is OGU.** A feature is not
+# always a genome — an amplicon sequence variant, a full-length 16S observed in a sample,
+# an assembled contig are all features with no genome to roll up to — so a row-keyed
+# flavour is a genuine second shape, not a variant spelling of this one. The identifier
+# layer is already ready for it: the mint behind `export_feature_id` publishes a genome
+# OR a `(reference, feature)` pair. What is genome-only is the roll-up, which counts what
+# `woltka_ogu` counts. This name says `genome` to be honest about that, rather than
+# implying generality the computation does not have.
 GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
 
@@ -1009,11 +1019,11 @@ def labelled_relation_sql(*, clearance: LabelClearance) -> str:
 # BIOM's `generated-by` attribute. The writer's own default is `miint`, which names
 # the library rather than the system that produced the file. The system and no
 # version, deliberately: a version here would have to be kept honest against four
-# components and a pinned extension build, and nothing reads it. **So the file
-# carries no provenance beyond this name today** — reproducing a table needs the
-# reference, the cohort, the coverage scope and threshold, and any gate, none of
-# which the bundle records yet.
-BIOM_GENERATED_BY = "qiita"
+# components and a pinned extension build, and the bundle's manifest is where the
+# provenance that reproduces a table actually lives — the reference, the cohort, the
+# coverage scope and threshold, the gate, and the tool versions including the miint
+# build. This attribute only says which system wrote the file.
+BIOM_GENERATED_BY = "qiita-miint"
 
 
 # ---------------------------------------------------------------------------
