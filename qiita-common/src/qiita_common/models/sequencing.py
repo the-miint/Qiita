@@ -1343,7 +1343,7 @@ class ExportedProcessingRequest(BaseModel):
     ``/exported-identifier`` takes for the same pair — a caller who could not build
     the table has no manifest to write.
 
-    Identical in shape to ``ExportedIdentifierRequest``, deliberately: two routes over
+    Identical in shape to ``ExportedIdentifierRequest``: two routes over
     one `(processing, cohort)` pair that authorized it differently would be two
     answers to "may I read this data".
     """

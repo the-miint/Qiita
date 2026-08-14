@@ -14,7 +14,7 @@ user would publish come out of the real mint routes**, so the assertion at the
 bottom is on the file itself: `QM…` handles, the genomes' `source_id`s, and not one
 column of ours.
 
-The fixture makes every load-bearing rule of the analytic visible in the OUTPUT:
+The fixture makes every rule of the analytic visible in the OUTPUT:
 
   * genome A (10 kb) is covered 0.6% in each of two samples, in EXTENDING regions
     — 1.2% pooled, so it clears a 1% threshold only when the cohort is pooled.
@@ -86,7 +86,7 @@ _LINEAGE_C = (
     "Escherichia",
     "coli",
 )
-# The blocked contig's own lineage, deliberately unlike its sibling's: if the exclusion
+# The blocked contig's own lineage, unlike its sibling's: if the exclusion
 # stopped being applied to the taxonomy stream, C would publish THIS instead, and a test
 # that gave both contigs one lineage could not tell.
 _LINEAGE_C_BLOCKED = (

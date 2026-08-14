@@ -151,7 +151,7 @@ async def test_retiring_a_row_does_not_change_its_published_handle(postgres_pool
     tie it to `retired` and a citation would silently change meaning the day the row
     was retired.
 
-    It deliberately does NOT test the unique index on the handle. That index cannot
+    It does NOT test the unique index on the handle. That index cannot
     fail — `'QP' || idx` is injective in a PRIMARY KEY — so it is defence against a
     future change to the generated expression, not a live constraint, and a test
     pretending otherwise would be a test that cannot fail.

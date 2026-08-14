@@ -23,7 +23,7 @@ from qiita_control_plane.miint import connect_with_miint
 
 _ENTRIES = [
     # G400's two contigs: the per-(feature, genome) fan-out the roll-up key must keep.
-    # `source` / `source_id` ride the response and are deliberately not staged — what a
+    # `source` / `source_id` ride the response and are not staged — what a
     # row is NAMED comes from the exported-feature mint, not from this map.
     {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
     {"feature_idx": 40, "genome_idx": 400, "source": "refseq", "source_id": "GCF_400"},
@@ -156,7 +156,7 @@ def test_the_staged_maps_carry_native_integer_keys_and_varchar_handles():
 
 
 def test_the_roll_up_key_keeps_the_fan_out_the_label_never_had():
-    """Two relations with deliberately different cardinalities, now from two different
+    """Two relations with different cardinalities, now from two different
     responses: the roll-up needs a row per contig, and the mint answers once per
     genome so the label has nothing to collapse."""
     with _staged() as conn:

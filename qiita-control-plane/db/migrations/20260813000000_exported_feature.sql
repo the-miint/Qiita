@@ -14,7 +14,7 @@
 -- general: a genome imported from a public source has one, while a feature Qiita
 -- observed itself (a full-length 16S seen in a sample, an assembled contig, an
 -- amplicon sequence variant) names nothing outside the load that produced it. So
--- this is a hybrid, and BOTH halves are load-bearing:
+-- this is a hybrid, and neither half is a fallback for the other:
 --
 --   * a genome carries qiita.genome.source_id, globally unique per source;
 --   * a feature carries qiita.reference_membership.accession — the FASTA-header
@@ -38,9 +38,9 @@
 --
 -- Why the accession is SNAPSHOTTED here instead of joined out of genome /
 -- reference_membership at read time: a published identifier must not change under
--- a later edit to its source row, and — the load-bearing half — the uniqueness of
--- the published namespace has to be a database constraint. A client cannot assert
--- it: it can see the emitted set of ONE artifact, never the accession some other
+-- a later edit to its source row, and — the half that forces the design — the
+-- uniqueness of the published namespace has to be a database constraint. A client cannot assert
+-- it: it can see the emitted set of one artifact, never the accession some other
 -- caller published last week, and never a minted 'QF7' that a collaborator's
 -- source_id happens to spell.
 --
@@ -93,8 +93,7 @@ CREATE TABLE qiita.exported_feature (
 
     -- The published handle. GENERATED, not written: Postgres refuses an INSERT
     -- that supplies a value, so it cannot be forged by a caller and cannot be
-    -- edited after publication. There is deliberately no code path that composes
-    -- this string.
+    -- edited after publication. No code path composes this string.
     export_feature_id   VARCHAR GENERATED ALWAYS AS (
         CASE WHEN accession_published THEN accession ELSE 'QF' || idx END
     ) STORED,
@@ -115,7 +114,7 @@ CREATE TABLE qiita.exported_feature (
     CONSTRAINT exported_feature_one_kind
         CHECK (retired OR num_nonnulls(genome_idx, feature_idx) = 1),
 
-    -- TEXT + CHECK rather than a Postgres ENUM, deliberately: this never crosses
+    -- TEXT + CHECK rather than a Postgres ENUM: this never crosses
     -- the wire, so there is no Python twin to keep in parity with.
     CONSTRAINT exported_feature_entity_kind_known
         CHECK (entity_kind IN ('genome', 'feature')),
@@ -179,7 +178,7 @@ COMMENT ON COLUMN qiita.exported_feature.accession IS
 -- One LIVE identifier per entity, so the same entity always resolves to the same
 -- export_feature_id and the mint is an idempotent upsert on these indexes.
 --
--- ONE INDEX PER KIND, deliberately: a live genome-kind row has feature_idx NULL
+-- ONE INDEX PER KIND: a live genome-kind row has feature_idx NULL
 -- and a unique index treats every NULL as distinct, so a single index over all the
 -- kind columns would let two live rows for one genome coexist. Widening it with
 -- NULLS NOT DISTINCT would instead make two DIFFERENT feature-kind rows collide.
@@ -210,7 +209,7 @@ CREATE UNIQUE INDEX exported_feature_live_reference_feature
 --     would hand the re-published genome a minted 'QF<n>' purely because a reference
 --     was once deleted, which is the outcome the hybrid exists to avoid.
 --
---   * reference_membership.accession is a FASTA header from ONE load, and 'contig_5'
+--   * reference_membership.accession is a FASTA header from one load, and 'contig_5'
 --     names nothing outside it. Releasing it would let an unrelated reference's
 --     unrelated sequence publish 'contig_5' next year — one public label having named
 --     two different sequences, which is precisely what this table promises cannot
@@ -229,7 +228,7 @@ CREATE UNIQUE INDEX exported_feature_export_feature_id_unique
 -- ---------------------------------------------------------------------------
 -- retire_detached_exported_feature
 -- ---------------------------------------------------------------------------
--- NOT a convenience: this trigger is what makes the `ON DELETE SET NULL` FKs
+-- Not a convenience: this trigger is what makes the `ON DELETE SET NULL` FKs
 -- above legal. Without it, deleting a reference would null feature_idx on a row
 -- whose `retired` is still false, exported_feature_one_kind would reject the
 -- UPDATE, and the reference delete would fail with a check violation instead of
@@ -245,8 +244,8 @@ DECLARE
     severed TEXT;
 BEGIN
     -- The three columns the published namespace is computed from are IMMUTABLE, and
-    -- this is the only thing that says so. ABOVE the retired early-return on purpose:
-    -- a retired row is precisely where the CHECKs stop helping (they are all written
+    -- this is the only thing that says so. It sits above the retired early-return
+    -- because a retired row is precisely where the CHECKs stop helping (they are all written
     -- `retired OR ...`, because a detached row has lost the columns they test), and
     -- it is also where the index predicate `NOT retired OR entity_kind = 'feature'`
     -- is still reading. So on a retired FEATURE row — the one case the namespace

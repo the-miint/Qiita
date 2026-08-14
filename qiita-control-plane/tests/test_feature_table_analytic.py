@@ -171,9 +171,9 @@ def test_pooled_keeps_the_discriminating_genome_for_every_sample():
 
 
 def test_per_sample_drops_the_pair_no_single_sample_covers():
-    """The same fixture under per-sample scope: G200 vanishes ENTIRELY, because
+    """The same fixture under per-sample scope: G200 vanishes entirely, because
     0.6% < 1% in each sample separately. This is the one-directional discriminator
-    — the rows a stricter scope removes — and it is the whole point of the scope."""
+    — the rows a stricter scope removes — and it is what the scope is for."""
     assert _table(ft.CoverageScope.PER_SAMPLE, 0.01) == [
         (1, 100, 1.0),
         (1, 400, 2.0),
@@ -235,7 +235,7 @@ def test_the_denominator_is_the_full_genome_length_in_both_scopes(scope):
 
 
 def test_per_sample_merges_intervals_within_a_contig_not_across_them():
-    """`compress_intervals` merges within ONE coordinate space, so a genome's covered
+    """`compress_intervals` merges within one coordinate space, so a genome's covered
     bases are the sum over its contigs — and the threshold here is chosen to make
     that discriminating rather than incidental.
 
@@ -808,7 +808,7 @@ def test_a_collision_between_genomes_the_threshold_DROPPED_is_not_refused():
 
 
 def test_a_genome_with_no_public_handle_is_refused():
-    """Staged deliberately from a mint response that omits G400.
+    """Staged from a mint response that omits G400.
 
     The client mints FROM the roll-up's own output, so this should be unreachable
     there; it is the backstop for a mint resolved against some other genome set — the
@@ -1048,7 +1048,7 @@ def test_a_published_row_with_no_tip_in_the_tree_is_refused(tmp_path):
 
 
 def test_a_tip_shared_by_two_published_genomes_is_refused(tmp_path):
-    """`feature_genome` is many-to-many on purpose — identical bytes are one
+    """`feature_genome` is many-to-many — identical bytes are one
     `feature_idx`, so a plasmid two organisms carry belongs to both — and renaming such a
     tip by genome duplicates the node. The shear's own error names a node id; this names
     the reason."""

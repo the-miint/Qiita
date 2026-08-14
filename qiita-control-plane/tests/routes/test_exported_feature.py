@@ -67,7 +67,7 @@ async def test_a_collided_genome_accession_falls_back_instead_of_failing(role_ke
     what it wanted and that it lost, so nobody has to guess why the label changed
     shape.
 
-    The request lists the entities in DESCENDING idx order on purpose. The winner is
+    The request lists the entities in DESCENDING idx order. The winner is
     the lower idx either way, which is only true because the mint's INSERT orders by
     it; listing them ascending would pass against an unordered INSERT too, and pin
     nothing.

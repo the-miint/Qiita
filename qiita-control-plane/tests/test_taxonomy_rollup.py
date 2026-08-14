@@ -2,7 +2,7 @@
 DuckDB.
 
 `qiita_common.taxonomy` is SQL text, so its own tests can only assert shape. These
-run it. They are deliberately separate from `test_plan_shards.py`, which pins the
+run it. They are separate from `test_plan_shards.py`, which pins the
 same reduction through the shard planner's *string* projection: that file is the
 regression net for the hoist (its assertions must keep passing untouched), while
 these are the column-form contract the published taxonomy sidecar rests on — a

@@ -7,7 +7,7 @@ control-plane route rather than anything the data plane can serve: `genome_idx`,
 minting is a write.
 
 There is no cohort authorization here, and the asymmetry with
-`/exported-identifier` is deliberate. That route names *samples*, which are
+`/exported-identifier` is not an omission. That route names *samples*, which are
 study-scoped and carry per-study access tiers. This one names reference
 entities — genomes and the features of a reference — which are not study-scoped:
 the same `reference:read` that already hands a caller the entire

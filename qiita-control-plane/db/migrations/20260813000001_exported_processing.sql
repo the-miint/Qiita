@@ -42,8 +42,7 @@ CREATE TABLE qiita.exported_processing (
 
     -- The published handle. GENERATED, not written: Postgres refuses an INSERT
     -- that supplies a value, so it cannot be forged by a caller, cannot drift from
-    -- idx, and cannot be edited after publication. There is deliberately no code
-    -- path that composes this string.
+    -- idx, and cannot be edited after publication. No code path composes this string.
     export_processing_id  VARCHAR GENERATED ALWAYS AS ('QP' || idx) STORED,
 
     -- The processing. Exactly one such column is non-null on a live row; see the
@@ -105,7 +104,7 @@ COMMENT ON COLUMN qiita.exported_processing.export_processing_id IS
 -- index.
 --
 -- PARTIAL on `NOT retired` so a retired row can be re-minted rather than colliding
--- with its own history forever. The case that needs it is a DELIBERATE retirement
+-- with its own history forever. The case that needs it is a deliberate retirement
 -- (published in error, an embargo) where alignment_idx stays attached; the purge
 -- path nulls the column and so could never collide anyway.
 CREATE UNIQUE INDEX exported_processing_live_processing
@@ -127,7 +126,7 @@ CREATE UNIQUE INDEX exported_processing_export_processing_id_unique
 -- ---------------------------------------------------------------------------
 -- retire_detached_exported_processing
 -- ---------------------------------------------------------------------------
--- The twin of qiita.retire_detached_exported_identifier, and NOT a convenience:
+-- The twin of qiita.retire_detached_exported_identifier, and not a convenience:
 -- without it the FK action would null alignment_idx on a row whose `retired` is
 -- still false, the one_processing CHECK would reject the UPDATE, and the alignment
 -- purge would fail with a check violation instead of succeeding. BEFORE UPDATE so

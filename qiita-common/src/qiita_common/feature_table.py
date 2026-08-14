@@ -101,7 +101,7 @@ from .taxonomy import (
 class CoverageScope(StrEnum):
     """The dimension breadth of coverage is measured over.
 
-    A plain `StrEnum` with no Postgres twin, deliberately: this is a per-request
+    A plain `StrEnum` with no Postgres twin: this is a per-request
     analytic parameter chosen by the caller, never stored, so there is no column
     for a database enum to guard. The values are the CLI's spelling.
 
@@ -164,7 +164,7 @@ OGU_INPUT_TABLE = "ogu_input"
 # ONE SURVIVOR RELATION PER SCOPE, because the two have different shapes:
 # `(genome_id)` for pooled, `(prep_sample_idx, genome_id)` for per-sample. The
 # names differ so that building one scope's set and joining the other's is a bind
-# error in BOTH directions.
+# error in both directions.
 #
 # Under a single shared name only one direction fails loudly. The other — a
 # per-sample set joined on the genome alone — is valid SQL and silently wrong: an
@@ -342,8 +342,8 @@ def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
     relation that was never created, so it is a bind error rather than a wrong
     number (see `_SURVIVOR_TABLES`).
 
-    The survivor join happens **here, before woltka**, and that ordering is
-    load-bearing: `woltka_ogu` splits a multi-mapped read across its number of
+    The survivor join happens **here, before woltka**, and the ordering decides the
+    numbers: `woltka_ogu` splits a multi-mapped read across its number of
     distinct `reference` values, so a read hitting a surviving and a dropped genome
     must lose the dropped one first to renormalize to 1.0 on the survivor.
     Filtering woltka's OUTPUT instead strands it at 0.5 — a plausible number rather
@@ -637,9 +637,9 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
     subquery.** Every count here is additive over the placement partitions, so
     aggregating the groups again gives identical numbers for one read of the widest
     relation in the pipeline instead of two — and `paired` is the common case. The
-    `coalesce`s are load-bearing rather than defensive: `sum()` over zero groups is
-    NULL, which would turn the empty slice's `total_rows` into NULL and silently
-    stop `check_gate_diagnostics`' `== 0` early return from firing.
+    `coalesce`s are not defensive padding — deleting them breaks the empty slice:
+    `sum()` over zero groups is NULL, which would turn `total_rows` into NULL and
+    silently stop `check_gate_diagnostics`' `== 0` early return from firing.
     """
     scorable = "count(cigar_sequence_identity(cigar))" if gate.min_identity is not None else "NULL"
     # miint's own predicate over the SAM flag, not hand-rolled bit math: the
@@ -704,7 +704,7 @@ def check_gate_diagnostics(
         if scorable_rows is None:
             raise ValueError(
                 "check_gate_diagnostics: scorable_rows is NULL while min_identity is "
-                "set. The row must come from gate_diagnostics_sql(the SAME gate), "
+                "set. The row must come from gate_diagnostics_sql(the same gate), "
                 "which only emits NULL there when identity is not being gated."
             )
         if scorable_rows == 0:
@@ -749,7 +749,7 @@ def check_gate_diagnostics(
 # ---------------------------------------------------------------------------
 
 # The counts, materialized. Both the populated and the empty path land here, so the
-# relabel below — and every writer after it — reads ONE relation whose name and
+# relabel below — and every writer after it — reads one relation whose name and
 # shape do not depend on whether the cohort had any alignments. Client-side only:
 # the server-side job COPYs `woltka_ogu_select_sql()` straight out to Parquet and
 # relabels nothing, because its output stays inside the system.
@@ -781,7 +781,7 @@ LABELLED_RELATION = "feature_table_labelled"
 # system — `export_id` per processed sample, `export_feature_id` per row. An `*_idx`
 # means nothing out there and is not a handle we promise to keep.
 #
-# The VARCHAR types are why the relabel is load-bearing rather than cosmetic: BIOM
+# The VARCHAR types are why the relabel cannot be skipped as cosmetic: BIOM
 # requires both id columns as VARCHAR while woltka hands back native BIGINTs, so
 # the order is relabel-then-write and there is no writable table before the join.
 LABELLED_SCHEMA = {
@@ -837,8 +837,8 @@ def published_membership_sql() -> str:
     **`MAP_TABLE` is the whole reference's map** — one row per `(feature, genome)` pair,
     and `feature_genome` is many-to-many, so a feature two organisms share appears once per
     genome. `GENOME_LABEL_TABLE` holds only the genomes the roll-up emitted. Restricting
-    one by the other is load-bearing in two different ways, which is why it is named here
-    once instead of spelled at each site:
+    one by the other does two different jobs, which is why it is named here once instead
+    of spelled at each site:
 
     * for the taxonomy sidecar it makes the reduction exactly as wide as the table, and
       cheap — a reference's whole taxonomy is reduced only for the genomes that survived;
@@ -869,7 +869,7 @@ def sample_label_table_sql(source: str) -> str:
 
 
 def _labelled_select_sql() -> str:
-    """The counts with both labels attached — the ONE join definition the
+    """The counts with both labels attached — the one join definition the
     diagnostics measure and the relabel writes, so what was checked is what lands.
 
     LEFT, not INNER: a count whose genome or sample has no label must survive the
@@ -1017,7 +1017,7 @@ def labelled_relation_sql(*, clearance: LabelClearance) -> str:
 
 # BIOM's `generated-by` attribute. The writer's own default is `miint`, which names
 # the library rather than the system that produced the file. The system and no
-# version, deliberately: a version here would have to be kept honest against four
+# version: a version here would have to be kept honest against four
 # components and a pinned extension build, and the bundle's manifest is where the
 # provenance that reproduces a table actually lives — the reference, the cohort, the
 # coverage scope and threshold, the gate, and the tool versions including the miint
@@ -1260,7 +1260,7 @@ def rollup_coverage_warning(coverage: RollupCoverage) -> str:
 # registered stream; and this is the largest relation in the recipe — GG2's backbone is
 # ~660k nodes — so the shear's clearance drops it the moment the shear is done.
 #
-# Deliberately NOT named for the lake table it comes from, unlike `TAXONOMY_TABLE`: the
+# Not named for the lake table it comes from, unlike `TAXONOMY_TABLE`: the
 # lake's is `reference_phylogeny` exactly, and one name meaning both a caller's ticket
 # argument and a local relation is a trap.
 PHYLOGENY_TABLE = "phylogeny_nodes"
@@ -1291,7 +1291,7 @@ SHEAR_KEEP_SET_RELATION = "phylogeny_keep_set"
 #
 # **The tree is the one artifact here that has to apply it itself.** The alignment and
 # the taxonomy arrive through exclusion-aware views, so a blocked feature is already gone
-# from the table and the sidecar; the phylogeny stream deliberately has no such view,
+# from the table and the sidecar; the phylogeny stream has no such view,
 # because anti-joining a tip's row would orphan its internal parents. So a blocked contig
 # reaches this recipe with its tip intact, and nothing else would drop it.
 BLOCKED_FEATURE_TABLE = "blocked_feature"
@@ -1420,8 +1420,8 @@ class TreeClearance:
 def sheared_tree_table_sql(*, clearance: TreeClearance) -> str:
     """Shear the tree down to the published keep-set, into `TREE_TABLE`.
 
-    `collapse := true` is miint's default and is passed explicitly because it is
-    load-bearing: it removes the single-child ancestors pruning leaves behind and **sums
+    `collapse := true` is miint's default and is passed explicitly rather than relied
+    on: it removes the single-child ancestors pruning leaves behind and **sums
     their branch lengths onto the surviving edge**, so a tip-to-tip distance in the
     sheared tree is that distance in the whole one.
 
@@ -1524,7 +1524,7 @@ def check_tree_diagnostics(
         )
     if shear_nodes != tree_nodes:
         # Renaming tips by genome multiplies a node whose feature belongs to more than
-        # one genome, which `feature_genome` allows on purpose (identical bytes share one
+        # one genome, which `feature_genome` allows (identical bytes share one
         # feature_idx, so a plasmid two organisms carry resolves to one feature under
         # both). The shear rejects the result — `Duplicate node_id: N` — so this refusal
         # buys the reason rather than the failure.

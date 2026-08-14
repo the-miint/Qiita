@@ -1,7 +1,7 @@
 """Tests for `qiita_common.feature_table` — the shared SQL of the feature-table
 analytic.
 
-These are **string-level** tests, deliberately: the module returns SQL text and never
+These are **string-level** tests: the module returns SQL text and never
 opens a connection, so there is nothing here to execute. The analytic's *behaviour* is
 pinned where it runs, against real miint:
 `qiita-compute-orchestrator/tests/jobs/test_estimate_feature_table.py` for the
@@ -43,7 +43,7 @@ _CREATE_BUILDERS = {
 
 
 def test_survivor_join_is_in_the_ogu_input_statement_not_after_woltka():
-    """The load-bearing ordering: non-surviving genomes leave woltka's INPUT.
+    """Non-surviving genomes must leave woltka's INPUT, not its output.
 
     `woltka_ogu` splits a multi-mapped read across its distinct `reference`
     values, so a read hitting one surviving and one dropped genome must lose the
@@ -238,7 +238,7 @@ def test_threshold_is_a_bound_parameter_in_both_scopes():
 
 
 def test_empty_result_schema_matches_the_woltka_projection():
-    """The 0-row short-circuit and the real path must produce the SAME schema.
+    """The 0-row short-circuit and the real path must produce the same schema.
     They are separate SQL statements, so nothing but this stops them drifting —
     and a consumer reading the Parquet back would see the drift as a missing
     column on empty cohorts only.
@@ -409,7 +409,7 @@ def test_the_pooled_partition_keys_on_the_placement_not_just_the_read():
 
 
 def test_the_pooled_aggregate_has_no_order_by():
-    """Deliberate, and safe only because both CIGAR scorers are permutation-invariant
+    """Safe only because both CIGAR scorers are permutation-invariant
     — a property `docs/duckdb-miint.md` records as upstream-documented and
     qiita-verified, and which the orchestrator's suite pins. An ORDER BY would buy a
     sort inside every partition for nothing.
@@ -623,7 +623,7 @@ def _relabel_check(
 
 
 def test_the_public_schema_carries_no_internal_identifier():
-    """The whole point of the relabel. `prep_sample_idx` and `genome_idx` are ours —
+    """What the relabel is for. `prep_sample_idx` and `genome_idx` are ours —
     they mean nothing outside this system and are not handles we promise to keep — so
     a published table names its columns with the minted `export_id` and its rows with
     the minted `export_feature_id`. Asserted on the schema rather than on one builder's text
@@ -827,8 +827,8 @@ def test_the_public_schema_is_exactly_the_biom_writers_required_set():
 @pytest.mark.parametrize("build", [ft.parquet_copy_sql, ft.biom_copy_sql])
 def test_both_writers_copy_the_RELABELLED_relation(build, tmp_path):
     """Not `OGU_OUTPUT_TABLE`, which is the same numbers keyed by our own identifiers
-    — the whole point of the relabel is that only one of these two relations may be
-    written to a file a user publishes."""
+    — and only one of these two relations may be written to a file a user
+    publishes."""
     sql = build(tmp_path / "out")
     assert f"COPY {ft.LABELLED_RELATION} TO " in sql
     assert ft.OGU_OUTPUT_TABLE not in sql
@@ -854,7 +854,7 @@ def test_the_biom_writer_names_qiita_as_the_generator(tmp_path):
 
 
 def test_the_biom_writer_sets_no_table_id(tmp_path):
-    """`ID` is left at the writer's default deliberately: the only distinctive handle
+    """`ID` is left at the writer's default: the only distinctive handle
     for this table today is an internal identifier, which must not ride a published
     file, and a constant would identify nothing."""
     assert "ID '" not in ft.biom_copy_sql(tmp_path / "t.biom")
@@ -903,8 +903,8 @@ def test_the_sequence_builds_the_filter_before_woltkas_input(scope):
 
 def test_an_unfiltered_sequence_has_no_coverage_step_at_all():
     """At threshold 0 there is nothing to filter, so neither the view nor the survivor
-    set is built — and the caller must not have to know that, which is the whole point
-    of the scope-to-`None` conversion living here."""
+    set is built — and the caller must not have to know that, which is why the
+    scope-to-`None` conversion lives here."""
     sequence = _sequence(ft.CoverageScope.PER_SAMPLE, 0.0)
     joined = " ".join(sequence)
     assert ft.COVERAGE_ALIGNMENTS_VIEW not in joined
@@ -1227,7 +1227,7 @@ def test_check_refuses_a_published_row_the_tree_has_no_tip_for():
 
 
 def test_check_refuses_a_genome_owning_more_than_one_tip():
-    """Which the shear would accept, keeping BOTH tips under one published handle."""
+    """Which the shear would accept, keeping both tips under one published handle."""
     with pytest.raises(ValueError, match="GCF_MULTI"):
         _tree_check(rows_with_many_tips=1, multi_tip_example="GCF_MULTI")
 

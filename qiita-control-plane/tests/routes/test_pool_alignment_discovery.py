@@ -80,7 +80,7 @@ async def test_pool_alignment_list_reports_a_params_hash_the_caller_can_recomput
     """The digest the server dedups the definition on, so a client can prove the
     `params` it received are the ones that were hashed.
 
-    Recomputing it here is the whole point rather than a restatement: a manifest
+    Recomputing it here is the test, not a restatement: a manifest
     published beside a table cites `params_hash` as the reproducibility key, and a
     client that copies a hash it never checked against the params it actually read
     would publish a claim it cannot support. This is also the test that fails if
@@ -97,7 +97,7 @@ async def test_pool_alignment_list_reports_a_params_hash_the_caller_can_recomput
 async def test_pool_alignment_list_reports_the_stored_digest_not_a_recomputed_one(ctx, seeded):
     """The field has to be the digest the server DEDUPS on, and for a well-formed
     definition that is indistinguishable from hashing `params` on the way out — so
-    this seeds a definition whose stored hash deliberately does not match its params.
+    this seeds a definition whose stored hash does not match its params.
 
     That state is not enforced against: `params_hash` is computed control-plane-side,
     so a bug, a hand-edit, or a migration could put the two out of step. A route that

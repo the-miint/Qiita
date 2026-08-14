@@ -73,7 +73,7 @@ async def require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> No
         raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
 
 
-# The ONE wording for "no such alignment", shared by every route that keys on an
+# The one wording for "no such alignment", shared by every route that keys on an
 # alignment_idx — the three cohort routes below and the alignment delete. Two spellings
 # of one condition is a difference a client can accidentally depend on, and the delete
 # route had its own until they were converged.

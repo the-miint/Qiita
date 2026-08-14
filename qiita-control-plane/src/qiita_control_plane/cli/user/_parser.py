@@ -716,7 +716,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # `feature-table build` — the client-side recipe: two REST maps, two Flight
     # streams, the analytic, and the relabel to public handles, all on the caller's
-    # own machine. There is deliberately no --reference-idx: the alignment records
+    # own machine. There is no --reference-idx: the alignment records
     # the reference it ran against.
     p_feature_table = sub.add_parser(
         "feature-table", help="Build a feature table from an alignment (client-side)"

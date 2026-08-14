@@ -83,7 +83,7 @@ def prefixed_rank_columns_sql(*, alias: str = "") -> str:
     `reference_taxonomy` today: ingest nullifies a blank rank as it strips it
     (`NULLIF(substr(...), '')` in the `reference_load` job), so a lineage carrying
     `p__` with nothing after it is stored as NULL, not `''`. The branch is kept because
-    it costs nothing and the NULL half of the same `CASE` is the load-bearing one.
+    it costs nothing and the NULL half of the same `CASE` is the one that fires.
     """
     prefix = f"{alias}." if alias else ""
     return ", ".join(
@@ -108,9 +108,9 @@ def genome_representative_taxonomy_select_sql(*, member_genome: str, taxonomy: s
     vanishing. A genome missing from a taxonomy artifact is indistinguishable from a
     genome absent from the table, so it has to be present and empty.
 
-    The LEFT JOIN to `taxonomy` is deliberate in both places it appears: a feature
-    with no taxonomy row is a *member* that cannot speak for the genome, not a
-    member that disappears.
+    The LEFT JOIN to `taxonomy`, in both places it appears, keeps a feature with no
+    taxonomy row as a *member* that cannot speak for the genome, rather than one that
+    disappears.
 
     **Why pick the member and join its row back, rather than eight
     `arg_min(rank, feature_idx)`s?** Because `arg_min` ignores rows whose *argument*

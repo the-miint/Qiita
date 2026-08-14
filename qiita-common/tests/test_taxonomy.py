@@ -27,8 +27,8 @@ from qiita_common.taxonomy import (
 
 
 def test_the_ranks_run_coarsest_to_finest():
-    """The order is load-bearing three times over — it is the DuckLake column order,
-    the order a lineage concatenates in, and the order the prefixes pair with."""
+    """The order is three contracts at once — the DuckLake column order, the order a
+    lineage concatenates in, and the order the prefixes pair with."""
     assert RANK_COLUMNS == (
         "domain",
         "phylum",

@@ -885,7 +885,7 @@ def _tree_rows(path) -> list[tuple]:
 
 
 def test_the_tree_is_sheared_to_the_published_rows_and_keeps_their_distances(monkeypatch, tmp_path):
-    """The whole point of shearing rather than filtering: c30 drops because feature 30 has
+    """Why shearing rather than filtering: c30 drops because feature 30 has
     no genome, `inner` is left with one child and collapses, and c10's branch becomes
     0.2 + 0.1 — the distance it had in the whole tree. Tips are named the way the table's
     rows are, so the two files join on one column."""

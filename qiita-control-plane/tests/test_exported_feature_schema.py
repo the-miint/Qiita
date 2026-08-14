@@ -428,7 +428,7 @@ async def test_a_retired_genome_row_does_not_block_a_fresh_identifier(postgres_p
     would hand a re-loaded genome a `QF<n>` purely because a reference was once
     deleted, which is the outcome the hybrid exists to avoid. A GENOME accession is
     the source's name for an organism, so handing it back names the same thing; the
-    feature kind is deliberately the opposite and is tested below.
+    feature kind is the opposite and is tested below.
     """
     principal_idx = await _principal(postgres_pool)
     genome_idx, source_id = await seed_genome(postgres_pool)

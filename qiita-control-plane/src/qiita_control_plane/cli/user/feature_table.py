@@ -81,7 +81,7 @@ _SEQUENCES_TABLE = "reference_sequences"
 # beside the reduction that depends on it.
 _TAXONOMY_TABLE = TAXONOMY_SOURCE_TABLE
 
-# The tree, which has NO exclusion-aware view on purpose: a row-wise anti-join would
+# The tree, which has no exclusion-aware view: a row-wise anti-join would
 # orphan the internal parents of an excluded tip and malform the tree, so the contract is
 # that a consumer shears to its own keep-set instead — which is what this recipe does.
 _PHYLOGENY_TABLE = "reference_phylogeny"
@@ -107,8 +107,8 @@ def _fetch_reference_exclusion(
     """GET the curated blocklist as it applies to this reference: one entry per blocked
     feature that the reference actually holds.
 
-    Only the tree needs it — see `ft.BLOCKED_FEATURE_TABLE`. Uncapped, and deliberately
-    not treated as if it were: a blocklist is hand-curated, so it is small by
+    Only the tree needs it — see `ft.BLOCKED_FEATURE_TABLE`. Uncapped, and not treated
+    as if it were: a blocklist is hand-curated, so it is small by
     construction, and the route already scopes it to one reference.
     """
     path = (
@@ -221,7 +221,7 @@ def _create_alignment_doget_ticket(
 def _create_reference_doget_ticket(
     base_url: str, token: str, *, reference_idx: int, table: str
 ) -> bytes:
-    """Mint a WHOLE-reference DoGet ticket for one of the reference's lake tables.
+    """Mint a whole-reference DoGet ticket for one of the reference's lake tables.
 
     Whole-reference in both uses: `feature_idx` is omitted rather than passed empty,
     which is how that route spells it. For lengths that is required — the coverage
@@ -552,7 +552,7 @@ def _tool_versions(con) -> dict[str, str]:
     clients on different builds can produce different numbers from identical input. It is
     read from the catalog rather than assumed, because the client path INSTALLs into a
     cache that never refreshes (see `miint_install_sql`) — what is loaded is the only
-    honest answer. `install_path` is deliberately not recorded: it is a path on this
+    honest answer. `install_path` is not recorded: it is a path on this
     machine, and a published file should not describe the machine that made it.
 
     The alignment's OWN aligner version is not here and cannot be: it ran server-side,
@@ -606,7 +606,7 @@ def _manifest_payload(
     `files` are basenames: the bundle's members relative to wherever it lands, since an
     absolute path describes the machine that built it.
 
-    No build timestamp, deliberately. Nothing here would use one, and leaving it out makes
+    No build timestamp. Nothing here would use one, and leaving it out makes
     the manifest a pure function of its inputs — so two bundles built the same way are
     byte-identical and can be diffed to show it.
 
@@ -890,7 +890,7 @@ def _run_build(
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    # ONE verified summary, read several times: the reference the table is relabelled
+    # One verified summary, read several times: the reference the table is relabelled
     # through, the digest the manifest cites, the aligner it names. Verifying it once and
     # reading it is what keeps those three from being three separate acts of trust.
     summary = _alignment_summary(

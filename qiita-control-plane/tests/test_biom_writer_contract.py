@@ -169,7 +169,7 @@ def test_a_missing_required_column_names_itself(tmp_path):
 
 
 def test_an_EXTRA_column_is_silently_ignored(tmp_path):
-    """The reason the relabel's projection is load-bearing rather than tidy: a relation
+    """Why the relabel's projection is not tidiness: a relation
     still carrying `genome_idx` writes a perfectly valid BIOM, with our internal
     identifier simply dropped on the floor. The writer would not have told anyone.
     """
