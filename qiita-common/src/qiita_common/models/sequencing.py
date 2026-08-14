@@ -1170,10 +1170,19 @@ class PoolAlignmentSummary(BaseModel):
     `params` is the alignment's config blob verbatim (reference, aligner, mask,
     shard set) — the same JSON `alignment_definition.params` stores, so an
     alignment_idx is self-describing without a second lookup.
+
+    `params_hash` is the SHA-256 of that blob's canonical JSON, hex-rendered — the
+    digest the control plane deduplicates definitions on. It is here so a client can
+    recompute it from the `params` beside it (`qiita_common.hashing.
+    canonical_params_hash`) and **refuse on mismatch**: everything a client derives
+    from `params` is only as trustworthy as the round trip that delivered them, and a
+    published manifest cites this digest as the reproducibility key. A client that
+    copied a hash it never checked would be publishing a claim it cannot support.
     """
 
     alignment_idx: Annotated[int, Field(gt=0)]
     params: dict[str, Any]
+    params_hash: str
     samples_completed: int
     samples_total: int
 
@@ -1320,6 +1329,46 @@ class ExportedIdentifierResponse(BaseModel):
     alignment_idx: Annotated[int, Field(gt=0)]
     identifiers: list[ExportedIdentifier]
     count: Annotated[int, Field(ge=0)]
+
+
+class ExportedProcessingRequest(BaseModel):
+    """Body for POST /api/v1/exported-processing — mint (or recover) the public
+    handle for the processing a bundle was built from.
+
+    ``alignment_idx`` is what the handle names. ``prep_sample_idx`` is not part of
+    that name at all: it is **how the caller proves they may have it**. Minting is a
+    write, and a route that wrote on behalf of data the caller cannot read would let
+    anyone walk the `alignment_idx` range and collect a handle for every processing in
+    the system. So the cohort rides the body and takes exactly the gate
+    ``/exported-identifier`` takes for the same pair — a caller who could not build
+    the table has no manifest to write.
+
+    Identical in shape to ``ExportedIdentifierRequest``: two routes over
+    one `(processing, cohort)` pair that authorized it differently would be two
+    answers to "may I read this data".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedProcessingResponse(BaseModel):
+    """Returned by POST /api/v1/exported-processing.
+
+    ``export_processing_id`` (``QP<idx>``) is what a published manifest cites. It is
+    minted by Postgres as a generated column, so nothing in Python composes one and
+    no caller can supply one.
+
+    ``alignment_idx`` is echoed back so the caller can tell which of several
+    processings the handle belongs to. It is an identifier they already sent us,
+    which is why returning it is not a leak — but it belongs in this response only,
+    never in the manifest the handle goes into.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    export_processing_id: str
 
 
 class MaskedReadExportManifest(BaseModel):

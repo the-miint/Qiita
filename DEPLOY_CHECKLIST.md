@@ -23,7 +23,14 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `20260813000000_exported_feature.sql` and `20260813000001_exported_processing.sql` —
+  plain `make migrate`, no out-of-band setup. Two empty mint tables
+  (`qiita.exported_feature`, `qiita.exported_processing`), each with the same
+  retire-on-detach trigger `qiita.exported_identifier` already carries. That behaviour now
+  applies on three more delete paths: deleting a **genome**, a **reference**, or an
+  `alignment_definition` that has published handles detaches and auto-retires them rather
+  than failing or removing them, and the retirement records which identifier was severed.
+  (#448)
 
 ### 4. Deploy
 
@@ -31,7 +38,18 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **The staged miint build must carry `shear_tree`** — `qiita feature-table build --tree`
+  calls it, and it is absent from older builds (`d0336e9` does not have it; the mirror's
+  current `1ad7fb4` does). There is no capability probe: an absent function surfaces as a
+  bare `Catalog Error` naming the function, so check it once here rather than letting a
+  user discover it. Run as the CP service account, against the staged extension directory
+  the CP already LOADs from:
+  ```bash
+  sudo -u qiita-api env MIINT_EXTENSION_DIRECTORY="$(grep -oP '(?<=^MIINT_EXTENSION_DIRECTORY=).*' /etc/qiita/control-plane.env)" \
+    python3 -c "import duckdb, os; c=duckdb.connect(':memory:', config={'extension_directory': os.environ['MIINT_EXTENSION_DIRECTORY'], 'allow_unsigned_extensions': 'true'}); c.execute('LOAD miint'); print(c.execute(\"SELECT count(*) FROM duckdb_functions() WHERE function_name='shear_tree'\").fetchone()[0])"
+  ```
+  Expect `1`. A `0` means the staged build predates the function — re-stage the extension
+  before telling anyone `--tree` works. (#448)
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +57,14 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
+  `qiita feature-table build` requires it.** Additive, so an older client ignores it and
+  nothing on the host changes. The direction that bites is the other one: the new CLI
+  recomputes that digest and refuses to build against a server too old to report one, by
+  design — a client cannot vouch for params it has no way to check. Anyone pointing this
+  build's CLI at an older deployment gets that refusal, not a wrong table. Two new mint
+  routes (`POST /exported-feature`, `POST /exported-processing`) ship alongside it under
+  the scopes their siblings already use — no new scope, so no PAT re-mint. (#448)
 
 ---
 

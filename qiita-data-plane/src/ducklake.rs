@@ -480,8 +480,12 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// row-wise anti-join would orphan internal parents and malform the tree. The
 /// contract instead is that a tree consumer shears the tree to the keep-set
 /// (`tips WHERE feature_idx NOT IN reference_exclusion`) with miint's
-/// `shear_tree`; there is no production tree consumer today, so no phylogeny view
-/// is built.
+/// `shear_tree`, so no phylogeny view is built. The consumer today is the
+/// client-side `qiita feature-table build --tree`, which honours that keep-set by
+/// reading the blocklist over REST — this being the one read surface that cannot
+/// hand it an exclusion-aware view — and intersects it with the genomes its table
+/// publishes. Neither set implies the other: a curator can block one contig of a
+/// genome that still publishes on a sibling's alignments.
 ///
 /// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), for the same reason the
 /// `read_masked` macro is `CREATE OR REPLACE`: the

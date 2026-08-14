@@ -66,6 +66,22 @@ def _lane_arg(raw: str) -> int | None:
     return value
 
 
+def _proportion_arg(raw: str) -> float:
+    """argparse `type` for a proportion in [0, 1] — a coverage breadth, a sequence
+    identity, a query coverage.
+
+    Rejected at parse time (exit 2) rather than after the run has streamed a cohort's
+    worth of alignment data, which is what a downstream check would cost.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a proportion in [0, 1], got {raw!r}") from None
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be a proportion in [0, 1], got {value}")
+    return value
+
+
 def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Fetch a resource by idx (GET) and print its JSON body.
 

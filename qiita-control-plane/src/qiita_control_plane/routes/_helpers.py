@@ -25,7 +25,11 @@ from qiita_common.models import (
     field_wire_name,
 )
 
-from ..auth.guards import PrepSampleReadAccess, filter_prep_samples_caller_can_read
+from ..auth.guards import (
+    COHORT_MIN_TIER,
+    PrepSampleReadAccess,
+    filter_prep_samples_caller_can_read,
+)
 from ..auth.principal import Principal
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -52,6 +56,75 @@ from ..repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
     write_sample_metadata,
 )
+from ..repositories.alignment_definition import alignment_definition_exists
+from ..repositories.block import list_incomplete_alignment_samples
+
+REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
+
+
+async def require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> None:
+    """404 unless the reference exists. Every reference-scoped route needs this so a
+    typo'd idx is distinguishable from a genuinely empty answer — or, on a route that
+    resolves the reference's contents, from contents that are genuinely absent."""
+    exists = await pool.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
+
+
+# The one wording for "no such alignment", shared by every route that keys on an
+# alignment_idx — the three cohort routes below and the alignment delete. Two spellings
+# of one condition is a difference a client can accidentally depend on, and the delete
+# route had its own until they were converged.
+ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
+
+
+async def authorize_completed_alignment_cohort(
+    pool: asyncpg.Pool,
+    *,
+    caller: Principal,
+    alignment_idx: int,
+    prep_sample_idx: list[int],
+    nothing_to: str,
+) -> list[int]:
+    """The gate every route that names a cohort of one alignment runs, and the single
+    copy of the order it runs in. Returns the authorized cohort.
+
+    **The order is a disclosure decision, not a style.** Three checks:
+
+    1. **The alignment exists** → 404, before anything discloses cohort state.
+    2. **Access** → 403, all-or-nothing. A partially-served cohort would answer for some
+       of a caller's samples and silently omit the rest.
+    3. **Completeness** → 422, only once access has passed. Reversed, the 422's sample
+       list would tell a caller which samples are in an alignment they have no right to
+       read at all. It also subsumes an unknown identifier: a prep_sample that is not
+       part of this alignment has no `qiita.alignment_sample` row and is reported here
+       rather than vanishing from an answer claiming to cover the whole cohort.
+       `alignment_sample.state` is first-class because alignment rows are NOT 1:1 with
+       reads, so the presence of rows never means done.
+
+    `nothing_to` completes the 422 — "an identifier names processed data, so there is
+    nothing yet to name" — and is the one thing the callers legitimately differ in. It is
+    a parameter rather than three copies of the whole ladder precisely because the order
+    above is what must not drift between them: three routes hand-writing a
+    security-relevant sequence is three chances for one to be reordered alone.
+    """
+    if not await alignment_definition_exists(pool, alignment_idx):
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+
+    cohort = await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, min_tier=COHORT_MIN_TIER
+    )
+
+    incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
+    if incomplete:
+        detail = (
+            f"{len(incomplete)} prep_sample(s) not completed for alignment"
+            f" {alignment_idx} (e.g. {first_few(incomplete)})"
+        )
+        raise HTTPException(status_code=422, detail=f"{detail}{nothing_to}")
+    return cohort
 
 
 def first_few(idxs: list[int], limit: int = 5) -> str:

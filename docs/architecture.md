@@ -255,8 +255,6 @@ erDiagram
     REFERENCE_MEMBERSHIP }o--|| FEATURE : includes
     FEATURE ||--o{ FEATURE_GENOME : "belongs to"
     FEATURE_GENOME }o--|| GENOME : "is part of"
-    REFERENCE ||--o{ PHYLOGENY_TIP_FEATURE : "has tree"
-    PHYLOGENY_TIP_FEATURE }o--|| FEATURE : "tip maps to"
 
     REFERENCE {
         uint64 reference_idx PK
@@ -289,12 +287,6 @@ erDiagram
         uint64 feature_idx FK
         uint64 genome_idx FK
     }
-
-    PHYLOGENY_TIP_FEATURE {
-        uint64 reference_idx FK
-        uint64 node_index FK
-        uint64 feature_idx FK
-    }
 ```
 
 The three levels:
@@ -309,7 +301,8 @@ Junction tables:
 |---|---|---|
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features belong to which reference version |
 | `feature_genome` | `(feature_idx, genome_idx)` | Which genome(s) a feature belongs to — many-to-many: not all features have a genome, and one feature can belong to several genomes (a plasmid shared across organisms shares one content-hash `feature_idx`) |
-| `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Maps phylogeny tip nodes to their corresponding feature sequences |
+
+**Tip-to-feature is not one of them.** A phylogeny tip's `feature_idx` is a **column on the DuckLake `reference_phylogeny` row**, not a Postgres junction table — the migration that created this schema says so explicitly (`db/migrations/20260501000003_reference.sql`). See [Phylogeny and Placements](#phylogeny-and-placements).
 
 A feature may belong to multiple references (e.g., the same contig in WoL3 and RS225). A genome may contain multiple features (e.g., a multi-contig assembly). A feature may also belong to multiple genomes: two organisms sharing an identical mobile element (a plasmid) resolve to one content-hash `feature_idx` under both `genome_idx` (`feature_genome` is a true many-to-many — the composite PK `(feature_idx, genome_idx)`, no standalone `UNIQUE(feature_idx)`). MD5-based deduplication ensures that if two references include the same sequence bytes, they share one `feature_idx` — no data is duplicated.
 
@@ -327,7 +320,6 @@ All ID minting and membership management lives in the control plane (Postgres OL
 | `feature` | `feature_idx` PK | Feature identity: sequence_hash, timestamps |
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features are in each reference version. `shard_id` (nullable `INTEGER`, `>= 0` CHECK) records the shard planner's assignment for a sharded *analysis* reference — the lineage-sorted shard index (0..N-1) the feature belongs to; NULL = unassigned (unsharded reference, e.g. a host reference, or a deferred/no-genome feature). `accession` (nullable `TEXT`) is the representative FASTA-header record accession (`read_id`) per feature — `feature` is content-hash-global so the per-`(reference, feature)` accession lives here; surfaced by the reference-exclusion query endpoint as external provenance |
 | `feature_genome` | `(feature_idx, genome_idx)` | Feature-to-genome mapping |
-| `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Tip node → feature mapping for phylogeny traversal |
 | `reference_index` | `reference_index_idx` PK, `reference_idx` FK | Built search indexes for a reference: `(index_type, fs_path, params JSONB, created_at, shard_id)`. No `UNIQUE(reference_idx, index_type)` — "growing" a reference appends a newer generation, newest wins. Today `index_type` ∈ {`rype` (the host-filter `.ryxdi` minimizer index), `rype_router` (the whole-reference multi-bucket routing `.ryxdi`), `minimap2` (the `.mmi`), `bowtie2` (the `.bt2` subject set)} — `minimap2` is dual-purpose (host-filter *and* per-shard analysis), `rype` is host-filter only, `rype_router` and `bowtie2` are analysis-alignment only (all three deliberately absent from `HOST_FILTER_REQUIRED_INDEX_TYPES`); the type is plain TEXT+CHECK, so a new index type is a one-line CHECK migration. `shard_id` (nullable `INTEGER`, `>= 0` CHECK) discriminates a per-shard *analysis* index (one row per shard, `shard_id` 0..N-1 — `minimap2`/`bowtie2`) from a whole-reference index (host `rype`/`minimap2`, or the `rype_router`; `shard_id` NULL); no `shard_count` column (it's `COUNT(*)` per `(reference_idx, index_type)`) |
 
 **Data plane (DuckLake):**
@@ -364,7 +356,9 @@ Non-taxonomic annotation systems (KEGG, COG, Pfam) are normalized under the GFF 
 
 Reference phylogenies are stored as node tables decomposed from Newick files via the miint `read_newick` table function. Each tree is keyed on `reference_idx` and contains `(node_index, name, branch_length, edge_id, parent_index, is_tip)` per node. The miint internal phylogeny data model is compatible with this schema.
 
-**Tip-to-feature mapping:** The `phylogeny_tip_feature` junction table (control plane, Postgres) maps `(reference_idx, node_index)` → `feature_idx` for tip nodes. This is populated at reference ingestion time (step 6 of bulk ingestion) by matching tip names in the Newick tree to features already registered in `reference_membership`. The mapping enables phylogeny-rooted queries: traverse the tree to collect descendant tips via `parent_index`, then join through `phylogeny_tip_feature` to reach `feature_idx` and from there to alignment/count tables. Internal nodes are addressed by `(reference_idx, node_index)` — they do not have a global identifier and are not referenced across trees.
+**Tip-to-feature mapping:** a tip row carries its own **`feature_idx` column**; internal nodes carry NULL. There is no junction table and none is planned — the mapping lives in DuckLake beside the topology, which is what the reference migration chose (`db/migrations/20260501000003_reference.sql`). It is populated at load by matching Newick tip names against the reference's sequence `read_id`s, with a LEFT JOIN so a tip that matches nothing keeps its row with a NULL `feature_idx` (`jobs/reference_load.py`'s `_write_phylogeny`). Phylogeny-rooted queries therefore stay inside one lake table: traverse `parent_index` to collect descendant tips, read their `feature_idx` directly, and go from there to alignment/count tables. Internal nodes are addressed by `(reference_idx, node_index)` — they have no global identifier and are not referenced across trees.
+
+**There is no exclusion-aware `reference_phylogeny_visible` view**, unlike sequences and taxonomy, and the reason is structural: a tree is not row-independent, so anti-joining a blocked tip's row would orphan its internal parents and malform the topology. The contract is that a consumer **shears** the tree to its keep-set instead (`qiita-data-plane/src/ducklake.rs`, `ensure_exclusion_tables`); see *Reference exclusion* below for who does that today.
 
 Phylogenetic placements (jplace format) are stored as raw placement data via `read_jplace` rather than resolved into the tree. Reconciliation of placements against the reference phylogeny happens at processing time or on user queries, keeping the stored data independent of tree topology changes.
 
@@ -383,7 +377,7 @@ The raw `alignment` / `reference_taxonomy` tables are **removed from both DoGet 
 
 The Postgres→DuckLake mirror is refreshed by a **wholesale idempotent REPLACE** DoAction (`sync_reference_exclusion`: `DELETE` then `INSERT … SELECT feature_idx FROM read_parquet(<dest>)`), in `REPLAY_SAFE_ACTIONS`. The control plane re-resolves the whole blocklist and re-materializes it (a) on **every blocklist mutation** (the admin route), (b) as the **post-load `sync-reference-exclusion` tail step** of every reference-load workflow (`reference-add`, `local-reference-add`, `host-reference-add`, `local-host-reference-add`) — a fresh assembly of an already-blocked genome mints new `feature_idx` the standing mirror can't know about, which the full re-resolve then catches (a genome re-loaded with identical bytes reuses the already-blocked `feature_idx` for free) — and (c) on demand via the `POST /reference/exclusion/sync` operator route, for recovery when the mirror drifts from Postgres (a prior sync's failure never retried, a rebuilt DuckLake catalog, or a fresh data plane). The step is the workflow **tail** deliberately, so all ingest and index registration persist before it runs. Because it is a status-neutral best-effort side step, its primitive **swallows** a transient data-plane failure (a `FlightError` or a concurrent-sync lock) rather than raising: at tail time the reference is `indexing` (or `active`), and `indexing → failed` is a legal transition, so a propagated blip would drive the workflow `failure_status` PATCH and clobber a fully-built, index-registered reference (and, mid-fan-out, fail its shard children). A swallowed blip leaves a possibly-stale mirror, reconciled out of band by the next blocklist mutation's sync or the operator `POST /reference/exclusion/sync`. (The signer/route path instead surfaces the failure as a retriable 502/503 — there the caller, not a half-built reference, bears the retry.)
 
-**Phylogeny defers to a `shear_tree` contract.** `reference_phylogeny` is not row-independent (a node carries `node_index`/`parent_index`/`is_tip`; `feature_idx` is on tips only), so a straight anti-join would orphan internal parents and malform the tree. There is **no production `reference_phylogeny` consumer today**, so no phylogeny view is built; `reference_phylogeny` stays raw/unfiltered. When a tree consumer is built, it must **shear** the tree to the keep-set `tips WHERE feature_idx NOT IN reference_exclusion` using miint's `shear_tree(tree_table, tips_table, collapse := true, ignore_missing := false)` (a table function that prunes to a keep-set of tips, re-sums branch lengths, and re-roots at the LCA). Prerequisite for that future work: `shear_tree` exists in the miint *source* (the DuckDB 1.5 line) but its presence in the pinned team-mirror build **has not been verified** — the commit postdates the most-recently-checked mirror build, and the mirror is the sole source of truth (no local version pin). So before a tree consumer relies on it, probe the pinned mirror and re-stage if absent (the `stage-miint-extension.sh` drill in [`docs/duckdb-miint.md`](duckdb-miint.md)). `reference_placements` also carries `feature_idx` but is out of scope, as is the Postgres index-build / membership filter (gating at consumption suffices). The remaining `feature_idx`-bearing raw surfaces (`reference_sequences`, `reference_sequence_chunks`, `reference_annotation`) are **deliberately not** anti-join-filtered: a blocked genome stays in the built indexes (it still consumes compute — an accepted, deliberate cost) and its raw sequence bytes stay retrievable; the mask targets only the *consumption products* — the alignment rows a feature table rolls up, and the taxonomy a lineage reads.
+**Phylogeny defers to a `shear_tree` contract.** `reference_phylogeny` is not row-independent (a node carries `node_index`/`parent_index`/`is_tip`; `feature_idx` is on tips only), so a straight anti-join would orphan internal parents and malform the tree. No phylogeny view is built and `reference_phylogeny` stays raw/unfiltered; a consumer **shears** it instead, using miint's `shear_tree(tree_table, tips_table, collapse := true, ignore_missing := false)` (a table function that prunes to a keep-set of tips, re-sums branch lengths, and re-roots at the LCA). The consumer today is the client-side `qiita feature-table build --tree`, and it applies **both** halves: `tips WHERE feature_idx NOT IN reference_exclusion` **and** the genomes its table publishes. Neither implies the other — a curator can block one contig of a genome that publishes on the strength of a sibling — so a tip is renamed only when it is published *and* unblocked, and is left nameless (hence sheared away) otherwise; a genome left with no usable tip is refused rather than published against a blocked one (`qiita_common.feature_table.shear_input_statements`, `check_tree_diagnostics`). **This is the one place the exclusion is not applied for the consumer**, which is why the client reads the blocklist over REST: the alignment and the taxonomy arrive through `_visible` views, and the phylogeny deliberately has none. `shear_tree` **is present in the pinned team-mirror build** and its contract is recorded in [`docs/duckdb-miint.md`](duckdb-miint.md) — including the one thing that bites a first consumer: it is absent from older builds, and the client `INSTALL` path never force-refreshes its cache, so a stale `~/.duckdb/extensions` fails with a bare `Catalog Error` rather than anything actionable (the build probes for it up front, `require_miint_function`). `reference_placements` also carries `feature_idx` but is out of scope, as is the Postgres index-build / membership filter (gating at consumption suffices). The remaining `feature_idx`-bearing raw surfaces (`reference_sequences`, `reference_sequence_chunks`, `reference_annotation`) are **deliberately not** anti-join-filtered: a blocked genome stays in the built indexes (it still consumes compute — an accepted, deliberate cost) and its raw sequence bytes stay retrievable; the mask targets only the *consumption products* — the alignment rows a feature table rolls up, and the taxonomy a lineage reads.
 
 Curation is a system-admin surface: `POST` / `DELETE /reference/exclusion` (global, `reference:exclusion:write`) and the reference-scoped query `GET /reference/{reference_idx}/exclusion` (`reference:read`), which intersects the global blocklist with a reference's membership and returns each blocked member's provenance — the genome `(source, source_id)` plus the reference's own `reference_membership.accession` (the FASTA-header record accession, persisted at load). The mutation routes are also the (a) sync trigger above. See [`docs/auth.md`](auth.md) for the scope ceiling and route contract.
 
@@ -488,7 +482,7 @@ Adding a new reference (potentially millions of sequences) is a multi-step pipel
 3. The SLURM hash job reads sequences using DuckDB + miint (`read_fastx`), computes MD5 hashes via DuckDB's built-in `md5()`, and writes a manifest (hash, sequence identifier, length, metadata) to the output directory
 4. The orchestrator reads the manifest and sends hashes to the control plane in bulk
 5. The control plane does a bulk dedup lookup against the `feature` table (`sequence_hash` unique index), reuses existing `feature_idx` for matches, mints new `feature_idx` for novel sequences, writes `reference_membership` and `feature_genome` records, and returns the `{hash → feature_idx}` mapping to the orchestrator
-6. The orchestrator submits a **load job** with the ID mapping; the SLURM job loads sequences, taxonomy, annotations, and phylogeny into DuckLake tables using the assigned `feature_idx` values. For references with a phylogeny, the load job also resolves tip names to `feature_idx` and the orchestrator writes `phylogeny_tip_feature` records to the control plane
+6. The orchestrator submits a **load job** with the ID mapping; the SLURM job loads sequences, taxonomy, annotations, and phylogeny into DuckLake tables using the assigned `feature_idx` values. For references with a phylogeny, the same job resolves tip names to `feature_idx` and writes them onto the tip rows themselves — no control-plane write is involved
 7. On completion, the orchestrator submits an **index build job** to create aligner indices (minimap2 `.mmi`, bowtie2)
 8. The control plane records the reference as active once all jobs complete
 
@@ -518,7 +512,7 @@ These queries demonstrate the join patterns the reference design supports:
 
 5. **Sequences by identifier:** "Give me the sequence for feature_idx 42" — direct lookup in the reference sequences table. Also supports bulk retrieval by identifier set via standard Flight ticket pattern.
 
-6. **Clade-scoped sample data:** "Give me all sample counts under this clade in the WoL3 tree" — the control plane resolves the clade to a `feature_idx` set: recursive CTE on the phylogeny node table (DuckLake, via data plane) to collect descendant tip `node_index` values, then join through `phylogeny_tip_feature` (Postgres) to get the `feature_idx` set. The control plane signs a Flight ticket scoped to those `feature_idx` values, and the data plane serves the count/alignment data. Same pattern as reference-scoped queries — the control plane resolves the identifier set, the data plane serves the data.
+6. **Clade-scoped sample data:** "Give me all sample counts under this clade in the WoL3 tree" — the clade resolves to a `feature_idx` set inside one DuckLake table: a recursive CTE on `reference_phylogeny.parent_index` collects the descendant tips and reads their `feature_idx` column directly. The control plane signs a Flight ticket scoped to those `feature_idx` values, and the data plane serves the count/alignment data. Same pattern as reference-scoped queries — the control plane resolves the identifier set, the data plane serves the data.
 
 ## Client Interfaces (Unresolved)
 
@@ -660,21 +654,36 @@ you know why:
   incomplete samples would tell a caller which samples are finished for an
   alignment they have no right to read at all.
 
-### Two maps that are REST reads, not Flight tickets
+### One map and three mints that are REST, not Flight tickets
 
-Turning those alignment rows into a feature table needs two translations, and
-both are control-plane REST calls rather than signed Flight tickets — the one
-place bulk-shaped analytic data does not come off the data plane:
+Turning those alignment rows into a publishable feature table needs four
+control-plane calls, and every one is REST rather than a signed Flight ticket —
+the one place bulk-shaped analytic data does not come off the data plane:
 
 | Call | Answers | Why not Flight |
 |---|---|---|
 | `GET /reference/{reference_idx}/genome-map` | `feature_idx` → `(genome_idx, source, source_id)` | `genome_idx` and the genome's provenance exist **only in Postgres**; no DuckLake table carries them, and `genome_idx` is not a filter column |
 | `POST /exported-identifier` | `(alignment_idx, prep_sample_idx)` → `export_id` | the identifier is *minted* here; it exists in Postgres only, and creating one is a write |
+| `POST /exported-feature` | `genome_idx` \| `feature_idx` → `export_feature_id` | same — a mint, and a write |
+| `POST /exported-processing` | `alignment_idx` → `export_processing_id` | same |
 
 That is the whole criterion: **a signed ticket can only name identifiers the
-data plane can resolve**, and neither call's columns exist out there. It is not a
+data plane can resolve**, and no call's columns exist out there. It is not a
 policy exception and it does not generalize — anything whose columns do live in
 the lake still goes through a ticket.
+
+**The three mints are one namespace, not three conventions.** Each is a table
+whose public handle is a GENERATED, UNIQUE column, so the guarantee that two
+things never publish under one name is a database fact rather than a client
+assertion; each is idempotent, so a rebuild renames nobody; and each retires
+rather than deletes, because a published handle is a promise. `exported_feature`
+is the hybrid — an accession wins wherever the entity has one no live row has
+already published, and a minted `QF<n>` covers the rest — which is why a bundle
+names its rows `GCF_000006605` rather than replacing a handle people know. The
+shape, the rejected alternatives, and what a new *kind* must update are in the
+three migrations (`20260810000000_exported_identifier.sql`,
+`20260813000000_exported_feature.sql`, `20260813000001_exported_processing.sql`);
+the FORWARD PLAN comment in each is the copy to read before adding one.
 
 **The exported identifier is the boundary where our identifiers stop.** A
 published table names its samples `QM<n>`, never `prep_sample_idx` — see the
@@ -707,6 +716,89 @@ same cohort shape, same `Tier.VIEWER` all-or-nothing gate, same refusal wording,
 same access-checked-first ordering. Two answers to "may this caller read this
 sample" is the drift that ends with one surface advertising what the other
 refuses.
+
+### The client-side feature table
+
+`qiita feature-table build` composes the primitives above into a genome-keyed (OGU)
+feature table **on the caller's own machine**. The division is the point: the control
+plane authorizes, mints public identifiers, and signs tickets; the data plane streams
+rows; the analytic, the relabel, and the write run in the client's own DuckDB under the
+caller's own credentials. **The table itself is computed nowhere else and stored
+nowhere** — it is a derived artifact on the caller's disk, not a resource this system
+holds. (The `export_id`s naming its samples *are* persisted, in Postgres, because they
+are promises: see the map section above.)
+
+```
+alignment slice  ───Flight DoGet (projected)──┐
+reference lengths ──Flight DoGet (whole ref)──┤
+reference taxonomy ─Flight DoGet (whole ref)──┤──> coverage filter ──> woltka_ogu
+reference phylogeny Flight DoGet (whole ref)──┤                            │
+genome map ─────────REST─────────────────────>┤                            v
+exported identifiers REST (mint)─────────────>┘        exported features ──REST (mint)
+                                                       exported processing REST (mint)
+                                                                           │
+                                                         relabel + shear <─┘
+                                                                           v
+   bundle: table (Parquet | BIOM) + .exported-identifier.json + .manifest.json
+                          + [.taxonomy.parquet] + [.tree.parquet]
+```
+
+**The row mint is downstream of woltka, not an input to it.** It is keyed on the genomes
+the roll-up actually emitted, so a build never mints a permanent public handle for a row it
+does not publish (`_published_genome_idxs`).
+
+**The analytic is SQL text in `qiita_common.feature_table`, shared with the
+compute-orchestrator's `estimate_feature_table` job.** Two consumers run the same
+analytic and must not disagree about it; they differ only in where the inputs come from
+and how the result is written — which is why the module owns no connection and no
+streaming, and why `qiita-common` has no `duckdb` dependency to let it. That module's
+docstrings are the single copy of *why* each step is shaped as it is; this section is
+the map, not a second copy. What a reader of the pipeline needs to know is that six of
+its properties are load-bearing rather than stylistic, and each is enforced and
+explained at exactly one place:
+
+| Property | Enforced at |
+|---|---|
+| the coverage survivor set joins **before** woltka, not after its output | `ogu_input_table_sql` |
+| a CIGAR gate filters the coverage calculation as well as the counts | `gated_alignment_table_sql` |
+| the relabel precedes the write and is what makes BIOM writable at all | `LABELLED_SCHEMA`, `labelled_relation_sql` |
+| the coverage scope rides the *relation name*, so a scope mismatch is a bind error | `_SURVIVOR_TABLES` |
+| a genome speaks through its lowest **classified** member, not its lowest | `genome_representative_taxonomy_select_sql` |
+| the tree's **tips are renamed before the shear**, not its output after | `shear_input_statements` |
+
+The last two are what make the optional companions — `--taxonomy` and `--tree` —
+joinable to the table rather than merely shipped beside it: all three artifacts are
+named from the one `exported_feature` mint, so `feature_id` is the join key across the
+bundle. The taxonomy reduction is shared with the shard planner, which must not tile a
+genome under one lineage while the client publishes another; the tree's shear is
+miint's `shear_tree`, which is also the answer to why `reference_phylogeny` has no
+exclusion-aware `_visible` view (see *Phylogeny and Placements*).
+
+Two consequences worth stating here, because neither is visible from any single site:
+
+- **Narrowing the cohort changes the table rather than filtering it.** Breadth of
+  coverage is measured over the cohort, so the cohort is part of the scientific
+  question — which is also why the ticket mint is all-or-nothing rather than narrowing
+  to what the caller may read.
+- **Every check in the recipe exists because its failure mode is a table that looks
+  right**, not one that errors. The SQL that would publish such a table is unreachable
+  without the check having run: the builders take a clearance object only the check
+  produces, so "diagnose before you act" is a type constraint rather than a convention.
+- **A build writes a bundle, not a file, and the bundle is all-or-nothing.** Its three
+  fixed members are the table, the identifier map, and the manifest; `--taxonomy` and
+  `--tree` add a fourth and fifth. A failure part-way unlinks every member, including
+  ones already committed (`_common.commit_partials`), because a bundle missing the map
+  is a table nobody can read and a bundle missing the manifest is one nobody can
+  reproduce — coverage filtering makes the table a function of the whole cohort, not
+  only of the samples in it, which is why the manifest is a member rather than a flag.
+
+Client half: `qiita_control_plane.cli.user.feature_table`, with `cli.user.alignment` for
+the discovery reads that yield an `alignment_idx`. The reference is read out of the
+alignment's own `params` rather than taken as a flag, so a caller cannot fetch the
+genome map for a different reference than the alignment used — and those `params` are
+verified against the digest the server reported for them (`_alignment_summary`) before
+anything is read off them, because the manifest cites that digest as the processing's
+reproducibility key.
 
 ## Auth & Data Access Flow
 
@@ -992,7 +1084,7 @@ Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qi
 
 Two logical Postgres databases on a single hardened instance, one per data domain:
 
-- **`qiita_miint`** — control-plane schema: principals, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping, phylogeny tip-feature mapping.
+- **`qiita_miint`** — control-plane schema: principals, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping.
 - **`qiita_miint_lake`** — DuckLake catalog (snapshots, data files, schemas) plus inlined small inserts (`ducklake_inlined_data_tables`).
 
 Each database has a dedicated owner role and a read-only role:
@@ -1422,5 +1514,5 @@ jobs:
 - **Reference ID minting flow:** Bulk reference ingestion is a multi-step pipeline: (1) SLURM hash job reads sequences via DuckDB + miint and computes MD5 hashes, writing a manifest; (2) orchestrator feeds hashes to control plane; (3) control plane does bulk dedup lookup (`features.sequence_hash` unique index, stored as Postgres `uuid`), reuses existing `feature_idx` for matches, mints new ones for novel sequences, writes membership records, returns ID mapping; (4) SLURM load job inserts sequences + taxonomy + annotations into DuckLake using assigned IDs; (5) SLURM index job builds aligner indices.
 - **Alignment → reference join:** Alignment Parquet contains `feature_idx` but not `reference_idx`. To scope alignment results to a specific reference version, the query joins `reference_membership(reference_idx, feature_idx)` at query time. This join can happen entirely in the data plane (DuckLake) for analytical queries, or the control plane can provide the authorized feature set for a given reference to narrow a Flight ticket.
 - **Reference filesystem paths:** Built reference data lives under `/scratch/persistent-local/references/{reference_idx}/{aligner}/` (local SSD, random-access aligner indices) or `/scratch/persistent/references/{reference_idx}/{aligner}/` (shared FS, references that don't need local-SSD random access). Built by SLURM jobs and read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct path. If the local-SSD copy of an aligner index is missing (cluster purge), the orchestrator rebuilds it at dispatch time before the alignment job runs.
-- **Phylogenetic addressing:** Internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to the sequence identity layer via the `phylogeny_tip_feature` junction table `(reference_idx, node_index) → feature_idx`, populated at ingestion time. Clade-scoped queries use a recursive CTE on `parent_index` to collect descendant tips, then join through `phylogeny_tip_feature` to reach `feature_idx`.
+- **Phylogenetic addressing:** Internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. A tip connects to the sequence identity layer through its own `feature_idx` column on the same DuckLake row, written at ingestion time; there is no junction table. Clade-scoped queries use a recursive CTE on `parent_index` to collect descendant tips and read `feature_idx` off them.
 - **Feature deduplication:** `feature_idx` is content-addressed via MD5 hash of the sequence bytes. The SLURM ingestion job computes hashes using DuckDB's built-in `md5()` function on sequences read via miint's `read_fastx`. Hashes are fed back to the control plane through the orchestrator for bulk dedup lookup. The control plane stores hashes as Postgres `uuid` type (MD5 is exactly 128 bits = UUID-sized) with a unique B-tree index, and upserts on `sequence_hash` — if a sequence already exists, the existing `feature_idx` is reused and the new reference's membership row simply points to it.

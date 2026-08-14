@@ -19,8 +19,10 @@ The params_hash is computed control-plane-side via
 qiita_common.hashing.canonical_params_hash (SHA-256 of the canonical config
 JSON) — no pgcrypto dependency on the database. The function only enforces the
 dedup and returns the row; asyncpg.ForeignKeyViolationError (unknown
-principal_idx) and asyncpg.InvalidParameterValueError (SQLSTATE 22023, a
-non-32-byte hash — unreachable via this helper) propagate to the caller.
+principal_idx), asyncpg.InvalidParameterValueError (SQLSTATE 22023, a
+non-32-byte hash — unreachable via this helper) and
+ParamsDoNotSurviveStorageError (a config whose jsonb round trip would change
+the digest) propagate to the caller.
 """
 
 import json
@@ -28,6 +30,48 @@ from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.hashing import canonical_params_hash
+
+
+class ParamsDoNotSurviveStorageError(RuntimeError):
+    """`params` contains a value whose jsonb round trip changes its canonical JSON.
+
+    Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
+    so a float Python spells with an exponent can come back as an integer literal
+    (1.5e30 → 1500000000000000000000000000000, which re-parses as an `int`), and -0.0
+    comes back as 0.0. Either way `canonical_params_hash` of the row we read is not the
+    digest we stored beside it.
+
+    That would be invisible — and permanent for the affected `alignment_idx` — if
+    nothing re-hashed the params. Something does: the pool alignment listing publishes
+    `params_hash` and the CLI recomputes it from the `params` beside it and refuses to
+    build on a mismatch (`cli/user/alignment.py`). So this is caught here, at the write
+    that would create it, rather than surfacing as an unexplainable refusal in someone
+    else's build months later.
+
+    A config needing a fractional value should carry it as a string, or as a scaled
+    integer. The sibling mints (`mask_definition`, `processing`) store params the same
+    way and have the same latent exposure; they are not guarded because nothing
+    re-hashes their stored params yet. If that changes, this check is what to reuse.
+    """
+
+
+async def _assert_params_survive_storage(
+    conn: asyncpg.Connection, params: dict, params_hash: bytes
+) -> None:
+    """Refuse `params` whose canonical hash changes across a jsonb round trip.
+
+    Asks Postgres to normalize the blob rather than predicting how it will: the rule is
+    `numeric`'s output format, and a Python-side approximation of it would be both
+    fiddly and wrong in the cases that matter. One extra statement per *definition*
+    mint, which happens once per unique config, not once per sample.
+    """
+    stored = await conn.fetchval("SELECT ($1::jsonb)::text", json.dumps(params))
+    if canonical_params_hash(json.loads(stored)) != params_hash:
+        raise ParamsDoNotSurviveStorageError(
+            f"these alignment params do not survive jsonb storage unchanged: stored as "
+            f"{stored!r}, which no longer hashes to the digest computed for them. See "
+            f"ParamsDoNotSurviveStorageError."
+        )
 
 
 async def mint_alignment_definition(
@@ -50,13 +94,16 @@ async def mint_alignment_definition(
     comment for the properties real growth support would need.
 
     Returns the qiita.alignment_definition row as an asyncpg.Record. Raises
-    asyncpg.ForeignKeyViolationError when principal_idx does not exist.
+    asyncpg.ForeignKeyViolationError when principal_idx does not exist, and
+    ParamsDoNotSurviveStorageError for a config whose stored form would stop matching
+    the digest stored beside it.
 
     No `require_transaction(conn)` guard: the qiita.mint_alignment_definition
     plpgsql body (the SELECT/INSERT upsert loop) executes as a single SQL
     statement, so Postgres wraps it in one transaction either way.
     """
     params_hash = canonical_params_hash(params)
+    await _assert_params_survive_storage(conn, params, params_hash)
     # asyncpg encodes a dict bound to a jsonb parameter via the JSON codec; pass
     # the serialized string explicitly so the behaviour is independent of
     # whether a JSON codec is registered on the connection.
@@ -181,7 +228,8 @@ async def list_alignments_over_prep_samples(
         "   WHERE prep_sample_idx = ANY($1::bigint[])"
         "   GROUP BY alignment_idx"
         ")"
-        " SELECT c.alignment_idx, ad.params, c.samples_completed, c.samples_total"
+        " SELECT c.alignment_idx, ad.params, ad.params_hash,"
+        "        c.samples_completed, c.samples_total"
         "   FROM counted c"
         "   JOIN qiita.alignment_definition ad ON ad.alignment_idx = c.alignment_idx"
         "  ORDER BY c.alignment_idx",

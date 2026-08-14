@@ -5,8 +5,8 @@ processed sample in a cohort, so a published feature table can name its samples
 without carrying ours. A control-plane route rather than anything the data plane
 can serve: the identifiers live only in Postgres, and minting one is a write.
 
-Cohort authorization is `authorize_prep_sample_cohort`, shared with the human
-alignment mint: minting a ticket for a cohort and minting the public handles for
+Cohort authorization is `authorize_completed_alignment_cohort`, shared with the
+human alignment mint: minting a ticket for a cohort and minting the public handles for
 that same cohort is one workflow, and two answers to "may I read this sample" is
 how one surface comes to advertise what the other refuses.
 """
@@ -24,17 +24,13 @@ from qiita_common.models import (
     ExportedIdentifierResponse,
 )
 
-from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
+from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
-from ..repositories.alignment_definition import alignment_definition_exists
-from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.exported_identifier import IncompleteMintError, mint_exported_identifiers
-from ._helpers import authorize_prep_sample_cohort, first_few
+from ._helpers import authorize_completed_alignment_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])
-
-_MSG_ALIGNMENT_NOT_FOUND = "alignment not found"
 
 # `require_human`, NOT the alignment mint's `require_complete_profile`, and the
 # difference is the rule rather than an oversight: a route that hands out access
@@ -71,40 +67,22 @@ async def mint_exported_identifier_map(
     An export_id is published, so the same processed sample must resolve the same
     way every time.
 
-    Validation order mirrors the alignment cohort mint exactly, because the two
-    take the same cohort and must never disagree about it:
-
-    1. **The alignment exists** → 404, before anything discloses cohort state.
-    2. **Access** → 403, all-or-nothing. A partially-minted cohort would name some
-       of a caller's samples and silently omit the rest.
-    3. **Completeness** → 422, only once access has passed. Reversed, the 422's
-       sample list would tell a caller which samples are in an alignment they have
-       no right to read. This also subsumes an unknown identifier: a
-       prep_sample that is not part of this alignment has no
-       `qiita.alignment_sample` row and is reported here rather than vanishing
-       from an answer that claims to cover the whole cohort.
+    The cohort gate is `authorize_completed_alignment_cohort`, shared with the
+    alignment ticket mint and the processing mint: the three take the same cohort and
+    must never disagree about it, and its docstring is the single copy of why the
+    checks run in the order they do.
 
     There is deliberately no refusal for a missing `biosample_accession`. The
     label this route replaced could not be composed without one; an `export_id`
     always can, so an unaccessioned sample is now labellable rather than a 422.
     """
-    if not await alignment_definition_exists(pool, body.alignment_idx):
-        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
-
-    cohort = await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=COHORT_MIN_TIER
+    cohort = await authorize_completed_alignment_cohort(
+        pool,
+        caller=caller,
+        alignment_idx=body.alignment_idx,
+        prep_sample_idx=body.prep_sample_idx,
+        nothing_to="; an identifier names processed data, so there is nothing yet to name",
     )
-
-    incomplete = await list_incomplete_alignment_samples(pool, body.alignment_idx, cohort)
-    if incomplete:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{len(incomplete)} prep_sample(s) not completed for alignment"
-                f" {body.alignment_idx} (e.g. {first_few(incomplete)}); an identifier"
-                " names processed data, so there is nothing yet to name"
-            ),
-        )
 
     try:
         rows = await mint_exported_identifiers(

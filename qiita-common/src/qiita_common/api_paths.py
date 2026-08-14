@@ -838,6 +838,34 @@ URL_EXPORTED_IDENTIFIER_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_IDENTIFIER_PREFIX}
 URL_EXPORTED_IDENTIFIER = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
 
 
+# =============================================================================
+# /exported-feature — the public handle a published table carries per ROW
+# =============================================================================
+# The other axis of the same artifact: /exported-identifier names the columns
+# (processed samples), this names the rows (genomes and features). POST for the
+# same two reasons — it mints, and the entity set has to ride the body.
+
+PATH_EXPORTED_FEATURE_PREFIX = "/exported-feature"
+PATH_EXPORTED_FEATURE_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_FEATURE_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_FEATURE_PREFIX}"
+URL_EXPORTED_FEATURE = f"{URL_EXPORTED_FEATURE_PREFIX}{PATH_EXPORTED_FEATURE_ROOT}"
+
+
+# =============================================================================
+# /exported-processing — the public handle a published bundle's manifest cites
+# =============================================================================
+# The third axis: /exported-identifier names a table's columns, /exported-feature
+# its rows, and this names what was DONE to produce it. POST because it mints, and
+# against the prefix like its two siblings.
+
+PATH_EXPORTED_PROCESSING_PREFIX = "/exported-processing"
+PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
+URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
+
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"

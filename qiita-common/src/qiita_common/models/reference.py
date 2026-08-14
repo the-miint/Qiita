@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
 
@@ -583,4 +583,106 @@ class GenomeMapResponse(BaseModel):
 
     reference_idx: Annotated[int, Field(gt=0)]
     entries: list[GenomeMapEntry]
+    count: Annotated[int, Field(ge=0)]
+
+
+# Upper bound on the entities a caller names in one exported-feature request,
+# counted ACROSS both kinds. Chosen for the same reason as the prep_sample cohort
+# cap in models/_base.py — request-payload size — but not shared with it: that one
+# is also sized by the width of a refusal's disclosure, and this route discloses
+# nothing about who may read what. A published feature set can be far larger than
+# this; minting is idempotent, so a caller batches.
+MAX_EXPORTED_FEATURE_ENTITIES = 10_000
+
+
+class ExportedFeatureRequest(BaseModel):
+    """Body for POST /api/v1/exported-feature — mint (or recover) the public handle
+    for each feature-axis entity a published artifact will name.
+
+    Two kinds, because the axis is not uniform. A **genome** is named by
+    `genome_idx` alone: its accession (`qiita.genome.source_id`) is a property of
+    the genome, reference-independent. A **feature** is named by `(reference_idx,
+    feature_idx)`, because the accession that names it is
+    `reference_membership.accession` — the FASTA header *that* reference used — and
+    one content-hashed feature can be named differently in two references.
+
+    Both lists may be empty individually but not together, and their combined
+    length is what the cap bounds: a caller asking for nothing has no answer to
+    receive, and the payload cost is the total either way.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    genome_idx: Annotated[
+        list[Annotated[int, Field(gt=0)]], Field(max_length=MAX_EXPORTED_FEATURE_ENTITIES)
+    ] = []
+    reference_idx: Annotated[int, Field(gt=0)] | None = None
+    feature_idx: Annotated[
+        list[Annotated[int, Field(gt=0)]], Field(max_length=MAX_EXPORTED_FEATURE_ENTITIES)
+    ] = []
+
+    @model_validator(mode="after")
+    def _coherent_entity_set(self) -> ExportedFeatureRequest:
+        if not self.genome_idx and not self.feature_idx:
+            raise ValueError("name at least one genome_idx or feature_idx")
+        # Dedup before the cap, and in input order. A repeated entity is one entity:
+        # the mint is idempotent, so leaving duplicates in would spend the cap on
+        # work Postgres then collapses anyway, and would refuse a request that names
+        # nothing like 10 000 distinct things. `Field(max_length=…)` above still
+        # bounds the raw payload, which is the other thing the cap is for.
+        self.genome_idx = list(dict.fromkeys(self.genome_idx))
+        self.feature_idx = list(dict.fromkeys(self.feature_idx))
+        total = len(self.genome_idx) + len(self.feature_idx)
+        if total > MAX_EXPORTED_FEATURE_ENTITIES:
+            raise ValueError(
+                f"{total} entities exceeds the {MAX_EXPORTED_FEATURE_ENTITIES} per-request"
+                " limit; minting is idempotent, so send several requests"
+            )
+        # A feature is only identifiable together with the reference that
+        # accessioned it, so neither half of that pair is optional. The reverse is
+        # rejected too: a reference_idx with no feature_idx would silently do
+        # nothing, and a caller who wrote it meant something.
+        if self.feature_idx and self.reference_idx is None:
+            raise ValueError("feature_idx requires reference_idx — an accession belongs to a pair")
+        if self.reference_idx is not None and not self.feature_idx:
+            raise ValueError("reference_idx names no feature_idx")
+        return self
+
+
+class ExportedFeature(BaseModel):
+    """One published entity's public handle.
+
+    `export_feature_id` is the label the table, its taxonomy sidecar and its tree
+    all carry, and it is minted by Postgres as a generated column — nothing in
+    Python composes one and no caller can supply one. It is the accession when
+    `accession_published`, and a `QF<n>` handle otherwise.
+
+    Exactly one of `genome_idx` or `(reference_idx, feature_idx)` is set, echoing
+    back the identifier the caller sent so the map can be joined to their rows.
+    Those are ours and belong in this map only, never in the artifact beside it.
+
+    `accession` rides along even when it lost: a caller who sees a `QF` handle for
+    an entity that plainly has an accession needs to be able to tell the difference
+    between "there was none" and "another entity published it first".
+    """
+
+    genome_idx: Annotated[int, Field(gt=0)] | None = None
+    reference_idx: Annotated[int, Field(gt=0)] | None = None
+    feature_idx: Annotated[int, Field(gt=0)] | None = None
+    export_feature_id: str
+    accession: str | None = None
+    accession_published: bool
+
+
+class ExportedFeatureResponse(BaseModel):
+    """Returned by POST /api/v1/exported-feature: one entry per requested entity,
+    genome entries first ascending by `genome_idx`, then feature entries ascending
+    by `feature_idx`.
+
+    Every requested entity is present or the whole request failed, so there is no
+    partial answer to signal and no `truncated` — the request body's own cap already
+    bounds the size.
+    """
+
+    identifiers: list[ExportedFeature]
     count: Annotated[int, Field(ge=0)]

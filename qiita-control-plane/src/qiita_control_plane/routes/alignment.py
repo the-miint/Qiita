@@ -40,7 +40,6 @@ from qiita_common.models import (
 
 from ..actions.library import delete_alignment_data
 from ..auth.guards import (
-    COHORT_MIN_TIER,
     require_complete_profile,
     require_scope,
     require_service_with_scope,
@@ -49,11 +48,7 @@ from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..feature_table import parse_feature_table_scope
-from ..repositories.alignment_definition import alignment_definition_exists
-from ..repositories.block import list_incomplete_alignment_samples
-from ._helpers import authorize_prep_sample_cohort, first_few
-
-_MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
+from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -116,7 +111,7 @@ async def delete_alignment_definition_route(
         "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
     if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
 
     # DuckLake alignment rows (idempotent, atomic delete-by-alignment_idx in the
     # data plane). Lake-first so a crash before the Postgres delete leaves a
@@ -239,39 +234,22 @@ async def create_alignment_cohort_doget_ticket(
     studies or users, so there is no second line of defence behind this
     function; every check below is the only one there is.
 
-    Validation is ordered, and the order is load-bearing:
-
-    1. **The alignment exists** → 404, before anything discloses cohort state.
-    2. **Access** → 403. All-or-nothing, never narrowed: coverage filtering
-       makes a feature table cohort-dependent, so quietly trimming the request
-       would answer a different scientific question under the name of the one
-       that was asked. The 403 names what to go fix — the unreadable studies, or
-       the samples whose every study link is retired (denied: a read gate fails
-       closed on that anomaly, unlike the work-ticket submit gate).
-    3. **Completeness** → 422, only once access has passed. Reversed, the 422's
-       sample list would tell a caller which samples are completed for an
-       alignment they have no right to read at all. ``alignment_sample.state``
-       is first-class because alignment rows are NOT 1:1 with reads, so the
-       presence of rows never means done — this is the check the work-ticket
-       route can skip because its runner resolver already ran it at submit.
-    4. **Sign**, sharing one helper with that route so the two cannot drift.
+    Validation is `authorize_completed_alignment_cohort`, whose docstring is the
+    single copy of why its three checks run in the order they do; the signing that
+    follows shares one helper with the work-ticket route so the two cannot drift.
+    Two things specific to this route and not to that gate: the cohort is never
+    narrowed because coverage filtering makes a feature table cohort-dependent, so
+    trimming the request would answer a different scientific question under the name
+    of the one asked; and the completeness check is the one the work-ticket route can
+    skip, its runner resolver having already run it at submit.
     """
-    if not await alignment_definition_exists(pool, alignment_idx):
-        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
-
-    cohort = await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=COHORT_MIN_TIER
+    cohort = await authorize_completed_alignment_cohort(
+        pool,
+        caller=caller,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=body.prep_sample_idx,
+        nothing_to="",
     )
-
-    incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
-    if incomplete:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{len(incomplete)} prep_sample(s) not completed for alignment"
-                f" {alignment_idx} (e.g. {first_few(incomplete)})"
-            ),
-        )
 
     return _sign_alignment_ticket(
         alignment_idx=alignment_idx,

@@ -239,18 +239,17 @@ Reference identifiers form a parallel hierarchy:
 
 ```
 reference_idx ── reference_membership ── feature_idx ── feature_genome ── genome_idx
-                                    └── phylogeny_tip_feature (reference_idx, node_index) → feature_idx
 ```
 
 - `reference_idx` = (name, version) pair for a reference database; `kind` distinguishes sequence references from taxonomy authorities
-- `genome_idx` = logical entity across references (nullable — not all features are genomes, e.g., 16S records)
-- `feature_idx` = specific sequence, deduplicated by MD5 hash via DuckDB `md5()` (identical bytes = same `feature_idx`; stored as Postgres `uuid`)
+- `genome_idx` = logical entity across references (nullable — not all features are genomes, e.g., 16S records). Carries the public `(source, source_id)` accession
+- `feature_idx` = specific sequence, deduplicated by MD5 hash via DuckDB `md5()` (identical bytes = same `feature_idx`). A **BIGINT identity** — the 128-bit hash is the separate `feature.sequence_hash uuid`. A feature's human-facing name lives on the *membership* (`reference_membership.accession`, nullable), not on `feature`
 
 `feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
 
-Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to `feature_idx` via the `phylogeny_tip_feature` junction table.
+Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. A tip carries its own `feature_idx` **column** on the DuckLake `reference_phylogeny` row (NULL on internal nodes); there is no junction table, and no exclusion-aware `_visible` view — see [`docs/architecture.md`](docs/architecture.md) under "Phylogeny and Placements" for why, and what a consumer must do instead.
 
-**Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` and `feature_idx` already use — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
+**Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` already uses — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
 
 ### Data plane design
 

@@ -22,6 +22,187 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A published feature table's rows can now be labelled without our identifiers (#448).**
+  `POST /exported-feature` mints the public handle for a feature-axis entity, the way
+  `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
+  and its sheared tree can all label a row the same way, which is what lets them be used
+  together. It is deliberately a **hybrid**: a real accession wins wherever one exists
+  (`genome.source_id` for a genome, `reference_membership.accession` for a feature, which is
+  why that kind is keyed on the `(reference, feature)` pair — identical bytes can be named
+  differently in two references), and a minted `QF<n>` is the fallback for an entity with no
+  accession. An accession is something a reader can actually resolve; replacing
+  `GCF_000006605` with a handle of ours would make the artifact worse.
+  **A collision is not an error.** Two genomes can share a `source_id` under different
+  `source`s, so the published namespace is a UNIQUE index and the mint resolves a clash by
+  giving the loser a minted handle — while still reporting the accession it wanted, so nobody
+  has to guess why one label changed shape. That arbitration cannot live client-side: a caller
+  sees the entities of one artifact, never the accession someone else published last week. Nor
+  can it live in the generated column, which sees only its own row. Where two entities in one
+  request want the same accession, the lower identifier keeps it.
+  An identifier is retired rather than deleted when the thing it named goes away, and what
+  happens to its string then depends on the kind: a **genome** releases its accession, because
+  the source's name for an organism means the same thing when the genome is re-loaded; a
+  **feature** reserves its accession forever, because a FASTA header names nothing outside the
+  load that emitted it and releasing it would let one published label come to name two
+  different sequences. The cost is accepted: re-loading a reference gives its features minted
+  handles instead of the accessions they had.
+
+- **A published bundle can now say what produced it, without naming an `alignment_idx` (#448).**
+  `POST /exported-processing` mints `QP<n>` for a processing — the third axis alongside
+  `/exported-identifier` (a table's columns) and `/exported-feature` (its rows). Coverage
+  filtering makes a feature table a function of the cohort it was built over rather than of the
+  samples in it, so a record of the processing is what makes the table reproducible at all, and
+  the only handle for it was internal. Unlike the feature mint this one is entirely minted with
+  no accession half: a processing is something we performed, so no outside authority has a name
+  for it. The request carries the **cohort** as well as the alignment, and takes
+  `/exported-identifier`'s gate step for step over that pair — the cohort authorizes and is not
+  part of the handle, so two callers publishing different slices of one processing still cite it
+  identically. Minting is a write, and without that gate any human could collect a handle for
+  every processing in the system, including ones over data they cannot read.
+  `GET …/sequenced-pool/{pool}/alignment` now also reports each definition's **`params_hash`**
+  (hex) — the digest the control plane deduplicates on. It is the server's own answer to "was
+  this the same processing", so it is what a manifest cites for reproducibility, and it is
+  reported from storage rather than recomputed on the way out. The CLI **recomputes it from the
+  `params` beside it and refuses to build on a mismatch**, which turns "the config arrived
+  intact" from an assumption into a checked fact — everything the build derives, starting with
+  which reference the whole table is relabelled through, is read off those params.
+
+- **A feature table can now ship its taxonomy, keyed the same way as its rows (#448).**
+  `qiita feature-table build --taxonomy` writes a third bundle member: one row per published
+  row, carrying the same `feature_id` and the eight ranks with their `d__`/`p__` prefixes
+  restored, so the two files join on one column. Parquet with eight columns rather than a
+  lineage string, because `concat_ws` skips NULLs — a lineage missing a middle rank silently
+  promotes every rank below it, so `d__Bacteria;f__Listeriaceae` reads as though the phylum
+  were Listeriaceae. An unclassified genome appears with NULL ranks rather than being left
+  out: a row missing from the sidecar reads as unclassified anyway, and nothing would
+  distinguish the two. A sidecar that does not describe the table beside it — short,
+  duplicated, or unnamed — is refused, since each of those is silent in a file people will
+  join regardless. The per-genome reduction behind it is now shared with the shard planner,
+  so a genome that tiles under one lineage publishes those same ranks.
+
+- **Every feature-table bundle now carries a manifest, and it is not optional (#448).** Coverage
+  filtering makes a table a function of the whole cohort it was built over rather than only of
+  the samples in it, so the same processing over a different cohort yields a different table —
+  a table without this record cannot be reproduced. `<stem>.manifest.json` names the processing
+  by its minted public handle **and** by the content-derived `params_hash` the client verified
+  before reading anything off `params`; the reference by name and version; the aligner, coverage
+  scope and threshold, and the gate if there was one; the cohort as `export_id`s; the published
+  row count; the bundle's own file list; and the versions of duckdb, the loaded miint build and
+  this CLI. The miint build is read from the catalog rather than assumed, because every
+  bioinformatics primitive is compiled into the extension, so two clients on different builds
+  can produce different numbers from identical input.
+  **No internal identifier appears anywhere in it** — that is what the two mints were for.
+  `params` is not copied verbatim for the same reason (it carries `reference_idx`, `mask_idx`
+  and `shard_ids`), so `aligner` is lifted out and the digest stands for the rest. There is no
+  build timestamp, deliberately: nothing would use one, and leaving it out makes the manifest a
+  pure function of its inputs, so two bundles built the same way are byte-identical and can be
+  diffed to show it.
+
+- **A feature table can now ship the reference's tree, sheared to the rows it publishes (#448).**
+  `qiita feature-table build --tree` writes the phylogeny pruned to the published keep-set,
+  as a node table (`node_index, name, branch_length, edge_id, parent_index, is_tip`) whose tip
+  names are the table's own `feature_id`s. Pruned ancestors have their branch lengths **summed
+  onto the surviving edge**, so a tip-to-tip distance in the shipped tree is the distance in
+  the whole one. Parquet rather than Newick, so the file needs no convention to read and the
+  Newick writer's edge-id default is the consumer's decision instead of ours; `edge_id` rides
+  along because it is the handle back to the reference's placements. The tips are renamed
+  *before* the shear rather than translated after, which is what makes one vocabulary
+  structural — the keep-set and the tree cannot disagree about which tip is which — and it
+  leaves an unpublished tip nameless, so a reference-internal FASTA header cannot reach a
+  published file. Four things are refused rather than approximated, each of them otherwise a
+  tree somebody would join to the table anyway: a reference with no phylogeny, a published row
+  with no tip, a row owning more than one tip (a contig-level tree, which the shear would
+  happily emit with duplicate tip labels), and a tip belonging to more than one **published**
+  genome (a plasmid published under two organisms cannot be one genome-named tip — whereas one
+  merely *present* under a second genome the table never mentions shears cleanly). Publishing
+  no rows at all is not one of these: an empty cohort gets an empty tree, the way it already
+  gets an empty table.
+
+- **The build now reports what it could not roll up (#448).** The genome map's INNER JOIN silently
+  drops alignments to features with no genome, and for some references that is most of what
+  was streamed. A build that cannot carry everything says the share and why — a
+  feature-rooted table is not built yet — rather than leaving a table that is quietly a
+  fraction of the data.
+
+- **The feature-table analytic is now shared, and breadth of coverage has a per-sample
+  scope (#448).** The SQL that turns alignment rows into an OGU table moved out of the
+  compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side
+  recipe runs the same analytic rather than a second copy of it — the relation names, the
+  pre-woltka survivor join, and the full-genome-length denominator are all one definition
+  now. Text only; `qiita-common` gains no `duckdb` dependency. On top of that, coverage can
+  be measured **per `(sample, genome)`** instead of pooled over the whole cohort: pooled
+  keeps delegating to miint's `genome_coverage`, while per-sample reproduces that macro's own
+  method with one more `GROUP BY` key, over the same denominator, so one threshold means the
+  same thing either way. The scopes are asymmetric on purpose — pooling unions intervals, so
+  pooled breadth is always at least the best single sample's, and per-sample can only ever
+  remove rows. Behaviour is unchanged for the existing server-side job, which stays pooled.
+
+- **Alignments can be gated on CIGAR sequence identity and query coverage (#448).** A gate filters
+  the breadth calculation as well as the counts — an alignment that fails it is not a
+  placement, so it must not contribute covered bases — and `cigar` rides the signed projection
+  only when a gate reads it. Paired data is judged a placement at a time, so mates are kept or
+  dropped together rather than orphaned, using the same placement key the orchestrator's
+  aligner uses (now shared, one definition, instead of a second copy). Three ways the gate
+  could have quietly produced a wrong answer are refused with an actionable message instead:
+  a slice whose CIGARs cannot be scored for identity at all (which would have dropped every
+  row and returned an empty table), a paired placement whose mate is missing or unscorable
+  (which `string_agg` would have scored on the surviving mate alone), and an unpaired gate
+  applied to paired data. The gate SQL is unreachable without having run those checks.
+
+- **A feature table can be relabelled to public identifiers (#448).** The counts come out keyed by
+  `prep_sample_idx` and `genome_idx`, which mean nothing outside this system; the relabel
+  joins the genome map and the exported-identifier mint to name them by the genome's
+  `source_id` and the sample's minted `export_id` instead, and the relabelled relation carries
+  those two columns and the value — not the identifiers it joined on. That also makes the
+  table writable as BIOM at all, which requires both id columns as text. Four ways the
+  relabel could have published a wrong table are refused with an actionable message: a label
+  relation that repeats a key (which would inflate every count for it), a count whose genome
+  or sample has no handle (a NULL id in a published file), and two genomes or two samples
+  sharing one handle (which a BIOM write would silently sum into one row). The
+  `source_id`-collision refusal is scoped to the genomes a table actually emits, so a
+  collision elsewhere in the reference does not fail a build whose output is correct. An empty
+  cohort travels the same relabel as a populated one, so it cannot yield a differently-shaped
+  file. On the client side, the two maps are fetched, staged into DuckDB with explicit native
+  types, and released once copied; the genome map's roll-up key and public label are staged
+  from the one response so they cannot disagree about which genomes exist.
+
+- **A feature table can be written as Parquet or BIOM, bundled with the map needed to read
+  it (#448).** One format per run — they hold the same numbers, so the choice is only about what
+  reads the file next, and Parquet is the default. **The caller names the table** and the
+  identifier map is named after it, so a pair stays visibly together and two builds of one
+  cohort can share a directory; a name whose extension contradicts the requested format is
+  refused rather than quietly rewritten. The bundle is both files or neither: the table names
+  its samples by their public handle alone, so without the exported-identifier map beside it
+  nobody can join it back to their own records. An artifact already at either name is refused
+  before anything is written — the two writers disagree on their own about overwriting, one refusing and one
+  replacing silently, so a second run would otherwise destroy a published file in one format
+  and fail in the other. The map carries, in the file rather than only in the terminal, the
+  warning that it is the one artifact holding an internal identifier and must not be shipped
+  onward. BIOM is a new surface for this repo, so what miint's writer does with our data is
+  now pinned by its own contract test and documented: it sums duplicate entries silently,
+  drops zeros, refuses NULL and empty identifiers, requires `value` as DOUBLE exactly, and
+  **ignores any extra column** — so it is the relabel's projection, not the writer, that
+  keeps our identifiers out of a published file.
+
+- **`qiita feature-table build` — a feature table, computed on your own machine (#448).** The first
+  CLI surface for any of the analytic-export routes, and the first thing that composes them:
+  the alignment slice and the reference lengths arrive as Flight streams, the genome map and
+  the public sample handles as REST reads, and the analytic, the relabel, and the write all
+  run locally under the caller's own token. Nothing is computed server-side and nothing is
+  persisted. `qiita alignment list` and `qiita alignment cohort` are the discovery half —
+  which alignments ran over a pool, and which of its samples you may build a table from —
+  since an `--alignment-idx` was otherwise unobtainable without a psql shell. Both scope
+  their answer to what the caller may read, which is what makes them agree with the ticket
+  mint. **There is no `--reference-idx`:** the alignment records the reference it ran
+  against, so a caller cannot name a different one and fetch the wrong genome map. The
+  cohort defaults to the pool's full mintable set and can be narrowed sample by sample —
+  which changes the table rather than filtering it, since breadth of coverage is measured
+  over the cohort. A CIGAR gate is opt-in per threshold, pools a placement's mates unless
+  told otherwise (correct for single-end data too, and the cheap alternative loses
+  correctness silently), and pays for the wide `cigar` column on the wire only when it is
+  asked for. Everything cheap and refusable happens before the two bulk streams: a wrong
+  alignment, an empty cohort, an over-cap genome map, or an output name already in use all
+  stop the run before a byte of alignment data moves.
 - **Mask lifecycle: a config can be deprecated, and an individual run withdrawn (#445).**
   A mask's `params_hash` covers the resolved thresholds, not the code that applies them
   (`filter_version` is the workflow YAML version, not the miint build), so a config whose
@@ -724,6 +905,91 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A retired `exported_feature` row could be edited out of the published namespace
+  (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has
+  lost the columns they test — so a retired row is exactly where they stop guarding, and it
+  is also where the namespace index is still reading `entity_kind`. Three UPDATEs each
+  released a reserved accession: flipping `entity_kind` to `genome` drops the row out of the
+  index predicate, and clearing `accession_published` or `accession` regenerates
+  `export_feature_id` to `QF<idx>`. A second entity could then publish a string that had
+  already named a different sequence, which is the one thing the table promises cannot
+  happen. All three are now rejected by the trigger, above its retired early-return. No code
+  path issued any of them, so nothing shipped wrong — this closes the hole, it does not
+  repair damage.
+
+- **Reference ingest cut a fixed three characters to strip a rank prefix (#448).** Latent,
+  not live: every prefix in `RANK_PREFIXES` is three characters today. But the check that
+  *requires* the prefix is generated from that tuple while the strip hard-coded its length,
+  so a four-character prefix would have left a stray character in every published taxonomy
+  sidecar with nothing to catch it. The strip now takes its length from the prefix it is
+  removing.
+
+- **A blocked contig's tip could be published in a sheared tree, under its genome's public
+  name (#448).** The alignment and the taxonomy reach this recipe through exclusion-aware views, so a
+  curator's blocklist already governs the table and its sidecar; the phylogeny deliberately has
+  no such view — a row-wise anti-join would orphan a tip's internal parents and malform the tree
+  — and the tree consumer is expected to apply the blocklist to its own keep-set instead. It was
+  not. A genome that publishes on the strength of one contig, with a curator's block on the
+  contig its tip is wired to, got that blocked tip's position written into the published tree.
+  The build now reads the reference's blocklist and names a tip only when it is both published
+  and unblocked. A genome with a second, unblocked tip publishes that one instead of being
+  refused as ambiguous; a genome left with no usable tip is refused, naming it, since its only
+  position in the tree comes from sequence the blocklist rejects.
+
+- **A duckdb failure during a feature-table build reached the user as a traceback (#448).** The
+  analytic runs on the caller's own machine, which makes duckdb's own failures both the
+  likeliest thing to go wrong on a large reference — the peak is a whole tree, and the shear
+  is single-threaded and allocation-bound — and the hardest to place, since an out-of-memory
+  or a spill with nowhere to go says nothing about whose memory ran out. Now a message that
+  says the analytic failed here, alongside the transport and refusal messages that were
+  already handled.
+
+- **The roll-up's coverage report understated the share it could not carry (#448).** It counted the
+  rows of a join to the genome map, and a feature belonging to several genomes — which
+  `feature_genome` allows on purpose, since identical bytes are one feature and a plasmid two
+  organisms carry belongs to both — fans that feature's alignment row out once per genome. Only
+  the denominator inflated, so a build reporting "1 of 4 (25.0%)" was really dropping 1 of 3
+  (33.3%). Counted directly now, the way the relabel's own diagnostics already did.
+
+- **The per-genome taxonomy reduction could return two rows for one genome (#448).** Picking a
+  representative member and joining its row back matches twice if the caller's relations hold a
+  duplicate at the winning position, where the aggregate this replaced could not multiply at
+  all. The sidecar's row-count check would have caught it; the shard planner, the other consumer,
+  has none — and two items sharing one id tile one genome into two shards. One row per genome is
+  now a property of the SQL. A reference whose taxonomy genuinely repeats a feature is refused
+  instead, measured on the streamed rows: two rows for one feature can disagree, and choosing
+  between two lineages silently is not ours to do.
+
+- **An alignment config whose stored form would stop matching its own digest is now refused at
+  the mint (#448).** Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
+  so `1.5e30` returns as an integer literal that Python re-reads as an `int`, and `-0.0` returns
+  as `0.0`. Either way the config read back no longer hashes to the `params_hash` stored beside
+  it — permanently, for that `alignment_idx`. Nothing hits this today (no alignment config
+  carries a float), but now that the digest is published and re-verified by clients, such a row
+  would refuse every build over it with nothing to point at. The mint asks Postgres to normalize
+  the blob and refuses a config that would not survive, so the failure lands on whoever adds the
+  value. A small-magnitude float like `1.23e-05` does round-trip and is still allowed.
+
+- **The documented `phylogeny_tip_feature` table never existed (#448).** Sites across
+  `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, three table inventories, an
+  ingestion step, a worked clade-scoped query — described a Postgres junction table mapping
+  `(reference_idx, node_index) → feature_idx`, contradicting the migration that deliberately
+  did not build one. A phylogeny tip carries `feature_idx` as a **column on its own DuckLake
+  row**; clade queries stay inside that one table instead of crossing to Postgres. The
+  architecture doc also now records why phylogeny has no exclusion-aware `_visible` view (a
+  row-wise anti-join would orphan internal parents and malform the tree, so a consumer shears
+  to its keep-set instead). Alongside it, `CLAUDE.md` claimed `feature_idx` is "stored as
+  Postgres `uuid`" — it is a BIGINT identity, and the uuid is the separate `sequence_hash`, so
+  the claim was an invitation to write `feature_idx::uuid`.
+
+- **`shear_tree` and the Newick writer are now documented from a probe rather than assumed (#448).**
+  `docs/duckdb-miint.md` had no `shear_tree` entry at all and the architecture doc recorded its
+  presence in the pinned miint mirror as unverified. It is present, and the entry now carries
+  its real signature, the separate-connection relation resolution, the float branch-length
+  summation, and both distinct failure messages. The load-bearing find is in the writer:
+  **`COPY … (FORMAT NEWICK)` turns on jplace-style `{N}` edge annotations by default whenever an
+  `edge_id` column is present**, so passing a sheared tree straight through — as upstream's own
+  example does — writes a file plain-Newick parsers may reject.
 - **A workflow that consumes a read mask now records it on `work_ticket.mask_idx` (#444).**
   The column was introduced for the minting path (`read-mask`, `fastq-to-parquet`), where
   the runner persists the mask it minted. `long-read-assembly` consumes an existing mask's
@@ -1625,6 +1891,51 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **A feature-table build now reads its reference before it streams anything (#448).** The
+  reference's name and version are only needed by the manifest, written last, so the read that
+  fetches them ran last too — which meant a reference this alignment names but the caller cannot
+  read was discovered *after* a whole cohort had crossed the wire. It is the cheapest thing in the
+  build that can refuse, so it now runs first. The processing mint stays last, deliberately: it is
+  a write, and a public handle minted for a build that then fails names a bundle nobody has.
+
+- **A BIOM file written by a feature-table build now names `qiita-miint` as its generator
+  (#448).** `qiita` named the project rather than the system that produced the file.
+
+- **The paired-row count asks miint instead of masking the SAM flag (#448).** `flags & 1 <> 0`
+  became `alignment_is_paired(flags)`, which is what `docs/duckdb-miint.md` tells callers to
+  use. Same numbers either way, which is why it is pinned by a test — nothing else would
+  notice a regression.
+
+- **Every route keyed on an `alignment_idx` now returns one wording for "no such alignment"
+  (#448).** The delete route answered `Alignment definition not found` while the three cohort
+  routes answered `alignment not found`, and no test asserted either, so one condition had two
+  bodies a client could come to depend on. Converged on the shared constant and pinned.
+
+- **The gate every alignment-cohort route runs is now one function, not three copies (#448).**
+  `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST
+  /exported-processing` all check that the alignment exists, then that the caller may read
+  the whole cohort, then that the cohort is completed — and that *order* is a disclosure
+  decision: reversed, the completeness refusal would list samples of an alignment the caller
+  has no right to read. Three routes hand-writing a security-relevant sequence is three
+  chances for one to be reordered alone, so it is now written once, with the reasoning
+  beside it, and the routes differ only in the clause that completes their 422.
+
+- **Reference ingest's rank-prefix check and its column projection are now generated from
+  the shared rank tuples (#448).** They were spelled out, eight clauses each, in the job — which
+  was harmless until the published taxonomy sidecar started *restoring* those prefixes by
+  position from the same tuples. A drift between the two would have silently relabelled
+  ranks in a file people join, and nothing would have caught it; now a change to the tuple
+  changes what ingest accepts.
+
+- **The all-or-nothing multi-file commit is now shared by both CLIs' exports (#448).** The
+  masked-read export's commit — write partials, then rename each into place, and on any
+  failure remove every partial *and* every already-committed file — moved to the shared CLI
+  helpers so the feature-table bundle uses the same one rather than a second copy. The
+  privacy chmod stays with the masked-read export, the only caller whose bytes need it. The
+  rollback of an already-committed file now has direct tests, which no caller's own suite
+  reached, and the one gap it cannot close — a kill between two renames — is written down
+  where the guarantee is stated.
 
 - **One `cap_rows` helper behind every capped list route (#427).** The
   fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
