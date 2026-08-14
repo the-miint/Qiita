@@ -76,7 +76,7 @@ _None yet._
   non-zero without committing if the collapse did not converge. Every mode is re-runnable,
   so a failure part-way is safe to repeat once its cause is fixed — and a concurrent load
   touching the same tables makes one of the two abort with a DuckLake transaction conflict
-  rather than either losing rows. (#449)
+  rather than either losing rows. (#457)
 
 ### Notes (no host action)
 
@@ -87,7 +87,7 @@ _None yet._
   control-plane log records what each one superseded (`register_files replaced rows in
   content-addressed tables`). Where a feature's two copies differ (a sequence and its
   reverse complement share one `feature_idx`), the newest load's bytes win; before this they
-  were both kept and read back concatenated. Every other lake table is untouched. (#449)
+  were both kept and read back concatenated. Every other lake table is untouched. (#457)
 
 - **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
   `qiita feature-table build` requires it.** Additive, so an older client ignores it and

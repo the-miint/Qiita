@@ -906,7 +906,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
-  (#449).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
+  (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
   carry ONE feature across every producer — but each load still wrote that feature's rows in
   full: the compute job writing the staging Parquet has no DuckLake access to anti-join
   against, and DuckLake enforces no PK/UNIQUE. Two assembly runs producing the same contig,
@@ -927,7 +927,7 @@ duplicates further down are historical strata; leave them where they are.
   back concatenated, which is neither strand and matches no declared length.
 
 - **`scripts/dedup-lake-sequence-tables.sh` collapses rows written before that fix
-  (#449).** A report by default, `APPLY=1` to collapse, over both content-addressed table
+  (#457).** A report by default, `APPLY=1` to collapse, over both content-addressed table
   pairs. It only collapses features whose copies are byte-identical (a plain `DISTINCT`, so
   no copy is picked over another); a feature whose copies DIFFER is reported and left alone,
   because the canonical hash keeps a sequence and its reverse complement on one `feature_idx`
