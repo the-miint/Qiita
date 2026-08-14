@@ -457,6 +457,15 @@ def test_diagnostics_count_split_partitions_only_for_a_paired_gate():
     assert "GROUP BY" not in unpaired
 
 
+def test_the_paired_count_asks_miint_rather_than_masking_the_flag():
+    """`docs/duckdb-miint.md` says to use the `alignment_is_*` family and not to
+    hand-roll bit math on `flags`. Pinned because both forms produce the same numbers,
+    so nothing else in the suite would notice a regression to `flags & 1 <> 0`."""
+    sql = ft.gate_diagnostics_sql(ft.AlignmentGate(min_identity=0.9))
+    assert "alignment_is_paired(flags)" in sql
+    assert "&" not in sql
+
+
 def _check(gate, *, total=1000, scorable=1000, unpoolable=0, paired_rows=None):
     """`check_gate_diagnostics` with the clean-slice defaults, so each test states only
     the count it is about. `paired_rows` defaults to what `gate.paired` implies."""

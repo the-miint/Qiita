@@ -5,8 +5,8 @@ processed sample in a cohort, so a published feature table can name its samples
 without carrying ours. A control-plane route rather than anything the data plane
 can serve: the identifiers live only in Postgres, and minting one is a write.
 
-Cohort authorization is `authorize_prep_sample_cohort`, shared with the human
-alignment mint: minting a ticket for a cohort and minting the public handles for
+Cohort authorization is `authorize_completed_alignment_cohort`, shared with the
+human alignment mint: minting a ticket for a cohort and minting the public handles for
 that same cohort is one workflow, and two answers to "may I read this sample" is
 how one surface comes to advertise what the other refuses.
 """
@@ -31,8 +31,6 @@ from ..repositories.exported_identifier import IncompleteMintError, mint_exporte
 from ._helpers import authorize_completed_alignment_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])
-
-_MSG_ALIGNMENT_NOT_FOUND = "alignment not found"
 
 # `require_human`, NOT the alignment mint's `require_complete_profile`, and the
 # difference is the rule rather than an oversight: a route that hands out access

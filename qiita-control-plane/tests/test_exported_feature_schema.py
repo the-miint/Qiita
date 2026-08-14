@@ -91,6 +91,65 @@ async def _cleanup(postgres_pool, *, reference_idx=None, feature_idxs=(), genome
         )
 
 
+async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_update(postgres_pool):
+    """The FORWARD PLAN comment in the migration says a further entity kind has to
+    update five things. This is the mechanism behind that sentence: every other test in
+    this module is behavioural, so each one exercises a constraint it happens to trip
+    and none of them notices a constraint that was never created — or one added later
+    without the reasoning. Adding a kind fails here first, which is where the list is.
+
+    Follows the `pg_constraint` / `pg_index` pattern the other schema tests in this
+    suite use. Names only: the definitions are asserted behaviourally below, and pinning
+    their text would break on a Postgres that renders an equivalent expression
+    differently."""
+    checks = {
+        r["conname"]
+        for r in await postgres_pool.fetch(
+            "SELECT c.conname FROM pg_constraint c"
+            "  JOIN pg_class ct ON ct.oid = c.conrelid"
+            "  JOIN pg_namespace cn ON cn.oid = ct.relnamespace"
+            " WHERE c.contype = 'c' AND cn.nspname = 'qiita'"
+            "   AND ct.relname = 'exported_feature'"
+        )
+    }
+    assert checks == {
+        "exported_feature_one_kind",
+        "exported_feature_entity_kind_known",
+        "exported_feature_kind_agrees_with_columns",
+        "exported_feature_reference_pairs_with_feature",
+        "exported_feature_published_accession_exists",
+        "exported_feature_retirement_consistent",
+    }, checks
+
+    indexes = {
+        r["indexname"]
+        for r in await postgres_pool.fetch(
+            "SELECT indexname FROM pg_indexes"
+            " WHERE schemaname = 'qiita' AND tablename = 'exported_feature'"
+        )
+    }
+    assert indexes == {
+        "exported_feature_pkey",
+        "exported_feature_live_genome",
+        "exported_feature_live_reference_feature",
+        "exported_feature_export_feature_id_unique",
+    }, indexes
+
+    # The one index whose PREDICATE is the asymmetry the namespace depends on: a
+    # retired genome releases its accession, a retired feature keeps it reserved.
+    # Behaviourally pinned by the two retirement tests below; pinned textually here
+    # because those two would both still pass if the predicate lost `NOT retired`.
+    (namespace,) = [
+        r["indexdef"]
+        for r in await postgres_pool.fetch(
+            "SELECT indexdef FROM pg_indexes"
+            " WHERE schemaname = 'qiita' AND tablename = 'exported_feature'"
+            "   AND indexname = 'exported_feature_export_feature_id_unique'"
+        )
+    ]
+    assert "NOT retired" in namespace and "'feature'" in namespace, namespace
+
+
 async def test_a_genome_publishes_its_accession(postgres_pool):
     principal_idx = await _principal(postgres_pool)
     genome_idx, source_id = await seed_genome(postgres_pool)
@@ -457,6 +516,93 @@ async def test_a_retired_feature_keeps_its_accession_reserved(postgres_pool):
         await cleanup_reference_graph(
             postgres_pool, reference_idx=second_ref, feature_idxs=[second_feature]
         )
+
+
+async def test_a_retired_feature_cannot_be_edited_out_of_the_reserved_namespace(postgres_pool):
+    """The reservation above is only as strong as the columns it is computed from.
+
+    Every CHECK on this table is written `retired OR ...`, because a detached row has
+    lost the columns they test — so a retired row is exactly where they stop helping,
+    and it is also where the namespace index is still reading `entity_kind`. Three
+    edits would each hand a reserved accession to the next caller: flipping
+    `entity_kind` to 'genome' drops the row out of the index predicate, and clearing
+    either `accession_published` or `accession` regenerates `export_feature_id` to
+    'QF<idx>'. The trigger rejects all three above its retired early-return.
+    """
+    principal_idx = await _principal(postgres_pool)
+    reference_idx = await seed_bare_reference(postgres_pool, label="expfeat-immutable")
+    feature_idx = await seed_bare_feature(postgres_pool)
+    header = f"contig_{uuid.uuid4().hex[:8]}"
+    await seed_reference_membership(
+        postgres_pool, reference_idx=reference_idx, feature_idx=feature_idx, accession=header
+    )
+    try:
+        row = await _insert_feature_row(
+            postgres_pool,
+            reference_idx=reference_idx,
+            feature_idx=feature_idx,
+            accession=header,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        await postgres_pool.execute(
+            "UPDATE qiita.exported_feature"
+            "   SET retired = true, retired_at = now(), retire_reason = 'published in error'"
+            " WHERE idx = $1",
+            row["idx"],
+        )
+        for column, value in (
+            ("entity_kind", "genome"),
+            ("accession_published", False),
+            ("accession", "something-else"),
+        ):
+            with pytest.raises(asyncpg.RaiseError, match="immutable"):
+                await postgres_pool.execute(
+                    f"UPDATE qiita.exported_feature SET {column} = $1 WHERE idx = $2",
+                    value,
+                    row["idx"],
+                )
+        # Still reserved, which is the property all three edits were reaching for.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT export_feature_id FROM qiita.exported_feature WHERE idx = $1", row["idx"]
+            )
+            == header
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_feature WHERE feature_idx = $1", feature_idx
+        )
+        await cleanup_reference_graph(
+            postgres_pool, reference_idx=reference_idx, feature_idxs=[feature_idx]
+        )
+
+
+async def test_retirement_itself_is_still_allowed(postgres_pool):
+    """The control for the test above: the guard sits over three columns, not over
+    the UPDATE that retires a row. Without this, making the trigger reject every
+    UPDATE would pass the immutability test and break the FK detach paths."""
+    principal_idx = await _principal(postgres_pool)
+    genome_idx, source_id = await seed_genome(postgres_pool)
+    try:
+        row = await _insert_genome_row(
+            postgres_pool,
+            genome_idx=genome_idx,
+            accession=source_id,
+            published=True,
+            created_by_idx=principal_idx,
+        )
+        await postgres_pool.execute(
+            "UPDATE qiita.exported_feature"
+            "   SET retired = true, retired_at = now(), retire_reason = 'withdrawn'"
+            " WHERE idx = $1",
+            row["idx"],
+        )
+        assert await postgres_pool.fetchval(
+            "SELECT retired FROM qiita.exported_feature WHERE idx = $1", row["idx"]
+        )
+    finally:
+        await _cleanup(postgres_pool, genome_idxs=[genome_idx])
 
 
 async def test_entity_kind_must_name_the_columns_the_row_holds(postgres_pool):

@@ -903,35 +903,26 @@ duplicates further down are historical strata; leave them where they are.
     `attributes` MAP is kept alongside the normalized terms, so a system we do not
     yet parse stays recoverable without a re-ingest.
 
-### Changed
-
-- **A feature-table build now reads its reference before it streams anything (#448).** The
-  reference's name and version are only needed by the manifest, written last, so the read that
-  fetches them ran last too — which meant a reference this alignment names but the caller cannot
-  read was discovered *after* a whole cohort had crossed the wire. It is the cheapest thing in the
-  build that can refuse, so it now runs first. The processing mint stays last, deliberately: it is
-  a write, and a public handle minted for a build that then fails names a bundle nobody has.
-
-- **A BIOM file written by a feature-table build now names `qiita-miint` as its generator
-  (#448).** `qiita` named the project rather than the system that produced the file.
-
-- **The gate every alignment-cohort route runs is now one function, not three copies (#448).**
-  `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST
-  /exported-processing` all check that the alignment exists, then that the caller may read
-  the whole cohort, then that the cohort is completed — and that *order* is a disclosure
-  decision: reversed, the completeness refusal would list samples of an alignment the caller
-  has no right to read. Three routes hand-writing a security-relevant sequence is three
-  chances for one to be reordered alone, so it is now written once, with the reasoning
-  beside it, and the routes differ only in the clause that completes their 422.
-
-- **Reference ingest's rank-prefix check and its column projection are now generated from
-  the shared rank tuples (#448).** They were spelled out, eight clauses each, in the job — which
-  was harmless until the published taxonomy sidecar started *restoring* those prefixes by
-  position from the same tuples. A drift between the two would have silently relabelled
-  ranks in a file people join, and nothing would have caught it; now a change to the tuple
-  changes what ingest accepts.
-
 ### Fixed
+
+- **A retired `exported_feature` row could be edited out of the published namespace
+  (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has
+  lost the columns they test — so a retired row is exactly where they stop guarding, and it
+  is also where the namespace index is still reading `entity_kind`. Three UPDATEs each
+  released a reserved accession: flipping `entity_kind` to `genome` drops the row out of the
+  index predicate, and clearing `accession_published` or `accession` regenerates
+  `export_feature_id` to `QF<idx>`. A second entity could then publish a string that had
+  already named a different sequence, which is the one thing the table promises cannot
+  happen. All three are now rejected by the trigger, above its retired early-return. No code
+  path issued any of them, so nothing shipped wrong — this closes the hole, it does not
+  repair damage.
+
+- **Reference ingest cut a fixed three characters to strip a rank prefix (#448).** Latent,
+  not live: every prefix in `RANK_PREFIXES` is three characters today. But the check that
+  *requires* the prefix is generated from that tuple while the strip hard-coded its length,
+  so a four-character prefix would have left a stray character in every published taxonomy
+  sidecar with nothing to catch it. The strip now takes its length from the prefix it is
+  removing.
 
 - **A blocked contig's tip could be published in a sheared tree, under its genome's public
   name (#448).** The alignment and the taxonomy reach this recipe through exclusion-aware views, so a
@@ -1900,6 +1891,42 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **A feature-table build now reads its reference before it streams anything (#448).** The
+  reference's name and version are only needed by the manifest, written last, so the read that
+  fetches them ran last too — which meant a reference this alignment names but the caller cannot
+  read was discovered *after* a whole cohort had crossed the wire. It is the cheapest thing in the
+  build that can refuse, so it now runs first. The processing mint stays last, deliberately: it is
+  a write, and a public handle minted for a build that then fails names a bundle nobody has.
+
+- **A BIOM file written by a feature-table build now names `qiita-miint` as its generator
+  (#448).** `qiita` named the project rather than the system that produced the file.
+
+- **The paired-row count asks miint instead of masking the SAM flag (#448).** `flags & 1 <> 0`
+  became `alignment_is_paired(flags)`, which is what `docs/duckdb-miint.md` tells callers to
+  use. Same numbers either way, which is why it is pinned by a test — nothing else would
+  notice a regression.
+
+- **Every route keyed on an `alignment_idx` now returns one wording for "no such alignment"
+  (#448).** The delete route answered `Alignment definition not found` while the three cohort
+  routes answered `alignment not found`, and no test asserted either, so one condition had two
+  bodies a client could come to depend on. Converged on the shared constant and pinned.
+
+- **The gate every alignment-cohort route runs is now one function, not three copies (#448).**
+  `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST
+  /exported-processing` all check that the alignment exists, then that the caller may read
+  the whole cohort, then that the cohort is completed — and that *order* is a disclosure
+  decision: reversed, the completeness refusal would list samples of an alignment the caller
+  has no right to read. Three routes hand-writing a security-relevant sequence is three
+  chances for one to be reordered alone, so it is now written once, with the reasoning
+  beside it, and the routes differ only in the clause that completes their 422.
+
+- **Reference ingest's rank-prefix check and its column projection are now generated from
+  the shared rank tuples (#448).** They were spelled out, eight clauses each, in the job — which
+  was harmless until the published taxonomy sidecar started *restoring* those prefixes by
+  position from the same tuples. A drift between the two would have silently relabelled
+  ranks in a file people join, and nothing would have caught it; now a change to the tuple
+  changes what ingest accepts.
 
 - **The all-or-nothing multi-file commit is now shared by both CLIs' exports (#448).** The
   masked-read export's commit — write partials, then rename each into place, and on any

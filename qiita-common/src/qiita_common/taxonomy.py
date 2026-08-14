@@ -1,7 +1,8 @@
 """The taxonomy rank shape, and the per-genome reduction its two consumers share.
 
-**SQL text only, no `duckdb` import** — the same discipline `feature_table.py` keeps,
-so `qiita-common` stays importable by anything that only needs the contract.
+**SQL text only** — like `feature_table.py`, this module opens no connection; a caller
+executes what it returns. The rank constants have a third importer (reference ingest),
+which takes the shape without the reduction.
 
 Two callers reduce a reference's per-feature taxonomy to one row per genome, for
 different reasons: the shard planner tiles genomes by lineage so a shard holds

@@ -294,8 +294,8 @@ def survivor_table_sql(scope: CoverageScope) -> str:
     over the same full-length denominator and the same `CAST(... AS DOUBLE)`
     division, so a single threshold means the same thing under either scope. This
     is what upstream means by the per-sample dimension being "already expressible
-    today" (duckdb-miint#217); when `genome_coverage_per_sample` lands (#220) this
-    branch collapses to one call.
+    today" (duckdb-miint#217); if `genome_coverage_per_sample` lands
+    (duckdb-miint#220, an open PR) this branch collapses to one call.
 
     The per-contig merge before the genome roll-up is not incidental:
     `compress_intervals` merges within one coordinate space, so grouping straight
@@ -463,12 +463,6 @@ def empty_ogu_select_sql() -> str:
 PAIRED_PLACEMENT_PARTITION = (
     "sequence_idx, feature_idx, LEAST(position, mate_position), GREATEST(position, mate_position)"
 )
-
-# SAM FLAG 0x1: "template having multiple segments in sequencing" — i.e. the read is
-# part of a pair. Set on both mates regardless of whether either mapped, which is
-# what makes it a reliable answer to "is this slice paired data?" even when a mate's
-# row never arrived.
-SAM_FLAG_PAIRED = 0x1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -648,7 +642,12 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
     stop `check_gate_diagnostics`' `== 0` early return from firing.
     """
     scorable = "count(cigar_sequence_identity(cigar))" if gate.min_identity is not None else "NULL"
-    paired_rows = f"count(*) FILTER (WHERE flags & {SAM_FLAG_PAIRED} <> 0)"
+    # miint's own predicate over the SAM flag, not hand-rolled bit math: the
+    # `alignment_is_*` family is what `docs/duckdb-miint.md` tells callers to use, and
+    # it reads the same `flags` USMALLINT the lake stores. 0x1 is set on both mates
+    # whether or not either mapped, so it answers "is this slice paired data?" even
+    # when a mate's row never arrived.
+    paired_rows = "count(*) FILTER (WHERE alignment_is_paired(flags))"
     if not gate.paired:
         return (
             f"SELECT count(*) AS total_rows, {scorable} AS scorable_rows, "
@@ -722,8 +721,8 @@ def check_gate_diagnostics(
 
     if not gate.paired and paired_rows:
         raise ValueError(
-            f"{paired_rows} of {total_rows} alignment rows are paired (SAM FLAG "
-            f"0x{SAM_FLAG_PAIRED:x}), but this gate scores each row on its own CIGAR. "
+            f"{paired_rows} of {total_rows} alignment rows are paired (SAM FLAG 0x1), "
+            f"but this gate scores each row on its own CIGAR. "
             f"That judges a placement's mates independently and orphans one when they "
             f"disagree, which is the guarantee the pooled form exists to give. Pass "
             f"`paired=True`; it is also correct for single-end rows, whose partition is "
@@ -1516,7 +1515,7 @@ def check_tree_diagnostics(
 
     The shear catches two of these itself, and it is the *message* that differs: its
     errors name our staged relation and, for missing tips, list every name — unusable at
-    a six-figure published set. The third it does not catch at all.
+    the size of a real published set. The third it does not catch at all.
     """
     if not tree_nodes:
         raise ValueError(

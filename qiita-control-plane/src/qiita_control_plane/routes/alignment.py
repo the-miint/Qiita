@@ -48,9 +48,7 @@ from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..feature_table import parse_feature_table_scope
-from ._helpers import authorize_completed_alignment_cohort
-
-_MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
+from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -113,7 +111,7 @@ async def delete_alignment_definition_route(
         "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
     if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
 
     # DuckLake alignment rows (idempotent, atomic delete-by-alignment_idx in the
     # data plane). Lake-first so a crash before the Postgres delete leaves a

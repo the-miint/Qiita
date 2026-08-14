@@ -32,8 +32,6 @@ from ._helpers import authorize_completed_alignment_cohort
 
 router = APIRouter(prefix=PATH_EXPORTED_PROCESSING_PREFIX, tags=["exported-processing"])
 
-_MSG_ALIGNMENT_NOT_FOUND = "alignment not found"
-
 # `require_human` and `prep_sample:read` even though this WRITES — both for the
 # reasons routes/exported_identifier.py spells out at its own guard: a route that
 # only names things sits at require_human, and the write is a mint of a name that is

@@ -74,8 +74,11 @@ CREATE TABLE qiita.exported_feature (
     -- Which kind this row is, spelled out rather than inferred from the columns
     -- above, because the detach NULLs the very column that would answer — and the
     -- published-namespace index below has to keep telling the kinds apart AFTER
-    -- retirement. That index is the only reader; see it for why it cares. Nothing
-    -- updates this column, and on a live row it must agree with the id columns.
+    -- retirement. That index is the only reader; see it for why it cares. On a live
+    -- row it must agree with the id columns, and it is IMMUTABLE — enforced by the
+    -- trigger below, not merely intended, because the CHECK that pairs it with the
+    -- columns is exempt once retired and a retired row is exactly where flipping it
+    -- would release a reserved accession.
     entity_kind         TEXT NOT NULL,
 
     -- The candidate accession, recorded whether or not it won. Keeping it after a
@@ -241,6 +244,31 @@ RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
     severed TEXT;
 BEGIN
+    -- The three columns the published namespace is computed from are IMMUTABLE, and
+    -- this is the only thing that says so. ABOVE the retired early-return on purpose:
+    -- a retired row is precisely where the CHECKs stop helping (they are all written
+    -- `retired OR ...`, because a detached row has lost the columns they test), and
+    -- it is also where the index predicate `NOT retired OR entity_kind = 'feature'`
+    -- is still reading. So on a retired FEATURE row — the one case the namespace
+    -- reserves forever — flipping entity_kind to 'genome' drops it out of the index
+    -- and hands its accession to the next caller who asks, and clearing
+    -- accession_published regenerates export_feature_id to 'QF<idx>' and vacates the
+    -- accession the same way. No code path issues either UPDATE today; that is what
+    -- makes this cheap, not what makes it unnecessary.
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.entity_kind IS DISTINCT FROM OLD.entity_kind THEN
+            RAISE EXCEPTION
+                'exported_feature.entity_kind is immutable (idx %): it decides whether '
+                'this row still reserves its accession after retirement', OLD.idx;
+        END IF;
+        IF NEW.accession IS DISTINCT FROM OLD.accession
+           OR NEW.accession_published IS DISTINCT FROM OLD.accession_published THEN
+            RAISE EXCEPTION
+                'exported_feature.accession/accession_published are immutable (idx %): '
+                'export_feature_id is generated from them, and a published handle '
+                'must not change under a later edit', OLD.idx;
+        END IF;
+    END IF;
     IF NEW.retired THEN
         RETURN NEW;
     END IF;
@@ -265,7 +293,10 @@ $$;
 COMMENT ON FUNCTION qiita.retire_detached_exported_feature() IS
     'Retires an exported_feature whose entity FK was just nulled by an ON DELETE '
     'SET NULL. Required for those FK actions to satisfy the one_kind and '
-    'reference-pairs CHECKs — without it, deleting a reference or a genome fails.';
+    'reference-pairs CHECKs — without it, deleting a reference or a genome fails. '
+    'Also rejects any UPDATE to entity_kind, accession or accession_published: the '
+    'published namespace is computed from all three, and the CHECKs that guard them '
+    'are exempt on the retired rows where an edit would release a reserved accession.';
 
 CREATE TRIGGER exported_feature_retire_on_detach
     BEFORE UPDATE ON qiita.exported_feature

@@ -140,8 +140,8 @@ def _mint_exported_features(
     """Mint (or recover) the public handle of each genome the table will publish.
 
     **Batched, because the reference is not the unit here.** The route caps one request
-    at `MAX_EXPORTED_FEATURE_ENTITIES`, and a whole-reference genome set runs well past
-    it — GG2's backbone alone is a six-figure count. Minting is idempotent server-side,
+    at `MAX_EXPORTED_FEATURE_ENTITIES`, and a whole-reference genome set runs past it —
+    GG2's backbone is over the cap on its own. Minting is idempotent server-side,
     which is what makes splitting one logical mint across N requests safe: a batch that
     fails can be retried, and a batch already minted returns the handles it minted
     before.
@@ -468,9 +468,9 @@ def _published_genome_idxs(con) -> list[int]:
 
     Read AFTER the coverage filter, not from the genome map, and that is the whole
     point: a reference's genome set is the wrong unit to mint public handles for. A
-    handle is a durable public act, and minting one for every genome in GG2's backbone
-    because a table mentioned the reference would leave six figures of permanent
-    identifiers for rows nobody published.
+    handle is a durable public act, and minting one for every genome in a reference
+    because a table mentioned it would leave permanent identifiers for rows nobody
+    published.
     """
     rows = con.execute(
         f"SELECT DISTINCT genome_idx FROM {ft.OGU_OUTPUT_TABLE} ORDER BY genome_idx"

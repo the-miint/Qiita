@@ -613,7 +613,7 @@ def test_the_row_labels_are_minted_only_for_the_genomes_actually_published(monke
     """A public handle is a durable act, so the mint is asked for the genomes the
     roll-up EMITTED — not for every genome in the reference. Minting the reference's
     whole set because a table mentioned it would leave permanent public identifiers for
-    rows nobody published; for GG2's backbone that is a six-figure number of them.
+    rows nobody published.
 
     At this threshold G200 (0.012 breadth) fails and G100 (0.5) survives, so the map
     covers two genomes and exactly one is minted for.

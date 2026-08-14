@@ -745,8 +745,7 @@ exported identifiers REST (mint)─────────────>┘     
 
 **The row mint is downstream of woltka, not an input to it.** It is keyed on the genomes
 the roll-up actually emitted, so a build never mints a permanent public handle for a row it
-does not publish — at GG2's backbone the difference is six figures of identifiers
-(`_published_genome_idxs`).
+does not publish (`_published_genome_idxs`).
 
 **The analytic is SQL text in `qiita_common.feature_table`, shared with the
 compute-orchestrator's `estimate_feature_table` job.** Two consumers run the same
@@ -762,7 +761,7 @@ explained at exactly one place:
 |---|---|
 | the coverage survivor set joins **before** woltka, not after its output | `ogu_input_table_sql` |
 | a CIGAR gate filters the coverage calculation as well as the counts | `gated_alignment_table_sql` |
-| the relabel precedes the write and is what makes BIOM writable at all | `LABELLED_SCHEMA`, `labelled_table_sql` |
+| the relabel precedes the write and is what makes BIOM writable at all | `LABELLED_SCHEMA`, `labelled_relation_sql` |
 | the coverage scope rides the *relation name*, so a scope mismatch is a bind error | `_SURVIVOR_TABLES` |
 | a genome speaks through its lowest **classified** member, not its lowest | `genome_representative_taxonomy_select_sql` |
 | the tree's **tips are renamed before the shear**, not its output after | `shear_input_statements` |

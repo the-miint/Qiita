@@ -38,7 +38,18 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **The staged miint build must carry `shear_tree`** — `qiita feature-table build --tree`
+  calls it, and it is absent from older builds (`d0336e9` does not have it; the mirror's
+  current `1ad7fb4` does). There is no capability probe: an absent function surfaces as a
+  bare `Catalog Error` naming the function, so check it once here rather than letting a
+  user discover it. Run as the CP service account, against the staged extension directory
+  the CP already LOADs from:
+  ```bash
+  sudo -u qiita-api env MIINT_EXTENSION_DIRECTORY="$(grep -oP '(?<=^MIINT_EXTENSION_DIRECTORY=).*' /etc/qiita/control-plane.env)" \
+    python3 -c "import duckdb, os; c=duckdb.connect(':memory:', config={'extension_directory': os.environ['MIINT_EXTENSION_DIRECTORY'], 'allow_unsigned_extensions': 'true'}); c.execute('LOAD miint'); print(c.execute(\"SELECT count(*) FROM duckdb_functions() WHERE function_name='shear_tree'\").fetchone()[0])"
+  ```
+  Expect `1`. A `0` means the staged build predates the function — re-stage the extension
+  before telling anyone `--tree` works. (#448)
 
 ### 6. After the deploy verifies green
 

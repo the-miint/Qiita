@@ -558,11 +558,16 @@ def _write_taxonomy(
         "  SELECT "
         f"    CAST({reference_idx} AS BIGINT) AS reference_idx,"
         "    m.feature_idx,"
-        # Same tuple as the prefix check above, so the column a rank lands in and
-        # the prefix it was required to carry cannot come apart.
+        # Strips the prefix the check above REQUIRED, per rank, so the column a rank
+        # lands in and the prefix it was required to carry cannot come apart. The cut
+        # length comes from the prefix itself rather than a literal 3: every prefix is
+        # three characters today, so a four-character one would otherwise leave a
+        # stray character in a published sidecar and nothing here would notice.
         + "".join(
-            f"    NULLIF(substr(p.ranks[{i}], 4), '') AS {quote_rank(column)},"
-            for i, column in enumerate(RANK_COLUMNS, start=1)
+            f"    NULLIF(substr(p.ranks[{i}], {len(prefix) + 1}), '') AS {quote_rank(column)},"
+            for i, (column, prefix) in enumerate(
+                zip(RANK_COLUMNS, RANK_PREFIXES, strict=True), start=1
+            )
         )
         + "    NULL::BIGINT AS ncbi_taxon_id"
         "  FROM (SELECT DISTINCT feature_idx FROM id_map) m"

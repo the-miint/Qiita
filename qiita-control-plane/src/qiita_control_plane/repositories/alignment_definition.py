@@ -19,8 +19,10 @@ The params_hash is computed control-plane-side via
 qiita_common.hashing.canonical_params_hash (SHA-256 of the canonical config
 JSON) — no pgcrypto dependency on the database. The function only enforces the
 dedup and returns the row; asyncpg.ForeignKeyViolationError (unknown
-principal_idx) and asyncpg.InvalidParameterValueError (SQLSTATE 22023, a
-non-32-byte hash — unreachable via this helper) propagate to the caller.
+principal_idx), asyncpg.InvalidParameterValueError (SQLSTATE 22023, a
+non-32-byte hash — unreachable via this helper) and
+ParamsDoNotSurviveStorageError (a config whose jsonb round trip would change
+the digest) propagate to the caller.
 """
 
 import json
