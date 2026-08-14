@@ -329,3 +329,118 @@ qiita_buckets_12() {
 pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((${n_pass:-0} + 1)); }
 fail() { printf '  \xe2\x9c\x97 %s: %s\n' "$1" "$2"; n_fail=$((${n_fail:-0} + 1)); }
 skip() { printf '  \xc2\xb7 %s: %s\n' "$1" "$2"; n_skip=$((${n_skip:-0} + 1)); }
+
+# --- DuckLake session helpers -------------------------------------------------
+# Shared by the two scripts that open a DuckDB session on the lake:
+# scripts/lake-shell.sh (read-only admin shell) and
+# scripts/dedup-lake-sequence-tables.sh (the one-off collapse). They were
+# byte-identical copies before this; a second, subtly-different copy of the
+# ATTACH input validation or the DATA_PATH derivation is the failure mode
+# read_env_var was factored out to avoid.
+
+# The DuckDB CLI version to match the data plane's linked DuckDB (duckdb crate
+# 1.10504.0 == DuckDB 1.5.4). The ducklake extension is versioned with DuckDB,
+# and a newer one may want to migrate the catalog schema it opens.
+QIITA_DUCKDB_VERSION="1.5.4"
+
+# Echo the duckdb CLI to run, or print install instructions and return 1.
+# $1 = an optional caller-supplied override (typically $QIITA_DUCKDB_BIN).
+qiita_duckdb_bin() {
+    local override="${1:-}" resolved
+    resolved="${override:-$(command -v duckdb || true)}"
+    if [ -n "$resolved" ]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+    cat >&2 <<INSTALL
+ERROR: no duckdb CLI on PATH.
+
+Install one into your own account (no root needed):
+
+  mkdir -p ~/.local/bin && cd "\$(mktemp -d)" \\
+    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${QIITA_DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip \\
+    && unzip -q duckdb_cli-linux-amd64.zip \\
+    && install -m 0755 duckdb ~/.local/bin/duckdb
+
+Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
+INSTALL
+    return 1
+}
+
+# ATTACH takes no bind parameters, so connection strings and paths are
+# interpolated into SQL. Reject the same characters
+# qiita-data-plane/src/ducklake.rs validate_sql_literal does — this is input
+# validation, not sanitization. $1 = value, $2 = label for the error.
+qiita_reject_sql_metacharacters() {
+    case "$1" in
+        *\'*|*\;*)
+            echo "ERROR: $2 contains a quote or semicolon; refusing to interpolate it into SQL." >&2
+            return 1
+            ;;
+    esac
+}
+
+# Echo the lake DATA_PATH derived from a data-plane env file's PATH_PERSISTENT.
+# $1 = env file. Returns 1 with a message on stderr if the file or the directory
+# is unusable.
+#
+# Byte-identical to the data plane's derivation — config.rs does a bare
+# format!("{path_persistent_raw}/ducklake") with NO normalization, and DuckLake
+# pins that exact string into the catalog at creation. Do not "tidy" a trailing
+# slash off PATH_PERSISTENT: on a host with PATH_PERSISTENT=/data/ the catalog
+# holds "/data//ducklake", and the tidied "/data/ducklake" is rejected outright
+# with `DATA_PATH parameter ... does not match existing data path in the catalog`.
+qiita_lake_data_path() {
+    local env_file="$1" persistent data_path
+    persistent="$(read_env_var "$env_file" PATH_PERSISTENT)"
+    if [ -z "$persistent" ]; then
+        echo "ERROR: PATH_PERSISTENT is unset in ${env_file}" >&2
+        return 1
+    fi
+    data_path="${persistent}/ducklake"
+    if [ ! -d "$data_path" ]; then
+        echo "ERROR: lake data path ${data_path} is not a directory" >&2
+        return 1
+    fi
+    if [ ! -r "$data_path" ] || [ ! -x "$data_path" ]; then
+        echo "ERROR: cannot read ${data_path}" >&2
+        echo "  It is mode 0750 qiita-data:qiita-data — you must be in the owning group." >&2
+        echo "  Check with: ls -ld ${data_path} && id" >&2
+        return 1
+    fi
+    printf '%s' "$data_path"
+}
+
+# Echo one pgpass line for $1=user / $2=password, keyed on the username alone
+# (wildcard host/port/db). `:` and `\` are the escaped characters; passwords may
+# hold any byte, which is why this is a line-builder rather than a map.
+# Pure (echo only) so the unit tests can call it.
+qiita_pgpass_line() {
+    local escaped_user="${1//\\/\\\\}" escaped_password="${2//\\/\\\\}"
+    escaped_user="${escaped_user//:/\\:}"
+    escaped_password="${escaped_password//:/\\:}"
+    printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}"
+}
+
+# Echo the SET statements bounding a lake session's resource use. DuckDB
+# otherwise takes every core and ~80% of system RAM, which is antisocial on a
+# shared deploy host where the services are the point. These are only STARTING
+# values — `SET threads = 8;` at a prompt overrides either at any time.
+# (`max_memory` and `worker_threads` are aliases of these two, not separate
+# knobs. Note DuckDB reads GB as decimal, so a 32GB limit caps at 29.8 GiB;
+# write GiB for a binary ceiling.)
+#
+# $1 = threads, $2 = memory limit, $3 = temp directory. Returns 1 on a value that
+# fails validation, since all three are interpolated into SQL.
+qiita_duckdb_session_limits() {
+    local threads="$1" memory_limit="$2" temp_dir="$3"
+    if ! printf '%s' "$threads" | grep -qE '^[1-9][0-9]*$'; then
+        echo "ERROR: thread count must be a positive integer, got '${threads}'" >&2
+        return 1
+    fi
+    qiita_reject_sql_metacharacters "$memory_limit" "the memory limit" || return 1
+    # An in-memory DB spills to ./.tmp by default, which fails from a read-only cwd.
+    qiita_reject_sql_metacharacters "$temp_dir" "the temp directory" || return 1
+    printf "SET threads = %s;\nSET memory_limit = '%s';\nSET temp_directory='%s';\n" \
+        "$threads" "$memory_limit" "$temp_dir"
+}

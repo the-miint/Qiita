@@ -719,10 +719,6 @@ impl FlightService for QiitaFlightService {
                 .await
                 .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
 
-                // `replaced` rides back so the control plane can log what a load
-                // superseded — a content-addressed table replaces on its key
-                // (REPLACE_KEY_TABLES), and a silent delete is the one thing an
-                // operator reconciling row counts cannot reconstruct.
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "registered": registration.registered,
                     "replaced": registration.replaced,
@@ -1949,7 +1945,7 @@ fn mask_metrics_counts(
 ///
 /// `feature_idx` is minted from the canonical sequence hash
 /// (`qiita_common.chunking.canonical_sequence_hash_expr`), so identical bytes
-/// carry ONE feature across every producer: two references that share a
+/// carry one feature across every producer: two references that share a
 /// sequence, or two assemblies that produce the same contig, each emit that
 /// feature's rows in full. The producer cannot anti-join them away — the compute
 /// job writing the staging Parquet has no DuckLake access — and DuckLake enforces
@@ -1959,12 +1955,36 @@ fn mask_metrics_counts(
 /// Replacing on the key is what makes a second load converge instead of
 /// accumulate.
 ///
-/// A table belongs here only when its key determines every other column, so
-/// dropping the lake's rows and taking the incoming ones is content-preserving:
-/// `sequence_hash` / `sequence_length_bp` are functions of the feature, and
-/// `chunk_index` + `chunk_data` are that feature's bytes. It also requires the
-/// incoming files to carry the COMPLETE row set for every key they mention —
-/// true of the `_feature_load` writers, which bin-pack whole features into parts.
+/// Two conditions admit a table, and the second is narrower than it looks:
+///
+/// 1. The incoming files carry the COMPLETE row set for every key they mention.
+///    True of the `_feature_load` writers, which bin-pack whole features into
+///    parts, so no part holds a fragment of a feature.
+/// 2. Every row set carrying one key is an acceptable substitute for any other.
+///    `sequence_hash` and `sequence_length_bp` are functions of the feature, so
+///    those are identical. `chunk_data` is NOT: the canonical hash is
+///    `LEAST(md5(seq), md5(revcomp(seq)))` over the upper-cased sequence, so a
+///    sequence, its reverse complement, and its case variants share one
+///    `feature_idx` while differing byte for byte. Replacing therefore lets the
+///    newest load's strand and casing win.
+///
+/// That last outcome is the point rather than a cost. Without the replace both
+/// byte strings persist and a reader gets them concatenated — neither strand,
+/// and a length that matches nothing. With it a reader gets one coherent
+/// sequence, and `sequence_length_bp` describes it. Nothing records which chunk
+/// arrived in which load, so "keep the older strand" is not on the menu.
+///
+/// The one-off `scripts/dedup-lake-sequence-tables.sh` refuses the case this
+/// accepts, and the asymmetry is in what each can see: here the incoming file is
+/// a single load, self-consistent by construction, so taking it whole cannot
+/// splice. There the lake already holds N interleaved copies with no load
+/// marker, so a per-`chunk_index` pick could assemble one sequence out of two
+/// strands — which is why that script leaves differing copies alone.
+///
+/// `assembly_membership` / `bin_quality` are deliberately absent: they carry
+/// `(prep_sample_idx, processing_idx)`, so a distinct run's rows are its own,
+/// and the runner fast-forwards a COMPLETED `register-files` on resume rather
+/// than re-running it (`runner::run_workflow`), so one run registers once.
 const REPLACE_KEY_TABLES: &[(&str, &str)] = &[
     ("reference_sequences", "feature_idx"),
     ("reference_sequence_chunks", "feature_idx"),
@@ -2001,6 +2021,10 @@ struct Registration {
     /// Rows the replace-by-key pass removed, per table — non-zero entries only.
     /// Empty when nothing this call registered was a `REPLACE_KEY_TABLES`
     /// target, or when every key it carried was new to the lake.
+    ///
+    /// Rides back to the control plane in the DoAction body, which logs it: a
+    /// delete nothing recorded is the one thing an operator reconciling row
+    /// counts cannot reconstruct.
     replaced: BTreeMap<&'static str, usize>,
 }
 
@@ -2154,8 +2178,7 @@ fn register_files(
                 ))
             })?;
             // Zero is the ordinary case (a first load, or a run whose features
-            // are all new) and says nothing; only a real supersede earns an
-            // entry, so the reported map is what an operator has to reconcile.
+            // are all new) and says nothing; only a real supersede earns an entry.
             if deleted > 0 {
                 replaced.insert(lake_table, deleted);
             }
@@ -4746,11 +4769,17 @@ mod tests {
         ));
     }
 
-    /// Re-running one assembly — same prep_sample, same processing, same
-    /// contigs — converges instead of accumulating. Each retry ships a fresh
-    /// staging Parquet under a new work ticket, so the lake gets a second file
-    /// carrying the same keys; replace-by-key is what keeps the row count at
-    /// one.
+    /// Registering the same contigs again converges instead of accumulating —
+    /// the DoAction's own idempotency, under a fresh work ticket each time (so
+    /// the lake gets a distinct file carrying the same keys, which is what makes
+    /// it a real second registration rather than a no-op).
+    ///
+    /// This is the primitive's property, not a workflow scenario: the runner
+    /// fast-forwards a COMPLETED `register-files` on resume rather than
+    /// re-running it, and disallow-without-delete refuses a fresh ticket for a
+    /// COMPLETED `(prep_sample_idx, processing_idx)`. What reaches the lake
+    /// twice today is one contig produced by two DIFFERENT runs — the sibling
+    /// test above.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
@@ -4855,6 +4884,171 @@ mod tests {
                 .unwrap_or_else(|e| panic!("column lookup for {table}.{key} failed: {e}"));
             assert_eq!(found, 1, "qiita_lake.{table} has no {key} column");
         }
+    }
+
+    /// The inverse direction: every lake table shaped like a content-addressed
+    /// sequence store IS registered. `replace_key_tables_match_the_lake_schema`
+    /// only catches a typo in an existing entry; this catches the omission that
+    /// matters — a fifth table added later with the same shape and no entry,
+    /// which would silently duplicate exactly as these four did.
+    ///
+    /// The shape is the column set, not the name: `(feature_idx, sequence_hash,
+    /// sequence_length_bp)` or `(feature_idx, chunk_index, chunk_data)`. A table
+    /// carrying a run-scoping column has a different set and is not matched.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn every_content_addressed_lake_table_is_registered() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_assembly_tables(&conn).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT table_name, list_sort(list(column_name)) AS cols \
+                 FROM duckdb_columns() WHERE database_name = 'qiita_lake' \
+                 GROUP BY table_name \
+                 HAVING cols = ['feature_idx', 'sequence_hash', 'sequence_length_bp'] \
+                     OR cols = ['chunk_data', 'chunk_index', 'feature_idx'] \
+                 ORDER BY table_name",
+            )
+            .unwrap();
+        let shaped: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(
+            !shaped.is_empty(),
+            "the shape query matched nothing — it can no longer catch an omission"
+        );
+        for table in &shaped {
+            assert!(
+                REPLACE_KEY_TABLES.iter().any(|(t, _)| t == table),
+                "qiita_lake.{table} is content-addressed but absent from REPLACE_KEY_TABLES, \
+                 so a second load carrying its keys would duplicate them; found shaped tables: \
+                 {shaped:?}"
+            );
+        }
+    }
+
+    /// The reference pair takes the same path as the assembly pair, and unlike it
+    /// is Flight-readable (`ALLOWED_TABLES`), so a duplicate there reaches a
+    /// consumer. Two references sharing a sequence each ship that feature's rows;
+    /// after both loads there is one of each.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_replaces_sequences_shared_across_references() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let shared: i64 = 972_010;
+        let b_only: i64 = 972_011;
+        let ticket_a: i64 = 972_000_000 + std::process::id() as i64;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.reference_sequences \
+                   WHERE feature_idx IN ({shared}, {b_only});
+                 DELETE FROM qiita_lake.reference_sequence_chunks \
+                   WHERE feature_idx IN ({shared}, {b_only});"
+            ))
+            .unwrap();
+        }
+
+        let seed = |contigs: &[(i64, &str, &[&str])], ticket: i64| {
+            let staging = seed_assembly_staging(contigs);
+            // Same two shapes, registered into the reference tables.
+            std::fs::rename(
+                staging.path().join("assembled_sequence.parquet"),
+                staging.path().join("reference_sequences.parquet"),
+            )
+            .unwrap();
+            std::fs::rename(
+                staging.path().join("assembled_sequence_chunks"),
+                staging.path().join("reference_sequence_chunks"),
+            )
+            .unwrap();
+            let mut files = std::collections::HashMap::new();
+            files.insert(
+                "reference_sequences.parquet".to_string(),
+                "reference_sequences".to_string(),
+            );
+            for part_index in 0..contigs.len() {
+                files.insert(
+                    format!("reference_sequence_chunks/part_{part_index:05}.parquet"),
+                    "reference_sequence_chunks".to_string(),
+                );
+            }
+            let payload = auth::ActionPayload {
+                action: "register_files".to_string(),
+                staging_dir: staging.path().to_str().unwrap().to_string(),
+                files,
+                work_ticket_idx: ticket,
+            };
+            let outcome = register_files(&connstr, &data_path, &payload)
+                .unwrap_or_else(|e| panic!("register_files failed: {e}"));
+            // Keep `staging` alive until after the call.
+            drop(staging);
+            outcome
+        };
+
+        // Reference A: one sequence, which reference B also carries.
+        seed(
+            &[(shared, "00000000-0000-0000-0000-000000972010", &["ACGT"])],
+            ticket_a,
+        );
+        let outcome_b = seed(
+            &[
+                (shared, "00000000-0000-0000-0000-000000972010", &["ACGT"]),
+                (b_only, "00000000-0000-0000-0000-000000972011", &["TTTT"]),
+            ],
+            ticket_a + 1,
+        );
+        assert_eq!(
+            outcome_b.replaced.get("reference_sequences").copied(),
+            Some(1),
+            "reference A's copy of the shared sequence is superseded"
+        );
+        assert_eq!(
+            outcome_b.replaced.get("reference_sequence_chunks").copied(),
+            Some(1)
+        );
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        for feature_idx in [shared, b_only] {
+            let (sequences, chunks): (i64, i64) = reader
+                .query_row(
+                    &format!(
+                        "SELECT (SELECT count(*) FROM qiita_lake.reference_sequences \
+                                  WHERE feature_idx = {feature_idx}), \
+                                (SELECT count(*) FROM qiita_lake.reference_sequence_chunks \
+                                  WHERE feature_idx = {feature_idx})"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(sequences, 1, "one sequence row for {feature_idx}");
+            assert_eq!(chunks, 1, "one chunk row for {feature_idx}");
+        }
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_sequences WHERE feature_idx IN ({shared}, {b_only});
+             DELETE FROM qiita_lake.reference_sequence_chunks \
+               WHERE feature_idx IN ({shared}, {b_only});"
+        ));
     }
 
     /// Pins the DuckLake-transaction semantics `register_files` relies on: a

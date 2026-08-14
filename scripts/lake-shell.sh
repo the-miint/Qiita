@@ -79,40 +79,7 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-# The DuckDB CLI should match the version the data plane links (duckdb crate
-# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
-# and a newer one may want to migrate the catalog schema it opens.
-DUCKDB_VERSION="1.5.4"
-DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-if [[ -z "${DUCKDB_BIN}" ]]; then
-    cat >&2 <<EOF
-ERROR: no duckdb CLI on PATH.
-
-Install one into your own account (no root needed):
-
-  mkdir -p ~/.local/bin && cd "\$(mktemp -d)" \\
-    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip \\
-    && unzip -q duckdb_cli-linux-amd64.zip \\
-    && install -m 0755 duckdb ~/.local/bin/duckdb
-
-Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
-EOF
-    exit 1
-fi
-
-# ATTACH takes no bind parameters, so connection strings and paths are
-# interpolated into SQL. Reject the same characters
-# qiita-data-plane/src/ducklake.rs validate_sql_literal does — this is input
-# validation, not sanitization.
-reject_sql_metacharacters() {
-    local value="$1" label="$2"
-    case "${value}" in
-        *\'*|*\;*)
-            echo "ERROR: ${label} contains a quote or semicolon; refusing to interpolate it into SQL." >&2
-            exit 1
-            ;;
-    esac
-}
+DUCKDB_BIN="$(qiita_duckdb_bin "${QIITA_DUCKDB_BIN:-}")" || exit 1
 
 # The password-splitting itself lives in deploy/_common.sh (qiita_split_conn_password,
 # unit-tested in test_deploy_scripts.py). These three hold its last result.
@@ -149,10 +116,10 @@ PGPASS_FILE="${TMPROOT}/pgpass"
 : > "${INIT_SQL}"; chmod 600 "${INIT_SQL}"
 : > "${PGPASS_FILE}"; chmod 600 "${PGPASS_FILE}"
 
-# pgpass lines are `host:port:database:user:password` with `:` and `\` escaped.
-# Both connections are keyed on the username alone (wildcard host/port/db),
-# which is unambiguous as long as they do not share one — and if they do share a
-# username with different passwords, error rather than let the first line win.
+# Both connections are keyed on the username alone (the wildcard host/port/db
+# qiita_pgpass_line writes), which is unambiguous as long as they do not share
+# one — and if they do share a username with different passwords, error rather
+# than let the first line win.
 #
 # The seen-set is two parallel indexed arrays and a linear scan rather than an
 # associative array, because macOS ships bash 3.2 — which has none, and which
@@ -164,7 +131,7 @@ PGPASS_SEEN_COUNT=0
 PGPASS_SEEN_USERS=()
 PGPASS_SEEN_PASSWORDS=()
 add_pgpass_entry() {
-    local user="$1" password="$2" escaped_user escaped_password i
+    local user="$1" password="$2" i
     for ((i = 0; i < PGPASS_SEEN_COUNT; i++)); do
         [[ "${PGPASS_SEEN_USERS[i]}" == "${user}" ]] || continue
         if [[ "${PGPASS_SEEN_PASSWORDS[i]}" != "${password}" ]]; then
@@ -178,9 +145,7 @@ add_pgpass_entry() {
     PGPASS_SEEN_USERS[PGPASS_SEEN_COUNT]="${user}"
     PGPASS_SEEN_PASSWORDS[PGPASS_SEEN_COUNT]="${password}"
     PGPASS_SEEN_COUNT=$((PGPASS_SEEN_COUNT + 1))
-    escaped_user="${user//\\/\\\\}"; escaped_user="${escaped_user//:/\\:}"
-    escaped_password="${password//\\/\\\\}"; escaped_password="${escaped_password//:/\\:}"
-    printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
+    qiita_pgpass_line "${user}" "${password}" >> "${PGPASS_FILE}"
 }
 
 # ---- the lake (required) ----------------------------------------------------
@@ -193,33 +158,14 @@ if [[ ! -r "${DP_ENV}" ]]; then
 fi
 
 LAKE_CONNSTR="$(read_env_var "${DP_ENV}" DUCKLAKE_CATALOG_CONNSTR)"
-PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 [[ -n "${LAKE_CONNSTR}" ]] || { echo "ERROR: DUCKLAKE_CATALOG_CONNSTR is unset in ${DP_ENV}" >&2; exit 1; }
-[[ -n "${PERSISTENT}" ]]   || { echo "ERROR: PATH_PERSISTENT is unset in ${DP_ENV}" >&2; exit 1; }
-
-# Byte-identical to the data plane's derivation — config.rs does a bare
-# format!("{path_persistent_raw}/ducklake") with NO normalization, and DuckLake
-# pins that exact string into the catalog at creation. Do not "tidy" a trailing
-# slash off PERSISTENT here: on a host with PATH_PERSISTENT=/data/ the catalog
-# holds "/data//ducklake", and the tidied "/data/ducklake" is rejected outright
-# with `DATA_PATH parameter ... does not match existing data path in the catalog`.
-DATA_PATH="${PERSISTENT}/ducklake"
-if [[ ! -d "${DATA_PATH}" ]]; then
-    echo "ERROR: lake data path ${DATA_PATH} is not a directory" >&2
-    exit 1
-fi
-if [[ ! -r "${DATA_PATH}" || ! -x "${DATA_PATH}" ]]; then
-    echo "ERROR: cannot read ${DATA_PATH}" >&2
-    echo "  It is mode 0750 qiita-data:qiita-data — you must be in the owning group." >&2
-    echo "  Check with: ls -ld ${DATA_PATH} && id" >&2
-    exit 1
-fi
+DATA_PATH="$(qiita_lake_data_path "${DP_ENV}")" || exit 1
 
 split_conn_password "${LAKE_CONNSTR}"
 LAKE_CONNSTR="${CONN_SANITIZED}"
 [[ -z "${CONN_PASSWORD}" ]] || add_pgpass_entry "${CONN_USER}" "${CONN_PASSWORD}"
-reject_sql_metacharacters "${LAKE_CONNSTR}" "the lake catalog connection string"
-reject_sql_metacharacters "${DATA_PATH}" "the lake data path"
+qiita_reject_sql_metacharacters "${LAKE_CONNSTR}" "the lake catalog connection string"
+qiita_reject_sql_metacharacters "${DATA_PATH}" "the lake data path"
 
 # ---- the control-plane database (optional) ----------------------------------
 
@@ -233,7 +179,7 @@ if [[ "${WANT_CP}" -eq 1 ]]; then
             split_conn_password "${CP_URL}"
             CP_URL="${CONN_SANITIZED}"
             [[ -z "${CONN_PASSWORD}" ]] || add_pgpass_entry "${CONN_USER}" "${CONN_PASSWORD}"
-            reject_sql_metacharacters "${CP_URL}" "the control-plane connection string"
+            qiita_reject_sql_metacharacters "${CP_URL}" "the control-plane connection string"
         fi
     else
         echo "NOTE: ${CP_ENV} is not readable, so qiita_cp is not attached." >&2
@@ -280,7 +226,7 @@ if [[ ! -d "${MIINT_EXT_DIR}" || ! -r "${MIINT_EXT_DIR}" ]]; then
     echo "  Check with: ls -ld ${MIINT_EXT_DIR}" >&2
     exit 1
 fi
-reject_sql_metacharacters "${MIINT_EXT_DIR}" "MIINT_EXTENSION_DIRECTORY"
+qiita_reject_sql_metacharacters "${MIINT_EXT_DIR}" "MIINT_EXTENSION_DIRECTORY"
 
 # The duckdb CLI aborts the ENTIRE init file on the first error — `.bail off`
 # does not cover that, and neither does moving the statement to `-cmd` — so an
@@ -300,26 +246,11 @@ fi
 
 # ---- build the session ------------------------------------------------------
 
-# TMPDIR is interpolated into the SET below, so it gets the same validation the
-# connection strings and the data path get — no carve-out just because it is the
-# caller's own variable.
-SESSION_TMPDIR="${TMPDIR:-/tmp}"
-reject_sql_metacharacters "${SESSION_TMPDIR}" "TMPDIR"
-
-# Resource defaults. DuckDB otherwise takes every core and ~80% of system RAM,
-# which is antisocial on a shared deploy host where the services are the point.
-# These are only the session's STARTING values — `SET threads = 8;` /
-# `SET memory_limit = '64GB';` at the prompt overrides either one at any time.
-# (`max_memory` and `worker_threads` are aliases of these two, not separate
-# knobs. Note DuckDB reads GB as decimal, so the 32GB default caps at 29.8 GiB;
-# write GiB if you want a binary ceiling.)
-LAKE_THREADS="${QIITA_LAKE_THREADS:-4}"
-LAKE_MEMORY_LIMIT="${QIITA_LAKE_MEMORY_LIMIT:-32GB}"
-if [[ ! "${LAKE_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: QIITA_LAKE_THREADS must be a positive integer, got '${LAKE_THREADS}'" >&2
-    exit 1
-fi
-reject_sql_metacharacters "${LAKE_MEMORY_LIMIT}" "QIITA_LAKE_MEMORY_LIMIT"
+# The three values are interpolated into SET statements, so they get the same
+# validation the connection strings and the data path get — no carve-out just
+# because TMPDIR is the caller's own variable.
+SESSION_LIMITS="$(qiita_duckdb_session_limits \
+    "${QIITA_LAKE_THREADS:-4}" "${QIITA_LAKE_MEMORY_LIMIT:-32GB}" "${TMPDIR:-/tmp}")" || exit 1
 
 # `.bail on` so an attach failure exits instead of silently dropping the user
 # into a shell with nothing attached. It stays on for non-interactive runs (a
@@ -343,10 +274,7 @@ reject_sql_metacharacters "${LAKE_MEMORY_LIMIT}" "QIITA_LAKE_MEMORY_LIMIT"
     echo "SET extension_directory='${MIINT_EXT_DIR}';"
     echo "LOAD miint;"
     echo "SET extension_directory=getvariable('qiita_default_ext_dir');"
-    echo "SET threads = ${LAKE_THREADS};"
-    echo "SET memory_limit = '${LAKE_MEMORY_LIMIT}';"
-    # An in-memory DB spills to ./.tmp by default, which fails from a read-only cwd.
-    echo "SET temp_directory='${SESSION_TMPDIR}';"
+    echo "${SESSION_LIMITS}"
     echo "ATTACH 'ducklake:postgres:${LAKE_CONNSTR}' AS qiita_lake (DATA_PATH '${DATA_PATH}', READ_ONLY);"
     [[ -z "${CP_URL}" ]] || echo "ATTACH '${CP_URL}' AS qiita_cp (TYPE postgres, READ_ONLY);"
     echo "USE qiita_lake;"

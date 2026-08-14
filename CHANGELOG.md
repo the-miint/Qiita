@@ -918,11 +918,13 @@ duplicates further down are historical strata; leave them where they are.
   them duplicated. `register_files` now REPLACES those four tables on `feature_idx` — the
   incoming Parquet's keys are deleted from the lake in the same transaction, ahead of every
   `ducklake_add_data_files` — so a second load converges instead of accumulating, and the
-  per-table counts ride back to the control plane, which logs them. The registry is
-  `REPLACE_KEY_TABLES` in `qiita-data-plane/src/flight_service.rs`; a table belongs there
-  only when its key determines every other column. The assembly tables were latent (absent
-  from `ALLOWED_TABLES`, so nothing reads them over Flight); the reference pair is on the
-  read path.
+  per-table counts ride back to the control plane, which logs them. `REPLACE_KEY_TABLES` in
+  `qiita-data-plane/src/flight_service.rs` is the registry and carries the admission
+  conditions. The assembly tables were latent (absent from `ALLOWED_TABLES`, so nothing
+  reads them over Flight); the reference pair is on the read path. Where a feature's copies
+  differ — the canonical hash keeps a sequence, its reverse complement and its case variants
+  on one `feature_idx` — the newest load's bytes now win; before, both were kept and read
+  back concatenated, which is neither strand and matches no declared length.
 
 - **`scripts/dedup-lake-sequence-tables.sh` collapses rows written before that fix
   (#449).** A report by default, `APPLY=1` to collapse, over both content-addressed table

@@ -60,19 +60,23 @@ _None yet._
   copies, so their `string_agg(chunk_data, '' ORDER BY chunk_index)` is twice
   `sequence_length_bp`. Run AFTER bucket 5 — before the new build is live the next load
   re-duplicates. Report first, then collapse; run as `qiita-data`, the only account that can
-  write the lake data path, from a dir it can traverse:
+  write the lake data path:
   ```bash
   sudo -u qiita-data bash /opt/qiita/checkout/scripts/dedup-lake-sequence-tables.sh
   sudo -u qiita-data APPLY=1 bash /opt/qiita/checkout/scripts/dedup-lake-sequence-tables.sh
   ```
-  (Substitute the checkout path; `qiita-data` needs a duckdb CLI on PATH or
-  `QIITA_DUCKDB_BIN` — see `scripts/lake-shell.sh` for install steps.) Both passes print
-  `collapsible_features` and `ambiguous_features` per table pair. **A non-zero
-  `ambiguous_features` is expected to be 0** — it means a feature whose copies hold
-  different bytes (a sequence and its reverse complement share one `feature_idx`), which the
-  script deliberately leaves alone because no column records which chunk came from which
-  load. If any appear, re-run the producing load rather than picking a copy by hand. After
-  APPLY the script re-checks the collapsed set: all three trailing counts must be `0`. (#449)
+  Substitute the checkout path. `qiita-data` needs a duckdb CLI on PATH or
+  `QIITA_DUCKDB_BIN`; match the data plane's DuckDB (the script prints install steps for the
+  right version if it finds none). Both passes print `collapsible_features` and
+  `ambiguous_features` per table pair. `ambiguous_features` is expected to be **0** — a
+  non-zero count means a feature whose copies hold different bytes (a sequence and its
+  reverse complement share one `feature_idx`), which the script deliberately leaves alone
+  because no column records which chunk came from which load; re-run the producing load
+  rather than picking a copy by hand. APPLY validates inside its transaction and exits
+  non-zero without committing if the collapse did not converge. Every mode is re-runnable,
+  so a failure part-way is safe to repeat once its cause is fixed — and a concurrent load
+  touching the same tables makes one of the two abort with a DuckLake transaction conflict
+  rather than either losing rows. (#449)
 
 ### Notes (no host action)
 
@@ -81,9 +85,9 @@ _None yet._
   holds deletes the lake's rows for that key in the same transaction, ahead of the
   registration — so the row count for those tables can now go DOWN across a load, and the
   control-plane log records what each one superseded (`register_files replaced rows in
-  content-addressed tables`). The other lake tables are untouched: `assembly_membership` and
-  `bin_quality` carry `(prep_sample_idx, processing_idx)`, so a run's rows are its own.
-  (#449)
+  content-addressed tables`). Where a feature's two copies differ (a sequence and its
+  reverse complement share one `feature_idx`), the newest load's bytes win; before this they
+  were both kept and read back concatenated. Every other lake table is untouched. (#449)
 
 - **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
   `qiita feature-table build` requires it.** Additive, so an older client ignores it and

@@ -1667,9 +1667,8 @@ async def register_files(
 
     Content-addressed tables are REPLACED on their key rather than appended to
     (the data plane's `REPLACE_KEY_TABLES`), so a load can supersede rows an
-    earlier one wrote. The per-table counts come back in `replaced` and are
-    logged here — a delete an operator reconciling row counts cannot otherwise
-    reconstruct.
+    earlier one wrote. Those per-table counts come back in `replaced`; logging
+    them here is what records the delete.
 
     Raises pyarrow.flight.FlightError on transport / data-plane failure.
     """

@@ -535,9 +535,8 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// (integrity is enforced upstream — the CP mints feature_idx/dedups on
 /// sequence_hash, the orchestrator verifies before load). `assembled_sequence` /
 /// `assembled_sequence_chunks` are additionally REPLACED on `feature_idx` at
-/// register time — `flight_service::REPLACE_KEY_TABLES`. `assembly_membership` /
-/// `bin_quality` are not: they carry `(prep_sample_idx, processing_idx)`, so a
-/// run's rows are its own.
+/// register time — `flight_service::REPLACE_KEY_TABLES`, which also says why
+/// `assembly_membership` / `bin_quality` are not.
 ///
 /// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
 /// register_files loads them and they are SQL-queryable in the catalog; they are
