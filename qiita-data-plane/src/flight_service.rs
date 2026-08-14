@@ -7,6 +7,7 @@
 //! avoids shared mutable state and allows concurrent requests — DuckLake's
 //! snapshot isolation in the shared Postgres catalog handles concurrency.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -712,14 +713,19 @@ impl FlightService for QiitaFlightService {
                 // crosses no await.
                 let catalog = self.catalog_connstr.clone();
                 let data_path = self.data_path.clone();
-                let registered = tokio::task::spawn_blocking(move || {
+                let registration = tokio::task::spawn_blocking(move || {
                     register_files(&catalog, &data_path, &payload)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
 
+                // `replaced` rides back so the control plane can log what a load
+                // superseded — a content-addressed table replaces on its key
+                // (REPLACE_KEY_TABLES), and a silent delete is the one thing an
+                // operator reconciling row counts cannot reconstruct.
                 let result_body = serde_json::to_vec(&serde_json::json!({
-                    "registered": registered,
+                    "registered": registration.registered,
+                    "replaced": registration.replaced,
                 }))
                 .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
 
@@ -1938,6 +1944,66 @@ fn mask_metrics_counts(
     }))
 }
 
+/// Lake tables a registration REPLACES by key rather than appends to, and the
+/// key column it replaces on.
+///
+/// `feature_idx` is minted from the canonical sequence hash
+/// (`qiita_common.chunking.canonical_sequence_hash_expr`), so identical bytes
+/// carry ONE feature across every producer: two references that share a
+/// sequence, or two assemblies that produce the same contig, each emit that
+/// feature's rows in full. The producer cannot anti-join them away — the compute
+/// job writing the staging Parquet has no DuckLake access — and DuckLake enforces
+/// no PK/UNIQUE, so an append leaves N copies and
+/// `string_agg(chunk_data, '' ORDER BY chunk_index)` returns the sequence
+/// concatenated with itself while `sequence_length_bp` still describes one copy.
+/// Replacing on the key is what makes a second load converge instead of
+/// accumulate.
+///
+/// A table belongs here only when its key determines every other column, so
+/// dropping the lake's rows and taking the incoming ones is content-preserving:
+/// `sequence_hash` / `sequence_length_bp` are functions of the feature, and
+/// `chunk_index` + `chunk_data` are that feature's bytes. It also requires the
+/// incoming files to carry the COMPLETE row set for every key they mention —
+/// true of the `_feature_load` writers, which bin-pack whole features into parts.
+const REPLACE_KEY_TABLES: &[(&str, &str)] = &[
+    ("reference_sequences", "feature_idx"),
+    ("reference_sequence_chunks", "feature_idx"),
+    ("assembled_sequence", "feature_idx"),
+    ("assembled_sequence_chunks", "feature_idx"),
+];
+
+/// The replace-by-key DELETE for one `REPLACE_KEY_TABLES` entry: drop every lake
+/// row whose key appears in ANY of the `n_files` Parquets about to be registered
+/// into that table. Takes one bound path parameter per file, in order.
+///
+/// One statement for the whole table, not one per file. A multi-file table
+/// arrives as several parts, and deleting part-by-part would let a later part's
+/// delete drop rows an earlier part had just added whenever the two share a key;
+/// it would also re-scan the lake table once per part.
+///
+/// `table` / `key` are interpolated because they are `REPLACE_KEY_TABLES`
+/// literals (the caller looks them up there, never using the payload's own
+/// string); the file paths are bound parameters, so a basename carrying a quote
+/// cannot reach the SQL text.
+fn replace_key_delete_sql(table: &str, key: &str, n_files: usize) -> String {
+    let incoming_keys = (0..n_files)
+        .map(|_| format!("SELECT {key} FROM read_parquet(?)"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    format!("DELETE FROM qiita_lake.{table} WHERE {key} IN ({incoming_keys})")
+}
+
+/// What one `register_files` call did.
+#[derive(Debug)]
+struct Registration {
+    /// Permanent lake paths registered, in payload iteration order.
+    registered: Vec<String>,
+    /// Rows the replace-by-key pass removed, per table — non-zero entries only.
+    /// Empty when nothing this call registered was a `REPLACE_KEY_TABLES`
+    /// target, or when every key it carried was new to the lake.
+    replaced: BTreeMap<&'static str, usize>,
+}
+
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
 /// Validates all requested files exist in staging, moves them to permanent
@@ -1947,6 +2013,9 @@ fn mask_metrics_counts(
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).
 ///
+/// Content-addressed tables are REPLACED on their key rather than appended to —
+/// see `REPLACE_KEY_TABLES` for which, and why.
+///
 /// Note: the action token is scoped to staging_dir + files, not to a specific
 /// reference_idx. The control plane is responsible for issuing tokens only for
 /// valid references in the correct state.
@@ -1954,7 +2023,7 @@ fn register_files(
     catalog_connstr: &str,
     data_path: &str,
     payload: &auth::ActionPayload,
-) -> Result<Vec<String>, Status> {
+) -> Result<Registration, Status> {
     let staging = std::path::Path::new(&payload.staging_dir);
     let perm_root = std::path::Path::new(data_path);
 
@@ -1994,7 +2063,9 @@ fn register_files(
     }
 
     // Move all files to permanent storage.
-    let mut moved: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // (DuckLake table, permanent path). The path is carried as a String because
+    // every consumer below binds it into SQL or reports it.
+    let mut moved: Vec<(String, String)> = Vec::new();
     for (filename, table) in &payload.files {
         let src = staging.join(filename);
         let dest_dir = perm_root.join(table);
@@ -2022,7 +2093,13 @@ fn register_files(
         // refuses to overwrite besides, as a hard safety net.
         let dest = dest_dir.join(lake_dest_filename(payload.work_ticket_idx, basename));
         move_file(&src, &dest)?;
-        moved.push((table.clone(), dest));
+        // Both SQL passes below name the destination as a string, so resolve it
+        // once here rather than re-deriving (and re-erroring on) it twice.
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?
+            .to_string();
+        moved.push((table.clone(), dest_str));
     }
 
     // Register in DuckLake. Tables are ensured at startup in main.rs.
@@ -2031,10 +2108,11 @@ fn register_files(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    // Register every moved file in ONE DuckLake transaction so the catalog
-    // update is all-or-nothing (mirrors delete_reference / delete_mask /
-    // delete_pool_reads). A failure part-way through the loop rolls back every
-    // prior ducklake_add_data_files call rather than leaving the reference
+    // Replace-by-key the content-addressed tables, then register every moved
+    // file, in ONE DuckLake transaction so the catalog update is all-or-nothing
+    // (mirrors delete_reference / delete_mask / delete_pool_reads). A failure
+    // part-way through rolls back every prior delete and
+    // ducklake_add_data_files call rather than leaving the reference
     // half-registered in the catalog.
     //
     // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
@@ -2048,29 +2126,62 @@ fn register_files(
     conn.execute_batch("BEGIN TRANSACTION")
         .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
 
-    let registration = (|| -> Result<Vec<String>, Status> {
+    let registration = (|| -> Result<Registration, Status> {
+        // Replace-by-key runs as its OWN pass, ahead of every add: one statement
+        // per target table over all the files headed for it, so no delete can
+        // touch a row this same registration already added.
+        let mut incoming: BTreeMap<(&'static str, &'static str), Vec<&str>> = BTreeMap::new();
+        for (table, dest) in &moved {
+            if let Some((lake_table, key)) = REPLACE_KEY_TABLES
+                .iter()
+                .find(|(candidate, _)| candidate == table)
+            {
+                incoming
+                    .entry((*lake_table, *key))
+                    .or_default()
+                    .push(dest.as_str());
+            }
+        }
+
+        let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for ((lake_table, key), dests) in &incoming {
+            let sql = replace_key_delete_sql(lake_table, key, dests.len());
+            let params: Vec<&dyn duckdb::ToSql> =
+                dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
+            let deleted = conn.execute(&sql, params.as_slice()).map_err(|e| {
+                Status::internal(format!(
+                    "replace-by-key delete failed for {lake_table}: {e}"
+                ))
+            })?;
+            // Zero is the ordinary case (a first load, or a run whose features
+            // are all new) and says nothing; only a real supersede earns an
+            // entry, so the reported map is what an operator has to reconcile.
+            if deleted > 0 {
+                replaced.insert(lake_table, deleted);
+            }
+        }
+
         let mut registered = Vec::new();
         for (table, dest) in &moved {
-            let dest_str = dest
-                .to_str()
-                .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
             conn.execute(
                 "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
-                duckdb::params![table, dest_str],
+                duckdb::params![table, dest],
             )
             .map_err(|e| {
                 Status::internal(format!(
-                    "ducklake_add_data_files failed for {table}/{}: {e}",
-                    dest.display()
+                    "ducklake_add_data_files failed for {table}/{dest}: {e}"
                 ))
             })?;
-            registered.push(dest_str.to_string());
+            registered.push(dest.clone());
         }
-        Ok(registered)
+        Ok(Registration {
+            registered,
+            replaced,
+        })
     })();
 
-    let registered = match registration {
-        Ok(registered) => registered,
+    let registration = match registration {
+        Ok(registration) => registration,
         Err(e) => {
             // Best-effort rollback; the catalog is left untouched so the control
             // plane can retry from a clean slate. The moved files stay on disk
@@ -2083,7 +2194,7 @@ fn register_files(
     conn.execute_batch("COMMIT")
         .map_err(|e| Status::internal(format!("failed to commit registration transaction: {e}")))?;
 
-    Ok(registered)
+    Ok(registration)
 }
 
 /// Delete every DuckLake row belonging to a reference.
@@ -4133,6 +4244,94 @@ mod tests {
         }
     }
 
+    // --- replace-by-key (in-memory DuckDB; no DuckLake catalog) ---
+
+    /// Every `REPLACE_KEY_TABLES` table appears once. A repeated table would run
+    /// its delete twice for the same incoming file — harmless today but a slip
+    /// worth catching, since the second pass would also mask a key typo in the
+    /// first.
+    #[test]
+    fn replace_key_tables_names_each_table_once() {
+        let mut seen = std::collections::HashSet::new();
+        for (table, _key) in REPLACE_KEY_TABLES {
+            assert!(seen.insert(*table), "{table} listed twice");
+        }
+    }
+
+    /// Write a `(feature_idx, chunk_index, chunk_data)` Parquet at `path`. The
+    /// COPY has no bound-parameter form, so it doubles any quote in the path to
+    /// escape it — precisely what the delete under test must NOT have to do.
+    #[cfg(test)]
+    fn seed_chunk_parquet(conn: &Connection, path: &std::path::Path, rows: &[(i64, i32, &str)]) {
+        let values = rows
+            .iter()
+            .map(|(feature_idx, chunk_index, data)| {
+                format!("({feature_idx}::BIGINT, {chunk_index}::INTEGER, '{data}')")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let literal = path.to_str().unwrap().replace('\'', "''");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES {values}) t(feature_idx, chunk_index, chunk_data)) \
+             TO '{literal}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    }
+
+    /// The replace-by-key DELETE removes exactly the rows whose key appears in
+    /// the incoming Parquets — the union across a multi-part table, not one part
+    /// — leaves every other key alone, and reads each file through a BOUND
+    /// parameter, so a lake path carrying a single quote is data, not SQL. Runs
+    /// against a plain in-memory DuckDB with a `qiita_lake` schema: the
+    /// statement's semantics are the thing under test, not DuckLake.
+    #[test]
+    fn replace_key_delete_removes_only_the_incoming_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA qiita_lake;
+             CREATE TABLE qiita_lake.assembled_sequence_chunks (
+                 feature_idx BIGINT NOT NULL,
+                 chunk_index INTEGER NOT NULL,
+                 chunk_data VARCHAR NOT NULL
+             );
+             -- Features 1 and 3 are contigs a second run also produces (1 has 2
+             -- chunks); feature 2 belongs to an earlier run only and must survive.
+             INSERT INTO qiita_lake.assembled_sequence_chunks VALUES
+                 (1, 0, 'AAAA'), (1, 1, 'CCCC'), (2, 0, 'GGGG'), (3, 0, 'TTTT');",
+        )
+        .unwrap();
+
+        // Two parts, and a single quote in one of the names — register_files
+        // mints each basename from the (signed, but CP-authored) staging
+        // filename, so a path must never be interpolated into the SQL text.
+        let dir = tempfile::tempdir().unwrap();
+        let part_a = dir.path().join("part'00000.parquet");
+        let part_b = dir.path().join("part_00001.parquet");
+        seed_chunk_parquet(&conn, &part_a, &[(1, 0, "AAAA"), (1, 1, "CCCC")]);
+        seed_chunk_parquet(&conn, &part_b, &[(3, 0, "TTTT")]);
+
+        let sql = replace_key_delete_sql("assembled_sequence_chunks", "feature_idx", 2);
+        let deleted = conn
+            .execute(
+                &sql,
+                duckdb::params![part_a.to_str().unwrap(), part_b.to_str().unwrap()],
+            )
+            .expect("read_parquet(?) must accept each path as a bound parameter");
+        assert_eq!(
+            deleted, 3,
+            "both of feature 1's chunk rows plus feature 3's"
+        );
+
+        let survivor_feature: i64 = conn
+            .query_row(
+                "SELECT feature_idx FROM qiita_lake.assembled_sequence_chunks",
+                [],
+                |r| r.get(0),
+            )
+            .expect("exactly one row must remain");
+        assert_eq!(survivor_feature, 2, "the other run's feature is untouched");
+    }
+
     // --- do_action dispatch trust checks (pure; no DuckDB) ---
 
     /// An action whose `Action.type` header disagrees with the signed
@@ -4291,11 +4490,15 @@ mod tests {
             work_ticket_idx: ticket,
         };
 
-        let registered =
+        let outcome =
             register_files(&connstr, &data_path, &payload).expect("register_files failed");
-        assert_eq!(registered.len(), 1, "one file registered");
+        assert_eq!(outcome.registered.len(), 1, "one file registered");
+        assert!(
+            outcome.replaced.is_empty(),
+            "reference_membership is not a REPLACE_KEY_TABLES target, so nothing is replaced"
+        );
         // The dest carries the ticket-unique minted name under the per-table dir.
-        let dest = std::path::Path::new(&registered[0]);
+        let dest = std::path::Path::new(&outcome.registered[0]);
         assert_eq!(
             dest.file_name().and_then(|f| f.to_str()).unwrap(),
             lake_dest_filename(ticket, "reference_membership.parquet")
@@ -4329,6 +4532,329 @@ mod tests {
         let _ = reader.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
         ));
+    }
+
+    // --- replace-by-key against a real DuckLake catalog ---
+
+    /// Seed one assembly run's staging dir in the shapes `ensure_assembly_tables`
+    /// declares: `assembled_sequence.parquet`, plus an
+    /// `assembled_sequence_chunks/` dir holding ONE PART PER CONTIG — the
+    /// multi-file form `write_feature_sequence_chunks` emits, so the registration
+    /// under test takes the grouped replace-by-key path rather than a
+    /// single-file shortcut.
+    ///
+    /// `contigs` is `(feature_idx, uuid, [chunk_data...])` — chunk_index is the
+    /// position, and `sequence_length_bp` is the summed chunk length, so a
+    /// reassembly check against it is meaningful rather than tautological.
+    #[cfg(feature = "integration")]
+    fn seed_assembly_staging(contigs: &[(i64, &str, &[&str])]) -> tempfile::TempDir {
+        let staging = tempfile::tempdir().unwrap();
+        let chunks_dir = staging.path().join("assembled_sequence_chunks");
+        std::fs::create_dir_all(&chunks_dir).unwrap();
+        let writer = Connection::open_in_memory().unwrap();
+
+        let sequence_rows: Vec<String> = contigs
+            .iter()
+            .map(|(feature_idx, uuid, chunks)| {
+                let length: usize = chunks.iter().map(|c| c.len()).sum();
+                format!("({feature_idx}::BIGINT, '{uuid}'::UUID, {length}::BIGINT)")
+            })
+            .collect();
+        let sequences = staging.path().join("assembled_sequence.parquet");
+        writer
+            .execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES {}) \
+                     t(feature_idx, sequence_hash, sequence_length_bp)) \
+                 TO '{}' (FORMAT PARQUET)",
+                sequence_rows.join(", "),
+                sequences.to_str().unwrap()
+            ))
+            .unwrap();
+
+        for (part_index, (feature_idx, _uuid, chunks)) in contigs.iter().enumerate() {
+            let rows: Vec<(i64, i32, &str)> = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, data)| (*feature_idx, i as i32, *data))
+                .collect();
+            seed_chunk_parquet(
+                &writer,
+                &chunks_dir.join(format!("part_{part_index:05}.parquet")),
+                &rows,
+            );
+        }
+
+        staging
+    }
+
+    #[cfg(feature = "integration")]
+    fn assembly_register_payload(
+        staging: &tempfile::TempDir,
+        n_parts: usize,
+        ticket: i64,
+    ) -> auth::ActionPayload {
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "assembled_sequence.parquet".to_string(),
+            "assembled_sequence".to_string(),
+        );
+        for part_index in 0..n_parts {
+            files.insert(
+                format!("assembled_sequence_chunks/part_{part_index:05}.parquet"),
+                "assembled_sequence_chunks".to_string(),
+            );
+        }
+        auth::ActionPayload {
+            action: "register_files".to_string(),
+            staging_dir: staging.path().to_str().unwrap().to_string(),
+            files,
+            work_ticket_idx: ticket,
+        }
+    }
+
+    /// One row per feature, whatever the lake already held: a contig two
+    /// assembly runs both produce collapses to ONE `feature_idx` (shared
+    /// canonical hash), and each run writes that feature's sequence + chunks in
+    /// full. Without replace-by-key the second load leaves two copies and
+    /// `string_agg(chunk_data, '' ORDER BY chunk_index)` returns the contig
+    /// concatenated with itself while `sequence_length_bp` still describes one.
+    ///
+    /// Asserts the run-A-only feature survives run B untouched — the replace is
+    /// scoped to the keys the incoming file carries, not to "this run's rows".
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_replaces_shared_contigs_across_assembly_runs() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let a_only: i64 = 971_010;
+        let shared: i64 = 971_011;
+        let b_only: i64 = 971_012;
+        let ticket_a: i64 = 971_000_000 + std::process::id() as i64;
+        let ticket_b: i64 = ticket_a + 1;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembled_sequence \
+                   WHERE feature_idx IN ({a_only}, {shared}, {b_only});
+                 DELETE FROM qiita_lake.assembled_sequence_chunks \
+                   WHERE feature_idx IN ({a_only}, {shared}, {b_only});"
+            ))
+            .unwrap();
+        }
+
+        // Run A: its own contig plus the one run B will also assemble.
+        let staging_a = seed_assembly_staging(&[
+            (
+                a_only,
+                "00000000-0000-0000-0000-000000971010",
+                &["ACGTACGT"],
+            ),
+            (
+                shared,
+                "00000000-0000-0000-0000-000000971011",
+                &["ACGTACGT", "ACGT"],
+            ),
+        ]);
+        let outcome_a = register_files(
+            &connstr,
+            &data_path,
+            &assembly_register_payload(&staging_a, 2, ticket_a),
+        )
+        .expect("run A register_files failed");
+        assert!(
+            outcome_a.replaced.is_empty(),
+            "a fresh feature set replaces nothing, got {:?}",
+            outcome_a.replaced
+        );
+
+        // Run B: the SAME contig (same feature_idx, same bytes) plus its own.
+        let staging_b = seed_assembly_staging(&[
+            (
+                shared,
+                "00000000-0000-0000-0000-000000971011",
+                &["ACGTACGT", "ACGT"],
+            ),
+            (b_only, "00000000-0000-0000-0000-000000971012", &["ACGT"]),
+        ]);
+        let outcome_b = register_files(
+            &connstr,
+            &data_path,
+            &assembly_register_payload(&staging_b, 2, ticket_b),
+        )
+        .expect("run B register_files failed");
+        assert_eq!(
+            outcome_b.replaced.get("assembled_sequence").copied(),
+            Some(1),
+            "run A's copy of the shared contig's sequence row is superseded"
+        );
+        assert_eq!(
+            outcome_b.replaced.get("assembled_sequence_chunks").copied(),
+            Some(2),
+            "and both of its chunk rows"
+        );
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        for (feature_idx, expected_length) in [(a_only, 8_i64), (shared, 12), (b_only, 4)] {
+            let rows: i64 = reader
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM qiita_lake.assembled_sequence \
+                         WHERE feature_idx = {feature_idx}"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1, "exactly one sequence row for {feature_idx}");
+
+            // The acceptance check: the reassembled bytes are as long as the row
+            // that describes them.
+            let (declared, reassembled): (i64, i64) = reader
+                .query_row(
+                    &format!(
+                        "SELECT s.sequence_length_bp, \
+                                length(string_agg(c.chunk_data, '' ORDER BY c.chunk_index)) \
+                         FROM qiita_lake.assembled_sequence s \
+                         JOIN qiita_lake.assembled_sequence_chunks c USING (feature_idx) \
+                         WHERE s.feature_idx = {feature_idx} \
+                         GROUP BY s.sequence_length_bp"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(declared, expected_length, "declared length {feature_idx}");
+            assert_eq!(
+                reassembled, declared,
+                "reassembled bytes for {feature_idx} must match sequence_length_bp"
+            );
+        }
+
+        // Tombstone the catalog rows only — the physical lake files stay
+        // registered until compaction (see the sibling register test).
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembled_sequence \
+               WHERE feature_idx IN ({a_only}, {shared}, {b_only});
+             DELETE FROM qiita_lake.assembled_sequence_chunks \
+               WHERE feature_idx IN ({a_only}, {shared}, {b_only});"
+        ));
+    }
+
+    /// Re-running one assembly — same prep_sample, same processing, same
+    /// contigs — converges instead of accumulating. Each retry ships a fresh
+    /// staging Parquet under a new work ticket, so the lake gets a second file
+    /// carrying the same keys; replace-by-key is what keeps the row count at
+    /// one.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let feature: i64 = 971_020;
+        let base_ticket: i64 = 971_100_000 + std::process::id() as i64;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
+                 DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature};"
+            ))
+            .unwrap();
+        }
+
+        let contigs: &[(i64, &str, &[&str])] = &[(
+            feature,
+            "00000000-0000-0000-0000-000000971020",
+            &["ACGTACGT", "TTTT"],
+        )];
+        for attempt in 0..3 {
+            let staging = seed_assembly_staging(contigs);
+            register_files(
+                &connstr,
+                &data_path,
+                &assembly_register_payload(&staging, 1, base_ticket + attempt),
+            )
+            .unwrap_or_else(|e| panic!("attempt {attempt} register_files failed: {e}"));
+        }
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let sequence_rows: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.assembled_sequence \
+                     WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence_rows, 1, "three loads, one sequence row");
+        let chunk_rows: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.assembled_sequence_chunks \
+                     WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_rows, 2, "one chunk row per chunk_index, not six");
+        let reassembled: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT length(string_agg(chunk_data, '' ORDER BY chunk_index)) \
+                     FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reassembled, 12, "the contig, not the contig three times");
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
+             DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature};"
+        ));
+    }
+
+    /// Every `REPLACE_KEY_TABLES` entry names a real lake table with that key
+    /// column. The delete interpolates both names into SQL, so a typo or a
+    /// renamed column would otherwise surface as a failed load in production
+    /// rather than here.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn replace_key_tables_match_the_lake_schema() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_assembly_tables(&conn).unwrap();
+
+        for (table, key) in REPLACE_KEY_TABLES {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM duckdb_columns() \
+                     WHERE database_name = 'qiita_lake' AND table_name = ? AND column_name = ?",
+                    duckdb::params![table, key],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("column lookup for {table}.{key} failed: {e}"));
+            assert_eq!(found, 1, "qiita_lake.{table} has no {key} column");
+        }
     }
 
     /// Pins the DuckLake-transaction semantics `register_files` relies on: a

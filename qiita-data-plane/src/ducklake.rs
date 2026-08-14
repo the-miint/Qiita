@@ -81,6 +81,8 @@ pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::
 /// - The control plane deduplicates features by sequence_hash before minting feature_idx
 /// - The orchestrator verifies data before loading
 /// - The data plane validates identifier sets programmatically on DoAction
+/// - `reference_sequences` / `reference_sequence_chunks` are additionally
+///   REPLACED on `feature_idx` at register time — `flight_service::REPLACE_KEY_TABLES`
 ///
 /// Per-table storage tuning (compression, row group size) is deferred to a
 /// separate configuration pass — see DuckLake configuration docs.
@@ -531,7 +533,11 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (integrity is enforced upstream — the CP mints feature_idx/dedups on
-/// sequence_hash, the orchestrator verifies before load).
+/// sequence_hash, the orchestrator verifies before load). `assembled_sequence` /
+/// `assembled_sequence_chunks` are additionally REPLACED on `feature_idx` at
+/// register time — `flight_service::REPLACE_KEY_TABLES`. `assembly_membership` /
+/// `bin_quality` are not: they carry `(prep_sample_idx, processing_idx)`, so a
+/// run's rows are its own.
 ///
 /// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
 /// register_files loads them and they are SQL-queryable in the catalog; they are

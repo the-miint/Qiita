@@ -53,9 +53,37 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- **Collapse the sequence rows duplicated before this deploy.** `register_files` now
+  replaces `assembled_sequence` / `assembled_sequence_chunks` / `reference_sequences` /
+  `reference_sequence_chunks` on `feature_idx` instead of appending, but it does not touch
+  rows already there. Measured 2026-08-13: 53,698 of 129,290 assembly features had two
+  copies, so their `string_agg(chunk_data, '' ORDER BY chunk_index)` is twice
+  `sequence_length_bp`. Run AFTER bucket 5 — before the new build is live the next load
+  re-duplicates. Report first, then collapse; run as `qiita-data`, the only account that can
+  write the lake data path, from a dir it can traverse:
+  ```bash
+  sudo -u qiita-data bash /opt/qiita/checkout/scripts/dedup-lake-sequence-tables.sh
+  sudo -u qiita-data APPLY=1 bash /opt/qiita/checkout/scripts/dedup-lake-sequence-tables.sh
+  ```
+  (Substitute the checkout path; `qiita-data` needs a duckdb CLI on PATH or
+  `QIITA_DUCKDB_BIN` — see `scripts/lake-shell.sh` for install steps.) Both passes print
+  `collapsible_features` and `ambiguous_features` per table pair. **A non-zero
+  `ambiguous_features` is expected to be 0** — it means a feature whose copies hold
+  different bytes (a sequence and its reverse complement share one `feature_idx`), which the
+  script deliberately leaves alone because no column records which chunk came from which
+  load. If any appear, re-run the producing load rather than picking a copy by hand. After
+  APPLY the script re-checks the collapsed set: all three trailing counts must be `0`. (#449)
 
 ### Notes (no host action)
+
+- **`register-files` now REPLACES the four content-addressed sequence tables on
+  `feature_idx` rather than appending.** A load that carries a feature the lake already
+  holds deletes the lake's rows for that key in the same transaction, ahead of the
+  registration — so the row count for those tables can now go DOWN across a load, and the
+  control-plane log records what each one superseded (`register_files replaced rows in
+  content-addressed tables`). The other lake tables are untouched: `assembly_membership` and
+  `bin_quality` carry `(prep_sample_idx, processing_idx)`, so a run's rows are its own.
+  (#449)
 
 - **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
   `qiita feature-table build` requires it.** Additive, so an older client ignores it and

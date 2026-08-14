@@ -26,6 +26,7 @@ _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
 _BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
 _LAKE_SHELL = _REPO_ROOT / "scripts" / "lake-shell.sh"
+_DEDUP_LAKE = _REPO_ROOT / "scripts" / "dedup-lake-sequence-tables.sh"
 
 # The scripts introduced/maintained for the deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
@@ -749,3 +750,130 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
     )
     assert result.returncode == 1, f"expected a hard failure, got:\n{result.stdout}"
     assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
+
+
+# --- scripts/dedup-lake-sequence-tables.sh: the one-off collapse of duplicated
+# rows in the content-addressed lake sequence tables. Same bash -n + shellcheck
+# gate; the SQL it emits is asserted against a stub duckdb. ---------------------
+
+
+def test_dedup_lake_exists_and_executable() -> None:
+    assert _DEDUP_LAKE.is_file(), f"{_DEDUP_LAKE} missing"
+    assert _DEDUP_LAKE.stat().st_mode & 0o111, f"{_DEDUP_LAKE} is not executable"
+
+
+def test_dedup_lake_is_valid_bash() -> None:
+    result = subprocess.run(["bash", "-n", str(_DEDUP_LAKE)], capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"bash -n failed for dedup-lake-sequence-tables.sh:\n{result.stderr}"
+    )
+
+
+def test_dedup_lake_passes_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
+    result = subprocess.run(
+        ["shellcheck", "-S", "warning", str(_DEDUP_LAKE)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"shellcheck flagged dedup-lake-sequence-tables.sh:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_dedup_lake_derives_data_path_exactly_like_the_data_plane() -> None:
+    """Same constraint lake-shell.sh is held to: DuckLake pins DATA_PATH into the
+    catalog at creation and rejects an attach whose DATA_PATH differs by a slash,
+    so this must reproduce config.rs's bare `format!("{path_persistent_raw}/ducklake")`."""
+    body = _DEDUP_LAKE.read_text()
+    assert 'DATA_PATH="${PERSISTENT}/ducklake"' in body
+    assert "PERSISTENT%/" not in body
+
+
+def _run_dedup(tmp_path: Path, *, apply: bool) -> str:
+    """Run the script against a stub duckdb that prints the SQL file it is handed,
+    so the emitted statements can be asserted without a catalog or a real CLI."""
+    persistent = tmp_path / "persistent"
+    (persistent / "ducklake").mkdir(parents=True)
+    dp_env = tmp_path / "data-plane.env"
+    dp_env.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=localhost user=lake_rw'\n"
+        f"PATH_PERSISTENT={persistent}\n"
+    )
+    stub = tmp_path / "duckdb-stub"
+    stub.write_text('#!/bin/bash\ncat "$2"\n')
+    stub.chmod(0o755)
+
+    env = {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)}
+    if apply:
+        env["APPLY"] = "1"
+    else:
+        env.pop("APPLY", None)
+    result = subprocess.run(
+        ["bash", str(_DEDUP_LAKE)], capture_output=True, text=True, env=env, check=True
+    )
+    return result.stdout
+
+
+def test_dedup_lake_report_mode_attaches_read_only_and_writes_nothing(tmp_path: Path) -> None:
+    """The default run is a report. READ_ONLY on the attach is what makes that a
+    DuckDB-enforced property rather than a promise about the SQL below it."""
+    sql = _run_dedup(tmp_path, apply=False)
+    assert "READ_ONLY" in sql
+    for mutation in ("DELETE FROM qiita_lake.", "INSERT INTO qiita_lake."):
+        assert mutation not in sql, f"report mode emitted {mutation!r}"
+
+
+def test_dedup_lake_apply_mode_collapses_both_table_pairs(tmp_path: Path) -> None:
+    """APPLY=1 drops READ_ONLY and collapses both content-addressed pairs. The
+    collapse is a plain DISTINCT over the duplicated features — no DISTINCT ON, no
+    per-chunk pick, because picking per chunk_index could splice two strands of the
+    same feature into one sequence."""
+    sql = _run_dedup(tmp_path, apply=True)
+    assert "READ_ONLY" not in sql
+    for seq, chunks in [
+        ("assembled_sequence", "assembled_sequence_chunks"),
+        ("reference_sequences", "reference_sequence_chunks"),
+    ]:
+        assert f"SELECT DISTINCT * FROM qiita_lake.{seq} SEMI JOIN dup_feature" in sql
+        assert f"SELECT DISTINCT * FROM qiita_lake.{chunks} SEMI JOIN dup_feature" in sql
+        assert f"DELETE FROM qiita_lake.{seq} WHERE feature_idx IN" in sql
+        assert f"INSERT INTO qiita_lake.{seq} SELECT * FROM keep_sequence" in sql
+        assert f"DELETE FROM qiita_lake.{chunks} WHERE feature_idx IN" in sql
+        assert f"INSERT INTO qiita_lake.{chunks} SELECT * FROM keep_chunk" in sql
+
+
+def test_dedup_lake_excludes_features_whose_copies_differ(tmp_path: Path) -> None:
+    """A feature's copies can legitimately hold different bytes — the canonical
+    hash keeps a sequence and its reverse complement on one feature_idx — and no
+    column records which chunk came from which load. Those are reported, then
+    removed from the collapse set."""
+    sql = _run_dedup(tmp_path, apply=True)
+    assert "HAVING count(DISTINCT chunk_data) > 1" in sql
+    assert (
+        "DELETE FROM dup_feature WHERE feature_idx IN (SELECT feature_idx FROM ambiguous_feature)"
+        in sql
+    )
+
+
+def test_dedup_lake_keeps_the_catalog_password_out_of_the_sql(tmp_path: Path) -> None:
+    """The password goes to libpq through a 0600 PGPASSFILE, never into the SQL
+    file (readable for as long as it exists) or argv (world-readable via /proc)."""
+    persistent = tmp_path / "persistent"
+    (persistent / "ducklake").mkdir(parents=True)
+    dp_env = tmp_path / "data-plane.env"
+    dp_env.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=localhost user=lake_rw password=s3cr3t'\n"
+        f"PATH_PERSISTENT={persistent}\n"
+    )
+    stub = tmp_path / "duckdb-stub"
+    stub.write_text('#!/bin/bash\ncat "$2"\necho "ARGV: $*"\n')
+    stub.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(_DEDUP_LAKE)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)},
+        check=True,
+    )
+    assert "s3cr3t" not in result.stdout
+    assert "user=lake_rw" in result.stdout, "the rest of the connstr still reaches the ATTACH"

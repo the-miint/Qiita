@@ -905,6 +905,33 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A sequence two loads both produced was stored twice, and reassembled twice as long
+  (#449).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
+  carry ONE feature across every producer — but each load still wrote that feature's rows in
+  full: the compute job writing the staging Parquet has no DuckLake access to anti-join
+  against, and DuckLake enforces no PK/UNIQUE. Two assembly runs producing the same contig,
+  or two references sharing a sequence, therefore left two rows in `assembled_sequence` /
+  `reference_sequences` and two per `chunk_index` in their chunk tables, so
+  `string_agg(chunk_data, '' ORDER BY chunk_index)` returned the sequence concatenated with
+  itself while `sequence_length_bp` still described one copy. Measured on the deploy
+  2026-08-13: 182,988 `assembled_sequence` rows over 129,290 distinct features, 53,698 of
+  them duplicated. `register_files` now REPLACES those four tables on `feature_idx` — the
+  incoming Parquet's keys are deleted from the lake in the same transaction, ahead of every
+  `ducklake_add_data_files` — so a second load converges instead of accumulating, and the
+  per-table counts ride back to the control plane, which logs them. The registry is
+  `REPLACE_KEY_TABLES` in `qiita-data-plane/src/flight_service.rs`; a table belongs there
+  only when its key determines every other column. The assembly tables were latent (absent
+  from `ALLOWED_TABLES`, so nothing reads them over Flight); the reference pair is on the
+  read path.
+
+- **`scripts/dedup-lake-sequence-tables.sh` collapses rows written before that fix
+  (#449).** A report by default, `APPLY=1` to collapse, over both content-addressed table
+  pairs. It only collapses features whose copies are byte-identical (a plain `DISTINCT`, so
+  no copy is picked over another); a feature whose copies DIFFER is reported and left alone,
+  because the canonical hash keeps a sequence and its reverse complement on one `feature_idx`
+  and no column records which chunk came from which load — picking per `chunk_index` could
+  splice two strands into one sequence.
+
 - **A retired `exported_feature` row could be edited out of the published namespace
   (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has
   lost the columns they test — so a retired row is exactly where they stop guarding, and it

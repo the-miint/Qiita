@@ -8,6 +8,14 @@ contig and a reference sequence with the same bytes carry the SAME
 `feature_idx`, so the sequence + chunk writers are byte-for-byte
 identical across the two tails — they live here, in neither job module.
 
+Both writers emit the run's WHOLE feature set, a feature another run
+already loaded included — a native job has no DuckLake access, so there
+is nothing here to anti-join against. Convergence happens at register
+time instead: the data plane replaces these tables on `feature_idx`
+rather than appending (`flight_service::REPLACE_KEY_TABLES`), which is
+what makes each output's COMPLETE per-feature row set — every chunk of
+every `feature_idx` it mentions — load-bearing.
+
 This is a **private shared helper**, not a dispatchable native job: it
 exports neither `Inputs` nor `execute`, and its leading-underscore name
 exempts it from the boot-time job scan (`scan_native_jobs`). Nothing
