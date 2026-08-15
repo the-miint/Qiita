@@ -43,6 +43,19 @@ from qiita_common.models.ena_import import (
 )
 
 from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
+from ..repositories.ena_import_batch import (
+    append_ena_import_batch_item_download_ticket,
+    ena_import_batch_exists,
+    ena_import_created_study,
+    fetch_download_work_ticket_idx_for_sequenced_pool,
+    fetch_ena_import_batch_items,
+    fetch_inflight_ena_import_batch_items,
+    fetch_work_ticket_states_for_idxs,
+    insert_ena_import_batch,
+    insert_ena_import_batch_item,
+    update_ena_import_batch_item_registered,
+    update_ena_import_batch_item_state,
+)
 from ..repositories.study import get_or_create_study_by_ena_accessions
 from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
@@ -102,18 +115,13 @@ async def create_ena_import_batch(
     validated = list(dict.fromkeys(validate_study_accession(a) for a in accessions))
 
     async with pool.acquire() as conn, conn.transaction():
-        batch_idx = await conn.fetchval(
-            "INSERT INTO qiita.ena_import_batch (submitted_by_principal_idx)"
-            " VALUES ($1) RETURNING idx",
-            principal.principal_idx,
+        batch_idx = await insert_ena_import_batch(
+            conn, submitted_by_principal_idx=principal.principal_idx
         )
         items: list[BatchImportItemHandle] = []
         for accession in validated:
-            item_idx = await conn.fetchval(
-                "INSERT INTO qiita.ena_import_batch_item (batch_idx, ena_study_accession)"
-                " VALUES ($1, $2) RETURNING idx",
-                batch_idx,
-                accession,
+            item_idx = await insert_ena_import_batch_item(
+                conn, batch_idx=batch_idx, ena_study_accession=accession
             )
             items.append(BatchImportItemHandle(idx=item_idx, ena_study_accession=accession))
     return batch_idx, items
@@ -122,12 +130,10 @@ async def create_ena_import_batch(
 async def _set_item_state(
     pool: asyncpg.Pool, item_idx: int, state: BatchItemState, *, failure_reason: str | None = None
 ) -> None:
-    await pool.execute(
-        "UPDATE qiita.ena_import_batch_item SET state = $2, failure_reason = $3 WHERE idx = $1",
-        item_idx,
-        state.value,
-        failure_reason,
-    )
+    async with pool.acquire() as conn:
+        await update_ena_import_batch_item_state(
+            conn, item_idx=item_idx, state=state.value, failure_reason=failure_reason
+        )
 
 
 def _run_outcomes(result: EnaStudyRegistrationResult) -> list[dict[str, Any]]:
@@ -151,11 +157,7 @@ async def _study_created_by_an_import(pool: asyncpg.Pool, study_idx: int) -> boo
     curated data. Note a batch deleted after its import (CASCADE) takes this
     record with it, and a later re-import of that accession is then refused.
     """
-    return await pool.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM qiita.ena_import_batch_item"
-        " WHERE study_idx = $1 AND study_created)",
-        study_idx,
-    )
+    return await ena_import_created_study(pool, study_idx)
 
 
 async def _set_item_registered(
@@ -166,67 +168,45 @@ async def _set_item_registered(
     study_created: bool,
     run_outcomes: list[dict[str, Any]],
 ) -> None:
-    """Record a study's registration on its batch item.
-
-    `study_created = study_created OR $5` is a self-referential SET clause
-    Postgres evaluates atomically within the UPDATE -- a re-drive that passes
-    `study_created=False` for an item already marked True cannot flip it back.
-    asyncpg has no default jsonb codec, so `run_outcomes` is written as a string
-    + `::jsonb`.
-    """
-    await pool.execute(
-        "UPDATE qiita.ena_import_batch_item"
-        " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb,"
-        "     study_created = study_created OR $5, failure_reason = NULL"
-        " WHERE idx = $1",
-        item_idx,
-        BatchItemState.REGISTERED.value,
-        study_idx,
-        json.dumps(run_outcomes),
-        study_created,
-    )
+    async with pool.acquire() as conn:
+        await update_ena_import_batch_item_registered(
+            conn,
+            item_idx=item_idx,
+            study_idx=study_idx,
+            study_created=study_created,
+            run_outcomes=run_outcomes,
+        )
 
 
 async def _append_item_download_ticket(pool: asyncpg.Pool, item_idx: int, ticket_idx: int) -> None:
     """Append one submitted download-ticket idx to the item's array the moment
     it is submitted, so a crash mid-loop leaves the tickets already sent
-    recorded (nothing orphaned). Idempotent: a re-drive that reuses an existing
-    ticket does not duplicate the idx."""
-    await pool.execute(
-        "UPDATE qiita.ena_import_batch_item"
-        " SET download_work_ticket_idxs = CASE"
-        "   WHEN $2 = ANY(download_work_ticket_idxs) THEN download_work_ticket_idxs"
-        "   ELSE array_append(download_work_ticket_idxs, $2) END"
-        " WHERE idx = $1",
-        item_idx,
-        ticket_idx,
-    )
+    recorded (nothing orphaned)."""
+    async with pool.acquire() as conn:
+        await append_ena_import_batch_item_download_ticket(
+            conn, item_idx=item_idx, ticket_idx=ticket_idx
+        )
 
 
 async def _mark_item_downloading(pool: asyncpg.Pool, item_idx: int) -> None:
     """Flip a fully-submitted item to `downloading`. Its ticket idxs are already
     persisted by `_append_item_download_ticket` as each was submitted, so this
     only advances the state."""
-    await pool.execute(
-        "UPDATE qiita.ena_import_batch_item SET state = $2 WHERE idx = $1",
-        item_idx,
-        BatchItemState.DOWNLOADING.value,
-    )
+    async with pool.acquire() as conn:
+        await update_ena_import_batch_item_state(
+            conn, item_idx=item_idx, state=BatchItemState.DOWNLOADING.value
+        )
 
 
 async def _existing_download_ticket_idx(pool: asyncpg.Pool, sequenced_pool_idx: int) -> int | None:
-    """The idx of an existing download-ena-study work_ticket for this pool, if
-    any (any state). Lets a re-driven `registered` item reuse a ticket a prior
-    run already submitted instead of re-submitting -- a sequenced_pool re-submit
-    would 409 (disallow-without-delete / the COMPLETED-pool gate), which would
-    wrongly fail the whole item."""
-    return await pool.fetchval(
-        "SELECT work_ticket_idx FROM qiita.work_ticket"
-        " WHERE action_id = $1 AND action_version = $2 AND sequenced_pool_idx = $3"
-        " ORDER BY work_ticket_idx LIMIT 1",
-        DOWNLOAD_ENA_STUDY_ACTION_ID,
-        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
-        sequenced_pool_idx,
+    """Lets a re-driven `registered` item reuse a ticket a prior run already
+    submitted instead of re-submitting -- see the call site in
+    `_process_one_study` for why (409-avoidance on re-drive)."""
+    return await fetch_download_work_ticket_idx_for_sequenced_pool(
+        pool,
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        sequenced_pool_idx=sequenced_pool_idx,
     )
 
 
@@ -428,19 +408,7 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     scheduled, for logging.
     """
     pool = app.state.pool
-    rows = await pool.fetch(
-        "SELECT bi.idx, bi.ena_study_accession, bi.batch_idx,"
-        "       b.submitted_by_principal_idx"
-        " FROM qiita.ena_import_batch_item bi"
-        " JOIN qiita.ena_import_batch b ON b.idx = bi.batch_idx"
-        " WHERE bi.state = ANY($1::text[])"
-        " ORDER BY bi.batch_idx, bi.idx",
-        [
-            BatchItemState.PENDING.value,
-            BatchItemState.RESOLVING.value,
-            BatchItemState.REGISTERED.value,
-        ],
-    )
+    rows = await fetch_inflight_ena_import_batch_items(pool)
     if not rows:
         return 0
 
@@ -492,27 +460,15 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
     non-terminal -> stays `downloading`; all terminal-success -> `done`. Every
     other persisted state passes through unchanged.
     """
-    exists = await pool.fetchval("SELECT 1 FROM qiita.ena_import_batch WHERE idx = $1", batch_idx)
-    if exists is None:
+    if not await ena_import_batch_exists(pool, batch_idx):
         return None
 
-    item_rows = await pool.fetch(
-        "SELECT idx, ena_study_accession, state, failure_reason, study_idx,"
-        "       download_work_ticket_idxs, run_outcomes"
-        " FROM qiita.ena_import_batch_item"
-        " WHERE batch_idx = $1"
-        " ORDER BY idx",
-        batch_idx,
-    )
+    item_rows = await fetch_ena_import_batch_items(pool, batch_idx)
 
     all_ticket_idxs = sorted({idx for row in item_rows for idx in row["download_work_ticket_idxs"]})
     ticket_states: dict[int, str] = {}
     if all_ticket_idxs:
-        ticket_rows = await pool.fetch(
-            "SELECT work_ticket_idx, state FROM qiita.work_ticket"
-            " WHERE work_ticket_idx = ANY($1::bigint[])",
-            all_ticket_idxs,
-        )
+        ticket_rows = await fetch_work_ticket_states_for_idxs(pool, all_ticket_idxs)
         ticket_states = {r["work_ticket_idx"]: r["state"] for r in ticket_rows}
 
     items: list[BatchImportItem] = []
