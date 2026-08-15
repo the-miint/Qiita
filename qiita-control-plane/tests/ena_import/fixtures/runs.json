@@ -31,7 +31,7 @@
       ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"],
       ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"],
       [89054035],
-      "791595268ae7a965664652bde3444a2b",
+      ["791595268ae7a965664652bde3444a2b"],
       298966,
       158722947
     ],

@@ -79,12 +79,12 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
         "GENOMIC",
         None,
         "ILLUMINA",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
+        [],
+        [],
+        [],
+        [],
+        None,
+        None,
     )
     return list(_RUN_COLUMNS), [row]
 
@@ -665,12 +665,12 @@ def _make_shared_sample_fakes(shared_sample_accession: str):
             "GENOMIC",
             None,
             "ILLUMINA",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
+            [],
+            [],
+            [],
+            [],
+            None,
+            None,
         )
         return list(_RUN_COLUMNS), [row]
 
