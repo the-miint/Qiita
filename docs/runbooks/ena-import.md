@@ -70,23 +70,20 @@ it once submitted.
 
 Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA default
 sample checklist) — the same shared checklist model every other metadata path in
-Qiita uses. A checklist-required field ENA did not supply for a given sample is
-reported back on the registration outcome, never silently dropped or defaulted:
-`GET /api/v1/ena-import-batch/{idx}` returns a `runs` array per item, one entry per
-ENA run carrying its `status`, a `failure_reason` when it failed, and
-`missing_required` (the checklist-required fields ENA did not supply). A
-harmonization *gap* (`missing_required`) does not fail the run; only a genuine
+Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns a `runs` array per item, one
+entry per ENA run carrying its `status` and a `failure_reason` when it failed. A
 harmonization error (an unparseable value, or a cross-study metadata slot collision)
-does, surfacing as that run's `status: failed` + `failure_reason`, isolated per-run
-exactly like an unmappable platform.
+fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
+per-run exactly like an unmappable platform. A checklist-required field ENA did not
+supply is not itself an error — the checklist binding, not enforcement, is what
+harmonization records.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at
 all (confirmed live against DDBJ study `PRJDB40364`'s sample `SAMD01818724`). Such a
 sample still registers normally — study, biosample, and sequenced/prep rows are all
 created — it simply harmonizes against an empty attribute map, so it carries no
-globally-linked metadata and the checklist's required fields show up in the
-`missing_required` report rather than blocking the import.
+globally-linked metadata.
 
 **Both the GSC-MIxS display-name and the underscore MIxS short-name vocabularies are
 recognized**, since real submitters (notably DDBJ) commonly use the latter:

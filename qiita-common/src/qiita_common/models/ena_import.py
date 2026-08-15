@@ -52,19 +52,12 @@ class RunImportOutcome(BaseModel):
 
     `status` is the `RunRegistrationStatus` value
     (`registered` / `skipped_already_present` / `failed`). `failure_reason` is
-    set only on `failed`. `missing_required` lists the checklist-required fields
-    ENA did not supply for a newly-created biosample (the harmonization gap) —
-    computed at import and reported here, never silently dropped. It is empty
-    for a biosample this import reused from an earlier study (no harmonization
-    write ran, so there was no gap to compute). A re-drive of an already-
-    registered item likewise recomputes nothing, and deliberately preserves the
-    gap the original pass recorded rather than reporting an empty one.
+    set only on `failed`.
     """
 
     run_accession: str
     status: str
     failure_reason: str | None = None
-    missing_required: list[str] = Field(default_factory=list)
 
 
 class BatchImportItem(BaseModel):
@@ -76,8 +69,8 @@ class BatchImportItem(BaseModel):
     failure_reason: str | None = None
     download_work_ticket_idxs: list[int] = Field(default_factory=list)
     # Per-run registration outcomes for this item's study, populated once
-    # register_ena_study runs (so an operator sees per-run failures and the
-    # harmonization gaps, not just the rolled-up item state). Empty until then.
+    # register_ena_study runs (so an operator sees per-run failures, not just
+    # the rolled-up item state). Empty until then.
     runs: list[RunImportOutcome] = Field(default_factory=list)
 
 

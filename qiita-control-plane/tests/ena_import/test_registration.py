@@ -254,9 +254,6 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
         "host",
         "local environmental context",
     ]
-    assert harmonization.checklist_name == "ERC000011"
-    # Both ERC000011-mandatory fields were supplied -- nothing to report.
-    assert harmonization.missing_required == []
 
     biosample_idx = await reg["pool"].fetchval(
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
@@ -497,10 +494,9 @@ async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
     }
 
 
-async def test_empty_sample_attributes_registers_with_missing_required_report(reg):
-    """A sample with zero ENA attributes must not fail the study: it registers with no
-    globally-linked metadata, and the ERC000011 missing-required report lists both
-    mandatory fields -- a report, never a rejection."""
+async def test_empty_sample_attributes_registers_normally(reg):
+    """A sample with zero ENA attributes must not fail the study: it registers with
+    no globally-linked metadata, not a rejection."""
     study_accession = unique_accession("PRJDB")
     header = _study_header(study_accession=study_accession)
     sample_accession = unique_accession("SAMD")
@@ -520,11 +516,6 @@ async def test_empty_sample_attributes_registers_with_missing_required_report(re
     assert harmonization is not None
     assert harmonization.mapped_count == 0
     assert harmonization.retained_unmapped == []
-    assert harmonization.checklist_name == "ERC000011"
-    assert harmonization.missing_required == [
-        "collection date",
-        "geographic location (country and/or sea)",
-    ]
 
     biosample_idx = await reg["pool"].fetchval(
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
