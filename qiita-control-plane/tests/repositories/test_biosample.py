@@ -30,7 +30,6 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
-    ensure_biosample_linked_to_study,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
@@ -144,8 +143,10 @@ async def test_insert_biosample_full_columns(ctx):
 
 
 # ---------------------------------------------------------------------------
-# get_or_create_biosample_by_ena_accession / ensure_biosample_linked_to_study
-# (ena_import.registration cross-study de-dup)
+# get_or_create_biosample_by_ena_accession (ena_import.registration
+# cross-study de-dup). The link-and-idempotency coverage for the (biosample,
+# study) pair now lives in test__sample_helpers.py, parametrized alongside
+# insert_entity_to_study's other specs.
 #
 # Known coverage gap, same shape as get_or_create_study_by_ena_accessions'
 # (tests/repositories/test_study.py): the ON-CONFLICT-DO-NOTHING +
@@ -212,60 +213,6 @@ async def test_get_or_create_biosample_by_ena_accession_reuses_on_hit(ctx):
         "SELECT owner_idx FROM qiita.biosample WHERE idx = $1", first_idx
     )
     assert owner == ctx["biosample_owner_idx"]
-
-
-async def test_ensure_biosample_linked_to_study_creates_link(ctx):
-    bs_idx, _ = await get_or_create_biosample_by_ena_accession(
-        ctx["pool"],
-        ena_sample_accession=unique_accession("SAMEA"),
-        owner_idx=ctx["biosample_owner_idx"],
-        created_by_idx=ctx["principal_idx"],
-    )
-    ctx["created"]["biosample"].append(bs_idx)
-
-    await ensure_biosample_linked_to_study(
-        ctx["pool"],
-        biosample_idx=bs_idx,
-        study_idx=ctx["study_idx"],
-        created_by_idx=ctx["principal_idx"],
-    )
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
-
-    linked = await ctx["pool"].fetchval(
-        "SELECT 1 FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-        bs_idx,
-        ctx["study_idx"],
-    )
-    assert linked == 1
-
-
-async def test_ensure_biosample_linked_to_study_is_idempotent(ctx):
-    """Unlike insert_entity_to_study (which raises UniqueViolationError on a
-    repeat call), a second call for the same (biosample, study) pair is a
-    silent no-op -- the whole point of this helper over the shared one."""
-    bs_idx, _ = await get_or_create_biosample_by_ena_accession(
-        ctx["pool"],
-        ena_sample_accession=unique_accession("SAMEA"),
-        owner_idx=ctx["biosample_owner_idx"],
-        created_by_idx=ctx["principal_idx"],
-    )
-    ctx["created"]["biosample"].append(bs_idx)
-
-    for _ in range(2):
-        await ensure_biosample_linked_to_study(
-            ctx["pool"],
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
-
-    count = await ctx["pool"].fetchval(
-        "SELECT count(*) FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-        bs_idx,
-        ctx["study_idx"],
-    )
-    assert count == 1
 
 
 # ---------------------------------------------------------------------------

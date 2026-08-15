@@ -48,11 +48,12 @@ from qiita_common.models.ena import (
 
 from qiita_control_plane.repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
+    insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import (
-    ensure_biosample_linked_to_study,
     get_or_create_biosample_by_ena_accession,
 )
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_protocol import fetch_prep_protocol_idx_by_name
 from qiita_control_plane.repositories.sequenced_sample import (
     fetch_sequenced_sample_idxs_by_ena_run_accession,
@@ -284,11 +285,13 @@ async def _register_one_run(
             # Must precede the composer: its prep_sample_to_study insert fires
             # reject_without_biosample_link, which requires a non-retired
             # biosample_to_study row to already exist.
-            await ensure_biosample_linked_to_study(
+            await insert_entity_to_study(
                 conn,
-                biosample_idx=biosample_idx,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=biosample_idx,
                 study_idx=study_idx,
                 created_by_idx=caller_idx,
+                on_conflict="ignore",
             )
 
             # Harmonize ENA attributes onto the biosample once -- only when THIS

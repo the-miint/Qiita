@@ -182,7 +182,7 @@ async def get_or_create_biosample_by_ena_accession(
     under a different owner is the expected cross-study-overlap case, not a
     conflict to reject. Linking the (possibly different-owner) study to
     this biosample is the caller's next step via
-    ensure_biosample_linked_to_study.
+    insert_entity_to_study(..., on_conflict="ignore") (_sample_helpers.py).
 
     Does not write any metadata itself -- unlike import_biosample_from_owner_
     biosample_id, which always inserts and mandates an owner-id value plus
@@ -217,33 +217,6 @@ async def get_or_create_biosample_by_ena_accession(
             " row is not visible"
         )
     return existing_idx, False
-
-
-async def ensure_biosample_linked_to_study(
-    conn: asyncpg.Connection,
-    *,
-    biosample_idx: int,
-    study_idx: int,
-    created_by_idx: int,
-) -> None:
-    """Idempotent (biosample, study) link insert.
-
-    ON CONFLICT DO NOTHING against the biosample_to_study primary key
-    (biosample_idx, study_idx). Unlike insert_entity_to_study
-    (_sample_helpers.py), which raises asyncpg.UniqueViolationError on a
-    repeat call, this is the ENA-import registration path's building block
-    precisely because re-registering an already-linked (biosample, study)
-    pair on re-import is the expected case, not an error -- see
-    ena_import.registration.register_ena_study.
-    """
-    await conn.execute(
-        "INSERT INTO qiita.biosample_to_study (biosample_idx, study_idx, created_by_idx)"
-        " VALUES ($1, $2, $3)"
-        " ON CONFLICT (biosample_idx, study_idx) DO NOTHING",
-        biosample_idx,
-        study_idx,
-        created_by_idx,
-    )
 
 
 async def fetch_caller_has_biosample_access(
