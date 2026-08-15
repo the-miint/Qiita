@@ -46,11 +46,11 @@ class BatchImportRequest(BaseModel):
     accessions: list[str] = Field(min_length=1)
 
 
-class RunImportOutcome(BaseModel):
+class EnaRunImportOutcome(BaseModel):
     """One ENA run's registration outcome within a batch item, surfaced on
     `GET /api/v1/ena-import-batch/{idx}`.
 
-    `status` is the `RunRegistrationStatus` value
+    `status` is the `EnaRunRegistrationStatus` value
     (`registered` / `skipped_already_present` / `failed`). `failure_reason` is
     set only on `failed`.
     """
@@ -71,7 +71,7 @@ class BatchImportItem(BaseModel):
     # Per-run registration outcomes for this item's study, populated once
     # register_ena_study runs (so an operator sees per-run failures, not just
     # the rolled-up item state). Empty until then.
-    runs: list[RunImportOutcome] = Field(default_factory=list)
+    ena_runs: list[EnaRunImportOutcome] = Field(default_factory=list)
 
 
 class BatchImportResponse(BaseModel):

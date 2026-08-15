@@ -3,7 +3,7 @@ sequenced_pool's reads from ENA via miint's `read_ena_sequences` into the
 DuckLake `read` table, once. The ENA-fetch analog of `ingest_reads`.
 
 For every `(prep_sample_idx, ena_run_accession)` in the runner-staged
-`run_map.parquet` roster, fetch that run's reads, mint a contiguous
+`ena_run_map.parquet` roster, fetch that run's reads, mint a contiguous
 `sequence_idx` range from the control plane, and write them as `read.parquet` —
 the same mint-then-sort-and-assign pipeline as `ingest_reads` (`..read_staging`).
 Two-write-target and idempotent/re-runnable semantics are identical too.
@@ -87,14 +87,14 @@ _TRANSIENT_ERROR_MARKERS = (
 class Inputs(BaseModel):
     """Typed input contract for ingest_ena_reads.
 
-    `run_map` is the runner-staged Parquet roster `(prep_sample_idx BIGINT,
+    `ena_run_map` is the runner-staged Parquet roster `(prep_sample_idx BIGINT,
     ena_run_accession VARCHAR)` from a live Postgres query. `reads_staging_root`
     is the scratch root durable per-sample `read.parquet` copies hang under (via
     `compute_reads_staging_path`). `download_method` defaults to 'http', the only
     transport this environment supports. `sequenced_pool_idx` / `sequencing_run_idx`
     / `work_ticket_idx` are framework-injected scope scalars."""
 
-    run_map: Path
+    ena_run_map: Path
     reads_staging_root: Path
     download_method: str = "http"
     sequenced_pool_idx: int
@@ -189,7 +189,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """Download every pool run's reads, up to `_CONCURRENCY` at once. See the
     module docstring for the per-run pipeline and fail-loud checks."""
     roster = read_roster_parquet(
-        inputs.run_map, value_column="ena_run_accession", roster_name="run_map"
+        inputs.ena_run_map, value_column="ena_run_accession", roster_name="ena_run_map"
     )
 
     workspace.mkdir(parents=True, exist_ok=True)

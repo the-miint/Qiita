@@ -26,7 +26,7 @@ def test_miint_resolver_resolves_a_real_small_stable_study():
     assert header.secondary_study_accession
     assert header.study_title
 
-    runs = resolver.resolve_runs(_STUDY_ACCESSION)
+    runs = resolver.resolve_ena_runs(_STUDY_ACCESSION)
     assert len(runs) >= 2
     for run in runs:
         assert run.study_accession == _STUDY_ACCESSION

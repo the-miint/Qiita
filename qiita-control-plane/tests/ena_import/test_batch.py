@@ -27,7 +27,7 @@ from qiita_control_plane.ena_import.batch import (
     reconcile_inflight_batches,
     schedule_ena_import_batch,
 )
-from qiita_control_plane.ena_import.registration import RunRegistrationStatus
+from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
 from qiita_control_plane.repositories.study import create_study
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
@@ -176,7 +176,7 @@ async def download_ena_study_action(postgres_pool):
             "name": "ingest_ena_reads",
             "step_type": "singleton",
             "module": "qiita_compute_orchestrator.jobs.ingest_ena_reads",
-            "inputs": ["run_map", "reads_staging_root"],
+            "inputs": ["ena_run_map", "reads_staging_root"],
             "outputs": ["read_staging_dir"],
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         }
@@ -1177,9 +1177,9 @@ async def test_process_one_study_surfaces_per_run_outcomes(
     status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
     assert status is not None
     item = status.items[0]
-    assert len(item.runs) == 1
-    run = item.runs[0]
-    assert run.status == RunRegistrationStatus.REGISTERED.value
+    assert len(item.ena_runs) == 1
+    run = item.ena_runs[0]
+    assert run.status == EnaRunRegistrationStatus.REGISTERED.value
     assert run.failure_reason is None
 
     await _cleanup_study(postgres_pool, accession)
@@ -1221,8 +1221,8 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
 
     # The failed run's detail is on the endpoint, not only the item-level reason.
     status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
-    failed_run = status.items[0].runs[0]
-    assert failed_run.status == RunRegistrationStatus.FAILED.value
+    failed_run = status.items[0].ena_runs[0]
+    assert failed_run.status == EnaRunRegistrationStatus.FAILED.value
     assert failed_run.failure_reason is not None
 
     await _cleanup_study(postgres_pool, accession)
@@ -1334,10 +1334,10 @@ async def test_set_item_registered_keeps_study_created_true_once_set(
     item_idx = items[0].idx
 
     await _set_item_registered(
-        postgres_pool, item_idx, study_idx=study_idx, study_created=True, run_outcomes=[]
+        postgres_pool, item_idx, study_idx=study_idx, study_created=True, ena_run_outcomes=[]
     )
     await _set_item_registered(
-        postgres_pool, item_idx, study_idx=study_idx, study_created=False, run_outcomes=[]
+        postgres_pool, item_idx, study_idx=study_idx, study_created=False, ena_run_outcomes=[]
     )
 
     study_created = await postgres_pool.fetchval(

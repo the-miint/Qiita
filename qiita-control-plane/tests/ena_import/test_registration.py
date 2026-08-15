@@ -19,7 +19,7 @@ from qiita_common.models.ena import (
 )
 
 from qiita_control_plane.ena_import.registration import (
-    RunRegistrationStatus,
+    EnaRunRegistrationStatus,
     register_ena_study,
 )
 from qiita_control_plane.repositories.study import get_or_create_study_by_ena_accessions
@@ -172,7 +172,7 @@ async def reg(postgres_pool):
     await _cleanup(postgres_pool, tracker)
 
 
-async def _register(reg, *, study_header, runs, sample_attributes=()):
+async def _register(reg, *, study_header, ena_runs, sample_attributes=()):
     """Resolve the study then register into it, the same two steps the batch
     driver does. Records whether this call created the study in
     `reg["study_created"]` -- the driver's import-created guard keys off it."""
@@ -190,7 +190,7 @@ async def _register(reg, *, study_header, runs, sample_attributes=()):
         reg["pool"],
         study_idx=study_row["idx"],
         study_header=study_header,
-        runs=runs,
+        ena_runs=ena_runs,
         sample_attributes=list(sample_attributes),
         owner_idx=reg["owner_idx"],
         caller_idx=reg["caller_idx"],
@@ -241,10 +241,10 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
     )
     attrs = _mixs_sample_attributes(sample_accession)
 
-    result = await _register(reg, study_header=header, runs=[run], sample_attributes=[attrs])
+    result = await _register(reg, study_header=header, ena_runs=[run], sample_attributes=[attrs])
 
-    assert result.runs[0].status == RunRegistrationStatus.REGISTERED
-    harmonization = result.runs[0].harmonization
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    harmonization = result.ena_runs[0].harmonization
     assert harmonization is not None
     # 9 tags: 5 mapped, 4 unmapped (host + the environmental-context triad).
     assert harmonization.mapped_count == 5
@@ -337,13 +337,17 @@ async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
         study_accession=study_b_accession,
     )
 
-    result_a = await _register(reg, study_header=header_a, runs=[run_a], sample_attributes=[attrs])
-    result_b = await _register(reg, study_header=header_b, runs=[run_b], sample_attributes=[attrs])
+    result_a = await _register(
+        reg, study_header=header_a, ena_runs=[run_a], sample_attributes=[attrs]
+    )
+    result_b = await _register(
+        reg, study_header=header_b, ena_runs=[run_b], sample_attributes=[attrs]
+    )
 
     # Write-once: harmonization ran only on the first import; the second reuses the
     # biosample and does not re-harmonize.
-    assert result_a.runs[0].harmonization is not None
-    assert result_b.runs[0].harmonization is None
+    assert result_a.ena_runs[0].harmonization is not None
+    assert result_b.ena_runs[0].harmonization is None
 
     biosample_idx = await reg["pool"].fetchval(
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
@@ -400,17 +404,17 @@ async def test_harmonization_parse_failure_isolated_to_its_run(reg):
     result = await _register(
         reg,
         study_header=header,
-        runs=[ok_run, bad_run],
+        ena_runs=[ok_run, bad_run],
         sample_attributes=[ok_attrs, bad_attrs],
     )
 
-    outcomes_by_accession = {o.run_accession: o for o in result.runs}
+    outcomes_by_accession = {o.run_accession: o for o in result.ena_runs}
     ok_outcome = outcomes_by_accession[ok_run.run_accession]
-    assert ok_outcome.status == RunRegistrationStatus.REGISTERED
+    assert ok_outcome.status == EnaRunRegistrationStatus.REGISTERED
     assert ok_outcome.harmonization is not None
 
     bad_outcome = outcomes_by_accession[bad_run.run_accession]
-    assert bad_outcome.status == RunRegistrationStatus.FAILED
+    assert bad_outcome.status == EnaRunRegistrationStatus.FAILED
     assert bad_outcome.failure_reason is not None
 
     # No orphan rows for the failed run -- its per-run transaction rolled back.
@@ -447,10 +451,10 @@ async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
         },
     )
 
-    result = await _register(reg, study_header=header, runs=[run], sample_attributes=[attrs])
+    result = await _register(reg, study_header=header, ena_runs=[run], sample_attributes=[attrs])
 
-    assert result.runs[0].status == RunRegistrationStatus.REGISTERED
-    harmonization = result.runs[0].harmonization
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    harmonization = result.ena_runs[0].harmonization
     assert harmonization is not None
     # lat_lon splits into latitude + longitude, so 4 mappable tags produce 5 entries.
     assert harmonization.mapped_count == 5
@@ -509,10 +513,10 @@ async def test_empty_sample_attributes_registers_normally(reg):
 
     # sample_attributes=[] -- what the resolvers return for a sample with zero
     # <SAMPLE_ATTRIBUTE> elements.
-    result = await _register(reg, study_header=header, runs=[run], sample_attributes=[])
+    result = await _register(reg, study_header=header, ena_runs=[run], sample_attributes=[])
 
-    assert result.runs[0].status == RunRegistrationStatus.REGISTERED
-    harmonization = result.runs[0].harmonization
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    harmonization = result.ena_runs[0].harmonization
     assert harmonization is not None
     assert harmonization.mapped_count == 0
     assert harmonization.retained_unmapped == []
@@ -549,9 +553,9 @@ async def test_reimport_same_study_reuses_study_row(reg):
         study_accession=study_accession,
     )
 
-    first = await _register(reg, study_header=header, runs=[run])
+    first = await _register(reg, study_header=header, ena_runs=[run])
     assert reg["study_created"] is True
-    second = await _register(reg, study_header=header, runs=[run])
+    second = await _register(reg, study_header=header, ena_runs=[run])
     assert reg["study_created"] is False
     assert first.study_idx == second.study_idx
 
@@ -594,8 +598,8 @@ async def test_shared_biosample_across_two_studies_one_row_two_links(reg):
         study_accession=study_b_accession,
     )
 
-    result_a = await _register(reg, study_header=header_a, runs=[run_a])
-    result_b = await _register(reg, study_header=header_b, runs=[run_b])
+    result_a = await _register(reg, study_header=header_a, ena_runs=[run_a])
+    result_b = await _register(reg, study_header=header_b, ena_runs=[run_b])
 
     assert result_a.study_idx != result_b.study_idx
 
@@ -647,8 +651,8 @@ async def test_concurrent_registration_of_shared_biosample_dedupes_to_one_row(re
     )
 
     result_a, result_b = await asyncio.gather(
-        _register(reg, study_header=header_a, runs=[run_a]),
-        _register(reg, study_header=header_b, runs=[run_b]),
+        _register(reg, study_header=header_a, ena_runs=[run_a]),
+        _register(reg, study_header=header_b, ena_runs=[run_b]),
     )
 
     assert result_a.study_idx != result_b.study_idx
@@ -678,8 +682,8 @@ async def test_concurrent_registration_of_shared_biosample_dedupes_to_one_row(re
     # write-once holding under real concurrency.
     harmonized_flags = sorted(
         [
-            result_a.runs[0].harmonization is not None,
-            result_b.runs[0].harmonization is not None,
+            result_a.ena_runs[0].harmonization is not None,
+            result_b.ena_runs[0].harmonization is not None,
         ]
     )
     assert harmonized_flags == [False, True]
@@ -708,10 +712,10 @@ async def test_paired_and_single_layout_runs_each_get_one_sequenced_sample(reg):
         library_layout="PAIRED",
     )
 
-    result = await _register(reg, study_header=header, runs=[single_run, paired_run])
+    result = await _register(reg, study_header=header, ena_runs=[single_run, paired_run])
 
-    assert {o.status for o in result.runs} == {RunRegistrationStatus.REGISTERED}
-    assert {o.run_accession for o in result.runs} == {
+    assert {o.status for o in result.ena_runs} == {EnaRunRegistrationStatus.REGISTERED}
+    assert {o.run_accession for o in result.ena_runs} == {
         single_run.run_accession,
         paired_run.run_accession,
     }
@@ -767,8 +771,8 @@ async def test_mixed_platform_study_creates_one_run_and_pool_per_platform(reg):
         library_source="METAGENOMIC",
     )
 
-    result = await _register(reg, study_header=header, runs=[illumina_run, nanopore_run])
-    assert {o.status for o in result.runs} == {RunRegistrationStatus.REGISTERED}
+    result = await _register(reg, study_header=header, ena_runs=[illumina_run, nanopore_run])
+    assert {o.status for o in result.ena_runs} == {EnaRunRegistrationStatus.REGISTERED}
 
     runs_rows = await reg["pool"].fetch(
         "SELECT idx, platform FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
@@ -844,7 +848,7 @@ async def test_created_pools_single_platform(reg):
         instrument_platform="ILLUMINA",
     )
 
-    result = await _register(reg, study_header=header, runs=[run])
+    result = await _register(reg, study_header=header, ena_runs=[run])
 
     assert len(result.created_pools) == 1
     created = result.created_pools[0]
@@ -882,7 +886,7 @@ async def test_created_pools_one_per_distinct_platform(reg):
         library_source="METAGENOMIC",
     )
 
-    result = await _register(reg, study_header=header, runs=[illumina_run, nanopore_run])
+    result = await _register(reg, study_header=header, ena_runs=[illumina_run, nanopore_run])
 
     assert {c.platform for c in result.created_pools} == {"illumina", "oxford_nanopore"}
     assert len({c.sequenced_pool_idx for c in result.created_pools}) == 2
@@ -900,7 +904,7 @@ async def test_created_pools_empty_when_every_run_fails(reg):
         instrument_platform="CAPILLARY",
     )
 
-    result = await _register(reg, study_header=header, runs=[bad_run])
+    result = await _register(reg, study_header=header, ena_runs=[bad_run])
 
     assert result.created_pools == []
 
@@ -925,13 +929,13 @@ async def test_reimport_is_idempotent_no_duplicates_and_runs_skipped(reg):
         study_accession=study_accession,
     )
 
-    first = await _register(reg, study_header=header, runs=[run])
-    assert first.runs[0].status == RunRegistrationStatus.REGISTERED
-    first_sequenced_sample_idx = first.runs[0].sequenced_sample_idx
+    first = await _register(reg, study_header=header, ena_runs=[run])
+    assert first.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    first_sequenced_sample_idx = first.ena_runs[0].sequenced_sample_idx
 
-    second = await _register(reg, study_header=header, runs=[run])
-    assert second.runs[0].status == RunRegistrationStatus.SKIPPED_ALREADY_PRESENT
-    assert second.runs[0].sequenced_sample_idx == first_sequenced_sample_idx
+    second = await _register(reg, study_header=header, ena_runs=[run])
+    assert second.ena_runs[0].status == EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT
+    assert second.ena_runs[0].sequenced_sample_idx == first_sequenced_sample_idx
 
     count = await reg["pool"].fetchval(
         "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
@@ -961,12 +965,12 @@ async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg
         library_source="GENOMIC",
     )
 
-    result = await _register(reg, study_header=header, runs=[ok_run, bad_run])
+    result = await _register(reg, study_header=header, ena_runs=[ok_run, bad_run])
 
-    outcomes_by_accession = {o.run_accession: o for o in result.runs}
-    assert outcomes_by_accession[ok_run.run_accession].status == RunRegistrationStatus.REGISTERED
+    outcomes_by_accession = {o.run_accession: o for o in result.ena_runs}
+    assert outcomes_by_accession[ok_run.run_accession].status == EnaRunRegistrationStatus.REGISTERED
     bad_outcome = outcomes_by_accession[bad_run.run_accession]
-    assert bad_outcome.status == RunRegistrationStatus.FAILED
+    assert bad_outcome.status == EnaRunRegistrationStatus.FAILED
     assert bad_outcome.failure_reason is not None
     assert "ChIP-Seq" in bad_outcome.failure_reason
 
@@ -1001,13 +1005,13 @@ async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg
         library_strategy="WGS",
         library_source="GENOMIC",
     )
-    rerun_result = await _register(reg, study_header=header, runs=[ok_run, fixed_run])
-    rerun_by_accession = {o.run_accession: o for o in rerun_result.runs}
+    rerun_result = await _register(reg, study_header=header, ena_runs=[ok_run, fixed_run])
+    rerun_by_accession = {o.run_accession: o for o in rerun_result.ena_runs}
     assert (
         rerun_by_accession[ok_run.run_accession].status
-        == RunRegistrationStatus.SKIPPED_ALREADY_PRESENT
+        == EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT
     )
-    assert rerun_by_accession[bad_run_accession].status == RunRegistrationStatus.REGISTERED
+    assert rerun_by_accession[bad_run_accession].status == EnaRunRegistrationStatus.REGISTERED
 
     final_count = await reg["pool"].fetchval(
         "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
@@ -1043,15 +1047,15 @@ async def test_unmappable_platform_run_isolated_others_registered(reg):
         instrument_platform="CAPILLARY",
     )
 
-    result = await _register(reg, study_header=header, runs=[ok_run, bad_run])
+    result = await _register(reg, study_header=header, ena_runs=[ok_run, bad_run])
 
-    outcomes_by_accession = {o.run_accession: o for o in result.runs}
+    outcomes_by_accession = {o.run_accession: o for o in result.ena_runs}
     ok_outcome = outcomes_by_accession[ok_run.run_accession]
-    assert ok_outcome.status == RunRegistrationStatus.REGISTERED
+    assert ok_outcome.status == EnaRunRegistrationStatus.REGISTERED
     assert ok_outcome.sequenced_sample_idx is not None
 
     bad_outcome = outcomes_by_accession[bad_run.run_accession]
-    assert bad_outcome.status == RunRegistrationStatus.FAILED
+    assert bad_outcome.status == EnaRunRegistrationStatus.FAILED
     assert bad_outcome.failure_reason is not None
     assert "CAPILLARY" in bad_outcome.failure_reason
 
@@ -1107,10 +1111,10 @@ async def test_all_unmappable_platform_study_all_failed_no_runs_or_pools(reg):
         instrument_platform=None,
     )
 
-    result = await _register(reg, study_header=header, runs=[bad_run_1, bad_run_2])
+    result = await _register(reg, study_header=header, ena_runs=[bad_run_1, bad_run_2])
 
-    assert {o.status for o in result.runs} == {RunRegistrationStatus.FAILED}
-    assert {o.run_accession for o in result.runs} == {
+    assert {o.status for o in result.ena_runs} == {EnaRunRegistrationStatus.FAILED}
+    assert {o.run_accession for o in result.ena_runs} == {
         bad_run_1.run_accession,
         bad_run_2.run_accession,
     }

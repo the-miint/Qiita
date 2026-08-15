@@ -39,7 +39,7 @@ from qiita_common.models.ena_import import (
     BatchImportItem,
     BatchImportStatus,
     BatchItemState,
-    RunImportOutcome,
+    EnaRunImportOutcome,
 )
 
 from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
@@ -60,8 +60,8 @@ from ..repositories.study import get_or_create_study_by_ena_accessions
 from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
 from .registration import (
+    EnaRunRegistrationStatus,
     EnaStudyRegistrationResult,
-    RunRegistrationStatus,
     register_ena_study,
 )
 from .submit import (
@@ -136,15 +136,15 @@ async def _set_item_state(
         )
 
 
-def _run_outcomes(result: EnaStudyRegistrationResult) -> list[dict[str, Any]]:
-    """Per-run outcomes for the item's `run_outcomes` JSONB column."""
+def _ena_run_outcomes(result: EnaStudyRegistrationResult) -> list[dict[str, Any]]:
+    """Per-run outcomes for the item's `ena_run_outcomes` JSONB column."""
     return [
         {
             "run_accession": o.run_accession,
             "status": o.status.value,
             "failure_reason": o.failure_reason,
         }
-        for o in result.runs
+        for o in result.ena_runs
     ]
 
 
@@ -166,7 +166,7 @@ async def _set_item_registered(
     *,
     study_idx: int,
     study_created: bool,
-    run_outcomes: list[dict[str, Any]],
+    ena_run_outcomes: list[dict[str, Any]],
 ) -> None:
     async with pool.acquire() as conn:
         await update_ena_import_batch_item_registered(
@@ -174,7 +174,7 @@ async def _set_item_registered(
             item_idx=item_idx,
             study_idx=study_idx,
             study_created=study_created,
-            run_outcomes=run_outcomes,
+            ena_run_outcomes=ena_run_outcomes,
         )
 
 
@@ -229,7 +229,7 @@ async def _process_one_study(
         study_header = await asyncio.to_thread(
             resolver.resolve_study_header, item.ena_study_accession
         )
-        runs = await asyncio.to_thread(resolver.resolve_runs, item.ena_study_accession)
+        ena_runs = await asyncio.to_thread(resolver.resolve_ena_runs, item.ena_study_accession)
         sample_attributes = await asyncio.to_thread(
             resolver.resolve_sample_attributes, item.ena_study_accession
         )
@@ -265,7 +265,7 @@ async def _process_one_study(
             pool,
             study_idx=study_idx,
             study_header=study_header,
-            runs=runs,
+            ena_runs=ena_runs,
             sample_attributes=sample_attributes,
             owner_idx=principal.principal_idx,
             caller_idx=principal.principal_idx,
@@ -275,7 +275,7 @@ async def _process_one_study(
             item.idx,
             study_idx=result.study_idx,
             study_created=study_created,
-            run_outcomes=_run_outcomes(result),
+            ena_run_outcomes=_ena_run_outcomes(result),
         )
 
         if not result.created_pools:
@@ -294,16 +294,16 @@ async def _process_one_study(
             )
             return
 
-        if not any(o.status is not RunRegistrationStatus.FAILED for o in result.runs):
+        if not any(o.status is not EnaRunRegistrationStatus.FAILED for o in result.ena_runs):
             # Pools exist (a platform mapped), but every run then failed inside
             # register_ena_study (protocol mapping, harmonization, or a DB error),
             # so the pools hold no sequenced_sample rows. Submitting downloads
             # against them would report success over an all-failed study. Terminal
-            # `failed`; the per-run reasons are already persisted on `run_outcomes`.
+            # `failed`; the per-run reasons are already persisted on `ena_run_outcomes`.
             reasons = "; ".join(
                 f"{o.run_accession}: {o.failure_reason}"
-                for o in result.runs
-                if o.status is RunRegistrationStatus.FAILED
+                for o in result.ena_runs
+                if o.status is EnaRunRegistrationStatus.FAILED
             )
             await _set_item_state(
                 pool,
@@ -493,9 +493,9 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
                 # unrecognized state, or a missing work_ticket row (state None) --
                 # must not read as success.
                 state = BatchItemState.DOWNLOADING
-        # run_outcomes is a JSONB column; asyncpg has no default jsonb codec, so
+        # ena_run_outcomes is a JSONB column; asyncpg has no default jsonb codec, so
         # it comes back as a JSON string. Empty ('[]') until register_ena_study ran.
-        runs = [RunImportOutcome(**o) for o in json.loads(row["run_outcomes"])]
+        ena_runs = [EnaRunImportOutcome(**o) for o in json.loads(row["ena_run_outcomes"])]
         items.append(
             BatchImportItem(
                 ena_study_accession=row["ena_study_accession"],
@@ -503,7 +503,7 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
                 study_idx=row["study_idx"],
                 failure_reason=failure_reason,
                 download_work_ticket_idxs=ticket_idxs,
-                runs=runs,
+                ena_runs=ena_runs,
             )
         )
     return BatchImportStatus(ena_import_batch_idx=batch_idx, items=items)

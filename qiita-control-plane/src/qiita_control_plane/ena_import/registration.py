@@ -18,7 +18,7 @@ Order of operations:
      `sequenced_pool` on it (reused if one already exists -- `insert_sequenced_
      pool` has no content key to de-dup against).
 
-  4. Per run, in its own transaction (per-run atomicity): get-or-create the
+  4. Per ENA run, in its own transaction (per-run atomicity): get-or-create the
      biosample by ENA sample accession (cross-study de-dup) and link it to the
      study. If newly created, harmonize its ENA attributes onto it once
      (write-once: cross-study reuse does not re-harmonize). Skip if a
@@ -26,7 +26,7 @@ Order of operations:
      re-import), else map library_strategy/library_source to a curated
      prep_protocol name and import via `import_sequenced_prep_sample`.
 
-Harmonization gaps are reported on `RunRegistrationOutcome.harmonization`, never
+Harmonization gaps are reported on `EnaRunRegistrationOutcome.harmonization`, never
 raised; a genuine harmonization failure is caught by the same per-run try/except
 as every other step. No read bytes or batch fan-out here -- those live in the
 download workflow and the batch driver.
@@ -74,8 +74,8 @@ from .protocol_mapping import map_ena_run_to_prep_protocol_name
 _ERC000011_CHECKLIST_NAME = "ERC000011"
 
 
-class RunRegistrationStatus(StrEnum):
-    """Per-run outcome discriminator for `RunRegistrationOutcome.status`."""
+class EnaRunRegistrationStatus(StrEnum):
+    """Per-run outcome discriminator for `EnaRunRegistrationOutcome.status`."""
 
     REGISTERED = "registered"
     SKIPPED_ALREADY_PRESENT = "skipped_already_present"
@@ -83,7 +83,7 @@ class RunRegistrationStatus(StrEnum):
 
 
 @dataclass(frozen=True)
-class RunRegistrationOutcome:
+class EnaRunRegistrationOutcome:
     """One ENA run's registration outcome.
 
     `prep_sample_idx` is set only on `REGISTERED`; `sequenced_sample_idx` on
@@ -94,7 +94,7 @@ class RunRegistrationOutcome:
     """
 
     run_accession: str
-    status: RunRegistrationStatus
+    status: EnaRunRegistrationStatus
     prep_sample_idx: int | None = None
     sequenced_sample_idx: int | None = None
     failure_reason: str | None = None
@@ -120,7 +120,7 @@ class EnaStudyRegistrationResult:
     """Composite result of one `register_ena_study` call."""
 
     study_idx: int
-    runs: list[RunRegistrationOutcome] = field(default_factory=list)
+    ena_runs: list[EnaRunRegistrationOutcome] = field(default_factory=list)
     created_pools: list[CreatedPool] = field(default_factory=list)
 
 
@@ -129,7 +129,7 @@ async def register_ena_study(
     *,
     study_idx: int,
     study_header: EnaStudyHeader,
-    runs: list[EnaRunRecord],
+    ena_runs: list[EnaRunRecord],
     sample_attributes: list[EnaSampleAttributes],
     owner_idx: int,
     caller_idx: int,
@@ -139,7 +139,7 @@ async def register_ena_study(
     The caller resolves the study (`get_or_create_study_by_ena_accessions`) and
     decides whether importing into it is allowed, so this never creates one.
 
-    Never raises for a per-run failure (see `RunRegistrationOutcome`); an
+    Never raises for a per-run failure (see `EnaRunRegistrationOutcome`); an
     unmappable `instrument_platform` is one such isolated per-run failure.
     """
     # A run whose sample has no entry here harmonizes against an empty map
@@ -155,25 +155,25 @@ async def register_ena_study(
 
         # Map each run's platform, isolated per run: an unmappable platform fails
         # only that run. Only successfully-mapped runs are grouped by platform.
-        runs_by_platform: dict[Platform, list[EnaRunRecord]] = defaultdict(list)
-        outcomes_by_accession: dict[str, RunRegistrationOutcome] = {}
-        for run in runs:
+        ena_runs_by_platform: dict[Platform, list[EnaRunRecord]] = defaultdict(list)
+        outcomes_by_accession: dict[str, EnaRunRegistrationOutcome] = {}
+        for ena_run in ena_runs:
             try:
-                platform = map_ena_platform(run.instrument_platform)
+                platform = map_ena_platform(ena_run.instrument_platform)
             except UnmappableEnaPlatformError as exc:
-                outcomes_by_accession[run.run_accession] = RunRegistrationOutcome(
-                    run_accession=run.run_accession,
-                    status=RunRegistrationStatus.FAILED,
+                outcomes_by_accession[ena_run.run_accession] = EnaRunRegistrationOutcome(
+                    run_accession=ena_run.run_accession,
+                    status=EnaRunRegistrationStatus.FAILED,
                     failure_reason=str(exc),
                 )
                 continue
-            runs_by_platform[platform].append(run)
+            ena_runs_by_platform[platform].append(ena_run)
 
         # One sequencing_run + sequenced_pool per distinct platform that has
         # at least one successfully-mapped run.
         sequenced_pool_idx_by_platform: dict[Platform, int] = {}
         created_pools: list[CreatedPool] = []
-        for platform in runs_by_platform:
+        for platform in ena_runs_by_platform:
             sequenced_pool_idx, sequencing_run_idx = await _get_or_create_pool_for_platform(
                 conn,
                 study_accession=study_header.study_accession,
@@ -189,11 +189,11 @@ async def register_ena_study(
                 )
             )
 
-        for platform, platform_runs in runs_by_platform.items():
-            for run in platform_runs:
-                outcomes_by_accession[run.run_accession] = await _register_one_run(
+        for platform, platform_runs in ena_runs_by_platform.items():
+            for ena_run in platform_runs:
+                outcomes_by_accession[ena_run.run_accession] = await _register_one_ena_run(
                     conn,
-                    run=run,
+                    ena_run=ena_run,
                     study_idx=study_idx,
                     platform=platform,
                     sequenced_pool_idx=sequenced_pool_idx_by_platform[platform],
@@ -204,11 +204,11 @@ async def register_ena_study(
                 )
 
     # Return per-run outcomes in the caller's input order.
-    outcomes = [outcomes_by_accession[run.run_accession] for run in runs]
+    outcomes = [outcomes_by_accession[ena_run.run_accession] for ena_run in ena_runs]
 
     return EnaStudyRegistrationResult(
         study_idx=study_idx,
-        runs=outcomes,
+        ena_runs=outcomes,
         created_pools=created_pools,
     )
 
@@ -256,10 +256,10 @@ async def _get_or_create_pool_for_platform(
     return sequenced_pool_idx, sequencing_run_idx
 
 
-async def _register_one_run(
+async def _register_one_ena_run(
     conn: asyncpg.Connection,
     *,
-    run: EnaRunRecord,
+    ena_run: EnaRunRecord,
     study_idx: int,
     platform: Platform,
     sequenced_pool_idx: int,
@@ -267,7 +267,7 @@ async def _register_one_run(
     caller_idx: int,
     metadata_checklist_idx: int,
     attrs_by_sample_accession: dict[str, EnaSampleAttributes],
-) -> RunRegistrationOutcome:
+) -> EnaRunRegistrationOutcome:
     """Register one ENA run inside its own transaction (per-run atomicity: a
     partial failure rolls back only this run). Never raises: every failure mode
     (platform/protocol-mapping, harmonization, composer/DB) is folded into a
@@ -278,7 +278,7 @@ async def _register_one_run(
         async with conn.transaction():
             biosample_idx, biosample_created = await get_or_create_biosample_by_ena_accession(
                 conn,
-                ena_sample_accession=run.sample_accession,
+                ena_sample_accession=ena_run.sample_accession,
                 owner_idx=owner_idx,
                 created_by_idx=caller_idx,
             )
@@ -299,7 +299,7 @@ async def _register_one_run(
             # canonical global-field values, so it is not re-harmonized.
             harmonization_result: HarmonizationResult | None = None
             if biosample_created:
-                sample_attrs = attrs_by_sample_accession.get(run.sample_accession)
+                sample_attrs = attrs_by_sample_accession.get(ena_run.sample_accession)
                 harmonization_result = await harmonize_biosample_attributes(
                     conn,
                     biosample_idx=biosample_idx,
@@ -310,19 +310,19 @@ async def _register_one_run(
                 )
 
             existing = await fetch_sequenced_sample_idxs_by_ena_run_accession(
-                conn, values=[run.run_accession]
+                conn, values=[ena_run.run_accession]
             )
-            if run.run_accession in existing:
-                return RunRegistrationOutcome(
-                    run_accession=run.run_accession,
-                    status=RunRegistrationStatus.SKIPPED_ALREADY_PRESENT,
-                    sequenced_sample_idx=existing[run.run_accession],
+            if ena_run.run_accession in existing:
+                return EnaRunRegistrationOutcome(
+                    run_accession=ena_run.run_accession,
+                    status=EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT,
+                    sequenced_sample_idx=existing[ena_run.run_accession],
                     harmonization=harmonization_result,
                 )
 
             protocol_name = map_ena_run_to_prep_protocol_name(
-                library_strategy=run.library_strategy,
-                library_source=run.library_source,
+                library_strategy=ena_run.library_strategy,
+                library_source=ena_run.library_source,
                 platform=platform,
             )
             prep_protocol_idx = await fetch_prep_protocol_idx_by_name(conn, protocol_name)
@@ -333,18 +333,18 @@ async def _register_one_run(
                 biosample_idx=biosample_idx,
                 prep_protocol_idx=prep_protocol_idx,
                 owner_idx=owner_idx,
-                sequenced_pool_item_id=run.run_accession,
+                sequenced_pool_item_id=ena_run.run_accession,
                 # This `metadata` is prep_sample-level (biosample attributes are
                 # harmonized above); no current resolver output populates it.
                 metadata={},
                 primary_study_idx=study_idx,
                 caller_idx=caller_idx,
-                ena_experiment_accession=run.experiment_accession,
-                ena_run_accession=run.run_accession,
+                ena_experiment_accession=ena_run.experiment_accession,
+                ena_run_accession=ena_run.run_accession,
             )
-            return RunRegistrationOutcome(
-                run_accession=run.run_accession,
-                status=RunRegistrationStatus.REGISTERED,
+            return EnaRunRegistrationOutcome(
+                run_accession=ena_run.run_accession,
+                status=EnaRunRegistrationStatus.REGISTERED,
                 prep_sample_idx=result.prep_sample_idx,
                 sequenced_sample_idx=result.sequenced_sample_idx,
                 harmonization=harmonization_result,
@@ -352,8 +352,8 @@ async def _register_one_run(
     except Exception as exc:  # noqa: BLE001 -- per-run isolation: a failure must
         # never abort sibling runs; it is recorded (accession + reason) in the
         # returned result, not swallowed.
-        return RunRegistrationOutcome(
-            run_accession=run.run_accession,
-            status=RunRegistrationStatus.FAILED,
+        return EnaRunRegistrationOutcome(
+            run_accession=ena_run.run_accession,
+            status=EnaRunRegistrationStatus.FAILED,
             failure_reason=str(exc),
         )

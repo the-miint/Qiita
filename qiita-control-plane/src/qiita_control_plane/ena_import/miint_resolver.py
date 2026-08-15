@@ -75,7 +75,7 @@ class MiintEnaResolver:
             raise EnaAccessionNotFoundError(f"no ENA study found for accession {accession!r}")
         return EnaStudyHeader(**dict(zip(columns, rows[0], strict=True)))
 
-    def resolve_runs(self, accession: str) -> list[EnaRunRecord]:
+    def resolve_ena_runs(self, accession: str) -> list[EnaRunRecord]:
         accession = validate_study_accession(accession)
         columns, rows = _query_ena_runs(accession)
         if not rows:
@@ -86,9 +86,9 @@ class MiintEnaResolver:
         accession = validate_study_accession(accession)
         rows = _query_ena_sample_attributes(accession)
         if not rows:
-            # Unlike resolve_study_header/resolve_runs, 0 rows here is NOT "nothing
+            # Unlike resolve_study_header/resolve_ena_runs, 0 rows here is NOT "nothing
             # resolved" -- a real ENA/DDBJ sample can carry zero <SAMPLE_ATTRIBUTE>
-            # elements (e.g. DDBJ study PRJDB40364's SAMD01818724), and resolve_runs
+            # elements (e.g. DDBJ study PRJDB40364's SAMD01818724), and resolve_ena_runs
             # already proved these samples real. Return [] rather than raise;
             # registration.register_ena_study treats a missing sample as empty.
             return []

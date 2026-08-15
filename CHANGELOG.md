@@ -100,10 +100,10 @@ duplicates further down are historical strata; leave them where they are.
   optional, pinned to `http` — no Aspera key-staging in this compute env)
   replaces the inert placeholder of the same name. The CP runner materializes
   the pool's `{prep_sample_idx, ena_run_accession}` roster from a LIVE
-  Postgres query (`run_map`, dispatched by declared-input name so it never
+  Postgres query (`ena_run_map`, dispatched by declared-input name so it never
   collides with bcl-convert's action-context-embedded `sample_map`, though
   both are `sequenced_pool`-scoped) via a new
-  `repositories.sequenced_sample.fetch_sequenced_pool_run_roster`. The job
+  `repositories.sequenced_sample.fetch_sequenced_pool_ena_run_roster`. The job
   opens a FRESH DuckDB connection per run (`open_miint_conn`) so
   `miint_warnings()` stays scoped to exactly that run, mints the
   `sequence_idx` range through the existing CO→CP callback, and fails loud
@@ -122,7 +122,7 @@ duplicates further down are historical strata; leave them where they are.
   `qiita.sequenced_sample.transport` column: a new `repositories.sequenced_sample.
   set_sequenced_pool_transport` stamps every row in the ticket's pool with
   the ticket's `download_method` (falling back to the same `http` default
-  `ingest_ena_reads.Inputs` uses), gated on the SAME `run_map`
+  `ingest_ena_reads.Inputs` uses), gated on the SAME `ena_run_map`
   declared-input check `_stage_ena_run_roster` uses so it never fires for
   bcl-convert or another `sequenced_pool`-scoped workflow.
 - **ENA-ingest DuckLake parity verification (#369).** New
@@ -981,6 +981,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA import: `run` renamed to `ena_run` throughout (#369).** "Run" is
+  overloaded in this domain — Qiita's own `sequencing_run` vs. ENA's "one
+  sequencing of a prepped sample" — so every identifier naming the latter now
+  says so explicitly: `EnaRunRegistrationOutcome`/`EnaRunRegistrationStatus`/
+  `EnaRunImportOutcome`, `MiintEnaResolver.resolve_ena_runs`,
+  `register_ena_study(ena_runs=...)`, `EnaStudyRegistrationResult.ena_runs`,
+  `BatchImportItem.ena_runs` (the `GET /ena-import-batch/{idx}` wire field,
+  was `runs`), `ena_import_batch_item.ena_run_outcomes` (new migration
+  `20260815000000_ena_import_batch_item_rename_run_outcomes.sql` renames the
+  column), `fetch_sequenced_pool_ena_run_roster`, and the runner's
+  `ENA_RUN_MAP_BINDING` (`ena_run_map`, was `run_map` — the download-ena-study
+  workflow YAML's declared input). `run_accession` and Qiita's own
+  `sequencing_run` surface are unchanged. No behavior change.
 - **ENA models no longer coerce `read_ena` output (#378).** Once miint returns
   typed columns (duckdb-miint#178), the boundary coercion helpers
   (`_coerce_optional_int`, `_split_semicolon_list`) and their `@field_validator`

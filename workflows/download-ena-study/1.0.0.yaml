@@ -16,7 +16,7 @@ description: >
   out by the batch driver.
 
   The runner materializes the pool's `{prep_sample_idx, ena_run_accession}`
-  roster from a LIVE Postgres query (`run_map`, unlike bcl-convert's
+  roster from a LIVE Postgres query (`ena_run_map`, unlike bcl-convert's
   action-context-embedded `sample_map` — the orchestrator has no DB
   access to enumerate the pool itself). The `ingest_ena_reads` step then
   fetches every run with `read_ena_sequences`, mints a sequence_idx range
@@ -43,7 +43,7 @@ context_schema:
     # The ENA study accession this pool's runs belong to (e.g. a
     # PRJEB/PRJNA BioProject accession, or its ENA secondary study
     # accession). Carried through for operator-visible provenance /
-    # logging; the actual run roster comes from `run_map`, not this
+    # logging; the actual run roster comes from `ena_run_map`, not this
     # field — `ingest_ena_reads` never re-resolves the study.
     ena_study_accession:
       type: string
@@ -58,7 +58,7 @@ context_schema:
       enum: [http]
 
 steps:
-  # Store the pool's reads once. For each run in `run_map`, fetch its
+  # Store the pool's reads once. For each run in `ena_run_map`, fetch its
   # reads via read_ena_sequences, mint a sequence_idx range, and write
   # the full reads — into `read/<prep_sample_idx>.parquet` (the register
   # part) and the durable per-sample copy under `reads_staging_root`.
@@ -67,12 +67,12 @@ steps:
   - step: ingest_ena_reads
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.ingest_ena_reads
-    # `run_map` and `reads_staging_root` are runner-resolved before the
+    # `ena_run_map` and `reads_staging_root` are runner-resolved before the
     # loop (_stage_ena_run_roster / READS_STAGING_ROOT_BINDING).
     # `download_method` rides through action_context via `params:` (a
     # scalar, not a path) — optional; the job defaults to 'http' when
     # a submitter omits it.
-    inputs: [run_map, reads_staging_root]
+    inputs: [ena_run_map, reads_staging_root]
     params: { download_method: download_method }
     outputs: [read_staging_dir]
     baseline_resources:

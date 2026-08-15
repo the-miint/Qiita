@@ -80,9 +80,9 @@ from ._processing import (
     _workflow_needs_processing,
 )
 from ._read_ingest import (
+    ENA_RUN_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
-    RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
@@ -334,7 +334,7 @@ async def run_workflow(
         # would wire this resolver into its ticket too. Same inside-try
         # placement as the resolvers above so an empty-pool / missing-
         # accession failure lands in the outer FAILED handler.
-        if _workflow_declares_input(action.steps, RUN_MAP_BINDING):
+        if _workflow_declares_input(action.steps, ENA_RUN_MAP_BINDING):
             bound.update(
                 await _stage_ena_run_roster(
                     pool, scope_target["sequenced_pool_idx"], workspace=workspace

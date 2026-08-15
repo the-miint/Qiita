@@ -35,7 +35,7 @@ from qiita_control_plane.ena_import.batch import (
     create_ena_import_batch,
 )
 from qiita_control_plane.repositories.sequenced_sample import (
-    fetch_sequenced_pool_run_roster,
+    fetch_sequenced_pool_ena_run_roster,
 )
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 from qiita_control_plane.testing.unique_names import unique_accession
@@ -140,7 +140,7 @@ def _entry_by_name(name: str):
     raise AssertionError(f"no action entry named {name!r} in download-ena-study YAML")
 
 
-def _write_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
+def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     """Write the `(prep_sample_idx, ena_run_accession)` roster Parquet the runner
     materializes for the step."""
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
@@ -290,7 +290,7 @@ async def download_ena_study_action(postgres_pool):
             "name": "ingest_ena_reads",
             "step_type": "singleton",
             "module": "qiita_compute_orchestrator.jobs.ingest_ena_reads",
-            "inputs": ["run_map", "reads_staging_root"],
+            "inputs": ["ena_run_map", "reads_staging_root"],
             "outputs": ["read_staging_dir"],
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         }
@@ -499,7 +499,7 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
     sequencing_run_idx = await postgres_pool.fetchval(
         "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
     )
-    roster_rows = await fetch_sequenced_pool_run_roster(
+    roster_rows = await fetch_sequenced_pool_ena_run_roster(
         postgres_pool, sequenced_pool_idx=sequenced_pool_idx
     )
     assert len(roster_rows) == 2
@@ -538,10 +538,10 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _local_mint)
 
-    run_map_path = tmp_path / "run_map.parquet"
-    _write_run_map(run_map_path, roster)
+    ena_run_map_path = tmp_path / "ena_run_map.parquet"
+    _write_ena_run_map(ena_run_map_path, roster)
     inputs = ingest_ena_reads.Inputs(
-        run_map=run_map_path,
+        ena_run_map=ena_run_map_path,
         reads_staging_root=tmp_path / "reads-staging",
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,

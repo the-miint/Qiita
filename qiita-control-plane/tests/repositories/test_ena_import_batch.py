@@ -109,7 +109,7 @@ async def test_insert_ena_import_batch_and_item_creates_rows(eib):
 
     item_row = await eib["pool"].fetchrow(
         "SELECT batch_idx, ena_study_accession, state, study_created,"
-        "       download_work_ticket_idxs, run_outcomes"
+        "       download_work_ticket_idxs, ena_run_outcomes"
         " FROM qiita.ena_import_batch_item WHERE idx = $1",
         item_idx,
     )
@@ -118,7 +118,7 @@ async def test_insert_ena_import_batch_and_item_creates_rows(eib):
     assert item_row["state"] == BatchItemState.PENDING.value
     assert item_row["study_created"] is False
     assert list(item_row["download_work_ticket_idxs"]) == []
-    assert item_row["run_outcomes"] == "[]"
+    assert item_row["ena_run_outcomes"] == "[]"
 
 
 async def test_insert_ena_import_batch_requires_transaction(eib):
@@ -202,11 +202,11 @@ async def test_update_ena_import_batch_item_registered_sets_fields(eib):
             item_idx=item_idx,
             study_idx=study_idx,
             study_created=True,
-            run_outcomes=outcomes,
+            ena_run_outcomes=outcomes,
         )
 
     row = await eib["pool"].fetchrow(
-        "SELECT state, study_idx, study_created, failure_reason, run_outcomes"
+        "SELECT state, study_idx, study_created, failure_reason, ena_run_outcomes"
         " FROM qiita.ena_import_batch_item WHERE idx = $1",
         item_idx,
     )
@@ -215,7 +215,7 @@ async def test_update_ena_import_batch_item_registered_sets_fields(eib):
     assert row["study_created"] is True
     assert row["failure_reason"] is None
     # jsonb does not preserve key order, so compare parsed structure.
-    assert json.loads(row["run_outcomes"]) == outcomes
+    assert json.loads(row["ena_run_outcomes"]) == outcomes
 
 
 async def test_update_ena_import_batch_item_registered_keeps_study_created_true_once_set(eib):
@@ -226,10 +226,10 @@ async def test_update_ena_import_batch_item_registered_keeps_study_created_true_
 
     async with eib["pool"].acquire() as conn:
         await update_ena_import_batch_item_registered(
-            conn, item_idx=item_idx, study_idx=study_idx, study_created=True, run_outcomes=[]
+            conn, item_idx=item_idx, study_idx=study_idx, study_created=True, ena_run_outcomes=[]
         )
         await update_ena_import_batch_item_registered(
-            conn, item_idx=item_idx, study_idx=study_idx, study_created=False, run_outcomes=[]
+            conn, item_idx=item_idx, study_idx=study_idx, study_created=False, ena_run_outcomes=[]
         )
 
     study_created = await eib["pool"].fetchval(
@@ -274,7 +274,7 @@ async def test_ena_import_created_study_true_and_false(eib):
             item_idx=item_idx,
             study_idx=created_study_idx,
             study_created=True,
-            run_outcomes=[],
+            ena_run_outcomes=[],
         )
 
     assert await ena_import_created_study(eib["pool"], created_study_idx) is True

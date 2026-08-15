@@ -20,7 +20,7 @@ from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.runner import (
-    RUN_MAP_BINDING,
+    ENA_RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
@@ -88,11 +88,11 @@ class _FakeRosterPool:
 
 def test_stage_ena_run_roster_writes_ordered_parquet(tmp_path):
     """The pool's (prep_sample_idx, ena_run_accession) rows are materialized
-    to `run_map.parquet`, ordered by prep_sample_idx (the repo fetch's own
+    to `ena_run_map.parquet`, ordered by prep_sample_idx (the repo fetch's own
     ORDER BY — this asserts the resolver preserves it verbatim)."""
     pool = _FakeRosterPool([(82, "ERR002"), (81, "ERR001")])
     bound = asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
-    out = bound[RUN_MAP_BINDING]
+    out = bound[ENA_RUN_MAP_BINDING]
     assert out.exists()
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(
@@ -104,7 +104,7 @@ def test_stage_ena_run_roster_writes_ordered_parquet(tmp_path):
 
 def test_stage_ena_run_roster_rejects_empty_pool(tmp_path):
     """An empty pool fails loud (BAD_INPUT) — there is nothing to download,
-    and this must never silently produce a 0-row run_map."""
+    and this must never silently produce a 0-row ena_run_map."""
     pool = _FakeRosterPool([])
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
@@ -124,15 +124,15 @@ def test_stage_ena_run_roster_rejects_missing_accession(tmp_path):
 
 
 def test_workflow_declares_run_map_binding_gate():
-    """`_workflow_declares_input` recognizes RUN_MAP_BINDING like any other
+    """`_workflow_declares_input` recognizes ENA_RUN_MAP_BINDING like any other
     declared input — the runner's dispatch branch in `_workflow.py` gates on
     exactly this, not on scope-kind, so it never fires for bcl-convert's
     (also sequenced_pool-scoped) ticket."""
-    ena_steps = [_step(inputs=["run_map", "reads_staging_root"], outputs=["read_staging_dir"])]
-    assert _workflow_declares_input(ena_steps, RUN_MAP_BINDING) is True
+    ena_steps = [_step(inputs=["ena_run_map", "reads_staging_root"], outputs=["read_staging_dir"])]
+    assert _workflow_declares_input(ena_steps, ENA_RUN_MAP_BINDING) is True
 
     bcl_steps = [_step(inputs=["convert_dir", "sample_map"], outputs=["read_staging_dir"])]
-    assert _workflow_declares_input(bcl_steps, RUN_MAP_BINDING) is False
+    assert _workflow_declares_input(bcl_steps, ENA_RUN_MAP_BINDING) is False
 
 
 _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"

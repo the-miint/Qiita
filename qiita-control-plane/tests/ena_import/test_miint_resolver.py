@@ -124,10 +124,10 @@ def test_resolve_study_header_rejects_non_study_accession(monkeypatch):
 def test_resolve_runs_maps_field_by_field(monkeypatch):
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
-    columns, rows = _load_fixture("runs.json")
+    columns, rows = _load_fixture("ena_runs.json")
     monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows))
 
-    runs = MiintEnaResolver().resolve_runs("PRJNA48739")
+    runs = MiintEnaResolver().resolve_ena_runs("PRJNA48739")
 
     assert_prjna48739_runs(runs)
 
@@ -138,7 +138,7 @@ def test_resolve_runs_zero_rows_is_not_found(monkeypatch):
     monkeypatch.setattr(_QUERY_RUNS, lambda accession: (["run_accession"], []))
 
     with pytest.raises(EnaAccessionNotFoundError, match="PRJEB00000000"):
-        MiintEnaResolver().resolve_runs("PRJEB00000000")
+        MiintEnaResolver().resolve_ena_runs("PRJEB00000000")
 
 
 def test_resolve_sample_attributes_pivots_by_sample(monkeypatch):
@@ -171,7 +171,7 @@ def test_resolve_runs_rejects_empty_accession(monkeypatch):
     monkeypatch.setattr(_QUERY_RUNS, lambda accession: pytest.fail("must not query"))
 
     with pytest.raises(InvalidEnaAccessionError):
-        MiintEnaResolver().resolve_runs("")
+        MiintEnaResolver().resolve_ena_runs("")
 
 
 # ---------------------------------------------------------------------------

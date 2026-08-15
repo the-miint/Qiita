@@ -67,7 +67,7 @@ def _entry_by_name(name: str):
     raise AssertionError(f"no action entry named {name!r} in download-ena-study YAML")
 
 
-def _write_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
+def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     """Write the `(prep_sample_idx, ena_run_accession)` roster Parquet the runner
     materializes for the step."""
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
@@ -260,11 +260,11 @@ async def test_ena_reads_land_in_ducklake_read_via_register_files(
         (prep_paired, _PAIRED_RUN_ACCESSION),
         (prep_single, _SINGLE_RUN_ACCESSION),
     ]
-    run_map_path = tmp_path / "run_map.parquet"
-    _write_run_map(run_map_path, roster)
+    ena_run_map_path = tmp_path / "ena_run_map.parquet"
+    _write_ena_run_map(ena_run_map_path, roster)
 
     inputs = ingest_ena_reads.Inputs(
-        run_map=run_map_path,
+        ena_run_map=ena_run_map_path,
         reads_staging_root=tmp_path / "reads-staging",
         sequenced_pool_idx=1,
         sequencing_run_idx=1,

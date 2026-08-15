@@ -167,9 +167,9 @@ from ._processing import (
 )
 from ._read_ingest import (
     _REFERENCE_SEQUENCES_TABLE,
+    ENA_RUN_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
-    RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     SHARD_FEATURES_BINDING,
     SHARD_ID_BINDING,
@@ -189,7 +189,7 @@ from ._read_ingest import (
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
-    _write_run_map_parquet,
+    _write_ena_run_map_parquet,
     _write_sample_map_parquet,
     _write_shard_mapping_parquet,
 )
@@ -393,9 +393,9 @@ __all__: list[str] = [
     "_stage_shard_mapping",
     "_stage_shard_roster",
     "_workflow_needs_sharded_align_indexes",
-    "RUN_MAP_BINDING",
+    "ENA_RUN_MAP_BINDING",
     "_stage_ena_run_roster",
-    "_write_run_map_parquet",
+    "_write_ena_run_map_parquet",
     "_write_shard_mapping_parquet",
     "asyncio",
     "asyncpg",

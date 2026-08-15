@@ -227,7 +227,7 @@ async def download_ena_study_action(postgres_pool):
             "name": "ingest_ena_reads",
             "step_type": "singleton",
             "module": "qiita_compute_orchestrator.jobs.ingest_ena_reads",
-            "inputs": ["run_map", "reads_staging_root"],
+            "inputs": ["ena_run_map", "reads_staging_root"],
             "outputs": ["read_staging_dir"],
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         }

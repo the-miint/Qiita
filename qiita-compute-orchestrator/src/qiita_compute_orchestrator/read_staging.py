@@ -123,7 +123,7 @@ def read_roster_parquet(
     on an empty or unreadable roster.
 
     The one place the roster-reading shape lives, so `ingest_reads`
-    (`sample_map` / `pool_item_id`) and `ingest_ena_reads` (`run_map` /
+    (`sample_map` / `pool_item_id`) and `ingest_ena_reads` (`ena_run_map` /
     `ena_run_accession`) cannot silently diverge. `value_column` and
     `roster_name` are trusted internal literals from the two callers, never user
     input (DuckDB can't bind an identifier, hence the interpolation)."""

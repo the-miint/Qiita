@@ -85,7 +85,7 @@ def _write_intermediate(
         )
 
 
-def _write_run_map(path, roster: list[tuple[int, str]]) -> None:
+def _write_ena_run_map(path, roster: list[tuple[int, str]]) -> None:
     """Write the `(prep_sample_idx, ena_run_accession)` roster Parquet the
     runner materializes for the step."""
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
@@ -106,10 +106,10 @@ def _durable_rows(staging_root, prep_sample_idx) -> list[tuple]:
 
 
 def _inputs(tmp_path, roster: list[tuple[int, str]]) -> Inputs:
-    run_map = tmp_path / "run_map.parquet"
-    _write_run_map(run_map, roster)
+    ena_run_map = tmp_path / "ena_run_map.parquet"
+    _write_ena_run_map(ena_run_map, roster)
     return Inputs(
-        run_map=run_map,
+        ena_run_map=ena_run_map,
         reads_staging_root=tmp_path / "staging",
         sequenced_pool_idx=5,
         sequencing_run_idx=3,
@@ -440,23 +440,23 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
 
 
 def test_empty_run_map_raises_value_error(tmp_path):
-    """An empty run_map.parquet is a resolver/dispatch bug, not a legitimate
+    """An empty ena_run_map.parquet is a resolver/dispatch bug, not a legitimate
     empty ticket — ValueError -> BAD_INPUT via the framework dispatcher."""
-    run_map = tmp_path / "run_map.parquet"
+    ena_run_map = tmp_path / "ena_run_map.parquet"
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             "COPY (SELECT * FROM (VALUES (1, 'x')) "
             "AS t(prep_sample_idx, ena_run_accession) WHERE false) "
-            f"TO '{run_map}' (FORMAT parquet)"
+            f"TO '{ena_run_map}' (FORMAT parquet)"
         )
     inputs = Inputs(
-        run_map=run_map,
+        ena_run_map=ena_run_map,
         reads_staging_root=tmp_path / "staging",
         sequenced_pool_idx=5,
         sequencing_run_idx=3,
         work_ticket_idx=_WORK_TICKET_IDX,
     )
-    with pytest.raises(ValueError, match="run_map is empty"):
+    with pytest.raises(ValueError, match="ena_run_map is empty"):
         _run(inputs, tmp_path / "ws")
 
 

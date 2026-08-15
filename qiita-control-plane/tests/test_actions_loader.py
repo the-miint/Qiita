@@ -1005,7 +1005,7 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
     ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
     assert ingest.module == "qiita_compute_orchestrator.jobs.ingest_ena_reads"
     assert ingest.container is None
-    assert ingest.inputs == ["run_map", "reads_staging_root"]
+    assert ingest.inputs == ["ena_run_map", "reads_staging_root"]
     assert ingest.params == {"download_method": "download_method"}
     assert ingest.outputs == ["read_staging_dir"]
 
@@ -1017,6 +1017,23 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
 
     # The inert placeholder must be gone now that the real workflow has landed.
     assert not (repo_root / "workflows" / "download-ena-study" / "workflow.yaml").exists()
+
+
+def test_download_ena_study_yaml_declares_ena_run_map_binding():
+    """Checks the YAML against the constant, not a second copy of the string:
+    input wiring matches by name, so a half-done rename only surfaces at
+    dispatch."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.runner import ENA_RUN_MAP_BINDING
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    dl = next(a for a in actions if a.action_id == "download-ena-study")
+    ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
+
+    assert ENA_RUN_MAP_BINDING in ingest.inputs
 
 
 def test_load_actions_loads_on_disk_read_mask_block_yaml():

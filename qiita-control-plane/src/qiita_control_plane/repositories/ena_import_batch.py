@@ -63,25 +63,25 @@ async def update_ena_import_batch_item_registered(
     item_idx: int,
     study_idx: int,
     study_created: bool,
-    run_outcomes: list[dict[str, Any]],
+    ena_run_outcomes: list[dict[str, Any]],
 ) -> None:
     """Record a study's registration on its batch item, state -> 'registered'.
 
     `study_created = study_created OR $5` is a self-referential SET clause
     Postgres evaluates atomically within the UPDATE -- a re-drive that passes
     `study_created=False` for an item already True cannot flip it back.
-    asyncpg has no default jsonb codec, so `run_outcomes` is written as a
+    asyncpg has no default jsonb codec, so `ena_run_outcomes` is written as a
     string + `::jsonb`.
     """
     await conn.execute(
         "UPDATE qiita.ena_import_batch_item"
-        " SET state = $2, study_idx = $3, run_outcomes = $4::jsonb,"
+        " SET state = $2, study_idx = $3, ena_run_outcomes = $4::jsonb,"
         "     study_created = study_created OR $5, failure_reason = NULL"
         " WHERE idx = $1",
         item_idx,
         BatchItemState.REGISTERED.value,
         study_idx,
-        json.dumps(run_outcomes),
+        json.dumps(ena_run_outcomes),
         study_created,
     )
 
@@ -182,7 +182,7 @@ async def fetch_ena_import_batch_items(
     """All qiita.ena_import_batch_item rows for `batch_idx`, ordered by idx."""
     return await pool_or_conn.fetch(
         "SELECT idx, ena_study_accession, state, failure_reason, study_idx,"
-        "       download_work_ticket_idxs, run_outcomes"
+        "       download_work_ticket_idxs, ena_run_outcomes"
         " FROM qiita.ena_import_batch_item"
         " WHERE batch_idx = $1"
         " ORDER BY idx",

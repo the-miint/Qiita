@@ -476,7 +476,7 @@ async def fetch_sequenced_pool_samples(
     return list(rows)
 
 
-async def fetch_sequenced_pool_run_roster(
+async def fetch_sequenced_pool_ena_run_roster(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     sequenced_pool_idx: int,
@@ -486,7 +486,7 @@ async def fetch_sequenced_pool_run_roster(
 
     The `ingest_ena_reads` download-job's roster source: the CO has no DB
     access, so the CP runner (`runner._read_ingest._stage_ena_run_roster`)
-    calls this before the step loop and stages the result as `run_map.parquet`.
+    calls this before the step loop and stages the result as `ena_run_map.parquet`.
     Unlike `fetch_sequenced_pool_samples` (the richer per-sample projection
     submit-host-filter-pool fans out over, with its biosample join and
     has_read_mask_ticket EXISTS), this is the minimal two-column projection the

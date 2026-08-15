@@ -29,9 +29,9 @@ from .protocol_mapping import (
 )
 from .registration import (
     CreatedPool,
+    EnaRunRegistrationOutcome,
+    EnaRunRegistrationStatus,
     EnaStudyRegistrationResult,
-    RunRegistrationOutcome,
-    RunRegistrationStatus,
     register_ena_study,
 )
 from .resolver import EnaAccessionNotFoundError
@@ -48,12 +48,12 @@ __all__ = [
     "CreatedPool",
     "EnaAccessionKind",
     "EnaAccessionNotFoundError",
+    "EnaRunRegistrationOutcome",
+    "EnaRunRegistrationStatus",
     "EnaStudyRegistrationResult",
     "HarmonizationResult",
     "InvalidEnaAccessionError",
     "MiintEnaResolver",
-    "RunRegistrationOutcome",
-    "RunRegistrationStatus",
     "UnmappableEnaLibraryStrategyError",
     "UnmappableEnaPlatformError",
     "build_download_ena_study_ticket",

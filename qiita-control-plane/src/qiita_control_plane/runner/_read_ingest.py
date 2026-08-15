@@ -22,7 +22,7 @@ from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
-from ..repositories.sequenced_sample import fetch_sequenced_pool_run_roster
+from ..repositories.sequenced_sample import fetch_sequenced_pool_ena_run_roster
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ READS_STAGING_ROOT_BINDING = "reads_staging_root"
 # by DECLARED-INPUT NAME (`_workflow_declares_input`), not scope-kind — both
 # bcl-convert and download-ena-study are sequenced_pool-scoped, so keying off
 # scope-kind would wire this resolver into bcl-convert's ticket too.
-RUN_MAP_BINDING = "run_map"
+ENA_RUN_MAP_BINDING = "ena_run_map"
 
 
 # Bindings a sharded build ticket's build steps consume: the per-shard feature
@@ -302,7 +302,7 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
     return {SAMPLE_MAP_BINDING: out}
 
 
-def _write_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) -> None:
+def _write_ena_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) -> None:
     """Write the `{prep_sample_idx, ena_run_accession}` roster to a Parquet
     `(prep_sample_idx BIGINT, ena_run_accession VARCHAR)` for the
     `ingest_ena_reads` step. pyarrow (already a Flight dependency) writes it
@@ -330,7 +330,7 @@ async def _stage_ena_run_roster(
     """Stage the download-ena-study pool's run roster before the step loop.
 
     SOURCE is a LIVE Postgres query (`repositories.sequenced_sample.
-    fetch_sequenced_pool_run_roster`), unlike `_resolve_sample_map`'s
+    fetch_sequenced_pool_ena_run_roster`), unlike `_resolve_sample_map`'s
     action_context-embedded roster: bcl-convert's submitter enumerates its own
     freshly-created samples and can embed them at submit time, but a
     download-ena-study ticket is submitted by the batch driver against a
@@ -346,7 +346,7 @@ async def _stage_ena_run_roster(
     against ENA-origin sequenced_samples, so a NULL accession is a
     misconfiguration (e.g. a non-ENA sample sharing the pool) that must never
     be silently skipped out of the roster."""
-    rows = await fetch_sequenced_pool_run_roster(pool, sequenced_pool_idx=sequenced_pool_idx)
+    rows = await fetch_sequenced_pool_ena_run_roster(pool, sequenced_pool_idx=sequenced_pool_idx)
     if not rows:
         raise _submission_bad_input(
             f"sequenced_pool {sequenced_pool_idx} has no sequenced_samples to build "
@@ -360,9 +360,9 @@ async def _stage_ena_run_roster(
         )
     roster = [(r["prep_sample_idx"], r["ena_run_accession"]) for r in rows]
     workspace.mkdir(parents=True, exist_ok=True)
-    out = workspace / "run_map.parquet"
-    _write_run_map_parquet(roster, out)
-    return {RUN_MAP_BINDING: out}
+    out = workspace / "ena_run_map.parquet"
+    _write_ena_run_map_parquet(roster, out)
+    return {ENA_RUN_MAP_BINDING: out}
 
 
 def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:
