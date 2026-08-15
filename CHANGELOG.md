@@ -75,12 +75,11 @@ duplicates further down are historical strata; leave them where they are.
   `ena_import.attribute_mapping.map_ena_attributes` into globally-linked
   metadata (cross-study comparable) and study-local metadata (retained
   verbatim, never dropped). `known_missing_reasons` is wired into the shared
-  `preflight_global_metadata` helper so an INSDC missing-value string (`not
+  `preflight_sample_metadata` helper so an INSDC missing-value string (`not
   collected`, ...) resolves as a missing-value marker instead of raising a
-  parse error. A checklist-required field ENA did not supply is reported on
-  the new `HarmonizationResult.missing_required` — never rejected; only a
-  genuine parse/type/collision failure fails that run, isolated exactly like
-  a platform/protocol-mapping failure. `host`, `taxon_id`, `host_taxon_id`,
+  parse error. A checklist-required field ENA did not supply is not rejected;
+  only a genuine parse/type/collision failure fails that run, isolated exactly
+  like a platform/protocol-mapping failure. `host`, `taxon_id`, `host_taxon_id`,
   and the GSC-MIxS broad-scale/local/medium environmental-context tags are
   deliberately left unmapped — resolving them onto their (NCBI Taxonomy- or
   ENVO-)terminology-typed global fields would fabricate an ontology-term
@@ -469,6 +468,22 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **ENA harmonization called sample-metadata helpers that no longer exist
+  (#369).** `ena_import/harmonization.py` imported `preflight_global_metadata`
+  and `write_global_metadata_entries`; both names went away when `main` merged
+  in and the import block was never updated, so `import
+  qiita_control_plane.routes` failed outright. Now calls
+  `preflight_sample_metadata` and `write_resolved_metadata_entries`, with
+  `allow_local=False` and `global_internal_names=False` explicit
+  (`map_ena_attributes` keys on `display_name`) and `on_conflict` left at
+  `"raise"`, so a second study sharing a biosample still cannot overwrite the
+  first import's global values.
+- **ENA run fixtures were left untyped by the coercion removal (#369).**
+  Removing `EnaRunRecord`'s boundary coercion made its list and int fields
+  strict, but the fixture update that followed missed values and the
+  `_fake_runs` helpers still built rows with empty-string placeholders, failing
+  validation in every test constructing one. Retyped the fixtures and helpers;
+  the recorded ENA values themselves are unchanged.
 - **miint staging gate now notices a missing `httpfs` (#369).**
   `staging_is_current` fingerprinted the miint object alone, so on a host whose
   miint stage was already current the deploy took the skip branch and never ran
@@ -981,6 +996,23 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **ENA import SQL moved into `repositories/` (#369).** `ena_import/batch.py`
+  held twelve queries alongside the batch driver and the status rollup. They
+  now live in a new `repositories/ena_import_batch.py`, and `ena_import/`
+  reaches the database only through repository functions. The transaction
+  spanning the per-accession insert loop and the per-item rollup in
+  `fetch_batch_status` stay in `batch.py`: both are orchestration, and
+  repository functions do not own transaction scope. The two `work_ticket`
+  lookups live in the same module rather than a new `repositories/work_ticket.py`,
+  matching how `work_ticket` SQL is already written next to the domain using it.
+- **`insert_entity_to_study` takes an `on_conflict` mode (#369).** New
+  `LinkConflictMode = Literal["raise", "ignore"]`, defaulting to `"raise"`: its
+  existing callers link a freshly minted entity, where a collision is a bug. A
+  link row has no value to overwrite, only existence, so the non-raising mode is
+  `ON CONFLICT DO NOTHING` rather than the `"upsert"` that
+  `MetadataConflictMode` means. Replaces the ENA path's hand-written
+  `ensure_biosample_linked_to_study`, where a repeat `(biosample, study)` pair
+  is expected — many ENA runs share a biosample and re-import is supported.
 - **ENA import: `run` renamed to `ena_run` throughout (#369).** "Run" is
   overloaded in this domain — Qiita's own `sequencing_run` vs. ENA's "one
   sequencing of a prepped sample" — so every identifier naming the latter now
@@ -1305,6 +1337,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Removed
 
+- **ENA import: the checklist-required gap report (#369).**
+  `metadata_checklist_field` has no implementation behind it yet, so reporting
+  which checklist-required fields ENA did not supply meant standing up a
+  placeholder for an unspecified entity. ENA enforces those fields at
+  submission and permits missing values, so the report rarely said anything
+  actionable and nothing downstream read it. Drops `missing_required` and
+  `checklist_name` from `HarmonizationResult`, `missing_required` from
+  `EnaRunImportOutcome` (and so from the `GET /ena-import-batch/{idx}`
+  response), and `_preserve_missing_required`, which existed only to carry the
+  field across a reconcile re-drive. `_set_item_registered` collapses to a
+  single `UPDATE`: its `SELECT ... FOR UPDATE` fed only that merge, and
+  `study_created = study_created OR $n` is evaluated atomically within the one
+  statement. `harmonization.py` now holds no SQL at all. The
+  `biosample.metadata_checklist_idx` binding is kept — it records which
+  checklist a sample was submitted under, using columns that already exist.
 - **ENA import: the batch's `download_method` (#369).** The batch persisted a
   transport and threaded it into every ticket it submitted. The download job
   already owns that choice and defaults it, so a re-drive had no business

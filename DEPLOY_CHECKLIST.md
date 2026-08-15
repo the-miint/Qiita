@@ -34,7 +34,9 @@ _None yet._
 - `make verify-deploy`'s workflow-actions check already lists every
   row; confirm it includes `download-ena-study 1.0.0` (new `workflows/`
   entry, picked up by the standing `qiita-admin actions sync` inside
-  `activate.sh` — no extra operator step).
+  `activate.sh` — no extra operator step). Its `ingest_ena_reads` step
+  declares the `ena_run_map` input; a stale synced copy naming `run_map`
+  means `actions sync` did not run.
 - (#381) Confirm the synced `align 1.0.0` action carries the
   raised `align_sharded` baseline. `actions sync` runs inside `activate.sh`, so this
   only checks it took — if the row still reads `cpu: 4` / `mem_gb: 32`, align blocks
