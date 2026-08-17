@@ -59,24 +59,36 @@ _None yet._
   rows already there. Measured 2026-08-13: 53,698 of 129,290 assembly features had two
   copies, so their `string_agg(chunk_data, '' ORDER BY chunk_index)` is twice
   `sequence_length_bp`. Run AFTER bucket 5 — before the new build is live the next load
-  re-duplicates. **One-off**: nothing after this deploy can create these rows, so this step
-  is archived with the deploy and not carried forward.
+  re-duplicates. One-off: nothing after this deploy can create these rows.
 
-  Run as `qiita-data`, the only account that can write the lake data path, with a duckdb CLI
-  matching the data plane's DuckDB (1.5.4). Read `DUCKLAKE_CATALOG_CONNSTR` and
-  `PATH_PERSISTENT` from `/etc/qiita/data-plane.env`; `DATA_PATH` is
-  `$PATH_PERSISTENT/ducklake` verbatim, trailing slash included — DuckLake rejects an attach
-  whose `DATA_PATH` differs by even a slash.
+  Run it as `qiita-data`, the only account that can write the lake data path. It is a
+  non-login account, so `sudo -u qiita-data`, and give `duckdb` an absolute path — nothing
+  is on that account's `PATH`, and it has no home to install into. Use the same DuckDB the
+  data plane links; `scripts/lake-shell.sh` pins the version and carries an install recipe.
 
-  `SET home_directory` is not optional: `qiita-data` is a non-login account whose `$HOME` is
-  `/dev/null`, and `INSTALL` resolves against `$HOME/.duckdb` and dies with `Can't find the
-  home directory` without it.
+  `scripts/lake-shell.sh` already derives everything this needs from
+  `/etc/qiita/data-plane.env` and is worth reading first for the two traps it encodes:
+  `DATA_PATH` is `$PATH_PERSISTENT/ducklake` **verbatim**, trailing slash included (DuckLake
+  rejects an attach differing by a slash), and the catalog password must not reach a file or
+  argv. Take the password out of `DUCKLAKE_CATALOG_CONNSTR` before pasting it below and hand
+  it to libpq instead:
 
-  Save the block below as `collapse.sql` and run `duckdb -bail -f collapse.sql` **once per
-  table pair** — substitute `assembled_sequence` / `assembled_sequence_chunks`, then
-  `reference_sequences` / `reference_sequence_chunks`. `-bail` is the CLI flag, not the
-  `.bail on` dot-command: a dot-command is only recognised at column 0, so a copy-paste that
-  picks up this block's indentation would silently run on without it.
+  ```bash
+  umask 077   # collapse.sql is read by duckdb only; do not leave it group-readable
+  printf '*:*:*:%s:%s\n' "$LAKE_USER" "$LAKE_PASSWORD" > ~/pgpass && chmod 600 ~/pgpass
+  sudo -u qiita-data env PGPASSFILE=~/pgpass /usr/local/bin/duckdb -bail -f collapse.sql
+  rm -f ~/pgpass collapse.sql
+  ```
+
+  `SET home_directory` in the block is not optional: `INSTALL` resolves against
+  `$HOME/.duckdb`, and `qiita-data`'s `$HOME` is `/dev/null`, which fails with `Can't find
+  the home directory`.
+
+  The `collapse.sql` the command above runs is below. Run it **once per table pair** —
+  substitute `assembled_sequence` / `assembled_sequence_chunks`, then `reference_sequences` /
+  `reference_sequence_chunks`. `-bail` is the CLI flag, not the `.bail on` dot-command: a
+  dot-command is only recognised at column 0, so a copy-paste that picks up this block's
+  indentation would silently run on without it.
 
   ```sql
   -- Substitute <CONNSTR>, <DATA_PATH>, <SEQ>, <CHUNKS>.
@@ -137,19 +149,27 @@ _None yet._
     (SELECT count(*) FROM (SELECT feature_idx FROM qiita_lake.<SEQ>
        SEMI JOIN dup_feature USING (feature_idx)
        GROUP BY feature_idx HAVING count(*) > 1))                       AS dups,
-    (SELECT count(*) FROM (SELECT s.feature_idx FROM qiita_lake.<SEQ> s
-       JOIN qiita_lake.<CHUNKS> c USING (feature_idx)
-       SEMI JOIN dup_feature d ON d.feature_idx = s.feature_idx
-       GROUP BY s.feature_idx, s.sequence_length_bp
-      HAVING length(string_agg(c.chunk_data, '' ORDER BY c.chunk_index))
-             <> s.sequence_length_bp))                                  AS mismatches);
+    -- sum(length(...)) rather than length(string_agg(...)): same number, without
+    -- sorting and rebuilding every sequence just to measure it. Winnowed to the
+    -- collapsed features before the join, not after.
+    (SELECT count(*) FROM (
+       SELECT s.feature_idx
+         FROM (SELECT * FROM qiita_lake.<SEQ> SEMI JOIN dup_feature USING (feature_idx)) s
+         JOIN (SELECT * FROM qiita_lake.<CHUNKS> SEMI JOIN dup_feature USING (feature_idx)) c
+           USING (feature_idx)
+        GROUP BY s.feature_idx, s.sequence_length_bp
+       HAVING sum(length(c.chunk_data)) <> s.sequence_length_bp))       AS mismatches);
   COMMIT;
   ```
 
   `ambiguous_features` is expected to be **0**. If any appear, re-run the producing load
-  (which now replaces on the key) rather than picking a copy by hand. Quiesce loads while
-  this runs: it and a concurrent `register-files` both write these tables, and one of the two
-  will abort with a DuckLake transaction conflict. Safe to re-run. (#457)
+  (which now replaces on the key) rather than picking a copy by hand.
+
+  **Quiesce loads while this runs.** This collapse does not take the `registration_lock` a
+  `register-files` does, so the two are not serialized against each other; where they touch
+  the same rows one will abort with a DuckLake transaction conflict, and the one that loses
+  may be the load — which cannot be retried from the top, because its staging files have
+  already been moved. The collapse itself is safe to re-run. (#457)
 
 ### Notes (no host action)
 

@@ -12,10 +12,12 @@ Both writers emit the run's whole feature set, a feature another run
 already loaded included — a native job has no DuckLake access, so there
 is nothing here to anti-join against. Convergence happens at register
 time instead: the data plane replaces these tables on `feature_idx`
-rather than appending (`flight_service::REPLACE_KEY_TABLES`), which
-requires each output to carry every chunk of every `feature_idx` it
-mentions. Split one feature across two parts and the replace drops the
-half that arrives in neither.
+rather than appending (`flight_service::REPLACE_KEY_TABLES`). What that
+requires is that a feature's rows all arrive in ONE registration, not in
+one part — the replace unions the keys of every part headed for a table
+before deleting anything, so a feature spread across several parts of
+the same load is covered. The runner satisfies this by enumerating the
+whole staging directory into a single register-files action.
 
 This is a **private shared helper**, not a dispatchable native job: it
 exports neither `Inputs` nor `execute`, and its leading-underscore name

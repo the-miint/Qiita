@@ -937,6 +937,10 @@ duplicates further down are historical strata; leave them where they are.
   contend for (measured: back to 1 row), and retries its own transaction when it loses rather
   than failing the ticket — it cannot be retried from the top, because its staging files were
   already moved. Registrations touching none of those tables skip the lock and never contend.
+  `delete_reference` takes the same lock and retry, because it writes two of the same tables:
+  without the lock a registration could add a feature between its snapshot and its commit,
+  where the orphan filter would not see the claim, and without the retry a registration's
+  delete could newly conflict it out.
 
 - **A retired `exported_feature` row could be edited out of the published namespace
   (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has

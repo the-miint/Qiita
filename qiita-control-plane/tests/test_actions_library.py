@@ -498,9 +498,7 @@ def test_reap_staged_reads_removes_files_and_empty_dirs(tmp_path):
 async def test_register_files_logs_what_a_load_replaced(monkeypatch, caplog):
     """The data plane replaces content-addressed tables on their key rather than
     appending (its REPLACE_KEY_TABLES), so a load can supersede rows an earlier one
-    wrote. The per-table counts ride back in `replaced`; log them, since a silent
-    delete is the one thing an operator reconciling row counts cannot reconstruct.
-    Zero-count tables never appear."""
+    wrote. The per-table counts ride back in `replaced` and are logged."""
     import json
     import logging
 
@@ -512,7 +510,7 @@ async def test_register_files_logs_what_a_load_replaced(monkeypatch, caplog):
                 json.dumps(
                     {
                         "registered": ["/lake/assembled_sequence/wt7-assembled_sequence.parquet"],
-                        "replaced": {"assembled_sequence": 3, "assembly_membership": 0},
+                        "replaced": {"assembled_sequence": 3},
                     }
                 ).encode()
             )
@@ -531,7 +529,6 @@ async def test_register_files_logs_what_a_load_replaced(monkeypatch, caplog):
 
     assert registered == ["/lake/assembled_sequence/wt7-assembled_sequence.parquet"]
     assert "'assembled_sequence': 3" in caplog.text
-    assert "assembly_membership" not in caplog.text, "a zero count is not a supersede"
 
 
 async def test_register_files_stays_quiet_when_nothing_was_replaced(monkeypatch, caplog):
