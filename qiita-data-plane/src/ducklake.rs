@@ -496,6 +496,36 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// already-attached catalog. Must run AFTER `ensure_reference_tables` +
 /// `ensure_alignment_tables` (the views reference `reference_taxonomy` +
 /// `alignment`).
+/// Create the single-row table registrations serialize on.
+///
+/// DuckLake gives snapshot isolation and no constraints, and it detects a
+/// conflict between two transactions only where they touch the SAME EXISTING
+/// row. That is enough for `register_files`' replace-by-key pass whenever the
+/// feature is already in the lake — every writer's DELETE targets the same rows,
+/// so they conflict and serialize. It is NOT enough when the feature is new:
+/// no DELETE matches anything, there is nothing to conflict on, and every writer
+/// commits its own copy. Measured against a DuckLake catalog with 4 concurrent
+/// writers of one feature: 1 row when it already existed, 4 when it did not.
+///
+/// So a registration that touches a content-addressed table bumps this row
+/// inside its transaction, giving concurrent writers a row they all contend for
+/// and turning "both commit" into "one commits, the rest retry". Measured on the
+/// same fixture: 1 row for 4 concurrent first loads.
+///
+/// The stored value is not read by anything — only the write matters. It is a
+/// counter rather than a constant so the UPDATE is unmistakably a mutation.
+pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.registration_lock (epoch BIGINT NOT NULL);
+         -- Guarded so a restart does not add a second row. Two data planes booting
+         -- at once could still race to insert; that is harmless, because an extra
+         -- row is one more thing every writer updates, not one fewer.
+         INSERT INTO qiita_lake.registration_lock (epoch)
+         SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.registration_lock);",
+    )?;
+    Ok(())
+}
+
 pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- Resolved excluded feature_idx set, mirrored wholesale from the CP

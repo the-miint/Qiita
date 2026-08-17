@@ -926,13 +926,17 @@ duplicates further down are historical strata; leave them where they are.
   on one `feature_idx` — the newest load's bytes now win; before, both were kept and read
   back concatenated, which is neither strand and matches no declared length.
 
-- **`scripts/dedup-lake-sequence-tables.sh` collapses rows written before that fix
-  (#457).** A report by default, `APPLY=1` to collapse, over both content-addressed table
-  pairs. It only collapses features whose copies are byte-identical (a plain `DISTINCT`, so
-  no copy is picked over another); a feature whose copies DIFFER is reported and left alone,
-  because the canonical hash keeps a sequence and its reverse complement on one `feature_idx`
-  and no column records which chunk came from which load — picking per `chunk_index` could
-  splice two strands into one sequence.
+- **Concurrent registrations of one feature no longer each kept a copy (#457).** The
+  replace-by-key delete above closes the race only where the feature is ALREADY in the lake:
+  DuckLake detects a conflict where two transactions touch the same existing row, so those
+  writers serialize. When the feature is NEW, nobody's delete matches, nothing conflicts, and
+  every writer commits — measured with 4 concurrent writers of one feature: 1 row when it
+  already existed, 4 when it did not, and 4 for two bare `ducklake_add_data_files` with no
+  delete at all. A registration touching a content-addressed table now bumps the single-row
+  `qiita_lake.registration_lock` inside its transaction, giving concurrent writers a row to
+  contend for (measured: back to 1 row), and retries its own transaction when it loses rather
+  than failing the ticket — it cannot be retried from the top, because its staging files were
+  already moved. Registrations touching none of those tables skip the lock and never contend.
 
 - **A retired `exported_feature` row could be edited out of the published namespace
   (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has

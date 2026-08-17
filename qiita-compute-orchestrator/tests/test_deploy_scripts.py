@@ -1,4 +1,4 @@
-"""Smoke-check the repo's operator shell scripts (deploy/*.sh, scripts/*.sh).
+"""Smoke-check the deploy shell scripts (deploy/*.sh).
 
 These run on the Linux deploy host, not in CI's Python env, so they have no
 unit-test harness of their own. This pure-unit guard (under `make test`) catches
@@ -26,7 +26,6 @@ _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
 _BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
 _LAKE_SHELL = _REPO_ROOT / "scripts" / "lake-shell.sh"
-_DEDUP_LAKE = _REPO_ROOT / "scripts" / "dedup-lake-sequence-tables.sh"
 
 # The scripts introduced/maintained for the deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
@@ -37,10 +36,6 @@ _SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh", "build-sifs.sh")
 # scripts rely on, so it gets the same bash -n + shellcheck gate — but NOT the
 # executable-bit check below, since it's never run directly.
 _SOURCED = ("_common.sh",)
-
-# Operator scripts outside deploy/. Same exists/parse/shellcheck gate; kept
-# explicit (not a glob) so a new one is a deliberate add here.
-_REPO_SCRIPTS = (_BUILD_SIF, _LAKE_SHELL, _DEDUP_LAKE)
 
 
 @pytest.mark.parametrize("name", _SCRIPTS)
@@ -377,32 +372,30 @@ def test_paths_touch_cli_no_match(paths: str) -> None:
     assert _call_paths_touch_cli(paths).returncode == 1
 
 
-# --- The scripts/ operator tools. All three source deploy/_common.sh, so they get
-# the same bash -n + shellcheck gate as the deploy scripts. The `# shellcheck
-# source=` directive in each keeps the cross-dir source from flagging. ----------
+# --- scripts/build-sif.sh: now sources deploy/_common.sh for the build-inputs
+# hash, so it gets the same bash -n + shellcheck gate as the deploy scripts. ------
 
 
-@pytest.mark.parametrize("path", _REPO_SCRIPTS, ids=lambda p: p.name)
-def test_repo_script_exists_and_executable(path: Path) -> None:
-    assert path.is_file(), f"{path} missing"
-    assert path.stat().st_mode & 0o111, f"{path} is not executable"
+def test_build_sif_exists_and_executable() -> None:
+    assert _BUILD_SIF.is_file(), f"{_BUILD_SIF} missing"
+    assert _BUILD_SIF.stat().st_mode & 0o111, f"{_BUILD_SIF} is not executable"
 
 
-@pytest.mark.parametrize("path", _REPO_SCRIPTS, ids=lambda p: p.name)
-def test_repo_script_is_valid_bash(path: Path) -> None:
-    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
-    assert result.returncode == 0, f"bash -n failed for {path.name}:\n{result.stderr}"
+def test_build_sif_is_valid_bash() -> None:
+    result = subprocess.run(["bash", "-n", str(_BUILD_SIF)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for build-sif.sh:\n{result.stderr}"
 
 
-@pytest.mark.parametrize("path", _REPO_SCRIPTS, ids=lambda p: p.name)
-def test_repo_script_passes_shellcheck(path: Path) -> None:
+def test_build_sif_passes_shellcheck() -> None:
     if shutil.which("shellcheck") is None:
         pytest.skip("shellcheck not installed")
+    # -S warning to match the deploy-script gate above; the `# shellcheck source=`
+    # directive in build-sif.sh keeps the cross-dir _common.sh source from flagging.
     result = subprocess.run(
-        ["shellcheck", "-S", "warning", str(path)], capture_output=True, text=True
+        ["shellcheck", "-S", "warning", str(_BUILD_SIF)], capture_output=True, text=True
     )
     assert result.returncode == 0, (
-        f"shellcheck flagged {path.name}:\n{result.stdout}\n{result.stderr}"
+        f"shellcheck flagged build-sif.sh:\n{result.stdout}\n{result.stderr}"
     )
 
 
@@ -630,56 +623,41 @@ def test_missing_sources_some_missing_returns_one_and_lists_them(tmp_path: Path)
     assert "present.rpm" not in missing
 
 
-# --- scripts/lake-shell.sh: the read-only DuckLake/CP shell.
+# --- scripts/lake-shell.sh: the read-only DuckLake/CP shell. Sources
+# deploy/_common.sh for read_env_var + qiita_split_conn_password, so it gets the
+# same bash -n + shellcheck gate as the deploy scripts. ------------------------
 
 
-def test_lake_data_path_derivation_matches_the_data_plane() -> None:
-    """DuckLake pins DATA_PATH into the catalog at creation and rejects an attach
-    whose DATA_PATH differs by even a slash, so the shared helper must reproduce
-    config.rs's bare `format!("{path_persistent_raw}/ducklake")` — no trailing-slash
-    normalization. A `${persistent%/}` here breaks every host whose
-    PATH_PERSISTENT ends in `/`."""
-    body = _COMMON.read_text()
-    assert 'data_path="${persistent}/ducklake"' in body
-    assert "persistent%/" not in body
+def test_lake_shell_exists_and_executable() -> None:
+    assert _LAKE_SHELL.is_file(), f"{_LAKE_SHELL} missing"
+    assert _LAKE_SHELL.stat().st_mode & 0o111, f"{_LAKE_SHELL} is not executable"
 
 
-def test_lake_data_path_echoes_the_derived_path(tmp_path: Path) -> None:
-    """And the helper derives it in practice, trailing slash carried through."""
-    persistent = tmp_path / "p/"
-    (persistent / "ducklake").mkdir(parents=True)
-    env_file = tmp_path / "data-plane.env"
-    env_file.write_text(f"PATH_PERSISTENT={persistent}\n")
+def test_lake_shell_is_valid_bash() -> None:
+    result = subprocess.run(["bash", "-n", str(_LAKE_SHELL)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for lake-shell.sh:\n{result.stderr}"
+
+
+def test_lake_shell_passes_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
     result = subprocess.run(
-        ["bash", "-c", f'source "{_COMMON}"; qiita_lake_data_path "$1"', "_", str(env_file)],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["shellcheck", "-S", "warning", str(_LAKE_SHELL)], capture_output=True, text=True
     )
-    assert result.stdout == f"{persistent}/ducklake"
+    assert result.returncode == 0, (
+        f"shellcheck flagged lake-shell.sh:\n{result.stdout}\n{result.stderr}"
+    )
 
 
-def test_lake_data_path_fails_when_unset_or_absent(tmp_path: Path) -> None:
-    """Both callers `|| exit 1` on it, so it must return non-zero rather than echo
-    an empty path that would ATTACH somewhere unintended."""
-    env_file = tmp_path / "data-plane.env"
-    env_file.write_text("OTHER=1\n")
-    unset = subprocess.run(
-        ["bash", "-c", f'source "{_COMMON}"; qiita_lake_data_path "$1"', "_", str(env_file)],
-        capture_output=True,
-        text=True,
-    )
-    assert unset.returncode == 1
-    assert "PATH_PERSISTENT" in unset.stderr
-
-    env_file.write_text(f"PATH_PERSISTENT={tmp_path / 'nope'}\n")
-    absent = subprocess.run(
-        ["bash", "-c", f'source "{_COMMON}"; qiita_lake_data_path "$1"', "_", str(env_file)],
-        capture_output=True,
-        text=True,
-    )
-    assert absent.returncode == 1
-    assert "not a directory" in absent.stderr
+def test_lake_shell_derives_data_path_exactly_like_the_data_plane() -> None:
+    """DuckLake pins DATA_PATH into the catalog at creation and rejects an attach
+    whose DATA_PATH differs by even a slash, so the script must reproduce
+    config.rs's bare `format!("{path_persistent_raw}/ducklake")` — no trailing-slash
+    normalization. A `${PERSISTENT%/}` here breaks every host whose
+    PATH_PERSISTENT ends in `/`."""
+    body = _LAKE_SHELL.read_text()
+    assert 'DATA_PATH="${PERSISTENT}/ducklake"' in body
+    assert "PERSISTENT%/" not in body
 
 
 def _call_split_conn_password(connstr: str) -> list[str]:
@@ -771,109 +749,3 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
     )
     assert result.returncode == 1, f"expected a hard failure, got:\n{result.stdout}"
     assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
-
-
-# --- scripts/dedup-lake-sequence-tables.sh: the emitted SQL, against a stub duckdb.
-
-
-def test_dedup_lake_covers_every_replace_key_table() -> None:
-    """The script's table pairs are a hand-written second copy of the data plane's
-    `REPLACE_KEY_TABLES`. Nothing else ties them together, so a fifth registry
-    entry would otherwise leave the collapse silently not covering it."""
-    registry = re.findall(
-        r'^\s*\("(\w+)", "\w+"\),',
-        (_REPO_ROOT / "qiita-data-plane" / "src" / "flight_service.rs")
-        .read_text()
-        .split("const REPLACE_KEY_TABLES", 1)[1]
-        .split("];", 1)[0],
-        re.MULTILINE,
-    )
-    assert registry, "REPLACE_KEY_TABLES entries not found — the parse drifted"
-    emitted = set(
-        re.findall(r"^\s*emit_pair_sql (\w+) (\w+)$", _DEDUP_LAKE.read_text(), re.MULTILINE)
-    )
-    covered = {table for pair in emitted for table in pair}
-    assert covered == set(registry), (
-        f"the collapse script covers {sorted(covered)} but REPLACE_KEY_TABLES holds "
-        f"{sorted(registry)}"
-    )
-
-
-def _run_dedup(
-    tmp_path: Path, *, apply: bool = False, connstr: str = "dbname=lake host=localhost user=lake_rw"
-) -> str:
-    """Run the script against a stub duckdb that prints the SQL file it is handed
-    (and its own argv), so the emitted statements can be asserted without a
-    catalog or a real CLI. `tests/integration/test_dedup_lake_sequence_tables.py`
-    executes that same SQL for real."""
-    persistent = tmp_path / "persistent"
-    (persistent / "ducklake").mkdir(parents=True, exist_ok=True)
-    dp_env = tmp_path / "data-plane.env"
-    dp_env.write_text(f"DUCKLAKE_CATALOG_CONNSTR='{connstr}'\nPATH_PERSISTENT={persistent}\n")
-    stub = tmp_path / "duckdb-stub"
-    stub.write_text('#!/bin/bash\ncat "$2"\necho "ARGV: $*"\n')
-    stub.chmod(0o755)
-
-    env = {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)}
-    if apply:
-        env["APPLY"] = "1"
-    else:
-        env.pop("APPLY", None)
-    result = subprocess.run(
-        ["bash", str(_DEDUP_LAKE)], capture_output=True, text=True, env=env, check=True
-    )
-    return result.stdout
-
-
-def test_dedup_lake_report_mode_attaches_read_only_and_writes_nothing(tmp_path: Path) -> None:
-    """The default run is a report. READ_ONLY on the attach is what makes that a
-    DuckDB-enforced property rather than a promise about the SQL below it."""
-    sql = _run_dedup(tmp_path, apply=False)
-    assert "READ_ONLY" in sql
-    for mutation in ("DELETE FROM qiita_lake.", "INSERT INTO qiita_lake."):
-        assert mutation not in sql, f"report mode emitted {mutation!r}"
-
-
-def test_dedup_lake_apply_mode_collapses_both_table_pairs(tmp_path: Path) -> None:
-    """APPLY=1 drops READ_ONLY and collapses both content-addressed pairs. The
-    collapse is a plain DISTINCT over the duplicated features — no per-chunk pick,
-    because picking per chunk_index could splice two strands of the same feature
-    into one sequence — and re-inserts ordered, so the collapsed rows keep the
-    feature_idx clustering the load path builds for row-group and file pruning."""
-    sql = _run_dedup(tmp_path, apply=True)
-    assert "READ_ONLY" not in sql
-    for seq, chunks in [
-        ("assembled_sequence", "assembled_sequence_chunks"),
-        ("reference_sequences", "reference_sequence_chunks"),
-    ]:
-        assert f"SELECT DISTINCT * FROM qiita_lake.{seq} SEMI JOIN dup_feature" in sql
-        assert f"SELECT DISTINCT * FROM qiita_lake.{chunks} SEMI JOIN dup_feature" in sql
-        assert f"DELETE FROM qiita_lake.{seq} WHERE feature_idx IN" in sql
-        assert (
-            f"INSERT INTO qiita_lake.{seq} SELECT * FROM keep_sequence ORDER BY feature_idx" in sql
-        )
-        assert f"DELETE FROM qiita_lake.{chunks} WHERE feature_idx IN" in sql
-        assert f"INSERT INTO qiita_lake.{chunks}" in sql
-    assert "SELECT * FROM keep_chunk ORDER BY feature_idx, chunk_index" in sql
-
-
-def test_dedup_lake_excludes_features_whose_copies_differ(tmp_path: Path) -> None:
-    """A feature's copies can legitimately hold different bytes — the canonical
-    hash keeps a sequence and its reverse complement on one feature_idx — and no
-    column records which chunk came from which load. Those are reported, then
-    removed from the collapse set."""
-    sql = _run_dedup(tmp_path, apply=True)
-    assert "HAVING count(DISTINCT chunk_data) > 1" in sql
-    assert (
-        "DELETE FROM dup_feature WHERE feature_idx IN (SELECT feature_idx FROM ambiguous_feature)"
-        in sql
-    )
-
-
-def test_dedup_lake_keeps_the_catalog_password_out_of_the_sql(tmp_path: Path) -> None:
-    """The password goes to libpq through a 0600 PGPASSFILE, never into the SQL
-    file (readable for as long as it exists) or argv (world-readable via /proc).
-    The stub echoes both, so this sees everything the real CLI would."""
-    out = _run_dedup(tmp_path, connstr="dbname=lake host=localhost user=lake_rw password=s3cr3t")
-    assert "s3cr3t" not in out
-    assert "user=lake_rw" in out, "the rest of the connstr still reaches the ATTACH"

@@ -1974,12 +1974,15 @@ fn mask_metrics_counts(
 /// sequence, and `sequence_length_bp` describes it. Nothing records which chunk
 /// arrived in which load, so "keep the older strand" is not on the menu.
 ///
-/// The one-off `scripts/dedup-lake-sequence-tables.sh` refuses the case this
-/// accepts, and the asymmetry is in what each can see: here the incoming file is
-/// a single load, self-consistent by construction, so taking it whole cannot
-/// splice. There the lake already holds N interleaved copies with no load
-/// marker, so a per-`chunk_index` pick could assemble one sequence out of two
-/// strands — which is why that script leaves differing copies alone.
+/// Taking the incoming file whole is what makes that safe: it is a single load,
+/// self-consistent by construction, so no chunk of one strand can end up beside
+/// a chunk of another. A rule that picked per `chunk_index` from rows already in
+/// the lake could do exactly that, since nothing there records which load a chunk
+/// came from.
+///
+/// Registrations into these tables also SERIALIZE against each other, via
+/// `registration_lock` — the DELETE alone does not make concurrent first loads
+/// of one feature conflict. See the transaction in `register_files`.
 ///
 /// `assembly_membership` / `bin_quality` are deliberately absent: they carry
 /// `(prep_sample_idx, processing_idx)`, so a distinct run's rows are its own,
@@ -2011,6 +2014,44 @@ fn replace_key_delete_sql(table: &str, key: &str, n_files: usize) -> String {
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     format!("DELETE FROM qiita_lake.{table} WHERE {key} IN ({incoming_keys})")
+}
+
+/// How long `register_files` keeps re-running its transaction after a failed
+/// COMMIT before giving up.
+///
+/// A budget rather than an attempt count, because the number of retries a writer
+/// needs is the number of writers ahead of it, which nothing here knows. It is a
+/// livelock backstop, not a tuning knob: one registration transaction measured
+/// ~0.03s against a DuckLake catalog (one 262 MB part), so this tolerates a
+/// serialized queue orders of magnitude longer than a deploy produces. Exceeding
+/// it means something other than contention is wrong, and the error says so.
+///
+/// Generous on purpose — the losing side cannot be retried from the top, because
+/// the staging files were already moved (see the retry's comment), so an
+/// exhausted budget loses the load.
+const REGISTER_COMMIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ceiling on the backoff between retries. Without a cap the doubling below
+/// would soon sleep away the whole budget in one wait.
+const REGISTER_COMMIT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Backoff before re-running a conflicted registration transaction.
+///
+/// Doubles per attempt to a cap, and is offset by the work ticket so writers that
+/// conflicted together do not wake together and conflict again. The ticket is the
+/// jitter source because it is already in hand, distinct per caller, and makes
+/// the wait reproducible for a given load — no RNG in the data plane's write path.
+fn register_commit_backoff(attempt: u32, work_ticket_idx: i64) -> std::time::Duration {
+    let base = std::time::Duration::from_millis(10)
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(REGISTER_COMMIT_BACKOFF_CAP);
+    let spread = base.as_millis() as u64;
+    let offset = if spread == 0 {
+        0
+    } else {
+        work_ticket_idx.unsigned_abs() % spread
+    };
+    base + std::time::Duration::from_millis(offset)
 }
 
 /// What one `register_files` call did.
@@ -2147,75 +2188,144 @@ fn register_files(
     // and never a double-registration. This matches how DuckLake already
     // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
     // either); a future maintenance pass sweeps them.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+    //
+    // Registrations that touch a content-addressed table SERIALIZE against each
+    // other, and retry when they lose. Both halves are needed:
+    //
+    // DuckLake detects a conflict only where two transactions touch the same
+    // EXISTING row, so the replace-by-key DELETE serializes writers of a feature
+    // the lake already holds — but NOT writers of a feature that is new, whose
+    // deletes match nothing. Measured with 4 concurrent writers of one feature:
+    // 1 row when it already existed, 4 when it did not, and 4 again for two bare
+    // `ducklake_add_data_files` with no delete at all. Bumping
+    // `registration_lock` gives every such registration a row to contend for, so
+    // the new-feature case conflicts too (measured: back to 1 row).
+    //
+    // The loser's work is fully re-runnable — its files are already at their
+    // ticket-unique lake paths and the delete+add is idempotent against whatever
+    // snapshot it re-reads — so it retries here rather than failing the ticket. A
+    // retry from the top would not work: the staging files were moved above, so
+    // the caller's next attempt gets `not_found`.
+    //
+    // Registrations touching none of those tables (read_mask, alignment) skip the
+    // lock and so never contend.
+    let takes_lock = moved
+        .iter()
+        .any(|(table, _)| REPLACE_KEY_TABLES.iter().any(|(t, _)| t == table));
+    let deadline = std::time::Instant::now() + REGISTER_COMMIT_BUDGET;
+    let mut committed: Option<Registration> = None;
+    let mut last_commit_error: Option<duckdb::Error> = None;
+    let mut attempt: u32 = 0;
+    loop {
+        conn.execute_batch("BEGIN TRANSACTION")
+            .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
 
-    let registration = (|| -> Result<Registration, Status> {
-        // Replace-by-key runs as its OWN pass, ahead of every add: one statement
-        // per target table over all the files headed for it, so no delete can
-        // touch a row this same registration already added.
-        let mut incoming: BTreeMap<(&'static str, &'static str), Vec<&str>> = BTreeMap::new();
-        for (table, dest) in &moved {
-            if let Some((lake_table, key)) = REPLACE_KEY_TABLES
-                .iter()
-                .find(|(candidate, _)| candidate == table)
-            {
-                incoming
-                    .entry((*lake_table, *key))
-                    .or_default()
-                    .push(dest.as_str());
+        let registration = (|| -> Result<Registration, Status> {
+            if takes_lock {
+                conn.execute(
+                    "UPDATE qiita_lake.registration_lock SET epoch = epoch + 1",
+                    [],
+                )
+                .map_err(|e| {
+                    Status::internal(format!("failed to take the registration lock: {e}"))
+                })?;
             }
-        }
 
-        let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
-        for ((lake_table, key), dests) in &incoming {
-            let sql = replace_key_delete_sql(lake_table, key, dests.len());
-            let params: Vec<&dyn duckdb::ToSql> =
-                dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
-            let deleted = conn.execute(&sql, params.as_slice()).map_err(|e| {
-                Status::internal(format!(
-                    "replace-by-key delete failed for {lake_table}: {e}"
-                ))
-            })?;
-            // Zero is the ordinary case (a first load, or a run whose features
-            // are all new) and says nothing; only a real supersede earns an entry.
-            if deleted > 0 {
-                replaced.insert(lake_table, deleted);
+            // Replace-by-key runs as its OWN pass, ahead of every add: one statement
+            // per target table over all the files headed for it, so no delete can
+            // touch a row this same registration already added.
+            let mut incoming: BTreeMap<(&'static str, &'static str), Vec<&str>> = BTreeMap::new();
+            for (table, dest) in &moved {
+                if let Some((lake_table, key)) = REPLACE_KEY_TABLES
+                    .iter()
+                    .find(|(candidate, _)| candidate == table)
+                {
+                    incoming
+                        .entry((*lake_table, *key))
+                        .or_default()
+                        .push(dest.as_str());
+                }
             }
+
+            let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for ((lake_table, key), dests) in &incoming {
+                let sql = replace_key_delete_sql(lake_table, key, dests.len());
+                let params: Vec<&dyn duckdb::ToSql> =
+                    dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
+                let deleted = conn.execute(&sql, params.as_slice()).map_err(|e| {
+                    Status::internal(format!(
+                        "replace-by-key delete failed for {lake_table}: {e}"
+                    ))
+                })?;
+                // Zero is the ordinary case (a first load, or a run whose features
+                // are all new) and says nothing; only a real supersede earns an entry.
+                if deleted > 0 {
+                    replaced.insert(lake_table, deleted);
+                }
+            }
+
+            let mut registered = Vec::new();
+            for (table, dest) in &moved {
+                conn.execute(
+                    "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+                    duckdb::params![table, dest],
+                )
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "ducklake_add_data_files failed for {table}/{dest}: {e}"
+                    ))
+                })?;
+                registered.push(dest.clone());
+            }
+            Ok(Registration {
+                registered,
+                replaced,
+            })
+        })();
+
+        let registration = match registration {
+            Ok(registration) => registration,
+            Err(e) => {
+                // A statement failed, not the commit. That is not a conflict and
+                // will not resolve on a retry, so roll back and surface it. The
+                // catalog is left untouched, so the control plane can retry from a
+                // clean slate; the moved files stay on disk as ticket-unique
+                // orphans (see above) — inert until a registration references them.
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+
+        match conn.execute_batch("COMMIT") {
+            Ok(()) => {
+                committed = Some(registration);
+                break;
+            }
+            // DuckLake rolled the transaction back on the failed commit, so the
+            // next iteration re-reads a fresh snapshot. Retrying every commit
+            // failure rather than string-matching the conflict is deliberate: the
+            // body is idempotent, so a retry of a non-conflict failure costs one
+            // more attempt and then reports it below.
+            Err(e) => last_commit_error = Some(e),
         }
 
-        let mut registered = Vec::new();
-        for (table, dest) in &moved {
-            conn.execute(
-                "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
-                duckdb::params![table, dest],
-            )
-            .map_err(|e| {
-                Status::internal(format!(
-                    "ducklake_add_data_files failed for {table}/{dest}: {e}"
-                ))
-            })?;
-            registered.push(dest.clone());
+        if std::time::Instant::now() >= deadline {
+            break;
         }
-        Ok(Registration {
-            registered,
-            replaced,
-        })
-    })();
+        std::thread::sleep(register_commit_backoff(attempt, payload.work_ticket_idx));
+        attempt = attempt.saturating_add(1);
+    }
 
-    let registration = match registration {
-        Ok(registration) => registration,
-        Err(e) => {
-            // Best-effort rollback; the catalog is left untouched so the control
-            // plane can retry from a clean slate. The moved files stay on disk
-            // as ticket-unique orphans (see above) — inert until a successful
-            // registration references them.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit registration transaction: {e}")))?;
+    let registration = committed.ok_or_else(|| {
+        Status::internal(format!(
+            "failed to commit registration transaction within {}s ({} attempt(s)): {}",
+            REGISTER_COMMIT_BUDGET.as_secs(),
+            attempt.saturating_add(1),
+            last_commit_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no attempt was made".to_string())
+        ))
+    })?;
 
     Ok(registration)
 }
@@ -4476,6 +4586,7 @@ mod tests {
             let conn = Connection::open_in_memory().unwrap();
             ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
             ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
             ))
@@ -4661,6 +4772,7 @@ mod tests {
             let conn = Connection::open_in_memory().unwrap();
             ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
             ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.assembled_sequence \
                    WHERE feature_idx IN ({a_only}, {shared}, {b_only});
@@ -4794,6 +4906,7 @@ mod tests {
             let conn = Connection::open_in_memory().unwrap();
             ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
             ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
                  DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature};"
@@ -4938,6 +5051,108 @@ mod tests {
         }
     }
 
+    /// Concurrent registrations of one feature leave ONE row, and every writer
+    /// succeeds.
+    ///
+    /// This is the case the replace-by-key DELETE alone does not cover, and the
+    /// reason `registration_lock` exists. DuckLake detects a conflict only where
+    /// two transactions touch the same EXISTING row, so when the feature is new
+    /// to the lake nobody's DELETE matches, nothing conflicts, and every writer
+    /// commits its own copy — measured at 4 rows for 4 concurrent writers. The
+    /// lock gives them a row to contend for; the retry is what turns the losers'
+    /// aborts back into successful loads.
+    ///
+    /// Runs against a lake that does NOT already hold the feature, because
+    /// pre-seeding it would make the DELETE conflict and the test would pass with
+    /// the lock removed.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn concurrent_registrations_of_one_feature_leave_one_row() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let shared: i64 = 973_010;
+        let base_ticket: i64 = 973_000_000 + std::process::id() as i64;
+        const WRITERS: i64 = 4;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
+                 DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {shared};"
+            ))
+            .unwrap();
+        }
+
+        // Stage every writer's Parquet BEFORE spawning, and release them from a
+        // barrier, so the only thing between the threads starting and their
+        // transactions is `register_files` itself. Seeding inside the threads
+        // staggered them enough that they never overlapped, and the test passed
+        // with the lock removed — i.e. it was not testing anything.
+        let payloads: Vec<(tempfile::TempDir, auth::ActionPayload)> = (0..WRITERS)
+            .map(|i| {
+                let staging = seed_assembly_staging(&[(
+                    shared,
+                    "00000000-0000-0000-0000-000000973010",
+                    &["ACGTACGT", "ACGT"],
+                )]);
+                let payload = assembly_register_payload(&staging, 1, base_ticket + i);
+                (staging, payload)
+            })
+            .collect();
+
+        let start = std::sync::Barrier::new(WRITERS as usize);
+        let outcomes: Vec<Result<Registration, Status>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = payloads
+                .iter()
+                .map(|(_staging, payload)| {
+                    let connstr = &connstr;
+                    let data_path = &data_path;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        register_files(connstr, data_path, payload)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                outcome.is_ok(),
+                "writer {i} failed instead of retrying its conflicted commit: {:?}",
+                outcome.as_ref().err()
+            );
+        }
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let (sequences, chunks): (i64, i64) = reader
+            .query_row(
+                &format!(
+                    "SELECT (SELECT count(*) FROM qiita_lake.assembled_sequence \
+                              WHERE feature_idx = {shared}), \
+                            (SELECT count(*) FROM qiita_lake.assembled_sequence_chunks \
+                              WHERE feature_idx = {shared})"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sequences, 1, "{WRITERS} concurrent loads, one sequence row");
+        assert_eq!(chunks, 2, "one chunk row per chunk_index, not {WRITERS}x");
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
+             DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {shared};"
+        ));
+    }
+
     /// The reference pair takes the same path as the assembly pair, and unlike it
     /// is Flight-readable (`ALLOWED_TABLES`), so a duplicate there reaches a
     /// consumer. Two references sharing a sequence each ship that feature's rows;
@@ -4957,6 +5172,7 @@ mod tests {
             let conn = Connection::open_in_memory().unwrap();
             ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
             ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.reference_sequences \
                    WHERE feature_idx IN ({shared}, {b_only});

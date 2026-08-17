@@ -59,24 +59,97 @@ _None yet._
   rows already there. Measured 2026-08-13: 53,698 of 129,290 assembly features had two
   copies, so their `string_agg(chunk_data, '' ORDER BY chunk_index)` is twice
   `sequence_length_bp`. Run AFTER bucket 5 — before the new build is live the next load
-  re-duplicates. Report first, then collapse; run as `qiita-data`, the only account that can
-  write the lake data path:
-  ```bash
-  sudo -u qiita-data bash /opt/qiita/checkout/scripts/dedup-lake-sequence-tables.sh
-  sudo -u qiita-data APPLY=1 bash /opt/qiita/checkout/scripts/dedup-lake-sequence-tables.sh
+  re-duplicates. **One-off**: nothing after this deploy can create these rows, so this step
+  is archived with the deploy and not carried forward.
+
+  Run as `qiita-data`, the only account that can write the lake data path, with a duckdb CLI
+  matching the data plane's DuckDB (1.5.4). Read `DUCKLAKE_CATALOG_CONNSTR` and
+  `PATH_PERSISTENT` from `/etc/qiita/data-plane.env`; `DATA_PATH` is
+  `$PATH_PERSISTENT/ducklake` verbatim, trailing slash included — DuckLake rejects an attach
+  whose `DATA_PATH` differs by even a slash.
+
+  `SET home_directory` is not optional: `qiita-data` is a non-login account whose `$HOME` is
+  `/dev/null`, and `INSTALL` resolves against `$HOME/.duckdb` and dies with `Can't find the
+  home directory` without it.
+
+  Save the block below as `collapse.sql` and run `duckdb -bail -f collapse.sql` **once per
+  table pair** — substitute `assembled_sequence` / `assembled_sequence_chunks`, then
+  `reference_sequences` / `reference_sequence_chunks`. `-bail` is the CLI flag, not the
+  `.bail on` dot-command: a dot-command is only recognised at column 0, so a copy-paste that
+  picks up this block's indentation would silently run on without it.
+
+  ```sql
+  -- Substitute <CONNSTR>, <DATA_PATH>, <SEQ>, <CHUNKS>.
+  SET home_directory='/tmp';
+  INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres;
+  SET memory_limit='32GB'; SET temp_directory='/tmp';
+  ATTACH 'ducklake:postgres:<CONNSTR>' AS qiita_lake (DATA_PATH '<DATA_PATH>');
+
+  -- Features held more than once.
+  CREATE OR REPLACE TEMP TABLE dup_feature AS
+  SELECT feature_idx FROM (
+      SELECT feature_idx FROM qiita_lake.<SEQ> GROUP BY feature_idx HAVING count(*) > 1
+      UNION
+      SELECT feature_idx FROM qiita_lake.<CHUNKS>
+       GROUP BY feature_idx, chunk_index HAVING count(*) > 1);
+
+  -- Of those, the ones whose copies are NOT byte-identical. A sequence and its
+  -- reverse complement share one feature_idx, and nothing records which chunk came
+  -- from which load, so collapsing these could splice two strands into one
+  -- sequence. They are reported and left alone.
+  CREATE OR REPLACE TEMP TABLE ambiguous_feature AS
+  SELECT feature_idx FROM qiita_lake.<SEQ> SEMI JOIN dup_feature USING (feature_idx)
+   GROUP BY feature_idx
+  HAVING count(DISTINCT sequence_hash) > 1 OR count(DISTINCT sequence_length_bp) > 1
+  UNION
+  SELECT feature_idx FROM qiita_lake.<CHUNKS> SEMI JOIN dup_feature USING (feature_idx)
+   GROUP BY feature_idx, chunk_index HAVING count(DISTINCT chunk_data) > 1;
+  DELETE FROM dup_feature WHERE feature_idx IN (SELECT feature_idx FROM ambiguous_feature);
+
+  SELECT (SELECT count(*) FROM dup_feature)       AS collapsible_features,
+         (SELECT count(*) FROM ambiguous_feature) AS ambiguous_features;
+  SELECT feature_idx FROM ambiguous_feature ORDER BY 1 LIMIT 50;
+
+  BEGIN TRANSACTION;
+  -- DISTINCT, not DISTINCT ON: every copy left in dup_feature is byte-identical, so
+  -- this picks nothing, it deduplicates. The DELETE removes EVERY copy of each
+  -- duplicated feature; the INSERT puts one back from the snapshot taken above, in
+  -- this same transaction. Features not in dup_feature are never touched.
+  CREATE OR REPLACE TEMP TABLE keep_sequence AS
+    SELECT DISTINCT * FROM qiita_lake.<SEQ> SEMI JOIN dup_feature USING (feature_idx);
+  CREATE OR REPLACE TEMP TABLE keep_chunk AS
+    SELECT DISTINCT * FROM qiita_lake.<CHUNKS> SEMI JOIN dup_feature USING (feature_idx);
+  DELETE FROM qiita_lake.<SEQ> WHERE feature_idx IN (SELECT feature_idx FROM dup_feature);
+  -- ORDER BY keeps the feature_idx clustering the load path builds for row-group
+  -- and file pruning.
+  INSERT INTO qiita_lake.<SEQ> SELECT * FROM keep_sequence ORDER BY feature_idx;
+  DELETE FROM qiita_lake.<CHUNKS> WHERE feature_idx IN (SELECT feature_idx FROM dup_feature);
+  INSERT INTO qiita_lake.<CHUNKS>
+    SELECT * FROM keep_chunk ORDER BY feature_idx, chunk_index;
+
+  -- Validate BEFORE committing: a collapse that did not converge must roll back,
+  -- not report a lake that is already wrong. `-bail` turns this into exit 1.
+  SELECT CASE WHEN dups + mismatches > 0
+              THEN error(format('collapse did not converge: {} duplicated, {} length '
+                                || 'mismatches', dups, mismatches))
+              ELSE 'converged' END
+  FROM (SELECT
+    (SELECT count(*) FROM (SELECT feature_idx FROM qiita_lake.<SEQ>
+       SEMI JOIN dup_feature USING (feature_idx)
+       GROUP BY feature_idx HAVING count(*) > 1))                       AS dups,
+    (SELECT count(*) FROM (SELECT s.feature_idx FROM qiita_lake.<SEQ> s
+       JOIN qiita_lake.<CHUNKS> c USING (feature_idx)
+       SEMI JOIN dup_feature d ON d.feature_idx = s.feature_idx
+       GROUP BY s.feature_idx, s.sequence_length_bp
+      HAVING length(string_agg(c.chunk_data, '' ORDER BY c.chunk_index))
+             <> s.sequence_length_bp))                                  AS mismatches);
+  COMMIT;
   ```
-  Substitute the checkout path. `qiita-data` needs a duckdb CLI on PATH or
-  `QIITA_DUCKDB_BIN`; match the data plane's DuckDB (the script prints install steps for the
-  right version if it finds none). Both passes print `collapsible_features` and
-  `ambiguous_features` per table pair. `ambiguous_features` is expected to be **0** — a
-  non-zero count means a feature whose copies hold different bytes (a sequence and its
-  reverse complement share one `feature_idx`), which the script deliberately leaves alone
-  because no column records which chunk came from which load; re-run the producing load
-  rather than picking a copy by hand. APPLY validates inside its transaction and exits
-  non-zero without committing if the collapse did not converge. Every mode is re-runnable,
-  so a failure part-way is safe to repeat once its cause is fixed — and a concurrent load
-  touching the same tables makes one of the two abort with a DuckLake transaction conflict
-  rather than either losing rows. (#457)
+
+  `ambiguous_features` is expected to be **0**. If any appear, re-run the producing load
+  (which now replaces on the key) rather than picking a copy by hand. Quiesce loads while
+  this runs: it and a concurrent `register-files` both write these tables, and one of the two
+  will abort with a DuckLake transaction conflict. Safe to re-run. (#457)
 
 ### Notes (no host action)
 
