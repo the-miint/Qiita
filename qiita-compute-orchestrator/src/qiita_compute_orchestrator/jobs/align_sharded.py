@@ -115,7 +115,7 @@ sort match the DuckLake `alignment` table
 `register-files` → `reconcile-alignment-block`. The runner resolves the
 router/shard paths from action_context (`_resolve_sharded_align_indexes`); the
 block's MASKED reads are streamed by the job itself (the control plane scopes the
-ticket to the `read_masked` view under the completed mask). The align planner
+ticket to the `read_masked` macro under the completed mask). The align planner
 fans out one block ticket per ~10M-read block. The integration smoke
 (`tests/integration/test_sharded_alignment.py`) drives `execute()` directly
 against real miint.
@@ -154,6 +154,7 @@ from typing import Literal
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.feature_table import PAIRED_PLACEMENT_PARTITION
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -945,10 +946,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # docs/duckdb-miint.md.
                 pooled_qualify = ""
                 if is_paired:
-                    partition = (
-                        "sequence_idx, feature_idx, "
-                        "LEAST(position, mate_position), GREATEST(position, mate_position)"
-                    )
+                    # The placement key is shared with the client-side feature-table
+                    # gate, which scores the same CIGARs the same way; one definition,
+                    # because a change reaching only one copy would silently rescore
+                    # every paired placement in the other.
+                    partition = PAIRED_PLACEMENT_PARTITION
                     pooled_cigar = f"string_agg(cigar, '') OVER (PARTITION BY {partition})"
                     pooled_qualify = (
                         f"QUALIFY cigar_sequence_identity({pooled_cigar}) >= {min_identity}"

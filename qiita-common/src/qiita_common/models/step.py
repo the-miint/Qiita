@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from qiita_common.auth_constants import MAX_TABLE_NAME_LENGTH
 from qiita_common.models._base import (
     ComputeTarget,
+    PrepSampleCohort,
     StepStatus,
     _normalize_scope_target,
     check_derived_inputs,
@@ -267,6 +268,25 @@ class DoGetTicketResponse(BaseModel):
     ticket: str  # base64-encoded signed ticket bytes
 
 
+# Columns a DoGet ticket asks to be projected, in this order.
+#
+# `min_length=1` rejects an explicit empty list (422) rather than letting it
+# widen to every column — the same rule, and the same reason, as
+# DoGetTicketRequest.feature_idx above. This is also the LAST layer that can
+# apply it: the data plane defaults an omitted field to an empty list, so on the
+# wire "empty" and "absent" are one value.
+#
+# The names themselves are checked against a per-table allowlist at signing time
+# (auth/tickets.py), which is what bounds this list in practice; the caps here
+# only keep an absurd request from being parsed before it is rejected, and are
+# deliberately wider than any projectable table. One alias so the two ticket
+# bodies that carry a projection cannot drift on any of the four numbers.
+ProjectionColumns = Annotated[
+    list[Annotated[str, Field(min_length=1, max_length=64)]],
+    Field(min_length=1, max_length=128),
+]
+
+
 class AlignmentDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/alignment/ticket/doget.
 
@@ -281,6 +301,36 @@ class AlignmentDoGetTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
+    # Omitted ⇒ no projection rides the ticket, byte-identical to the historical
+    # shape. See ProjectionColumns for what a present list means.
+    columns: ProjectionColumns | None = None
+
+
+class AlignmentCohortDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/alignment/{alignment_idx}/ticket/doget — the
+    HUMAN-callable alignment mint, where the caller names the cohort itself.
+
+    The sibling ``AlignmentDoGetTicketRequest`` reads its cohort out of a work
+    ticket the runner resolver already validated; there is no such upstream for
+    a client-driven request, so here the caller states the cohort and the route
+    authorizes every sample per-study before signing. The alignment rides the
+    path, not the body, because it is what is being read.
+
+    Both fields are REQUIRED and ``min_length=1``, which is the one place they
+    diverge from the service-account body:
+
+    * An empty ``prep_sample_idx`` would sign an unscoped alignment ticket.
+    * An omitted ``columns`` is rejected at stream time by the data plane (the
+      alignment surface requires a signed projection — ``cigar`` is ~96% of a
+      row, so there is no safe server-side default). Requiring it here turns a
+      Flight ``InvalidArgument`` into a 422 the caller can act on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: PrepSampleCohort
+    # Required here, unlike its optional twin above — see the class docstring.
+    columns: ProjectionColumns
 
 
 class ReadDoGetTicketRequest(BaseModel):

@@ -34,6 +34,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
         }
     ),
     SystemRole.WET_LAB_ADMIN: frozenset(
@@ -48,6 +51,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
             # Upload slots — needed to drive reference data ingest via the
             # qiita-admin CLI, whose reference-add audience includes
             # wet_lab_admin.
@@ -81,6 +87,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # deleting a mask drops its mask_definition row and DuckLake
             # read_mask data. Service accounts never get it.
             Scope.MASK_DEFINITION_DELETE,
+            # Deprecating a mask / withdrawing its runs is system_admin-only for
+            # the same reason: it decides that published results were produced by
+            # a filter we no longer stand behind. Non-destructive, but not a
+            # judgement a service account or wet_lab_admin makes.
+            Scope.MASK_DEFINITION_LIFECYCLE,
             # Full alignment purge is system_admin-only, same as
             # MASK_DEFINITION_DELETE: deleting an alignment drops its
             # alignment_definition row (cascading the alignment_sample gate) and
@@ -89,6 +100,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ALIGNMENT_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,

@@ -71,6 +71,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_GENOME_MEMBER",
     ),
+    (
+        "URL_REFERENCE_GENOME_MAP",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_GENOME_MAP",
+    ),
     # /host-filter-profile
     (
         "URL_HOST_FILTER_PROFILE_LIST",
@@ -229,6 +234,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_POOL_ALIGN_PLAN",
     ),
     (
+        "URL_SEQUENCED_POOL_ALIGNMENT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGNMENT",
+    ),
+    (
+        "URL_SEQUENCED_POOL_ALIGNMENT_COHORT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGNMENT_COHORT",
+    ),
+    (
         "URL_SEQUENCED_SAMPLE_EXCEPTIONS",
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_SAMPLE_EXCEPTIONS",
@@ -312,6 +327,24 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_SAMPLE_PREFIX",
         "PATH_SEQUENCED_SAMPLE_BY_IDX",
     ),
+    # /sample-label
+    (
+        "URL_EXPORTED_IDENTIFIER",
+        "PATH_EXPORTED_IDENTIFIER_PREFIX",
+        "PATH_EXPORTED_IDENTIFIER_ROOT",
+    ),
+    # /exported-feature
+    (
+        "URL_EXPORTED_FEATURE",
+        "PATH_EXPORTED_FEATURE_PREFIX",
+        "PATH_EXPORTED_FEATURE_ROOT",
+    ),
+    # /exported-processing
+    (
+        "URL_EXPORTED_PROCESSING",
+        "PATH_EXPORTED_PROCESSING_PREFIX",
+        "PATH_EXPORTED_PROCESSING_ROOT",
+    ),
     # /prep-sample
     (
         "URL_PREP_SAMPLE_STUDY_LIST",
@@ -343,6 +376,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_PREP_SAMPLE",
     ),
+    (
+        "URL_MASK_DEFINITION_STATUS",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_STATUS",
+    ),
+    (
+        "URL_MASK_DEFINITION_SAMPLE_STATUS",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_SAMPLE_STATUS",
+    ),
     # /alignment-definition
     (
         "URL_ALIGNMENT_DEFINITION_BY_IDX",
@@ -351,6 +394,7 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ),
     # /alignment (Flight DoGet ticket for the alignment sink)
     ("URL_ALIGNMENT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_DOGET"),
+    ("URL_ALIGNMENT_COHORT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_COHORT_DOGET"),
 ]
 
 

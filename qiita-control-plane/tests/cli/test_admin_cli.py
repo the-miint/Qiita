@@ -743,9 +743,17 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     )
     assert rc == 0
 
-    # Parquet streams straight to a ParquetWriter (no DuckDB/Acero), so it passes
-    # no buffer-realign option — only the fastq path needs one.
-    assert fake_cls.instances[0].do_get_options == [None, None]
+    # Parquet streams straight to a ParquetWriter (no DuckDB/Acero), so it asks
+    # for no buffer realignment — only the fastq path needs that. Asserted on the
+    # option's value rather than on the options object being `None`: since
+    # `--compress` arrived, call options are always constructed (an empty header
+    # list plus no read_options, which is wire-equivalent to passing nothing) so
+    # that the two independent knobs cannot drop each other.
+    import pyarrow.ipc as _ipc
+
+    for opt in fake_cls.instances[0].do_get_options:
+        assert opt.read_options.ensure_alignment == _ipc.Alignment.Any
+        assert opt.headers == []
 
     f_a = out_dir / "SAMN_A.5.7.42.parquet"
     f_b = out_dir / "SAMN_B.5.7.43.parquet"
@@ -939,6 +947,91 @@ def test_masked_read_export_fastq_realigns_flight_buffers(monkeypatch, tmp_path)
     for opt in options:
         assert opt is not None, "fastq do_get called without FlightCallOptions"
         assert opt.read_options.ensure_alignment == ipc.Alignment.DataTypeSpecific
+
+
+def _run_masked_export_capturing_options(monkeypatch, tmp_path, fmt, extra_argv):
+    """Run masked-read-export over one sample and return the captured
+    FlightCallOptions of its single DoGet."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    tables = {
+        42: pa.table(
+            {
+                "read_id": ["rA0"],
+                "sequence1": ["ACGT"],
+                "qual1": _qual([[40, 40, 40, 40]]),
+                "sequence2": pa.array([None], type=pa.string()),
+                "qual2": _qual([None]),
+            }
+        )
+    }
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            fmt,
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+            *extra_argv,
+        ]
+    )
+    assert rc == 0
+    (options,) = fake_cls.instances[0].do_get_options
+    return options
+
+
+def test_masked_read_export_sends_no_compression_header_by_default(monkeypatch, tmp_path):
+    """Default off: this CLI usually runs on the deploy host, which is above the
+    break-even bandwidth. The request must stay indistinguishable from one made
+    before the flag existed, so a pre-flag data plane still serves it."""
+    from qiita_common.flight_constants import IPC_COMPRESSION_HEADER
+
+    options = _run_masked_export_capturing_options(monkeypatch, tmp_path, "parquet", [])
+    assert IPC_COMPRESSION_HEADER.encode() not in dict(options.headers)
+
+
+def test_masked_read_export_compress_flag_requests_zstd(monkeypatch, tmp_path):
+    from qiita_common.flight_constants import (
+        IPC_COMPRESSION_HEADER,
+        IPC_COMPRESSION_ZSTD,
+    )
+
+    options = _run_masked_export_capturing_options(monkeypatch, tmp_path, "parquet", ["--compress"])
+    assert dict(options.headers)[IPC_COMPRESSION_HEADER.encode()] == (IPC_COMPRESSION_ZSTD.encode())
+
+
+def test_masked_read_export_compress_keeps_the_fastq_realignment(monkeypatch, tmp_path):
+    """The two knobs are independent and must not drop each other. Losing
+    read_options here would silently reintroduce the Acero buffer-misalignment
+    warnings that the realignment fix exists to suppress."""
+    import pyarrow.ipc as ipc
+    from qiita_common.flight_constants import IPC_COMPRESSION_HEADER
+
+    options = _run_masked_export_capturing_options(monkeypatch, tmp_path, "fastq", ["--compress"])
+    assert IPC_COMPRESSION_HEADER.encode() in dict(options.headers)
+    assert options.read_options.ensure_alignment == ipc.Alignment.DataTypeSpecific
 
 
 def test_masked_read_export_aborts_on_null_accession(monkeypatch, tmp_path, capsys):
@@ -1261,7 +1354,7 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
 #
 # These run the REAL miint FORMAT FASTQ writer (miint is a core dependency,
 # installed/loaded by setup_miint_test_env in tests/conftest.py). The fake
-# Flight stream hands DuckDB a table carrying the read_masked view's columns
+# Flight stream hands DuckDB a table carrying the read_masked macro's columns
 # (read_id, sequence1, qual1, sequence2, qual2; qual* are UTINYINT[]); pairing
 # is read from sequence2 null-ness, since the manifest carries no paired flag.
 # ---------------------------------------------------------------------------
@@ -1756,3 +1849,27 @@ def test_fanout_pump_posts_and_reports_fail_stop(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "FAIL-STOPPED" in err
     assert "released 0" in err
+
+
+def test_export_stem_is_the_pooled_composite():
+    """Pins the stem's exact shape. It embeds internal identifiers and predates the
+    rule against those leaving Qiita; this test is what makes an accidental change
+    to a system_admin-only filename convention visible."""
+    from qiita_control_plane.cli.admin.masked_export import _export_stem
+
+    sample = {"biosample_accession": "SAMN_A", "prep_sample_idx": 42}
+    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"
+
+
+def test_export_stem_ignores_an_ena_run_accession():
+    """The stem is the composite ALWAYS, never the run accession: preferring the
+    accession would silently rename every submitted sample's export file and route
+    around the `_SAFE_ACCESSION` charset check."""
+    from qiita_control_plane.cli.admin.masked_export import _export_stem
+
+    sample = {
+        "biosample_accession": "SAMN_A",
+        "prep_sample_idx": 42,
+        "ena_run_accession": "ERR1234567",
+    }
+    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"

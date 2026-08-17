@@ -14,6 +14,7 @@ from ..repositories.mask_definition import (
     ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
     ADAPTER_SET_HASH_KEY,
     RESOLVED_QC_KEY,
+    MaskDefinitionDeprecated,
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
@@ -478,6 +479,12 @@ async def _mint_read_mask(
                 legacy_params=legacy_params,
                 adapter_hash_scheme=adapter_hashes.scheme(),
             )
+    except MaskDefinitionDeprecated as exc:
+        # Same class as the FK case below: the ticket named a config that cannot be
+        # minted against, which is bad input rather than a fault to retry. Left
+        # unhandled it reaches run_workflow's catch-all and is recorded as
+        # UNKNOWN_PERMANENT, which tells the operator nothing.
+        raise _submission_bad_input(exc.detail) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise _submission_bad_input(
             f"could not mint read mask: originator principal "

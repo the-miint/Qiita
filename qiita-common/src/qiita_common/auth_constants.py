@@ -58,10 +58,34 @@ class Scope(StrEnum):
     # READ_MASKED_DOGET is below: alignment is not raw human/host reads, so it rides
     # the generic scope rather than a privacy-sensitive one.
     TICKET_DOGET = "ticket:doget"
+    # Mint an alignment DoGet ticket as a HUMAN, naming the cohort directly.
+    #
+    # Split from TICKET_DOGET because the two carry different trust models, not
+    # different data. TICKET_DOGET signs a cohort the control plane read out of a
+    # work ticket's action_context, which the runner resolver already validated
+    # at submit; there is no such upstream for a client-driven request, so this
+    # scope's route resolves the cohort and authorizes it per-study (Tier.VIEWER
+    # on every study each sample links to) before signing. Reusing TICKET_DOGET
+    # would have put a human PAT on the worker path — and it is deliberately
+    # absent from every role ceiling precisely so that cannot happen.
+    #
+    # On every role ceiling, unlike its neighbours: for a plain user the
+    # per-study tier check is the real boundary, so the role does not need to be.
+    # That argument is honest only for `user`. `wet_lab_admin` and `system_admin`
+    # are at or above the cohort gate's `bypass_role`
+    # (`filter_prep_samples_caller_can_read`), so for them the whole cohort comes
+    # back readable with no per-study lookup at all and the 403 cannot fire — the
+    # ROLE is the boundary, which is the inverse of the reason above. Both are
+    # deliberate; they are just not the same reason, and a reader who assumes the
+    # per-study check protects every caller is wrong about the two roles that
+    # matter most. Correspondingly NOT on SERVICE_ACCOUNT_SCOPE_CEILING — a
+    # worker holding both would be two ways into one surface with two different
+    # validation paths.
+    ALIGNMENT_DOGET = "alignment:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
     # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
     # and alignment tickets): masked reads are privacy-sensitive (the lake
-    # retains human/host reads, excluded only by the read_masked view), so the
+    # retains human/host reads, excluded only by the read_masked macro), so the
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
     READ_MASKED_DOGET = "read_masked:doget"
@@ -71,7 +95,7 @@ class Scope(StrEnum):
     #
     # Distinct from BOTH neighbours, and strictly the most privileged of the
     # three. `read_block` streams RAW `read` rows: host/human sequence that the
-    # `read_masked` view exists to exclude, so it is a strict superset of what
+    # `read_masked` macro exists to exclude, so it is a strict superset of what
     # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
     # `alignment` slice) would let any service account minting reference tickets
     # pull raw reads — an inversion of the model the two scopes above establish.
@@ -83,6 +107,14 @@ class Scope(StrEnum):
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     # Mirrors REFERENCE_DELETE.
     MASK_DEFINITION_DELETE = "mask_definition:delete"
+    # Mask LIFECYCLE: deprecate a config so it can no longer be minted against, and
+    # withdraw individual runs of a sound config. Separate from
+    # MASK_DEFINITION_DELETE because the two are opposites — deletion destroys the
+    # record of what filtered published data, deprecation preserves it and adds the
+    # judgement. Separate from the minting capability (READ_MASKED_DOGET) because a
+    # service account that mints masks must not be able to void them. system_admin
+    # only, in ROLE_IMPLIED_SCOPES.
+    MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"
     # Full purge of an alignment (the alignment_definition row + its DuckLake
     # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
     # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
@@ -136,7 +168,7 @@ class Scope(StrEnum):
     # accounts.
     ADMIN_BIOSAMPLE_OWNER_ID_READ = "admin:biosample_owner_id_read"
     # Admin per-pool masked-read export: list a sequenced_pool's samples and mint
-    # per-sample DoGet tickets on the data plane's read_masked view, so an admin
+    # per-sample DoGet tickets on the data plane's read_masked macro, so an admin
     # can download masked sequence data locally. This is the first *human*
     # masked-read pull — distinct from the service-account READ_MASKED_DOGET path
     # (which is untouched). Admin-gated until there's a model for auto-selecting

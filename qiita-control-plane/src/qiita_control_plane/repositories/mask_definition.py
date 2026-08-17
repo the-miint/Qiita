@@ -28,16 +28,73 @@ fragments that do so are defined once below and interpolated into each query.
 """
 
 import json
-from typing import get_args
+from typing import Literal, get_args
 
 import asyncpg
 from qiita_common.actions import PER_SAMPLE_MASK_ACTION_IDS
 from qiita_common.hashing import canonical_params_hash
-from qiita_common.models import MaskSampleState, Tier, WorkTicketState
+from qiita_common.models import (
+    MaskDefinitionStatus,
+    MaskSampleState,
+    Tier,
+    WorkTicketState,
+)
 
-# The two mask_sample states, taken from the wire type rather than retyped, so the
-# SQL and the model cannot drift. Ordered 'pending', 'completed' by the Literal.
-_MASK_STATE_PENDING, _MASK_STATE_COMPLETED = get_args(MaskSampleState)
+from . import require_transaction
+
+# Column projection backing every MaskDefinition response. Defined once because
+# three readers (the mint, the by-idx fetch, and the list) return the same shape,
+# and a lifecycle column added to one of them and not the others is a silent
+# `status` default in the API rather than an error.
+MASK_DEFINITION_RETURNING = (
+    "mask_idx, params_hash, filter_workflow, filter_version, params, created_by_idx,"
+    " created_at, adapter_hash_scheme, status, deprecated_at, deprecated_by_idx,"
+    " deprecation_reason, superseded_by"
+)
+
+
+# The same projection as MASK_DEFINITION_RETURNING, qualified for the list query's
+# join against the tally CTE. Derived from it rather than retyped so a lifecycle
+# column cannot reach one reader and miss the other.
+_MASK_DEFINITION_LIST_COLUMNS = ", ".join(
+    f"md.{col.strip()}" for col in MASK_DEFINITION_RETURNING.split(",")
+)
+
+
+class MaskDefinitionDeprecated(Exception):
+    """Raised when a mint resolves to a mask whose config has been deprecated.
+
+    Carries the SQLSTATE 23514 the plpgsql mint raises, translated at this layer
+    so routes and the runner match on a type rather than on a Postgres error
+    string. A deprecated config is void: it must not mask new data."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+def _state_literal(value: str) -> str:
+    """Assert `value` is a MaskSampleState member and return it.
+
+    A membership check, not a lookup: the string is still written here. What it
+    buys is that a renamed or removed member fails at import instead of silently
+    matching no rows."""
+    members = get_args(MaskSampleState)
+    if value not in members:
+        raise ValueError(f"{value!r} is not a MaskSampleState; have {members}")
+    return value
+
+
+# The mask_sample states this module writes into SQL, each asserted against the
+# wire type so a renamed member fails at import rather than matching no rows.
+# Looked up by value, not by position: the Literal has three members and the
+# roster CTE synthesizes only two — 'invalidated' can only be read off an
+# existing mask_sample row.
+_MASK_STATE_PENDING, _MASK_STATE_COMPLETED, _MASK_STATE_INVALIDATED = (
+    _state_literal("pending"),
+    _state_literal("completed"),
+    _state_literal("invalidated"),
+)
 
 # Per-(mask, sample) masking state.
 #
@@ -240,18 +297,27 @@ async def mint_mask_definition(
     # asyncpg encodes a dict bound to a jsonb parameter via the JSON codec; pass
     # the serialized string explicitly so the behaviour is independent of
     # whether a JSON codec is registered on the connection.
-    return await conn.fetchrow(
-        "SELECT mask_idx, params_hash, filter_workflow, filter_version,"
-        "       params, created_by_idx, created_at, adapter_hash_scheme"
-        "  FROM qiita.mint_mask_definition($1, $2, $3, $4::jsonb, $5, $6, $7)",
-        params_hash,
-        filter_workflow,
-        filter_version,
-        json.dumps(params),
-        principal_idx,
-        legacy_params_hash,
-        adapter_hash_scheme,
-    )
+    try:
+        return await conn.fetchrow(
+            f"SELECT {MASK_DEFINITION_RETURNING}"
+            "  FROM qiita.mint_mask_definition($1, $2, $3, $4::jsonb, $5, $6, $7)",
+            params_hash,
+            filter_workflow,
+            filter_version,
+            json.dumps(params),
+            principal_idx,
+            legacy_params_hash,
+            adapter_hash_scheme,
+        )
+    except asyncpg.CheckViolationError as exc:
+        # The mint raises SQLSTATE 23514 for a deprecated config. asyncpg maps that
+        # class to CheckViolationError, which a genuine table CHECK would also
+        # raise — so match on the message the function sets, and re-raise anything
+        # else untouched rather than reporting an unrelated constraint as a
+        # deprecation.
+        if "is deprecated" not in str(exc):
+            raise
+        raise MaskDefinitionDeprecated(str(exc)) from exc
 
 
 async def fetch_mask_definition_by_idx(
@@ -264,10 +330,7 @@ async def fetch_mask_definition_by_idx(
     open transaction or stands alone.
     """
     return await pool_or_conn.fetchrow(
-        "SELECT mask_idx, params_hash, filter_workflow, filter_version,"
-        "       params, created_by_idx, created_at, adapter_hash_scheme"
-        "  FROM qiita.mask_definition"
-        " WHERE mask_idx = $1",
+        f"SELECT {MASK_DEFINITION_RETURNING}  FROM qiita.mask_definition WHERE mask_idx = $1",
         mask_idx,
     )
 
@@ -323,6 +386,7 @@ async def list_mask_definitions(
     visible_to_principal_idx: int | None,
     sequenced_pool_idx: int | None = None,
     prep_sample_idx: int | None = None,
+    status: MaskDefinitionStatus | None = None,
     limit: int,
 ) -> list[asyncpg.Record]:
     """Return up to `limit` mask_definition rows, newest first, each with its
@@ -347,33 +411,50 @@ async def list_mask_definitions(
         sees the masks that touched their own samples, and a zero-tally row never
         reveals a mask the narrowing excluded.
 
+    `status` narrows to one config lifecycle. Omitted, BOTH are returned: a
+    deprecated mask stays listed so "what filter produced this published
+    submission?" keeps an answer.
+
     Callers that need to detect truncation pass `limit = cap + 1`; a returned
     length > cap means the set exceeded the cap.
     """
     args: list = [*_MASKED_SAMPLE_ARGS]
+    args.append(_MASK_STATE_INVALIDATED)
+    invalidated_param = f"${len(args)}"
     scope, narrowed = _sample_scope_sql(
         args=args,
         sequenced_pool_idx=sequenced_pool_idx,
         prep_sample_idx=prep_sample_idx,
         visible_to_principal_idx=visible_to_principal_idx,
     )
+    status_predicate = ""
+    if status is not None:
+        args.append(status.value)
+        status_predicate = f"md.status = ${len(args)}"
     args.append(limit)
     limit_param = f"${len(args)}"
+    # `narrowed` and `status` are independent WHERE sources, so the connective is
+    # computed rather than baked into either fragment.
+    where_parts = [p for p in ("t.mask_idx IS NOT NULL" if narrowed else "", status_predicate) if p]
+    where_sql = ("  WHERE " + " AND ".join(where_parts)) if where_parts else ""
     query = (
         _MASKED_SAMPLE_CTE + ", tally AS ("
         "    SELECT msk.mask_idx,"
         "           count(*) FILTER (WHERE msk.mask_state = $3) AS samples_completed,"
-        "           count(*) FILTER (WHERE msk.mask_state = $4) AS samples_pending"
+        "           count(*) FILTER (WHERE msk.mask_state = $4) AS samples_pending,"
+        f"           count(*) FILTER (WHERE msk.mask_state = {invalidated_param})"
+        "               AS samples_invalidated"
         "      FROM masked_sample msk"
         f"     WHERE true{scope}"
         "     GROUP BY msk.mask_idx"
         ")"
-        " SELECT md.mask_idx, md.filter_workflow, md.filter_version, md.params, md.created_at,"
+        f" SELECT {_MASK_DEFINITION_LIST_COLUMNS},"
         "        COALESCE(t.samples_completed, 0) AS samples_completed,"
-        "        COALESCE(t.samples_pending, 0) AS samples_pending"
+        "        COALESCE(t.samples_pending, 0) AS samples_pending,"
+        "        COALESCE(t.samples_invalidated, 0) AS samples_invalidated"
         "   FROM qiita.mask_definition md"
         "   LEFT JOIN tally t ON t.mask_idx = md.mask_idx"
-        + ("  WHERE t.mask_idx IS NOT NULL" if narrowed else "")
+        + where_sql
         + "  ORDER BY md.mask_idx DESC"
         f"  LIMIT {limit_param}"
     )
@@ -427,3 +508,121 @@ async def fetch_mask_prep_samples(
         f"  LIMIT ${len(args)}"
     )
     return list(await pool_or_conn.fetch(query, *args))
+
+
+class MaskDefinitionNotFound(Exception):
+    """Raised when the mask_idx does not exist."""
+
+    def __init__(self, mask_idx: int) -> None:
+        self.mask_idx = mask_idx
+        super().__init__(f"no mask_definition with mask_idx={mask_idx}")
+
+
+async def transition_mask_definition_status(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    mask_idx: int,
+    status: MaskDefinitionStatus,
+    reason: str | None,
+    superseded_by: int | None,
+    principal_idx: int,
+) -> asyncpg.Record:
+    """Set a mask CONFIG's lifecycle status and return the updated row.
+
+    The three provenance columns move with `status` in one UPDATE, so the
+    biconditional CHECK on the table can never see a half-applied transition.
+    Idempotent: re-deprecating an already-deprecated mask restamps who/when/why
+    rather than refusing, which is what a corrected reason wants.
+
+    Raises MaskDefinitionNotFound when the row does not exist, and
+    asyncpg.ForeignKeyViolationError when `superseded_by` names no mask.
+    """
+    deprecating = status is MaskDefinitionStatus.DEPRECATED
+    row = await conn.fetchrow(
+        f"UPDATE qiita.mask_definition"
+        f"    SET status = $2,"
+        f"        deprecated_at = CASE WHEN $3::boolean THEN now() END,"
+        f"        deprecated_by_idx = CASE WHEN $3::boolean THEN $4::bigint END,"
+        f"        deprecation_reason = CASE WHEN $3::boolean THEN $5::text END,"
+        f"        superseded_by = CASE WHEN $3::boolean THEN $6::bigint END"
+        f"  WHERE mask_idx = $1"
+        f" RETURNING {MASK_DEFINITION_RETURNING}",
+        mask_idx,
+        status.value,
+        deprecating,
+        principal_idx,
+        reason,
+        superseded_by,
+    )
+    if row is None:
+        raise MaskDefinitionNotFound(mask_idx)
+    return row
+
+
+async def set_mask_sample_states(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idxs: list[int],
+    state: Literal["completed", "invalidated"],
+    reason: str | None,
+    principal_idx: int,
+) -> dict[str, list[int]]:
+    """Withdraw (or restore) specific RUNS of one mask.
+
+    Returns `{"updated", "unchanged", "not_found", "skipped_pending"}` over the
+    requested prep_samples: rows whose state changed, rows that already held the
+    requested state, prep_samples with no gate row under this mask, and rows still
+    `'pending'`.
+
+    A `'pending'` row is skipped rather than written. `'pending'` is the masking
+    pipeline's value — reconcile and finalize-mask-sample flip it to `'completed'`
+    when the run lands — so writing `'invalidated'` over it would be undone by the
+    pipeline without anyone being told. There is also nothing to withdraw yet: the
+    run has not produced a pass-set.
+
+    Runs inside the caller's transaction and takes each row's `FOR UPDATE` lock
+    before deciding, the same serialization every other mask_sample writer uses
+    (`lock_mask_sample`). Without it the classification is read on one pooled
+    connection and applied on another, so a concurrent reconcile could flip a row
+    out of `'pending'` between the two and the response would describe a state that
+    never held.
+    """
+    require_transaction(conn)
+    present = {
+        r["prep_sample_idx"]: r["state"]
+        for r in await conn.fetch(
+            "SELECT prep_sample_idx, state FROM qiita.mask_sample"
+            " WHERE mask_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
+            " ORDER BY prep_sample_idx"
+            " FOR UPDATE",
+            mask_idx,
+            prep_sample_idxs,
+        )
+    }
+    not_found = [idx for idx in prep_sample_idxs if idx not in present]
+    skipped_pending = [idx for idx, st in present.items() if st == _MASK_STATE_PENDING]
+    unchanged = [idx for idx, st in present.items() if st == state]
+    to_update = [idx for idx, st in present.items() if st not in (state, _MASK_STATE_PENDING)]
+    if to_update:
+        invalidating = state == _MASK_STATE_INVALIDATED
+        await conn.execute(
+            "UPDATE qiita.mask_sample"
+            "    SET state = $3,"
+            "        invalidated_at = CASE WHEN $4::boolean THEN now() END,"
+            "        invalidated_by_idx = CASE WHEN $4::boolean THEN $5::bigint END,"
+            "        invalidation_reason = CASE WHEN $4::boolean THEN $6::text END"
+            "  WHERE mask_idx = $1 AND prep_sample_idx = ANY($2::bigint[])",
+            mask_idx,
+            to_update,
+            state,
+            invalidating,
+            principal_idx,
+            reason,
+        )
+    return {
+        "updated": sorted(to_update),
+        "unchanged": sorted(unchanged),
+        "not_found": sorted(not_found),
+        "skipped_pending": sorted(skipped_pending),
+    }

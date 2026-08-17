@@ -216,6 +216,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "zstd",
 ]
 
 [[package]]
@@ -1803,6 +1804,7 @@ version = "2026.3.0"
 dependencies = [
  "arrow-array",
  "arrow-flight",
+ "arrow-ipc",
  "arrow-schema",
  "base64",
  "duckdb",

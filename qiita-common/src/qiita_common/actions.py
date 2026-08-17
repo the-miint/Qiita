@@ -132,6 +132,13 @@ BCL_CONVERT_ACTION_ID = "bcl-convert"
 BLOCK_MASK_ACTION_ID = "read-mask-block"
 ALIGN_ACTION_ID = "align"
 
+# The long-read assembly action's bare id (workflows/long-read-assembly/<version>.yaml).
+# Bare id for the same reason as the ones above. It is the one action that CONSUMES a
+# read mask rather than minting one — it assembles the `read_masked` pass-set named by
+# its action_context `mask_idx` — so a reader asking "which tickets depend on a mask
+# they did not create" keys on it.
+LONG_READ_ASSEMBLY_ACTION_ID = "long-read-assembly"
+
 
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
